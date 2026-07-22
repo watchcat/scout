@@ -117,6 +117,77 @@ async fn decode<T: for<'de> Deserialize<'de>>(resp: reqwest::Response) -> Result
     })
 }
 
+use rig::tool::Tool;
+use serde_json::json;
+
+#[derive(Deserialize)]
+pub struct SearchArgs {
+    pub query: String,
+}
+
+pub struct KagiSearchTool(pub KagiClient);
+
+impl Tool for KagiSearchTool {
+    const NAME: &'static str = "kagi_search";
+    type Error = KagiError;
+    type Args = SearchArgs;
+    type Output = Vec<SearchResult>;
+
+    fn description(&self) -> String {
+        "Search the web. Returns result titles, URLs and snippets. \
+         Use for finding products, shops, prices and reviews."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "web search query"}
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.0.search(&args.query, 10).await
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SummarizeArgs {
+    pub url: String,
+}
+
+pub struct KagiSummarizeTool(pub KagiClient);
+
+impl Tool for KagiSummarizeTool {
+    const NAME: &'static str = "kagi_summarize";
+    type Error = KagiError;
+    type Args = SummarizeArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "Summarize a web page by URL. Use to pull details (specs, price, \
+         condition, shipping) from a specific product page found via search."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL of the page to summarize"}
+            },
+            "required": ["url"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.0.summarize(&args.url).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +295,39 @@ mod tests {
 
         let out = client(&server).await.summarize("https://shop.example/p/1").await.unwrap();
         assert_eq!(out, "A fine product.");
+    }
+
+    #[tokio::test]
+    async fn search_tool_calls_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"t": 0, "title": "T", "url": "https://u", "snippet": "s"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = KagiSearchTool(client(&server).await);
+        let out = tool.call(SearchArgs { query: "x".into() }).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(!tool.description().is_empty());
+        assert_eq!(KagiSearchTool::NAME, "kagi_search");
+    }
+
+    #[tokio::test]
+    async fn summarize_tool_calls_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v0/summarize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"output": "ok", "tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = KagiSummarizeTool(client(&server).await);
+        let out = tool.call(SummarizeArgs { url: "https://u".into() }).await.unwrap();
+        assert_eq!(out, "ok");
     }
 }

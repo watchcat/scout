@@ -32,12 +32,13 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let kagi = KagiClient::new(http, cfg.kagi_api_key.clone(), KAGI_API_BASE.to_string());
+    let kagi = KagiClient::new(http.clone(), cfg.kagi_api_key.clone(), KAGI_API_BASE.to_string());
     let llm = agent::llm_client(&cfg.minimax_api_key)?;
 
     let deps = AgentDeps {
         llm,
         kagi,
+        http,
         store: store.clone(),
         secondhand_sites: cfg.secondhand_sites.clone(),
     };

@@ -1,6 +1,9 @@
 # Build stage: dependency layer is cached separately so code changes don't
 # recompile DuckDB (the expensive part).
 FROM rust:bookworm AS builder
+# DuckDB's C++ compile is memory-hungry; full parallelism OOMs the Docker VM
+# (observed: 10 jobs vs ~8 GiB VM RAM hangs the build). 4 jobs fits.
+ENV CARGO_BUILD_JOBS=4
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs \

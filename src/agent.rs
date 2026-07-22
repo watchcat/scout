@@ -1,4 +1,5 @@
 use crate::store::Store;
+use crate::tools::fetch::FetchPageTool;
 use crate::tools::kagi::{KagiClient, KagiSearchTool};
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
@@ -33,8 +34,14 @@ and confirm what you saved.
 - Use kagi_search for general product searches. Use search_secondhand when the \
 user wants used items or second-hand is a sensible option (electronics, \
 furniture, bikes, tools...).
+- Search results often include retailer search/listing pages (URLs containing \
+/s/?, /search, ?q=, ?searchtext=). NEVER present those as a product link. Open \
+a promising listing or product page with fetch_page and take the direct \
+product URL and price from it. Queries that include brand plus model number \
+surface direct product pages more often.
 - Always include the price (with currency) and a direct link for every option \
-you present. At most 5 options, best first.
+you present. At most 5 options, best first. If you genuinely could not reach a \
+direct product page, say so explicitly rather than passing off a listing URL.
 - If key criteria are missing (budget, country for shipping, size, must-have \
 features), ask before searching.
 - Reply in plain text without markdown formatting. Put URLs on their own lines. \
@@ -53,6 +60,7 @@ pub fn llm_client(api_key: &str) -> Result<LlmClient> {
 pub struct AgentDeps {
     pub llm: LlmClient,
     pub kagi: KagiClient,
+    pub http: reqwest::Client,
     pub store: Store,
     pub secondhand_sites: Vec<String>,
 }
@@ -68,6 +76,7 @@ pub fn build_agent(
         .agent(MODEL)
         .preamble(PREAMBLE)
         .tool(KagiSearchTool(d.kagi.clone()))
+        .tool(FetchPageTool { http: d.http.clone() })
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
             sites: d.secondhand_sites.clone(),

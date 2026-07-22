@@ -8,6 +8,7 @@ mod draft;
 mod store;
 mod text;
 mod tools;
+mod vision;
 
 fn main() {
     println!("scout: not wired up yet");

@@ -45,11 +45,12 @@ async fn tick(bot: &Bot, store: &Store, today: NaiveDate) -> Result<()> {
         );
         match bot.send_message(ChatId(reminder.chat_id), text).await {
             Ok(_) => {
-                let next_due = advance_from(
-                    NaiveDate::parse_from_str(&reminder.next_due, "%Y-%m-%d")?,
-                    reminder.interval_days,
-                    today,
-                );
+                let Ok(parsed) = NaiveDate::parse_from_str(&reminder.next_due, "%Y-%m-%d") else {
+                    tracing::error!(reminder_id = reminder.id, next_due = %reminder.next_due,
+                        "unparseable next_due; skipping reminder");
+                    continue;
+                };
+                let next_due = advance_from(parsed, reminder.interval_days, today);
                 let store = store.clone();
                 let next_s = next_due.to_string();
                 tokio::task::spawn_blocking(move || store.set_next_due(reminder.id, &next_s))

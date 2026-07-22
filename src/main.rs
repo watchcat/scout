@@ -4,6 +4,7 @@
 
 mod config;
 mod store;
+mod text;
 mod tools;
 
 fn main() {

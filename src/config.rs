@@ -49,8 +49,13 @@ fn parse_user_ids(raw: &str) -> Result<HashSet<i64>> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| {
-            s.parse::<i64>()
-                .with_context(|| format!("invalid Telegram user id: {s:?}"))
+            let id = s
+                .parse::<i64>()
+                .with_context(|| format!("invalid Telegram user id: {s:?}"))?;
+            if id < 1 {
+                bail!("invalid Telegram user id (must be positive): {s}");
+            }
+            Ok(id)
         })
         .collect::<Result<HashSet<i64>>>()?;
     if ids.is_empty() {
@@ -125,6 +130,16 @@ mod tests {
     fn empty_allowlist_fails() {
         let mut env = base_env();
         env.insert("ALLOWED_TELEGRAM_USER_IDS", " ");
+        assert!(load(&env).is_err());
+    }
+
+    #[test]
+    fn non_positive_user_id_fails() {
+        let mut env = base_env();
+        env.insert("ALLOWED_TELEGRAM_USER_IDS", "-100123,111");
+        assert!(load(&env).is_err());
+
+        env.insert("ALLOWED_TELEGRAM_USER_IDS", "0,111");
         assert!(load(&env).is_err());
     }
 }

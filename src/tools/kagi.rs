@@ -21,13 +21,17 @@ pub struct SearchResult {
 
 #[derive(Deserialize)]
 struct SearchResponse {
-    data: Vec<RawResult>,
+    data: SearchData,
 }
 
-/// `t == 0` is a search result; other values (related searches etc.) are skipped.
+#[derive(Deserialize, Default)]
+struct SearchData {
+    #[serde(default)]
+    search: Vec<RawResult>,
+}
+
 #[derive(Deserialize)]
 struct RawResult {
-    t: i64,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -36,17 +40,29 @@ struct RawResult {
     snippet: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct SummarizeResponse {
-    data: SummarizeData,
+/// Strips HTML tags and decodes the handful of entities Kagi snippets use.
+/// Tags are removed first, then entities are decoded with `&amp;` last so a
+/// literal `&amp;lt;` in the source decodes to `&lt;`, not `<`.
+fn clean_snippet(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
-#[derive(Deserialize)]
-struct SummarizeData {
-    output: String,
-}
-
-/// Thin client over the Kagi Search and Universal Summarizer APIs.
+/// Thin client over the Kagi v1 Search API.
 /// `base_url` is injectable so tests can point it at a mock server.
 #[derive(Clone)]
 pub struct KagiClient {
@@ -63,35 +79,23 @@ impl KagiClient {
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, KagiError> {
         let resp = self
             .http
-            .get(format!("{}/v0/search", self.base_url))
-            .header("Authorization", format!("Bot {}", self.api_key))
-            .query(&[("q", query)])
+            .post(format!("{}/v1/search", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&serde_json::json!({ "query": query, "limit": limit }))
             .send()
             .await?;
         let body: SearchResponse = decode(check(resp).await?).await?;
         Ok(body
             .data
+            .search
             .into_iter()
-            .filter(|r| r.t == 0)
             .map(|r| SearchResult {
                 title: r.title.unwrap_or_default(),
                 url: r.url.unwrap_or_default(),
-                snippet: r.snippet.unwrap_or_default(),
+                snippet: clean_snippet(&r.snippet.unwrap_or_default()),
             })
             .take(limit)
             .collect())
-    }
-
-    pub async fn summarize(&self, url: &str) -> Result<String, KagiError> {
-        let resp = self
-            .http
-            .get(format!("{}/v0/summarize", self.base_url))
-            .header("Authorization", format!("Bot {}", self.api_key))
-            .query(&[("url", url), ("summary_type", "summary")])
-            .send()
-            .await?;
-        let body: SummarizeResponse = decode(check(resp).await?).await?;
-        Ok(body.data.output)
     }
 }
 
@@ -154,45 +158,11 @@ impl Tool for KagiSearchTool {
     }
 }
 
-#[derive(Deserialize)]
-pub struct SummarizeArgs {
-    pub url: String,
-}
-
-pub struct KagiSummarizeTool(pub KagiClient);
-
-impl Tool for KagiSummarizeTool {
-    const NAME: &'static str = "kagi_summarize";
-    type Error = KagiError;
-    type Args = SummarizeArgs;
-    type Output = String;
-
-    fn description(&self) -> String {
-        "Summarize a web page by URL. Use to pull details (specs, price, \
-         condition, shipping) from a specific product page found via search."
-            .to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "URL of the page to summarize"}
-            },
-            "required": ["url"]
-        })
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        self.0.summarize(&args.url).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn client(server: &MockServer) -> KagiClient {
@@ -200,19 +170,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_parses_results_and_skips_non_results() {
+    async fn search_parses_results_and_cleans_snippets() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v0/search"))
-            .and(query_param("q", "usb hub"))
-            .and(header("Authorization", "Bot test-key"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "usb hub", "limit": 10})))
+            .and(header("Authorization", "Bearer test-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "meta": {"id": "x", "node": "n", "ms": 5},
-                "data": [
-                    {"t": 0, "title": "Hub A", "url": "https://a.example", "snippet": "nice hub"},
-                    {"t": 1, "list": ["usb hub 3.0"]},
-                    {"t": 0, "title": "Hub B", "url": "https://b.example", "snippet": "cheap hub"}
-                ]
+                "data": {
+                    "search": [
+                        {
+                            "url": "https://a.example",
+                            "title": "Hub A",
+                            "snippet": "a <strong>usb</strong> &#39;hub&#39;",
+                            "props": {}
+                        },
+                        {"url": "https://b.example", "title": "Hub B", "snippet": "cheap hub"}
+                    ],
+                    "related_search": ["usb hub 3.0"]
+                }
             })))
             .mount(&server)
             .await;
@@ -224,7 +201,7 @@ mod tests {
                 SearchResult {
                     title: "Hub A".into(),
                     url: "https://a.example".into(),
-                    snippet: "nice hub".into()
+                    snippet: "a usb 'hub'".into()
                 },
                 SearchResult {
                     title: "Hub B".into(),
@@ -236,14 +213,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_truncates_to_limit() {
+    async fn search_truncates_to_limit_even_when_server_ignores_it() {
         let server = MockServer::start().await;
         let many: Vec<_> = (0..10)
-            .map(|i| json!({"t": 0, "title": format!("R{i}"), "url": "https://x", "snippet": ""}))
+            .map(|i| json!({"title": format!("R{i}"), "url": "https://x", "snippet": ""}))
             .collect();
-        Mock::given(method("GET"))
-            .and(path("/v0/search"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": many})))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": many}})))
             .mount(&server)
             .await;
 
@@ -254,9 +231,13 @@ mod tests {
     #[tokio::test]
     async fn search_surfaces_api_errors() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v0/search"))
-            .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "meta": {"id": "x"},
+                "data": null,
+                "errors": [{"code": "401", "message": "Invalid API key", "url": ""}]
+            })))
             .mount(&server)
             .await;
 
@@ -267,8 +248,8 @@ mod tests {
     #[tokio::test]
     async fn search_reports_unexpected_body_as_decode_error() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v0/search"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
             .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
             .mount(&server)
             .await;
@@ -279,31 +260,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summarize_returns_output() {
+    async fn missing_search_key_is_empty() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v0/summarize"))
-            .and(query_param("url", "https://shop.example/p/1"))
-            .and(query_param("summary_type", "summary"))
-            .and(header("Authorization", "Bot test-key"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "meta": {"id": "x"},
-                "data": {"output": "A fine product.", "tokens": 42}
+                "data": {"related_search": []}
             })))
             .mount(&server)
             .await;
 
-        let out = client(&server).await.summarize("https://shop.example/p/1").await.unwrap();
-        assert_eq!(out, "A fine product.");
+        let results = client(&server).await.search("q", 5).await.unwrap();
+        assert_eq!(results, Vec::new());
     }
 
     #[tokio::test]
     async fn search_tool_calls_through() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v0/search"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{"t": 0, "title": "T", "url": "https://u", "snippet": "s"}]
+                "data": {"search": [{"title": "T", "url": "https://u", "snippet": "s"}]}
             })))
             .mount(&server)
             .await;
@@ -315,19 +292,20 @@ mod tests {
         assert_eq!(KagiSearchTool::NAME, "kagi_search");
     }
 
-    #[tokio::test]
-    async fn summarize_tool_calls_through() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v0/summarize"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": {"output": "ok", "tokens": 1}
-            })))
-            .mount(&server)
-            .await;
+    #[test]
+    fn clean_snippet_strips_tags() {
+        assert_eq!(clean_snippet("a <strong>bold</strong> word"), "a bold word");
+    }
 
-        let tool = KagiSummarizeTool(client(&server).await);
-        let out = tool.call(SummarizeArgs { url: "https://u".into() }).await.unwrap();
-        assert_eq!(out, "ok");
+    #[test]
+    fn clean_snippet_decodes_entities() {
+        assert_eq!(clean_snippet("Tom &amp; Jerry &#39;s &quot;show&quot;"), "Tom & Jerry 's \"show\"");
+        assert_eq!(clean_snippet("a&nbsp;b"), "a b");
+    }
+
+    #[test]
+    fn clean_snippet_does_not_double_decode_amp() {
+        // "&amp;lt;" must become "&lt;", not "<" — amp decodes last.
+        assert_eq!(clean_snippet("&amp;lt;"), "&lt;");
     }
 }

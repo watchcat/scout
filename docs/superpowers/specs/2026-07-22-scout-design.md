@@ -54,7 +54,7 @@ One Rust binary, no external services beyond the three APIs.
 | `bot.rs` | Teloxide dispatcher: allowlist filter, `/start`, `/help`, `/reset` commands, main text-message handler, photo handler with the draft-confirm state machine |
 | `vision.rs` | Download a Telegram photo, send it to MiniMax M3 as an image message, return a drafted search description |
 | `agent.rs` | Build the rig agent: MiniMax M3 through rig's OpenAI-compatible provider with base URL `https://api.minimax.io/v1`, model `minimax-m3`; product-research system prompt; tool registration |
-| `tools/kagi.rs` | `kagi_search` and `kagi_summarize` implementing rig's `Tool` trait as `reqwest` calls against the Kagi API |
+| `tools/kagi.rs` | `kagi_search` (and `kagi_summarize`, removed for now: Kagi v1 API has no summarizer endpoint yet) implementing rig's `Tool` trait as `reqwest` calls against the Kagi API |
 | `tools/secondhand.rs` | `search_secondhand`: concurrent site-scoped Kagi queries across the configured platforms, merged and grouped by platform |
 | `tools/purchases.rs` | `record_purchase` and `query_purchases` implementing rig's `Tool` trait on top of `store.rs` |
 | `tools/reminders.rs` | `create_reminder`, `list_reminders`, `cancel_reminder` implementing rig's `Tool` trait on top of `store.rs` |
@@ -181,7 +181,8 @@ default list stays short.
 ### System prompt (agent behavior)
 
 The agent acts as a product-research assistant: searches with `kagi_search`,
-optionally pulls page details with `kagi_summarize`, compares options, always
+optionally pulls page details with `kagi_summarize` (removed for now: Kagi v1
+API has no summarizer endpoint yet), compares options, always
 cites prices and links, and asks the user for missing criteria (budget,
 region, must-have features) instead of guessing. When the user mentions
 having bought something, it records it with `record_purchase`. On every

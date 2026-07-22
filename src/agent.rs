@@ -1,5 +1,5 @@
 use crate::store::Store;
-use crate::tools::kagi::{KagiClient, KagiSearchTool, KagiSummarizeTool};
+use crate::tools::kagi::{KagiClient, KagiSearchTool};
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
 use crate::tools::secondhand::SecondhandSearchTool;
@@ -32,8 +32,7 @@ create_reminder ONLY after the user explicitly agrees.
 and confirm what you saved.
 - Use kagi_search for general product searches. Use search_secondhand when the \
 user wants used items or second-hand is a sensible option (electronics, \
-furniture, bikes, tools...). Use kagi_summarize to pull details from a specific \
-product page.
+furniture, bikes, tools...).
 - Always include the price (with currency) and a direct link for every option \
 you present. At most 5 options, best first.
 - If key criteria are missing (budget, country for shipping, size, must-have \
@@ -69,7 +68,6 @@ pub fn build_agent(
         .agent(MODEL)
         .preamble(PREAMBLE)
         .tool(KagiSearchTool(d.kagi.clone()))
-        .tool(KagiSummarizeTool(d.kagi.clone()))
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
             sites: d.secondhand_sites.clone(),

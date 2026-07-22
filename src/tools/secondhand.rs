@@ -66,7 +66,7 @@ impl Tool for SecondhandSearchTool {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn tool(server: &MockServer, sites: &[&str]) -> SecondhandSearchTool {
@@ -83,19 +83,19 @@ mod tests {
     #[tokio::test]
     async fn queries_are_site_scoped_and_grouped() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v0/search"))
-            .and(query_param("q", "site:ebay.com bike"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "site:ebay.com bike", "limit": 5})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{"t": 0, "title": "eBay bike", "url": "https://e", "snippet": ""}]
+                "data": {"search": [{"title": "eBay bike", "url": "https://e", "snippet": ""}]}
             })))
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/v0/search"))
-            .and(query_param("q", "site:vinted.com bike"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "site:vinted.com bike", "limit": 5})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{"t": 0, "title": "Vinted bike", "url": "https://v", "snippet": ""}]
+                "data": {"search": [{"title": "Vinted bike", "url": "https://v", "snippet": ""}]}
             })))
             .mount(&server)
             .await;
@@ -116,17 +116,17 @@ mod tests {
     #[tokio::test]
     async fn one_platform_failing_does_not_sink_the_others() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v0/search"))
-            .and(query_param("q", "site:good.com widget"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "site:good.com widget", "limit": 5})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{"t": 0, "title": "ok", "url": "https://g", "snippet": ""}]
+                "data": {"search": [{"title": "ok", "url": "https://g", "snippet": ""}]}
             })))
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/v0/search"))
-            .and(query_param("q", "site:bad.com widget"))
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "site:bad.com widget", "limit": 5})))
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
             .mount(&server)
             .await;

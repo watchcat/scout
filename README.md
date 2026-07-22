@@ -6,7 +6,7 @@ you get links and comparisons, purchasing stays in your hands.
 
 Built with [teloxide](https://github.com/teloxide/teloxide),
 [rig](https://rig.rs) (MiniMax M3 via its OpenAI-compatible API),
-[Kagi Search/Summarizer](https://help.kagi.com/kagi/api/search.html), and
+[Kagi Search API (v1)](https://help.kagi.com/kagi/api/search.html), and
 DuckDB for purchase memory.
 
 ## Features
@@ -17,6 +17,9 @@ DuckDB for purchase memory.
   in parallel
 - Purchase memory: "where did I buy X last time?"
 - Reorder reminders for periodic purchases, delivered in Telegram
+
+Note: page summarization (Kagi Universal Summarizer) is temporarily removed —
+Kagi's v1 API doesn't offer it yet; it returns when they ship it.
 
 ## Setup
 
@@ -34,7 +37,7 @@ DuckDB for purchase memory.
 | `TELEGRAM_BOT_TOKEN` | yes | — | bot token from @BotFather |
 | `ALLOWED_TELEGRAM_USER_IDS` | yes | — | comma-separated numeric ids |
 | `MINIMAX_API_KEY` | yes | — | LLM |
-| `KAGI_API_KEY` | yes | — | search + summarizer |
+| `KAGI_API_KEY` | yes | — | search |
 | `SCOUT_DB_PATH` | no | `scout.duckdb` | DuckDB file |
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
 

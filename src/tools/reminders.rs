@@ -7,11 +7,14 @@ use serde_json::json;
 
 /// First due date: anchor on the last matching purchase when known
 /// (stepping by interval until the date is in the future), else today + interval.
+///
+/// Panics if `interval_days < 1` — callers must validate first.
 pub fn default_next_due(
     last_purchase: Option<NaiveDate>,
     interval_days: i64,
     today: NaiveDate,
 ) -> NaiveDate {
+    assert!(interval_days >= 1, "interval_days must be >= 1");
     match last_purchase {
         Some(mut d) => {
             while d <= today {
@@ -199,6 +202,12 @@ mod tests {
             default_next_due(None, 30, date("2026-07-22")),
             date("2026-08-21")
         );
+    }
+
+    #[test]
+    #[should_panic]
+    fn default_next_due_panics_on_non_positive_interval() {
+        default_next_due(None, 0, date("2026-07-22"));
     }
 
     fn setup() -> (Store, TempDir) {

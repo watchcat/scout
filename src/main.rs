@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 mod config;
+mod draft;
 mod store;
 mod text;
 mod tools;

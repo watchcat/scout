@@ -8,6 +8,8 @@ pub enum KagiError {
     Http(#[from] reqwest::Error),
     #[error("kagi api error (status {status}): {body}")]
     Api { status: u16, body: String },
+    #[error("kagi returned an unexpected response: {detail}")]
+    Decode { detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -66,7 +68,7 @@ impl KagiClient {
             .query(&[("q", query)])
             .send()
             .await?;
-        let body: SearchResponse = check(resp).await?.json().await?;
+        let body: SearchResponse = decode(check(resp).await?).await?;
         Ok(body
             .data
             .into_iter()
@@ -88,7 +90,7 @@ impl KagiClient {
             .query(&[("url", url), ("summary_type", "summary")])
             .send()
             .await?;
-        let body: SummarizeResponse = check(resp).await?.json().await?;
+        let body: SummarizeResponse = decode(check(resp).await?).await?;
         Ok(body.data.output)
     }
 }
@@ -103,6 +105,16 @@ async fn check(resp: reqwest::Response) -> Result<reqwest::Response, KagiError> 
             body: resp.text().await.unwrap_or_default(),
         })
     }
+}
+
+async fn decode<T: for<'de> Deserialize<'de>>(resp: reqwest::Response) -> Result<T, KagiError> {
+    let text = resp.text().await?;
+    serde_json::from_str(&text).map_err(|e| {
+        let snippet: String = text.chars().take(200).collect();
+        KagiError::Decode {
+            detail: format!("{e}; body: {snippet}"),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -179,6 +191,20 @@ mod tests {
 
         let err = client(&server).await.search("q", 5).await.unwrap_err();
         assert!(matches!(err, KagiError::Api { status: 401, .. }), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn search_reports_unexpected_body_as_decode_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let err = client(&server).await.search("q", 5).await.unwrap_err();
+        assert!(matches!(err, KagiError::Decode { .. }), "got: {err}");
+        assert!(err.to_string().contains("unexpected response"), "got: {err}");
     }
 
     #[tokio::test]

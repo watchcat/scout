@@ -141,9 +141,18 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     };
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
-    let file = bot.get_file(photo.file.id.clone()).await?;
-    let mut bytes: Vec<u8> = Vec::new();
-    bot.download_file(&file.path, &mut bytes).await?;
+    let bytes = match download_photo(&bot, photo.file.id.clone()).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, "photo download failed");
+            bot.send_message(
+                chat_id,
+                "Sorry, I couldn't download that photo. Please try again.",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     match describe_photo(&app.deps.llm, &bytes, msg.caption()).await {
         Ok(draft) => {
@@ -168,6 +177,17 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     Ok(())
 }
 
+/// Downloads a Telegram file by id into memory.
+async fn download_photo(
+    bot: &Bot,
+    file_id: teloxide::types::FileId,
+) -> anyhow::Result<Vec<u8>> {
+    let file = bot.get_file(file_id).await?;
+    let mut bytes: Vec<u8> = Vec::new();
+    bot.download_file(&file.path, &mut bytes).await?;
+    Ok(bytes)
+}
+
 /// Runs the agent against a snapshot of this chat's history, then writes the
 /// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
 /// from being held across awaits.
@@ -186,11 +206,39 @@ async fn run_agent(
 
     let reply = agent.chat(prompt, &mut history).await?;
 
-    if history.len() > HISTORY_CAP {
-        history.drain(..history.len() - HISTORY_CAP);
-    }
+    trim_history(&mut history, HISTORY_CAP);
     app.chats.entry(chat_id).or_default().history = history;
     Ok(reply)
+}
+
+/// Caps `history` at `cap` messages, then trims further so it never starts
+/// mid tool-call/tool-result exchange. Providers serialize history as-is, and
+/// a leading orphaned tool-result message (a user-role message whose content
+/// is a `ToolResult` left behind when its assistant tool-call got cut) is
+/// rejected by strict OpenAI-compatible backends. We only trust a history
+/// that begins with a plain user text message.
+pub(crate) fn trim_history(history: &mut Vec<LlmMessage>, cap: usize) {
+    if history.len() <= cap {
+        return;
+    }
+    history.drain(..history.len() - cap);
+    match history.iter().position(is_plain_user_text) {
+        Some(0) => {}
+        Some(i) => {
+            history.drain(..i);
+        }
+        None => history.clear(),
+    }
+}
+
+/// A `Message::User` whose content is entirely plain text - no tool-result,
+/// image, or other part that only makes sense following a tool call.
+fn is_plain_user_text(msg: &LlmMessage) -> bool {
+    matches!(
+        msg,
+        LlmMessage::User { content }
+            if content.iter().all(|c| !matches!(c, rig::message::UserContent::ToolResult(_)))
+    )
 }
 
 /// Send in <=4096-char chunks; each chunk gets one retry.
@@ -208,4 +256,105 @@ async fn send_chunked(bot: &Bot, chat_id: ChatId, text: &str) -> ResponseResult<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
+    use rig::message::ToolCall;
+    use rig::one_or_many::OneOrMany;
+
+    fn user_text(s: &str) -> LlmMessage {
+        LlmMessage::user(s)
+    }
+
+    fn assistant_text(s: &str) -> LlmMessage {
+        LlmMessage::assistant(s)
+    }
+
+    fn assistant_tool_call(id: &str, name: &str) -> LlmMessage {
+        LlmMessage::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                id.to_string(),
+                rig::message::ToolFunction {
+                    name: name.to_string(),
+                    arguments: serde_json::json!({}),
+                },
+            ))),
+        }
+    }
+
+    fn tool_result(id: &str) -> LlmMessage {
+        LlmMessage::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: id.to_string(),
+                call_id: None,
+                content: OneOrMany::one(ToolResultContent::text("result")),
+            })),
+        }
+    }
+
+    #[test]
+    fn under_cap_is_untouched() {
+        let mut history = vec![user_text("hi"), assistant_text("hello")];
+        let original = history.clone();
+        trim_history(&mut history, 10);
+        assert_eq!(history, original);
+    }
+
+    #[test]
+    fn at_cap_is_untouched() {
+        let mut history = vec![user_text("hi"), assistant_text("hello")];
+        let original = history.clone();
+        trim_history(&mut history, 2);
+        assert_eq!(history, original);
+    }
+
+    #[test]
+    fn over_cap_trims_to_cap_and_starts_on_plain_user_text() {
+        // Clean exchanges only, so the cap boundary itself lands on a user
+        // text message - no further trimming needed.
+        let mut history = vec![
+            user_text("q1"),
+            assistant_text("a1"),
+            user_text("q2"),
+            assistant_text("a2"),
+            user_text("q3"),
+            assistant_text("a3"),
+        ];
+        trim_history(&mut history, 4);
+        assert!(history.len() <= 4);
+        assert!(is_plain_user_text(&history[0]), "got: {:?}", history[0]);
+        assert_eq!(history.last(), Some(&assistant_text("a3")));
+    }
+
+    #[test]
+    fn drain_landing_on_tool_result_trims_forward_to_next_user_text() {
+        // Cap of 4 lands the drain boundary right on the tool-result message
+        // (index 2), which must not be kept as the new head.
+        let mut history = vec![
+            user_text("q1"),                        // 0 - dropped by cap
+            assistant_tool_call("call-1", "search"), // 1 - dropped by cap
+            tool_result("call-1"),                   // 2 - would be new head; orphaned, must drop
+            assistant_text("a1"),                    // 3 - also orphaned (no leading user turn)
+            user_text("q2"),                         // 4 - first safe head
+            assistant_text("a2"),                    // 5
+        ];
+        trim_history(&mut history, 4);
+        assert_eq!(history, vec![user_text("q2"), assistant_text("a2")]);
+        assert!(is_plain_user_text(&history[0]));
+    }
+
+    #[test]
+    fn no_safe_head_after_drain_yields_empty_history_without_panicking() {
+        let mut history = vec![
+            assistant_tool_call("call-1", "search"),
+            tool_result("call-1"),
+            assistant_text("final answer"),
+        ];
+        trim_history(&mut history, 1);
+        assert!(history.is_empty());
+    }
 }

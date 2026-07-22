@@ -2,6 +2,8 @@
 // (removed in the last task).
 #![allow(dead_code)]
 
+mod config;
+
 fn main() {
     println!("scout: not wired up yet");
 }

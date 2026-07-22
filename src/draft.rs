@@ -8,9 +8,14 @@ pub enum DraftResolution {
     Confirmed(String),
     /// User sent their own text instead — search with that.
     Replaced(String),
+    /// User dismissed the draft — drop it, search nothing.
+    Cancelled,
 }
 
+/// Matches the reply-keyboard "Go" button as well as typed confirmations.
 const CONFIRM_WORDS: &[&str] = &["go", "ok", "okay", "yes", "y", "sure"];
+/// Matches the reply-keyboard "Cancel" button as well as typed dismissals.
+const CANCEL_WORDS: &[&str] = &["cancel", "no", "stop", "nevermind", "never mind"];
 
 pub fn resolve_draft(pending: Option<&str>, text: &str) -> DraftResolution {
     let Some(draft) = pending else {
@@ -19,6 +24,8 @@ pub fn resolve_draft(pending: Option<&str>, text: &str) -> DraftResolution {
     let normalized = text.trim().to_lowercase();
     if CONFIRM_WORDS.contains(&normalized.as_str()) {
         DraftResolution::Confirmed(draft.to_string())
+    } else if CANCEL_WORDS.contains(&normalized.as_str()) {
+        DraftResolution::Cancelled
     } else {
         DraftResolution::Replaced(text.trim().to_string())
     }
@@ -35,13 +42,29 @@ mod tests {
 
     #[test]
     fn confirm_words_use_the_draft() {
-        for word in ["go", "GO", " ok ", "Yes", "y", "sure"] {
+        for word in ["go", "GO", " ok ", "Yes", "y", "sure", "Go"] {
             assert_eq!(
                 resolve_draft(Some("red mountain bike"), word),
                 DraftResolution::Confirmed("red mountain bike".to_string()),
                 "word: {word:?}"
             );
         }
+    }
+
+    #[test]
+    fn cancel_words_dismiss_the_draft() {
+        for word in ["cancel", "Cancel", " no ", "STOP", "nevermind", "Never mind"] {
+            assert_eq!(
+                resolve_draft(Some("red mountain bike"), word),
+                DraftResolution::Cancelled,
+                "word: {word:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_words_without_draft_are_normal_text() {
+        assert_eq!(resolve_draft(None, "cancel"), DraftResolution::NoDraft);
     }
 
     #[test]

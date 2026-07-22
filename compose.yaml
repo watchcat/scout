@@ -1,0 +1,12 @@
+services:
+  scout:
+    build: .
+    env_file: .env
+    environment:
+      SCOUT_DB_PATH: /data/scout.duckdb
+    volumes:
+      - scout-data:/data
+    restart: unless-stopped
+
+volumes:
+  scout-data:

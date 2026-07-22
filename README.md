@@ -41,6 +41,17 @@ Kagi's v1 API doesn't offer it yet; it returns when they ship it.
 | `SCOUT_DB_PATH` | no | `scout.duckdb` | DuckDB file |
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
 
+## Running with Docker
+
+```
+docker compose up -d --build
+```
+
+Reads keys from `.env` at runtime (never baked into the image). Purchase
+memory lives in the `scout-data` volume, so it survives rebuilds; the
+container restarts automatically unless stopped (`docker compose down`).
+Logs: `docker compose logs -f`.
+
 ## Development
 
 `cargo test` — unit tests (HTTP mocked with wiremock, DuckDB on temp files).

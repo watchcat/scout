@@ -4,6 +4,7 @@
 
 mod config;
 mod store;
+mod tools;
 
 fn main() {
     println!("scout: not wired up yet");

@@ -196,6 +196,7 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Internal: id must come from a trusted source (the scheduler) — no owner check.
     pub fn set_next_due(&self, id: i64, next_due: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -336,10 +337,11 @@ mod tests {
         s.create_reminder(1, 10, "future", 30, "2026-09-01").unwrap();
         let cancelled = s.create_reminder(1, 10, "cancelled", 30, "2026-07-01").unwrap();
         s.cancel_reminder(1, cancelled.id).unwrap();
+        s.create_reminder(2, 20, "other-user", 30, "2026-07-02").unwrap();
 
         let due = s.due_reminders("2026-07-22").unwrap();
         let items: Vec<_> = due.iter().map(|r| r.item.as_str()).collect();
-        assert_eq!(items, vec!["overdue", "today"]);
+        assert_eq!(items, vec!["overdue", "other-user", "today"]);
     }
 
     #[test]

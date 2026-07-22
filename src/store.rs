@@ -57,6 +57,16 @@ pub struct NewPurchase {
     pub purchased_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Reminder {
+    pub id: i64,
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub item: String,
+    pub interval_days: i64,
+    pub next_due: String, // YYYY-MM-DD
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -128,6 +138,72 @@ impl Store {
         }
         Ok(out)
     }
+
+    pub fn create_reminder(
+        &self,
+        user_id: i64,
+        chat_id: i64,
+        item: &str,
+        interval_days: i64,
+        next_due: &str,
+    ) -> Result<Reminder> {
+        let conn = self.conn.lock().unwrap();
+        let id: i64 = conn.query_row(
+            "INSERT INTO reminders (user_id, chat_id, item, interval_days, next_due)
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
+            params![user_id, chat_id, item, interval_days, next_due],
+            |row| row.get(0),
+        )?;
+        Ok(Reminder {
+            id,
+            user_id,
+            chat_id,
+            item: item.to_string(),
+            interval_days,
+            next_due: next_due.to_string(),
+        })
+    }
+
+    /// Active reminders for one user, soonest first.
+    pub fn list_reminders(&self, user_id: i64) -> Result<Vec<Reminder>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_id, chat_id, item, interval_days, next_due FROM reminders
+             WHERE user_id = ? AND active ORDER BY next_due ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![user_id], row_to_reminder)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Returns true if an active reminder belonging to this user was cancelled.
+    pub fn cancel_reminder(&self, user_id: i64, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE reminders SET active = false WHERE id = ? AND user_id = ? AND active",
+            params![id, user_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// All users' active reminders with next_due <= today (ISO date string).
+    pub fn due_reminders(&self, today: &str) -> Result<Vec<Reminder>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_id, chat_id, item, interval_days, next_due FROM reminders
+             WHERE active AND next_due <= ? ORDER BY next_due ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![today], row_to_reminder)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    pub fn set_next_due(&self, id: i64, next_due: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE reminders SET next_due = ? WHERE id = ?",
+            params![next_due, id],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_purchase(row: &Row) -> duckdb::Result<Purchase> {
@@ -140,6 +216,17 @@ fn row_to_purchase(row: &Row) -> duckdb::Result<Purchase> {
         currency: row.get(5)?,
         notes: row.get(6)?,
         purchased_at: row.get(7)?,
+    })
+}
+
+fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
+    Ok(Reminder {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        chat_id: row.get(2)?,
+        item: row.get(3)?,
+        interval_days: row.get(4)?,
+        next_due: row.get(5)?,
     })
 }
 
@@ -215,5 +302,52 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].item, "new");
         assert_eq!(found[1].item, "old");
+    }
+
+    #[test]
+    fn create_list_cancel_reminder() {
+        let (s, _d) = test_store();
+        let r = s.create_reminder(1, 10, "coffee", 30, "2026-08-01").unwrap();
+        assert_eq!(r.id, 1);
+
+        let listed = s.list_reminders(1).unwrap();
+        assert_eq!(listed, vec![r.clone()]);
+        assert!(s.list_reminders(2).unwrap().is_empty());
+
+        assert!(s.cancel_reminder(1, r.id).unwrap());
+        assert!(s.list_reminders(1).unwrap().is_empty());
+        // second cancel is a no-op
+        assert!(!s.cancel_reminder(1, r.id).unwrap());
+    }
+
+    #[test]
+    fn cancel_is_scoped_to_owner() {
+        let (s, _d) = test_store();
+        let r = s.create_reminder(1, 10, "coffee", 30, "2026-08-01").unwrap();
+        assert!(!s.cancel_reminder(2, r.id).unwrap());
+        assert_eq!(s.list_reminders(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn due_reminders_selects_past_and_today_only() {
+        let (s, _d) = test_store();
+        s.create_reminder(1, 10, "overdue", 30, "2026-07-01").unwrap();
+        s.create_reminder(1, 10, "today", 30, "2026-07-22").unwrap();
+        s.create_reminder(1, 10, "future", 30, "2026-09-01").unwrap();
+        let cancelled = s.create_reminder(1, 10, "cancelled", 30, "2026-07-01").unwrap();
+        s.cancel_reminder(1, cancelled.id).unwrap();
+
+        let due = s.due_reminders("2026-07-22").unwrap();
+        let items: Vec<_> = due.iter().map(|r| r.item.as_str()).collect();
+        assert_eq!(items, vec!["overdue", "today"]);
+    }
+
+    #[test]
+    fn set_next_due_updates() {
+        let (s, _d) = test_store();
+        let r = s.create_reminder(1, 10, "coffee", 30, "2026-07-01").unwrap();
+        s.set_next_due(r.id, "2026-08-01").unwrap();
+        assert!(s.due_reminders("2026-07-22").unwrap().is_empty());
+        assert_eq!(s.list_reminders(1).unwrap()[0].next_due, "2026-08-01");
     }
 }

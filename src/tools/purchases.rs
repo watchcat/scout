@@ -47,6 +47,15 @@ impl Tool for RecordPurchaseTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let mut args = args;
+        args.purchased_at = match args.purchased_at {
+            Some(s) => {
+                chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                    .map_err(|e| StoreToolError(format!("purchased_at must be YYYY-MM-DD: {e}")))?;
+                Some(s)
+            }
+            None => Some(chrono::Local::now().date_naive().to_string()),
+        };
         let store = self.store.clone();
         let user_id = self.user_id;
         tokio::task::spawn_blocking(move || store.record_purchase(user_id, args))
@@ -146,5 +155,44 @@ mod tests {
             .await
             .unwrap();
         assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_defaults_purchased_at_to_today() {
+        let (store, _d) = setup();
+        let record = RecordPurchaseTool { store, user_id: 1 };
+        let recorded = record
+            .call(NewPurchase {
+                item: "coffee beans".into(),
+                store: "Amazon".into(),
+                url: None,
+                price: None,
+                currency: None,
+                notes: None,
+                purchased_at: None,
+            })
+            .await
+            .unwrap();
+        let date = recorded.purchased_at.expect("purchased_at should be defaulted");
+        chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+            .expect("defaulted purchased_at should be YYYY-MM-DD");
+    }
+
+    #[tokio::test]
+    async fn record_rejects_malformed_purchased_at() {
+        let (store, _d) = setup();
+        let record = RecordPurchaseTool { store, user_id: 1 };
+        let result = record
+            .call(NewPurchase {
+                item: "coffee beans".into(),
+                store: "Amazon".into(),
+                url: None,
+                price: None,
+                currency: None,
+                notes: None,
+                purchased_at: Some("June 28".into()),
+            })
+            .await;
+        assert!(result.is_err());
     }
 }

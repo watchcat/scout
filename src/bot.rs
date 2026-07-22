@@ -135,6 +135,9 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
 
 async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
+    if let Some(mut chat) = app.chats.get_mut(&chat_id.0) {
+        chat.pending_draft = None;
+    }
     // Sizes are ordered smallest to largest; take the largest.
     let Some(photo) = msg.photo().and_then(|sizes| sizes.last()) else {
         return Ok(());

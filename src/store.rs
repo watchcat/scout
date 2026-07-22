@@ -60,7 +60,9 @@ pub struct NewPurchase {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Reminder {
     pub id: i64,
+    #[serde(skip)]
     pub user_id: i64,
+    #[serde(skip)]
     pub chat_id: i64,
     pub item: String,
     pub interval_days: i64,

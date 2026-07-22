@@ -24,7 +24,7 @@ DuckDB for purchase memory.
 2. Get your numeric Telegram user id from [@userinfobot](https://t.me/userinfobot).
 3. Get a [Kagi API key](https://kagi.com/settings?p=api) (paid) and a
    [MiniMax API key](https://www.minimax.io).
-4. Copy the values into `.env` (see the template in this repo).
+4. Copy `.env.example` to `.env` and fill in the values.
 5. `cargo run` (first build takes a while — DuckDB is compiled in).
 
 ## Configuration

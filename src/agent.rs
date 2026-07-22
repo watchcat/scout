@@ -9,8 +9,10 @@ use rig::providers::openai;
 
 pub const MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 pub const MODEL: &str = "minimax-m3";
-/// Cap on model calls per request so a confused agent can't burn credits.
-pub const MAX_TURNS: usize = 5;
+/// Cap on model calls per request so a confused agent can't burn credits. 8
+/// leaves headroom for the mandated query_purchases -> search -> secondhand
+/// -> summarize -> answer flow.
+pub const MAX_TURNS: usize = 8;
 /// Conversation history cap per chat (messages, not exchanges).
 pub const HISTORY_CAP: usize = 20;
 

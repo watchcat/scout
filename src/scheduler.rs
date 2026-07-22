@@ -39,6 +39,11 @@ async fn tick(bot: &Bot, store: &Store, today: NaiveDate) -> Result<()> {
         tokio::task::spawn_blocking(move || store.due_reminders(&today_s)).await??
     };
     for reminder in due {
+        if reminder.interval_days < 1 {
+            tracing::error!(reminder_id = reminder.id, interval_days = reminder.interval_days,
+                "invalid interval_days; skipping reminder");
+            continue;
+        }
         let text = format!(
             "⏰ Time to reorder {} — want me to search for deals?",
             reminder.item

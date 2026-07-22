@@ -2,7 +2,10 @@ pub const TELEGRAM_LIMIT: usize = 4096;
 
 /// Split `text` into chunks of at most `limit` characters, preferring to cut
 /// at newlines, then spaces, so URLs and words stay intact.
+///
+/// Panics if limit == 0.
 pub fn split_message(text: &str, limit: usize) -> Vec<String> {
+    assert!(limit > 0, "limit must be > 0");
     let mut chunks = Vec::new();
     let mut rest = text.trim();
     while !rest.is_empty() {
@@ -60,6 +63,22 @@ mod tests {
         let text = "a".repeat(25);
         let chunks = split_message(&text, 10);
         assert_eq!(chunks, vec!["a".repeat(10), "a".repeat(10), "a".repeat(5)]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn zero_limit_panics() {
+        split_message("hello", 0);
+    }
+
+    #[test]
+    fn multibyte_text_splits_on_char_boundaries() {
+        let text = "żółć ".repeat(10); // 50 chars, mostly multibyte
+        let chunks = split_message(&text, 12);
+        for c in &chunks {
+            assert!(c.chars().count() <= 12, "chunk too long: {c:?}");
+        }
+        assert_eq!(chunks.join(" ").split_whitespace().count(), 10);
     }
 
     #[test]

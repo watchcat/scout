@@ -2,6 +2,7 @@
 // (removed in the last task).
 #![allow(dead_code)]
 
+mod agent;
 mod config;
 mod draft;
 mod store;

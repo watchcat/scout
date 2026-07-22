@@ -5,6 +5,7 @@
 mod agent;
 mod config;
 mod draft;
+mod scheduler;
 mod store;
 mod text;
 mod tools;

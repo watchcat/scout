@@ -84,7 +84,7 @@ mod tests {
     async fn queries_are_site_scoped_and_grouped() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/search"))
+            .and(path("/v0/search"))
             .and(query_param("q", "site:ebay.com bike"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"t": 0, "title": "eBay bike", "url": "https://e", "snippet": ""}]
@@ -92,7 +92,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/v1/search"))
+            .and(path("/v0/search"))
             .and(query_param("q", "site:vinted.com bike"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"t": 0, "title": "Vinted bike", "url": "https://v", "snippet": ""}]
@@ -117,7 +117,7 @@ mod tests {
     async fn one_platform_failing_does_not_sink_the_others() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/search"))
+            .and(path("/v0/search"))
             .and(query_param("q", "site:good.com widget"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"t": 0, "title": "ok", "url": "https://g", "snippet": ""}]
@@ -125,7 +125,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/v1/search"))
+            .and(path("/v0/search"))
             .and(query_param("q", "site:bad.com widget"))
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
             .mount(&server)

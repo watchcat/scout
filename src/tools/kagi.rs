@@ -63,7 +63,7 @@ impl KagiClient {
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, KagiError> {
         let resp = self
             .http
-            .get(format!("{}/v1/search", self.base_url))
+            .get(format!("{}/v0/search", self.base_url))
             .header("Authorization", format!("Bot {}", self.api_key))
             .query(&[("q", query)])
             .send()
@@ -203,7 +203,7 @@ mod tests {
     async fn search_parses_results_and_skips_non_results() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/search"))
+            .and(path("/v0/search"))
             .and(query_param("q", "usb hub"))
             .and(header("Authorization", "Bot test-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -242,7 +242,7 @@ mod tests {
             .map(|i| json!({"t": 0, "title": format!("R{i}"), "url": "https://x", "snippet": ""}))
             .collect();
         Mock::given(method("GET"))
-            .and(path("/v1/search"))
+            .and(path("/v0/search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": many})))
             .mount(&server)
             .await;
@@ -255,7 +255,7 @@ mod tests {
     async fn search_surfaces_api_errors() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/search"))
+            .and(path("/v0/search"))
             .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
             .mount(&server)
             .await;
@@ -268,7 +268,7 @@ mod tests {
     async fn search_reports_unexpected_body_as_decode_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/search"))
+            .and(path("/v0/search"))
             .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
             .mount(&server)
             .await;
@@ -301,7 +301,7 @@ mod tests {
     async fn search_tool_calls_through() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/search"))
+            .and(path("/v0/search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{"t": 0, "title": "T", "url": "https://u", "snippet": "s"}]
             })))

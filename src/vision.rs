@@ -4,7 +4,7 @@ use base64::prelude::{Engine, BASE64_STANDARD};
 use rig::client::CompletionClient;
 use rig::completion::message::Image;
 use rig::completion::Prompt;
-use rig::message::{DocumentSourceKind, ImageMediaType};
+use rig::message::{DocumentSourceKind, ImageDetail, ImageMediaType};
 
 const VISION_PREAMBLE: &str = "\
 Look at the product in the photo and describe it as one concise web-search \
@@ -26,6 +26,9 @@ pub async fn describe_photo(
     let image = Image {
         data: DocumentSourceKind::base64(&BASE64_STANDARD.encode(image_jpeg)),
         media_type: Some(ImageMediaType::JPEG),
+        // MiniMax rejects the "auto" detail rig sends by default (error 2013);
+        // request high detail explicitly — better for reading brand/model text.
+        detail: Some(ImageDetail::High),
         ..Default::default()
     };
     Ok(agent.prompt(image).await?.trim().to_string())

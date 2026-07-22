@@ -27,6 +27,12 @@ purchases themselves — the bot never buys anything.
   search for deals?"). The agent creates/lists/cancels reminders on request
   and may *suggest* one when it notices a periodic purchase, but only creates
   it after the user confirms
+- Photo search: the user sends a picture, MiniMax M3 (multimodal) drafts a
+  search description from it, the bot shows the draft, and the user edits or
+  confirms it before any search runs
+- Second-hand platform search: a `search_secondhand` tool fans out
+  site-scoped Kagi queries (eBay, Marktplaats, Vinted, … — configurable) in
+  parallel and returns results grouped by platform
 
 **Out of scope (v1), doors left open:**
 - Purchasing / checkout automation of any kind
@@ -45,9 +51,11 @@ One Rust binary, no external services beyond the three APIs.
 | Module | Responsibility |
 |---|---|
 | `config.rs` | Load and validate `.env` values via `dotenvy`; parse `ALLOWED_TELEGRAM_USER_IDS` (comma-separated) into a set |
-| `bot.rs` | Teloxide dispatcher: allowlist filter, `/start`, `/help`, `/reset` commands, main text-message handler |
+| `bot.rs` | Teloxide dispatcher: allowlist filter, `/start`, `/help`, `/reset` commands, main text-message handler, photo handler with the draft-confirm state machine |
+| `vision.rs` | Download a Telegram photo, send it to MiniMax M3 as an image message, return a drafted search description |
 | `agent.rs` | Build the rig agent: MiniMax M3 through rig's OpenAI-compatible provider with base URL `https://api.minimax.io/v1`, model `minimax-m3`; product-research system prompt; tool registration |
 | `tools/kagi.rs` | `kagi_search` and `kagi_summarize` implementing rig's `Tool` trait as `reqwest` calls against the Kagi API |
+| `tools/secondhand.rs` | `search_secondhand`: concurrent site-scoped Kagi queries across the configured platforms, merged and grouped by platform |
 | `tools/purchases.rs` | `record_purchase` and `query_purchases` implementing rig's `Tool` trait on top of `store.rs` |
 | `tools/reminders.rs` | `create_reminder`, `list_reminders`, `cancel_reminder` implementing rig's `Tool` trait on top of `store.rs` |
 | `store.rs` | DuckDB access: open/create the database file, run migrations, insert/query purchases and reminders |
@@ -61,6 +69,8 @@ One Rust binary, no external services beyond the three APIs.
 - `KAGI_API_KEY`
 - `SCOUT_DB_PATH` — optional; path to the DuckDB file, default `scout.duckdb`
   in the working directory
+- `SECONDHAND_SITES` — optional; comma-separated domains for
+  `search_secondhand`, default `ebay.com,marktplaats.nl,vinted.com`
 
 Missing/malformed values fail fast at startup with a clear message.
 
@@ -136,6 +146,38 @@ If the Telegram send fails, `next_due` is left unchanged so the next tick
 retries. Reminders are plain messages — acting on one is just the user
 replying, which flows through the normal agent path.
 
+### Photo search
+
+MiniMax M3 is multimodal, so the same model handles vision — no separate
+service. Flow:
+
+1. User sends a photo → bot downloads the largest resolution via Telegram's
+   `getFile`, base64-encodes it as a data URL
+2. `vision.rs` sends it to M3 with a fixed prompt: "describe this product as
+   a concise web-search query (brand, model, distinguishing features)"
+3. Bot replies with the draft: "Looks like: ⟨draft⟩ — reply **go** to search,
+   or send a corrected description"
+4. The chat enters an `AwaitingConfirm(draft)` state (kept in the same
+   in-memory chat-state map). The next message either confirms (`go`, `ok`,
+   `yes` — case-insensitive) or *replaces* the draft with the user's text;
+   either way the resulting description then flows through the normal agent
+   path as if the user had typed it
+5. `/reset` (or a new photo) clears any pending draft
+
+An optional photo caption is passed to the vision prompt as context (e.g.
+"find this jacket but in blue").
+
+### Second-hand platform search
+
+`search_secondhand(query)` fans out one Kagi query per configured domain —
+`site:ebay.com ⟨query⟩`, `site:marktplaats.nl ⟨query⟩`, … — concurrently via
+`futures::join_all`, then returns results grouped by platform. Parallelism
+lives in the tool, not in the LLM's tool-calling behavior, so it is
+guaranteed. A platform whose query fails contributes an error note for that
+platform instead of failing the whole call. The domain list comes from
+`SECONDHAND_SITES`; each Kagi query counts against the API quota, so the
+default list stays short.
+
 ### System prompt (agent behavior)
 
 The agent acts as a product-research assistant: searches with `kagi_search`,
@@ -146,7 +188,9 @@ having bought something, it records it with `record_purchase`. On every
 find/buy request it calls `query_purchases` first and weaves relevant
 history into the reply — including noticing periodicity ("3rd time in ~3
 months"). When it spots a periodic purchase without a reminder, it offers to
-create one, calling `create_reminder` only after the user agrees.
+create one, calling `create_reminder` only after the user agrees. When the
+user wants used/second-hand items — or when second-hand is a sensible option
+for the product — it uses `search_secondhand` alongside `kagi_search`.
 
 ## Data flow
 
@@ -178,6 +222,10 @@ create one, calling `create_reminder` only after the user agrees.
 - Scheduler tests: due-reminder selection and `next_due` advancement against
   a temp-file DuckDB (the tick function takes "today" as a parameter so
   tests don't depend on the clock)
+- Photo-flow tests: `AwaitingConfirm` state transitions (confirm words,
+  replacement text, reset, new photo)
+- Second-hand tests: site-scoped query construction, per-platform grouping,
+  and one-platform-fails-others-succeed merging against `wiremock`
 - End-to-end with the real LLM loop: manual, once real keys are in `.env`
 
 ## Key dependencies

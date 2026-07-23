@@ -8,7 +8,10 @@ use rig::completion::{Chat, Message as LlmMessage};
 use std::sync::Arc;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, KeyboardButton, KeyboardMarkup, KeyboardRemove, ReplyMarkup};
+use teloxide::types::{
+    ChatAction, CopyTextButton, InlineKeyboardButton, InlineKeyboardButtonKind,
+    InlineKeyboardMarkup,
+};
 use teloxide::utils::command::BotCommands;
 
 pub struct App {
@@ -117,9 +120,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     let prompt = match resolution {
         DraftResolution::NoDraft => text,
         DraftResolution::Cancelled => {
-            bot.send_message(chat_id, "Okay, dropped it.")
-                .reply_markup(ReplyMarkup::KeyboardRemove(KeyboardRemove::new()))
-                .await?;
+            bot.send_message(chat_id, "Okay, dropped it.").await?;
             return Ok(());
         }
         DraftResolution::Confirmed(draft) | DraftResolution::Replaced(draft) => {
@@ -130,17 +131,14 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
     match run_agent(&app, user_id, chat_id.0, &prompt).await {
-        Ok(reply) => send_chunked(&bot, chat_id, &reply, had_draft).await?,
+        Ok(reply) => send_chunked(&bot, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "agent request failed");
-            let mut req = bot.send_message(
+            bot.send_message(
                 chat_id,
                 "Sorry, something went wrong on my side. Please try again.",
-            );
-            if had_draft {
-                req = req.reply_markup(ReplyMarkup::KeyboardRemove(KeyboardRemove::new()));
-            }
-            req.await?;
+            )
+            .await?;
         }
     }
     Ok(())
@@ -176,11 +174,11 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
             bot.send_message(
                 chat_id,
                 format!(
-                    "Looks like: {draft}\n\nTap Go to search, Cancel to drop it, \
-                     or send a corrected description."
+                    "Looks like: {draft}\n\nReply 'go' to search as-is, or tap the \
+                     button to copy the text, then paste, edit and send it."
                 ),
             )
-            .reply_markup(ReplyMarkup::Keyboard(draft_keyboard()))
+            .reply_markup(copy_draft_markup(&draft))
             .await?;
         }
         Err(e) => {
@@ -259,42 +257,29 @@ fn is_plain_user_text(msg: &LlmMessage) -> bool {
     )
 }
 
-/// The one-tap keyboard shown under a photo draft. One-time + resized so it
-/// collapses after use instead of covering the chat.
-fn draft_keyboard() -> KeyboardMarkup {
-    KeyboardMarkup::new(vec![vec![
-        KeyboardButton::new("Go"),
-        KeyboardButton::new("Cancel"),
-    ]])
-    .resize_keyboard()
-    .one_time_keyboard()
+/// Inline button under a photo draft: tapping copies the draft into the
+/// clipboard so the user can paste, edit and send it. Bot API caps
+/// copyable text at 256 chars.
+fn copy_draft_markup(draft: &str) -> InlineKeyboardMarkup {
+    let text: String = draft.chars().take(256).collect();
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::new(
+        "📋 Copy to edit",
+        InlineKeyboardButtonKind::CopyText(CopyTextButton { text }),
+    )]])
 }
 
-/// Send in <=4096-char chunks; each chunk gets one retry. `remove_keyboard`
-/// drops any reply keyboard (from a photo draft) with the first chunk.
-async fn send_chunked(
-    bot: &Bot,
-    chat_id: ChatId,
-    text: &str,
-    remove_keyboard: bool,
-) -> ResponseResult<()> {
+/// Send in <=4096-char chunks; each chunk gets one retry.
+async fn send_chunked(bot: &Bot, chat_id: ChatId, text: &str) -> ResponseResult<()> {
     let chunks = split_message(text, TELEGRAM_LIMIT);
     if chunks.is_empty() {
         bot.send_message(chat_id, "(no answer - please try again)").await?;
         return Ok(());
     }
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        let send = || {
-            let mut req = bot.send_message(chat_id, chunk.clone());
-            if remove_keyboard && i == 0 {
-                req = req.reply_markup(ReplyMarkup::KeyboardRemove(KeyboardRemove::new()));
-            }
-            req
-        };
-        if let Err(e) = send().await {
+    for chunk in chunks {
+        if let Err(e) = bot.send_message(chat_id, chunk.clone()).await {
             tracing::warn!(error = %e, "send failed, retrying once");
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            send().await?;
+            bot.send_message(chat_id, chunk).await?;
         }
     }
     Ok(())

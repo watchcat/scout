@@ -1,5 +1,6 @@
 use crate::agent::{LlmClient, MODEL};
-use anyhow::Result;
+use crate::text::strip_thinking;
+use anyhow::{bail, Result};
 use base64::prelude::{Engine, BASE64_STANDARD};
 use rig::client::CompletionClient;
 use rig::completion::message::Image;
@@ -31,5 +32,9 @@ pub async fn describe_photo(
         detail: Some(ImageDetail::High),
         ..Default::default()
     };
-    Ok(agent.prompt(image).await?.trim().to_string())
+    let draft = strip_thinking(&agent.prompt(image).await?);
+    if draft.is_empty() {
+        bail!("vision model returned no description besides thinking output");
+    }
+    Ok(draft)
 }

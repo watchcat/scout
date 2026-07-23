@@ -1,5 +1,32 @@
 pub const TELEGRAM_LIMIT: usize = 4096;
 
+/// Remove `<think>`/`<thinking>` blocks that reasoning models (MiniMax M3)
+/// sometimes emit inline in their output. An unclosed trailing block is
+/// dropped to the end of the string. Case-insensitive; result is trimmed.
+pub fn strip_thinking(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(start) = lower.find("<think") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        // Prefer the longer closer when both match at the same position
+        // ("</thinking>" contains "</think>" as a prefix).
+        let closer = ["</thinking>", "</think>"]
+            .iter()
+            .filter_map(|t| lower[start..].find(t).map(|i| (start + i, t.len())))
+            .min_by_key(|&(i, len)| (i, std::cmp::Reverse(len)));
+        match closer {
+            Some((i, len)) => rest = &rest[i + len..],
+            None => break, // unclosed block: drop the remainder
+        }
+    }
+    out.trim().to_string()
+}
+
 /// Split `text` into chunks of at most `limit` characters, preferring to cut
 /// at newlines, then spaces, so URLs and words stay intact.
 ///
@@ -35,6 +62,35 @@ pub fn split_message(text: &str, limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_thinking_removes_closed_blocks() {
+        assert_eq!(
+            strip_thinking("<think>hmm what is this</think>Alfa AWUS036ACHM wifi adapter"),
+            "Alfa AWUS036ACHM wifi adapter"
+        );
+        assert_eq!(
+            strip_thinking("<thinking>let me look</thinking>red bike<thinking>more</thinking> 26 inch"),
+            "red bike 26 inch"
+        );
+    }
+
+    #[test]
+    fn strip_thinking_prefers_matching_longer_closer() {
+        // "</thinking>" must be consumed whole, not just its "</think>" prefix.
+        assert_eq!(strip_thinking("<thinking>x</thinking>query"), "query");
+        assert!(!strip_thinking("<thinking>x</thinking>query").contains("ing>"));
+    }
+
+    #[test]
+    fn strip_thinking_drops_unclosed_trailing_block() {
+        assert_eq!(strip_thinking("good query <think>and then it ramble"), "good query");
+    }
+
+    #[test]
+    fn strip_thinking_leaves_plain_text_alone() {
+        assert_eq!(strip_thinking("  plain query  "), "plain query");
+    }
 
     #[test]
     fn short_text_is_one_chunk() {

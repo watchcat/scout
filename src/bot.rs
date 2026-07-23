@@ -1,7 +1,7 @@
 use crate::agent::{build_agent, AgentDeps, HISTORY_CAP};
 use crate::config::Config;
 use crate::draft::{resolve_draft, DraftResolution};
-use crate::text::{split_message, TELEGRAM_LIMIT};
+use crate::text::{split_message, strip_thinking, TELEGRAM_LIMIT};
 use crate::vision::describe_photo;
 use dashmap::DashMap;
 use rig::completion::{Chat, Message as LlmMessage};
@@ -220,7 +220,7 @@ async fn run_agent(
         .map(|c| c.history.clone())
         .unwrap_or_default();
 
-    let reply = agent.chat(prompt, &mut history).await?;
+    let reply = strip_thinking(&agent.chat(prompt, &mut history).await?);
 
     trim_history(&mut history, HISTORY_CAP);
     app.chats.entry(chat_id).or_default().history = history;

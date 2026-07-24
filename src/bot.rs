@@ -229,12 +229,19 @@ async fn handle_reaction(
     reaction: MessageReactionUpdated,
     app: Arc<App>,
 ) -> ResponseResult<()> {
+    tracing::info!(
+        chat_id = reaction.chat.id.0,
+        message_id = reaction.message_id.0,
+        new_reaction = ?reaction.new_reaction,
+        "reaction update received"
+    );
     let Some(user) = reaction.user() else { return Ok(()) };
     let user_id = user.id.0 as i64;
     if !app.cfg.allowed_user_ids.contains(&user_id) {
         return Ok(());
     }
     if !thumbs_up_added(&reaction.old_reaction, &reaction.new_reaction) {
+        tracing::debug!("not a newly added thumbs-up; ignoring");
         return Ok(());
     }
     let chat_id = reaction.chat.id;
@@ -243,7 +250,13 @@ async fn handle_reaction(
         .get(&chat_id.0)
         .and_then(|c| c.reply_text(reaction.message_id.0))
     else {
-        // Reacted to something we no longer (or never) tracked — stay quiet.
+        // Reacted to something we no longer (or never) tracked — stay quiet
+        // toward the user (the cache is in-memory, so replies from before the
+        // last restart can't be resolved).
+        tracing::info!(
+            message_id = reaction.message_id.0,
+            "thumbs-up on an untracked message (sent before last restart?); ignoring"
+        );
         return Ok(());
     };
 

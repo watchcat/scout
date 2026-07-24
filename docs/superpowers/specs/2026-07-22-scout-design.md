@@ -41,6 +41,11 @@ purchases themselves — the bot never buys anything.
   agent uses them instead of re-asking. `/reset` does not clear the profile.
   The `secondhand_sites` fact (comma-separated domains, normalized, max 8)
   overrides the configured default marketplace list per user.
+- Reaction-to-save: a 👍 reaction on a bot reply means "considering buying".
+  The bot keeps the last 30 replies it sent per chat in memory (reaction
+  updates carry only a message id); on a fresh 👍 from an allowlisted user it
+  feeds the reacted text back to the agent, which offers which product link
+  to save and records the purchase only after confirmation.
 
 **Out of scope (v1), doors left open:**
 - Purchasing / checkout automation of any kind

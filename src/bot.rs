@@ -8,9 +8,10 @@ use rig::completion::{Chat, Message as LlmMessage};
 use std::sync::Arc;
 use teloxide::net::Download;
 use teloxide::prelude::*;
+use std::collections::VecDeque;
 use teloxide::types::{
     ChatAction, CopyTextButton, InlineKeyboardButton, InlineKeyboardButtonKind,
-    InlineKeyboardMarkup,
+    InlineKeyboardMarkup, MessageReactionUpdated, ReactionType,
 };
 use teloxide::utils::command::BotCommands;
 
@@ -20,10 +21,32 @@ pub struct App {
     pub chats: DashMap<i64, ChatSession>,
 }
 
+/// How many of the bot's own recent replies to keep per chat so reactions
+/// (which carry only a message id) can be resolved back to their text.
+const SENT_REPLY_CAP: usize = 30;
+
 #[derive(Default)]
 pub struct ChatSession {
     pub history: Vec<LlmMessage>,
     pub pending_draft: Option<String>,
+    /// (message_id, text) of replies this bot sent, newest last.
+    pub sent_replies: VecDeque<(i32, String)>,
+}
+
+impl ChatSession {
+    pub fn remember_reply(&mut self, message_id: i32, text: &str) {
+        self.sent_replies.push_back((message_id, text.to_string()));
+        while self.sent_replies.len() > SENT_REPLY_CAP {
+            self.sent_replies.pop_front();
+        }
+    }
+
+    pub fn reply_text(&self, message_id: i32) -> Option<String> {
+        self.sent_replies
+            .iter()
+            .find(|(id, _)| *id == message_id)
+            .map(|(_, text)| text.clone())
+    }
 }
 
 #[derive(BotCommands, Clone)]
@@ -50,7 +73,7 @@ Commands:
 /help - this message";
 
 pub async fn run(bot: Bot, app: Arc<App>) {
-    let handler = Update::filter_message()
+    let messages = Update::filter_message()
         .filter(|msg: Message, app: Arc<App>| is_allowed(&app, &msg))
         .branch(
             dptree::entry()
@@ -63,6 +86,11 @@ pub async fn run(bot: Bot, app: Arc<App>) {
         .branch(
             dptree::filter(|msg: Message| msg.text().is_some()).endpoint(handle_text),
         );
+    // Adding this branch makes the dispatcher request message_reaction
+    // updates from Telegram automatically (allowed_updates hinting).
+    let handler = dptree::entry()
+        .branch(messages)
+        .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![app])
@@ -131,7 +159,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
     match run_agent(&app, user_id, chat_id.0, &prompt).await {
-        Ok(reply) => send_chunked(&bot, chat_id, &reply).await?,
+        Ok(reply) => send_chunked(&bot, &app, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "agent request failed");
             bot.send_message(
@@ -191,6 +219,59 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         }
     }
     Ok(())
+}
+
+/// A 👍 on one of the bot's replies means "I'm considering buying this" —
+/// resolve the reacted message's text and let the agent offer to save the
+/// right product to purchase memory.
+async fn handle_reaction(
+    bot: Bot,
+    reaction: MessageReactionUpdated,
+    app: Arc<App>,
+) -> ResponseResult<()> {
+    let Some(user) = reaction.user() else { return Ok(()) };
+    let user_id = user.id.0 as i64;
+    if !app.cfg.allowed_user_ids.contains(&user_id) {
+        return Ok(());
+    }
+    if !thumbs_up_added(&reaction.old_reaction, &reaction.new_reaction) {
+        return Ok(());
+    }
+    let chat_id = reaction.chat.id;
+    let Some(text) = app
+        .chats
+        .get(&chat_id.0)
+        .and_then(|c| c.reply_text(reaction.message_id.0))
+    else {
+        // Reacted to something we no longer (or never) tracked — stay quiet.
+        return Ok(());
+    };
+
+    let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+    let prompt = format!(
+        "[system note] The user reacted with a thumbs-up to this earlier reply \
+         of yours:\n---\n{text}\n---\nThat means they are considering buying \
+         one of the products in it. If the reply contains exactly one product, \
+         ask them to confirm saving it to purchase memory (confirm store and \
+         price while you're at it). If it contains several, list them as a \
+         short numbered list and ask which one to save. Do NOT call \
+         record_purchase until they confirm."
+    );
+    match run_agent(&app, user_id, chat_id.0, &prompt).await {
+        Ok(reply) => send_chunked(&bot, &app, chat_id, &reply).await?,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, "reaction follow-up failed");
+        }
+    }
+    Ok(())
+}
+
+fn thumbs_up_added(old: &[ReactionType], new: &[ReactionType]) -> bool {
+    let has_thumb = |rs: &[ReactionType]| {
+        rs.iter()
+            .any(|r| matches!(r, ReactionType::Emoji { emoji } if emoji == "👍"))
+    };
+    !has_thumb(old) && has_thumb(new)
 }
 
 /// Downloads a Telegram file by id into memory.
@@ -272,25 +353,67 @@ fn copy_draft_markup(draft: &str) -> InlineKeyboardMarkup {
     )]])
 }
 
-/// Send in <=4096-char chunks; each chunk gets one retry.
-async fn send_chunked(bot: &Bot, chat_id: ChatId, text: &str) -> ResponseResult<()> {
+/// Send in <=4096-char chunks; each chunk gets one retry. Sent chunks are
+/// remembered per chat so a later reaction on one can be resolved to its
+/// text.
+async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> ResponseResult<()> {
     let chunks = split_message(text, TELEGRAM_LIMIT);
     if chunks.is_empty() {
         bot.send_message(chat_id, "(no answer - please try again)").await?;
         return Ok(());
     }
     for chunk in chunks {
-        if let Err(e) = bot.send_message(chat_id, chunk.clone()).await {
-            tracing::warn!(error = %e, "send failed, retrying once");
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            bot.send_message(chat_id, chunk).await?;
-        }
+        let sent = match bot.send_message(chat_id, chunk.clone()).await {
+            Ok(sent) => sent,
+            Err(e) => {
+                tracing::warn!(error = %e, "send failed, retrying once");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                bot.send_message(chat_id, chunk.clone()).await?
+            }
+        };
+        app.chats
+            .entry(chat_id.0)
+            .or_default()
+            .remember_reply(sent.id.0, &chunk);
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{thumbs_up_added, ChatSession, SENT_REPLY_CAP};
+    use teloxide::types::ReactionType;
+
+    fn thumb() -> ReactionType {
+        ReactionType::Emoji { emoji: "👍".to_string() }
+    }
+
+    fn heart() -> ReactionType {
+        ReactionType::Emoji { emoji: "❤".to_string() }
+    }
+
+    #[test]
+    fn thumbs_up_detection_only_fires_on_newly_added_thumb() {
+        assert!(thumbs_up_added(&[], &[thumb()]));
+        assert!(thumbs_up_added(&[heart()], &[heart(), thumb()]));
+        // removing, unrelated reactions, or pre-existing thumb: no trigger
+        assert!(!thumbs_up_added(&[thumb()], &[]));
+        assert!(!thumbs_up_added(&[], &[heart()]));
+        assert!(!thumbs_up_added(&[thumb()], &[thumb(), heart()]));
+    }
+
+    #[test]
+    fn reply_cache_resolves_and_caps() {
+        let mut session = ChatSession::default();
+        for i in 0..(SENT_REPLY_CAP as i32 + 5) {
+            session.remember_reply(i, &format!("reply {i}"));
+        }
+        assert_eq!(session.sent_replies.len(), SENT_REPLY_CAP);
+        // oldest evicted, newest resolvable
+        assert_eq!(session.reply_text(0), None);
+        assert_eq!(session.reply_text(34), Some("reply 34".to_string()));
+    }
+
     use super::*;
     use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
     use rig::message::ToolCall;

@@ -4,7 +4,7 @@ use crate::tools::kagi::{KagiClient, KagiSearchTool};
 use crate::tools::memory::{ForgetFactTool, RememberFactTool};
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
-use crate::tools::secondhand::SecondhandSearchTool;
+use crate::tools::secondhand::{effective_sites, SecondhandSearchTool};
 use anyhow::Result;
 use rig::client::CompletionClient;
 use rig::providers::openai;
@@ -52,6 +52,12 @@ it with remember_fact using a short snake_case key. Update it the same way \
 when it changes; use forget_fact when a stored fact is wrong or the user asks \
 you to forget it. The profile is shown below, so answer 'what do you know \
 about me?' directly from it.
+- The second-hand marketplaces searched for this user come from the \
+secondhand_sites profile fact: a comma-separated domain list, e.g. \
+'ebay.com,vinted.nl,marktplaats.nl' (max 8). When the user asks to add or \
+remove a marketplace, save the FULL updated list with remember_fact under \
+that key; forget_fact restores the default list. List changes take effect \
+from the user's next message.
 - Reply in plain text without markdown formatting. Put URLs on their own lines. \
 Keep replies compact - this is a chat.";
 
@@ -105,7 +111,7 @@ pub fn build_agent(
         .tool(FetchPageTool { http: d.http.clone() })
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
-            sites: d.secondhand_sites.clone(),
+            sites: effective_sites(facts, &d.secondhand_sites),
         })
         .tool(RecordPurchaseTool { store: d.store.clone(), user_id })
         .tool(QueryPurchasesTool { store: d.store.clone(), user_id })

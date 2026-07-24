@@ -39,6 +39,8 @@ purchases themselves — the bot never buys anything.
   `remember_fact` and removes them via `forget_fact`; on every request the
   user's facts are injected into the system prompt (capped at 50), so the
   agent uses them instead of re-asking. `/reset` does not clear the profile.
+  The `secondhand_sites` fact (comma-separated domains, normalized, max 8)
+  overrides the configured default marketplace list per user.
 
 **Out of scope (v1), doors left open:**
 - Purchasing / checkout automation of any kind

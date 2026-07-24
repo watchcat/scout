@@ -12,6 +12,48 @@ pub struct PlatformResults {
     pub error: Option<String>,
 }
 
+/// Profile fact key holding a user's personal marketplace list.
+pub const SITES_FACT_KEY: &str = "secondhand_sites";
+/// Each site costs one Kagi query per search; keep the fan-out bounded.
+const MAX_SITES: usize = 8;
+
+/// The marketplace list to search for this user: their `secondhand_sites`
+/// profile fact when present (comma-separated domains), else the configured
+/// default.
+pub fn effective_sites(facts: &[(String, String)], default: &[String]) -> Vec<String> {
+    facts
+        .iter()
+        .find(|(k, _)| k == SITES_FACT_KEY)
+        .map(|(_, v)| parse_sites(v))
+        .filter(|sites| !sites.is_empty())
+        .unwrap_or_else(|| default.to_vec())
+}
+
+/// Normalize a comma/whitespace-separated domain list: strip scheme, `www.`
+/// and paths, lowercase, dedupe, cap at MAX_SITES.
+pub fn parse_sites(value: &str) -> Vec<String> {
+    let mut sites = Vec::new();
+    for raw in value.split([',', ' ', '\n']) {
+        let site = raw
+            .trim()
+            .to_lowercase()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("www.")
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if !site.is_empty() && site.contains('.') && !sites.contains(&site) {
+            sites.push(site);
+            if sites.len() >= MAX_SITES {
+                break;
+            }
+        }
+    }
+    sites
+}
+
 pub struct SecondhandSearchTool {
     pub client: KagiClient,
     pub sites: Vec<String>,
@@ -64,6 +106,34 @@ impl Tool for SecondhandSearchTool {
 
 #[cfg(test)]
 mod tests {
+    use super::{effective_sites, parse_sites, SITES_FACT_KEY};
+
+    #[test]
+    fn parse_sites_normalizes_and_dedupes() {
+        assert_eq!(
+            parse_sites("https://www.eBay.com/sch/x, vinted.nl , ebay.com\nmarktplaats.nl"),
+            vec!["ebay.com", "vinted.nl", "marktplaats.nl"]
+        );
+        assert!(parse_sites("not-a-domain, ,").is_empty());
+    }
+
+    #[test]
+    fn parse_sites_caps_the_list() {
+        let many = (0..20).map(|i| format!("site{i}.com")).collect::<Vec<_>>().join(",");
+        assert_eq!(parse_sites(&many).len(), 8);
+    }
+
+    #[test]
+    fn effective_sites_prefers_valid_fact_over_default() {
+        let default = vec!["ebay.com".to_string()];
+        let facts = vec![(SITES_FACT_KEY.to_string(), "vinted.pl, allegro.pl".to_string())];
+        assert_eq!(effective_sites(&facts, &default), vec!["vinted.pl", "allegro.pl"]);
+        // no fact, or a fact that parses to nothing → default
+        assert_eq!(effective_sites(&[], &default), default);
+        let junk = vec![(SITES_FACT_KEY.to_string(), "garbage".to_string())];
+        assert_eq!(effective_sites(&junk, &default), default);
+    }
+
     use super::*;
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};

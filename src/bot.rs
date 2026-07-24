@@ -213,7 +213,11 @@ async fn run_agent(
     chat_id: i64,
     prompt: &str,
 ) -> anyhow::Result<String> {
-    let agent = build_agent(&app.deps, user_id, chat_id);
+    let facts = {
+        let store = app.deps.store.clone();
+        tokio::task::spawn_blocking(move || store.list_facts(user_id)).await??
+    };
+    let agent = build_agent(&app.deps, user_id, chat_id, &facts);
     let mut history = app
         .chats
         .get(&chat_id)

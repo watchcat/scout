@@ -33,6 +33,12 @@ purchases themselves — the bot never buys anything.
 - Second-hand platform search: a `search_secondhand` tool fans out
   site-scoped Kagi queries (eBay, Marktplaats, Vinted, … — configurable) in
   parallel and returns results grouped by platform
+- User profile memory: durable facts (delivery country, sizes, budget style,
+  …) stored per Telegram user in DuckDB (`user_facts`: user_id, key, value,
+  updated_at; upsert on (user_id, key)). The agent saves facts via
+  `remember_fact` and removes them via `forget_fact`; on every request the
+  user's facts are injected into the system prompt (capped at 50), so the
+  agent uses them instead of re-asking. `/reset` does not clear the profile.
 
 **Out of scope (v1), doors left open:**
 - Purchasing / checkout automation of any kind
@@ -58,6 +64,7 @@ One Rust binary, no external services beyond the three APIs.
 | `tools/secondhand.rs` | `search_secondhand`: concurrent site-scoped Kagi queries across the configured platforms, merged and grouped by platform |
 | `tools/purchases.rs` | `record_purchase` and `query_purchases` implementing rig's `Tool` trait on top of `store.rs` |
 | `tools/reminders.rs` | `create_reminder`, `list_reminders`, `cancel_reminder` implementing rig's `Tool` trait on top of `store.rs` |
+| `tools/memory.rs` | `remember_fact` and `forget_fact` for the per-user profile; reads are injected into the prompt, not a tool |
 | `store.rs` | DuckDB access: open/create the database file, run migrations, insert/query purchases and reminders |
 | `scheduler.rs` | Background tokio task: every 15 minutes, fetch due reminders, send the Telegram message, advance `next_due` |
 

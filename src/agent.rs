@@ -1,6 +1,7 @@
 use crate::store::Store;
 use crate::tools::fetch::FetchPageTool;
 use crate::tools::kagi::{KagiClient, KagiSearchTool};
+use crate::tools::memory::{ForgetFactTool, RememberFactTool};
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
 use crate::tools::secondhand::SecondhandSearchTool;
@@ -43,7 +44,14 @@ surface direct product pages more often.
 you present. At most 5 options, best first. If you genuinely could not reach a \
 direct product page, say so explicitly rather than passing off a listing URL.
 - If key criteria are missing (budget, country for shipping, size, must-have \
-features), ask before searching.
+features), ask before searching — but NEVER ask for something already listed \
+in the user profile below; use the stored value.
+- When the user reveals a durable fact about themselves (delivery country, \
+sizes, budget style, favourite shops or brands, second-hand preference), save \
+it with remember_fact using a short snake_case key. Update it the same way \
+when it changes; use forget_fact when a stored fact is wrong or the user asks \
+you to forget it. The profile is shown below, so answer 'what do you know \
+about me?' directly from it.
 - Reply in plain text without markdown formatting. Put URLs on their own lines. \
 Keep replies compact - this is a chat.";
 
@@ -65,16 +73,34 @@ pub struct AgentDeps {
     pub secondhand_sites: Vec<String>,
 }
 
+/// Cap on injected profile facts, bounding prompt growth.
+const MAX_PROFILE_FACTS: usize = 50;
+
+/// The system prompt plus the user's long-term profile. Injecting facts here
+/// (instead of behind a recall tool) means the agent can never forget to
+/// check them.
+pub fn preamble_with_profile(facts: &[(String, String)]) -> String {
+    let mut p = PREAMBLE.to_string();
+    if !facts.is_empty() {
+        p.push_str("\n\nKnown about this user (long-term profile):\n");
+        for (key, value) in facts.iter().take(MAX_PROFILE_FACTS) {
+            p.push_str(&format!("- {key}: {value}\n"));
+        }
+    }
+    p
+}
+
 /// Built per incoming message: tools capture the requesting user's identity,
 /// so the LLM never sees or chooses user ids.
 pub fn build_agent(
     d: &AgentDeps,
     user_id: i64,
     chat_id: i64,
+    facts: &[(String, String)],
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     d.llm
         .agent(MODEL)
-        .preamble(PREAMBLE)
+        .preamble(&preamble_with_profile(facts))
         .tool(KagiSearchTool(d.kagi.clone()))
         .tool(FetchPageTool { http: d.http.clone() })
         .tool(SecondhandSearchTool {
@@ -86,6 +112,28 @@ pub fn build_agent(
         .tool(CreateReminderTool { store: d.store.clone(), user_id, chat_id })
         .tool(ListRemindersTool { store: d.store.clone(), user_id })
         .tool(CancelReminderTool { store: d.store.clone(), user_id })
+        .tool(RememberFactTool { store: d.store.clone(), user_id })
+        .tool(ForgetFactTool { store: d.store.clone(), user_id })
         .default_max_turns(MAX_TURNS)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_is_appended_when_present() {
+        let plain = preamble_with_profile(&[]);
+        assert_eq!(plain, PREAMBLE);
+
+        let facts = vec![
+            ("delivery_country".to_string(), "NL".to_string()),
+            ("shoe_size".to_string(), "44".to_string()),
+        ];
+        let with = preamble_with_profile(&facts);
+        assert!(with.starts_with(PREAMBLE));
+        assert!(with.contains("- delivery_country: NL"));
+        assert!(with.contains("- shoe_size: 44"));
+    }
 }

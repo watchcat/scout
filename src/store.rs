@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS reminders (
     active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
+CREATE TABLE IF NOT EXISTS user_facts (
+    user_id BIGINT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (user_id, key)
+);
 "#;
 
 /// A purchase as the agent sees it. `purchased_at` is an ISO `YYYY-MM-DD`
@@ -207,6 +214,37 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Insert or overwrite one user-profile fact.
+    pub fn upsert_fact(&self, user_id: i64, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_facts (user_id, key, value) VALUES (?, ?, ?)
+             ON CONFLICT (user_id, key)
+             DO UPDATE SET value = excluded.value, updated_at = now()",
+            params![user_id, key, value],
+        )?;
+        Ok(())
+    }
+
+    /// One user's profile facts as (key, value), sorted by key.
+    pub fn list_facts(&self, user_id: i64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM user_facts WHERE user_id = ? ORDER BY key ASC")?;
+        let rows = stmt.query_map(params![user_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Returns true if the fact existed and was removed.
+    pub fn forget_fact(&self, user_id: i64, key: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM user_facts WHERE user_id = ? AND key = ?",
+            params![user_id, key],
+        )?;
+        Ok(n > 0)
+    }
 }
 
 fn row_to_purchase(row: &Row) -> duckdb::Result<Purchase> {
@@ -353,5 +391,39 @@ mod tests {
         s.set_next_due(r.id, "2026-08-01").unwrap();
         assert!(s.due_reminders("2026-07-22").unwrap().is_empty());
         assert_eq!(s.list_reminders(1).unwrap()[0].next_due, "2026-08-01");
+    }
+
+    #[test]
+    fn facts_upsert_overwrites_and_lists_sorted() {
+        let (s, _d) = test_store();
+        s.upsert_fact(1, "shoe_size", "43").unwrap();
+        s.upsert_fact(1, "delivery_country", "NL").unwrap();
+        s.upsert_fact(1, "shoe_size", "44").unwrap();
+
+        assert_eq!(
+            s.list_facts(1).unwrap(),
+            vec![
+                ("delivery_country".to_string(), "NL".to_string()),
+                ("shoe_size".to_string(), "44".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn facts_are_scoped_per_user() {
+        let (s, _d) = test_store();
+        s.upsert_fact(1, "delivery_country", "NL").unwrap();
+        assert!(s.list_facts(2).unwrap().is_empty());
+        assert!(!s.forget_fact(2, "delivery_country").unwrap());
+        assert_eq!(s.list_facts(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forget_fact_removes_and_reports() {
+        let (s, _d) = test_store();
+        s.upsert_fact(1, "budget_style", "prefers cheap used gear").unwrap();
+        assert!(s.forget_fact(1, "budget_style").unwrap());
+        assert!(!s.forget_fact(1, "budget_style").unwrap());
+        assert!(s.list_facts(1).unwrap().is_empty());
     }
 }

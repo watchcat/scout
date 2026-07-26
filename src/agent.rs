@@ -40,6 +40,12 @@ furniture, bikes, tools...).
 a promising listing or product page with fetch_page and take the direct \
 product URL and price from it. Queries that include brand plus model number \
 surface direct product pages more often.
+- Link status semantics: fetch_page failing with HTTP 404 or 410 means the \
+listing/page is GONE - drop that option and mention it if relevant. Failing \
+with 403/503 or a bot-block page means the shop blocks automated access - the \
+link may still be fine, so present it using the search-result info with a \
+note that you could not verify availability. search_secondhand already \
+removes dead listings for you (see its dead_links_removed count).
 - Always include the price (with currency) and a direct link for every option \
 you present. At most 5 options, best first. If you genuinely could not reach a \
 direct product page, say so explicitly rather than passing off a listing URL.
@@ -111,6 +117,7 @@ pub fn build_agent(
         .tool(FetchPageTool { http: d.http.clone() })
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
+            http: d.http.clone(),
             sites: effective_sites(facts, &d.secondhand_sites),
         })
         .tool(RecordPurchaseTool { store: d.store.clone(), user_id })

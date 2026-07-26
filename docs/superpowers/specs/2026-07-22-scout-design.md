@@ -32,7 +32,11 @@ purchases themselves — the bot never buys anything.
   confirms it before any search runs
 - Second-hand platform search: a `search_secondhand` tool fans out
   site-scoped Kagi queries (eBay, Marktplaats, Vinted, … — configurable) in
-  parallel and returns results grouped by platform
+  parallel and returns results grouped by platform. Every hit's link is
+  probed concurrently; listings answering 404/410 (deleted/sold) are dropped
+  before reaching the model (`dead_links_removed` reports the count).
+  Bot-walls (403/503) and network errors are treated as "can't verify", not
+  "gone" — big retailers like Amazon block plain HTTP clients.
 - User profile memory: durable facts (delivery country, sizes, budget style,
   …) stored per Telegram user in DuckDB (`user_facts`: user_id, key, value,
   updated_at; upsert on (user_id, key)). The agent saves facts via

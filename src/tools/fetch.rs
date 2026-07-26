@@ -3,6 +3,9 @@ use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+/// UA sent with all page requests (fetch_page and link verification).
+pub(crate) const BOT_USER_AGENT: &str = "Mozilla/5.0 (compatible; ScoutBot/0.1)";
+
 /// Readable-text cap: enough for a product/listing page's useful content
 /// without flooding the model context.
 const MAX_TEXT_CHARS: usize = 6000;
@@ -76,7 +79,7 @@ impl Tool for FetchPageTool {
         let resp = self
             .http
             .get(url.clone())
-            .header("User-Agent", "Mozilla/5.0 (compatible; ScoutBot/0.1)")
+            .header("User-Agent", BOT_USER_AGENT)
             .send()
             .await?;
         let status = resp.status();

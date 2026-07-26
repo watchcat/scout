@@ -67,12 +67,7 @@ pub struct SecondhandSearchTool {
 /// (404/410 — e.g. a deleted Marktplaats listing answers 410). Bot walls
 /// (403/503) and network errors are NOT dead: we just can't verify those.
 async fn is_dead_link(http: &reqwest::Client, url: &str) -> bool {
-    match http
-        .get(url)
-        .header("User-Agent", super::fetch::BOT_USER_AGENT)
-        .send()
-        .await
-    {
+    match super::fetch::browser_get(http, url).send().await {
         Ok(resp) => matches!(resp.status().as_u16(), 404 | 410),
         Err(_) => false,
     }

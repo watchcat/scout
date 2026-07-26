@@ -3,8 +3,23 @@ use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// UA sent with all page requests (fetch_page and link verification).
-pub(crate) const BOT_USER_AGENT: &str = "Mozilla/5.0 (compatible; ScoutBot/0.1)";
+/// Headers for all page requests (fetch_page and link verification). A real
+/// browser UA matters: e.g. Amazon serves full product pages to it but a
+/// 503 bot-wall to bot-styled UAs — this is a personal assistant fetching a
+/// handful of public pages, not bulk scraping.
+pub(crate) const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// GET with browser-like headers; shared by fetch_page and link probing.
+pub(crate) fn browser_get(http: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    http.get(url)
+        .header("User-Agent", BROWSER_USER_AGENT)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "en-US,en;q=0.9,nl;q=0.8")
+}
 
 /// Readable-text cap: enough for a product/listing page's useful content
 /// without flooding the model context.
@@ -76,12 +91,7 @@ impl Tool for FetchPageTool {
                 url.scheme()
             )));
         }
-        let resp = self
-            .http
-            .get(url.clone())
-            .header("User-Agent", BOT_USER_AGENT)
-            .send()
-            .await?;
+        let resp = browser_get(&self.http, url.clone()).send().await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(FetchError::Invalid(format!("page returned HTTP {status}")));

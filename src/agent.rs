@@ -11,10 +11,11 @@ use rig::providers::openai;
 
 pub const MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 pub const MODEL: &str = "minimax-m3";
-/// Cap on model calls per request so a confused agent can't burn credits. 8
-/// leaves headroom for the mandated query_purchases -> search -> secondhand
-/// -> summarize -> answer flow.
-pub const MAX_TURNS: usize = 8;
+/// Cap on model calls per request so a confused agent can't burn credits.
+/// The full flow (query_purchases -> search -> secondhand -> a few
+/// fetch_page opens -> answer) legitimately needs ~10; 12 leaves headroom
+/// while still bounding a runaway loop.
+pub const MAX_TURNS: usize = 12;
 /// Conversation history cap per chat (messages, not exchanges).
 pub const HISTORY_CAP: usize = 20;
 
@@ -40,6 +41,9 @@ furniture, bikes, tools...).
 a promising listing or product page with fetch_page and take the direct \
 product URL and price from it. Queries that include brand plus model number \
 surface direct product pages more often.
+- Budget your steps: open at most 3 pages with fetch_page per request, \
+picking the most promising candidates. Prefer answering with what you have \
+over exhaustively verifying everything.
 - Link status semantics: fetch_page failing with HTTP 404 or 410 means the \
 listing/page is GONE - drop that option and mention it if relevant. Failing \
 with 403/503 or a bot-block page means the shop blocks automated access - the \

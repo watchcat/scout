@@ -162,14 +162,22 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         Ok(reply) => send_chunked(&bot, &app, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "agent request failed");
-            bot.send_message(
-                chat_id,
-                "Sorry, something went wrong on my side. Please try again.",
-            )
-            .await?;
+            bot.send_message(chat_id, agent_error_message(&e)).await?;
         }
     }
     Ok(())
+}
+
+/// Turn an agent failure into a user-facing message; the max-turns budget
+/// gets an actionable explanation instead of the generic apology.
+fn agent_error_message(e: &anyhow::Error) -> &'static str {
+    if e.to_string().contains("max turns") {
+        "That request needed more research steps than I allow per message. \
+         Try narrowing it (a more specific product, or fewer platforms), or \
+         ask me to continue from where I stopped."
+    } else {
+        "Sorry, something went wrong on my side. Please try again."
+    }
 }
 
 async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {

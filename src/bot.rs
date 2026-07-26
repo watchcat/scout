@@ -25,12 +25,55 @@ pub struct App {
 /// (which carry only a message id) can be resolved back to their text.
 const SENT_REPLY_CAP: usize = 30;
 
+/// A chat quiet for longer than this starts a fresh session on the next
+/// message; for text messages an LLM check may restore the old context if
+/// the new message continues the same topic.
+const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 #[derive(Default)]
 pub struct ChatSession {
     pub history: Vec<LlmMessage>,
     pub pending_draft: Option<String>,
     /// (message_id, text) of replies this bot sent, newest last.
     pub sent_replies: VecDeque<(i32, String)>,
+    /// When this chat last had activity; None until the first message.
+    pub last_seen: Option<std::time::Instant>,
+}
+
+/// True when the gap since `last_seen` exceeds the session TTL.
+fn session_expired(last_seen: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_seen.is_some_and(|t| now.duration_since(t) > SESSION_TTL)
+}
+
+/// The last `n` plain-text messages of a history, rendered as
+/// "user:/assistant:" lines for the continuation classifier.
+fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
+    let mut lines: Vec<String> = history
+        .iter()
+        .rev()
+        .filter_map(|m| match m {
+            LlmMessage::User { content } => content
+                .iter()
+                .filter_map(|c| match c {
+                    rig::message::UserContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .reduce(|a, b| format!("{a}\n{b}"))
+                .map(|t| format!("user: {t}")),
+            LlmMessage::Assistant { content, .. } => content
+                .iter()
+                .filter_map(|c| match c {
+                    rig::message::AssistantContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .reduce(|a, b| format!("{a}\n{b}"))
+                .map(|t| format!("assistant: {t}")),
+            _ => None,
+        })
+        .take(n)
+        .collect();
+    lines.reverse();
+    lines.join("\n")
 }
 
 impl ChatSession {
@@ -68,8 +111,11 @@ Send a photo of a product and I'll draft a search from it.
 Tell me when you bought something and I'll remember where and for how much.
 I can remind you when it's time to reorder things you buy regularly.
 
+After 10 quiet minutes I start a fresh conversation automatically (I'll pick
+the old one back up if you're clearly continuing the same topic).
+
 Commands:
-/reset - forget this conversation
+/reset - forget this conversation right now
 /help - this message";
 
 pub async fn run(bot: Bot, app: Arc<App>) {
@@ -134,6 +180,37 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     let chat_id = msg.chat.id;
     let Some(user_id) = sender_id(&msg) else { return Ok(()) };
 
+    // Session expiry: after a long gap the old context is set aside; a quick
+    // LLM check restores it when the new message continues the same topic.
+    let stale_history = {
+        let mut chat = app.chats.entry(chat_id.0).or_default();
+        let now = std::time::Instant::now();
+        let expired = session_expired(chat.last_seen, now) && !chat.history.is_empty();
+        chat.last_seen = Some(now);
+        if expired {
+            chat.pending_draft = None;
+            Some(std::mem::take(&mut chat.history))
+        } else {
+            None
+        }
+    };
+    if let Some(old_history) = stale_history {
+        let excerpt = last_messages_text(&old_history, 6);
+        match crate::agent::continues_previous(&app.deps.llm, &excerpt, &text).await {
+            Ok(true) => {
+                tracing::info!(chat_id = chat_id.0, "session expired but topic continues; restoring context");
+                app.chats.entry(chat_id.0).or_default().history = old_history;
+            }
+            Ok(false) => {
+                tracing::info!(chat_id = chat_id.0, "session expired; starting fresh");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, chat_id = chat_id.0,
+                    "continuation check failed; starting fresh");
+            }
+        }
+    }
+
     let pending = app
         .chats
         .get(&chat_id.0)
@@ -182,7 +259,16 @@ fn agent_error_message(e: &anyhow::Error) -> &'static str {
 
 async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
-    if let Some(mut chat) = app.chats.get_mut(&chat_id.0) {
+    {
+        // A photo after a long gap always starts fresh (no continuation
+        // check — a new photo is a new product hunt), and any stale draft
+        // is dropped either way.
+        let mut chat = app.chats.entry(chat_id.0).or_default();
+        let now = std::time::Instant::now();
+        if session_expired(chat.last_seen, now) {
+            chat.history.clear();
+        }
+        chat.last_seen = Some(now);
         chat.pending_draft = None;
     }
     // Sizes are ordered smallest to largest; take the largest.
@@ -421,6 +507,32 @@ mod tests {
         assert!(!thumbs_up_added(&[thumb()], &[]));
         assert!(!thumbs_up_added(&[], &[heart()]));
         assert!(!thumbs_up_added(&[thumb()], &[thumb(), heart()]));
+    }
+
+    #[test]
+    fn session_expiry_boundary() {
+        use super::{session_expired, SESSION_TTL};
+        use std::time::Instant;
+        let now = Instant::now();
+        assert!(!session_expired(None, now), "first contact is never stale");
+        assert!(!session_expired(Some(now - SESSION_TTL / 2), now));
+        assert!(session_expired(
+            Some(now - SESSION_TTL - std::time::Duration::from_secs(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn last_messages_text_renders_roles_and_takes_tail() {
+        use super::last_messages_text;
+        let history = vec![
+            user_text("oldest question"),
+            assistant_text("oldest answer"),
+            user_text("find me a bike"),
+            assistant_text("here are 3 bikes"),
+        ];
+        let excerpt = last_messages_text(&history, 2);
+        assert_eq!(excerpt, "user: find me a bike\nassistant: here are 3 bikes");
     }
 
     #[test]

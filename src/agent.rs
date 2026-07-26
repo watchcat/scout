@@ -89,6 +89,31 @@ pub struct AgentDeps {
     pub secondhand_sites: Vec<String>,
 }
 
+/// One-shot classifier used when a chat resumes after the session TTL: does
+/// the new message continue the previous conversation, or start a new
+/// request? Errors should be treated as "new" by the caller (fresh session
+/// is the safe default).
+pub async fn continues_previous(
+    llm: &LlmClient,
+    previous_excerpt: &str,
+    new_message: &str,
+) -> Result<bool> {
+    let agent = llm
+        .agent(MODEL)
+        .preamble(
+            "You judge whether a new chat message continues the previous \
+             conversation or starts an unrelated new request. Reply with \
+             exactly one word: CONTINUE or NEW.",
+        )
+        .build();
+    let question = format!(
+        "Previous conversation (latest excerpts):\n{previous_excerpt}\n\n\
+         New message:\n{new_message}\n\nCONTINUE or NEW?"
+    );
+    let verdict = crate::text::strip_thinking(&rig::completion::Prompt::prompt(&agent, question).await?);
+    Ok(verdict.to_uppercase().contains("CONTINUE"))
+}
+
 /// Cap on injected profile facts, bounding prompt growth.
 const MAX_PROFILE_FACTS: usize = 50;
 

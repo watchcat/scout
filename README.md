@@ -19,6 +19,8 @@ DuckDB for purchase memory.
   list), queried in parallel; dead listings (404/410) are filtered out
 - Live eBay data via the official Browse API when `EBAY_CLIENT_ID`/`SECRET`
   are set: real prices, condition and availability instead of search snippets
+- Live Marktplaats data via the site's public search JSON (no keys needed):
+  prices with bid-vs-fixed labeling, seller city, direct listing links
 - Purchase memory: "where did I buy X last time?" — plus 👍 a suggestion to
   save it as a purchase
 - Per-user profile memory (delivery country, sizes, preferred marketplaces)

@@ -11,12 +11,21 @@ DuckDB for purchase memory.
 
 ## Features
 
-- Conversational product search with follow-up refinement
-- Photo search: send a product photo, confirm/edit the drafted query, search
-- Second-hand search across eBay/Marktplaats/Vinted (configurable), queried
-  in parallel
-- Purchase memory: "where did I buy X last time?"
+- Conversational product search with follow-up refinement; opens product
+  pages to extract direct links and prices instead of listing-page URLs
+- Photo search: send a product photo, confirm/edit the drafted query
+  (one-tap copy button), search
+- Second-hand search across eBay/Marktplaats/Vinted (per-user configurable
+  list), queried in parallel; dead listings (404/410) are filtered out
+- Live eBay data via the official Browse API when `EBAY_CLIENT_ID`/`SECRET`
+  are set: real prices, condition and availability instead of search snippets
+- Purchase memory: "where did I buy X last time?" — plus 👍 a suggestion to
+  save it as a purchase
+- Per-user profile memory (delivery country, sizes, preferred marketplaces)
+  injected into every request, so the bot stops re-asking
 - Reorder reminders for periodic purchases, delivered in Telegram
+- Sessions auto-reset after 10 idle minutes, with LLM-checked restore when
+  you continue the same topic
 
 Note: page summarization (Kagi Universal Summarizer) is temporarily removed —
 Kagi's v1 API doesn't offer it yet; it returns when they ship it.

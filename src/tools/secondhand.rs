@@ -1,5 +1,6 @@
 use super::ebay::EbayClient;
 use super::kagi::{KagiClient, SearchArgs, SearchResult};
+use super::marktplaats::MarktplaatsClient;
 use rig::tool::Tool;
 use serde::Serialize;
 use serde_json::json;
@@ -64,6 +65,9 @@ pub struct SecondhandSearchTool {
     /// When configured, eBay sites are queried through the official Browse
     /// API (live price/condition/availability) instead of Kagi + probing.
     pub ebay: Option<EbayClient>,
+    /// Marktplaats sites use the site's own public search JSON (no auth);
+    /// on failure the platform reports an error like any other.
+    pub marktplaats: MarktplaatsClient,
     pub sites: Vec<String>,
 }
 
@@ -107,10 +111,46 @@ impl Tool for SecondhandSearchTool {
             let client = self.client.clone();
             let http = self.http.clone();
             let ebay = self.ebay.clone();
+            let marktplaats = self.marktplaats.clone();
             let site = site.clone();
             let raw_query = args.query.clone();
             let query = format!("site:{site} {}", args.query);
             async move {
+                // Marktplaats via the site's own search JSON: live listings
+                // with prices; results link straight to link.marktplaats.nl.
+                if site.split('.').next() == Some("marktplaats") {
+                    return match marktplaats.search(&raw_query, 5).await {
+                        Ok(items) => PlatformResults {
+                            platform: site,
+                            results: items
+                                .into_iter()
+                                .map(|i| SearchResult {
+                                    title: i.title,
+                                    url: i.url,
+                                    snippet: {
+                                        let mut parts: Vec<String> = Vec::new();
+                                        if let Some(p) = i.price {
+                                            parts.push(p);
+                                        }
+                                        if let Some(c) = i.city {
+                                            parts.push(c);
+                                        }
+                                        parts.push("live Marktplaats listing".to_string());
+                                        parts.join(" · ")
+                                    },
+                                })
+                                .collect(),
+                            dead_links_removed: 0,
+                            error: None,
+                        },
+                        Err(e) => PlatformResults {
+                            platform: site,
+                            results: Vec::new(),
+                            dead_links_removed: 0,
+                            error: Some(e.to_string()),
+                        },
+                    };
+                }
                 // eBay via the official API when configured: live data, no
                 // probing needed (their site 403s plain HTTP clients anyway).
                 if let Some(ebay) = ebay.filter(|_| site == "ebay" || site.split('.').next() == Some("ebay")) {
@@ -220,6 +260,7 @@ mod tests {
             ),
             http: reqwest::Client::new(),
             ebay: None,
+            marktplaats: MarktplaatsClient::new(reqwest::Client::new(), server.uri()),
             sites: sites.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -312,7 +353,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let out = tool(&server, &["marktplaats.nl"])
+        let out = tool(&server, &["vinted.com"])
             .call(SearchArgs { query: "s25 ultra".into() })
             .await
             .unwrap();
@@ -397,5 +438,31 @@ mod tests {
         assert_eq!(out[0].results[0].snippet, "9.99 EUR · New · live eBay listing");
         assert_eq!(out[1].platform, "vinted.com");
         assert!(out[1].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn marktplaats_sites_use_the_public_search_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lrp/api/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "listings": [{"itemId": "m111", "title": "Hub",
+                              "priceInfo": {"priceCents": 1500, "priceType": "FIXED"},
+                              "location": {"cityName": "Delft"}}]
+            })))
+            .mount(&server)
+            .await;
+        // Kagi must not be called: no /v1/search mock mounted; a call there
+        // would 404 and produce an error field.
+
+        let out = tool(&server, &["marktplaats.nl"])
+            .call(SearchArgs { query: "hub".into() })
+            .await
+            .unwrap();
+
+        assert!(out[0].error.is_none());
+        assert_eq!(out[0].results.len(), 1);
+        assert_eq!(out[0].results[0].url, "https://link.marktplaats.nl/m111");
+        assert_eq!(out[0].results[0].snippet, "15.00 EUR · Delft · live Marktplaats listing");
     }
 }

@@ -44,12 +44,17 @@ async fn main() -> Result<()> {
         )
     });
     tracing::info!(ebay_api = ebay.is_some(), "eBay Browse API verification");
+    let marktplaats = tools::marktplaats::MarktplaatsClient::new(
+        http.clone(),
+        tools::marktplaats::MARKTPLAATS_BASE.to_string(),
+    );
 
     let deps = AgentDeps {
         llm,
         kagi,
         http,
         ebay,
+        marktplaats,
         store: store.clone(),
         secondhand_sites: cfg.secondhand_sites.clone(),
     };

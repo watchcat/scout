@@ -2,6 +2,7 @@ use crate::store::Store;
 use crate::tools::ebay::EbayClient;
 use crate::tools::fetch::FetchPageTool;
 use crate::tools::kagi::{KagiClient, KagiSearchTool};
+use crate::tools::marktplaats::MarktplaatsClient;
 use crate::tools::memory::{ForgetFactTool, RememberFactTool};
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
@@ -51,9 +52,9 @@ with 403/503 or a bot-block page means the shop blocks automated access - the \
 link may still be fine, so present it using the search-result info with a \
 note that you could not verify availability. search_secondhand already \
 removes dead listings for you (see its dead_links_removed count). Results \
-marked 'live eBay listing' come from eBay's official API and are already \
-verified with current prices - never call fetch_page on eBay URLs (their \
-site blocks it); use the data as returned.
+marked 'live eBay listing' or 'live Marktplaats listing' come from live \
+APIs and are already verified with current prices - do not re-verify them \
+with fetch_page (eBay blocks it anyway); use the data as returned.
 - Always include the price (with currency) and a direct link for every option \
 you present. At most 5 options, best first. If you genuinely could not reach a \
 direct product page, say so explicitly rather than passing off a listing URL.
@@ -90,6 +91,7 @@ pub struct AgentDeps {
     pub kagi: KagiClient,
     pub http: reqwest::Client,
     pub ebay: Option<EbayClient>,
+    pub marktplaats: MarktplaatsClient,
     pub store: Store,
     pub secondhand_sites: Vec<String>,
 }
@@ -153,6 +155,7 @@ pub fn build_agent(
             client: d.kagi.clone(),
             http: d.http.clone(),
             ebay: d.ebay.clone(),
+            marktplaats: d.marktplaats.clone(),
             sites: effective_sites(facts, &d.secondhand_sites),
         })
         .tool(RecordPurchaseTool { store: d.store.clone(), user_id })

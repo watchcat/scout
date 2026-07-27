@@ -50,7 +50,10 @@ listing/page is GONE - drop that option and mention it if relevant. Failing \
 with 403/503 or a bot-block page means the shop blocks automated access - the \
 link may still be fine, so present it using the search-result info with a \
 note that you could not verify availability. search_secondhand already \
-removes dead listings for you (see its dead_links_removed count).
+removes dead listings for you (see its dead_links_removed count). Results \
+marked 'live eBay listing' come from eBay's official API and are already \
+verified with current prices - never call fetch_page on eBay URLs (their \
+site blocks it); use the data as returned.
 - Always include the price (with currency) and a direct link for every option \
 you present. At most 5 options, best first. If you genuinely could not reach a \
 direct product page, say so explicitly rather than passing off a listing URL.

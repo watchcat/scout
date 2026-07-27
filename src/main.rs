@@ -34,11 +34,22 @@ async fn main() -> Result<()> {
         .build()?;
     let kagi = KagiClient::new(http.clone(), cfg.kagi_api_key.clone(), KAGI_API_BASE.to_string());
     let llm = agent::llm_client(&cfg.minimax_api_key)?;
+    let ebay = cfg.ebay_credentials.clone().map(|(id, secret)| {
+        tools::ebay::EbayClient::new(
+            http.clone(),
+            id,
+            secret,
+            cfg.ebay_marketplace.clone(),
+            tools::ebay::EBAY_API_BASE.to_string(),
+        )
+    });
+    tracing::info!(ebay_api = ebay.is_some(), "eBay Browse API verification");
 
     let deps = AgentDeps {
         llm,
         kagi,
         http,
+        ebay,
         store: store.clone(),
         secondhand_sites: cfg.secondhand_sites.clone(),
     };

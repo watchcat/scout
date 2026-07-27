@@ -9,6 +9,9 @@ pub struct Config {
     pub kagi_api_key: String,
     pub db_path: String,
     pub secondhand_sites: Vec<String>,
+    /// eBay Browse API credentials; both set or feature disabled.
+    pub ebay_credentials: Option<(String, String)>,
+    pub ebay_marketplace: String,
 }
 
 impl Config {
@@ -32,6 +35,13 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let non_empty = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+        let ebay_credentials = match (non_empty("EBAY_CLIENT_ID"), non_empty("EBAY_CLIENT_SECRET")) {
+            (Some(id), Some(secret)) => Some((id, secret)),
+            (None, None) => None,
+            _ => bail!("EBAY_CLIENT_ID and EBAY_CLIENT_SECRET must be set together"),
+        };
+
         Ok(Self {
             telegram_bot_token: required("TELEGRAM_BOT_TOKEN")?,
             allowed_user_ids,
@@ -39,6 +49,8 @@ impl Config {
             kagi_api_key: required("KAGI_API_KEY")?,
             db_path: get("SCOUT_DB_PATH").unwrap_or_else(|| "scout.duckdb".to_string()),
             secondhand_sites,
+            ebay_credentials,
+            ebay_marketplace: get("EBAY_MARKETPLACE").unwrap_or_else(|| "EBAY_NL".to_string()),
         })
     }
 }
@@ -140,6 +152,25 @@ mod tests {
         assert!(load(&env).is_err());
 
         env.insert("ALLOWED_TELEGRAM_USER_IDS", "0,111");
+        assert!(load(&env).is_err());
+    }
+
+    #[test]
+    fn ebay_credentials_all_or_nothing() {
+        let cfg = load(&base_env()).unwrap();
+        assert!(cfg.ebay_credentials.is_none());
+        assert_eq!(cfg.ebay_marketplace, "EBAY_NL");
+
+        let mut env = base_env();
+        env.insert("EBAY_CLIENT_ID", "app-id");
+        env.insert("EBAY_CLIENT_SECRET", "cert-id");
+        env.insert("EBAY_MARKETPLACE", "EBAY_DE");
+        let cfg = load(&env).unwrap();
+        assert_eq!(cfg.ebay_credentials, Some(("app-id".to_string(), "cert-id".to_string())));
+        assert_eq!(cfg.ebay_marketplace, "EBAY_DE");
+
+        let mut env = base_env();
+        env.insert("EBAY_CLIENT_ID", "app-id-only");
         assert!(load(&env).is_err());
     }
 }

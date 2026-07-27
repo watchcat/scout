@@ -40,6 +40,8 @@ Kagi's v1 API doesn't offer it yet; it returns when they ship it.
 | `KAGI_API_KEY` | yes | — | search |
 | `SCOUT_DB_PATH` | no | `scout.duckdb` | DuckDB file |
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
+| `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` | no | — | eBay Browse API: live prices/availability for eBay results |
+| `EBAY_MARKETPLACE` | no | `EBAY_NL` | eBay marketplace id |
 
 ## Running with Docker
 

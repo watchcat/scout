@@ -1,4 +1,5 @@
 use crate::store::Store;
+use crate::tools::ebay::EbayClient;
 use crate::tools::fetch::FetchPageTool;
 use crate::tools::kagi::{KagiClient, KagiSearchTool};
 use crate::tools::memory::{ForgetFactTool, RememberFactTool};
@@ -85,6 +86,7 @@ pub struct AgentDeps {
     pub llm: LlmClient,
     pub kagi: KagiClient,
     pub http: reqwest::Client,
+    pub ebay: Option<EbayClient>,
     pub store: Store,
     pub secondhand_sites: Vec<String>,
 }
@@ -147,6 +149,7 @@ pub fn build_agent(
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
             http: d.http.clone(),
+            ebay: d.ebay.clone(),
             sites: effective_sites(facts, &d.secondhand_sites),
         })
         .tool(RecordPurchaseTool { store: d.store.clone(), user_id })

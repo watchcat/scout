@@ -1,3 +1,4 @@
+use super::ebay::EbayClient;
 use super::kagi::{KagiClient, SearchArgs, SearchResult};
 use rig::tool::Tool;
 use serde::Serialize;
@@ -60,6 +61,9 @@ pub fn parse_sites(value: &str) -> Vec<String> {
 pub struct SecondhandSearchTool {
     pub client: KagiClient,
     pub http: reqwest::Client,
+    /// When configured, eBay sites are queried through the official Browse
+    /// API (live price/condition/availability) instead of Kagi + probing.
+    pub ebay: Option<EbayClient>,
     pub sites: Vec<String>,
 }
 
@@ -102,9 +106,41 @@ impl Tool for SecondhandSearchTool {
         let searches = self.sites.iter().map(|site| {
             let client = self.client.clone();
             let http = self.http.clone();
+            let ebay = self.ebay.clone();
             let site = site.clone();
+            let raw_query = args.query.clone();
             let query = format!("site:{site} {}", args.query);
             async move {
+                // eBay via the official API when configured: live data, no
+                // probing needed (their site 403s plain HTTP clients anyway).
+                if let Some(ebay) = ebay.filter(|_| site == "ebay" || site.split('.').next() == Some("ebay")) {
+                    return match ebay.search(&raw_query, 5).await {
+                        Ok(items) => PlatformResults {
+                            platform: site,
+                            results: items
+                                .into_iter()
+                                .map(|i| SearchResult {
+                                    title: i.title,
+                                    url: i.url,
+                                    snippet: match (i.price, i.condition) {
+                                        (Some(p), Some(c)) => format!("{p} · {c} · live eBay listing"),
+                                        (Some(p), None) => format!("{p} · live eBay listing"),
+                                        (None, Some(c)) => format!("{c} · live eBay listing"),
+                                        (None, None) => "live eBay listing".to_string(),
+                                    },
+                                })
+                                .collect(),
+                            dead_links_removed: 0,
+                            error: None,
+                        },
+                        Err(e) => PlatformResults {
+                            platform: site,
+                            results: Vec::new(),
+                            dead_links_removed: 0,
+                            error: Some(e.to_string()),
+                        },
+                    };
+                }
                 match client.search(&query, 5).await {
                     Ok(results) => {
                         // Verify every hit concurrently; drop deleted listings.
@@ -183,6 +219,7 @@ mod tests {
                 server.uri(),
             ),
             http: reqwest::Client::new(),
+            ebay: None,
             sites: sites.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -314,5 +351,51 @@ mod tests {
         // 503 (anti-bot) and network failures are "can't verify", not "gone".
         assert_eq!(out[0].results.len(), 2);
         assert_eq!(out[0].dead_links_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn ebay_sites_use_the_browse_api_when_configured() {
+        let server = MockServer::start().await;
+        // eBay API mocks (token + browse) — Kagi must NOT be called for ebay.nl
+        Mock::given(method("POST"))
+            .and(path("/identity/v1/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "t", "expires_in": 7200
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/buy/browse/v1/item_summary/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "itemSummaries": [{"title": "Live hub", "itemWebUrl": "https://ebay.nl/itm/9",
+                                   "price": {"value": "9.99", "currency": "EUR"}, "condition": "New"}]
+            })))
+            .mount(&server)
+            .await;
+        // Kagi mock for the non-ebay site
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"search": []}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut t = tool(&server, &["ebay.nl", "vinted.com"]);
+        t.ebay = Some(super::EbayClient::new(
+            reqwest::Client::new(),
+            "id".into(),
+            "sec".into(),
+            "EBAY_NL".into(),
+            server.uri(),
+        ));
+        let out = t.call(SearchArgs { query: "hub".into() }).await.unwrap();
+
+        assert_eq!(out[0].platform, "ebay.nl");
+        assert_eq!(out[0].results.len(), 1);
+        assert_eq!(out[0].results[0].url, "https://ebay.nl/itm/9");
+        assert_eq!(out[0].results[0].snippet, "9.99 EUR · New · live eBay listing");
+        assert_eq!(out[1].platform, "vinted.com");
+        assert!(out[1].error.is_none());
     }
 }

@@ -1,3 +1,4 @@
+pub mod ebay;
 pub mod fetch;
 pub mod kagi;
 pub mod memory;

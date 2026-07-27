@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS user_facts (
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     PRIMARY KEY (user_id, key)
 );
+CREATE TABLE IF NOT EXISTS request_log (
+    user_id BIGINT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
 "#;
 
 /// A purchase as the agent sees it. `purchased_at` is an ISO `YYYY-MM-DD`
@@ -245,6 +250,41 @@ impl Store {
         )?;
         Ok(n > 0)
     }
+
+    /// Record one handled request for usage statistics.
+    pub fn log_request(&self, user_id: i64, kind: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO request_log (user_id, kind) VALUES (?, ?)",
+            params![user_id, kind],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn log_request_at(&self, user_id: i64, kind: &str, at: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO request_log (user_id, kind, created_at) VALUES (?, ?, CAST(? AS TIMESTAMP))",
+            params![user_id, kind, at],
+        )?;
+        Ok(())
+    }
+
+    /// (user_id, day "YYYY-MM-DD", request count) for everything at or after
+    /// `cutoff` ("YYYY-MM-DD 00:00:00"), ordered by day then user.
+    pub fn usage_stats(&self, cutoff: &str) -> Result<Vec<(i64, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
+             FROM request_log WHERE created_at >= CAST(? AS TIMESTAMP)
+             GROUP BY user_id, day ORDER BY day ASC, user_id ASC",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
 }
 
 fn row_to_purchase(row: &Row) -> duckdb::Result<Purchase> {
@@ -416,6 +456,30 @@ mod tests {
         assert!(s.list_facts(2).unwrap().is_empty());
         assert!(!s.forget_fact(2, "delivery_country").unwrap());
         assert_eq!(s.list_facts(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn usage_stats_group_by_user_and_day_with_cutoff() {
+        let (s, _d) = test_store();
+        s.log_request_at(1, "text", "2026-07-25 10:00:00").unwrap();
+        s.log_request_at(1, "text", "2026-07-25 11:00:00").unwrap();
+        s.log_request_at(2, "photo", "2026-07-25 12:00:00").unwrap();
+        s.log_request_at(1, "text", "2026-07-26 09:00:00").unwrap();
+        s.log_request_at(1, "text", "2026-07-20 09:00:00").unwrap(); // before cutoff
+
+        let rows = s.usage_stats("2026-07-25 00:00:00").unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "2026-07-25".to_string(), 2),
+                (2, "2026-07-25".to_string(), 1),
+                (1, "2026-07-26".to_string(), 1),
+            ]
+        );
+        // live logging path writes with defaults and lands in stats
+        s.log_request(3, "reaction").unwrap();
+        let rows = s.usage_stats("2000-01-01 00:00:00").unwrap();
+        assert!(rows.iter().any(|(u, _, _)| *u == 3));
     }
 
     #[test]

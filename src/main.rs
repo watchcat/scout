@@ -3,6 +3,7 @@ mod bot;
 mod config;
 mod draft;
 mod scheduler;
+mod stats;
 mod store;
 mod text;
 mod tools;

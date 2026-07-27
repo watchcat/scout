@@ -11,7 +11,7 @@ use teloxide::prelude::*;
 use std::collections::VecDeque;
 use teloxide::types::{
     ChatAction, CopyTextButton, InlineKeyboardButton, InlineKeyboardButtonKind,
-    InlineKeyboardMarkup, MessageReactionUpdated, ReactionType,
+    InlineKeyboardMarkup, MessageReactionUpdated, ParseMode, ReactionType,
 };
 use teloxide::utils::command::BotCommands;
 
@@ -101,6 +101,8 @@ enum Command {
     Help,
     #[command(description = "forget this conversation and any pending photo draft")]
     Reset,
+    #[command(description = "usage statistics: /stat [days]")]
+    Stat(String),
 }
 
 const HELP: &str = "\
@@ -116,6 +118,7 @@ the old one back up if you're clearly continuing the same topic).
 
 Commands:
 /reset - forget this conversation right now
+/stat [days] - usage statistics (default 7 days)
 /help - this message";
 
 pub async fn run(bot: Bot, app: Arc<App>) {
@@ -171,14 +174,60 @@ async fn handle_command(
             app.chats.remove(&msg.chat.id.0);
             bot.send_message(msg.chat.id, "Conversation cleared.").await?;
         }
+        Command::Stat(arg) => {
+            let days = match crate::stats::parse_days(&arg) {
+                Ok(days) => days,
+                Err(e) => {
+                    bot.send_message(msg.chat.id, format!("{e} — usage: /stat [1-90]")).await?;
+                    return Ok(());
+                }
+            };
+            let today = chrono::Local::now().date_naive();
+            let cutoff = format!(
+                "{} 00:00:00",
+                today - chrono::Duration::days(i64::from(days) - 1)
+            );
+            let rows = {
+                let store = app.deps.store.clone();
+                tokio::task::spawn_blocking(move || store.usage_stats(&cutoff))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r)
+            };
+            match rows {
+                Ok(rows) => {
+                    let report = crate::stats::format_stats(&rows, days, today);
+                    bot.send_message(msg.chat.id, format!("<pre>{report}</pre>"))
+                        .parse_mode(ParseMode::Html)
+                        .await?;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "usage stats query failed");
+                    bot.send_message(msg.chat.id, "Sorry, couldn't compute stats.").await?;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Fire-and-forget usage logging; never delays request handling.
+fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
+    let store = app.deps.store.clone();
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || store.log_request(user_id, kind)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "request logging failed"),
+            Err(e) => tracing::warn!(error = %e, "request logging join failed"),
+        }
+    });
 }
 
 async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let text = msg.text().unwrap_or_default().to_string();
     let chat_id = msg.chat.id;
     let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    log_request(&app, user_id, "text");
 
     // Session expiry: after a long gap the old context is set aside; a quick
     // LLM check restores it when the new message continues the same topic.
@@ -275,6 +324,9 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     let Some(photo) = msg.photo().and_then(|sizes| sizes.last()) else {
         return Ok(());
     };
+    if let Some(user_id) = sender_id(&msg) {
+        log_request(&app, user_id, "photo");
+    }
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
     let bytes = match download_photo(&bot, photo.file.id.clone()).await {
@@ -354,6 +406,7 @@ async fn handle_reaction(
         return Ok(());
     };
 
+    log_request(&app, user_id, "reaction");
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
     let prompt = format!(
         "[system note] The user reacted with a thumbs-up to this earlier reply \

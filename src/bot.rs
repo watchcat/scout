@@ -465,7 +465,22 @@ async fn run_agent(
         .map(|c| c.history.clone())
         .unwrap_or_default();
 
-    let reply = strip_thinking(&agent.chat(prompt, &mut history).await?);
+    let mut reply = strip_thinking(&agent.chat(prompt, &mut history).await?);
+
+    // Guard against links the model wrote but never saw: an invented Amazon
+    // /dp/<ASIN> URL reads as a real product page and answers 404. One repair
+    // turn, then scrub whatever is still dead.
+    let dead = crate::links::dead_links_in(&app.deps.http, &reply).await;
+    if !dead.is_empty() {
+        tracing::warn!(?dead, chat_id, "dead links in reply; asking the agent to correct it");
+        let note = crate::links::repair_prompt(&dead);
+        reply = strip_thinking(&agent.chat(note, &mut history).await?);
+        let still_dead = crate::links::dead_links_in(&app.deps.http, &reply).await;
+        if !still_dead.is_empty() {
+            tracing::warn!(?still_dead, chat_id, "dead links survived the correction; stripping");
+            reply = crate::links::strike_dead(&reply, &still_dead);
+        }
+    }
 
     trim_history(&mut history, HISTORY_CAP);
     app.chats.entry(chat_id).or_default().history = history;

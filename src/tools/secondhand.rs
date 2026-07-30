@@ -1,6 +1,7 @@
 use super::ebay::EbayClient;
 use super::kagi::{KagiClient, SearchArgs, SearchResult};
 use super::marktplaats::MarktplaatsClient;
+use crate::links::is_dead_link;
 use rig::tool::Tool;
 use serde::Serialize;
 use serde_json::json;
@@ -69,16 +70,6 @@ pub struct SecondhandSearchTool {
     /// on failure the platform reports an error like any other.
     pub marktplaats: MarktplaatsClient,
     pub sites: Vec<String>,
-}
-
-/// True only when the server definitively says the page no longer exists
-/// (404/410 — e.g. a deleted Marktplaats listing answers 410). Bot walls
-/// (403/503) and network errors are NOT dead: we just can't verify those.
-async fn is_dead_link(http: &reqwest::Client, url: &str) -> bool {
-    match super::fetch::browser_get(http, url).send().await {
-        Ok(resp) => matches!(resp.status().as_u16(), 404 | 410),
-        Err(_) => false,
-    }
 }
 
 impl Tool for SecondhandSearchTool {

@@ -1,0 +1,154 @@
+//! Outgoing-link verification.
+//!
+//! The model sometimes writes product URLs it never saw in tool output —
+//! Amazon `/dp/<ASIN>` links are the worst case, because the slug is ignored
+//! and an invented ASIN looks perfectly plausible while answering 404. Every
+//! reply is therefore probed before it reaches the user.
+
+use std::time::Duration;
+
+/// Per-probe timeout: link checking must not stall a reply.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+/// Upper bound on probes per reply (replies carry at most ~5 options).
+const MAX_PROBES: usize = 12;
+
+/// True only when the server definitively says the page no longer exists
+/// (404/410 — e.g. a deleted Marktplaats listing answers 410, an invented
+/// Amazon ASIN answers 404). Bot walls (403/503) and network errors are NOT
+/// dead: we just can't verify those.
+pub async fn is_dead_link(http: &reqwest::Client, url: &str) -> bool {
+    match crate::tools::fetch::browser_get(http, url)
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) => matches!(resp.status().as_u16(), 404 | 410),
+        Err(_) => false,
+    }
+}
+
+/// http(s) URLs in `text`, in order, deduped and capped at [`MAX_PROBES`].
+/// Trailing sentence punctuation is trimmed so "see https://x.com/a." probes
+/// the actual link.
+pub fn extract_urls(text: &str) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("http") {
+        let tail = &rest[start..];
+        if !(tail.starts_with("http://") || tail.starts_with("https://")) {
+            rest = &tail["http".len()..];
+            continue;
+        }
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let url = tail[..end]
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'', '>'])
+            .to_string();
+        rest = &tail[end..];
+        if url.len() > "https://".len() && !urls.contains(&url) {
+            urls.push(url);
+            if urls.len() >= MAX_PROBES {
+                break;
+            }
+        }
+    }
+    urls
+}
+
+/// Probes every link in `text` concurrently and returns those that are
+/// definitively gone.
+pub async fn dead_links_in(http: &reqwest::Client, text: &str) -> Vec<String> {
+    let urls = extract_urls(text);
+    let verdicts = futures::future::join_all(urls.iter().map(|url| {
+        let http = http.clone();
+        let url = url.clone();
+        async move { is_dead_link(&http, &url).await }
+    }))
+    .await;
+    urls.into_iter()
+        .zip(verdicts)
+        .filter_map(|(url, dead)| dead.then_some(url))
+        .collect()
+}
+
+/// The follow-up prompt handed back to the agent when its answer contains
+/// dead links, asking for a corrected answer.
+pub fn repair_prompt(dead: &[String]) -> String {
+    format!(
+        "[system note] These links in your last reply are dead (HTTP 404/410 — \
+         the page does not exist):\n{}\n\nDo not show them again. They were \
+         most likely constructed rather than taken from tool output. Re-send \
+         your answer using only links you actually saw in tool results; verify \
+         a replacement with fetch_page if you are unsure, or drop that option \
+         and name the shop without a link. Reply with the corrected answer \
+         only, no apology or explanation of this note.",
+        dead.join("\n")
+    )
+}
+
+/// Last-resort scrub when the agent's corrected answer still carries dead
+/// links: the URL is replaced in place so the user cannot tap it.
+pub fn strike_dead(text: &str, dead: &[String]) -> String {
+    let mut out = text.to_string();
+    for url in dead {
+        out = out.replace(url, "(link unavailable - page not found)");
+    }
+    out.push_str("\n\nNote: some links did not resolve and were removed.");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn extracts_dedupes_and_trims_urls() {
+        let text = "First https://a.com/x (see https://b.com/y), and \
+                    https://a.com/x again. Not a url: httpfoo, ftp://c.com/z";
+        assert_eq!(
+            extract_urls(text),
+            vec!["https://a.com/x".to_string(), "https://b.com/y".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignores_bare_scheme_fragments() {
+        assert!(extract_urls("http:// and https://").is_empty());
+        assert_eq!(extract_urls("http://a.io"), vec!["http://a.io".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn only_404_and_410_count_as_dead() {
+        let server = MockServer::start().await;
+        for (p, status) in [("gone", 410), ("missing", 404), ("blocked", 403), ("ok", 200)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{p}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+        }
+        let http = reqwest::Client::new();
+        let text = format!(
+            "{0}/ok {0}/blocked {0}/missing {0}/gone",
+            server.uri()
+        );
+        let dead = dead_links_in(&http, &text).await;
+        assert_eq!(
+            dead,
+            vec![format!("{}/missing", server.uri()), format!("{}/gone", server.uri())]
+        );
+    }
+
+    #[test]
+    fn strike_dead_replaces_and_notes() {
+        let out = strike_dead(
+            "Option A\nhttps://a.com/x\nOption B\nhttps://b.com/y",
+            &["https://a.com/x".to_string()],
+        );
+        assert!(!out.contains("https://a.com/x"));
+        assert!(out.contains("https://b.com/y"));
+        assert!(out.contains("(link unavailable - page not found)"));
+        assert!(out.contains("did not resolve"));
+    }
+}

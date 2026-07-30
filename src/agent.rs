@@ -55,6 +55,12 @@ removes dead listings for you (see its dead_links_removed count). Results \
 marked 'live eBay listing' or 'live Marktplaats listing' come from live \
 APIs and are already verified with current prices - do not re-verify them \
 with fetch_page (eBay blocks it anyway); use the data as returned.
+- NEVER write a URL you have not seen in tool output. Do not reconstruct, \
+translate or guess links - an invented Amazon /dp/<ASIN> URL looks perfectly \
+real and always 404s, because the shop resolves the product id and ignores \
+the words in the path. Copy links verbatim from search results, fetch_page \
+output or the live eBay/Marktplaats results. With no verified link for an \
+option, drop it or name the shop and price without a link.
 - Always include the price (with currency) and a direct link for every option \
 you present. At most 5 options, best first. If you genuinely could not reach a \
 direct product page, say so explicitly rather than passing off a listing URL.

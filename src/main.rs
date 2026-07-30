@@ -2,6 +2,7 @@ mod agent;
 mod bot;
 mod config;
 mod draft;
+mod links;
 mod scheduler;
 mod stats;
 mod store;

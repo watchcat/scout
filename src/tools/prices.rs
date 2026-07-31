@@ -1,4 +1,6 @@
+use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 /// One purchasable offer as the model extracted it. `units` is how many
 /// countable things the listing contains (3 for a 3-pack); `shipping` absent
@@ -199,6 +201,70 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
     })
 }
 
+/// Stateless: all the inputs come from the model, all the rules are in
+/// `compare`.
+pub struct ComparePricesTool;
+
+impl Tool for ComparePricesTool {
+    const NAME: &'static str = "compare_prices";
+    type Error = PriceCompareError;
+    type Args = CompareArgs;
+    type Output = Comparison;
+
+    fn description(&self) -> String {
+        "Rank product offers by real cost: landed price (item + shipping) and \
+         price per unit. Call it ONCE with every candidate offer when the user \
+         asks for the cheapest option or the best price. Returns the cheapest \
+         way to buy one (best_single), the best price per unit (best_per_unit, \
+         usually a multipack), a ranked table and notes. Use its numbers \
+         verbatim — do not recompute them. Omit shipping for an offer when the \
+         page does not state it; never guess it."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "unit_name": {
+                    "type": "string",
+                    "description": "what one unit is: blade, gram, piece, litre..."
+                },
+                "offers": {
+                    "type": "array",
+                    "description": "all candidate offers, same currency, counted in the same unit",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "url": {"type": "string", "description": "direct link to the offer"},
+                            "shop": {"type": "string", "description": "e.g. bol.com"},
+                            "price": {"type": "number", "description": "listing price, no shipping"},
+                            "currency": {"type": "string", "description": "e.g. EUR"},
+                            "units": {
+                                "type": "integer",
+                                "description": "how many units the listing contains (3 for a 3-pack); default 1"
+                            },
+                            "shipping": {
+                                "type": "number",
+                                "description": "shipping cost when stated; omit entirely if unknown"
+                            },
+                            "condition": {"type": "string", "description": "new, used..."},
+                            "note": {"type": "string", "description": "short caveat, e.g. ships from UK"}
+                        },
+                        "required": ["title", "url", "price", "currency"]
+                    }
+                }
+            },
+            "required": ["unit_name", "offers"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        compare(&args)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +395,27 @@ mod tests {
         let no_url = compare(&args(vec![Offer { url: "  ".to_string(), ..offer("bad", 1.0, 1, None) }]))
             .unwrap_err();
         assert!(no_url.to_string().contains("url"), "got: {no_url}");
+    }
+
+    #[tokio::test]
+    async fn tool_accepts_the_model_facing_json() {
+        let args: CompareArgs = serde_json::from_value(serde_json::json!({
+            "unit_name": "blade",
+            "offers": [
+                {"title": "3 pack", "url": "https://e.com/3", "price": 15.17,
+                 "currency": "EUR", "units": 3, "shipping": 16.98},
+                {"title": "single", "url": "https://e.com/1", "price": 35.25,
+                 "currency": "EUR", "shipping": 2.21}
+            ]
+        }))
+        .unwrap();
+
+        // units defaults to 1 when the model omits it
+        assert_eq!(args.offers[1].units, 1);
+
+        let out = ComparePricesTool.call(args).await.unwrap();
+        assert_eq!(out.best_per_unit.title, "3 pack");
+        assert_eq!(out.best_single.title, "single");
+        assert_eq!(ComparePricesTool::NAME, "compare_prices");
     }
 }

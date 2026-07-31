@@ -4,6 +4,7 @@ use crate::tools::fetch::FetchPageTool;
 use crate::tools::kagi::{KagiClient, KagiSearchTool};
 use crate::tools::marktplaats::MarktplaatsClient;
 use crate::tools::memory::{ForgetFactTool, RememberFactTool};
+use crate::tools::prices::ComparePricesTool;
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
 use crate::tools::secondhand::{effective_sites, SecondhandSearchTool};
@@ -164,6 +165,7 @@ pub fn build_agent(
             marktplaats: d.marktplaats.clone(),
             sites: effective_sites(facts, &d.secondhand_sites),
         })
+        .tool(ComparePricesTool)
         .tool(RecordPurchaseTool { store: d.store.clone(), user_id })
         .tool(QueryPurchasesTool { store: d.store.clone(), user_id })
         .tool(CreateReminderTool { store: d.store.clone(), user_id, chat_id })

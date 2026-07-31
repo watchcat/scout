@@ -99,6 +99,10 @@ fn round_per_unit(x: f64) -> f64 {
 struct Ranked {
     row: Row,
     per_unit: f64,
+    /// Position in the input, the only dependable identity for an offer: the
+    /// preamble forbids inventing URLs, so pack variants of one product page
+    /// legitimately arrive with the same url.
+    idx: usize,
 }
 
 /// Everything that would make a comparison meaningless rather than merely
@@ -150,11 +154,13 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
     let mut ranked: Vec<Ranked> = args
         .offers
         .iter()
-        .map(|o| {
+        .enumerate()
+        .map(|(idx, o)| {
             let landed = o.price + o.shipping.unwrap_or(0.0);
             let per_unit = landed / o.units as f64;
             Ranked {
                 per_unit,
+                idx,
                 row: Row {
                     title: o.title.clone(),
                     url: o.url.clone(),
@@ -190,8 +196,8 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
         .min_by(|a, b| a.per_unit.total_cmp(&b.per_unit))
         .expect("candidate set is non-empty");
 
-    let bulk_advantage = best_per_unit.row.url != best_single.row.url
-        && best_per_unit.per_unit < best_single.per_unit;
+    let bulk_advantage =
+        best_per_unit.idx != best_single.idx && best_per_unit.per_unit < best_single.per_unit;
     let saving_vs_single_pct = if bulk_advantage && best_single.per_unit > 0.0 {
         ((best_single.per_unit - best_per_unit.per_unit) / best_single.per_unit * 100.0).round()
             as i64
@@ -348,6 +354,23 @@ mod tests {
         assert_eq!(out.best_per_unit.title, "A4 2500 box");
         assert!(out.bulk_advantage);
         assert_eq!(out.saving_vs_single_pct, 20);
+        assert!(!out.notes.iter().any(|n| n.contains("no bulk option")));
+    }
+
+    #[test]
+    fn pack_variants_sharing_one_url_can_still_show_a_bulk_advantage() {
+        // One product page, two pack options: the preamble forbids inventing
+        // URLs, so this is what the model legitimately sends.
+        let same_url = |title: &str, price: f64, units: u32| Offer {
+            url: "https://shop.example/p".to_string(),
+            ..offer(title, price, units, Some(0.0))
+        };
+        let out = compare(&args(vec![same_url("single", 10.0, 1), same_url("3-pack", 15.0, 3)])).unwrap();
+
+        assert_eq!(out.best_single.title, "single");
+        assert_eq!(out.best_per_unit.title, "3-pack");
+        assert!(out.bulk_advantage, "different picks must not report no bulk advantage");
+        assert_eq!(out.saving_vs_single_pct, 50);
         assert!(!out.notes.iter().any(|n| n.contains("no bulk option")));
     }
 

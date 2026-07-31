@@ -211,7 +211,15 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
 
     let mut notes = Vec::new();
     let unknown = rows.len() - rows.iter().filter(|r| r.shipping_known).count();
-    if unknown > 0 {
+    if unknown == rows.len() {
+        // Holding them out of the headline was impossible — they are the
+        // headline — so saying they were held out would be false.
+        notes.push(
+            "no offer states shipping; every figure here excludes delivery and the picks are on \
+             item price alone — say so in your reply"
+                .to_string(),
+        );
+    } else if unknown > 0 {
         notes.push(format!(
             "{unknown} offer(s) do not state shipping; they are ranked on item price alone and \
              cannot be a headline pick — say so when you mention them"
@@ -486,7 +494,12 @@ mod tests {
         // it is still listed, first even, because it is cheapest per unit
         assert_eq!(out.rows[0].title, "mystery-shipping");
         assert!(!out.rows[0].shipping_known);
-        assert!(out.notes.iter().any(|n| n.contains("do not state shipping")));
+        // Here the wording is true: a fully-known offer took the headline.
+        assert!(
+            out.notes.iter().any(|n| n.contains("cannot be a headline pick")),
+            "got: {:?}",
+            out.notes
+        );
     }
 
     #[test]
@@ -500,6 +513,18 @@ mod tests {
         assert_eq!(out.best_single.title, "a");
         assert_eq!(out.best_per_unit.title, "b"); // 7.50/unit
         assert!(out.bulk_advantage);
+        // The held-out-of-the-headline note would be a lie: these offers ARE
+        // the headline picks, because nothing better exists.
+        assert!(
+            !out.notes.iter().any(|n| n.contains("cannot be a headline pick")),
+            "got: {:?}",
+            out.notes
+        );
+        assert!(
+            out.notes.iter().any(|n| n.contains("no offer states shipping")),
+            "got: {:?}",
+            out.notes
+        );
     }
 
     #[test]

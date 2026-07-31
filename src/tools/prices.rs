@@ -75,8 +75,30 @@ pub struct Comparison {
 #[error("{0}")]
 pub struct PriceCompareError(pub String);
 
+fn round_to(x: f64, decimals: i32) -> f64 {
+    let f = 10f64.powi(decimals);
+    (x * f).round() / f
+}
+
 fn round2(x: f64) -> f64 {
-    (x * 100.0).round() / 100.0
+    round_to(x, 2)
+}
+
+/// Per-unit prices are shown to the user, so they need enough precision to
+/// mean something: cents are fine for a blade, but "0.00 per gram" is not a
+/// price. Below 10 cents a unit, show four decimals.
+fn round_per_unit(x: f64) -> f64 {
+    if x >= 0.10 { round_to(x, 2) } else { round_to(x, 4) }
+}
+
+/// A `Row` plus the value the ranking is actually done on: the exact,
+/// unrounded landed price per unit. Rounding before comparing collapses
+/// everything cheap — a gram of detergent, a sheet of paper — onto the same
+/// number and then breaks the tie by input order, which is how a dearer
+/// offer used to win.
+struct Ranked {
+    row: Row,
+    per_unit: f64,
 }
 
 /// Everything that would make a comparison meaningless rather than merely
@@ -125,54 +147,61 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
     validate(args)?;
     let currency = args.offers[0].currency.trim().to_uppercase();
 
-    let mut rows: Vec<Row> = args
+    let mut ranked: Vec<Ranked> = args
         .offers
         .iter()
         .map(|o| {
-            let landed = round2(o.price + o.shipping.unwrap_or(0.0));
-            Row {
-                title: o.title.clone(),
-                url: o.url.clone(),
-                shop: o.shop.clone(),
-                units: o.units,
-                price: round2(o.price),
-                shipping: o.shipping.map(round2),
-                landed,
-                per_unit: round2(landed / o.units as f64),
-                shipping_known: o.shipping.is_some(),
-                condition: o.condition.clone(),
-                note: o.note.clone(),
+            let landed = o.price + o.shipping.unwrap_or(0.0);
+            let per_unit = landed / o.units as f64;
+            Ranked {
+                per_unit,
+                row: Row {
+                    title: o.title.clone(),
+                    url: o.url.clone(),
+                    shop: o.shop.clone(),
+                    units: o.units,
+                    price: round2(o.price),
+                    shipping: o.shipping.map(round2),
+                    landed: round2(landed),
+                    per_unit: round_per_unit(per_unit),
+                    shipping_known: o.shipping.is_some(),
+                    condition: o.condition.clone(),
+                    note: o.note.clone(),
+                },
             }
         })
         .collect();
-    rows.sort_by(|a, b| a.per_unit.total_cmp(&b.per_unit));
+    ranked.sort_by(|a, b| a.per_unit.total_cmp(&b.per_unit));
 
     // Offers that hide shipping until checkout must not win a headline pick
     // over one whose full cost is known — unless nothing is known.
-    let known: Vec<&Row> = rows.iter().filter(|r| r.shipping_known).collect();
-    let candidates: Vec<&Row> = if known.is_empty() { rows.iter().collect() } else { known };
+    let known: Vec<&Ranked> = ranked.iter().filter(|r| r.row.shipping_known).collect();
+    let candidates: Vec<&Ranked> = if known.is_empty() { ranked.iter().collect() } else { known };
 
-    let smallest = candidates.iter().map(|r| r.units).min().unwrap_or(1);
+    let smallest = candidates.iter().map(|r| r.row.units).min().unwrap_or(1);
+    // Within one pack size, cheapest per unit is cheapest landed.
     let best_single = candidates
         .iter()
-        .filter(|r| r.units == smallest)
-        .min_by(|a, b| a.landed.total_cmp(&b.landed))
-        .map(|r| (*r).clone())
+        .filter(|r| r.row.units == smallest)
+        .min_by(|a, b| a.per_unit.total_cmp(&b.per_unit))
         .expect("candidate set is non-empty");
     let best_per_unit = candidates
         .iter()
         .min_by(|a, b| a.per_unit.total_cmp(&b.per_unit))
-        .map(|r| (*r).clone())
         .expect("candidate set is non-empty");
 
-    let bulk_advantage =
-        best_per_unit.url != best_single.url && best_per_unit.per_unit < best_single.per_unit;
+    let bulk_advantage = best_per_unit.row.url != best_single.row.url
+        && best_per_unit.per_unit < best_single.per_unit;
     let saving_vs_single_pct = if bulk_advantage && best_single.per_unit > 0.0 {
         ((best_single.per_unit - best_per_unit.per_unit) / best_single.per_unit * 100.0).round()
             as i64
     } else {
         0
     };
+    let best_single = best_single.row.clone();
+    let best_per_unit = best_per_unit.row.clone();
+
+    let rows: Vec<Row> = ranked.iter().map(|r| r.row.clone()).collect();
 
     let mut notes = Vec::new();
     let unknown = rows.len() - rows.iter().filter(|r| r.shipping_known).count();
@@ -285,6 +314,85 @@ mod tests {
 
     fn args(offers: Vec<Offer>) -> CompareArgs {
         CompareArgs { unit_name: "blade".to_string(), offers }
+    }
+
+    fn args_in(unit_name: &str, offers: Vec<Offer>) -> CompareArgs {
+        CompareArgs { unit_name: unit_name.to_string(), offers }
+    }
+
+    #[test]
+    fn sub_cent_units_are_ranked_on_the_exact_price_not_the_rounded_one() {
+        // Both bags round to 0.00 per gram; the cheaper one must still win.
+        let out = compare(&args_in(
+            "gram",
+            vec![offer("bag-4eur", 4.00, 1000, Some(0.0)), offer("bag-3eur", 3.00, 1000, Some(0.0))],
+        ))
+        .unwrap();
+
+        assert_eq!(out.best_per_unit.title, "bag-3eur");
+        assert_eq!(out.rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec![
+            "bag-3eur", "bag-4eur"
+        ]);
+    }
+
+    #[test]
+    fn sub_cent_bulk_advantage_is_detected() {
+        // 0.009 vs 0.0072 per sheet: both round to 0.01, the box is 20% cheaper.
+        let out = compare(&args_in(
+            "sheet",
+            vec![offer("A4 500", 4.50, 500, Some(0.0)), offer("A4 2500 box", 18.00, 2500, Some(0.0))],
+        ))
+        .unwrap();
+
+        assert_eq!(out.best_single.title, "A4 500");
+        assert_eq!(out.best_per_unit.title, "A4 2500 box");
+        assert!(out.bulk_advantage);
+        assert_eq!(out.saving_vs_single_pct, 20);
+        assert!(!out.notes.iter().any(|n| n.contains("no bulk option")));
+    }
+
+    #[test]
+    fn saving_pct_uses_exact_unit_prices() {
+        // 0.025 vs 0.020 per gram is a 20% saving, not the 33% the rounded
+        // values (0.03 vs 0.02) suggest.
+        let out = compare(&args_in(
+            "gram",
+            vec![offer("1kg", 25.00, 1000, Some(0.0)), offer("5kg", 100.00, 5000, Some(0.0))],
+        ))
+        .unwrap();
+
+        assert!(out.bulk_advantage);
+        assert_eq!(out.saving_vs_single_pct, 20);
+    }
+
+    #[test]
+    fn per_unit_divides_the_unrounded_landed_sum() {
+        // landed rounds to 10.01, but 10.005 / 2 is 5.0025 → 5.00, not 5.01.
+        let out = compare(&args(vec![offer("odd", 10.005, 2, Some(0.0))])).unwrap();
+
+        assert_eq!(out.rows[0].landed, 10.01);
+        assert_eq!(out.rows[0].per_unit, 5.00);
+    }
+
+    #[test]
+    fn per_unit_precision_adapts_to_the_size_of_the_unit_price() {
+        // >= 0.10 per unit: cents are enough.
+        let cents = compare(&args_in("gram", vec![
+            offer("a", 12.345, 100, Some(0.0)),
+            offer("boundary", 10.0, 100, Some(0.0)),
+        ]))
+        .unwrap();
+        assert_eq!(cents.rows.iter().find(|r| r.title == "a").unwrap().per_unit, 0.12);
+        assert_eq!(cents.rows.iter().find(|r| r.title == "boundary").unwrap().per_unit, 0.1);
+
+        // < 0.10 per unit: cents would print "0.00 per gram".
+        let sub = compare(&args_in("gram", vec![
+            offer("just under", 9.9, 100, Some(0.0)),
+            offer("tiny", 3.0, 1000, Some(0.0)),
+        ]))
+        .unwrap();
+        assert_eq!(sub.rows.iter().find(|r| r.title == "just under").unwrap().per_unit, 0.099);
+        assert_eq!(sub.rows.iter().find(|r| r.title == "tiny").unwrap().per_unit, 0.003);
     }
 
     #[test]

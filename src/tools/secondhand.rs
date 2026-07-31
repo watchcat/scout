@@ -153,11 +153,21 @@ impl Tool for SecondhandSearchTool {
                                 .map(|i| SearchResult {
                                     title: i.title,
                                     url: i.url,
-                                    snippet: match (i.price, i.condition) {
-                                        (Some(p), Some(c)) => format!("{p} · {c} · live eBay listing"),
-                                        (Some(p), None) => format!("{p} · live eBay listing"),
-                                        (None, Some(c)) => format!("{c} · live eBay listing"),
-                                        (None, None) => "live eBay listing".to_string(),
+                                    snippet: {
+                                        let mut parts: Vec<String> = Vec::new();
+                                        match (i.price, i.shipping) {
+                                            (Some(p), Some(s)) => {
+                                                parts.push(format!("{p} + {s} shipping"))
+                                            }
+                                            (Some(p), None) => parts.push(p),
+                                            (None, Some(s)) => parts.push(format!("{s} shipping")),
+                                            (None, None) => {}
+                                        }
+                                        if let Some(c) = i.condition {
+                                            parts.push(c);
+                                        }
+                                        parts.push("live eBay listing".to_string());
+                                        parts.join(" · ")
                                     },
                                 })
                                 .collect(),
@@ -400,7 +410,10 @@ mod tests {
             .and(path("/buy/browse/v1/item_summary/search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "itemSummaries": [{"title": "Live hub", "itemWebUrl": "https://ebay.nl/itm/9",
-                                   "price": {"value": "9.99", "currency": "EUR"}, "condition": "New"}]
+                                   "price": {"value": "9.99", "currency": "EUR"}, "condition": "New",
+                                   "shippingOptions": [
+                                       {"shippingCost": {"value": "4.95", "currency": "EUR"}}
+                                   ]}]
             })))
             .mount(&server)
             .await;
@@ -426,7 +439,10 @@ mod tests {
         assert_eq!(out[0].platform, "ebay.nl");
         assert_eq!(out[0].results.len(), 1);
         assert_eq!(out[0].results[0].url, "https://ebay.nl/itm/9");
-        assert_eq!(out[0].results[0].snippet, "9.99 EUR · New · live eBay listing");
+        assert_eq!(
+            out[0].results[0].snippet,
+            "9.99 EUR + 4.95 EUR shipping · New · live eBay listing"
+        );
         assert_eq!(out[1].platform, "vinted.com");
         assert!(out[1].error.is_none());
     }

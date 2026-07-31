@@ -22,6 +22,9 @@ pub struct EbayItem {
     pub title: String,
     pub url: String,
     pub price: Option<String>, // "49.99 EUR"
+    /// Shipping cost as eBay states it for this marketplace ("4.95 EUR").
+    /// `None` means the listing does not state one — not that it is free.
+    pub shipping: Option<String>,
     pub condition: Option<String>,
 }
 
@@ -58,8 +61,16 @@ struct RawItem {
     item_web_url: Option<String>,
     #[serde(default)]
     price: Option<RawPrice>,
+    #[serde(default, rename = "shippingOptions")]
+    shipping_options: Vec<RawShippingOption>,
     #[serde(default)]
     condition: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawShippingOption {
+    #[serde(default, rename = "shippingCost")]
+    shipping_cost: Option<RawPrice>,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +79,15 @@ struct RawPrice {
     value: Option<String>,
     #[serde(default)]
     currency: Option<String>,
+}
+
+/// "12.50" + "EUR" -> "12.50 EUR"; currency alone is not a price.
+fn money(p: RawPrice) -> Option<String> {
+    match (p.value, p.currency) {
+        (Some(v), Some(c)) => Some(format!("{v} {c}")),
+        (Some(v), None) => Some(v),
+        _ => None,
+    }
 }
 
 impl EbayClient {
@@ -144,11 +164,13 @@ impl EbayClient {
                 Some(EbayItem {
                     title: raw.title.unwrap_or_default(),
                     url,
-                    price: raw.price.and_then(|p| match (p.value, p.currency) {
-                        (Some(v), Some(c)) => Some(format!("{v} {c}")),
-                        (Some(v), None) => Some(v),
-                        _ => None,
-                    }),
+                    price: raw.price.and_then(money),
+                    shipping: raw
+                        .shipping_options
+                        .into_iter()
+                        .next()
+                        .and_then(|o| o.shipping_cost)
+                        .and_then(money),
                     condition: raw.condition,
                 })
             })
@@ -197,10 +219,16 @@ mod tests {
             .and(header("Authorization", "Bearer tok-1"))
             .and(header("X-EBAY-C-MARKETPLACE-ID", "EBAY_NL"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "total": 2,
+                "total": 3,
                 "itemSummaries": [
                     {"title": "USB hub 3.0", "itemWebUrl": "https://ebay.nl/itm/1",
-                     "price": {"value": "12.50", "currency": "EUR"}, "condition": "Used"},
+                     "price": {"value": "12.50", "currency": "EUR"}, "condition": "Used",
+                     "shippingOptions": [
+                         {"shippingCostType": "FIXED",
+                          "shippingCost": {"value": "4.95", "currency": "EUR"}}
+                     ]},
+                    {"title": "USB hub, pickup only", "itemWebUrl": "https://ebay.nl/itm/2",
+                     "price": {"value": "9.00", "currency": "EUR"}},
                     {"title": "no url item"}
                 ]
             })))
@@ -211,16 +239,27 @@ mod tests {
         let items = c.search("usb hub", 5).await.unwrap();
         assert_eq!(
             items,
-            vec![EbayItem {
-                title: "USB hub 3.0".into(),
-                url: "https://ebay.nl/itm/1".into(),
-                price: Some("12.50 EUR".into()),
-                condition: Some("Used".into()),
-            }]
+            vec![
+                EbayItem {
+                    title: "USB hub 3.0".into(),
+                    url: "https://ebay.nl/itm/1".into(),
+                    price: Some("12.50 EUR".into()),
+                    shipping: Some("4.95 EUR".into()),
+                    condition: Some("Used".into()),
+                },
+                EbayItem {
+                    title: "USB hub, pickup only".into(),
+                    url: "https://ebay.nl/itm/2".into(),
+                    price: Some("9.00 EUR".into()),
+                    // no shippingOptions -> unknown, NOT free
+                    shipping: None,
+                    condition: None,
+                },
+            ]
         );
         // second call: token endpoint must NOT be hit again (expect(1) above)
         let again = c.search("usb hub", 5).await.unwrap();
-        assert_eq!(again.len(), 1);
+        assert_eq!(again.len(), 2);
     }
 
     #[tokio::test]

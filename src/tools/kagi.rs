@@ -4,6 +4,8 @@ pub const KAGI_API_BASE: &str = "https://kagi.com/api";
 
 #[derive(Debug, thiserror::Error)]
 pub enum KagiError {
+    #[error("{0}")]
+    Budget(String),
     #[error("kagi request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("kagi api error (status {status}): {body}")]
@@ -140,7 +142,11 @@ const MAX_QUERIES: usize = 3;
 /// context readable.
 const MERGED_LIMIT: usize = 12;
 
-pub struct KagiSearchTool(pub KagiClient);
+pub struct KagiSearchTool {
+    pub client: KagiClient,
+    /// Shared with search_secondhand: the cap is on what one request costs.
+    pub budget: std::sync::Arc<super::budget::SearchBudget>,
+}
 
 impl Tool for KagiSearchTool {
     const NAME: &'static str = "kagi_search";
@@ -183,11 +189,24 @@ impl Tool for KagiSearchTool {
                 queries.push(q);
             }
         }
+        // Translations are the first thing to drop when the allowance is
+        // nearly spent — the user's own phrasing is queries[0].
+        let granted = self.budget.claim(queries.len());
+        if granted == 0 {
+            return Err(KagiError::Budget(format!(
+                "search budget spent ({} queries per request) — answer from the results you \
+                 already have instead of searching again",
+                super::budget::QUERIES_PER_REQUEST
+            )));
+        }
+        queries.truncate(granted);
+
         // One language: keep the old depth. Several: less from each, since
         // the merged list is what the model reads.
         let per_query = if queries.len() == 1 { 10 } else { 6 };
         let answers =
-            futures::future::join_all(queries.iter().map(|q| self.0.search(q, per_query))).await;
+            futures::future::join_all(queries.iter().map(|q| self.client.search(q, per_query)))
+                .await;
 
         let mut merged: Vec<SearchResult> = Vec::new();
         let mut first_error = None;
@@ -345,7 +364,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = KagiSearchTool(client(&server).await);
+        let tool = KagiSearchTool { client: client(&server).await, budget: Default::default() };
         let out = tool
             .call(SearchArgs { query: "x".into(), also_queries: Vec::new() })
             .await
@@ -377,7 +396,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let out = KagiSearchTool(client(&server).await)
+        let out = KagiSearchTool { client: client(&server).await, budget: Default::default() }
             .call(SearchArgs {
                 query: "laundry detergent".into(),
                 also_queries: vec!["wasmiddel".into(), "  ".into()],
@@ -391,6 +410,42 @@ mod tests {
             vec!["https://a.example", "https://shared.example", "https://bol.example"]
         );
         assert_eq!(out[1].snippet, "english");
+    }
+
+    #[tokio::test]
+    async fn the_search_budget_drops_translations_first_then_refuses() {
+        let server = MockServer::start().await;
+        // Only the main query is mocked; if a translation ran with 1 left,
+        // the limit would be 6 and this mock would not match.
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "q", "limit": 10})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": [
+                {"title": "T", "url": "https://u", "snippet": ""}
+            ]}})))
+            .mount(&server)
+            .await;
+
+        let tool = KagiSearchTool {
+            client: client(&server).await,
+            budget: std::sync::Arc::new(crate::tools::budget::SearchBudget::new(1)),
+        };
+        // asked for 3 queries, granted 1: the user's own phrasing survives
+        let out = tool
+            .call(SearchArgs {
+                query: "q".into(),
+                also_queries: vec!["vertaling".into(), "Übersetzung".into()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+
+        let err = tool
+            .call(SearchArgs { query: "q".into(), also_queries: Vec::new() })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KagiError::Budget(_)), "got: {err}");
+        assert!(err.to_string().contains("already have"), "got: {err}");
     }
 
     #[tokio::test]
@@ -411,7 +466,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = KagiSearchTool(client(&server).await);
+        let tool = KagiSearchTool { client: client(&server).await, budget: Default::default() };
         let out = tool
             .call(SearchArgs { query: "ok".into(), also_queries: vec!["boom".into()] })
             .await

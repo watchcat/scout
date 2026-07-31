@@ -263,10 +263,12 @@ pub fn build_agent(
     chat_id: i64,
     facts: &[(String, String)],
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
+    // One allowance per request, shared by both searching tools.
+    let budget = std::sync::Arc::new(crate::tools::budget::SearchBudget::default());
     d.llm
         .agent(MODEL)
         .preamble(&preamble_with_profile(facts))
-        .tool(KagiSearchTool(d.kagi.clone()))
+        .tool(KagiSearchTool { client: d.kagi.clone(), budget: budget.clone() })
         .tool(FetchPageTool::new(d.http.clone()))
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
@@ -274,6 +276,7 @@ pub fn build_agent(
             ebay: d.ebay.clone(),
             marktplaats: d.marktplaats.clone(),
             sites: effective_sites(facts, &d.secondhand_sites),
+            budget,
         })
         .tool(ComparePricesTool)
         .tool(RecordPurchaseTool { store: d.store.clone(), user_id })

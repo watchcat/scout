@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod ebay;
 pub mod fetch;
 pub mod kagi;

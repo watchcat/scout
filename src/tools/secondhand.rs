@@ -70,6 +70,9 @@ pub struct SecondhandSearchTool {
     /// on failure the platform reports an error like any other.
     pub marktplaats: MarktplaatsClient,
     pub sites: Vec<String>,
+    /// Shared with kagi_search. Sites served by the eBay/Marktplaats APIs
+    /// cost nothing here; the rest are one billed query each.
+    pub budget: std::sync::Arc<crate::tools::budget::SearchBudget>,
 }
 
 impl Tool for SecondhandSearchTool {
@@ -103,6 +106,7 @@ impl Tool for SecondhandSearchTool {
             let http = self.http.clone();
             let ebay = self.ebay.clone();
             let marktplaats = self.marktplaats.clone();
+            let budget = self.budget.clone();
             let site = site.clone();
             let raw_query = args.query.clone();
             let query = format!("site:{site} {}", args.query);
@@ -182,6 +186,18 @@ impl Tool for SecondhandSearchTool {
                         },
                     };
                 }
+                // Everything below this point is a billed Kagi query; the
+                // API-backed platforms above are free and always run.
+                if budget.claim(1) == 0 {
+                    return PlatformResults {
+                        platform: site,
+                        results: Vec::new(),
+                        dead_links_removed: 0,
+                        error: Some(
+                            "search budget spent for this request — not searched".to_string(),
+                        ),
+                    };
+                }
                 match client.search(&query, 5).await {
                     Ok(results) => {
                         // Verify every hit concurrently; drop deleted listings.
@@ -252,6 +268,37 @@ mod tests {
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[tokio::test]
+    async fn sites_beyond_the_search_budget_are_reported_not_searched() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": [
+                {"title": "T", "url": "https://u", "snippet": ""}
+            ]}})))
+            .mount(&server)
+            .await;
+
+        let mut t = tool(&server, &["vinted.com", "rebuy.nl", "catawiki.com"]);
+        t.budget = std::sync::Arc::new(crate::tools::budget::SearchBudget::new(2));
+        let out = t
+            .call(SearchArgs { query: "hub".into(), also_queries: Vec::new() })
+            .await
+            .unwrap();
+
+        // every platform still reports back; the third says why it is empty
+        assert_eq!(out.len(), 3);
+        let searched = out.iter().filter(|p| p.error.is_none()).count();
+        assert_eq!(searched, 2);
+        let skipped = out.iter().find(|p| p.error.is_some()).unwrap();
+        assert!(skipped.results.is_empty());
+        assert!(
+            skipped.error.as_deref().unwrap().contains("search budget spent"),
+            "got: {:?}",
+            skipped.error
+        );
+    }
+
     fn tool(server: &MockServer, sites: &[&str]) -> SecondhandSearchTool {
         SecondhandSearchTool {
             client: KagiClient::new(
@@ -262,6 +309,7 @@ mod tests {
             http: reqwest::Client::new(),
             ebay: None,
             marktplaats: MarktplaatsClient::new(reqwest::Client::new(), server.uri()),
+            budget: Default::default(),
             sites: sites.iter().map(|s| s.to_string()).collect(),
         }
     }

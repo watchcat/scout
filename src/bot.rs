@@ -282,6 +282,13 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         }
     };
 
+    let prompt = if looks_like_price_request(&prompt) {
+        tracing::info!(chat_id = chat_id.0, "price request; requiring compare_prices");
+        format!("{prompt}{PRICE_REQUEST_NOTE}")
+    } else {
+        prompt
+    };
+
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
     match run_agent(&app, user_id, chat_id.0, &prompt).await {
@@ -292,6 +299,39 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         }
     }
     Ok(())
+}
+
+/// Markers of a "find me the cheapest one" request, in the languages this
+/// bot's users write in. Substrings, so Russian and Dutch inflections match.
+const PRICE_MARKERS: &[&str] = &[
+    "cheapest",
+    "cheaper",
+    "best price",
+    "lowest price",
+    "best deal",
+    "bargain",
+    "дешев",   // дешевый / дешевле / подешевле
+    "дешёв",
+    "лучшая цена",
+    "лучшую цену",
+    "goedkoop", // goedkoop / goedkoopste / goedkoper
+    "beste prijs",
+];
+
+/// Appended to the user's message when they ask for the cheapest option.
+/// The preamble carries the same rule, but it competes with a dozen others
+/// halfway through a long search — as the freshest line in the prompt it
+/// actually fires. (Observed: a cheapest-price request that opened eight
+/// pages and answered from raw snippets without comparing anything.)
+const PRICE_REQUEST_NOTE: &str = "\n\n[system note] This is a cheapest-price request. \
+Before answering you MUST call compare_prices once, passing every candidate offer with its \
+price, currency, pack size (units) and shipping cost where stated. Present its best_single \
+and best_per_unit, using its numbers verbatim. Keep enough turns free to do it: search \
+first, open at most 3 pages, then compare.";
+
+fn looks_like_price_request(text: &str) -> bool {
+    let text = text.to_lowercase();
+    PRICE_MARKERS.iter().any(|m| text.contains(m))
 }
 
 /// Turn an agent failure into a user-facing message; the max-turns budget
@@ -700,6 +740,25 @@ mod tests {
         trim_history(&mut history, 4);
         assert_eq!(history, vec![user_text("q2"), assistant_text("a2")]);
         assert!(is_plain_user_text(&history[0]));
+    }
+
+    #[test]
+    fn price_requests_are_recognised_across_languages() {
+        for asking in [
+            "find the cheapest ariel professional detergent",
+            "Найди самый дешевый Ariel Professional liquid colour detergent",
+            "где подешевле?",
+            "wat is de goedkoopste optie?",
+            "which one has the BEST PRICE",
+        ] {
+            assert!(looks_like_price_request(asking), "missed: {asking}");
+        }
+        for other in [
+            "find me a body groomer for sensitive skin",
+            "did I buy coffee last month?",
+        ] {
+            assert!(!looks_like_price_request(other), "false positive: {other}");
+        }
     }
 
     #[test]

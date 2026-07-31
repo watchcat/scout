@@ -28,6 +28,22 @@ the user find products online, compare options, and remember their purchases. \
 You never buy anything yourself.
 
 Rules:
+- Cheapest/best-price requests ('cheapest X', 'best price', 'how cheap can I \
+get X') end in a compare_prices call - that is not optional, and the reply is \
+wrong without it. While reading results, note each offer's pack size (how \
+many units the listing contains) and its shipping cost when the result or \
+page states them - never invent either, omit what is not stated. Then call \
+compare_prices ONCE with every candidate offer and take all numbers from its \
+output verbatim; do not do the arithmetic yourself. Present best_single as \
+'Cheapest one-off' (or, when its units are more than 1, as the cheapest pack \
+of that size) and, when bulk_advantage is true, best_per_unit as 'Best per \
+unit' with the pack size and the saving; when it is false, say plainly that \
+buying more does not save. Add at most 3 runners-up from rows. Follow the \
+tool's notes: name the offers whose shipping is unknown, and state the pack \
+size you assumed when a listing did not spell it out. All offers in one call \
+must share a currency - compare the user's currency and mention offers in \
+other currencies separately. Plan your turns so the comparison happens: \
+search, open at most 3 pages, compare, answer.
 - When the user asks to find or buy something, ALWAYS call query_purchases first \
 to check whether they bought it (or something similar) before. Mention relevant \
 history in your reply, including cadence you notice (e.g. 'you buy this roughly \
@@ -62,19 +78,6 @@ real and always 404s, because the shop resolves the product id and ignores \
 the words in the path. Copy links verbatim from search results, fetch_page \
 output or the live eBay/Marktplaats results. With no verified link for an \
 option, drop it or name the shop and price without a link.
-- Cheapest/best-price requests ('cheapest X', 'best price', 'how cheap can I \
-get X'): while reading results, note each offer's pack size (how many units \
-the listing contains) and its shipping cost when the result or page states \
-them - never invent either, omit what is not stated. Then call compare_prices \
-ONCE with every candidate offer and take all numbers from its output \
-verbatim; do not do the arithmetic yourself. Present best_single as \
-'Cheapest one-off' and, when bulk_advantage is true, best_per_unit as 'Best \
-per unit' with the pack size and the saving; when it is false, say plainly \
-that buying more does not save. Add at most 3 runners-up from rows. Follow \
-the tool's notes: name the offers whose shipping is unknown, and state the \
-pack size you assumed when a listing did not spell it out. All offers in one \
-call must share a currency - compare the user's currency and mention offers \
-in other currencies separately.
 - Always include the price (with currency) and a direct link for every option \
 you present. At most 5 options, best first. If you genuinely could not reach a \
 direct product page, say so explicitly rather than passing off a listing URL.
@@ -170,7 +173,7 @@ pub fn build_agent(
         .agent(MODEL)
         .preamble(&preamble_with_profile(facts))
         .tool(KagiSearchTool(d.kagi.clone()))
-        .tool(FetchPageTool { http: d.http.clone() })
+        .tool(FetchPageTool::new(d.http.clone()))
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
             http: d.http.clone(),

@@ -24,6 +24,10 @@ pub(crate) fn browser_get(http: &reqwest::Client, url: impl reqwest::IntoUrl) ->
 /// Readable-text cap: enough for a product/listing page's useful content
 /// without flooding the model context.
 const MAX_TEXT_CHARS: usize = 6000;
+/// Page opens allowed per request. The preamble asks for at most this many,
+/// but a model chasing one more listing will happily open eight and burn the
+/// turn budget before it answers — so the tool enforces it too.
+const MAX_OPENS: usize = 3;
 const MAX_LINKS: usize = 30;
 const MAX_LINK_TEXT_CHARS: usize = 120;
 
@@ -55,8 +59,16 @@ pub struct PageContent {
 
 /// Plain-HTTP page fetcher: readable text + links, so the agent can open a
 /// retailer listing page and pull out direct product URLs and prices.
+/// Built per request, so `opens` counts this request's page opens.
 pub struct FetchPageTool {
     pub http: reqwest::Client,
+    opens: std::sync::atomic::AtomicUsize,
+}
+
+impl FetchPageTool {
+    pub fn new(http: reqwest::Client) -> Self {
+        Self { http, opens: std::sync::atomic::AtomicUsize::new(0) }
+    }
 }
 
 impl Tool for FetchPageTool {
@@ -89,6 +101,14 @@ impl Tool for FetchPageTool {
             return Err(FetchError::Invalid(format!(
                 "unsupported url scheme: {}",
                 url.scheme()
+            )));
+        }
+        // Counted only once the url is worth opening, so a malformed one
+        // costs the model a turn but not part of its page budget.
+        if self.opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_OPENS {
+            return Err(FetchError::Invalid(format!(
+                "page budget spent ({MAX_OPENS} opens per request) — answer with what you \
+                 already have instead of opening more pages"
             )));
         }
         let resp = browser_get(&self.http, url.clone()).send().await?;
@@ -304,7 +324,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = FetchPageTool { http: reqwest::Client::new() };
+        let tool = FetchPageTool::new(reqwest::Client::new());
         let page = tool
             .call(FetchArgs { url: format!("{}/p/1", server.uri()) })
             .await
@@ -312,6 +332,30 @@ mod tests {
         assert!(page.text.contains("Widget"));
         assert_eq!(page.links.len(), 1);
         assert!(page.links[0].url.ends_with("/p/2"));
+    }
+
+    #[tokio::test]
+    async fn page_opens_are_capped_per_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html><body>ok</body></html>"))
+            .mount(&server)
+            .await;
+
+        let tool = FetchPageTool::new(reqwest::Client::new());
+        for i in 0..MAX_OPENS {
+            let page = tool.call(FetchArgs { url: format!("{}/p/{i}", server.uri()) }).await;
+            assert!(page.is_ok(), "open {i} should be allowed");
+        }
+        let err = tool
+            .call(FetchArgs { url: format!("{}/p/extra", server.uri()) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("page budget spent"), "got: {err}");
+
+        // A fresh tool (i.e. the next request) starts with a full budget.
+        let next = FetchPageTool::new(reqwest::Client::new());
+        assert!(next.call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.is_ok());
     }
 
     #[tokio::test]
@@ -323,7 +367,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = FetchPageTool { http: reqwest::Client::new() };
+        let tool = FetchPageTool::new(reqwest::Client::new());
         let err = tool
             .call(FetchArgs { url: format!("{}/gone", server.uri()) })
             .await

@@ -61,7 +61,9 @@ kagi_search's also_queries (up to 2) - they run in parallel with the main \
 query in ONE call and the results come back merged, so this costs no extra \
 steps. Translate the product terms properly: 'laundry detergent' is \
 'wasmiddel' in Dutch and 'Waschmittel' in German; copying English words into \
-a Dutch query finds nothing. When the user asks to search in different \
+a Dutch query finds nothing. Translate the product words only - never a \
+site: filter, a URL or a price, and do not spend a translated query \
+re-checking a page you have already opened. When the user asks to search in different \
 languages, save the FULL list with remember_fact under search_languages; \
 forget_fact returns to the delivery country's language.
 - Search results often include retailer search/listing pages (URLs containing \
@@ -72,6 +74,14 @@ surface direct product pages more often.
 - Budget your steps: open at most 3 pages with fetch_page per request, \
 picking the most promising candidates. Prefer answering with what you have \
 over exhaustively verifying everything.
+- fetch_page reports availability from the page's own markup: 'out of stock' \
+means the shop cannot sell it - never present that option, and if the user \
+asked about that exact product, say it is out of stock there. 'in stock' \
+confirms it, and null means the page does not say, which is not the same as \
+available. A shop answers HTTP 200 for a product it cannot sell, so this \
+field is the only stock signal you have; the page text is not (a bol.com \
+page for a sold-out item shows 'Niet leverbaar' once and 'In winkelwagen' \
+seven times, all from its recommendations).
 - Link status semantics: fetch_page failing with HTTP 404 or 410 means the \
 listing/page is GONE - drop that option and mention it if relevant. Failing \
 with 403/503 or a bot-block page means the shop blocks automated access - the \

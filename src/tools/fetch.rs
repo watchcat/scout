@@ -55,6 +55,42 @@ pub struct PageContent {
     pub text: String,
     pub truncated: bool,
     pub links: Vec<PageLink>,
+    /// What the page's structured markup says about stock, when it says
+    /// anything. `None` means unknown, not available.
+    pub availability: Option<&'static str>,
+}
+
+/// Stock status from schema.org markup, which is the only trustworthy signal:
+/// shops answer HTTP 200 for a product they cannot sell, and the visible text
+/// is useless — a bol.com page for an unavailable item carries "Niet
+/// leverbaar" once and seven "In winkelwagen" from its recommendations
+/// carousel. Read from the raw HTML, since the markup lives in a JSON-LD
+/// <script> block that text extraction throws away.
+///
+/// Markup that says both (a page listing several offers) is treated as
+/// unknown rather than guessed at.
+fn availability(html: &str) -> Option<&'static str> {
+    let html = html.to_ascii_lowercase();
+    let says = |needles: &[&str]| needles.iter().any(|n| html.contains(n));
+    let out = says(&[
+        "\"outofstock\"",
+        "schema.org/outofstock",
+        "\"soldout\"",
+        "schema.org/soldout",
+        "\"discontinued\"",
+        "schema.org/discontinued",
+    ]);
+    let available = says(&[
+        "\"instock\"",
+        "schema.org/instock",
+        "\"limitedavailability\"",
+        "schema.org/limitedavailability",
+    ]);
+    match (out, available) {
+        (true, false) => Some("out of stock"),
+        (false, true) => Some("in stock"),
+        _ => None,
+    }
 }
 
 /// Plain-HTTP page fetcher: readable text + links, so the agent can open a
@@ -78,9 +114,10 @@ impl Tool for FetchPageTool {
     type Output = PageContent;
 
     fn description(&self) -> String {
-        "Fetch a web page and return its readable text plus its links. Use it \
-         to open a retailer listing/search page or a product page and extract \
-         direct product links and prices."
+        "Fetch a web page and return its readable text, its links, and what \
+         its markup says about stock ('out of stock' / 'in stock' / null when \
+         the page does not say). Use it to open a retailer listing/product \
+         page and extract direct product links and prices."
             .to_string()
     }
 
@@ -122,6 +159,7 @@ impl Tool for FetchPageTool {
 }
 
 fn extract_page(html: &str, base: &Url) -> PageContent {
+    let availability = availability(html);
     let without_scripts = strip_tag_blocks(&strip_tag_blocks(html, "script"), "style");
     let links = extract_links(&without_scripts, base);
     let full_text = collapse_ws(&decode_entities(&strip_tags(&without_scripts)));
@@ -131,7 +169,7 @@ fn extract_page(html: &str, base: &Url) -> PageContent {
     } else {
         full_text
     };
-    PageContent { text, truncated, links }
+    PageContent { text, truncated, links, availability }
 }
 
 /// Remove `<tag ...>...</tag>` blocks wholesale (for script/style, whose
@@ -332,6 +370,31 @@ mod tests {
         assert!(page.text.contains("Widget"));
         assert_eq!(page.links.len(), 1);
         assert!(page.links[0].url.ends_with("/p/2"));
+    }
+
+    #[test]
+    fn availability_comes_from_markup_not_from_prose() {
+        // Shape of the real bol.com page that prompted this: JSON-LD says the
+        // product is gone, while the visible text is dominated by the
+        // recommendations carousel saying the opposite.
+        let bol = r##"<html><body>
+            <script type="application/ld+json">{"@type":"Product","name":"Ariel Professional",
+            "offers":{"@type":"Offer","availability":"OutOfStock"},"@context":"https://schema.org/"}</script>
+            <p>Niet leverbaar</p>
+            <div class="carousel">In winkelwagen<span>Op voorraad</span>In winkelwagen</div>
+            </body></html>"##;
+        let page = extract_page(bol, &Url::parse("https://www.bol.com/nl/nl/p/x/123/").unwrap());
+        assert_eq!(page.availability, Some("out of stock"));
+        // the JSON-LD itself must not leak into the readable text
+        assert!(!page.text.contains("OutOfStock"), "got: {}", page.text);
+
+        let in_stock = r#"<html><body><link itemprop="availability" href="https://schema.org/InStock"/></body></html>"#;
+        assert_eq!(availability(in_stock), Some("in stock"));
+
+        // A page carrying both (several offers) is unknown, not a guess.
+        assert_eq!(availability(r#"{"availability":"OutOfStock"}{"availability":"InStock"}"#), None);
+        // Dutch prose alone proves nothing — that is what the carousel showed.
+        assert_eq!(availability("<p>Niet leverbaar, uitverkocht</p>"), None);
     }
 
     #[tokio::test]

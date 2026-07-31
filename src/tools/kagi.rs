@@ -200,6 +200,11 @@ impl Tool for KagiSearchTool {
             )));
         }
         queries.truncate(granted);
+        tracing::debug!(
+            queries = granted,
+            budget_left = self.budget.remaining(),
+            "kagi search"
+        );
 
         // One language: keep the old depth. Several: less from each, since
         // the merged list is what the model reads.

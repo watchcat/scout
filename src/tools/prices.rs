@@ -109,6 +109,13 @@ struct Ranked {
 /// imprecise. The messages are instructions to the model, not diagnostics.
 fn validate(args: &CompareArgs) -> Result<(), PriceCompareError> {
     let bad = |m: String| Err(PriceCompareError(m));
+    if args.unit_name.trim().is_empty() {
+        return bad(
+            "unit_name is empty — pass what one unit is (blade, gram, litre, piece); it is \
+             printed next to every price"
+                .to_string(),
+        );
+    }
     if args.offers.is_empty() {
         return bad("give at least one offer to compare".to_string());
     }
@@ -589,6 +596,11 @@ mod tests {
         let no_url = compare(&args(vec![Offer { url: "  ".to_string(), ..offer("bad", 1.0, 1, None) }]))
             .unwrap_err();
         assert!(no_url.to_string().contains("url"), "got: {no_url}");
+
+        // Otherwise the reply reads "€10.72 per ".
+        let blank_unit =
+            compare(&args_in("  ", vec![offer("ok", 1.0, 1, Some(0.0))])).unwrap_err();
+        assert!(blank_unit.to_string().contains("unit_name"), "got: {blank_unit}");
     }
 
     #[test]

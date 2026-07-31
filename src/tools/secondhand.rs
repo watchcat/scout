@@ -287,7 +287,7 @@ mod tests {
             .await;
 
         let out = tool(&server, &["ebay.com", "vinted.com"])
-            .call(SearchArgs { query: "bike".into() })
+            .call(SearchArgs { query: "bike".into(), also_queries: Vec::new() })
             .await
             .unwrap();
 
@@ -318,7 +318,7 @@ mod tests {
             .await;
 
         let out = tool(&server, &["good.com", "bad.com"])
-            .call(SearchArgs { query: "widget".into() })
+            .call(SearchArgs { query: "widget".into(), also_queries: Vec::new() })
             .await
             .unwrap();
 
@@ -355,7 +355,7 @@ mod tests {
             .await;
 
         let out = tool(&server, &["vinted.com"])
-            .call(SearchArgs { query: "s25 ultra".into() })
+            .call(SearchArgs { query: "s25 ultra".into(), also_queries: Vec::new() })
             .await
             .unwrap();
 
@@ -386,7 +386,7 @@ mod tests {
             .await;
 
         let out = tool(&server, &["ebay.com"])
-            .call(SearchArgs { query: "widget".into() })
+            .call(SearchArgs { query: "widget".into(), also_queries: Vec::new() })
             .await
             .unwrap();
 
@@ -434,7 +434,7 @@ mod tests {
             "EBAY_NL".into(),
             server.uri(),
         ));
-        let out = t.call(SearchArgs { query: "hub".into() }).await.unwrap();
+        let out = t.call(SearchArgs { query: "hub".into(), also_queries: Vec::new() }).await.unwrap();
 
         assert_eq!(out[0].platform, "ebay.nl");
         assert_eq!(out[0].results.len(), 1);
@@ -463,7 +463,7 @@ mod tests {
         // would 404 and produce an error field.
 
         let out = tool(&server, &["marktplaats.nl"])
-            .call(SearchArgs { query: "hub".into() })
+            .call(SearchArgs { query: "hub".into(), also_queries: Vec::new() })
             .await
             .unwrap();
 

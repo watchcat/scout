@@ -127,7 +127,18 @@ use serde_json::json;
 #[derive(Deserialize)]
 pub struct SearchArgs {
     pub query: String,
+    /// Other phrasings of the same search — normally translations into the
+    /// user's local languages. Run concurrently with `query`, so covering
+    /// three languages costs one agent turn, not three.
+    #[serde(default)]
+    pub also_queries: Vec<String>,
 }
+
+/// Queries per search_web call (the main one plus translations).
+const MAX_QUERIES: usize = 3;
+/// Merged result cap: enough to compare on, small enough to keep the model's
+/// context readable.
+const MERGED_LIMIT: usize = 12;
 
 pub struct KagiSearchTool(pub KagiClient);
 
@@ -139,7 +150,10 @@ impl Tool for KagiSearchTool {
 
     fn description(&self) -> String {
         "Search the web. Returns result titles, URLs and snippets. \
-         Use for finding products, shops, prices and reviews."
+         Use for finding products, shops, prices and reviews. Pass \
+         translations of your query in also_queries to reach local shops — \
+         they are searched in parallel and the results are merged, so it \
+         costs no extra steps."
             .to_string()
     }
 
@@ -147,14 +161,60 @@ impl Tool for KagiSearchTool {
         json!({
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "web search query"}
+                "query": {"type": "string", "description": "web search query"},
+                "also_queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "up to 2 translations of the same query into the user's \
+                                    search languages, e.g. ['vloeibaar wasmiddel kleur', \
+                                    'Flüssigwaschmittel Color'] — translate the product \
+                                    terms, do not just copy the English words"
+                }
             },
             "required": ["query"]
         })
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        self.0.search(&args.query, 10).await
+        let mut queries = vec![args.query.trim().to_string()];
+        for q in &args.also_queries {
+            let q = q.trim().to_string();
+            if !q.is_empty() && !queries.contains(&q) && queries.len() < MAX_QUERIES {
+                queries.push(q);
+            }
+        }
+        // One language: keep the old depth. Several: less from each, since
+        // the merged list is what the model reads.
+        let per_query = if queries.len() == 1 { 10 } else { 6 };
+        let answers =
+            futures::future::join_all(queries.iter().map(|q| self.0.search(q, per_query))).await;
+
+        let mut merged: Vec<SearchResult> = Vec::new();
+        let mut first_error = None;
+        for answer in answers {
+            match answer {
+                // Results arrive in query order, so the user's own phrasing
+                // wins any duplicate URL.
+                Ok(results) => {
+                    for r in results {
+                        if !merged.iter().any(|m| m.url == r.url) {
+                            merged.push(r);
+                        }
+                    }
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            // A translation failing is not worth losing the results we have.
+            Some(e) if merged.is_empty() => Err(e),
+            _ => {
+                merged.truncate(MERGED_LIMIT);
+                Ok(merged)
+            }
+        }
     }
 }
 
@@ -286,10 +346,90 @@ mod tests {
             .await;
 
         let tool = KagiSearchTool(client(&server).await);
-        let out = tool.call(SearchArgs { query: "x".into() }).await.unwrap();
+        let out = tool
+            .call(SearchArgs { query: "x".into(), also_queries: Vec::new() })
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert!(!tool.description().is_empty());
         assert_eq!(KagiSearchTool::NAME, "kagi_search");
+    }
+
+    #[tokio::test]
+    async fn translated_queries_run_in_parallel_and_merge() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "laundry detergent", "limit": 6})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": [
+                {"title": "EN shop", "url": "https://a.example", "snippet": ""},
+                {"title": "shared", "url": "https://shared.example", "snippet": "english"}
+            ]}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "wasmiddel", "limit": 6})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": [
+                {"title": "shared", "url": "https://shared.example", "snippet": "dutch"},
+                {"title": "bol.com", "url": "https://bol.example", "snippet": ""}
+            ]}})))
+            .mount(&server)
+            .await;
+
+        let out = KagiSearchTool(client(&server).await)
+            .call(SearchArgs {
+                query: "laundry detergent".into(),
+                also_queries: vec!["wasmiddel".into(), "  ".into()],
+            })
+            .await
+            .unwrap();
+
+        // merged, deduped by url, and the user's own phrasing wins the dupe
+        assert_eq!(
+            out.iter().map(|r| r.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://a.example", "https://shared.example", "https://bol.example"]
+        );
+        assert_eq!(out[1].snippet, "english");
+    }
+
+    #[tokio::test]
+    async fn a_failing_translation_does_not_sink_the_search() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "ok", "limit": 6})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": [
+                {"title": "T", "url": "https://u", "snippet": ""}
+            ]}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "boom", "limit": 6})))
+            .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
+            .mount(&server)
+            .await;
+
+        let tool = KagiSearchTool(client(&server).await);
+        let out = tool
+            .call(SearchArgs { query: "ok".into(), also_queries: vec!["boom".into()] })
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+
+        // but when every query fails the model must see the error
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": "kaboom", "limit": 6})))
+            .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let err = tool
+            .call(SearchArgs { query: "boom".into(), also_queries: vec!["kaboom".into()] })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KagiError::Api { status: 500, .. }), "got: {err}");
     }
 
     #[test]

@@ -55,6 +55,15 @@ and confirm what you saved.
 - Use kagi_search for general product searches. Use search_secondhand when the \
 user wants used items or second-hand is a sensible option (electronics, \
 furniture, bikes, tools...).
+- Local shops rank on local terms, so a product search must cover the search \
+languages listed for this user below. Put the translated queries in \
+kagi_search's also_queries (up to 2) - they run in parallel with the main \
+query in ONE call and the results come back merged, so this costs no extra \
+steps. Translate the product terms properly: 'laundry detergent' is \
+'wasmiddel' in Dutch and 'Waschmittel' in German; copying English words into \
+a Dutch query finds nothing. When the user asks to search in different \
+languages, save the FULL list with remember_fact under search_languages; \
+forget_fact returns to the delivery country's language.
 - Search results often include retailer search/listing pages (URLs containing \
 /s/?, /search, ?q=, ?searchtext=). NEVER present those as a product link. Open \
 a promising listing or product page with fetch_page and take the direct \
@@ -147,6 +156,77 @@ pub async fn continues_previous(
 /// Cap on injected profile facts, bounding prompt growth.
 const MAX_PROFILE_FACTS: usize = 50;
 
+/// Profile fact holding an explicit search-language list.
+pub const LANGUAGES_FACT_KEY: &str = "search_languages";
+/// Languages per search, English included — one query each, run in parallel.
+const MAX_LANGUAGES: usize = 3;
+
+/// Country token -> language of that country's shops. Only the markets this
+/// bot's users buy from; an unknown country simply means English-only.
+const COUNTRY_LANGUAGES: &[(&str, &str)] = &[
+    ("nl", "Dutch"),
+    ("netherlands", "Dutch"),
+    ("nederland", "Dutch"),
+    ("holland", "Dutch"),
+    ("be", "Dutch"),
+    ("belgium", "Dutch"),
+    ("de", "German"),
+    ("germany", "German"),
+    ("deutschland", "German"),
+    ("at", "German"),
+    ("fr", "French"),
+    ("france", "French"),
+    ("es", "Spanish"),
+    ("spain", "Spanish"),
+    ("it", "Italian"),
+    ("italy", "Italian"),
+    ("pl", "Polish"),
+    ("poland", "Polish"),
+];
+
+/// Languages this user's product searches should cover, English first.
+///
+/// An explicit `search_languages` fact wins; otherwise the delivery country
+/// decides, because local shops rank on local terms — searching "laundry
+/// detergent" barely surfaces bol.com, "wasmiddel" does.
+pub fn search_languages(facts: &[(String, String)]) -> Vec<String> {
+    let mut langs = vec!["English".to_string()];
+    let mut add = |lang: &str| {
+        let lang = capitalize(lang);
+        if !lang.is_empty() && !langs.contains(&lang) && langs.len() < MAX_LANGUAGES {
+            langs.push(lang);
+        }
+    };
+
+    if let Some((_, value)) = facts.iter().find(|(k, _)| k == LANGUAGES_FACT_KEY) {
+        for lang in value.split([',', ';', '/']) {
+            add(lang.trim());
+        }
+        return langs;
+    }
+
+    for (key, value) in facts.iter().filter(|(k, _)| k.starts_with("delivery_")) {
+        for token in value.split(|c: char| !c.is_alphabetic()) {
+            if let Some((_, lang)) = COUNTRY_LANGUAGES
+                .iter()
+                .find(|(c, _)| *c == token.to_lowercase())
+            {
+                add(lang);
+            }
+        }
+        let _ = key;
+    }
+    langs
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.trim().chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars.flat_map(|c| c.to_lowercase())).collect(),
+        None => String::new(),
+    }
+}
+
 /// The system prompt plus the user's long-term profile. Injecting facts here
 /// (instead of behind a recall tool) means the agent can never forget to
 /// check them.
@@ -158,6 +238,10 @@ pub fn preamble_with_profile(facts: &[(String, String)]) -> String {
             p.push_str(&format!("- {key}: {value}\n"));
         }
     }
+    p.push_str(&format!(
+        "\nSearch languages for this user: {}.\n",
+        search_languages(facts).join(", ")
+    ));
     p
 }
 
@@ -200,7 +284,10 @@ mod tests {
     #[test]
     fn profile_is_appended_when_present() {
         let plain = preamble_with_profile(&[]);
-        assert_eq!(plain, PREAMBLE);
+        assert!(plain.starts_with(PREAMBLE));
+        // with nothing known, the only search language is English
+        assert!(plain.contains("Search languages for this user: English."));
+        assert!(!plain.contains("long-term profile"));
 
         let facts = vec![
             ("delivery_country".to_string(), "NL".to_string()),
@@ -210,5 +297,54 @@ mod tests {
         assert!(with.starts_with(PREAMBLE));
         assert!(with.contains("- delivery_country: NL"));
         assert!(with.contains("- shoe_size: 44"));
+    }
+
+    fn facts(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn search_languages_come_from_the_delivery_country() {
+        assert_eq!(
+            search_languages(&facts(&[("delivery_country", "NL")])),
+            vec!["English", "Dutch"]
+        );
+        // the other user's profile stores a city, not a country
+        assert_eq!(
+            search_languages(&facts(&[("delivery_city", "Hilversum, NL")])),
+            vec!["English", "Dutch"]
+        );
+        assert_eq!(
+            search_languages(&facts(&[("delivery_country", "Germany")])),
+            vec!["English", "German"]
+        );
+        // nothing known, or a country we have no mapping for: English only
+        assert_eq!(search_languages(&[]), vec!["English"]);
+        assert_eq!(
+            search_languages(&facts(&[("delivery_country", "JP")])),
+            vec!["English"]
+        );
+    }
+
+    #[test]
+    fn explicit_search_languages_fact_wins_and_is_capped() {
+        assert_eq!(
+            search_languages(&facts(&[
+                ("delivery_country", "NL"),
+                ("search_languages", "dutch, GERMAN"),
+            ])),
+            vec!["English", "Dutch", "German"]
+        );
+        // English is always there, duplicates and overflow are dropped
+        assert_eq!(
+            search_languages(&facts(&[("search_languages", "english, dutch, german, french")])),
+            vec!["English", "Dutch", "German"]
+        );
+    }
+
+    #[test]
+    fn profile_block_states_the_search_languages() {
+        let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]));
+        assert!(p.contains("Search languages for this user: English, Dutch."), "got: {p}");
     }
 }

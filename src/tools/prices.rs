@@ -226,10 +226,21 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
         ));
     }
     if !bulk_advantage {
-        notes.push(
-            "no bulk option beats buying one — tell the user that instead of inventing a second pick"
-                .to_string(),
-        );
+        // best_single is the cheapest of the smallest pack size available,
+        // which is not always one unit — do not let the reply call a 3-pack a
+        // one-off.
+        notes.push(if best_single.units == 1 {
+            "no bulk option beats buying one — tell the user that instead of inventing a second \
+             pick"
+                .to_string()
+        } else {
+            let n = best_single.units;
+            format!(
+                "no bulk option beats the cheapest {n}-pack, and no single unit is on offer here \
+                 — call the pick the cheapest {n}-pack, not a one-off, and do not invent a second \
+                 pick"
+            )
+        });
     }
 
     Ok(Comparison {
@@ -478,6 +489,28 @@ mod tests {
         .unwrap();
         assert!(!tie.bulk_advantage);
         assert_eq!(tie.saving_vs_single_pct, 0);
+    }
+
+    #[test]
+    fn no_bulk_note_names_the_smallest_pack_when_no_single_is_available() {
+        // The only offer with known shipping is a 3-pack, so best_single is a
+        // 3-pack; "no bulk option beats buying one" describes a purchase that
+        // was never on the table.
+        let out = compare(&args(vec![
+            offer("single", 5.0, 1, None),
+            offer("3-pack", 20.0, 3, Some(2.0)),
+        ]))
+        .unwrap();
+
+        assert_eq!(out.best_single.title, "3-pack");
+        assert_eq!(out.best_single.units, 3);
+        assert!(!out.bulk_advantage);
+        assert!(!out.notes.iter().any(|n| n.contains("buying one")), "got: {:?}", out.notes);
+        assert!(
+            out.notes.iter().any(|n| n.contains("no bulk option") && n.contains("3-pack")),
+            "got: {:?}",
+            out.notes
+        );
     }
 
     #[test]

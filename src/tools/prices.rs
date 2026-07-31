@@ -214,7 +214,7 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
     let best_single = best_single.row.clone();
     let best_per_unit = best_per_unit.row.clone();
 
-    let rows: Vec<Row> = ranked.iter().map(|r| r.row.clone()).collect();
+    let rows: Vec<Row> = ranked.into_iter().map(|r| r.row).collect();
 
     let mut notes = Vec::new();
     let unknown = rows.len() - rows.iter().filter(|r| r.shipping_known).count();
@@ -362,7 +362,10 @@ mod tests {
         // Both bags round to 0.00 per gram; the cheaper one must still win.
         let out = compare(&args_in(
             "gram",
-            vec![offer("bag-4eur", 4.00, 1000, Some(0.0)), offer("bag-3eur", 3.00, 1000, Some(0.0))],
+            vec![
+                offer("bag-4eur", 4.00, 1000, Some(0.0)),
+                offer("bag-3eur", 3.00, 1000, Some(0.0)),
+            ],
         ))
         .unwrap();
 
@@ -377,7 +380,10 @@ mod tests {
         // 0.009 vs 0.0072 per sheet: both round to 0.01, the box is 20% cheaper.
         let out = compare(&args_in(
             "sheet",
-            vec![offer("A4 500", 4.50, 500, Some(0.0)), offer("A4 2500 box", 18.00, 2500, Some(0.0))],
+            vec![
+                offer("A4 500", 4.50, 500, Some(0.0)),
+                offer("A4 2500 box", 18.00, 2500, Some(0.0)),
+            ],
         ))
         .unwrap();
 
@@ -396,7 +402,8 @@ mod tests {
             url: "https://shop.example/p".to_string(),
             ..offer(title, price, units, Some(0.0))
         };
-        let out = compare(&args(vec![same_url("single", 10.0, 1), same_url("3-pack", 15.0, 3)])).unwrap();
+        let out =
+            compare(&args(vec![same_url("single", 10.0, 1), same_url("3-pack", 15.0, 3)])).unwrap();
 
         assert_eq!(out.best_single.title, "single");
         assert_eq!(out.best_per_unit.title, "3-pack");

@@ -3,6 +3,7 @@ pub mod fetch;
 pub mod kagi;
 pub mod marktplaats;
 pub mod memory;
+pub mod prices;
 pub mod purchases;
 pub mod reminders;
 pub mod secondhand;

@@ -269,8 +269,10 @@ impl Tool for ComparePricesTool {
         "Rank product offers by real cost: landed price (item + shipping) and \
          price per unit. Call it ONCE with every candidate offer when the user \
          asks for the cheapest option or the best price. Returns the cheapest \
-         way to buy one (best_single), the best price per unit (best_per_unit, \
-         usually a multipack), a ranked table and notes. Use its numbers \
+         way to buy the smallest pack in the set (best_single — that is not \
+         necessarily one unit, check its units field before calling it a \
+         one-off), the best price per unit (best_per_unit, usually a \
+         multipack), a ranked table and notes. Use its numbers \
          verbatim — do not recompute them. Omit shipping for an offer when the \
          page does not state it; never guess it."
             .to_string()
@@ -297,7 +299,10 @@ impl Tool for ComparePricesTool {
                             "currency": {"type": "string", "description": "e.g. EUR"},
                             "units": {
                                 "type": "integer",
-                                "description": "how many units the listing contains (3 for a 3-pack); default 1"
+                                "description": "how many unit_name this listing contains in total \
+                                    — a 3-pack of blades is 3; with unit_name=gram a 500 g bag is \
+                                    500; a box of 4 packs of 5 blades is 20. Every offer in the \
+                                    call must count in the same unit. Default 1"
                             },
                             "shipping": {
                                 "type": "number",
@@ -584,6 +589,23 @@ mod tests {
         let no_url = compare(&args(vec![Offer { url: "  ".to_string(), ..offer("bad", 1.0, 1, None) }]))
             .unwrap_err();
         assert!(no_url.to_string().contains("url"), "got: {no_url}");
+    }
+
+    #[test]
+    fn model_facing_text_ties_units_to_unit_name_and_explains_best_single() {
+        let params = ComparePricesTool.parameters();
+        let units = params["properties"]["offers"]["items"]["properties"]["units"]["description"]
+            .as_str()
+            .expect("units has a description");
+        // Without this the model sends units=1 for a 500 g bag and units=500
+        // for the next one, and the tool cannot detect the mix.
+        assert!(units.contains("unit_name"), "got: {units}");
+        assert!(units.contains("500"), "got: {units}");
+        assert!(units.contains("same unit"), "got: {units}");
+
+        // best_single is the smallest pack available, not necessarily one.
+        let description = ComparePricesTool.description();
+        assert!(description.contains("smallest pack"), "got: {description}");
     }
 
     #[tokio::test]

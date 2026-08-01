@@ -3,6 +3,7 @@ mod bot;
 mod config;
 mod draft;
 mod links;
+mod progress;
 mod scheduler;
 mod stats;
 mod store;

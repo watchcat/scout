@@ -1,10 +1,14 @@
 use crate::agent::{build_agent, AgentDeps, HISTORY_CAP};
 use crate::config::Config;
 use crate::draft::{resolve_draft, DraftResolution};
+use crate::progress::Live;
 use crate::text::{split_message, strip_thinking, TELEGRAM_LIMIT};
 use crate::vision::describe_photo;
 use dashmap::DashMap;
+use futures::StreamExt;
+use rig::agent::MultiTurnStreamItem;
 use rig::completion::{Chat, Message as LlmMessage};
+use rig::streaming::{StreamedAssistantContent, StreamingChat};
 use std::sync::Arc;
 use teloxide::net::Download;
 use teloxide::prelude::*;
@@ -291,8 +295,9 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
 
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
-    match run_agent(&app, user_id, chat_id.0, &prompt).await {
-        Ok(reply) => send_chunked(&bot, &app, chat_id, &reply).await?,
+    let mut live = Live::new(bot.clone(), chat_id);
+    match run_agent(&app, &mut live, user_id, chat_id.0, &prompt).await {
+        Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "agent request failed");
             bot.send_message(chat_id, agent_error_message(&e)).await?;
@@ -457,8 +462,9 @@ async fn handle_reaction(
          short numbered list and ask which one to save. Do NOT call \
          record_purchase until they confirm."
     );
-    match run_agent(&app, user_id, chat_id.0, &prompt).await {
-        Ok(reply) => send_chunked(&bot, &app, chat_id, &reply).await?,
+    let mut live = Live::new(bot.clone(), chat_id);
+    match run_agent(&app, &mut live, user_id, chat_id.0, &prompt).await {
+        Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "reaction follow-up failed");
         }
@@ -488,8 +494,13 @@ async fn download_photo(
 /// Runs the agent against a snapshot of this chat's history, then writes the
 /// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
 /// from being held across awaits.
+///
+/// The run is streamed: `live` shows which tool is running and then the
+/// answer as it is written, because the tool calls alone take most of a
+/// minute and an idle chat looks broken.
 async fn run_agent(
     app: &App,
+    live: &mut Live,
     user_id: i64,
     chat_id: i64,
     prompt: &str,
@@ -505,7 +516,45 @@ async fn run_agent(
         .map(|c| c.history.clone())
         .unwrap_or_default();
 
-    let mut reply = strip_thinking(&agent.chat(prompt, &mut history).await?);
+    let mut streamed = String::new();
+    let mut final_response = None;
+    {
+        let mut stream = agent.stream_chat(prompt, history.clone()).await;
+        while let Some(item) = stream.next().await {
+            match item? {
+                MultiTurnStreamItem::ToolExecutionStart { tool_call, .. } => {
+                    let args = &tool_call.function.arguments;
+                    live.show(&crate::progress::describe(&tool_call.function.name, args), false)
+                        .await;
+                }
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
+                    streamed.push_str(&t.text);
+                    // Unclosed <think> blocks render as nothing, so the
+                    // model's reasoning never reaches the chat.
+                    live.show(&strip_thinking(&streamed), false).await;
+                }
+                MultiTurnStreamItem::FinalResponse(res) => {
+                    final_response = Some(res);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // The streamed deltas are the answer; the final response is the
+    // authority on both the text and the history to keep.
+    let (text, new_history) = match final_response {
+        Some(res) => (res.output().to_string(), res.messages().map(|m| m.to_vec())),
+        None => (streamed.clone(), None),
+    };
+    if let Some(h) = new_history {
+        history = h;
+    }
+    let mut reply = strip_thinking(&text);
+    if reply.is_empty() {
+        reply = strip_thinking(&streamed);
+    }
 
     // Guard against links the model wrote but never saw: an invented Amazon
     // /dp/<ASIN> URL reads as a real product page and answers 404. One repair
@@ -568,15 +617,33 @@ fn copy_draft_markup(draft: &str) -> InlineKeyboardMarkup {
     )]])
 }
 
+/// Puts the finished answer where the progress message already is: the first
+/// chunk replaces it, any remainder follows as new messages. Every chunk is
+/// remembered so a later 👍 resolves to its text.
+async fn deliver(
+    bot: &Bot,
+    app: &App,
+    live: &mut Live,
+    chat_id: ChatId,
+    text: &str,
+) -> ResponseResult<()> {
+    let mut chunks = split_message(text, TELEGRAM_LIMIT).into_iter();
+    let Some(first) = chunks.next() else {
+        live.show("(no answer - please try again)", true).await;
+        return Ok(());
+    };
+    live.show(&first, true).await;
+    if let Some(id) = live.message_id() {
+        app.chats.entry(chat_id.0).or_default().remember_reply(id.0, live.shown());
+    }
+    send_chunked(bot, app, chat_id, &chunks.collect::<Vec<_>>().join("\n")).await
+}
+
 /// Send in <=4096-char chunks; each chunk gets one retry. Sent chunks are
 /// remembered per chat so a later reaction on one can be resolved to its
 /// text.
 async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> ResponseResult<()> {
     let chunks = split_message(text, TELEGRAM_LIMIT);
-    if chunks.is_empty() {
-        bot.send_message(chat_id, "(no answer - please try again)").await?;
-        return Ok(());
-    }
     for chunk in chunks {
         let sent = match bot.send_message(chat_id, chunk.clone()).await {
             Ok(sent) => sent,

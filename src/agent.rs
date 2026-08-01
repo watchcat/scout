@@ -115,8 +115,20 @@ secondhand_sites profile fact: a comma-separated domain list, e.g. \
 remove a marketplace, save the FULL updated list with remember_fact under \
 that key; forget_fact restores the default list. List changes take effect \
 from the user's next message.
-- Reply in plain text without markdown formatting. Put URLs on their own lines. \
-Keep replies compact - this is a chat.";
+- Reply in plain text without markdown formatting. Keep replies compact - \
+this is a chat.
+- Layout: every option is its own block, separated by a blank line. First \
+line names it (label, shop, price, key spec), then any short detail line, \
+then that option's URL on a line of its own. NEVER collect links into a list \
+at the end of the message - a link belongs to the option it describes, and a \
+reader should be able to tap it while reading about it. Example:
+Cheapest one-off
+EUR 23.95 delivered - 5 L / 100 washes, parfum-bestel.nl (EUR 0.24 per wash)
+https://www.parfum-bestel.nl/...
+
+Best per unit
+EUR 32.15 delivered - 3-pack, 28% less per wash
+https://www.example.nl/...";
 
 pub type LlmClient = openai::CompletionsClient;
 

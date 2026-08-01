@@ -7,11 +7,33 @@
 
 use std::time::{Duration, Instant};
 use teloxide::prelude::*;
-use teloxide::types::MessageId;
+use teloxide::types::{MessageId, ParseMode};
 
 /// Telegram rate-limits edits; this is comfortably under what it tolerates
 /// while still feeling live.
 const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(1200);
+/// How much of the model's reasoning to keep on screen. It runs to
+/// paragraphs; the newest sentence or two is the part worth reading.
+const THINKING_TAIL: usize = 220;
+
+/// The last `max` characters, cut at a word boundary and marked with a
+/// leading ellipsis when anything was dropped.
+fn tail(text: &str, max: usize) -> String {
+    let text = text.trim();
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().skip(count - max).collect();
+    let cut = cut.split_once(' ').map(|(_, rest)| rest).unwrap_or(&cut);
+    format!("…{}", cut.trim_start())
+}
+
+/// Telegram's HTML parse mode needs these three escaped; anything else in a
+/// reasoning trace is literal.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
 
 /// One Telegram message, repeatedly rewritten.
 pub struct Live {
@@ -43,6 +65,17 @@ impl Live {
     /// land). Failures are logged, never fatal: losing a progress frame must
     /// not lose the answer.
     pub async fn show(&mut self, text: &str, force: bool) {
+        self.render(text, force, None).await
+    }
+
+    /// The model's reasoning, in italics — it is worth watching while the
+    /// search runs, but it must never read as part of the answer.
+    pub async fn show_thinking(&mut self, text: &str) {
+        let text = tail(text, THINKING_TAIL);
+        self.render(&text, false, Some(format!("<i>💭 {}</i>", escape_html(&text)))).await
+    }
+
+    async fn render(&mut self, text: &str, force: bool, html: Option<String>) {
         let text = text.trim();
         if text.is_empty() || text == self.shown {
             return;
@@ -53,17 +86,19 @@ impl Live {
         // Long answers are chunked by the caller; a frame that overflows is
         // clipped rather than dropped.
         let text: String = text.chars().take(crate::text::TELEGRAM_LIMIT).collect();
+        let body = html.clone().unwrap_or_else(|| text.clone());
+        let parse_mode = html.is_some().then_some(ParseMode::Html);
         let sent = match self.message {
-            Some(id) => self
-                .bot
-                .edit_message_text(self.chat_id, id, text.clone())
-                .await
-                .map(|m| m.id),
-            None => self
-                .bot
-                .send_message(self.chat_id, text.clone())
-                .await
-                .map(|m| m.id),
+            Some(id) => {
+                let mut req = self.bot.edit_message_text(self.chat_id, id, body);
+                req.parse_mode = parse_mode;
+                req.await.map(|m| m.id)
+            }
+            None => {
+                let mut req = self.bot.send_message(self.chat_id, body);
+                req.parse_mode = parse_mode;
+                req.await.map(|m| m.id)
+            }
         };
         match sent {
             Ok(id) => {
@@ -165,6 +200,23 @@ mod tests {
         assert_eq!(describe("fetch_page", &json!({"url": "not a url"})), "📄 opening a page");
         assert_eq!(describe("compare_prices", &json!({})), "🧮 comparing prices");
         assert_eq!(describe("brand_new_tool", &json!(null)), "⚙️ brand_new_tool");
+    }
+
+    #[test]
+    fn thinking_is_tailed_at_a_word_boundary_and_html_safe() {
+        assert_eq!(tail("short thought", 220), "short thought");
+
+        let long = "a".repeat(200) + " and then the newest part of the reasoning";
+        let cut = tail(&long, 30);
+        assert!(cut.starts_with('…'), "got: {cut}");
+        assert!(cut.ends_with("newest part of the reasoning"), "got: {cut}");
+        assert!(!cut.contains("aaa"), "the old part is gone: {cut}");
+
+        // A reasoning trace quoting markup must not become markup itself.
+        assert_eq!(
+            escape_html("compare <b>5 L</b> & 3 L > 1 L"),
+            "compare &lt;b&gt;5 L&lt;/b&gt; &amp; 3 L &gt; 1 L"
+        );
     }
 
     #[test]

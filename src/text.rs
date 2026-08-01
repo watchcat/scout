@@ -3,7 +3,35 @@ pub const TELEGRAM_LIMIT: usize = 4096;
 /// Remove `<think>`/`<thinking>` blocks that reasoning models (MiniMax M3)
 /// sometimes emit inline in their output. An unclosed trailing block is
 /// dropped to the end of the string. Case-insensitive; result is trimmed.
+///
+/// Orphan closers are stripped too: when the provider streams reasoning on
+/// its own channel, the text channel can begin with a bare `</think>` whose
+/// opener was never in it.
 pub fn strip_thinking(s: &str) -> String {
+    let stripped = strip_thinking_blocks(s);
+    let mut out = stripped.as_str();
+    let mut cleaned = String::with_capacity(stripped.len());
+    loop {
+        let lower = out.to_ascii_lowercase();
+        let orphan = ["</thinking>", "</think>", "<thinking>", "<think>"]
+            .iter()
+            .filter_map(|t| lower.find(t).map(|i| (i, t.len())))
+            .min_by_key(|&(i, len)| (i, std::cmp::Reverse(len)));
+        match orphan {
+            Some((i, len)) => {
+                cleaned.push_str(&out[..i]);
+                out = &out[i + len..];
+            }
+            None => {
+                cleaned.push_str(out);
+                break;
+            }
+        }
+    }
+    cleaned.trim().to_string()
+}
+
+fn strip_thinking_blocks(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     loop {
@@ -85,6 +113,19 @@ mod tests {
     #[test]
     fn strip_thinking_drops_unclosed_trailing_block() {
         assert_eq!(strip_thinking("good query <think>and then it ramble"), "good query");
+    }
+
+    #[test]
+    fn strip_thinking_removes_orphan_closers() {
+        // What MiniMax actually streamed once reasoning moved to its own
+        // channel: closers with no opener, one per model turn.
+        assert_eq!(
+            strip_thinking("</think>\n\n</think>\n\nI need to clarify which products."),
+            "I need to clarify which products."
+        );
+        assert_eq!(strip_thinking("</thinking>answer"), "answer");
+        // a stray opener with nothing after it leaves nothing behind
+        assert_eq!(strip_thinking("<think>"), "");
     }
 
     #[test]

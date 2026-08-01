@@ -517,6 +517,8 @@ async fn run_agent(
         .unwrap_or_default();
 
     let mut streamed = String::new();
+    // Reasoning arrives on its own channel, separate from the answer text.
+    let mut thinking = String::new();
     let mut final_response = None;
     {
         let mut stream = agent.stream_chat(prompt, history.clone()).await;
@@ -529,9 +531,35 @@ async fn run_agent(
                 }
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
                     streamed.push_str(&t.text);
-                    // Unclosed <think> blocks render as nothing, so the
-                    // model's reasoning never reaches the chat.
-                    live.show(&strip_thinking(&streamed), false).await;
+                    // Unclosed <think> blocks render as nothing, so inline
+                    // reasoning never reaches the chat as answer text.
+                    let answer = strip_thinking(&streamed);
+                    if !answer.is_empty() {
+                        live.show(&answer, false).await;
+                    }
+                }
+                // MiniMax streams its reasoning on a separate channel. Shown
+                // in italics while it works, replaced by the answer after.
+                MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. },
+                ) => {
+                    thinking.push_str(&reasoning);
+                    if strip_thinking(&streamed).is_empty() {
+                        live.show_thinking(&thinking).await;
+                    }
+                }
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
+                    r,
+                )) => {
+                    for block in &r.content {
+                        if let rig::completion::message::ReasoningContent::Text { text, .. } = block
+                        {
+                            thinking.push_str(text);
+                        }
+                    }
+                    if strip_thinking(&streamed).is_empty() {
+                        live.show_thinking(&thinking).await;
+                    }
                 }
                 MultiTurnStreamItem::FinalResponse(res) => {
                     final_response = Some(res);

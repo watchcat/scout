@@ -51,9 +51,22 @@ async fn main() -> Result<()> {
         tools::marktplaats::MARKTPLAATS_BASE.to_string(),
     );
 
+    let perplexity = cfg.perplexity_api_key.clone().map(|key| {
+        tools::perplexity::PerplexityClient::new(
+            http.clone(),
+            key,
+            tools::perplexity::PERPLEXITY_API_BASE.to_string(),
+        )
+    });
+    tracing::info!(
+        perplexity = perplexity.is_some(),
+        "second search engine (Kagi always on)"
+    );
+
     let deps = AgentDeps {
         llm,
         kagi,
+        perplexity,
         http,
         ebay,
         marktplaats,

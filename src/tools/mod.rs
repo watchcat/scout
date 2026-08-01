@@ -4,6 +4,7 @@ pub mod fetch;
 pub mod kagi;
 pub mod marktplaats;
 pub mod memory;
+pub mod perplexity;
 pub mod prices;
 pub mod purchases;
 pub mod reminders;

@@ -7,6 +7,8 @@ pub struct Config {
     pub allowed_user_ids: HashSet<i64>,
     pub minimax_api_key: String,
     pub kagi_api_key: String,
+    /// Perplexity Search API key; without it search runs on Kagi alone.
+    pub perplexity_api_key: Option<String>,
     pub db_path: String,
     pub secondhand_sites: Vec<String>,
     /// eBay Browse API credentials; both set or feature disabled.
@@ -47,6 +49,7 @@ impl Config {
             allowed_user_ids,
             minimax_api_key: required("MINIMAX_API_KEY")?,
             kagi_api_key: required("KAGI_API_KEY")?,
+            perplexity_api_key: non_empty("PERPLEXITY_API_KEY"),
             db_path: get("SCOUT_DB_PATH").unwrap_or_else(|| "scout.duckdb".to_string()),
             secondhand_sites,
             ebay_credentials,

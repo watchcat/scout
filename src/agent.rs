@@ -1,7 +1,7 @@
 use crate::store::Store;
 use crate::tools::ebay::EbayClient;
 use crate::tools::fetch::FetchPageTool;
-use crate::tools::kagi::{KagiClient, KagiSearchTool};
+use crate::tools::kagi::{KagiClient, WebSearchTool};
 use crate::tools::marktplaats::MarktplaatsClient;
 use crate::tools::memory::{ForgetFactTool, RememberFactTool};
 use crate::tools::prices::ComparePricesTool;
@@ -52,12 +52,12 @@ monthly, last on 2026-06-28 from Amazon').
 create_reminder ONLY after the user explicitly agrees.
 - When the user mentions having bought something, record it with record_purchase \
 and confirm what you saved.
-- Use kagi_search for general product searches. Use search_secondhand when the \
+- Use search_web for general product searches. Use search_secondhand when the \
 user wants used items or second-hand is a sensible option (electronics, \
 furniture, bikes, tools...).
 - Local shops rank on local terms, so a product search must cover the search \
 languages listed for this user below. Put the translated queries in \
-kagi_search's also_queries (up to 2) - they run in parallel with the main \
+search_web's also_queries (up to 2) - they run in parallel with the main \
 query in ONE call and the results come back merged, so this costs no extra \
 steps. Translate the product terms properly: 'laundry detergent' is \
 'wasmiddel' in Dutch and 'Waschmittel' in German; copying English words into \
@@ -131,6 +131,8 @@ pub fn llm_client(api_key: &str) -> Result<LlmClient> {
 pub struct AgentDeps {
     pub llm: LlmClient,
     pub kagi: KagiClient,
+    /// Second search engine when a key is configured; see WebSearchTool.
+    pub perplexity: Option<crate::tools::perplexity::PerplexityClient>,
     pub http: reqwest::Client,
     pub ebay: Option<EbayClient>,
     pub marktplaats: MarktplaatsClient,
@@ -268,7 +270,11 @@ pub fn build_agent(
     d.llm
         .agent(MODEL)
         .preamble(&preamble_with_profile(facts))
-        .tool(KagiSearchTool { client: d.kagi.clone(), budget: budget.clone() })
+        .tool(WebSearchTool {
+            kagi: d.kagi.clone(),
+            perplexity: d.perplexity.clone(),
+            budget: budget.clone(),
+        })
         .tool(FetchPageTool::new(d.http.clone()))
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),

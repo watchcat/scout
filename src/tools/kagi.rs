@@ -142,14 +142,21 @@ const MAX_QUERIES: usize = 3;
 /// context readable.
 const MERGED_LIMIT: usize = 12;
 
-pub struct KagiSearchTool {
-    pub client: KagiClient,
-    /// Shared with search_secondhand: the cap is on what one request costs.
+/// Web search over both engines we have. They are complementary, not
+/// redundant: on the same Dutch shopping query their results overlapped by
+/// 2 URLs in 20, and the small retailers with the cheap offers were split
+/// between them. Kagi bills per query, Perplexity per request (any number of
+/// queries), so the cheap engine carries the language fan-out.
+pub struct WebSearchTool {
+    pub kagi: KagiClient,
+    pub perplexity: Option<super::perplexity::PerplexityClient>,
+    /// Kagi's allowance, shared with search_secondhand. Perplexity is an
+    /// order of magnitude cheaper and is not counted against it.
     pub budget: std::sync::Arc<super::budget::SearchBudget>,
 }
 
-impl Tool for KagiSearchTool {
-    const NAME: &'static str = "kagi_search";
+impl Tool for WebSearchTool {
+    const NAME: &'static str = "search_web";
     type Error = KagiError;
     type Args = SearchArgs;
     type Output = Vec<SearchResult>;
@@ -189,50 +196,69 @@ impl Tool for KagiSearchTool {
                 queries.push(q);
             }
         }
-        // Translations are the first thing to drop when the allowance is
-        // nearly spent — the user's own phrasing is queries[0].
+        // Kagi bills per query, so translations are the first thing to drop
+        // when the allowance runs low — the user's own phrasing is
+        // queries[0]. A spent budget is not fatal any more: Perplexity keeps
+        // searching, all languages included, for a fraction of the price.
         let granted = self.budget.claim(queries.len());
-        if granted == 0 {
+        tracing::debug!(
+            kagi_queries = granted,
+            budget_left = self.budget.remaining(),
+            perplexity = self.perplexity.is_some(),
+            "web search"
+        );
+        if granted == 0 && self.perplexity.is_none() {
             return Err(KagiError::Budget(format!(
                 "search budget spent ({} queries per request) — answer from the results you \
                  already have instead of searching again",
                 super::budget::QUERIES_PER_REQUEST
             )));
         }
-        queries.truncate(granted);
-        tracing::debug!(
-            queries = granted,
-            budget_left = self.budget.remaining(),
-            "kagi search"
+
+        // One Kagi query: keep the old depth. Several: less from each, since
+        // the merged list is what the model reads. Counted on what the budget
+        // granted, not on what was asked for.
+        let per_query = if granted <= 1 { 10 } else { 6 };
+        let kagi = futures::future::join_all(
+            queries.iter().take(granted).map(|q| self.kagi.search(q, per_query)),
         );
+        let (kagi, perplexity) = match &self.perplexity {
+            Some(p) => {
+                let (k, p) = futures::future::join(kagi, p.search(&queries, MERGED_LIMIT)).await;
+                (k, Some(p))
+            }
+            None => (kagi.await, None),
+        };
 
-        // One language: keep the old depth. Several: less from each, since
-        // the merged list is what the model reads.
-        let per_query = if queries.len() == 1 { 10 } else { 6 };
-        let answers =
-            futures::future::join_all(queries.iter().map(|q| self.client.search(q, per_query)))
-                .await;
-
+        // Kagi first: it carries the user's own phrasing and the small-shop
+        // long tail, and a duplicate URL keeps the first snippet seen.
         let mut merged: Vec<SearchResult> = Vec::new();
         let mut first_error = None;
-        for answer in answers {
-            match answer {
-                // Results arrive in query order, so the user's own phrasing
-                // wins any duplicate URL.
-                Ok(results) => {
-                    for r in results {
-                        if !merged.iter().any(|m| m.url == r.url) {
-                            merged.push(r);
-                        }
-                    }
+        let mut push = |results: Vec<SearchResult>| {
+            for r in results {
+                if !merged.iter().any(|m| m.url == r.url) {
+                    merged.push(r);
                 }
+            }
+        };
+        for answer in kagi {
+            match answer {
+                Ok(results) => push(results),
                 Err(e) => {
                     first_error.get_or_insert(e);
                 }
             }
         }
+        match perplexity {
+            Some(Ok(results)) => push(results),
+            // One engine failing is not worth losing the other's results.
+            Some(Err(e)) => {
+                first_error.get_or_insert(KagiError::Api { status: 0, body: e.to_string() });
+            }
+            None => {}
+        }
+
         match first_error {
-            // A translation failing is not worth losing the results we have.
             Some(e) if merged.is_empty() => Err(e),
             _ => {
                 merged.truncate(MERGED_LIMIT);
@@ -369,14 +395,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = KagiSearchTool { client: client(&server).await, budget: Default::default() };
+        let tool = WebSearchTool { kagi: client(&server).await, perplexity: None, budget: Default::default() };
         let out = tool
             .call(SearchArgs { query: "x".into(), also_queries: Vec::new() })
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
         assert!(!tool.description().is_empty());
-        assert_eq!(KagiSearchTool::NAME, "kagi_search");
+        assert_eq!(WebSearchTool::NAME, "search_web");
     }
 
     #[tokio::test]
@@ -401,7 +427,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let out = KagiSearchTool { client: client(&server).await, budget: Default::default() }
+        let out = WebSearchTool { kagi: client(&server).await, perplexity: None, budget: Default::default() }
             .call(SearchArgs {
                 query: "laundry detergent".into(),
                 also_queries: vec!["wasmiddel".into(), "  ".into()],
@@ -415,6 +441,81 @@ mod tests {
             vec!["https://a.example", "https://shared.example", "https://bol.example"]
         );
         assert_eq!(out[1].snippet, "english");
+    }
+
+    /// A Perplexity stand-in on the same mock server, so both engines can be
+    /// driven from one test.
+    async fn pplx(server: &MockServer) -> crate::tools::perplexity::PerplexityClient {
+        crate::tools::perplexity::PerplexityClient::new(
+            reqwest::Client::new(),
+            "p".to_string(),
+            server.uri(),
+        )
+    }
+
+    #[tokio::test]
+    async fn both_engines_are_merged_kagi_first() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": [
+                {"title": "small shop", "url": "https://tradefix.nl/p", "snippet": "kagi"},
+                {"title": "both", "url": "https://bol.com/p", "snippet": "from kagi"}
+            ]}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": [
+                {"title": "both", "url": "https://bol.com/p", "snippet": "from perplexity"},
+                {"title": "other shop", "url": "https://koala.nl/p", "snippet": "pplx"}
+            ]})))
+            .mount(&server)
+            .await;
+
+        let out = WebSearchTool {
+            kagi: client(&server).await,
+            perplexity: Some(pplx(&server).await),
+            budget: Default::default(),
+        }
+        .call(SearchArgs { query: "wasmiddel".into(), also_queries: vec!["detergent".into()] })
+        .await
+        .unwrap();
+
+        // deduped by url, Kagi's ordering and snippet win the shared hit
+        assert_eq!(
+            out.iter().map(|r| r.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://tradefix.nl/p", "https://bol.com/p", "https://koala.nl/p"]
+        );
+        assert_eq!(out[1].snippet, "from kagi");
+    }
+
+    #[tokio::test]
+    async fn a_spent_kagi_budget_falls_back_to_perplexity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("kagi must not be called"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": [
+                {"title": "still searching", "url": "https://koala.nl/p", "snippet": ""}
+            ]})))
+            .mount(&server)
+            .await;
+
+        let out = WebSearchTool {
+            kagi: client(&server).await,
+            perplexity: Some(pplx(&server).await),
+            budget: std::sync::Arc::new(crate::tools::budget::SearchBudget::new(0)),
+        }
+        .call(SearchArgs { query: "q".into(), also_queries: Vec::new() })
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 1);
     }
 
     #[tokio::test]
@@ -431,8 +532,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = KagiSearchTool {
-            client: client(&server).await,
+        let tool = WebSearchTool {
+            kagi: client(&server).await,
+            perplexity: None,
             budget: std::sync::Arc::new(crate::tools::budget::SearchBudget::new(1)),
         };
         // asked for 3 queries, granted 1: the user's own phrasing survives
@@ -471,7 +573,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = KagiSearchTool { client: client(&server).await, budget: Default::default() };
+        let tool = WebSearchTool { kagi: client(&server).await, perplexity: None, budget: Default::default() };
         let out = tool
             .call(SearchArgs { query: "ok".into(), also_queries: vec!["boom".into()] })
             .await

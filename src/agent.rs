@@ -55,6 +55,11 @@ and confirm what you saved.
 - Use search_web for general product searches. Use search_secondhand when the \
 user wants used items or second-hand is a sensible option (electronics, \
 furniture, bikes, tools...).
+- When search_bol is available, use it for anything likely sold on bol.com \
+(household goods, electronics, books, toys) - it queries their catalogue \
+directly, so the title, price and product URL are current and need no \
+fetch_page. Search it in Dutch. Its delivery text is timing, not shipping \
+cost, so shipping stays unknown for compare_prices unless a page states it.
 - Local shops rank on local terms, so a product search must cover the search \
 languages listed for this user below. Put the translated queries in \
 search_web's also_queries (up to 2) - they run in parallel with the main \
@@ -143,6 +148,8 @@ pub fn llm_client(api_key: &str) -> Result<LlmClient> {
 pub struct AgentDeps {
     pub llm: LlmClient,
     pub kagi: KagiClient,
+    /// Live bol.com catalogue when credentials are configured.
+    pub bol: Option<crate::tools::bol::BolClient>,
     /// Second search engine when a key is configured; see WebSearchTool.
     pub perplexity: Option<crate::tools::perplexity::PerplexityClient>,
     pub http: reqwest::Client,
@@ -279,7 +286,8 @@ pub fn build_agent(
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     // One allowance per request, shared by both searching tools.
     let budget = std::sync::Arc::new(crate::tools::budget::SearchBudget::default());
-    d.llm
+    let mut builder = d
+        .llm
         .agent(MODEL)
         .preamble(&preamble_with_profile(facts))
         .tool(WebSearchTool {
@@ -303,9 +311,13 @@ pub fn build_agent(
         .tool(ListRemindersTool { store: d.store.clone(), user_id })
         .tool(CancelReminderTool { store: d.store.clone(), user_id })
         .tool(RememberFactTool { store: d.store.clone(), user_id })
-        .tool(ForgetFactTool { store: d.store.clone(), user_id })
-        .default_max_turns(MAX_TURNS)
-        .build()
+        .tool(ForgetFactTool { store: d.store.clone(), user_id });
+    // Offered only when configured, so the model never sees a tool that
+    // cannot work.
+    if let Some(bol) = &d.bol {
+        builder = builder.tool(crate::tools::bol::BolSearchTool { client: bol.clone() });
+    }
+    builder.default_max_turns(MAX_TURNS).build()
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+pub mod bol;
 pub mod budget;
 pub mod ebay;
 pub mod fetch;

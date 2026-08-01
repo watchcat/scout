@@ -11,6 +11,9 @@ pub struct Config {
     pub perplexity_api_key: Option<String>,
     pub db_path: String,
     pub secondhand_sites: Vec<String>,
+    /// bol.com Marketing Catalog API credentials; both set or disabled.
+    pub bol_credentials: Option<(String, String)>,
+    pub bol_country: String,
     /// eBay Browse API credentials; both set or feature disabled.
     pub ebay_credentials: Option<(String, String)>,
     pub ebay_marketplace: String,
@@ -38,6 +41,11 @@ impl Config {
             .collect();
 
         let non_empty = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+        let bol_credentials = match (non_empty("BOL_CLIENT_ID"), non_empty("BOL_CLIENT_SECRET")) {
+            (Some(id), Some(secret)) => Some((id, secret)),
+            (None, None) => None,
+            _ => bail!("BOL_CLIENT_ID and BOL_CLIENT_SECRET must be set together"),
+        };
         let ebay_credentials = match (non_empty("EBAY_CLIENT_ID"), non_empty("EBAY_CLIENT_SECRET")) {
             (Some(id), Some(secret)) => Some((id, secret)),
             (None, None) => None,
@@ -52,6 +60,8 @@ impl Config {
             perplexity_api_key: non_empty("PERPLEXITY_API_KEY"),
             db_path: get("SCOUT_DB_PATH").unwrap_or_else(|| "scout.duckdb".to_string()),
             secondhand_sites,
+            bol_credentials,
+            bol_country: get("BOL_COUNTRY").unwrap_or_else(|| "NL".to_string()),
             ebay_credentials,
             ebay_marketplace: get("EBAY_MARKETPLACE").unwrap_or_else(|| "EBAY_NL".to_string()),
         })

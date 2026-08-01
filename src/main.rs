@@ -52,6 +52,18 @@ async fn main() -> Result<()> {
         tools::marktplaats::MARKTPLAATS_BASE.to_string(),
     );
 
+    let bol = cfg.bol_credentials.clone().map(|(id, secret)| {
+        tools::bol::BolClient::new(
+            http.clone(),
+            id,
+            secret,
+            cfg.bol_country.clone(),
+            tools::bol::BOL_API_BASE.to_string(),
+            tools::bol::BOL_LOGIN_BASE.to_string(),
+        )
+    });
+    tracing::info!(bol_api = bol.is_some(), "bol.com Catalog API");
+
     let perplexity = cfg.perplexity_api_key.clone().map(|key| {
         tools::perplexity::PerplexityClient::new(
             http.clone(),
@@ -67,6 +79,7 @@ async fn main() -> Result<()> {
     let deps = AgentDeps {
         llm,
         kagi,
+        bol,
         perplexity,
         http,
         ebay,

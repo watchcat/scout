@@ -28,6 +28,9 @@ DuckDB for purchase memory.
   (one-tap copy button), search
 - Second-hand search across eBay/Marktplaats/Vinted (per-user configurable
   list), queried in parallel; dead listings (404/410) are filtered out
+- Live bol.com catalogue via their Marketing Catalog API when
+  `BOL_CLIENT_ID`/`SECRET` are set: current titles, prices and product URLs
+  with no page scraping
 - Live eBay data via the official Browse API when `EBAY_CLIENT_ID`/`SECRET`
   are set: real prices, condition and availability instead of search snippets
 - Live Marktplaats data via the site's public search JSON (no keys needed):
@@ -63,6 +66,8 @@ Kagi's v1 API doesn't offer it yet; it returns when they ship it.
 | `PERPLEXITY_API_KEY` | no | — | second search engine, merged with Kagi; carries the multi-language fan-out |
 | `SCOUT_DB_PATH` | no | `scout.duckdb` | DuckDB file |
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
+| `BOL_CLIENT_ID` + `BOL_CLIENT_SECRET` | no | — | bol.com Marketing Catalog API: live catalogue search (affiliate account) |
+| `BOL_COUNTRY` | no | `NL` | bol.com market: `NL` or `BE` |
 | `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` | no | — | eBay Browse API: live prices/availability for eBay results |
 | `EBAY_MARKETPLACE` | no | `EBAY_NL` | eBay marketplace id |
 

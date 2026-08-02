@@ -344,6 +344,18 @@ fn looks_like_price_request(text: &str) -> bool {
 
 /// How much of the model's own notes to hand the wrap-up agent.
 const WRAP_UP_CONTEXT: usize = 6000;
+/// No stream item for this long means the run is stuck. Generous, because a
+/// tool call (three site searches, a page fetch and its dead-link probes)
+/// runs between items — but all of those carry their own timeouts well
+/// under this. rig's client has no timeout of its own, so this is the only
+/// thing standing between a stalled connection and a chat that waits
+/// forever.
+const STREAM_STALL: std::time::Duration = std::time::Duration::from_secs(90);
+/// Hard ceiling on one request. A thorough price comparison takes ~60-90s;
+/// past this the user is better served by an answer built from the notes.
+const RUN_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+/// The salvage write-up is one tool-less call.
+const WRAP_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The last `max` characters — the newest notes are the ones carrying
 /// confirmed prices.
@@ -541,16 +553,31 @@ async fn run_agent(
     // Reasoning arrives on its own channel, separate from the answer text.
     let mut thinking = String::new();
     let mut final_response = None;
-    let mut out_of_turns = false;
+    let mut salvage = None;
     {
+        let started = std::time::Instant::now();
         let mut stream = agent.stream_chat(prompt, history.clone()).await;
-        while let Some(item) = stream.next().await {
-            let item = match item {
+        loop {
+            // A stalled stream must not hang the chat: whatever the reason,
+            // the user gets an answer built from what we have.
+            let next = match tokio::time::timeout(STREAM_STALL, stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    salvage = Some("the model stopped responding");
+                    break;
+                }
+            };
+            if started.elapsed() > RUN_BUDGET {
+                salvage = Some("this took too long");
+                break;
+            }
+            let item = match next {
                 Ok(item) => item,
                 // Not fatal: by this point the research is usually done and
                 // only the write-up is missing. Salvaged below.
                 Err(e) if is_max_turns(&e) => {
-                    out_of_turns = true;
+                    salvage = Some("I ran out of research steps");
                     break;
                 }
                 Err(e) => return Err(e.into()),
@@ -616,16 +643,30 @@ async fn run_agent(
         reply = strip_thinking(&streamed);
     }
 
-    if out_of_turns {
-        tracing::warn!(chat_id, "turn budget exhausted; writing up from notes");
-        live.show("✍️ out of research steps - writing up what I found", false).await;
-        // The history from an interrupted run is not returned, so the
+    if let Some(reason) = salvage {
+        tracing::warn!(chat_id, reason, "run interrupted; writing up from notes");
+        live.show("✍️ wrapping up with what I found so far", false).await;
+        // The history of an interrupted run is never returned, so the
         // model's own notes are the material: its reasoning already lists
         // the prices it confirmed.
         let notes = tail_chars(&format!("{thinking}\n\n{streamed}"), WRAP_UP_CONTEXT);
         let wrap_up = wrap_up_agent(&app.deps, &facts);
-        let asked = format!("{WRAP_UP_NOTE}\n\nYour research notes so far:\n{notes}");
-        reply = strip_thinking(&rig::completion::Prompt::prompt(&wrap_up, asked).await?);
+        let asked = format!(
+            "{WRAP_UP_NOTE}\nTell the user briefly that {reason}, then give the answer.\n\n\
+             Your research notes so far:\n{notes}"
+        );
+        // The salvage attempt gets its own deadline: it must never become a
+        // second way to hang.
+        reply = match tokio::time::timeout(
+            WRAP_UP_BUDGET,
+            rig::completion::Prompt::prompt(&wrap_up, asked),
+        )
+        .await
+        {
+            Ok(Ok(text)) => strip_thinking(&text),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("wrap-up timed out after the run was interrupted"),
+        };
         // Keep the exchange in context; the interrupted turns are lost.
         history.push(LlmMessage::user(prompt));
         history.push(LlmMessage::assistant(&reply));

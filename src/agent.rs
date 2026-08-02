@@ -145,6 +145,12 @@ https://www.example.nl/...";
 
 pub type LlmClient = openai::CompletionsClient;
 
+/// Note on timeouts: rig's HTTP client has none, so a stalled MiniMax stream
+/// would hang a request forever — which is how a user ended up staring at
+/// "comparing 5 offers per gram" with nothing after it. Handing rig our own
+/// configured client is not possible here (rig-core is on reqwest 0.12,
+/// this crate on 0.13, so the `Client` types are unrelated), so the guard
+/// lives in bot.rs instead, around the stream itself.
 pub fn llm_client(api_key: &str) -> Result<LlmClient> {
     Ok(openai::CompletionsClient::builder()
         .api_key(api_key)

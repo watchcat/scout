@@ -26,8 +26,10 @@ pub(crate) fn browser_get(http: &reqwest::Client, url: impl reqwest::IntoUrl) ->
 const MAX_TEXT_CHARS: usize = 6000;
 /// Page opens allowed per request. The preamble asks for at most this many,
 /// but a model chasing one more listing will happily open eight and burn the
-/// turn budget before it answers — so the tool enforces it too.
-const MAX_OPENS: usize = 3;
+/// turn budget before it answers — so the tool enforces it too. Three
+/// proved too tight once repeats stopped being charged: a comparison across
+/// four shops needs four pages, and the fifth is headroom.
+const MAX_OPENS: usize = 5;
 const MAX_LINKS: usize = 30;
 const MAX_LINK_TEXT_CHARS: usize = 120;
 

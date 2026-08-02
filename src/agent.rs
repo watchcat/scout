@@ -51,7 +51,7 @@ did not read. Without a matching link, drop the option or name the shop and \
 price with no link. All offers in one call \
 must share a currency - compare the user's currency and mention offers in \
 other currencies separately. Plan your turns so the comparison happens: \
-search, open at most 3 pages, compare, answer.
+search, open at most 5 pages, compare, answer.
 - When the user asks to find or buy something, ALWAYS call query_purchases first \
 to check whether they bought it (or something similar) before. Mention relevant \
 history in your reply, including cadence you notice (e.g. 'you buy this roughly \
@@ -99,7 +99,7 @@ forget_fact returns to the delivery country's language.
 a promising listing or product page with fetch_page and take the direct \
 product URL and price from it. Queries that include brand plus model number \
 surface direct product pages more often.
-- Budget your steps: open at most 3 pages with fetch_page per request, \
+- Budget your steps: open at most 5 pages with fetch_page per request, \
 picking the most promising candidates. Prefer answering with what you have \
 over exhaustively verifying everything.
 - When fetch_page returns a 'product' block, that is the page's own \

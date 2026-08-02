@@ -68,6 +68,21 @@ furniture, bikes, tools...).
 directly, so the title, price and product URL are current and need no \
 fetch_page. Search it in Dutch. Its delivery text is timing, not shipping \
 cost, so shipping stays unknown for compare_prices unless a page states it.
+- Some users list favourite shops below, each with the kind of product it \
+is for. When what you are searching for falls in that kind - judge it \
+sensibly, a stain remover is a cleaning product - spend one of search_web's \
+also_queries on 'site:<domain> <product>'. Small shops do not rank for \
+ordinary queries even under their product's exact name, so this scoped query \
+is the only way their offers appear at all; a shop listed with no category \
+applies to every search. Keep that query to brand, product line and the one \
+word that distinguishes the variant - 'vanish oxi action pink'. Pack size, \
+volume and words like cheapest push the product page out of the results \
+entirely: measured on this shop, the same query with 'powder 1.5 kg' \
+appended dropped the page from first to nowhere in the top ten. Never use the site: query for a product outside the \
+shop's kind. When the user asks to always check a shop (optionally for a \
+kind of product), save the FULL list with remember_fact under \
+favourite_shops as 'domain:category' entries, e.g. \
+'123schoon.nl:cleaning products, coolblue.nl:electronics'.
 - Local shops rank on local terms, so a product search must cover the search \
 languages listed for this user below. Put the translated queries in \
 search_web's also_queries (up to 2) - they run in parallel with the main \
@@ -214,6 +229,52 @@ const MAX_PROFILE_FACTS: usize = 50;
 
 /// Profile fact holding an explicit search-language list.
 pub const LANGUAGES_FACT_KEY: &str = "search_languages";
+/// Profile fact listing shops worth a site-scoped query, each with the kind
+/// of product it applies to: `123schoon.nl:cleaning, coolblue.nl:electronics`.
+pub const SHOPS_FACT_KEY: &str = "favourite_shops";
+/// Enough for the shops one household actually returns to.
+const MAX_SHOPS: usize = 8;
+
+/// Shops to search by name, as (domain, what it is for) pairs. A bare domain
+/// with no category means every search.
+///
+/// Small shops do not rank: 123schoon.nl sells the Vanish powder a user
+/// found through a shopping ad, and neither engine returns it for the
+/// product's own name — but both return it for `site:123schoon.nl vanish
+/// oxi action`. Scoping the query is the only thing that reaches them.
+pub fn favourite_shops(facts: &[(String, String)]) -> Vec<(String, String)> {
+    let Some((_, value)) = facts.iter().find(|(k, _)| k == SHOPS_FACT_KEY) else {
+        return Vec::new();
+    };
+    let mut shops = Vec::new();
+    for entry in value.split([',', ';', '\n']) {
+        // Strip the scheme before splitting on ':', or "https://shop.nl:x"
+        // splits into "https" and the rest.
+        let entry = entry.trim().to_lowercase();
+        let entry = entry
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("www.");
+        let (domain, category) = match entry.split_once(':') {
+            Some((d, c)) => (d, c.trim().to_string()),
+            None => (entry, String::new()),
+        };
+        let domain = domain
+            .trim()
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if domain.contains('.') && !shops.iter().any(|(d, _): &(String, _)| *d == domain) {
+            shops.push((domain, category));
+            if shops.len() >= MAX_SHOPS {
+                break;
+            }
+        }
+    }
+    shops
+}
 /// Languages per search, English included — one query each, run in parallel.
 const MAX_LANGUAGES: usize = 3;
 
@@ -298,6 +359,16 @@ pub fn preamble_with_profile(facts: &[(String, String)]) -> String {
         "\nSearch languages for this user: {}.\n",
         search_languages(facts).join(", ")
     ));
+    let shops = favourite_shops(facts);
+    if !shops.is_empty() {
+        p.push_str("\nShops this user wants searched by name, and for what:\n");
+        for (domain, category) in &shops {
+            match category.is_empty() {
+                true => p.push_str(&format!("- {domain}: any product\n")),
+                false => p.push_str(&format!("- {domain}: {category}\n")),
+            }
+        }
+    }
     p
 }
 
@@ -430,6 +501,46 @@ mod tests {
             search_languages(&facts(&[("search_languages", "english, dutch, german, french")])),
             vec!["English", "Dutch", "German"]
         );
+    }
+
+    #[test]
+    fn favourite_shops_are_parsed_with_their_category() {
+        assert_eq!(
+            favourite_shops(&facts(&[(
+                "favourite_shops",
+                "https://www.123schoon.nl/:Cleaning Products, coolblue.nl:electronics"
+            )])),
+            vec![
+                ("123schoon.nl".to_string(), "cleaning products".to_string()),
+                ("coolblue.nl".to_string(), "electronics".to_string()),
+            ]
+        );
+        // A bare domain applies everywhere.
+        assert_eq!(
+            favourite_shops(&facts(&[("favourite_shops", "bol.com")])),
+            vec![("bol.com".to_string(), String::new())]
+        );
+        // Junk entries are dropped, duplicates collapse.
+        assert_eq!(
+            favourite_shops(&facts(&[("favourite_shops", "notadomain, bol.com:books, bol.com:toys")])),
+            vec![("bol.com".to_string(), "books".to_string())]
+        );
+        assert!(favourite_shops(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_profile_block_pairs_each_shop_with_its_kind_of_product() {
+        let p = preamble_with_profile(&facts(&[(
+            "favourite_shops",
+            "123schoon.nl:cleaning products, bol.com",
+        )]));
+        assert!(p.contains("- 123schoon.nl: cleaning products"), "got: {p}");
+        assert!(p.contains("- bol.com: any product"), "got: {p}");
+
+        // Nothing listed, nothing said: the rule must not invite a site:
+        // query at a shop the user never named.
+        let none = preamble_with_profile(&[]);
+        assert!(!none.contains("Shops this user wants searched"));
     }
 
     #[test]

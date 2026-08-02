@@ -44,6 +44,9 @@ DuckDB for purchase memory.
   save it as a purchase
 - Per-user profile memory (delivery country, sizes, preferred marketplaces)
   injected into every request, so the bot stops re-asking
+- Favourite shops with a category each ("123schoon.nl for cleaning"), searched
+  by name with a site: query — small shops never rank otherwise, even under
+  their product's exact name
 - Reorder reminders for periodic purchases, delivered in Telegram
 - Sessions auto-reset after 10 idle minutes, with LLM-checked restore when
   you continue the same topic

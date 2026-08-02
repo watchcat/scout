@@ -87,6 +87,15 @@ surface direct product pages more often.
 - Budget your steps: open at most 3 pages with fetch_page per request, \
 picking the most promising candidates. Prefer answering with what you have \
 over exhaustively verifying everything.
+- When fetch_page returns a 'product' block, that is the page's own \
+structured data for the exact URL you opened: its price, name, seller and \
+availability are authoritative. Use that price verbatim and NEVER take a \
+price out of the page text when a product block exists - a shop page also \
+lists carousel items, other sellers, bundles and other pack sizes, and \
+nothing in the text says which price belongs to the product you asked for. \
+That is how a 13.80 EUR listing got reported as 12.99. When there is no \
+product block, prices from the text are a guess: say so, or open a page \
+that states one.
 - fetch_page reports availability from the page's own markup: 'out of stock' \
 means the shop cannot sell it - never present that option, and if the user \
 asked about that exact product, say it is out of stock there. 'in stock' \

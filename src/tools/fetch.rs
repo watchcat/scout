@@ -58,6 +58,126 @@ pub struct PageContent {
     /// What the page's structured markup says about stock, when it says
     /// anything. `None` means unknown, not available.
     pub availability: Option<&'static str>,
+    /// The page's own data for the product at this exact URL. Authoritative:
+    /// the visible text of a shop page carries prices for carousels, other
+    /// sellers and unrelated pack sizes, and nothing distinguishes them.
+    pub product: Option<PageProduct>,
+}
+
+/// A product as the page's schema.org markup describes it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PageProduct {
+    pub name: Option<String>,
+    /// Formatted like every other price the model sees: "13.80 EUR".
+    pub price: Option<String>,
+    pub availability: Option<&'static str>,
+    pub seller: Option<String>,
+}
+
+/// schema.org `availability` in either form: "InStock" or the full
+/// "https://schema.org/InStock".
+fn availability_word(value: &str) -> Option<&'static str> {
+    let value = value.rsplit('/').next().unwrap_or(value).to_ascii_lowercase();
+    match value.as_str() {
+        "instock" | "limitedavailability" | "onlineonly" => Some("in stock"),
+        "outofstock" | "soldout" | "discontinued" => Some("out of stock"),
+        "preorder" | "backorder" => Some("on backorder"),
+        _ => None,
+    }
+}
+
+/// Every `<script type="application/ld+json">` payload that parses.
+fn json_ld_blocks(html: &str) -> Vec<serde_json::Value> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(start) = lower[from..].find("<script").map(|i| i + from) {
+        let Some(open_end) = lower[start..].find('>').map(|i| i + start + 1) else { break };
+        let is_ld = lower[start..open_end].contains("application/ld+json");
+        let Some(close) = lower[open_end..].find("</script").map(|i| i + open_end) else { break };
+        if is_ld {
+            if let Ok(value) = serde_json::from_str(html[open_end..close].trim()) {
+                out.push(value);
+            }
+        }
+        from = close + 1;
+    }
+    out
+}
+
+/// Collects every node that carries an offer with a price, keeping the url
+/// it claims — a bol.com page is one ProductGroup whose variants each have
+/// their own url and price, and only one of them is the page you fetched.
+fn collect_products(node: &serde_json::Value, out: &mut Vec<(Option<String>, PageProduct)>) {
+    match node {
+        serde_json::Value::Array(items) => items.iter().for_each(|i| collect_products(i, out)),
+        serde_json::Value::Object(map) => {
+            let offer = match map.get("offers") {
+                Some(serde_json::Value::Array(offers)) => {
+                    offers.iter().find(|o| o.get("price").is_some())
+                }
+                Some(value @ serde_json::Value::Object(_)) if value.get("price").is_some() => {
+                    Some(value)
+                }
+                _ => None,
+            };
+            if let Some(offer) = offer {
+                let text = |v: Option<&serde_json::Value>| match v {
+                    Some(serde_json::Value::String(s)) => Some(s.trim().to_string()),
+                    Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+                    _ => None,
+                };
+                let price = text(offer.get("price")).map(|p| {
+                    match text(offer.get("priceCurrency")) {
+                        Some(currency) => format!("{p} {currency}"),
+                        None => p,
+                    }
+                });
+                out.push((
+                    text(map.get("url")),
+                    PageProduct {
+                        name: text(map.get("name")),
+                        price,
+                        availability: text(offer.get("availability"))
+                            .as_deref()
+                            .and_then(availability_word),
+                        seller: offer
+                            .get("seller")
+                            .and_then(|s| s.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(|n| n.to_string()),
+                    },
+                ));
+            }
+            map.values().for_each(|v| collect_products(v, out));
+        }
+        _ => {}
+    }
+}
+
+/// The product this URL is actually about. Matching is on the url path
+/// because shops shorten it in markup (no product id, no trailing slash), so
+/// one has to be a prefix of the other; the longest such match wins.
+fn extract_product(html: &str, page: &Url) -> Option<PageProduct> {
+    let mut found = Vec::new();
+    for block in json_ld_blocks(html) {
+        collect_products(&block, &mut found);
+    }
+    let path = page.path().trim_end_matches('/').to_ascii_lowercase();
+    let mut best: Option<(usize, PageProduct)> = None;
+    for (url, product) in &found {
+        let Some(claimed) = url.as_deref().and_then(|u| Url::parse(u).ok()) else { continue };
+        let claimed = claimed.path().trim_end_matches('/').to_ascii_lowercase();
+        if claimed.len() > 1
+            && (path.starts_with(&claimed) || claimed.starts_with(&path))
+            && best.as_ref().is_none_or(|(len, _)| claimed.len() > *len)
+        {
+            best = Some((claimed.len(), product.clone()));
+        }
+    }
+    best.map(|(_, p)| p)
+        // A page describing exactly one product needs no disambiguation.
+        .or_else(|| (found.len() == 1).then(|| found[0].1.clone()))
 }
 
 /// Stock status from schema.org markup, which is the only trustworthy signal:
@@ -159,7 +279,12 @@ impl Tool for FetchPageTool {
 }
 
 fn extract_page(html: &str, base: &Url) -> PageContent {
-    let availability = availability(html);
+    let product = extract_product(html, base);
+    // The product's own status beats a page-wide guess when both exist.
+    let availability = product
+        .as_ref()
+        .and_then(|p| p.availability)
+        .or_else(|| availability(html));
     let without_scripts = strip_tag_blocks(&strip_tag_blocks(html, "script"), "style");
     let links = extract_links(&without_scripts, base);
     let full_text = collapse_ws(&decode_entities(&strip_tags(&without_scripts)));
@@ -169,7 +294,7 @@ fn extract_page(html: &str, base: &Url) -> PageContent {
     } else {
         full_text
     };
-    PageContent { text, truncated, links, availability }
+    PageContent { text, truncated, links, availability, product }
 }
 
 /// Remove `<tag ...>...</tag>` blocks wholesale (for script/style, whose
@@ -370,6 +495,71 @@ mod tests {
         assert!(page.text.contains("Widget"));
         assert_eq!(page.links.len(), 1);
         assert!(page.links[0].url.ends_with("/p/2"));
+    }
+
+
+    #[test]
+    fn the_price_comes_from_the_variant_matching_the_url() {
+        // The real bol.com page a user sent us: one ProductGroup, two
+        // variants with their own urls and prices, and ~40 unrelated euro
+        // amounts in the visible text from carousels and other sellers. We
+        // reported one of those instead of the 13.80 the page states.
+        let html = r##"<html><body>
+          <script type="application/ld+json">
+          {"@type":"ProductGroup","name":"Vanish","hasVariant":[
+            {"@type":"Product","name":"Vanish Oxi Action 1.5 kg",
+             "url":"https://www.bol.com/nl/nl/p/vanish-oxi-action-poeder-vlekverwijderaar-voor-gekleurde-was-1-5-kg",
+             "offers":{"@type":"Offer","price":"13.80","priceCurrency":"EUR",
+                       "availability":"https://schema.org/InStock",
+                       "seller":{"@type":"Organization","name":"MYSCO"}}},
+            {"@type":"Product","name":"Vanish Oxi Action 10 x 1.5 kg",
+             "url":"https://www.bol.com/nl/nl/p/vanish-oxi-action-veilige-kleur-poeder-zonder-bleek",
+             "offers":{"@type":"Offer","price":"55.99","priceCurrency":"EUR",
+                       "availability":"InStock"}}]}
+          </script>
+          <div class="carousel">€ 14,99 € 11,99 € 2,99 € 12,99</div>
+          </body></html>"##;
+        let url = Url::parse(
+            "https://www.bol.com/nl/nl/p/vanish-oxi-action-poeder-vlekverwijderaar-voor-gekleurde-was-1-5-kg/9300000087803700/",
+        )
+        .unwrap();
+
+        let page = extract_page(html, &url);
+        let product = page.product.expect("the page states its own product");
+        assert_eq!(product.price.as_deref(), Some("13.80 EUR"));
+        assert_eq!(product.name.as_deref(), Some("Vanish Oxi Action 1.5 kg"));
+        assert_eq!(product.seller.as_deref(), Some("MYSCO"));
+        assert_eq!(product.availability, Some("in stock"));
+        // the product's own status also settles the page-level field
+        assert_eq!(page.availability, Some("in stock"));
+    }
+
+    #[test]
+    fn a_single_product_page_needs_no_url_match() {
+        let html = r#"<html><body><script type="application/ld+json">
+          {"@type":"Product","name":"Widget","offers":{"price":9.5,"priceCurrency":"EUR",
+           "availability":"OutOfStock"}}
+          </script></body></html>"#;
+        let page = extract_page(html, &Url::parse("https://shop.example/anything").unwrap());
+        let product = page.product.unwrap();
+        assert_eq!(product.price.as_deref(), Some("9.5 EUR"));
+        assert_eq!(page.availability, Some("out of stock"));
+    }
+
+    #[test]
+    fn pages_without_product_markup_report_nothing_rather_than_guessing() {
+        let html = "<html><body><p>Great deal: € 9,99 today only</p></body></html>";
+        let page = extract_page(html, &Url::parse("https://shop.example/p").unwrap());
+        assert_eq!(page.product, None);
+        assert_eq!(page.availability, None);
+        // …and a variant list that matches no url leaves the price unclaimed
+        let mismatched = r#"<html><body><script type="application/ld+json">
+          {"@type":"ProductGroup","hasVariant":[
+            {"url":"https://shop.example/other-a","offers":{"price":"1.00","priceCurrency":"EUR"}},
+            {"url":"https://shop.example/other-b","offers":{"price":"2.00","priceCurrency":"EUR"}}]}
+          </script></body></html>"#;
+        let page = extract_page(mismatched, &Url::parse("https://shop.example/p").unwrap());
+        assert_eq!(page.product, None);
     }
 
     #[test]

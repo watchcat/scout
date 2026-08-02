@@ -1,16 +1,25 @@
-# Build stage: dependency layer is cached separately so code changes don't
-# recompile DuckDB (the expensive part).
+# syntax=docker/dockerfile:1
+
+# Build stage. Cargo's registry and target directory live in BuildKit caches
+# instead of image layers, which is what keeps rebuilds cheap:
+#   * a source change recompiles this crate alone (~20s)
+#   * a Cargo.toml change recompiles the changed dependency alone, instead of
+#     DuckDB's C++ from scratch — that is the ~10 minute build, and touching
+#     dependencies three times in an afternoon paid it three times.
+# The layer-based dependency trick this replaces could only do the first.
 FROM rust:bookworm AS builder
 # DuckDB's C++ compile is memory-hungry; full parallelism OOMs the Docker VM
 # (observed: 10 jobs vs ~8 GiB VM RAM hangs the build). 4 jobs fits.
 ENV CARGO_BUILD_JOBS=4
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs \
-    && cargo build --release \
-    && rm -rf src
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+# The binary has to be copied out within this step: a cache mount is not part
+# of the layer that results from it.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    cargo build --release \
+    && cp target/release/scout /scout
 
 # Runtime stage: TLS deps plus Chromium, used only to re-open pages that
 # refuse a plain HTTP client (a shop behind a challenge answers 403 to
@@ -24,7 +33,7 @@ RUN apt-get update \
     && useradd -m scout \
     && mkdir -p /data \
     && chown scout:scout /data
-COPY --from=builder /app/target/release/scout /usr/local/bin/scout
+COPY --from=builder /scout /usr/local/bin/scout
 USER scout
 WORKDIR /data
 ENV SCOUT_DB_PATH=/data/scout.duckdb

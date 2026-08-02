@@ -44,13 +44,13 @@ pub struct FetchArgs {
     pub url: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PageLink {
     pub url: String,
     pub text: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PageContent {
     pub text: String,
     pub truncated: bool,
@@ -671,11 +671,27 @@ pub struct FetchPageTool {
     /// after plain HTTP has failed.
     pub renderer: Option<super::browser::Renderer>,
     opens: std::sync::atomic::AtomicUsize,
+    /// Pages already read during this request. A model that re-opens one it
+    /// has seen gets it back for free: without this, a repeat fetch of the
+    /// same kruidvat page ate a third of the budget and left none for the
+    /// Action listing the user was asking about.
+    seen: std::sync::Mutex<std::collections::HashMap<String, PageContent>>,
 }
 
 impl FetchPageTool {
     pub fn new(http: reqwest::Client, renderer: Option<super::browser::Renderer>) -> Self {
-        Self { http, renderer, opens: std::sync::atomic::AtomicUsize::new(0) }
+        Self {
+            http,
+            renderer,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Keeps a page for the rest of the request and hands back a copy.
+    fn remember(&self, key: String, page: PageContent) -> PageContent {
+        self.seen.lock().unwrap().insert(key, page.clone());
+        page
     }
 }
 
@@ -729,6 +745,14 @@ impl Tool for FetchPageTool {
                 url.scheme()
             )));
         }
+        // A page already read this request is free: re-reading it cannot
+        // tell us anything new, and charging for it costs the budget a page
+        // that would have.
+        let key = url.as_str().trim_end_matches('/').to_string();
+        if let Some(cached) = self.seen.lock().unwrap().get(&key) {
+            tracing::info!(url = %url, "already read this request; serving the page again");
+            return Ok(cached.clone());
+        }
         // Counted only once the url is worth opening, so a malformed one
         // costs the model a turn but not part of its page budget.
         if self.opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_OPENS {
@@ -750,7 +774,7 @@ impl Tool for FetchPageTool {
             tracing::info!(url = %url, status = status.as_u16(), "retrying with headless browser");
             match renderer.render(url.as_str()).await {
                 Ok(html) if !super::browser::looks_unrendered(&html) => {
-                    return Ok(extract_page(&html, &url));
+                    return Ok(self.remember(key, extract_page(&html, &url)));
                 }
                 Ok(_) => tracing::info!(url = %url, "render produced no usable page"),
                 Err(e) => tracing::warn!(url = %url, error = %e, "render failed"),
@@ -759,7 +783,7 @@ impl Tool for FetchPageTool {
         if !status.is_success() {
             return Err(FetchError::Invalid(format!("page returned HTTP {status}")));
         }
-        Ok(extract_page(&body, &url))
+        Ok(self.remember(key, extract_page(&body, &url)))
     }
 }
 
@@ -1301,6 +1325,41 @@ mod tests {
           <div>€ 12,99</div></body></html>"#;
         let page = extract_page(html, &Url::parse("https://shop.example/p/widget").unwrap());
         assert_eq!(page.product, None);
+    }
+
+    #[tokio::test]
+    async fn re_reading_a_page_is_free() {
+        // Observed in production: two of three opens went on the same
+        // kruidvat page, so the Action listing the user asked about was
+        // refused by our own budget and never priced.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/p/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body>the first page</body></html>"),
+            )
+            // fetched once, however often the model asks for it
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/p/other"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html><body>ok</body></html>"))
+            .mount(&server)
+            .await;
+
+        let tool = FetchPageTool::new(reqwest::Client::new(), None);
+        let first = format!("{}/p/1", server.uri());
+        for _ in 0..3 {
+            let page = tool.call(FetchArgs { url: first.clone() }).await.unwrap();
+            assert!(page.text.contains("the first page"));
+        }
+        // Those repeats cost no budget, so two further pages still open.
+        for i in 0..2 {
+            let url = format!("{}/p/other?n={i}", server.uri());
+            assert!(tool.call(FetchArgs { url }).await.is_ok(), "open {i} should be allowed");
+        }
     }
 
     #[tokio::test]

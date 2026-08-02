@@ -6,6 +6,11 @@ services:
       SCOUT_DB_PATH: /data/scout.duckdb
     volumes:
       - scout-data:/data
+    # Chromium's helper processes (renderer, zygote, crashpad) outlive the
+    # process we spawn and are reparented to PID 1. Without an init there,
+    # scout is PID 1 and never reaps them: one render left 35 zombies, which
+    # ends in an exhausted PID table.
+    init: true
     restart: unless-stopped
 
 volumes:

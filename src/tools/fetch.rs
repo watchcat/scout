@@ -86,16 +86,19 @@ fn availability_word(value: &str) -> Option<&'static str> {
     }
 }
 
-/// Every `<script type="application/ld+json">` payload that parses.
-fn json_ld_blocks(html: &str) -> Vec<serde_json::Value> {
+/// Every `<script type="{mime}">` payload that parses. Two mime types matter:
+/// `application/ld+json` for schema.org markup, and `application/json` for the
+/// framework state blocks (`__NUXT_DATA__`, `__NEXT_DATA__`) that shops
+/// without schema.org markup still ship. The two never collide as substrings.
+fn script_json_blocks(html: &str, mime: &str) -> Vec<serde_json::Value> {
     let lower = html.to_ascii_lowercase();
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(start) = lower[from..].find("<script").map(|i| i + from) {
         let Some(open_end) = lower[start..].find('>').map(|i| i + start + 1) else { break };
-        let is_ld = lower[start..open_end].contains("application/ld+json");
+        let is_wanted = lower[start..open_end].contains(mime);
         let Some(close) = lower[open_end..].find("</script").map(|i| i + open_end) else { break };
-        if is_ld {
+        if is_wanted {
             if let Ok(value) = serde_json::from_str(html[open_end..close].trim()) {
                 out.push(value);
             }
@@ -155,12 +158,388 @@ fn collect_products(node: &serde_json::Value, out: &mut Vec<(Option<String>, Pag
     }
 }
 
+/// The value a microdata property carries: `content`/`href` when the tag has
+/// one (meta/link), otherwise the tag's own text.
+fn microdata_values(html: &str, prop: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let needle = format!("itemprop=\"{prop}\"");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(&needle).map(|i| i + from) {
+        from = at + needle.len();
+        let Some(open) = lower[..at].rfind('<') else { continue };
+        let Some(close) = lower[at..].find('>').map(|i| i + at) else { continue };
+        let tag = &html[open..close];
+        let attr = ["content=\"", "href=\""].iter().find_map(|a| {
+            let start = tag.to_ascii_lowercase().find(a)? + a.len();
+            let end = tag[start..].find('"')? + start;
+            Some(tag[start..end].trim().to_string())
+        });
+        let value = attr.unwrap_or_else(|| {
+            let text = &html[close + 1..];
+            let end = text.find('<').unwrap_or(text.len());
+            text[..end].trim().to_string()
+        });
+        if !value.is_empty() {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// Prices as written on a page: "13,80", "€ 13.80", "13.80 EUR".
+fn normalize_price(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+        .collect();
+    let cleaned = cleaned.replace(',', ".");
+    // "1.234.56" style thousands separators: keep the last dot as decimal.
+    let value: f64 = match cleaned.matches('.').count() {
+        0 | 1 => cleaned.parse().ok()?,
+        _ => {
+            let cut = cleaned.rfind('.')?;
+            format!("{}.{}", cleaned[..cut].replace('.', ""), &cleaned[cut + 1..])
+                .parse()
+                .ok()?
+        }
+    };
+    (value.is_finite() && value > 0.0).then(|| format!("{value:.2}"))
+}
+
+/// schema.org microdata, used by shops that never adopted JSON-LD.
+///
+/// Only a page carrying exactly one price is accepted: without a DOM there
+/// is no way to tell which `itemprop="price"` belongs to the product and
+/// which to a related-items strip, and a confident wrong price is the one
+/// outcome worth avoiding.
+fn microdata_product(html: &str) -> Option<PageProduct> {
+    let prices = microdata_values(html, "price");
+    let [price] = prices.as_slice() else { return None };
+    let price = normalize_price(price)?;
+    let currency = microdata_values(html, "pricecurrency")
+        .first()
+        .map(|c| c.trim().to_uppercase())
+        .unwrap_or_else(|| "EUR".to_string());
+    Some(PageProduct {
+        name: microdata_values(html, "name").first().cloned(),
+        price: Some(format!("{price} {currency}")),
+        availability: microdata_values(html, "availability")
+            .first()
+            .and_then(|a| availability_word(a)),
+        seller: None,
+    })
+}
+
+/// Field names a shop's own state uses for the product's address, for the
+/// amount, and for the object the amount may sit one level down in.
+const URL_KEYS: [&str; 5] = ["url", "link", "slug", "path", "canonicalUrl"];
+const PRICE_KEYS: [&str; 3] = ["price", "amount", "value"];
+const PRICE_CONTAINER_KEYS: [&str; 3] = ["price", "offers", "pricing"];
+const STOCK_KEYS: [&str; 4] = ["availability", "stock", "inStock", "isAvailable"];
+
+/// Nesting allowed when walking a plain payload, and hops allowed along a
+/// devalue reference chain. Application state is routinely cyclic once a
+/// framework's reactivity layer has been through it, and devalue's index
+/// table can encode those cycles, so both walks are capped rather than
+/// trusted to terminate.
+const MAX_JSON_DEPTH: usize = 64;
+const MAX_REF_HOPS: usize = 16;
+
+type JsonObject = serde_json::Map<String, serde_json::Value>;
+
+/// A parsed `<script type="application/json">` payload in one of the two
+/// shapes shops ship: plain nested JSON, or devalue — the flattened form Nuxt
+/// emits, where the root array is a value table and every field inside a
+/// container holds an index into that table instead of the value itself.
+enum Payload<'a> {
+    Plain,
+    Devalue(&'a [serde_json::Value]),
+}
+
+impl<'a> Payload<'a> {
+    /// devalue containers hold nothing but indices, so a root array whose
+    /// objects carry only numbers — at least one of which lands on another
+    /// container — is the flattened form; anything else is read as it stands.
+    /// Guessing this wrong is expensive in both directions: read plain JSON as
+    /// devalue and every price becomes a table lookup, read devalue as plain
+    /// and the index 1299 is reported as a price.
+    fn detect(root: &'a serde_json::Value) -> Self {
+        let Some(table) = root.as_array() else { return Payload::Plain };
+        let mut refs = 0usize;
+        for value in table.iter().filter_map(|v| v.as_object()).flat_map(|o| o.values()) {
+            // devalue writes undefined and holes as negative numbers, so only
+            // the non-negative values are indices; a literal of any other type
+            // means this is ordinary JSON.
+            let Some(index) = value.as_u64() else {
+                if !value.is_number() {
+                    return Payload::Plain;
+                }
+                continue;
+            };
+            if table.get(index as usize).is_some_and(|v| v.is_object() || v.is_array()) {
+                refs += 1;
+            }
+        }
+        if refs > 0 {
+            Payload::Devalue(table)
+        } else {
+            Payload::Plain
+        }
+    }
+
+    /// What a field actually carries. A plain payload stores it inline; a
+    /// devalue field stores an index, and the element it lands on may itself
+    /// be a `["ShallowReactive", 1]` type wrapper standing for another index.
+    fn resolve(&self, value: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+        let Payload::Devalue(table) = self else { return Some(value) };
+        // Exactly one index hop: what the table holds is the literal, even
+        // when that literal is itself a number.
+        let mut current = table.get(value.as_u64()? as usize)?;
+        for _ in 0..MAX_REF_HOPS {
+            match current.as_array().map(|items| items.as_slice()) {
+                Some([serde_json::Value::String(_), inner]) => {
+                    current = table.get(inner.as_u64()? as usize)?;
+                }
+                _ => return Some(current),
+            }
+        }
+        None
+    }
+
+    /// Every object the payload contains. A devalue table already holds each
+    /// container at its top level, so there is nothing to walk.
+    fn objects(&self, root: &'a serde_json::Value) -> Vec<&'a JsonObject> {
+        let mut out = Vec::new();
+        match self {
+            Payload::Devalue(table) => out.extend(table.iter().filter_map(|v| v.as_object())),
+            Payload::Plain => collect_objects(root, 0, &mut out),
+        }
+        out
+    }
+}
+
+fn collect_objects<'a>(node: &'a serde_json::Value, depth: usize, out: &mut Vec<&'a JsonObject>) {
+    if depth > MAX_JSON_DEPTH {
+        return;
+    }
+    match node {
+        serde_json::Value::Object(map) => {
+            out.push(map);
+            map.values().for_each(|v| collect_objects(v, depth + 1, out));
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().for_each(|v| collect_objects(v, depth + 1, out));
+        }
+        _ => {}
+    }
+}
+
+/// The first of these fields that resolves to a non-empty string.
+fn string_field<'a>(obj: &'a JsonObject, payload: &Payload<'a>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let text = payload.resolve(obj.get(*key)?)?.as_str()?.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    })
+}
+
+fn currency_field<'a>(obj: &'a JsonObject, payload: &Payload<'a>) -> Option<String> {
+    string_field(obj, payload, &["currency", "priceCurrency"]).map(|c| c.to_uppercase())
+}
+
+/// How much of the page's path this object claims as its own url, when it
+/// claims the page at all. Same prefix rule as the JSON-LD matcher, since
+/// shops shorten paths in their state as freely as in their markup — plus a
+/// tail match for `slug`, which is never a path and so can never be a prefix.
+fn matched_path<'a>(obj: &'a JsonObject, payload: &Payload<'a>, path: &str) -> Option<usize> {
+    URL_KEYS
+        .iter()
+        .filter_map(|key| {
+            let claimed = string_field(obj, payload, std::slice::from_ref(key))?;
+            let claimed = claimed.split(['?', '#']).next()?;
+            let claimed = match Url::parse(claimed) {
+                Ok(url) => url.path().to_string(),
+                Err(_) => claimed.to_string(),
+            };
+            let claimed = claimed.trim_end_matches('/').to_ascii_lowercase();
+            if claimed.len() < 2 {
+                return None;
+            }
+            let hit = if claimed.starts_with('/') {
+                path.starts_with(&claimed) || claimed.starts_with(path)
+            } else {
+                path.ends_with(&format!("/{claimed}"))
+            };
+            hit.then_some(claimed.len())
+        })
+        .max()
+}
+
+fn as_scalar(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    matches!(value, serde_json::Value::Number(_) | serde_json::Value::String(_)).then_some(value)
+}
+
+/// The object's raw price value and the currency written beside it: either on
+/// the object itself, or one level down in the object shops park it in
+/// (`{"price": {"__typename": "Price", "price": 1299}}` is Jumbo's shape).
+fn scalar_price<'a>(
+    obj: &'a JsonObject,
+    payload: &Payload<'a>,
+) -> Option<(&'a serde_json::Value, Option<String>)> {
+    let direct = PRICE_KEYS.iter().find_map(|key| as_scalar(payload.resolve(obj.get(*key)?)?));
+    if let Some(value) = direct {
+        return Some((value, currency_field(obj, payload)));
+    }
+    PRICE_CONTAINER_KEYS.iter().find_map(|key| {
+        let nested = payload.resolve(obj.get(*key)?)?;
+        let nested = match nested {
+            // an offers list: the first entry that is an object
+            serde_json::Value::Array(items) => {
+                items.iter().find_map(|i| payload.resolve(i)?.as_object())
+            }
+            other => other.as_object(),
+        }?;
+        let value = PRICE_KEYS.iter().find_map(|key| as_scalar(payload.resolve(nested.get(*key)?)?))?;
+        Some((value, currency_field(nested, payload).or_else(|| currency_field(obj, payload))))
+    })
+}
+
+/// A payload's price in major units ("12.99"), or nothing when the payload
+/// leaves it ambiguous.
+///
+/// Embedded state stores minor units as readily as major: Jumbo's price is the
+/// integer 1299 for €12.99, and nothing in the JSON says which it is — €1299
+/// is an equally well-formed reading, and reporting that would be a far worse
+/// failure than reporting no price at all. A decimal separator settles it; a
+/// bare integer is settled only by the page writing the amount out in its own
+/// visible text, and when it does not, the price goes unreported.
+fn payload_price(value: &serde_json::Value, text: &str) -> Option<String> {
+    let integer = match value {
+        serde_json::Value::Number(n) if n.is_f64() => return normalize_price(&n.to_string()),
+        serde_json::Value::Number(n) => n.as_i64()?,
+        serde_json::Value::String(s) if s.contains(['.', ',']) => return normalize_price(s),
+        serde_json::Value::String(s) => s.trim().parse().ok()?,
+        _ => return None,
+    };
+    if integer <= 0 {
+        return None;
+    }
+    let cents = format!("{:.2}", integer as f64 / 100.0);
+    if text_writes_amount(text, &cents) {
+        return Some(cents);
+    }
+    let major = format!("{integer}.00");
+    text_writes_amount(text, &major).then_some(major)
+}
+
+/// Whether the page writes this amount out as a price — "12.99" or "12,99",
+/// and not as a fragment of a longer number, so that "112,99" elsewhere on the
+/// page cannot confirm 12.99.
+fn text_writes_amount(text: &str, amount: &str) -> bool {
+    let comma = amount.replace('.', ",");
+    [amount, comma.as_str()].iter().any(|needle| {
+        let mut from = 0;
+        while let Some(at) = text[from..].find(*needle).map(|i| i + from) {
+            let end = at + needle.len();
+            let free = |c: Option<char>| !c.is_some_and(|c| c.is_ascii_digit() || c == ',' || c == '.');
+            if free(text[..at].chars().next_back()) && free(text[end..].chars().next()) {
+                return true;
+            }
+            from = end;
+        }
+        false
+    })
+}
+
+/// Stock as embedded state spells it: a schema.org word, a screaming-snake
+/// enum, or a boolean.
+fn stock_word(value: &serde_json::Value) -> Option<&'static str> {
+    let text = match value {
+        serde_json::Value::Bool(b) => return Some(if *b { "in stock" } else { "out of stock" }),
+        serde_json::Value::String(s) => s.to_ascii_uppercase(),
+        _ => return None,
+    };
+    availability_word(&text).or_else(|| {
+        // "UNAVAILABLE" contains "AVAILABLE", so the negatives go first.
+        let says = |needles: &[&str]| needles.iter().any(|n| text.contains(n));
+        if says(&["OUT_OF_STOCK", "UNAVAILABLE", "SOLD_OUT", "FALSE"]) {
+            Some("out of stock")
+        } else if says(&["AVAILABLE", "IN_STOCK", "TRUE"]) {
+            Some("in stock")
+        } else {
+            None
+        }
+    })
+}
+
+fn payload_availability<'a>(obj: &'a JsonObject, payload: &Payload<'a>) -> Option<&'static str> {
+    STOCK_KEYS.iter().find_map(|key| {
+        let value = payload.resolve(obj.get(*key)?)?;
+        stock_word(value).or_else(|| {
+            // Jumbo nests it: availability -> { isAvailable, availability }.
+            let nested = value.as_object()?;
+            STOCK_KEYS.iter().find_map(|key| stock_word(payload.resolve(nested.get(*key)?)?))
+        })
+    })
+}
+
+/// The page as a reader sees it, used to confirm a price the embedded state
+/// left ambiguous.
+fn visible_text(html: &str) -> String {
+    let without_scripts = strip_tag_blocks(&strip_tag_blocks(html, "script"), "style");
+    collapse_ws(&decode_entities(&strip_tags(&without_scripts)))
+}
+
+/// Shops that ship no schema.org markup still ship their own state: a
+/// `<script type="application/json">` block holding the very product the page
+/// was rendered from. Jumbo is the case that prompted this — its JSON-LD offer
+/// carries no price at all, while its Nuxt payload has the product, its url
+/// and its price.
+///
+/// Only an object whose own url matches the fetched page is read. A price
+/// found loose in a payload is exactly the guess this extractor exists to
+/// prevent, so an unmatched payload yields nothing.
+fn embedded_json_product(html: &str, page: &Url) -> Option<PageProduct> {
+    let path = page.path().trim_end_matches('/').to_ascii_lowercase();
+    for root in script_json_blocks(html, "application/json") {
+        let payload = Payload::detect(&root);
+        let mut best: Option<(usize, &JsonObject)> = None;
+        for obj in payload.objects(&root) {
+            // A url alone is not enough: the Nuxt root object names the page's
+            // own path too, and it is not a product.
+            let Some(claimed) = matched_path(obj, &payload, &path) else { continue };
+            if scalar_price(obj, &payload).is_none() {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(len, _)| claimed > *len) {
+                best = Some((claimed, obj));
+            }
+        }
+        let Some((_, obj)) = best else { continue };
+        let Some((raw, currency)) = scalar_price(obj, &payload) else { continue };
+        // Stripping a 600 KB page is not free, so it waits for a match.
+        let text = visible_text(html);
+        let product = PageProduct {
+            name: string_field(obj, &payload, &["name", "title"]),
+            price: payload_price(raw, &text)
+                .map(|price| format!("{price} {}", currency.unwrap_or_else(|| "EUR".into()))),
+            availability: payload_availability(obj, &payload),
+            seller: string_field(obj, &payload, &["seller", "merchant"]),
+        };
+        if product.price.is_none() && product.name.is_none() && product.availability.is_none() {
+            return None;
+        }
+        return Some(product);
+    }
+    None
+}
+
 /// The product this URL is actually about. Matching is on the url path
 /// because shops shorten it in markup (no product id, no trailing slash), so
 /// one has to be a prefix of the other; the longest such match wins.
 fn extract_product(html: &str, page: &Url) -> Option<PageProduct> {
     let mut found = Vec::new();
-    for block in json_ld_blocks(html) {
+    for block in script_json_blocks(html, "application/ld+json") {
         collect_products(&block, &mut found);
     }
     let path = page.path().trim_end_matches('/').to_ascii_lowercase();
@@ -178,6 +557,10 @@ fn extract_product(html: &str, page: &Url) -> Option<PageProduct> {
     best.map(|(_, p)| p)
         // A page describing exactly one product needs no disambiguation.
         .or_else(|| (found.len() == 1).then(|| found[0].1.clone()))
+        .or_else(|| microdata_product(html))
+        // Last: shops with no schema.org markup at all, read from the JSON
+        // application state they render the page from.
+        .or_else(|| embedded_json_product(html, page))
 }
 
 /// Stock status from schema.org markup, which is the only trustworthy signal:
@@ -535,6 +918,48 @@ mod tests {
     }
 
     #[test]
+    fn microdata_is_used_when_there_is_no_json_ld() {
+        let html = r#"<html><body>
+          <div itemscope itemtype="https://schema.org/Product">
+            <h1 itemprop="name">Vanish Oxi Action 1.5 kg</h1>
+            <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+              <meta itemprop="price" content="13,80">
+              <meta itemprop="priceCurrency" content="eur">
+              <link itemprop="availability" href="https://schema.org/InStock">
+            </div>
+          </div>
+          <div class="related">€ 9,99 € 24,50</div>
+        </body></html>"#;
+        let page = extract_page(html, &Url::parse("https://shop.example/p/1").unwrap());
+        let product = page.product.expect("microdata describes the product");
+        assert_eq!(product.price.as_deref(), Some("13.80 EUR"));
+        assert_eq!(product.name.as_deref(), Some("Vanish Oxi Action 1.5 kg"));
+        assert_eq!(product.availability, Some("in stock"));
+    }
+
+    #[test]
+    fn microdata_with_several_prices_is_refused() {
+        // A related-items strip carrying its own offers: no way to tell which
+        // price is the product's, so the page reports none.
+        let html = r#"<html><body>
+          <span itemprop="price">13,80</span>
+          <span itemprop="price">9,99</span>
+        </body></html>"#;
+        let page = extract_page(html, &Url::parse("https://shop.example/p/1").unwrap());
+        assert_eq!(page.product, None);
+    }
+
+    #[test]
+    fn written_prices_are_normalised() {
+        assert_eq!(normalize_price("13,80").as_deref(), Some("13.80"));
+        assert_eq!(normalize_price("€ 13.80").as_deref(), Some("13.80"));
+        assert_eq!(normalize_price("1.234,56").as_deref(), Some("1234.56"));
+        assert_eq!(normalize_price("9").as_deref(), Some("9.00"));
+        assert_eq!(normalize_price("gratis"), None);
+        assert_eq!(normalize_price("0,00"), None);
+    }
+
+    #[test]
     fn a_single_product_page_needs_no_url_match() {
         let html = r#"<html><body><script type="application/ld+json">
           {"@type":"Product","name":"Widget","offers":{"price":9.5,"priceCurrency":"EUR",
@@ -585,6 +1010,116 @@ mod tests {
         assert_eq!(availability(r#"{"availability":"OutOfStock"}{"availability":"InStock"}"#), None);
         // Dutch prose alone proves nothing — that is what the carousel showed.
         assert_eq!(availability("<p>Niet leverbaar, uitverkocht</p>"), None);
+    }
+
+    /// The shape of Jumbo's `__NUXT_DATA__`, shrunk: a devalue value table
+    /// where every field inside a container is an index into the table, the
+    /// product's price is the integer 1299 for €12.99, and `["ShallowReactive",
+    /// 1]` wrappers stand in front of the containers they wrap.
+    fn nuxt_page(visible: &str) -> String {
+        format!(
+            r#"<html><body>
+          <script type="application/json" id="__NUXT_DATA__">
+          [["ShallowReactive",1],
+           {{"data":2,"path":6,"serverRendered":10}},
+           {{"product":3}},
+           {{"title":4,"link":6,"canonicalUrl":13,"price":7,"availability":9}},
+           "Vanish Oxi Action Poeder Kleur 720g",
+           "Price",
+           "/producten/vanish-oxi-action-poeder-kleur-720g-749765STK",
+           {{"__typename":5,"price":8,"promoPrice":11}},
+           1299,
+           {{"__typename":5,"isAvailable":10,"availability":12}},
+           true,
+           null,
+           "AVAILABLE",
+           "https://www.jumbo.com/producten/vanish-oxi-action-poeder-kleur-720g-749765STK"]
+          </script>
+          <div class="price">{visible}</div>
+          </body></html>"#
+        )
+    }
+
+    fn jumbo_url() -> Url {
+        Url::parse("https://www.jumbo.com/producten/vanish-oxi-action-poeder-kleur-720g-749765STK")
+            .unwrap()
+    }
+
+    #[test]
+    fn devalue_state_gives_the_price_the_page_confirms() {
+        // No JSON-LD price and no microdata anywhere on the page: without the
+        // payload there is nothing to report but the visible text.
+        let html = nuxt_page("Prijs: &euro; 12,99 per stuk");
+        let page = extract_page(&html, &jumbo_url());
+        let product = page.product.expect("the Nuxt payload states the product");
+        assert_eq!(product.price.as_deref(), Some("12.99 EUR"));
+        assert_eq!(product.name.as_deref(), Some("Vanish Oxi Action Poeder Kleur 720g"));
+        assert_eq!(product.availability, Some("in stock"));
+        assert_eq!(page.availability, Some("in stock"));
+    }
+
+    #[test]
+    fn an_integer_price_the_page_never_writes_out_is_refused() {
+        // 1299 is €12.99 or €1299 and the payload does not say which. With no
+        // written amount to settle it, the product is reported without a
+        // price rather than with a possibly hundredfold wrong one.
+        let html = nuxt_page("Prijs op aanvraag");
+        let page = extract_page(&html, &jumbo_url());
+        let product = page.product.expect("name and stock are still known");
+        assert_eq!(product.price, None);
+        assert_eq!(product.availability, Some("in stock"));
+
+        // A longer number containing the amount does not count as confirmation.
+        assert!(!text_writes_amount("Nu 112,99 in plaats van 129,95", "12.99"));
+        // The integer reading is taken when that is what the page writes.
+        assert_eq!(
+            payload_price(&serde_json::json!(1299), "Laptop 1299,00 euro").as_deref(),
+            Some("1299.00")
+        );
+    }
+
+    #[test]
+    fn plain_state_is_read_without_index_resolution() {
+        // Next.js ships the state as ordinary nested JSON: the fields hold
+        // their values, not indices into a table.
+        let html = r#"<html><body>
+          <script type="application/json" id="__NEXT_DATA__">
+          {"props":{"pageProps":{"product":{
+             "name":"Vanish Oxi Action 1.5 kg",
+             "url":"https://www.bol.com/nl/nl/p/vanish-oxi-action-1-5-kg/",
+             "price":"13.80","currency":"eur","inStock":true}}}}
+          </script>
+          <div>€ 9,99 € 24,50</div>
+          </body></html>"#;
+        let url = Url::parse("https://www.bol.com/nl/nl/p/vanish-oxi-action-1-5-kg/9300000087803700/")
+            .unwrap();
+        let product = extract_page(html, &url).product.expect("the payload states the product");
+        assert_eq!(product.price.as_deref(), Some("13.80 EUR"));
+        assert_eq!(product.name.as_deref(), Some("Vanish Oxi Action 1.5 kg"));
+        assert_eq!(product.availability, Some("in stock"));
+    }
+
+    #[test]
+    fn a_payload_matching_no_url_reports_nothing() {
+        // The payload describes a product, the page is a different one: the
+        // price on offer belongs to neither, so none is reported.
+        let html = nuxt_page("&euro; 12,99");
+        let page = extract_page(&html, &Url::parse("https://www.jumbo.com/producten/ariel").unwrap());
+        assert_eq!(page.product, None);
+    }
+
+    #[test]
+    fn a_cyclic_payload_terminates() {
+        // devalue's table can reference itself; a wrapper chain that never
+        // reaches a value must not hang or recurse away the stack.
+        let html = r#"<html><body>
+          <script type="application/json">
+          [["ShallowReactive",1],{"data":0,"link":4,"price":2},
+           ["Reactive",3],["Reactive",2],"/p/widget"]
+          </script>
+          <div>€ 12,99</div></body></html>"#;
+        let page = extract_page(html, &Url::parse("https://shop.example/p/widget").unwrap());
+        assert_eq!(page.product, None);
     }
 
     #[tokio::test]

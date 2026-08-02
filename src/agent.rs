@@ -16,9 +16,11 @@ pub const MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 pub const MODEL: &str = "minimax-m3";
 /// Cap on model calls per request so a confused agent can't burn credits.
 /// The full flow (query_purchases -> search -> secondhand -> a few
-/// fetch_page opens -> answer) legitimately needs ~10; 12 leaves headroom
-/// while still bounding a runaway loop.
-pub const MAX_TURNS: usize = 12;
+/// fetch_page opens -> compare_prices -> answer) legitimately needs ~12 now
+/// that price comparisons are mandatory; 16 leaves headroom while still
+/// bounding a runaway loop. Running out is no longer fatal — see
+/// [`wrap_up_agent`].
+pub const MAX_TURNS: usize = 16;
 /// Conversation history cap per chat (messages, not exchanges).
 pub const HISTORY_CAP: usize = 20;
 
@@ -274,6 +276,28 @@ pub fn preamble_with_profile(facts: &[(String, String)]) -> String {
         search_languages(facts).join(", ")
     ));
     p
+}
+
+/// Note handed to the wrap-up agent when the turn budget runs out.
+pub const WRAP_UP_NOTE: &str = "[system note] You have run out of research steps and cannot \
+call any more tools. Answer now from what you already gathered above: give the options you \
+did confirm, with their prices and links, and say plainly which parts you could not verify. \
+A partial answer is what is wanted here - do not apologise and do not ask to continue.";
+
+/// A tool-less agent over the same preamble and history, used when the turn
+/// budget is exhausted. By that point the model usually has everything it
+/// needs and only the final write-up is missing; without this the whole run
+/// is thrown away and the user gets an apology instead of the prices we
+/// already paid to look up.
+pub fn wrap_up_agent(
+    d: &AgentDeps,
+    facts: &[(String, String)],
+) -> rig::agent::Agent<openai::completion::CompletionModel> {
+    d.llm
+        .agent(MODEL)
+        .preamble(&preamble_with_profile(facts))
+        .default_max_turns(1)
+        .build()
 }
 
 /// Built per incoming message: tools capture the requesting user's identity,

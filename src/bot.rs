@@ -1,4 +1,4 @@
-use crate::agent::{build_agent, AgentDeps, HISTORY_CAP};
+use crate::agent::{build_agent, wrap_up_agent, AgentDeps, HISTORY_CAP, WRAP_UP_NOTE};
 use crate::config::Config;
 use crate::draft::{resolve_draft, DraftResolution};
 use crate::progress::Live;
@@ -300,7 +300,10 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "agent request failed");
-            bot.send_message(chat_id, agent_error_message(&e)).await?;
+            // Replace the progress message rather than sending a second one:
+            // otherwise the user is left with a half-written thought frozen
+            // above the apology.
+            live.show(agent_error_message(&e), true).await;
         }
     }
     Ok(())
@@ -337,6 +340,23 @@ first, open at most 3 pages, then compare.";
 fn looks_like_price_request(text: &str) -> bool {
     let text = text.to_lowercase();
     PRICE_MARKERS.iter().any(|m| text.contains(m))
+}
+
+/// How much of the model's own notes to hand the wrap-up agent.
+const WRAP_UP_CONTEXT: usize = 6000;
+
+/// The last `max` characters — the newest notes are the ones carrying
+/// confirmed prices.
+fn tail_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    text.chars().skip(count.saturating_sub(max)).collect()
+}
+
+/// rig wraps the turn-limit failure in its own error types; the message is
+/// the stable part across them.
+fn is_max_turns(e: &impl std::fmt::Display) -> bool {
+    let text = e.to_string();
+    text.contains("MaxTurnsError") || text.contains("max turns")
 }
 
 /// Turn an agent failure into a user-facing message; the max-turns budget
@@ -467,6 +487,7 @@ async fn handle_reaction(
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "reaction follow-up failed");
+            live.show(agent_error_message(&e), true).await;
         }
     }
     Ok(())
@@ -520,10 +541,21 @@ async fn run_agent(
     // Reasoning arrives on its own channel, separate from the answer text.
     let mut thinking = String::new();
     let mut final_response = None;
+    let mut out_of_turns = false;
     {
         let mut stream = agent.stream_chat(prompt, history.clone()).await;
         while let Some(item) = stream.next().await {
-            match item? {
+            let item = match item {
+                Ok(item) => item,
+                // Not fatal: by this point the research is usually done and
+                // only the write-up is missing. Salvaged below.
+                Err(e) if is_max_turns(&e) => {
+                    out_of_turns = true;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            match item {
                 MultiTurnStreamItem::ToolExecutionStart { tool_call, .. } => {
                     let args = &tool_call.function.arguments;
                     live.show(&crate::progress::describe(&tool_call.function.name, args), false)
@@ -582,6 +614,21 @@ async fn run_agent(
     let mut reply = strip_thinking(&text);
     if reply.is_empty() {
         reply = strip_thinking(&streamed);
+    }
+
+    if out_of_turns {
+        tracing::warn!(chat_id, "turn budget exhausted; writing up from notes");
+        live.show("✍️ out of research steps - writing up what I found", false).await;
+        // The history from an interrupted run is not returned, so the
+        // model's own notes are the material: its reasoning already lists
+        // the prices it confirmed.
+        let notes = tail_chars(&format!("{thinking}\n\n{streamed}"), WRAP_UP_CONTEXT);
+        let wrap_up = wrap_up_agent(&app.deps, &facts);
+        let asked = format!("{WRAP_UP_NOTE}\n\nYour research notes so far:\n{notes}");
+        reply = strip_thinking(&rig::completion::Prompt::prompt(&wrap_up, asked).await?);
+        // Keep the exchange in context; the interrupted turns are lost.
+        history.push(LlmMessage::user(prompt));
+        history.push(LlmMessage::assistant(&reply));
     }
 
     // Guard against links the model wrote but never saw: an invented Amazon
@@ -835,6 +882,25 @@ mod tests {
         trim_history(&mut history, 4);
         assert_eq!(history, vec![user_text("q2"), assistant_text("a2")]);
         assert!(is_plain_user_text(&history[0]));
+    }
+
+    #[test]
+    fn the_turn_limit_is_recognised_however_rig_wraps_it() {
+        // Exactly what production logged when a user was left hanging.
+        assert!(is_max_turns(&"PromptError: MaxTurnsError: reached max turns limit: 12"));
+        assert!(is_max_turns(&"reached max turns limit: 16"));
+        assert!(!is_max_turns(&"kagi api error (status 401): bad key"));
+        assert!(!is_max_turns(&"perplexity request failed: timed out"));
+    }
+
+    #[test]
+    fn wrap_up_notes_keep_the_newest_findings() {
+        let notes = format!("{}\nconfirmed: 44.99 EUR for 9 kg", "old chatter ".repeat(500));
+        let kept = tail_chars(&notes, 60);
+        assert_eq!(kept.chars().count(), 60);
+        assert!(kept.ends_with("confirmed: 44.99 EUR for 9 kg"), "got: {kept}");
+        // shorter than the cap: untouched
+        assert_eq!(tail_chars("short", 60), "short");
     }
 
     #[test]

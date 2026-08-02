@@ -186,10 +186,11 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
         .collect();
     ranked.sort_by(|a, b| a.per_unit.total_cmp(&b.per_unit));
 
-    // Offers that hide shipping until checkout must not win a headline pick
-    // over one whose full cost is known — unless nothing is known.
-    let known: Vec<&Ranked> = ranked.iter().filter(|r| r.row.shipping_known).collect();
-    let candidates: Vec<&Ranked> = if known.is_empty() { ranked.iter().collect() } else { known };
+    // Every offer competes, including those that state no shipping cost: an
+    // unstated delivery fee is a reason to label a pick, not to bury it —
+    // most shops never state one until checkout, and hiding them would hide
+    // the cheapest option most of the time.
+    let candidates: Vec<&Ranked> = ranked.iter().collect();
 
     let smallest = candidates.iter().map(|r| r.row.units).min().unwrap_or(1);
     // Within one pack size, cheapest per unit is cheapest landed.
@@ -219,18 +220,38 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
     let mut notes = Vec::new();
     let unknown = rows.len() - rows.iter().filter(|r| r.shipping_known).count();
     if unknown == rows.len() {
-        // Holding them out of the headline was impossible — they are the
-        // headline — so saying they were held out would be false.
         notes.push(
-            "no offer states shipping; every figure here excludes delivery and the picks are on \
-             item price alone — say so in your reply"
+            "no offer states shipping; every figure here is item-only and excludes delivery — \
+             say so in your reply"
                 .to_string(),
         );
     } else if unknown > 0 {
+        let named: Vec<&str> = rows
+            .iter()
+            .filter(|r| !r.shipping_known)
+            .map(|r| r.title.as_str())
+            .take(5)
+            .collect();
         notes.push(format!(
-            "{unknown} offer(s) do not state shipping; they are ranked on item price alone and \
-             cannot be a headline pick — say so when you mention them"
+            "item-only (shipping not stated): {} — present them normally but mark the price as \
+             excluding delivery",
+            named.join("; ")
         ));
+    }
+    // The same page cannot be two different packs at two different prices;
+    // one of them was pasted from another listing.
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(twin) = rows[i + 1..]
+            .iter()
+            .find(|other| other.url == row.url && other.units != row.units)
+        {
+            notes.push(format!(
+                "{:?} and {:?} share one url ({}) but claim different pack sizes ({} vs {}) — at \
+                 most one is right; re-check the page before presenting either",
+                row.title, twin.title, row.url, row.units, twin.units
+            ));
+            break;
+        }
     }
     if !bulk_advantage {
         // best_single is the cheapest of the smallest pack size available,
@@ -512,12 +533,12 @@ mod tests {
 
     #[test]
     fn no_bulk_note_names_the_smallest_pack_when_no_single_is_available() {
-        // The only offer with known shipping is a 3-pack, so best_single is a
-        // 3-pack; "no bulk option beats buying one" describes a purchase that
+        // Nobody sells this as a single: the smallest pack is 3, so
+        // "no bulk option beats buying one" would describe a purchase that
         // was never on the table.
         let out = compare(&args(vec![
-            offer("single", 5.0, 1, None),
             offer("3-pack", 20.0, 3, Some(2.0)),
+            offer("6-pack", 60.0, 6, Some(2.0)),
         ]))
         .unwrap();
 
@@ -533,25 +554,55 @@ mod tests {
     }
 
     #[test]
-    fn unknown_shipping_cannot_take_a_headline_pick() {
-        // Cheapest on sticker price, but shipping is unstated.
+    fn unknown_shipping_still_wins_the_headline_but_is_named() {
+        // Cheapest on item price, shipping unstated. Most shops never state
+        // one before checkout, so demoting it would hide the cheapest option
+        // as a matter of course.
         let out = compare(&args(vec![
             offer("mystery-shipping", 5.0, 1, None),
             offer("known", 9.0, 1, Some(1.0)),
         ]))
         .unwrap();
 
-        assert_eq!(out.best_single.title, "known");
-        assert_eq!(out.best_per_unit.title, "known");
-        // it is still listed, first even, because it is cheapest per unit
-        assert_eq!(out.rows[0].title, "mystery-shipping");
+        assert_eq!(out.best_single.title, "mystery-shipping");
+        assert_eq!(out.best_per_unit.title, "mystery-shipping");
         assert!(!out.rows[0].shipping_known);
-        // Here the wording is true: a fully-known offer took the headline.
+        // ...but the reply has to say the price excludes delivery, and which
+        // offer that applies to.
         assert!(
-            out.notes.iter().any(|n| n.contains("cannot be a headline pick")),
+            out.notes
+                .iter()
+                .any(|n| n.contains("item-only") && n.contains("mystery-shipping")),
             "got: {:?}",
             out.notes
         );
+    }
+
+    #[test]
+    fn one_url_claiming_two_pack_sizes_is_flagged() {
+        // Exactly the production slip: a 9 kg pick carrying the URL of a
+        // 2.7 kg listing, alongside that listing itself.
+        let out = compare(&args(vec![
+            Offer {
+                url: "https://bol.com/p/vanish-2-7-kg/".to_string(),
+                ..offer("6 x 1.5 kg", 44.99, 9000, None)
+            },
+            Offer {
+                url: "https://bol.com/p/vanish-2-7-kg/".to_string(),
+                ..offer("2.7 kg", 13.90, 2700, None)
+            },
+        ]))
+        .unwrap();
+
+        assert!(
+            out.notes.iter().any(|n| n.contains("share one url")
+                && n.contains("9000")
+                && n.contains("2700")),
+            "got: {:?}",
+            out.notes
+        );
+        // Both still rank; the model is told to re-check, not to guess.
+        assert_eq!(out.rows.len(), 2);
     }
 
     #[test]

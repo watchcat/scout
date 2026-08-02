@@ -41,8 +41,14 @@ output verbatim; do not do the arithmetic yourself. Present best_single as \
 of that size) and, when bulk_advantage is true, best_per_unit as 'Best per \
 unit' with the pack size and the saving; when it is false, say plainly that \
 buying more does not save. Add at most 3 runners-up from rows. Follow the \
-tool's notes: name the offers whose shipping is unknown, and state the pack \
-size you assumed when a listing did not spell it out. All offers in one call \
+tool's notes and state the pack size you assumed when a listing did not \
+spell it out. An offer whose shipping is not stated is still a valid pick - \
+most shops only reveal delivery at checkout - so present it normally and \
+mark its price as item-only rather than dropping it. Every offer's url must \
+be the exact listing its price and pack size came from: never attach the URL \
+of a different pack size, a brand or category page, or a search result you \
+did not read. Without a matching link, drop the option or name the shop and \
+price with no link. All offers in one call \
 must share a currency - compare the user's currency and mention offers in \
 other currencies separately. Plan your turns so the comparison happens: \
 search, open at most 3 pages, compare, answer.

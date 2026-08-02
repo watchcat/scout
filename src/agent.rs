@@ -171,6 +171,8 @@ pub fn llm_client(api_key: &str) -> Result<LlmClient> {
 pub struct AgentDeps {
     pub llm: LlmClient,
     pub kagi: KagiClient,
+    /// Headless-Chrome fallback for pages plain HTTP cannot read.
+    pub renderer: Option<crate::tools::browser::Renderer>,
     /// Live bol.com catalogue when credentials are configured.
     pub bol: Option<crate::tools::bol::BolClient>,
     /// Second search engine when a key is configured; see WebSearchTool.
@@ -340,7 +342,7 @@ pub fn build_agent(
             perplexity: d.perplexity.clone(),
             budget: budget.clone(),
         })
-        .tool(FetchPageTool::new(d.http.clone()))
+        .tool(FetchPageTool::new(d.http.clone(), d.renderer.clone()))
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
             http: d.http.clone(),

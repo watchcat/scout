@@ -601,12 +601,32 @@ fn availability(html: &str) -> Option<&'static str> {
 /// Built per request, so `opens` counts this request's page opens.
 pub struct FetchPageTool {
     pub http: reqwest::Client,
+    /// Headless-Chrome fallback, when a browser is installed. Only reached
+    /// after plain HTTP has failed.
+    pub renderer: Option<super::browser::Renderer>,
     opens: std::sync::atomic::AtomicUsize,
 }
 
 impl FetchPageTool {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http, opens: std::sync::atomic::AtomicUsize::new(0) }
+    pub fn new(http: reqwest::Client, renderer: Option<super::browser::Renderer>) -> Self {
+        Self { http, renderer, opens: std::sync::atomic::AtomicUsize::new(0) }
+    }
+}
+
+/// Whether a headless render is worth trying after a plain fetch.
+///
+/// 404/410 mean the page is gone — rendering cannot bring it back, and
+/// pretending otherwise would undo the dead-link checks. A bot wall (403,
+/// 429, 503) or a challenge page served with HTTP 200 is exactly what a real
+/// browser is for.
+fn worth_rendering(status: Option<u16>, body: &str) -> bool {
+    match status {
+        Some(404 | 410) => false,
+        Some(403 | 429 | 503) | None => true,
+        Some(s) if !(200..300).contains(&s) => true,
+        // A success that carries no readable content: challenge or a shell
+        // page whose body arrives by script.
+        _ => super::browser::looks_unrendered(body),
     }
 }
 
@@ -653,12 +673,33 @@ impl Tool for FetchPageTool {
         }
         let resp = browser_get(&self.http, url.clone()).send().await?;
         let status = resp.status();
+        let body = if status.is_success() { resp.text().await? } else { String::new() };
+
+        // Plain HTTP could not read this page; a real browser sometimes can.
+        if let Some(renderer) = self
+            .renderer
+            .as_ref()
+            .filter(|_| worth_rendering(Some(status.as_u16()), &body))
+        {
+            tracing::info!(url = %url, status = status.as_u16(), "retrying with headless browser");
+            match renderer.render(url.as_str()).await {
+                Ok(html) if !super::browser::looks_unrendered(&html) => {
+                    return Ok(extract_page(&html, &url));
+                }
+                Ok(_) => tracing::info!(url = %url, "render produced no usable page"),
+                Err(e) => tracing::warn!(url = %url, error = %e, "render failed"),
+            }
+        }
         if !status.is_success() {
             return Err(FetchError::Invalid(format!("page returned HTTP {status}")));
         }
-        let html = resp.text().await?;
-        Ok(extract_page(&html, &url))
+        Ok(extract_page(&body, &url))
     }
+}
+
+#[cfg(test)]
+pub fn extract_page_for_test(html: &str, url: &str) -> Option<PageProduct> {
+    extract_page(html, &Url::parse(url).unwrap()).product
 }
 
 fn extract_page(html: &str, base: &Url) -> PageContent {
@@ -870,7 +911,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = FetchPageTool::new(reqwest::Client::new());
+        let tool = FetchPageTool::new(reqwest::Client::new(), None);
         let page = tool
             .call(FetchArgs { url: format!("{}/p/1", server.uri()) })
             .await
@@ -915,6 +956,26 @@ mod tests {
         assert_eq!(product.availability, Some("in stock"));
         // the product's own status also settles the page-level field
         assert_eq!(page.availability, Some("in stock"));
+    }
+
+
+    #[test]
+    fn rendering_is_reserved_for_pages_plain_http_cannot_read() {
+        let real_page = "<html><body>".to_string() + &"content ".repeat(500) + "</body></html>";
+
+        // Bot walls and challenges are what a browser is for.
+        assert!(worth_rendering(Some(403), ""));
+        assert!(worth_rendering(Some(429), ""));
+        assert!(worth_rendering(Some(503), ""));
+        assert!(worth_rendering(Some(200), "<html><title>Just a moment...</title></html>"));
+        assert!(worth_rendering(Some(200), "<html><body>tiny shell</body></html>"));
+
+        // A page that is simply gone stays gone: rendering it would undo the
+        // dead-link checks.
+        assert!(!worth_rendering(Some(404), ""));
+        assert!(!worth_rendering(Some(410), ""));
+        // A page we could read needs no browser.
+        assert!(!worth_rendering(Some(200), &real_page));
     }
 
     #[test]
@@ -1130,7 +1191,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = FetchPageTool::new(reqwest::Client::new());
+        let tool = FetchPageTool::new(reqwest::Client::new(), None);
         for i in 0..MAX_OPENS {
             let page = tool.call(FetchArgs { url: format!("{}/p/{i}", server.uri()) }).await;
             assert!(page.is_ok(), "open {i} should be allowed");
@@ -1142,7 +1203,7 @@ mod tests {
         assert!(err.to_string().contains("page budget spent"), "got: {err}");
 
         // A fresh tool (i.e. the next request) starts with a full budget.
-        let next = FetchPageTool::new(reqwest::Client::new());
+        let next = FetchPageTool::new(reqwest::Client::new(), None);
         assert!(next.call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.is_ok());
     }
 
@@ -1155,7 +1216,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = FetchPageTool::new(reqwest::Client::new());
+        let tool = FetchPageTool::new(reqwest::Client::new(), None);
         let err = tool
             .call(FetchArgs { url: format!("{}/gone", server.uri()) })
             .await

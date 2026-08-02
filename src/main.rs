@@ -52,6 +52,9 @@ async fn main() -> Result<()> {
         tools::marktplaats::MARKTPLAATS_BASE.to_string(),
     );
 
+    let renderer = tools::browser::find_chrome().map(tools::browser::Renderer::new);
+    tracing::info!(headless_browser = renderer.is_some(), "fallback renderer");
+
     let bol = cfg.bol_credentials.clone().map(|(id, secret)| {
         tools::bol::BolClient::new(
             http.clone(),
@@ -79,6 +82,7 @@ async fn main() -> Result<()> {
     let deps = AgentDeps {
         llm,
         kagi,
+        renderer,
         bol,
         perplexity,
         http,

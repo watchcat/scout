@@ -24,6 +24,11 @@ DuckDB for purchase memory.
   are compared on the same basis
 - Stock status read from a page's schema.org markup, because shops answer
   HTTP 200 for products they cannot sell
+- Prices read from a page's own structured data — schema.org JSON-LD,
+  microdata, or the framework state a shop embeds — never from the flattened
+  page text, which mixes in carousels, other sellers and other pack sizes
+- Pages that block plain HTTP are re-opened once in headless Chrome, which
+  clears the challenge shops like action.com put in front of them
 - Photo search: send a product photo, confirm/edit the drafted query
   (one-tap copy button), search
 - Second-hand search across eBay/Marktplaats/Vinted (per-user configurable
@@ -68,6 +73,7 @@ Kagi's v1 API doesn't offer it yet; it returns when they ship it.
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
 | `BOL_CLIENT_ID` + `BOL_CLIENT_SECRET` | no | — | bol.com Marketing Catalog API: live catalogue search (affiliate account) |
 | `BOL_COUNTRY` | no | `NL` | bol.com market: `NL` or `BE` |
+| `SCOUT_CHROME` | no | auto-detected | Chrome/Chromium for the headless fallback on blocked pages |
 | `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` | no | — | eBay Browse API: live prices/availability for eBay results |
 | `EBAY_MARKETPLACE` | no | `EBAY_NL` | eBay marketplace id |
 

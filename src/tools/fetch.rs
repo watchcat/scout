@@ -108,10 +108,60 @@ fn script_json_blocks(html: &str, mime: &str) -> Vec<serde_json::Value> {
     out
 }
 
+/// Corrects a price that is a hundred times the page's own OpenGraph
+/// amount. That is the shape of a cents-in-euros slip, and it is worth a
+/// dedicated check because it is the error that survives every other one:
+/// 640 EUR for a bottle of cola reads as a real number, not a bug.
+///
+/// Only that exact factor is corrected. Any other disagreement is left
+/// alone rather than guessed at.
+fn with_og_correction(product: PageProduct, html: &str) -> PageProduct {
+    let (Some(price), Some(og)) = (product.price.as_deref(), og_price(html)) else {
+        return product;
+    };
+    let Some(shown) = price.split_whitespace().next().and_then(|p| p.parse::<f64>().ok()) else {
+        return product;
+    };
+    if og > 0.0 && (shown / 100.0 - og).abs() < 0.005 {
+        let currency = price.split_once(' ').map(|(_, c)| c.to_string());
+        return PageProduct {
+            price: Some(match currency {
+                Some(currency) => format!("{og:.2} {currency}"),
+                None => format!("{og:.2}"),
+            }),
+            ..product
+        };
+    }
+    product
+}
+
+/// One product the markup describes, before deciding which is the page's.
+struct Candidate {
+    url: Option<String>,
+    /// Whether the price was written with decimals. A bare integer is how a
+    /// broken shop theme leaks cents: japanesetaste.nl publishes "6.48" for
+    /// this bottle in one JSON-LD block and "648" in another.
+    decimals: bool,
+    product: PageProduct,
+}
+
+/// The page's OpenGraph product price, an independent statement of the same
+/// number that shop themes get right far more often than their JSON-LD.
+fn og_price(html: &str) -> Option<f64> {
+    let lower = html.to_ascii_lowercase();
+    let at = lower.find("property=\"product:price:amount\"")?;
+    let open = lower[..at].rfind('<')?;
+    let close = lower[at..].find('>')? + at;
+    let tag = &html[open..close];
+    let start = tag.to_ascii_lowercase().find("content=\"")? + "content=\"".len();
+    let end = tag[start..].find('"')? + start;
+    normalize_price(&tag[start..end])?.parse().ok()
+}
+
 /// Collects every node that carries an offer with a price, keeping the url
 /// it claims — a bol.com page is one ProductGroup whose variants each have
 /// their own url and price, and only one of them is the page you fetched.
-fn collect_products(node: &serde_json::Value, out: &mut Vec<(Option<String>, PageProduct)>) {
+fn collect_products(node: &serde_json::Value, out: &mut Vec<Candidate>) {
     match node {
         serde_json::Value::Array(items) => items.iter().for_each(|i| collect_products(i, out)),
         serde_json::Value::Object(map) => {
@@ -130,15 +180,17 @@ fn collect_products(node: &serde_json::Value, out: &mut Vec<(Option<String>, Pag
                     Some(serde_json::Value::Number(n)) => Some(n.to_string()),
                     _ => None,
                 };
-                let price = text(offer.get("price")).map(|p| {
+                let raw = text(offer.get("price")).unwrap_or_default();
+                let price = normalize_price(&raw).map(|p| {
                     match text(offer.get("priceCurrency")) {
                         Some(currency) => format!("{p} {currency}"),
                         None => p,
                     }
                 });
-                out.push((
-                    text(map.get("url")),
-                    PageProduct {
+                out.push(Candidate {
+                    url: text(map.get("url")),
+                    decimals: raw.contains('.') || raw.contains(','),
+                    product: PageProduct {
                         name: text(map.get("name")),
                         price,
                         availability: text(offer.get("availability"))
@@ -150,7 +202,7 @@ fn collect_products(node: &serde_json::Value, out: &mut Vec<(Option<String>, Pag
                             .and_then(|n| n.as_str())
                             .map(|n| n.to_string()),
                     },
-                ));
+                });
             }
             map.values().for_each(|v| collect_products(v, out));
         }
@@ -543,20 +595,34 @@ fn extract_product(html: &str, page: &Url) -> Option<PageProduct> {
         collect_products(&block, &mut found);
     }
     let path = page.path().trim_end_matches('/').to_ascii_lowercase();
-    let mut best: Option<(usize, PageProduct)> = None;
-    for (url, product) in &found {
-        let Some(claimed) = url.as_deref().and_then(|u| Url::parse(u).ok()) else { continue };
+    // Ranked by (price written with decimals, length of the url match): a
+    // shop that describes one product twice, once at "6.48" and once at
+    // "648", is telling us which of the two it means by how it wrote it.
+    let mut best: Option<((bool, usize), PageProduct)> = None;
+    for candidate in &found {
+        // Relative urls are normal in schema.org and must be resolved
+        // against the page — parsing them standalone fails, which silently
+        // dropped the only correct block on a Shopify page.
+        let Some(claimed) = candidate
+            .url
+            .as_deref()
+            .and_then(|u| page.join(u).ok())
+        else {
+            continue;
+        };
         let claimed = claimed.path().trim_end_matches('/').to_ascii_lowercase();
+        let rank = (candidate.decimals, claimed.len());
         if claimed.len() > 1
             && (path.starts_with(&claimed) || claimed.starts_with(&path))
-            && best.as_ref().is_none_or(|(len, _)| claimed.len() > *len)
+            && best.as_ref().is_none_or(|(seen, _)| rank > *seen)
         {
-            best = Some((claimed.len(), product.clone()));
+            best = Some((rank, candidate.product.clone()));
         }
     }
     best.map(|(_, p)| p)
         // A page describing exactly one product needs no disambiguation.
-        .or_else(|| (found.len() == 1).then(|| found[0].1.clone()))
+        .or_else(|| (found.len() == 1).then(|| found[0].product.clone()))
+        .map(|p| with_og_correction(p, html))
         .or_else(|| microdata_product(html))
         // Last: shops with no schema.org markup at all, read from the JSON
         // application state they render the page from.
@@ -960,6 +1026,58 @@ mod tests {
 
 
     #[test]
+    fn a_shop_contradicting_itself_loses_to_the_price_it_wrote_with_decimals() {
+        // japanesetaste.nl, verbatim in shape: two Product blocks for one
+        // bottle. The correct one carries a relative url, the one leaking
+        // Shopify's cents carries the absolute url that matches the page.
+        // We reported 648 EUR for a 6.48 EUR bottle of cola.
+        let html = r##"<html><head>
+          <meta property="product:price:amount" content="6,48">
+          <script type="application/ld+json">
+          {"@type":"Product","name":"Coca-Cola Fiber 470ml",
+           "url":"/products/coca-cola-fiber-470ml",
+           "offers":{"@type":"Offer","priceCurrency":"EUR","price":"6.48",
+                     "availability":"InStock","seller":{"name":"Japanese Taste"}}}
+          </script>
+          <script type="application/ld+json">
+          {"@type":"Product","name":"Coca-Cola Fiber 470ml",
+           "url":"https://shop.example/products/coca-cola-fiber-470ml",
+           "offers":[{"@type":"Offer","price":"648","priceCurrency":"EUR",
+                      "availability":"InStock"}]}
+          </script></head><body>ok</body></html>"##;
+        let url = Url::parse("https://shop.example/products/coca-cola-fiber-470ml").unwrap();
+
+        let product = extract_page(html, &url).product.expect("product");
+        assert_eq!(product.price.as_deref(), Some("6.48 EUR"));
+        assert_eq!(product.seller.as_deref(), Some("Japanese Taste"));
+    }
+
+    #[test]
+    fn a_cents_price_is_corrected_against_the_pages_own_og_amount() {
+        // Same slip with only the broken block present: the OpenGraph
+        // amount is an independent statement of the same number.
+        let html = r##"<html><head>
+          <meta property="product:price:amount" content="6,48">
+          <script type="application/ld+json">
+          {"@type":"Product","name":"Cola","url":"https://shop.example/p/cola",
+           "offers":{"price":"648","priceCurrency":"EUR"}}
+          </script></head><body>ok</body></html>"##;
+        let product = extract_page(html, &Url::parse("https://shop.example/p/cola").unwrap())
+            .product
+            .expect("product");
+        assert_eq!(product.price.as_deref(), Some("6.48 EUR"));
+
+        // A disagreement that is NOT the cents factor is left alone: we do
+        // not know which is right, and inventing an answer is the failure
+        // this whole area exists to prevent.
+        let other = html.replace(r#"content="6,48""#, r#"content="12,00""#);
+        let product = extract_page(&other, &Url::parse("https://shop.example/p/cola").unwrap())
+            .product
+            .expect("product");
+        assert_eq!(product.price.as_deref(), Some("648.00 EUR"));
+    }
+
+    #[test]
     fn rendering_is_reserved_for_pages_plain_http_cannot_read() {
         let real_page = "<html><body>".to_string() + &"content ".repeat(500) + "</body></html>";
 
@@ -977,6 +1095,7 @@ mod tests {
         // A page we could read needs no browser.
         assert!(!worth_rendering(Some(200), &real_page));
     }
+
 
     #[test]
     fn microdata_is_used_when_there_is_no_json_ld() {
@@ -1028,7 +1147,8 @@ mod tests {
           </script></body></html>"#;
         let page = extract_page(html, &Url::parse("https://shop.example/anything").unwrap());
         let product = page.product.unwrap();
-        assert_eq!(product.price.as_deref(), Some("9.5 EUR"));
+        // normalised to cents like every other price the model sees
+        assert_eq!(product.price.as_deref(), Some("9.50 EUR"));
         assert_eq!(page.availability, Some("out of stock"));
     }
 

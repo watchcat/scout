@@ -11,7 +11,7 @@ Built in Rust with [teloxide](https://github.com/teloxide/teloxide),
 say about prices.
 
 ```
-You:   найди самый дешёвый Vanish Oxi Action colour
+You:   find me cheapest Vanish Oxi Action colour
 
 Scout: 💭 checking your purchase history…
        🔎 searching in 3 languages: vanish oxi action colour

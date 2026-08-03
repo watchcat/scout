@@ -17,18 +17,24 @@ frames/1-price-comparison.png   ->  "Price comparison"
 frames/2-photo-search.png       ->  "Photo search"
 ```
 
-## Shot list
+## Current frames
 
-Six frames, each showing something the others don't:
-
-| # | Name | What to capture |
+| # | Name | Shows |
 |---|---|---|
-| 1 | `1-price-comparison.png` | A cheapest-price answer: both headline picks, per-unit prices, links. The single most convincing screen. |
-| 2 | `2-live-progress.png` | Mid-run, while the progress message is still updating — `🔎 searching in 3 languages…` or `🧮 comparing 6 offers per kilo`. Catch it before the answer lands. |
-| 3 | `3-photo-search.png` | A product photo you sent, with the drafted search description and the 📋 Copy to edit button underneath. |
-| 4 | `4-purchase-memory.png` | Asking *"where did I buy X last time?"* and getting the shop, price and date back. Or the 👍 flow offering to save a purchase. |
-| 5 | `5-second-hand.png` | A second-hand search: eBay/Marktplaats results with live prices and conditions. |
-| 6 | `6-usage-stats.png` | `/stat 30` — the monospace bar chart. |
+| 1 | `1-Cheapest-price search.png` | A full cheapest-price answer: both headline picks, per-kg maths, runners-up, item-only warning |
+| 2 | `2-Alternatives request.png` | Asking for alternatives and getting a fresh comparison |
+| 3 | `3-Follow-up request.png` | Changing the requirement mid-conversation ("white, not colour") and having it re-run |
+| 4 | `4-Live progress.png` | The streaming commentary — composited from the three captures in `raw/` |
+
+`raw/` holds the original progress captures. They are single lines, 11:1 wide,
+and padding them into a square canvas leaves them 90% empty — so they are
+stacked into one frame instead. Rebuild that composite if you replace them.
+
+### Worth adding
+
+Nothing yet covers photo search (send a picture, edit the drafted query), the
+👍 purchase-memory flow, second-hand results, or `/stat`. Drop them in as
+`5-…`, `6-…` and rerun.
 
 ## Capturing
 

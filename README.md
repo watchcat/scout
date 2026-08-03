@@ -10,27 +10,13 @@ Built in Rust with [teloxide](https://github.com/teloxide/teloxide),
 [rig](https://rig.rs), DuckDB, and a deep suspicion of what language models
 say about prices.
 
-```
-You:   find me cheapest Vanish Oxi Action colour
+<p align="center">
+  <img src="docs/img/scout-demo.gif" alt="Scout comparing prices, handling a follow-up, and streaming its progress" width="800">
+</p>
 
-Scout: 💭 checking your purchase history…
-       🔎 searching in 3 languages: vanish oxi action colour
-       📄 opening action.com
-       🧮 comparing 6 offers per kilo
-
-       Cheapest one-off
-       EUR 3.98 — 600 g, Action (EUR 6.63/kg), in stock
-       https://www.action.com/nl-nl/p/2577875/vanish-oxi-action-…
-
-       Best per unit
-       EUR 13.80 — 1.5 kg, bol.com (EUR 9.20/kg), sold by MYSCO
-       https://www.bol.com/nl/nl/p/vanish-oxi-action-poeder-…
-
-       Buying the big pack does not save here — the 600 g at Action is
-       cheaper per kilo than any bulk option I found.
-
-       Prices are item-only; neither shop states shipping before checkout.
-```
+Real output, unedited: every price per kilo, every link verified, and a running
+commentary while it works — including the moment it catches its own wrong URL
+and goes to find the right one.
 
 ---
 

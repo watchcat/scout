@@ -29,17 +29,34 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 FRAMES = ROOT / "docs" / "img" / "frames"
 OUTPUT = ROOT / "docs" / "img" / "scout-demo.gif"
 
-# Telegram's dark background, so padding disappears into the screenshot.
-BACKGROUND = (24, 34, 45)
-CAPTION_BAR = (33, 46, 60)
 CAPTION_TEXT = (236, 240, 243)
 CAPTION_HEIGHT = 44
+# Fallback only; the real background is sampled from the screenshots.
+BACKGROUND = (20, 24, 31)
+
+
+def sample_background(images: list) -> tuple:
+    """The chat background, taken from the screenshots themselves.
+
+    Padding must be invisible: frames are rarely the same height, and a
+    guessed colour turns every short frame into a visible letterbox.
+    """
+    from collections import Counter
+
+    votes = Counter()
+    for img in images:
+        w, h = img.size
+        for pt in ((1, 1), (w - 2, 1), (1, h - 2), (w - 2, h - 2)):
+            votes[img.getpixel(pt)] += 1
+    return votes.most_common(1)[0][0] if votes else BACKGROUND
 
 
 def caption_from(path: pathlib.Path) -> str:
     """`1-price-comparison.png` -> `Price comparison`."""
     stem = re.sub(r"^\d+[-_. ]*", "", path.stem)
-    return stem.replace("-", " ").replace("_", " ").strip().capitalize()
+    text = stem.replace("-", " ").replace("_", " ").strip()
+    # Only the first letter — capitalize() would lowercase "eBay", "bol.com".
+    return text[:1].upper() + text[1:] if text else path.stem
 
 
 def load_font(size: int) -> ImageFont.ImageFont:
@@ -59,7 +76,7 @@ def load_font(size: int) -> ImageFont.ImageFont:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=3.0, help="seconds per frame")
-    ap.add_argument("--width", type=int, default=420, help="output width in px")
+    ap.add_argument("--width", type=int, default=800, help="output width in px")
     ap.add_argument("--no-captions", action="store_true")
     args = ap.parse_args()
 
@@ -73,9 +90,13 @@ def main() -> int:
         sys.exit(f"no screenshots in {FRAMES} — see docs/img/README.md for the shot list")
 
     font = load_font(20)
+    opened = [Image.open(s).convert("RGB") for s in shots]
+    background = sample_background(opened)
+    # A caption bar slightly lighter than the chat, so it reads as chrome.
+    caption_bar = tuple(min(255, c + 14) for c in background)
+
     scaled = []
-    for shot in shots:
-        img = Image.open(shot).convert("RGB")
+    for shot, img in zip(shots, opened):
         height = round(img.height * args.width / img.width)
         scaled.append((shot, img.resize((args.width, height), Image.LANCZOS)))
 
@@ -87,14 +108,14 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = pathlib.Path(tmp)
         for i, (shot, img) in enumerate(scaled):
-            frame = Image.new("RGB", (args.width, canvas_h), BACKGROUND)
+            frame = Image.new("RGB", (args.width, canvas_h), background)
             top = CAPTION_HEIGHT if not args.no_captions else 0
             # Centred vertically in whatever space is left over.
             frame.paste(img, (0, top + (canvas_h - top - img.height) // 2))
 
             if not args.no_captions:
                 draw = ImageDraw.Draw(frame)
-                draw.rectangle([0, 0, args.width, CAPTION_HEIGHT], fill=CAPTION_BAR)
+                draw.rectangle([0, 0, args.width, CAPTION_HEIGHT], fill=caption_bar)
                 text = caption_from(shot)
                 box = draw.textbbox((0, 0), text, font=font)
                 draw.text(

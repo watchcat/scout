@@ -553,36 +553,33 @@ async fn run_agent(
     // Reasoning arrives on its own channel, separate from the answer text.
     let mut thinking = String::new();
     let mut final_response = None;
-    let mut salvage = None;
-    {
-        let started = std::time::Instant::now();
-        let mut stream = agent.stream_chat(prompt, history.clone()).await;
-        loop {
-            // A stalled stream must not hang the chat: whatever the reason,
-            // the user gets an answer built from what we have.
-            let next = match tokio::time::timeout(STREAM_STALL, stream.next()).await {
-                Ok(Some(item)) => item,
-                Ok(None) => break,
-                Err(_) => {
-                    salvage = Some("the model stopped responding");
-                    break;
-                }
-            };
-            if started.elapsed() > RUN_BUDGET {
-                salvage = Some("this took too long");
-                break;
-            }
-            let item = match next {
-                Ok(item) => item,
-                // Not fatal: by this point the research is usually done and
-                // only the write-up is missing. Salvaged below.
-                Err(e) if is_max_turns(&e) => {
-                    salvage = Some("I ran out of research steps");
-                    break;
-                }
-                Err(e) => return Err(e.into()),
-            };
-            match item {
+    // The whole streamed run sits inside one deadline. A guard on
+    // stream.next() alone is not enough: it leaves every await in the loop
+    // body uncovered, and the budget check below it can only fire when an
+    // item arrives — so a run that stops receiving anything is bounded by
+    // nothing. Observed once at fifteen minutes before the provider finally
+    // errored, with the user watching a frozen progress message.
+    let outcome: Result<Result<Option<&'static str>, anyhow::Error>, _> =
+        tokio::time::timeout(RUN_BUDGET, async {
+            let mut stream = agent.stream_chat(prompt, history.clone()).await;
+            loop {
+                // A silent stream is a stall even while the run as a whole
+                // still has time left.
+                let next = match tokio::time::timeout(STREAM_STALL, stream.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => return Ok(None),
+                    Err(_) => return Ok(Some("the model stopped responding")),
+                };
+                let item = match next {
+                    Ok(item) => item,
+                    // Not fatal: by this point the research is usually done
+                    // and only the write-up is missing. Salvaged below.
+                    Err(e) if is_max_turns(&e) => {
+                        return Ok(Some("I ran out of research steps"))
+                    }
+                    Err(e) => return Err(anyhow::Error::from(e)),
+                };
+                match item {
                 MultiTurnStreamItem::ToolExecutionStart { tool_call, .. } => {
                     let args = &tool_call.function.arguments;
                     live.show(&crate::progress::describe(&tool_call.function.name, args), false)
@@ -622,12 +619,21 @@ async fn run_agent(
                 }
                 MultiTurnStreamItem::FinalResponse(res) => {
                     final_response = Some(res);
-                    break;
+                    return Ok(None);
                 }
                 _ => {}
             }
-        }
-    }
+            }
+        })
+        .await;
+
+    // Partial text survives a dropped future: whatever the run wrote before
+    // the deadline is still in `streamed`/`thinking` for the wrap-up.
+    let salvage = match outcome {
+        Ok(Ok(reason)) => reason,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => Some("this took too long"),
+    };
 
     // The streamed deltas are the answer; the final response is the
     // authority on both the text and the history to keep.

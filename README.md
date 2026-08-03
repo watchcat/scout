@@ -206,5 +206,4 @@ invalidation. Only a cold cache pays the full compile.
 
 ## License
 
-No license file yet — until one is added, default copyright applies and
-nobody else may legally reuse this code. Pick one before publishing.
+[MIT](LICENSE) — do what you like with it.

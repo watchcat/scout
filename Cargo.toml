@@ -2,6 +2,9 @@
 name = "scout"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A Telegram shopping researcher that verifies prices and links instead of inventing them"
+repository = "https://github.com/watchcat/scout"
 
 [dependencies]
 rig = "0.40"

@@ -15,12 +15,12 @@ use rig::providers::openai;
 pub const MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 pub const MODEL: &str = "minimax-m3";
 /// Cap on model calls per request so a confused agent can't burn credits.
-/// The full flow (query_purchases -> search -> secondhand -> a few
-/// fetch_page opens -> compare_prices -> answer) legitimately needs ~12 now
-/// that price comparisons are mandatory; 16 leaves headroom while still
-/// bounding a runaway loop. Running out is no longer fatal — see
-/// [`wrap_up_agent`].
-pub const MAX_TURNS: usize = 16;
+/// The full flow (query_purchases -> search -> secondhand -> up to five
+/// fetch_page opens -> compare_prices -> answer) legitimately needs ~14 now
+/// that price comparisons are mandatory and the page budget is five; 20
+/// leaves headroom while still bounding a runaway loop. Running out is not
+/// fatal — see [`wrap_up_agent`].
+pub const MAX_TURNS: usize = 20;
 /// Conversation history cap per chat (messages, not exchanges).
 pub const HISTORY_CAP: usize = 20;
 

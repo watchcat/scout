@@ -170,7 +170,7 @@ Roughly 8,500 lines of Rust across a dozen focused modules.
 - **Allowlist only.** This is built as a personal/household bot. There's no
   multi-tenant isolation beyond per-user memory scoping.
 - **Costs real money.** Kagi bills per query and MiniMax per token. Budgets are
-  capped per request (15 search queries, 5 page opens, 16 model turns) — but
+  capped per request (15 search queries, 5 page opens, 20 model turns) — but
   it's not free.
 
 ---

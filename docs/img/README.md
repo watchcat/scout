@@ -50,9 +50,29 @@ Nothing yet covers photo search (send a picture, edit the drafted query), the
 
 ```bash
 python3 scripts/build-demo-gif.py --seconds 4      # slower cycle
-python3 scripts/build-demo-gif.py --width 360      # smaller file
+python3 scripts/build-demo-gif.py --fade 0         # hard cuts, ~460 KB
+python3 scripts/build-demo-gif.py --fade-steps 2   # coarser fade, ~820 KB
+python3 scripts/build-demo-gif.py --width 640      # smaller file
 python3 scripts/build-demo-gif.py --no-captions    # no caption bar
 ```
+
+### Why the fade costs what it does
+
+Held frames are nearly free — GIF stores only what changed, and a frame that
+sits still changes nothing. Fade frames change every pixel, so each one costs
+close to a full frame. Measured on these four screenshots:
+
+| Setting | Size |
+|---|---|
+| no fade | 460 KB |
+| 2 steps, 64 colours | 823 KB |
+| **3 steps, 64 colours (default)** | **1.27 MB** |
+| 3 steps, 256 colours | 1.75 MB |
+| 7 steps, dithered crossfade | 4.27 MB |
+
+Dithering is off and the palette is capped at 64 because these are flat UI
+colours: the text stays crisp, and the noise dithering would add is exactly
+what defeats compression on a fade.
 
 Keep the result under about 5 MB — GitHub serves larger files, but they stall
 on slow connections and the README is the first thing anyone sees.

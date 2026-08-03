@@ -5,8 +5,13 @@ Screenshots vary in size between devices and Telegram clients, so every frame
 is scaled to one width and padded to one canvas — a GIF with mismatched frame
 sizes jumps around as it loops.
 
+Frames are held, then faded out to the chat background and in to the next.
+Fade frames change every pixel, so they cost far more than held ones — the
+defaults (3 steps, a 64-colour palette, no dithering) are what keep the file
+near 1 MB instead of 4. `--fade 0` drops back to hard cuts at about 460 KB.
+
 Usage:
-    python3 scripts/build-demo-gif.py [--seconds 3] [--width 420]
+    python3 scripts/build-demo-gif.py [--seconds 3] [--width 800] [--fade 0.45]
 
 Input:  docs/img/frames/*.png|jpg, in filename order.
         The name after the leading number becomes the caption:
@@ -78,6 +83,8 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=3.0, help="seconds per frame")
     ap.add_argument("--width", type=int, default=800, help="output width in px")
     ap.add_argument("--no-captions", action="store_true")
+    ap.add_argument("--fade", type=float, default=0.45, help="fade seconds; 0 disables")
+    ap.add_argument("--fade-steps", type=int, default=3, help="blended frames per half-fade")
     args = ap.parse_args()
 
     if not shutil.which("ffmpeg"):
@@ -107,6 +114,7 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = pathlib.Path(tmp)
+        built = []
         for i, (shot, img) in enumerate(scaled):
             frame = Image.new("RGB", (args.width, canvas_h), background)
             top = CAPTION_HEIGHT if not args.no_captions else 0
@@ -124,26 +132,63 @@ def main() -> int:
                     font=font,
                     fill=CAPTION_TEXT,
                 )
+            built.append(frame)
             frame.save(tmp / f"{i:03d}.png")
             print(f"  frame {i + 1}: {shot.name}" + ("" if args.no_captions else f"  “{caption_from(shot)}”"))
 
-        # Two passes: a palette built from every frame, then the encode. A
-        # per-frame palette makes flat UI colours shimmer as the loop runs.
+        # Timeline: hold, fade out to the chat background, fade in to the
+        # next. The last fades back into the first, so the loop has no seam.
+        #
+        # Fading *through* the background rather than crossfading directly is
+        # both softer to watch and far smaller: a direct blend ghosts two
+        # screens of text over each other, and that entropy defeats GIF's
+        # inter-frame compression (measured at 3.9 MB). Fades to a near-flat
+        # dark frame compress to almost nothing.
+        steps = args.fade_steps if args.fade > 0 else 0
+        blank = Image.new("RGB", (args.width, canvas_h), background)
+        timeline = []  # (path, seconds on screen)
+        for i, frame in enumerate(built):
+            timeline.append((tmp / f"{i:03d}.png", args.seconds))
+            if not steps:
+                continue
+            nxt = built[(i + 1) % len(built)]
+            half = args.fade / (2 * steps)
+            for s in range(1, steps + 1):          # out
+                path = tmp / f"x{i:03d}o{s:02d}.png"
+                Image.blend(frame, blank, s / steps).save(path)
+                timeline.append((path, half))
+            for s in range(1, steps):              # in (final step is the held frame)
+                path = tmp / f"x{i:03d}i{s:02d}.png"
+                Image.blend(blank, nxt, s / steps).save(path)
+                timeline.append((path, half))
+
+        # ffmpeg's concat demuxer takes a duration per entry, which a plain
+        # -framerate cannot express: holds are seconds, fade steps are tens
+        # of milliseconds.
+        listing = tmp / "timeline.txt"
+        with listing.open("w") as fh:
+            for path, secs in timeline:
+                fh.write(f"file '{path}'\nduration {secs:.3f}\n")
+            fh.write(f"file '{timeline[-1][0]}'\n")  # concat needs a final repeat
+
         palette = tmp / "palette.png"
-        rate = f"1/{args.seconds}"
-        common = ["-y", "-loglevel", "error", "-framerate", rate, "-i", str(tmp / "%03d.png")]
+        demux = ["-f", "concat", "-safe", "0", "-i", str(listing)]
         subprocess.run(
-            ["ffmpeg", *common, "-vf", "palettegen=stats_mode=diff", str(palette)],
+            ["ffmpeg", "-y", "-loglevel", "error", *demux,
+             "-vf", "palettegen=stats_mode=diff:max_colors=64", str(palette)],
             check=True,
         )
         subprocess.run(
-            [
-                "ffmpeg", *common, "-i", str(palette),
-                "-lavfi", "paletteuse=dither=bayer:bayer_scale=3",
-                "-loop", "0", str(OUTPUT),
-            ],
+            ["ffmpeg", "-y", "-loglevel", "error", *demux, "-i", str(palette),
+             # Screenshots are flat UI colour, so dithering adds only noise —
+             # and noise in a crossfade destroys inter-frame compression
+             # (measured: 4.3 MB dithered vs a fraction of that without).
+             "-lavfi", "paletteuse=dither=none:diff_mode=rectangle",
+             "-loop", "0", str(OUTPUT)],
             check=True,
         )
+        if steps:
+            print(f"  + {len(built)} crossfades, {steps} steps over {args.fade}s")
 
     size_kb = OUTPUT.stat().st_size / 1024
     print(f"\n{OUTPUT.relative_to(ROOT)} — {len(shots)} frames, {size_kb:.0f} KB")

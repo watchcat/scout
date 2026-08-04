@@ -12,7 +12,6 @@ use rig::streaming::{StreamedAssistantContent, StreamingChat};
 use std::sync::Arc;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use std::collections::VecDeque;
 use teloxide::types::{
     ChatAction, CopyTextButton, InlineKeyboardButton, InlineKeyboardButtonKind,
     InlineKeyboardMarkup, MessageReactionUpdated, ParseMode, ReactionType,
@@ -55,14 +54,31 @@ pub struct ChatSession {
     pub pending_draft: Option<String>,
     /// When this chat last had activity; None until the first message.
     pub last_seen: Option<std::time::Instant>,
-    /// Last user_id to send a message. Used to gate the TTL continuation
-    /// check so user A's context is never restored as user B's opening
-    /// turn.
-    pub last_seen_user_id: Option<i64>,
 }
+
 /// True when the gap since `last_seen` exceeds the session TTL.
 fn session_expired(last_seen: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last_seen.is_some_and(|t| now.duration_since(t) > SESSION_TTL)
+}
+
+/// Apply session expiry to one slot and hand back the aged-out history, if
+/// there was any, for the continuation check to look at.
+///
+/// The slot belongs to a single (chat, user) pair, so this only ever touches
+/// the caller's own context. A draft is dropped whenever the session ages
+/// out, whether or not the history comes back: otherwise a photo drafted
+/// before the gap stays armed and the next bare "ok" searches for it.
+fn take_expired_session(
+    chat: &mut ChatSession,
+    now: std::time::Instant,
+) -> Option<Vec<LlmMessage>> {
+    let expired = session_expired(chat.last_seen, now);
+    chat.last_seen = Some(now);
+    if !expired {
+        return None;
+    }
+    chat.pending_draft = None;
+    (!chat.history.is_empty()).then(|| std::mem::take(&mut chat.history))
 }
 
 /// The last `n` plain-text messages of a history, rendered as
@@ -149,7 +165,7 @@ the old one back up if you're clearly continuing the same topic).
 
 Commands:
 /reset - forget this conversation right now
-/stat [days] - usage statistics (default 7 days)
+/stat [days] - your usage statistics (default 7 days)
 /help - this message";
 
 pub async fn run(bot: Bot, app: Arc<App>) {
@@ -191,6 +207,22 @@ fn sender_id(msg: &Message) -> Option<i64> {
     msg.from.as_ref().map(|u| u.id.0 as i64)
 }
 
+fn sender_name(msg: &Message) -> Option<String> {
+    msg.from.as_ref().map(display_name)
+}
+
+/// What `/stat` shows next to a user id. `@handle` when there is one, since
+/// that is what people recognise; otherwise the Telegram first/last name.
+fn display_name(user: &teloxide::types::User) -> String {
+    if let Some(handle) = &user.username {
+        return format!("@{handle}");
+    }
+    match &user.last_name {
+        Some(last) => format!("{} {last}", user.first_name),
+        None => user.first_name.clone(),
+    }
+}
+
 async fn handle_command(
     bot: Bot,
     msg: Message,
@@ -204,9 +236,9 @@ async fn handle_command(
         Command::Reset => {
             // Only the caller's session in this chat is cleared; other
             // allowed users keep theirs intact.
-            let user_id = match sender_id(&msg) {
-                Some(id) => id,
-                None => return Ok(()),
+            let Some(user_id) = sender_id(&msg) else {
+                tracing::debug!("/reset from a message with no sender; ignoring");
+                return Ok(());
             };
             app.chats.remove(&chat_key(msg.chat.id.0, user_id));
             bot.send_message(msg.chat.id, "Conversation cleared.").await?;
@@ -219,26 +251,35 @@ async fn handle_command(
                     return Ok(());
                 }
             };
-            let user_id = match sender_id(&msg) {
-                Some(id) => id,
-                None => return Ok(()),
+            let Some(user_id) = sender_id(&msg) else {
+                tracing::debug!("/stat from a message with no sender; ignoring");
+                return Ok(());
             };
+            // Admins see the whole bot; everyone else sees only themselves.
+            // This branch is the only place cross-user counts are reachable.
+            let admin = app.cfg.admin_user_ids.contains(&user_id);
             let today = chrono::Local::now().date_naive();
             let cutoff = format!(
                 "{} 00:00:00",
                 today - chrono::Duration::days(i64::from(days) - 1)
             );
-            let rows = {
+            let data = {
                 let store = app.deps.store.clone();
-                let user_id = user_id;
-                tokio::task::spawn_blocking(move || store.usage_stats_for(&cutoff, user_id))
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|r| r)
+                tokio::task::spawn_blocking(move || {
+                    let rows = if admin {
+                        store.usage_stats_all(&cutoff)?
+                    } else {
+                        store.usage_stats_for(&cutoff, user_id)?
+                    };
+                    Ok::<_, anyhow::Error>((rows, store.display_names()?))
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r)
             };
-            match rows {
-                Ok(rows) => {
-                    let report = crate::stats::format_stats(&rows, days, today);
+            match data {
+                Ok((rows, names)) => {
+                    let report = crate::stats::format_stats(&rows, days, today, user_id, &names);
                     bot.send_message(msg.chat.id, format!("<pre>{report}</pre>"))
                         .parse_mode(ParseMode::Html)
                         .await?;
@@ -253,11 +294,17 @@ async fn handle_command(
     Ok(())
 }
 
-/// Fire-and-forget usage logging; never delays request handling.
-fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
+/// Fire-and-forget usage logging; never delays request handling. The name
+/// is refreshed on every request so `/stat` can label ids with something
+/// readable, and follows the user when they rename themselves.
+fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str, name: Option<String>) {
     let store = app.deps.store.clone();
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || store.log_request(user_id, kind)).await {
+        match tokio::task::spawn_blocking(move || {
+            store.log_request(user_id, kind, name.as_deref())
+        })
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "request logging failed"),
             Err(e) => tracing::warn!(error = %e, "request logging join failed"),
@@ -269,28 +316,17 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     let text = msg.text().unwrap_or_default().to_string();
     let chat_id = msg.chat.id;
     let Some(user_id) = sender_id(&msg) else { return Ok(()) };
-    log_request(&app, user_id, "text");
+    log_request(&app, user_id, "text", sender_name(&msg));
 
     // Session expiry: after a long gap the old context is set aside; a quick
-    // LLM check restores it when the new message continues the same topic
-    // AND is from the same user who left it. In a group chat with multiple
-    // allowed users this prevents user B from inheriting user A's session.
+    // LLM check restores it when the new message continues the same topic.
+    // The session belongs to one (chat, user) pair, so what is restored is
+    // always the caller's own context — in a group, user B can never inherit
+    // user A's.
     let key = chat_key(chat_id.0, user_id);
     let stale_history = {
         let mut chat = app.chats.entry(key).or_default();
-        let now = std::time::Instant::now();
-        let prior_user = chat.last_seen_user_id;
-        // Only the same user who left the session may resume it.
-        let same_user = prior_user == Some(user_id);
-        let expired = session_expired(chat.last_seen, now) && !chat.history.is_empty();
-        let last_seen_user_id = Some(user_id);
-        chat.last_seen = Some(now);
-        chat.last_seen_user_id = last_seen_user_id;
-        if expired && same_user {
-            Some(std::mem::take(&mut chat.history))
-        } else {
-            None
-        }
+        take_expired_session(&mut chat, std::time::Instant::now())
     };
     if let Some(old_history) = stale_history {
         let excerpt = last_messages_text(&old_history, 6);
@@ -442,14 +478,13 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
             chat.history.clear();
         }
         chat.last_seen = Some(now);
-        chat.last_seen_user_id = Some(user_id);
         chat.pending_draft = None;
     }
     // Sizes are ordered smallest to largest; take the largest.
     let Some(photo) = msg.photo().and_then(|sizes| sizes.last()) else {
         return Ok(());
     };
-    log_request(&app, user_id, "photo");
+    log_request(&app, user_id, "photo", sender_name(&msg));
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
     let bytes = match download_photo(&bot, photo.file.id.clone()).await {
@@ -525,7 +560,7 @@ async fn handle_reaction(
         return Ok(());
     };
 
-    log_request(&app, user_id, "reaction");
+    log_request(&app, user_id, "reaction", Some(display_name(user)));
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
     let prompt = format!(
         "[system note] The user reacted with a thumbs-up to this earlier reply \
@@ -882,8 +917,6 @@ mod tests {
         // sender in the same chat into one entry. The new key tuple forces
         // each user to a distinct slot, so their history and draft never
         // cross.
-        use dashmap::DashMap;
-
         let chats: DashMap<(i64, i64), ChatSession> = DashMap::new();
 
         let alice_key = chat_key(9001, 111);
@@ -892,73 +925,79 @@ mod tests {
         // Alice writes a history and a draft.
         {
             let mut s = chats.entry(alice_key).or_default();
-            s.history.push(LlmMessage::user("find me a USB hub"));
+            s.history.push(user_text("find me a USB hub"));
             s.pending_draft = Some("USB hub".to_string());
-            s.last_seen_user_id = Some(111);
         }
 
         // Bob's entry is independent — same chat, different user.
         assert!(chats.get(&bob_key).is_none());
-        chats.entry(bob_key).or_default().history.push(LlmMessage::user("where is my bike?"));
+        chats.entry(bob_key).or_default().history.push(user_text("where is my bike?"));
 
-        // Alice's history still contains exactly her exchange.
-        let alice = chats.get(&alice_key).unwrap();
-        assert_eq!(alice.history.len(), 1);
-        assert_eq!(alice.pending_draft.as_deref(), Some("USB hub"));
+        // Each slot holds exactly its own owner's exchange. Guards are
+        // scoped: DashMap deadlocks against itself if a read guard is still
+        // alive when the same shard is written below.
+        {
+            let alice = chats.get(&alice_key).unwrap();
+            assert_eq!(alice.history.len(), 1);
+            assert_eq!(alice.pending_draft.as_deref(), Some("USB hub"));
 
-        // Bob's history does not contain Alice's text.
-        let bob = chats.get(&bob_key).unwrap();
-        assert_eq!(bob.history.len(), 1);
-        assert!(
-            bob.history
-                .iter()
-                .all(|m| !matches!(m, LlmMessage::User { content }
-                    if content.iter().any(|c| matches!(c,
-                        rig::message::UserContent::Text(t) if t.text.contains("USB hub"))))),
-            "Bob must not see Alice's chat"
-        );
+            let bob = chats.get(&bob_key).unwrap();
+            assert_eq!(bob.history.len(), 1);
+            assert_eq!(bob.pending_draft, None, "Alice's draft must not reach Bob");
+            assert_eq!(
+                last_messages_text(&bob.history, 1),
+                "user: where is my bike?",
+                "Bob must not see Alice's chat"
+            );
+        }
 
-        // Dropping Alice's slot leaves Bob's untouched.
+        // /reset drops one user's slot and leaves the others alone.
         chats.remove(&alice_key);
         assert!(chats.get(&alice_key).is_none());
         assert!(chats.get(&bob_key).is_some(), "removing one user must not affect others");
     }
 
     #[test]
-    fn last_seen_user_id_gates_continuation_across_users() {
-        // Mock the snapshot decision the handle_text continuation check
-        // makes. After a long gap, only the same user that left the session
-        // can resume it. Different user -> start fresh.
-        use dashmap::DashMap;
+    fn expiry_takes_the_history_and_disarms_the_draft() {
+        use super::take_expired_session;
+        use std::time::{Duration, Instant};
 
-        let chats: DashMap<(i64, i64), ChatSession> = DashMap::new();
-        let key_a = chat_key(9001, 111);
-        let key_b = chat_key(9001, 222);
+        let now = Instant::now();
+        let stale = now - SESSION_TTL - Duration::from_secs(1);
 
-        // Alice's session: she was the last to speak, with a TTL-aged
-        // history sitting in the slot.
-        let prior = vec![
-            LlmMessage::user("find me a USB hub under €20"),
-            LlmMessage::assistant("here are 3 options: ..."),
-        ];
-        {
-            let mut s = chats.entry(key_a).or_default();
-            s.history = prior.clone();
-            s.last_seen_user_id = Some(111);
-        }
+        // Aged out with history: hand it back for the continuation check,
+        // and drop the draft — a photo drafted before the gap must not be
+        // confirmed by the next bare "ok".
+        let mut chat = ChatSession {
+            history: vec![user_text("find me a USB hub")],
+            pending_draft: Some("USB hub, 4-port, black".to_string()),
+            last_seen: Some(stale),
+        };
+        let taken = take_expired_session(&mut chat, now).expect("expired session yields history");
+        assert_eq!(taken.len(), 1);
+        assert!(chat.history.is_empty(), "history moved out of the slot");
+        assert_eq!(chat.pending_draft, None, "stale draft must be disarmed");
+        assert_eq!(chat.last_seen, Some(now));
 
-        // Bob, last user_id=222, arrives after the TTL has aged. Same chat.
-        let mut bob = chats.entry(key_b).or_default();
-        bob.last_seen_user_id = Some(222);
-        // A continuation check gated on prior_user == Some(user) would
-        // return false here, leaving Bob's history empty (fresh). The test
-        // mirrors that decision: he must not see Alice's prior context.
-        let same_user = prior.is_empty()
-            || chats
-                .get(&key_a) // using key_a only as a stand-in for "session of prior user"
-                .and_then(|s| s.last_seen_user_id)
-                == Some(222);
-        assert!(!same_user, "Bob must not be treated as continuing Alice's session");
+        // Aged out with no history: still disarms the draft. This is the
+        // photo-then-silence case, and the one the gate used to miss.
+        let mut chat = ChatSession {
+            history: vec![],
+            pending_draft: Some("USB hub, 4-port, black".to_string()),
+            last_seen: Some(stale),
+        };
+        assert!(take_expired_session(&mut chat, now).is_none());
+        assert_eq!(chat.pending_draft, None);
+
+        // Still inside the TTL: nothing is touched.
+        let mut chat = ChatSession {
+            history: vec![user_text("find me a USB hub")],
+            pending_draft: Some("USB hub, 4-port, black".to_string()),
+            last_seen: Some(now - SESSION_TTL / 2),
+        };
+        assert!(take_expired_session(&mut chat, now).is_none());
+        assert_eq!(chat.history.len(), 1, "live session keeps its history");
+        assert_eq!(chat.pending_draft.as_deref(), Some("USB hub, 4-port, black"));
     }
 
     #[test]

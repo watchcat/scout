@@ -5,6 +5,10 @@ use std::collections::HashSet;
 pub struct Config {
     pub telegram_bot_token: String,
     pub allowed_user_ids: HashSet<i64>,
+    /// Users who may see everyone's numbers in `/stat`. Everyone else sees
+    /// only their own. Defaults to the first id in the allowlist, which is
+    /// whoever set the bot up; `SCOUT_ADMIN_USER_IDS` overrides that.
+    pub admin_user_ids: HashSet<i64>,
     pub minimax_api_key: String,
     pub kagi_api_key: String,
     /// Perplexity Search API key; without it search runs on Kagi alone.
@@ -31,7 +35,19 @@ impl Config {
                 .with_context(|| format!("missing required env var {k}"))
         };
 
-        let allowed_user_ids = parse_user_ids(&required("ALLOWED_TELEGRAM_USER_IDS")?)?;
+        // Parsed in order so the first entry can act as the default admin.
+        let allowed = parse_user_ids(&required("ALLOWED_TELEGRAM_USER_IDS")?)?;
+        let admin_user_ids = match get("SCOUT_ADMIN_USER_IDS").filter(|v| !v.trim().is_empty()) {
+            Some(raw) => {
+                let admins = parse_user_ids(&raw)?;
+                if let Some(stranger) = admins.iter().find(|id| !allowed.contains(id)) {
+                    bail!("SCOUT_ADMIN_USER_IDS contains {stranger}, who is not in ALLOWED_TELEGRAM_USER_IDS");
+                }
+                admins.into_iter().collect()
+            }
+            None => HashSet::from([allowed[0]]),
+        };
+        let allowed_user_ids: HashSet<i64> = allowed.into_iter().collect();
 
         let secondhand_sites = get("SECONDHAND_SITES")
             .unwrap_or_else(|| "ebay.com,marktplaats.nl,vinted.com".to_string())
@@ -55,6 +71,7 @@ impl Config {
         Ok(Self {
             telegram_bot_token: required("TELEGRAM_BOT_TOKEN")?,
             allowed_user_ids,
+            admin_user_ids,
             minimax_api_key: required("MINIMAX_API_KEY")?,
             kagi_api_key: required("KAGI_API_KEY")?,
             perplexity_api_key: non_empty("PERPLEXITY_API_KEY"),
@@ -68,7 +85,8 @@ impl Config {
     }
 }
 
-fn parse_user_ids(raw: &str) -> Result<HashSet<i64>> {
+/// Ordered so callers can treat the first id as "whoever set this up".
+fn parse_user_ids(raw: &str) -> Result<Vec<i64>> {
     let ids = raw
         .split(',')
         .map(str::trim)
@@ -82,9 +100,9 @@ fn parse_user_ids(raw: &str) -> Result<HashSet<i64>> {
             }
             Ok(id)
         })
-        .collect::<Result<HashSet<i64>>>()?;
+        .collect::<Result<Vec<i64>>>()?;
     if ids.is_empty() {
-        bail!("ALLOWED_TELEGRAM_USER_IDS must contain at least one user id");
+        bail!("user id list must contain at least one id");
     }
     Ok(ids)
 }
@@ -166,6 +184,43 @@ mod tests {
 
         env.insert("ALLOWED_TELEGRAM_USER_IDS", "0,111");
         assert!(load(&env).is_err());
+    }
+
+    #[test]
+    fn first_allowed_id_is_the_default_admin() {
+        // Whoever set the bot up is listed first; they get the cross-user
+        // /stat view without any extra configuration.
+        let cfg = load(&base_env()).unwrap();
+        assert_eq!(cfg.admin_user_ids, HashSet::from([111]));
+        assert!(!cfg.admin_user_ids.contains(&222));
+    }
+
+    #[test]
+    fn explicit_admin_ids_override_the_default() {
+        let mut env = base_env();
+        env.insert("SCOUT_ADMIN_USER_IDS", "222");
+        let cfg = load(&env).unwrap();
+        assert_eq!(cfg.admin_user_ids, HashSet::from([222]));
+
+        env.insert("SCOUT_ADMIN_USER_IDS", "111, 222");
+        assert_eq!(
+            load(&env).unwrap().admin_user_ids,
+            HashSet::from([111, 222])
+        );
+    }
+
+    #[test]
+    fn an_admin_must_also_be_allowed() {
+        // Otherwise the id can never reach /stat and the config silently
+        // does nothing.
+        let mut env = base_env();
+        env.insert("SCOUT_ADMIN_USER_IDS", "333");
+        let err = load(&env).unwrap_err().to_string();
+        assert!(err.contains("333"), "got: {err}");
+
+        // Blank is the same as unset: fall back to the first allowed id.
+        env.insert("SCOUT_ADMIN_USER_IDS", "  ");
+        assert_eq!(load(&env).unwrap().admin_user_ids, HashSet::from([111]));
     }
 
     #[test]

@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
         cfg,
         deps,
         chats: DashMap::new(),
+        replies: DashMap::new(),
     });
 
     tracing::info!("scout is up");

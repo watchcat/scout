@@ -1,6 +1,7 @@
 use anyhow::Result;
 use duckdb::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +41,13 @@ CREATE TABLE IF NOT EXISTS request_log (
     user_id BIGINT NOT NULL,
     kind TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+-- Telegram display names, refreshed on every request so /stat can label a
+-- user id with something readable. Names change; the id is the identity.
+CREATE TABLE IF NOT EXISTS users (
+    user_id BIGINT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
 "#;
 
@@ -251,13 +259,23 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Record one handled request for usage statistics.
-    pub fn log_request(&self, user_id: i64, kind: &str) -> Result<()> {
+    /// Record one handled request for usage statistics. `display_name` is
+    /// the sender's current Telegram name, refreshed on every request so
+    /// `/stat` can show something other than a bare id.
+    pub fn log_request(&self, user_id: i64, kind: &str, display_name: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO request_log (user_id, kind) VALUES (?, ?)",
             params![user_id, kind],
         )?;
+        if let Some(name) = display_name.map(str::trim).filter(|n| !n.is_empty()) {
+            conn.execute(
+                "INSERT INTO users (user_id, display_name) VALUES (?, ?)
+                 ON CONFLICT (user_id)
+                 DO UPDATE SET display_name = excluded.display_name, updated_at = now()",
+                params![user_id, name],
+            )?;
+        }
         Ok(())
     }
 
@@ -271,9 +289,28 @@ impl Store {
         Ok(())
     }
 
-    /// (user_id, day "YYYY-MM-DD", request count) for everything at or after
-    /// `cutoff` ("YYYY-MM-DD 00:00:00"), ordered by day then user.
-    pub fn usage_stats(&self, cutoff: &str) -> Result<Vec<(i64, String, i64)>> {
+    /// Per-day request counts scoped to a single user, as
+    /// (user_id, day "YYYY-MM-DD", count) at or after `cutoff`
+    /// ("YYYY-MM-DD 00:00:00"). This is what non-admin `/stat` callers get,
+    /// so they only ever see their own volume however many users share the
+    /// bot.
+    pub fn usage_stats_for(&self, cutoff: &str, user_id: i64) -> Result<Vec<(i64, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
+             FROM request_log WHERE user_id = ? AND created_at >= CAST(? AS TIMESTAMP)
+             GROUP BY user_id, day ORDER BY day ASC, user_id ASC",
+        )?;
+        let rows = stmt.query_map(params![user_id, cutoff], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// The same shape across every user. Only reachable from `/stat` when
+    /// the caller is in `Config::admin_user_ids` — the callers of this
+    /// method are the whole access-control surface for cross-user data.
+    pub fn usage_stats_all(&self, cutoff: &str) -> Result<Vec<(i64, String, i64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT user_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
@@ -283,6 +320,15 @@ impl Store {
         let rows = stmt.query_map(params![cutoff], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Last-seen display name per user id. Small enough to read whole —
+    /// one row per person who has ever messaged the bot.
+    pub fn display_names(&self) -> Result<BTreeMap<i64, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT user_id, display_name FROM users")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 }
@@ -459,7 +505,37 @@ mod tests {
     }
 
     #[test]
-    fn usage_stats_group_by_user_and_day_with_cutoff() {
+    fn usage_stats_for_is_scoped_to_one_user() {
+        // /stat pulls from this method so a per-user query never sees
+        // anyone else's request count.
+        let (s, _d) = test_store();
+        s.log_request_at(1, "text", "2026-07-25 10:00:00").unwrap();
+        s.log_request_at(1, "text", "2026-07-25 11:00:00").unwrap();
+        s.log_request_at(2, "photo", "2026-07-25 12:00:00").unwrap();
+        s.log_request_at(1, "text", "2026-07-20 09:00:00").unwrap(); // before cutoff
+
+        let mine = s.usage_stats_for("2026-07-25 00:00:00", 1).unwrap();
+        assert_eq!(
+            mine,
+            vec![(1, "2026-07-25".to_string(), 2)],
+            "user 1 should see only their own rows"
+        );
+
+        let theirs = s.usage_stats_for("2026-07-25 00:00:00", 2).unwrap();
+        assert_eq!(
+            theirs,
+            vec![(2, "2026-07-25".to_string(), 1)],
+            "user 2 must not see user 1's counts"
+        );
+
+        let empty = s.usage_stats_for("2026-07-25 00:00:00", 99).unwrap();
+        assert!(empty.is_empty(), "unknown user sees nothing");
+    }
+
+    #[test]
+    fn usage_stats_all_spans_every_user() {
+        // The admin view. Same shape as the per-user query so /stat can
+        // render either without knowing which it got.
         let (s, _d) = test_store();
         s.log_request_at(1, "text", "2026-07-25 10:00:00").unwrap();
         s.log_request_at(1, "text", "2026-07-25 11:00:00").unwrap();
@@ -467,7 +543,7 @@ mod tests {
         s.log_request_at(1, "text", "2026-07-26 09:00:00").unwrap();
         s.log_request_at(1, "text", "2026-07-20 09:00:00").unwrap(); // before cutoff
 
-        let rows = s.usage_stats("2026-07-25 00:00:00").unwrap();
+        let rows = s.usage_stats_all("2026-07-25 00:00:00").unwrap();
         assert_eq!(
             rows,
             vec![
@@ -476,10 +552,35 @@ mod tests {
                 (1, "2026-07-26".to_string(), 1),
             ]
         );
+
         // live logging path writes with defaults and lands in stats
-        s.log_request(3, "reaction").unwrap();
-        let rows = s.usage_stats("2000-01-01 00:00:00").unwrap();
+        s.log_request(3, "reaction", None).unwrap();
+        let rows = s.usage_stats_all("2000-01-01 00:00:00").unwrap();
         assert!(rows.iter().any(|(u, _, _)| *u == 3));
+    }
+
+    #[test]
+    fn display_names_track_the_latest_seen_name() {
+        let (s, _d) = test_store();
+        s.log_request(1, "text", Some("@alice")).unwrap();
+        s.log_request(2, "text", Some("Bob Jansen")).unwrap();
+        // A user with no name attached is logged but stays unnamed, so
+        // /stat falls back to the bare id.
+        s.log_request(3, "text", None).unwrap();
+        // Blank names are not a name.
+        s.log_request(4, "text", Some("   ")).unwrap();
+
+        let names = s.display_names().unwrap();
+        assert_eq!(names.get(&1).map(String::as_str), Some("@alice"));
+        assert_eq!(names.get(&2).map(String::as_str), Some("Bob Jansen"));
+        assert_eq!(names.get(&3), None);
+        assert_eq!(names.get(&4), None);
+
+        // Renaming overwrites rather than accumulating rows.
+        s.log_request(1, "text", Some("@alice_new")).unwrap();
+        let names = s.display_names().unwrap();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names.get(&1).map(String::as_str), Some("@alice_new"));
     }
 
     #[test]

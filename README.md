@@ -74,7 +74,8 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - Your profile: delivery country, sizes, preferred marketplaces, languages.
   Injected into every request so it stops re-asking
 - Reorder reminders for things you buy periodically, delivered in Telegram
-- `/stat` for per-user usage with a text bar chart
+- `/stat` for usage with a text bar chart — your own numbers, or everyone's
+  if you're the admin
 
 **Behaves itself**
 - Streams progress live — which tool is running and on what — then the answer
@@ -113,6 +114,7 @@ compiles from source.
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | **yes** | — | bot token from @BotFather |
 | `ALLOWED_TELEGRAM_USER_IDS` | **yes** | — | comma-separated numeric ids |
+| `SCOUT_ADMIN_USER_IDS` | no | first allowed id | who sees everyone's numbers in `/stat`; everyone else sees only their own |
 | `MINIMAX_API_KEY` | **yes** | — | the LLM |
 | `KAGI_API_KEY` | **yes** | — | search: small-retailer coverage, `site:` scoping |
 | `PERPLEXITY_API_KEY` | no | — | second engine, merged with Kagi; carries the multi-language fan-out cheaply |
@@ -148,7 +150,7 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 12 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **164 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **176 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness.
 
@@ -167,8 +169,9 @@ Roughly 8,500 lines of Rust across a dozen focused modules.
 - **A shop that lies convincingly wins.** If a page publishes only a
   bare-integer cents price with nothing to cross-check, Scout reports that
   number instead of inventing a division.
-- **Allowlist only.** This is built as a personal/household bot. There's no
-  multi-tenant isolation beyond per-user memory scoping.
+- **Allowlist only.** This is built as a personal/household bot. Conversation
+  state, purchase memory and `/stat` are scoped per user — but everyone on
+  the allowlist shares one process, one database file and one API budget.
 - **Costs real money.** Kagi bills per query and MiniMax per token. Budgets are
   capped per request (15 search queries, 5 page opens, 20 model turns) — but
   it's not free.
@@ -178,7 +181,7 @@ Roughly 8,500 lines of Rust across a dozen focused modules.
 ## Development
 
 ```bash
-cargo test                  # 164 tests, no network needed
+cargo test                  # 176 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

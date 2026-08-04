@@ -63,8 +63,10 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - Opens product pages and extracts the real link, price, seller and stock
 - Pages that block plain HTTP get re-opened in **headless Chrome**, which
   clears the challenge shops like action.com put in front of them
-- Live APIs where they exist: eBay Browse, bol.com Catalog, Marktplaats —
-  current prices with no scraping at all
+- Live APIs where they exist: eBay Browse, Marktplaats, and bol.com Catalog
+  if you have an approved affiliate account — current prices, no scraping.
+  Each is optional; without one, those shops still arrive through search and
+  get read the same way as any other page
 - Second-hand search across eBay / Marktplaats / Vinted in parallel, with
   sold and deleted listings filtered out
 
@@ -120,7 +122,7 @@ compiles from source.
 | `PERPLEXITY_API_KEY` | no | — | second engine, merged with Kagi; carries the multi-language fan-out cheaply |
 | `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` | no | — | eBay Browse API: live prices, condition, shipping |
 | `EBAY_MARKETPLACE` | no | `EBAY_NL` | eBay marketplace id |
-| `BOL_CLIENT_ID` + `BOL_CLIENT_SECRET` | no | — | bol.com Catalog API (affiliate account) |
+| `BOL_CLIENT_ID` + `BOL_CLIENT_SECRET` | no | — | bol.com Catalog API; needs an **approved** affiliate account, which bol.com may decline |
 | `BOL_COUNTRY` | no | `NL` | `NL` or `BE` |
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
 | `SCOUT_CHROME` | no | auto-detected | Chrome/Chromium for the headless fallback |
@@ -138,7 +140,7 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 12 tools
                 │                                    │
                 │  streams progress + answer         ├─ search_web        Kagi + Perplexity, merged
                 │  back into one edited message      ├─ search_secondhand eBay / Marktplaats / Vinted
-                │                                    ├─ search_bol        live bol.com catalogue
+                │                                    ├─ search_bol        bol.com catalogue *
                 ▼                                    ├─ fetch_page        + headless-Chrome fallback
         link verification                            ├─ compare_prices    deterministic, in Rust
         (nothing dead ships)                         ├─ query_purchases   ─┐
@@ -146,6 +148,9 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 12 tools
                                                      ├─ remember_fact      │
                                                      ├─ forget_fact       ─┘
                                                      └─ reminders (create/list/cancel)
+
+        * registered only when its credentials are set — bol.com needs an
+          approved affiliate account, and they do reject applications
 ```
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
@@ -163,6 +168,10 @@ Roughly 8,500 lines of Rust across a dozen focused modules.
 - **Curated marketplaces.** eBay, bol.com, Marktplaats and Vinted are wired in
   deliberately; everything else arrives through general web search. Excellent
   for NL/EU, thinner elsewhere.
+- **Some of those APIs are gated.** eBay and bol.com both want developer or
+  affiliate accounts, and bol.com turns applications down. Each integration
+  is optional and Scout runs fine without it — the shop just goes back to
+  being an ordinary page found by search and read for its structured data.
 - **Not every wall falls.** Headless Chrome clears Cloudflare on some shops and
   not others. When a page can't be verified, Scout says so rather than
   guessing.

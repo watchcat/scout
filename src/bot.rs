@@ -207,10 +207,6 @@ fn sender_id(msg: &Message) -> Option<i64> {
     msg.from.as_ref().map(|u| u.id.0 as i64)
 }
 
-fn sender_name(msg: &Message) -> Option<String> {
-    msg.from.as_ref().map(display_name)
-}
-
 /// What `/stat` shows next to a user id. `@handle` when there is one, since
 /// that is what people recognise; otherwise the Telegram first/last name.
 fn display_name(user: &teloxide::types::User) -> String {
@@ -229,6 +225,9 @@ async fn handle_command(
     cmd: Command,
     app: Arc<App>,
 ) -> ResponseResult<()> {
+    // Commands are not counted as requests, but they do tell us who is
+    // asking — without this, running /stat never records your own name.
+    note_sender(&app, &msg);
     match cmd {
         Command::Start | Command::Help => {
             bot.send_message(msg.chat.id, HELP).await?;
@@ -278,7 +277,8 @@ async fn handle_command(
                 .and_then(|r| r)
             };
             match data {
-                Ok((rows, names)) => {
+                Ok((rows, mut names)) => {
+                    backfill_names(&bot, &app, &rows, &mut names).await;
                     let report = crate::stats::format_stats(&rows, days, today, user_id, &names);
                     bot.send_message(msg.chat.id, format!("<pre>{report}</pre>"))
                         .parse_mode(ParseMode::Html)
@@ -294,17 +294,67 @@ async fn handle_command(
     Ok(())
 }
 
-/// Fire-and-forget usage logging; never delays request handling. The name
-/// is refreshed on every request so `/stat` can label ids with something
-/// readable, and follows the user when they rename themselves.
-fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str, name: Option<String>) {
+/// How many names one `/stat` will look up. Bounded because each is a
+/// round trip to Telegram; the answers are stored, so a second `/stat`
+/// picks up where this one stopped.
+const NAME_BACKFILL_LIMIT: usize = 25;
+
+/// Learn the names of users who appear in the stats but predate the names
+/// table — otherwise every historical id reads `—` until its owner happens
+/// to message again.
+///
+/// `getChat` answers for anyone who has talked to the bot, which is exactly
+/// who lands in `request_log`. Results are persisted, so this is one call
+/// per user ever, not per `/stat`.
+async fn backfill_names(
+    bot: &Bot,
+    app: &Arc<App>,
+    rows: &[(i64, String, i64)],
+    names: &mut std::collections::BTreeMap<i64, String>,
+) {
+    let missing: Vec<i64> = rows
+        .iter()
+        .map(|(user, _, _)| *user)
+        .filter(|user| !names.contains_key(user))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .take(NAME_BACKFILL_LIMIT)
+        .collect();
+
+    for user_id in missing {
+        let chat = match bot.get_chat(ChatId(user_id)).await {
+            Ok(chat) => chat,
+            // Blocked the bot, deleted account, never a private chat —
+            // none of it is worth failing /stat over.
+            Err(e) => {
+                tracing::debug!(error = %e, user_id, "could not look up a display name");
+                continue;
+            }
+        };
+        let Some(name) = chat_display_name(&chat) else { continue };
+        note_user(app, user_id, name.clone());
+        names.insert(user_id, name);
+    }
+}
+
+/// The `/stat` label for a chat fetched by id, matching `display_name` for
+/// a `User`. Only private chats carry a person's name.
+fn chat_display_name(chat: &teloxide::types::ChatFullInfo) -> Option<String> {
+    if let Some(handle) = chat.username() {
+        return Some(format!("@{handle}"));
+    }
+    let first = chat.first_name()?;
+    Some(match chat.last_name() {
+        Some(last) => format!("{first} {last}"),
+        None => first.to_string(),
+    })
+}
+
+/// Fire-and-forget usage logging; never delays request handling.
+fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
     let store = app.deps.store.clone();
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || {
-            store.log_request(user_id, kind, name.as_deref())
-        })
-        .await
-        {
+        match tokio::task::spawn_blocking(move || store.log_request(user_id, kind)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "request logging failed"),
             Err(e) => tracing::warn!(error = %e, "request logging join failed"),
@@ -312,11 +362,32 @@ fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str, name: Option<St
     });
 }
 
+/// Fire-and-forget name refresh, so `/stat` has something to print besides
+/// an id. Separate from `log_request` on purpose: running a command should
+/// teach the bot your name without inflating your request count.
+fn note_user(app: &Arc<App>, user_id: i64, name: String) {
+    let store = app.deps.store.clone();
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || store.remember_user(user_id, &name)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "display name update failed"),
+            Err(e) => tracing::warn!(error = %e, "display name join failed"),
+        }
+    });
+}
+
+fn note_sender(app: &Arc<App>, msg: &Message) {
+    if let Some(user) = msg.from.as_ref() {
+        note_user(app, user.id.0 as i64, display_name(user));
+    }
+}
+
 async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let text = msg.text().unwrap_or_default().to_string();
     let chat_id = msg.chat.id;
     let Some(user_id) = sender_id(&msg) else { return Ok(()) };
-    log_request(&app, user_id, "text", sender_name(&msg));
+    log_request(&app, user_id, "text");
+    note_sender(&app, &msg);
 
     // Session expiry: after a long gap the old context is set aside; a quick
     // LLM check restores it when the new message continues the same topic.
@@ -484,7 +555,8 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     let Some(photo) = msg.photo().and_then(|sizes| sizes.last()) else {
         return Ok(());
     };
-    log_request(&app, user_id, "photo", sender_name(&msg));
+    log_request(&app, user_id, "photo");
+    note_sender(&app, &msg);
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
     let bytes = match download_photo(&bot, photo.file.id.clone()).await {
@@ -560,7 +632,8 @@ async fn handle_reaction(
         return Ok(());
     };
 
-    log_request(&app, user_id, "reaction", Some(display_name(user)));
+    log_request(&app, user_id, "reaction");
+    note_user(&app, user_id, display_name(user));
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
     let prompt = format!(
         "[system note] The user reacted with a thumbs-up to this earlier reply \

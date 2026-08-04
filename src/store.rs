@@ -259,23 +259,31 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Record one handled request for usage statistics. `display_name` is
-    /// the sender's current Telegram name, refreshed on every request so
-    /// `/stat` can show something other than a bare id.
-    pub fn log_request(&self, user_id: i64, kind: &str, display_name: Option<&str>) -> Result<()> {
+    /// Record one handled request for usage statistics.
+    pub fn log_request(&self, user_id: i64, kind: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO request_log (user_id, kind) VALUES (?, ?)",
             params![user_id, kind],
         )?;
-        if let Some(name) = display_name.map(str::trim).filter(|n| !n.is_empty()) {
-            conn.execute(
-                "INSERT INTO users (user_id, display_name) VALUES (?, ?)
-                 ON CONFLICT (user_id)
-                 DO UPDATE SET display_name = excluded.display_name, updated_at = now()",
-                params![user_id, name],
-            )?;
+        Ok(())
+    }
+
+    /// Remember what to call a user id in `/stat`. Deliberately separate
+    /// from `log_request`: commands should teach the bot your name without
+    /// also counting as requests. A blank name is not a name.
+    pub fn remember_user(&self, user_id: i64, display_name: &str) -> Result<()> {
+        let name = display_name.trim();
+        if name.is_empty() {
+            return Ok(());
         }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO users (user_id, display_name) VALUES (?, ?)
+             ON CONFLICT (user_id)
+             DO UPDATE SET display_name = excluded.display_name, updated_at = now()",
+            params![user_id, name],
+        )?;
         Ok(())
     }
 
@@ -554,7 +562,7 @@ mod tests {
         );
 
         // live logging path writes with defaults and lands in stats
-        s.log_request(3, "reaction", None).unwrap();
+        s.log_request(3, "reaction").unwrap();
         let rows = s.usage_stats_all("2000-01-01 00:00:00").unwrap();
         assert!(rows.iter().any(|(u, _, _)| *u == 3));
     }
@@ -562,25 +570,32 @@ mod tests {
     #[test]
     fn display_names_track_the_latest_seen_name() {
         let (s, _d) = test_store();
-        s.log_request(1, "text", Some("@alice")).unwrap();
-        s.log_request(2, "text", Some("Bob Jansen")).unwrap();
-        // A user with no name attached is logged but stays unnamed, so
-        // /stat falls back to the bare id.
-        s.log_request(3, "text", None).unwrap();
-        // Blank names are not a name.
-        s.log_request(4, "text", Some("   ")).unwrap();
+        s.remember_user(1, "@alice").unwrap();
+        s.remember_user(2, "Bob Jansen").unwrap();
+        // Blank is not a name — the row is left absent so /stat falls back
+        // to the bare id rather than printing an empty column.
+        s.remember_user(4, "   ").unwrap();
 
         let names = s.display_names().unwrap();
         assert_eq!(names.get(&1).map(String::as_str), Some("@alice"));
         assert_eq!(names.get(&2).map(String::as_str), Some("Bob Jansen"));
-        assert_eq!(names.get(&3), None);
         assert_eq!(names.get(&4), None);
 
         // Renaming overwrites rather than accumulating rows.
-        s.log_request(1, "text", Some("@alice_new")).unwrap();
+        s.remember_user(1, "@alice_new").unwrap();
         let names = s.display_names().unwrap();
         assert_eq!(names.len(), 2);
         assert_eq!(names.get(&1).map(String::as_str), Some("@alice_new"));
+    }
+
+    #[test]
+    fn logging_a_request_does_not_invent_a_name() {
+        // Requests and names are recorded independently: someone can appear
+        // in /stat's counts long before the bot knows what to call them.
+        let (s, _d) = test_store();
+        s.log_request(7, "text").unwrap();
+        assert!(s.display_names().unwrap().is_empty());
+        assert_eq!(s.usage_stats_all("2000-01-01 00:00:00").unwrap().len(), 1);
     }
 
     #[test]

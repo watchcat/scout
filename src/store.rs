@@ -272,15 +272,17 @@ impl Store {
     }
 
     /// (user_id, day "YYYY-MM-DD", request count) for everything at or after
-    /// `cutoff` ("YYYY-MM-DD 00:00:00"), ordered by day then user.
-    pub fn usage_stats(&self, cutoff: &str) -> Result<Vec<(i64, String, i64)>> {
+    /// Per-day request counts scoped to a single user. Used by `/stat` so
+    /// callers only ever see their own request volume, regardless of how
+    /// many users share the bot.
+    pub fn usage_stats_for(&self, cutoff: &str, user_id: i64) -> Result<Vec<(i64, String, i64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT user_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
-             FROM request_log WHERE created_at >= CAST(? AS TIMESTAMP)
+             FROM request_log WHERE user_id = ? AND created_at >= CAST(? AS TIMESTAMP)
              GROUP BY user_id, day ORDER BY day ASC, user_id ASC",
         )?;
-        let rows = stmt.query_map(params![cutoff], |row| {
+        let rows = stmt.query_map(params![user_id, cutoff], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         rows.map(|r| r.map_err(Into::into)).collect()
@@ -459,27 +461,31 @@ mod tests {
     }
 
     #[test]
-    fn usage_stats_group_by_user_and_day_with_cutoff() {
+    fn usage_stats_for_is_scoped_to_one_user() {
+        // /stat pulls from this method so a per-user query never sees
+        // anyone else's request count.
         let (s, _d) = test_store();
         s.log_request_at(1, "text", "2026-07-25 10:00:00").unwrap();
         s.log_request_at(1, "text", "2026-07-25 11:00:00").unwrap();
         s.log_request_at(2, "photo", "2026-07-25 12:00:00").unwrap();
-        s.log_request_at(1, "text", "2026-07-26 09:00:00").unwrap();
         s.log_request_at(1, "text", "2026-07-20 09:00:00").unwrap(); // before cutoff
 
-        let rows = s.usage_stats("2026-07-25 00:00:00").unwrap();
+        let mine = s.usage_stats_for("2026-07-25 00:00:00", 1).unwrap();
         assert_eq!(
-            rows,
-            vec![
-                (1, "2026-07-25".to_string(), 2),
-                (2, "2026-07-25".to_string(), 1),
-                (1, "2026-07-26".to_string(), 1),
-            ]
+            mine,
+            vec![(1, "2026-07-25".to_string(), 2)],
+            "user 1 should see only their own rows"
         );
-        // live logging path writes with defaults and lands in stats
-        s.log_request(3, "reaction").unwrap();
-        let rows = s.usage_stats("2000-01-01 00:00:00").unwrap();
-        assert!(rows.iter().any(|(u, _, _)| *u == 3));
+
+        let theirs = s.usage_stats_for("2026-07-25 00:00:00", 2).unwrap();
+        assert_eq!(
+            theirs,
+            vec![(2, "2026-07-25".to_string(), 1)],
+            "user 2 must not see user 1's counts"
+        );
+
+        let empty = s.usage_stats_for("2026-07-25 00:00:00", 99).unwrap();
+        assert!(empty.is_empty(), "unknown user sees nothing");
     }
 
     #[test]

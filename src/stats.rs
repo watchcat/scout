@@ -5,7 +5,8 @@ const BAR_MAX_WIDTH: usize = 20;
 
 /// Render the /stat report: per-user totals with daily averages plus a
 /// per-day Unicode bar chart. `rows` are (user_id, "YYYY-MM-DD", count)
-/// from `Store::usage_stats`; the window is the `days` days ending `today`.
+/// from `Store::usage_stats_for` (single user) or `usage_stats` (all
+/// users); the window is the `days` days ending `today`.
 pub fn format_stats(rows: &[(i64, String, i64)], days: u32, today: NaiveDate) -> String {
     let total: i64 = rows.iter().map(|(_, _, c)| c).sum();
     if total == 0 {
@@ -24,16 +25,23 @@ pub fn format_stats(rows: &[(i64, String, i64)], days: u32, today: NaiveDate) ->
         total as f64 / days as f64
     );
 
+    // Single-user callers (the default after scoping /stat per user) read
+    // better with "you"; multi-user aggregation retains the numeric id.
+    let single_user = per_user.len() == 1;
     let mut users: Vec<(i64, i64)> = per_user.into_iter().collect();
     users.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     for (user, count) in users {
+        let label = if single_user { "you".to_string() } else { format!("{user}") };
         out.push_str(&format!(
-            "{user:>12}  {count:>4}  ({:.1}/day)\n",
+            "{label:>12}  {count:>4}  ({:.1}/day)\n",
             count as f64 / days as f64
         ));
     }
 
-    out.push_str("\nPer day (all users):\n");
+    out.push_str(&format!(
+        "\nPer day{}:\n",
+        if single_user { " (you)" } else { "" }
+    ));
     let max = per_day.values().copied().max().unwrap_or(1).max(1);
     for offset in (0..days as i64).rev() {
         let date = today - Duration::days(offset);
@@ -90,6 +98,19 @@ mod tests {
         let pos_111 = out.find("111").unwrap();
         assert!(pos_222 < pos_111);
         assert!(out.contains("(1.5/day)")); // user 111: 3 requests / 2 days
+        // multi-user label: the trailing chart still says "Per day:"
+        assert!(out.contains("Per day:\n"));
+    }
+
+    #[test]
+    fn single_user_calls_render_as_you() {
+        // `/stat` is now per-user, so the typical render is a single user
+        // and the label should read "you" rather than the raw id.
+        let rows = vec![(42, "2026-07-27".to_string(), 7)];
+        let out = format_stats(&rows, 1, date("2026-07-27"));
+        assert!(out.contains("           you  "), "got: {out}");
+        assert!(!out.contains(" 42  "), "raw user_id must not leak: {out}");
+        assert!(out.contains("Per day (you):"), "got: {out}");
     }
 
     #[test]

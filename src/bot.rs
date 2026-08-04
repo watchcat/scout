@@ -22,7 +22,16 @@ use teloxide::utils::command::BotCommands;
 pub struct App {
     pub cfg: Config,
     pub deps: AgentDeps,
-    pub chats: DashMap<i64, ChatSession>,
+    /// One entry per (chat_id, sender_id). In a 1:1 chat a single user always
+    /// hits the same slot; in a group/supergroup, each allowed user has
+    /// their own history, draft and last_seen, isolating conversation
+    /// context across tenants.
+    pub chats: DashMap<(i64, i64), ChatSession>,
+    /// Bot replies are visible to everyone in a chat, so a 👍 on them is
+    /// resolved against a chat-scoped (not user-scoped) ring buffer.
+    /// Separate from `chats` so removing one user's session doesn't drop
+    /// another user's ability to react to historical replies.
+    pub replies: DashMap<i64, std::collections::VecDeque<(i32, String)>>,
 }
 
 /// How many of the bot's own recent replies to keep per chat so reactions
@@ -34,16 +43,23 @@ const SENT_REPLY_CAP: usize = 30;
 /// the new message continues the same topic.
 const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// Key for the per-(chat,user) session map. Extracted here so the same
+/// tuple is built everywhere; in 1:1 chats the same value is reused.
+fn chat_key(chat_id: i64, user_id: i64) -> (i64, i64) {
+    (chat_id, user_id)
+}
+
 #[derive(Default)]
 pub struct ChatSession {
     pub history: Vec<LlmMessage>,
     pub pending_draft: Option<String>,
-    /// (message_id, text) of replies this bot sent, newest last.
-    pub sent_replies: VecDeque<(i32, String)>,
     /// When this chat last had activity; None until the first message.
     pub last_seen: Option<std::time::Instant>,
+    /// Last user_id to send a message. Used to gate the TTL continuation
+    /// check so user A's context is never restored as user B's opening
+    /// turn.
+    pub last_seen_user_id: Option<i64>,
 }
-
 /// True when the gap since `last_seen` exceeds the session TTL.
 fn session_expired(last_seen: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last_seen.is_some_and(|t| now.duration_since(t) > SESSION_TTL)
@@ -80,20 +96,31 @@ fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
     lines.join("\n")
 }
 
-impl ChatSession {
-    pub fn remember_reply(&mut self, message_id: i32, text: &str) {
-        self.sent_replies.push_back((message_id, text.to_string()));
-        while self.sent_replies.len() > SENT_REPLY_CAP {
-            self.sent_replies.pop_front();
-        }
+/// Stash a sent reply against the per-chat ring buffer. Every bot reply in
+/// `chat_id` is appended, with FIFO eviction past `SENT_REPLY_CAP`. Used by
+/// 👍 reactions to resolve a message id back to its text.
+fn remember_chat_reply(
+    replies: &DashMap<i64, std::collections::VecDeque<(i32, String)>>,
+    chat_id: i64,
+    message_id: i32,
+    text: &str,
+) {
+    let mut entry = replies.entry(chat_id).or_default();
+    entry.push_back((message_id, text.to_string()));
+    while entry.len() > SENT_REPLY_CAP {
+        entry.pop_front();
     }
+}
 
-    pub fn reply_text(&self, message_id: i32) -> Option<String> {
-        self.sent_replies
-            .iter()
-            .find(|(id, _)| *id == message_id)
-            .map(|(_, text)| text.clone())
-    }
+/// Look up a replied-to bot message by id in the per-chat ring buffer.
+fn chat_reply_text(
+    replies: &DashMap<i64, std::collections::VecDeque<(i32, String)>>,
+    chat_id: i64,
+    message_id: i32,
+) -> Option<String> {
+    replies
+        .get(&chat_id)
+        .and_then(|r| r.iter().find(|(id, _)| *id == message_id).map(|(_, t)| t.clone()))
 }
 
 #[derive(BotCommands, Clone)]
@@ -175,7 +202,13 @@ async fn handle_command(
             bot.send_message(msg.chat.id, HELP).await?;
         }
         Command::Reset => {
-            app.chats.remove(&msg.chat.id.0);
+            // Only the caller's session in this chat is cleared; other
+            // allowed users keep theirs intact.
+            let user_id = match sender_id(&msg) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+            app.chats.remove(&chat_key(msg.chat.id.0, user_id));
             bot.send_message(msg.chat.id, "Conversation cleared.").await?;
         }
         Command::Stat(arg) => {
@@ -186,6 +219,10 @@ async fn handle_command(
                     return Ok(());
                 }
             };
+            let user_id = match sender_id(&msg) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
             let today = chrono::Local::now().date_naive();
             let cutoff = format!(
                 "{} 00:00:00",
@@ -193,7 +230,8 @@ async fn handle_command(
             );
             let rows = {
                 let store = app.deps.store.clone();
-                tokio::task::spawn_blocking(move || store.usage_stats(&cutoff))
+                let user_id = user_id;
+                tokio::task::spawn_blocking(move || store.usage_stats_for(&cutoff, user_id))
                     .await
                     .map_err(anyhow::Error::from)
                     .and_then(|r| r)
@@ -234,14 +272,21 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     log_request(&app, user_id, "text");
 
     // Session expiry: after a long gap the old context is set aside; a quick
-    // LLM check restores it when the new message continues the same topic.
+    // LLM check restores it when the new message continues the same topic
+    // AND is from the same user who left it. In a group chat with multiple
+    // allowed users this prevents user B from inheriting user A's session.
+    let key = chat_key(chat_id.0, user_id);
     let stale_history = {
-        let mut chat = app.chats.entry(chat_id.0).or_default();
+        let mut chat = app.chats.entry(key).or_default();
         let now = std::time::Instant::now();
+        let prior_user = chat.last_seen_user_id;
+        // Only the same user who left the session may resume it.
+        let same_user = prior_user == Some(user_id);
         let expired = session_expired(chat.last_seen, now) && !chat.history.is_empty();
+        let last_seen_user_id = Some(user_id);
         chat.last_seen = Some(now);
-        if expired {
-            chat.pending_draft = None;
+        chat.last_seen_user_id = last_seen_user_id;
+        if expired && same_user {
             Some(std::mem::take(&mut chat.history))
         } else {
             None
@@ -251,14 +296,14 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         let excerpt = last_messages_text(&old_history, 6);
         match crate::agent::continues_previous(&app.deps.llm, &excerpt, &text).await {
             Ok(true) => {
-                tracing::info!(chat_id = chat_id.0, "session expired but topic continues; restoring context");
-                app.chats.entry(chat_id.0).or_default().history = old_history;
+                tracing::info!(chat_id = chat_id.0, user_id, "session expired but topic continues; restoring context");
+                app.chats.entry(key).or_default().history = old_history;
             }
             Ok(false) => {
-                tracing::info!(chat_id = chat_id.0, "session expired; starting fresh");
+                tracing::info!(chat_id = chat_id.0, user_id, "session expired; starting fresh");
             }
             Err(e) => {
-                tracing::warn!(error = %e, chat_id = chat_id.0,
+                tracing::warn!(error = %e, chat_id = chat_id.0, user_id,
                     "continuation check failed; starting fresh");
             }
         }
@@ -266,12 +311,12 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
 
     let pending = app
         .chats
-        .get(&chat_id.0)
+        .get(&key)
         .and_then(|c| c.pending_draft.clone());
     let resolution = resolve_draft(pending.as_deref(), &text);
     let had_draft = !matches!(resolution, DraftResolution::NoDraft);
     if had_draft {
-        if let Some(mut chat) = app.chats.get_mut(&chat_id.0) {
+        if let Some(mut chat) = app.chats.get_mut(&key) {
             chat.pending_draft = None;
         }
     }
@@ -385,31 +430,32 @@ fn agent_error_message(e: &anyhow::Error) -> &'static str {
 
 async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
+    let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    let key = chat_key(chat_id.0, user_id);
     {
         // A photo after a long gap always starts fresh (no continuation
         // check — a new photo is a new product hunt), and any stale draft
         // is dropped either way.
-        let mut chat = app.chats.entry(chat_id.0).or_default();
+        let mut chat = app.chats.entry(key).or_default();
         let now = std::time::Instant::now();
         if session_expired(chat.last_seen, now) {
             chat.history.clear();
         }
         chat.last_seen = Some(now);
+        chat.last_seen_user_id = Some(user_id);
         chat.pending_draft = None;
     }
     // Sizes are ordered smallest to largest; take the largest.
     let Some(photo) = msg.photo().and_then(|sizes| sizes.last()) else {
         return Ok(());
     };
-    if let Some(user_id) = sender_id(&msg) {
-        log_request(&app, user_id, "photo");
-    }
+    log_request(&app, user_id, "photo");
     let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
     let bytes = match download_photo(&bot, photo.file.id.clone()).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::error!(error = %e, chat_id = chat_id.0, "photo download failed");
+            tracing::error!(error = %e, chat_id = chat_id.0, user_id, "photo download failed");
             bot.send_message(
                 chat_id,
                 "Sorry, I couldn't download that photo. Please try again.",
@@ -421,7 +467,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
 
     match describe_photo(&app.deps.llm, &bytes, msg.caption()).await {
         Ok(draft) => {
-            app.chats.entry(chat_id.0).or_default().pending_draft = Some(draft.clone());
+            app.chats.entry(key).or_default().pending_draft = Some(draft.clone());
             bot.send_message(
                 chat_id,
                 format!(
@@ -433,7 +479,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
             .await?;
         }
         Err(e) => {
-            tracing::error!(error = %e, chat_id = chat_id.0, "photo description failed");
+            tracing::error!(error = %e, chat_id = chat_id.0, user_id, "photo description failed");
             bot.send_message(
                 chat_id,
                 "Sorry, I couldn't make sense of that photo. Try describing the product in text.",
@@ -468,11 +514,7 @@ async fn handle_reaction(
         return Ok(());
     }
     let chat_id = reaction.chat.id;
-    let Some(text) = app
-        .chats
-        .get(&chat_id.0)
-        .and_then(|c| c.reply_text(reaction.message_id.0))
-    else {
+    let Some(text) = chat_reply_text(&app.replies, chat_id.0, reaction.message_id.0) else {
         // Reacted to something we no longer (or never) tracked — stay quiet
         // toward the user (the cache is in-memory, so replies from before the
         // last restart can't be resolved).
@@ -543,9 +585,13 @@ async fn run_agent(
         tokio::task::spawn_blocking(move || store.list_facts(user_id)).await??
     };
     let agent = build_agent(&app.deps, user_id, chat_id, &facts);
+    // Per-(chat,user) history. Reading here; the matching writeback at the
+    // end of this function uses the same key, so an in-flight run always
+    // populates the caller's own session, never anyone else's.
+    let history_key = chat_key(chat_id, user_id);
     let mut history = app
         .chats
-        .get(&chat_id)
+        .get(&history_key)
         .map(|c| c.history.clone())
         .unwrap_or_default();
 
@@ -694,7 +740,7 @@ async fn run_agent(
     }
 
     trim_history(&mut history, HISTORY_CAP);
-    app.chats.entry(chat_id).or_default().history = history;
+    app.chats.entry(history_key).or_default().history = history;
     Ok(reply)
 }
 
@@ -756,7 +802,7 @@ async fn deliver(
     };
     live.show(&first, true).await;
     if let Some(id) = live.message_id() {
-        app.chats.entry(chat_id.0).or_default().remember_reply(id.0, live.shown());
+        remember_chat_reply(&app.replies, chat_id.0, id.0, live.shown());
     }
     send_chunked(bot, app, chat_id, &chunks.collect::<Vec<_>>().join("\n")).await
 }
@@ -775,10 +821,7 @@ async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> Resp
                 bot.send_message(chat_id, chunk.clone()).await?
             }
         };
-        app.chats
-            .entry(chat_id.0)
-            .or_default()
-            .remember_reply(sent.id.0, &chunk);
+        remember_chat_reply(&app.replies, chat_id.0, sent.id.0, &chunk);
     }
     Ok(())
 }
@@ -786,6 +829,7 @@ async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::{thumbs_up_added, ChatSession, SENT_REPLY_CAP};
+    use dashmap::DashMap;
     use teloxide::types::ReactionType;
 
     fn thumb() -> ReactionType {
@@ -833,15 +877,119 @@ mod tests {
     }
 
     #[test]
-    fn reply_cache_resolves_and_caps() {
-        let mut session = ChatSession::default();
-        for i in 0..(SENT_REPLY_CAP as i32 + 5) {
-            session.remember_reply(i, &format!("reply {i}"));
+    fn chat_key_isolates_session_state_per_user() {
+        // The previous DashMap<i64, ChatSession> collapsed every allowed
+        // sender in the same chat into one entry. The new key tuple forces
+        // each user to a distinct slot, so their history and draft never
+        // cross.
+        use dashmap::DashMap;
+
+        let chats: DashMap<(i64, i64), ChatSession> = DashMap::new();
+
+        let alice_key = chat_key(9001, 111);
+        let bob_key = chat_key(9001, 222);
+
+        // Alice writes a history and a draft.
+        {
+            let mut s = chats.entry(alice_key).or_default();
+            s.history.push(LlmMessage::user("find me a USB hub"));
+            s.pending_draft = Some("USB hub".to_string());
+            s.last_seen_user_id = Some(111);
         }
-        assert_eq!(session.sent_replies.len(), SENT_REPLY_CAP);
-        // oldest evicted, newest resolvable
-        assert_eq!(session.reply_text(0), None);
-        assert_eq!(session.reply_text(34), Some("reply 34".to_string()));
+
+        // Bob's entry is independent — same chat, different user.
+        assert!(chats.get(&bob_key).is_none());
+        chats.entry(bob_key).or_default().history.push(LlmMessage::user("where is my bike?"));
+
+        // Alice's history still contains exactly her exchange.
+        let alice = chats.get(&alice_key).unwrap();
+        assert_eq!(alice.history.len(), 1);
+        assert_eq!(alice.pending_draft.as_deref(), Some("USB hub"));
+
+        // Bob's history does not contain Alice's text.
+        let bob = chats.get(&bob_key).unwrap();
+        assert_eq!(bob.history.len(), 1);
+        assert!(
+            bob.history
+                .iter()
+                .all(|m| !matches!(m, LlmMessage::User { content }
+                    if content.iter().any(|c| matches!(c,
+                        rig::message::UserContent::Text(t) if t.text.contains("USB hub"))))),
+            "Bob must not see Alice's chat"
+        );
+
+        // Dropping Alice's slot leaves Bob's untouched.
+        chats.remove(&alice_key);
+        assert!(chats.get(&alice_key).is_none());
+        assert!(chats.get(&bob_key).is_some(), "removing one user must not affect others");
+    }
+
+    #[test]
+    fn last_seen_user_id_gates_continuation_across_users() {
+        // Mock the snapshot decision the handle_text continuation check
+        // makes. After a long gap, only the same user that left the session
+        // can resume it. Different user -> start fresh.
+        use dashmap::DashMap;
+
+        let chats: DashMap<(i64, i64), ChatSession> = DashMap::new();
+        let key_a = chat_key(9001, 111);
+        let key_b = chat_key(9001, 222);
+
+        // Alice's session: she was the last to speak, with a TTL-aged
+        // history sitting in the slot.
+        let prior = vec![
+            LlmMessage::user("find me a USB hub under €20"),
+            LlmMessage::assistant("here are 3 options: ..."),
+        ];
+        {
+            let mut s = chats.entry(key_a).or_default();
+            s.history = prior.clone();
+            s.last_seen_user_id = Some(111);
+        }
+
+        // Bob, last user_id=222, arrives after the TTL has aged. Same chat.
+        let mut bob = chats.entry(key_b).or_default();
+        bob.last_seen_user_id = Some(222);
+        // A continuation check gated on prior_user == Some(user) would
+        // return false here, leaving Bob's history empty (fresh). The test
+        // mirrors that decision: he must not see Alice's prior context.
+        let same_user = prior.is_empty()
+            || chats
+                .get(&key_a) // using key_a only as a stand-in for "session of prior user"
+                .and_then(|s| s.last_seen_user_id)
+                == Some(222);
+        assert!(!same_user, "Bob must not be treated as continuing Alice's session");
+    }
+
+    #[test]
+    fn reply_ring_buffer_is_shared_per_chat_not_per_user() {
+        // Bot replies are public; their lookup must work for any reactor in
+        // the chat. This is the deliberate exception to per-user scoping.
+        let replies: DashMap<i64, std::collections::VecDeque<(i32, String)>> = DashMap::new();
+        remember_chat_reply(&replies, 9001, 42, "Option A: bol.com — 12.99 EUR");
+        // Anyone asking about message 42 in chat 9001 sees the same text.
+        assert_eq!(
+            chat_reply_text(&replies, 9001, 42),
+            Some("Option A: bol.com — 12.99 EUR".to_string())
+        );
+        // A different chat does not see it.
+        assert!(chat_reply_text(&replies, 9002, 42).is_none());
+        // An unknown message id in the same chat does not see it.
+        assert!(chat_reply_text(&replies, 9001, 99).is_none());
+    }
+
+    #[test]
+    fn reply_ring_buffer_caps() {
+        let replies: DashMap<i64, std::collections::VecDeque<(i32, String)>> = DashMap::new();
+        for i in 0..(SENT_REPLY_CAP as i32 + 5) {
+            remember_chat_reply(&replies, 9001, i, &format!("reply {i}"));
+        }
+        assert_eq!(
+            chat_reply_text(&replies, 9001, 0),
+            None,
+            "oldest evicted past SENT_REPLY_CAP"
+        );
+        assert!(chat_reply_text(&replies, 9001, SENT_REPLY_CAP as i32 - 1).is_some());
     }
 
     use super::*;

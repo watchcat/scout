@@ -40,6 +40,7 @@ is pinned by a test.
 | Compared a €15 3-pack against a €35 single and called the 3-pack cheaper. | A `compare_prices` tool does the arithmetic **in Rust**: landed cost (item + shipping), price per unit, exact ranking. The model reports numbers, it doesn't compute them. |
 | A user was left staring at a half-written progress message forever. | Every run is bounded — stalled stream, total runtime, wrap-up. Running out of steps produces a partial answer from what was found, never silence. |
 | Sticker price ranked a €15.17 listing above a €35.25 one; shipping was €16.98 vs €2.21. | Comparisons are on **landed cost**. Offers that don't state shipping still compete, but their prices are labelled item-only. |
+| Reddit's bot wall answers **HTTP 200** with a plausible shell, so it came back as a page that merely had nothing on it — and the model opened three more just like it, then stalled. | A bot check is an **error**, not content, and it tells the model to stop opening that host. Reddit threads are read through `old.reddit.com`, which serves the whole thread to a plain GET: 8 KB of interstitial becomes 69 KB with every comment. |
 
 The theme: **the model decides what to look for, Rust decides what's true.**
 
@@ -155,7 +156,7 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 12 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **177 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **180 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness.
 
@@ -190,7 +191,7 @@ Roughly 8,500 lines of Rust across a dozen focused modules.
 ## Development
 
 ```bash
-cargo test                  # 177 tests, no network needed
+cargo test                  # 180 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

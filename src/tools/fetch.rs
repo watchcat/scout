@@ -703,6 +703,22 @@ impl FetchPageTool {
 /// pretending otherwise would undo the dead-link checks. A bot wall (403,
 /// 429, 503) or a challenge page served with HTTP 200 is exactly what a real
 /// browser is for.
+/// Reddit's own site is a JavaScript shell behind a bot wall, but the old
+/// interface serves the same thread fully rendered — post, comments and all
+/// — to a plain GET. Measured on one thread: www gives 8 KB of interstitial,
+/// old gives 69 KB with every comment in it.
+///
+/// Only the HTML hosts are switched. `i.redd.it` and friends serve media and
+/// have no old-interface equivalent.
+fn readable_url(url: &Url) -> Option<Url> {
+    if !matches!(url.host_str(), Some("reddit.com" | "www.reddit.com")) {
+        return None;
+    }
+    let mut old = url.clone();
+    old.set_host(Some("old.reddit.com")).ok()?;
+    Some(old)
+}
+
 fn worth_rendering(status: Option<u16>, body: &str) -> bool {
     match status {
         Some(404 | 410) => false,
@@ -763,7 +779,12 @@ impl Tool for FetchPageTool {
                  already have instead of opening more pages"
             )));
         }
-        let resp = browser_get(&self.http, url.clone()).send().await?;
+        // Some hosts have a second address that answers plain GETs properly.
+        let fetched = readable_url(&url).unwrap_or_else(|| url.clone());
+        if fetched != url {
+            tracing::info!(url = %url, via = %fetched, "using the readable host");
+        }
+        let resp = browser_get(&self.http, fetched.clone()).send().await?;
         let status = resp.status();
         let body = if status.is_success() { resp.text().await? } else { String::new() };
 
@@ -774,9 +795,9 @@ impl Tool for FetchPageTool {
             .filter(|_| worth_rendering(Some(status.as_u16()), &body))
         {
             tracing::info!(url = %url, status = status.as_u16(), "retrying with headless browser");
-            match renderer.render(url.as_str()).await {
+            match renderer.render(fetched.as_str()).await {
                 Ok(html) if !super::browser::looks_unrendered(&html) => {
-                    return Ok(self.remember(key, extract_page(&html, &url)));
+                    return Ok(self.remember(key, extract_page(&html, &fetched)));
                 }
                 Ok(_) => tracing::info!(url = %url, "render produced no usable page"),
                 Err(e) => tracing::warn!(url = %url, error = %e, "render failed"),
@@ -785,7 +806,18 @@ impl Tool for FetchPageTool {
         if !status.is_success() {
             return Err(FetchError::Invalid(format!("page returned HTTP {status}")));
         }
-        Ok(self.remember(key, extract_page(&body, &url)))
+        // A wall that answers 200. Handing its text back as page content is
+        // what let the model mistake it for a page with nothing on it and
+        // open three more just like it.
+        if super::browser::is_challenge_page(&body) {
+            return Err(FetchError::Invalid(format!(
+                "{} served a bot check instead of the page, and it could not be cleared — \
+                 this site is unreadable, so do not open more pages on it; use what the \
+                 search results already told you",
+                url.host_str().unwrap_or("the site")
+            )));
+        }
+        Ok(self.remember(key, extract_page(&body, &fetched)))
     }
 }
 
@@ -1013,6 +1045,36 @@ mod tests {
         assert!(page.links[0].url.ends_with("/p/2"));
     }
 
+    #[tokio::test]
+    async fn a_bot_wall_that_answers_200_is_an_error_not_a_page() {
+        // Reddit's wall, verbatim in shape: HTTP 200, real-looking shell, no
+        // content. Returned as text it reads like a page that happened to be
+        // empty, and the model opens more of the same — which is how one run
+        // walked into a five-minute stall.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/thread"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<html><head><title>Reddit - Please wait for verification</title></head>\
+                 <body></body></html>",
+            ))
+            .mount(&server)
+            .await;
+
+        // No renderer configured, so the wall cannot be cleared.
+        let tool = FetchPageTool::new(reqwest::Client::new(), None);
+        let err = tool
+            .call(FetchArgs { url: format!("{}/thread", server.uri()) })
+            .await
+            .expect_err("a bot check is not a page");
+        let msg = err.to_string();
+        assert!(msg.contains("bot check"), "got: {msg}");
+        assert!(
+            msg.contains("do not open more pages"),
+            "the model needs to be told to stop, not just that this one failed: {msg}"
+        );
+    }
+
 
     #[test]
     fn the_price_comes_from_the_variant_matching_the_url() {
@@ -1101,6 +1163,31 @@ mod tests {
             .product
             .expect("product");
         assert_eq!(product.price.as_deref(), Some("648.00 EUR"));
+    }
+
+    #[test]
+    fn reddit_threads_are_read_through_the_old_interface() {
+        let old = |u: &str| readable_url(&Url::parse(u).unwrap()).map(String::from);
+
+        // Path, query and fragment survive; only the host moves.
+        assert_eq!(
+            old("https://www.reddit.com/r/teenageengineering/comments/1hkpmq6/whos_got_the_cm15/"),
+            Some(
+                "https://old.reddit.com/r/teenageengineering/comments/1hkpmq6/whos_got_the_cm15/"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            old("https://reddit.com/r/x/comments/1/y/?sort=top"),
+            Some("https://old.reddit.com/r/x/comments/1/y/?sort=top".to_string())
+        );
+
+        // Media hosts have no old-interface equivalent, and everything else
+        // is none of our business.
+        assert_eq!(old("https://i.redd.it/abc.jpg"), None);
+        assert_eq!(old("https://preview.redd.it/abc.jpg"), None);
+        assert_eq!(old("https://old.reddit.com/r/x/"), None, "already readable");
+        assert_eq!(old("https://www.bol.com/nl/nl/p/x/123/"), None);
     }
 
     #[test]

@@ -43,9 +43,18 @@ fn is_challenge(html: &str) -> bool {
         .and_then(|(_, rest)| rest.split_once("</title>"))
         .map(|(t, _)| t.trim().to_string())
         .unwrap_or_default();
-    ["just a moment", "checking your browser", "attention required", "access denied"]
-        .iter()
-        .any(|m| title.contains(m))
+    [
+        "just a moment",
+        "checking your browser",
+        "attention required",
+        "access denied",
+        // Reddit's wall answers HTTP 200 with a plausible-looking shell, so
+        // without this it reads as a page that simply had nothing on it.
+        "please wait for verification",
+        "verifying you are human",
+    ]
+    .iter()
+    .any(|m| title.contains(m))
         || lower.contains("cf-chl-widget")
 }
 
@@ -53,6 +62,12 @@ fn is_challenge(html: &str) -> bool {
 /// small its content clearly arrives by script.
 pub fn looks_unrendered(html: &str) -> bool {
     is_challenge(html) || html.len() < 2048
+}
+
+/// Whether a body is a bot check. Exposed so `fetch_page` can fail loudly
+/// rather than hand an interstitial back as if it were the page.
+pub fn is_challenge_page(html: &str) -> bool {
+    is_challenge(html)
 }
 
 /// Where Chrome lives, if it does. Resolved once at startup: without it the
@@ -183,6 +198,23 @@ mod tests {
                       </script></body></html>";
         assert!(!is_challenge(passed));
         assert!(!looks_unrendered(&format!("{passed}{}", "padding ".repeat(400))));
+    }
+
+    #[test]
+    fn reddits_wall_is_a_challenge_despite_answering_200() {
+        // The exact title www.reddit.com serves to a plain GET (measured
+        // 2026-08-05: HTTP 200, 8.5 KB, no thread content). It used to fall
+        // through as ordinary page text, so the model read it as a page with
+        // nothing on it and opened three more just like it.
+        let wall = "<html><head><title>Reddit - Please wait for verification</title>\
+                    </head><body></body></html>";
+        assert!(is_challenge(wall));
+        assert!(is_challenge_page(wall));
+
+        // A real thread title from the same subreddit must not match.
+        let real = "<html><head><title>Who’s got the CM-15? : teenageengineering\
+                    </title></head><body>comments</body></html>";
+        assert!(!is_challenge(real));
     }
 
     #[test]

@@ -362,6 +362,41 @@ fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
     });
 }
 
+/// Telegram clears the "typing…" indicator about five seconds after the
+/// action is sent, so keeping it lit means resending it.
+const TYPING_REFRESH: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Holds Telegram's "typing…" indicator up for as long as it is alive, and
+/// drops it the moment it goes out of scope.
+///
+/// The progress message covers the parts of a run that produce events. It
+/// cannot cover the parts that produce nothing — a slow page render, or a
+/// model call that stalls — and during those the last edit just sits there,
+/// indistinguishable from a crashed bot. One user watched five minutes of
+/// that. The indicator is the cheapest honest signal available: it says the
+/// process is alive and this run has not been abandoned, without editing a
+/// message or claiming progress that isn't happening.
+struct Typing(tokio::task::JoinHandle<()>);
+
+impl Typing {
+    fn start(bot: Bot, chat_id: ChatId) -> Self {
+        Self(tokio::spawn(async move {
+            loop {
+                // Failures are ignored on purpose: a missing indicator must
+                // never be the reason a reply doesn't arrive.
+                let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+                tokio::time::sleep(TYPING_REFRESH).await;
+            }
+        }))
+    }
+}
+
+impl Drop for Typing {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Fire-and-forget name refresh, so `/stat` has something to print besides
 /// an id. Separate from `log_request` on purpose: running a command should
 /// teach the bot your name without inflating your request count.
@@ -445,7 +480,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         prompt
     };
 
-    let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+    let _typing = Typing::start(bot.clone(), chat_id);
 
     let mut live = Live::new(bot.clone(), chat_id);
     match run_agent(&app, &mut live, user_id, chat_id.0, &prompt).await {
@@ -557,7 +592,9 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     };
     log_request(&app, user_id, "photo");
     note_sender(&app, &msg);
-    let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+    // Download plus a vision call, with no progress message in this path —
+    // the indicator is the only sign anything is happening.
+    let _typing = Typing::start(bot.clone(), chat_id);
 
     let bytes = match download_photo(&bot, photo.file.id.clone()).await {
         Ok(bytes) => bytes,
@@ -634,7 +671,7 @@ async fn handle_reaction(
 
     log_request(&app, user_id, "reaction");
     note_user(&app, user_id, display_name(user));
-    let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+    let _typing = Typing::start(bot.clone(), chat_id);
     let prompt = format!(
         "[system note] The user reacted with a thumbs-up to this earlier reply \
          of yours:\n---\n{text}\n---\nThat means they are considering buying \
@@ -956,6 +993,18 @@ mod tests {
         assert!(!thumbs_up_added(&[thumb()], &[]));
         assert!(!thumbs_up_added(&[], &[heart()]));
         assert!(!thumbs_up_added(&[thumb()], &[thumb(), heart()]));
+    }
+
+    #[test]
+    fn the_typing_indicator_is_refreshed_before_telegram_drops_it() {
+        // Telegram clears the action after about five seconds. Refreshing on
+        // or after that boundary leaves visible gaps, and a gap in the only
+        // liveness signal we have is exactly the thing this replaced.
+        use super::TYPING_REFRESH;
+        assert!(
+            TYPING_REFRESH < std::time::Duration::from_secs(5),
+            "refresh must beat Telegram's ~5s expiry, got {TYPING_REFRESH:?}"
+        );
     }
 
     #[test]

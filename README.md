@@ -82,7 +82,8 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 
 **Behaves itself**
 - Streams progress live — which tool is running and on what — then the answer
-  as it's written, all in one edited message
+  as it's written, all in one edited message, with the typing indicator held
+  up throughout so a slow step never looks like a crash
 - Sessions reset after 10 idle minutes, with an LLM check that restores
   context when you're clearly continuing the same topic
 - Hard caps on searches, page opens and turns per request, so no single
@@ -156,7 +157,7 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 12 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **180 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **181 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness.
 
@@ -191,7 +192,7 @@ Roughly 8,500 lines of Rust across a dozen focused modules.
 ## Development
 
 ```bash
-cargo test                  # 180 tests, no network needed
+cargo test                  # 181 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

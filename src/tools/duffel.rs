@@ -185,6 +185,13 @@ pub struct Leg {
     /// Where the traveller changes plane and for how long, in order. Empty
     /// on a direct flight.
     pub connections: Vec<Connection>,
+    /// The whole leg drawn on one line, for the reply to print unchanged:
+    /// `AMS 20:15 15.09 → ✈ → PVG 3h 20m → ✈ → HKG 20:35 16.09`.
+    ///
+    /// Built here rather than by the model for the same reason the ranking
+    /// is: a model retyping departure times is a model that can get one
+    /// wrong, and a wrong departure time reads exactly like a right one.
+    pub itinerary: String,
 }
 
 /// A change of plane part-way through a leg.
@@ -623,11 +630,20 @@ fn leg(slice: &RawSlice) -> Option<Leg> {
                 .map(|s| s.duration.as_deref().and_then(duration_minutes))
                 .sum()
         });
+    let origin = iata(&first.origin).or_else(|| iata(&slice.origin)).unwrap_or_default();
+    let destination = iata(&last.destination)
+        .or_else(|| iata(&slice.destination))
+        .unwrap_or_default();
+    let connections: Vec<Connection> = slice
+        .segments
+        .windows(2)
+        .map(|pair| connection(&pair[0], &pair[1]))
+        .collect();
+
     Some(Leg {
-        origin: iata(&first.origin).or_else(|| iata(&slice.origin)).unwrap_or_default(),
-        destination: iata(&last.destination)
-            .or_else(|| iata(&slice.destination))
-            .unwrap_or_default(),
+        itinerary: itinerary(&origin, &destination, first, last, &connections),
+        origin,
+        destination,
         departing_at_local: first.departing_at.clone().unwrap_or_default(),
         arriving_at_local: last.arriving_at.clone().unwrap_or_default(),
         duration_minutes,
@@ -648,12 +664,49 @@ fn leg(slice: &RawSlice) -> Option<Leg> {
                 format!("{carrier}{}", s.marketing_carrier_flight_number.clone().unwrap_or_default())
             })
             .collect(),
-        connections: slice
-            .segments
-            .windows(2)
-            .map(|pair| connection(&pair[0], &pair[1]))
-            .collect(),
+        connections,
     })
+}
+
+/// One leg on a single line, ends outward: where you leave from and when,
+/// each change and how long you wait there, where you land and when.
+///
+/// Anything the offer did not state is left out rather than guessed —
+/// half a timestamp invites the reader to assume the other half.
+fn itinerary(
+    origin: &str,
+    destination: &str,
+    first: &RawSegment,
+    last: &RawSegment,
+    connections: &[Connection],
+) -> String {
+    const HOP: &str = " → ✈ → ";
+    let mut parts = vec![stamped(origin, first.departing_at.as_deref())];
+    for stop in connections {
+        // A change of airport shows both, because it is the difference
+        // between a walk to the next gate and a coach across a city.
+        let place = match &stop.departs_from {
+            Some(onward) => format!("{}/{onward}", stop.airport),
+            None => stop.airport.clone(),
+        };
+        parts.push(match &stop.layover {
+            Some(wait) => format!("{place} {wait}"),
+            None => place,
+        });
+    }
+    parts.push(stamped(destination, last.arriving_at.as_deref()));
+    parts.join(HOP)
+}
+
+/// `AMS 20:15 15.09`, or bare `AMS` when there is no usable timestamp.
+fn stamped(airport: &str, at: Option<&str>) -> String {
+    let clock = at
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
+        .map(|t| t.format("%H:%M %d.%m").to_string());
+    match clock {
+        Some(when) => format!("{airport} {when}"),
+        None => airport.to_string(),
+    }
 }
 
 /// The gap between landing on one flight and leaving on the next.
@@ -1044,6 +1097,7 @@ mod tests {
                 stops: 0,
                 flights: vec!["KL1693".into()],
                 connections: Vec::new(),
+                itinerary: "AMS 09:15 14.09 → ✈ → LIS 11:20 14.09".into(),
             }]
         );
     }
@@ -1145,6 +1199,121 @@ mod tests {
         assert_eq!(stop.departing_at_local, "2026-09-16T17:50:00");
         assert_eq!(stop.layover.as_deref(), Some("3h 20m"));
         assert!(!stop.changes_airport);
+    }
+
+    #[test]
+    fn a_leg_draws_itself_as_a_strip_the_reply_can_print_verbatim() {
+        // Built in Rust and copied out unchanged, for the same reason the
+        // ranking is: a model retyping departure times is a model that can
+        // get one wrong.
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_mu", "total_amount": "612.00", "total_currency": "EUR",
+            "owner": {"name": "China Eastern", "iata_code": "MU"},
+            "slices": [{
+                "duration": "PT20H35M",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "HKG"},
+                "segments": [
+                    segment("AMS", "PVG", "2026-09-15T20:15:00", "2026-09-16T14:30:00", "0772", one_bag_each()),
+                    segment("PVG", "HKG", "2026-09-16T17:50:00", "2026-09-16T20:35:00", "0505", one_bag_each())
+                ]
+            }]
+        }]}})
+        .to_string();
+
+        let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
+        assert_eq!(
+            leg.itinerary,
+            "AMS 20:15 15.09 → ✈ → PVG 3h 20m → ✈ → HKG 20:35 16.09"
+        );
+    }
+
+    #[test]
+    fn a_direct_flight_draws_as_a_single_hop() {
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_direct", "total_amount": "184.30", "total_currency": "EUR",
+            "owner": {"name": "KLM", "iata_code": "KL"},
+            "slices": [{
+                "duration": "PT3H5M",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "LIS"},
+                "segments": [segment("AMS", "LIS", "2026-09-14T09:15:00", "2026-09-14T11:20:00", "1693", one_bag_each())]
+            }]
+        }]}})
+        .to_string();
+
+        let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
+        assert_eq!(leg.itinerary, "AMS 09:15 14.09 → ✈ → LIS 11:20 14.09");
+    }
+
+    #[test]
+    fn two_connections_draw_as_two_waits() {
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_et", "total_amount": "604.05", "total_currency": "EUR",
+            "owner": {"name": "Ethiopian Airlines", "iata_code": "ET"},
+            "slices": [{
+                "duration": "PT19H5M",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "CPT"},
+                "segments": [
+                    segment("AMS", "ADD", "2026-10-12T17:55:00", "2026-10-13T01:40:00", "4365", one_bag_each()),
+                    segment("ADD", "JNB", "2026-10-13T08:10:00", "2026-10-13T11:00:00", "0713", one_bag_each()),
+                    segment("JNB", "CPT", "2026-10-13T11:55:00", "2026-10-13T13:00:00", "0845", one_bag_each())
+                ]
+            }]
+        }]}})
+        .to_string();
+
+        let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
+        assert_eq!(
+            leg.itinerary,
+            "AMS 17:55 12.10 → ✈ → ADD 6h 30m → ✈ → JNB 55m → ✈ → CPT 13:00 13.10"
+        );
+    }
+
+    #[test]
+    fn a_strip_shows_both_airports_when_the_connection_moves_you() {
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_split", "total_amount": "200.00", "total_currency": "EUR",
+            "owner": {"name": "Whoever", "iata_code": "ZZ"},
+            "slices": [{
+                "duration": "PT12H",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "DUB"},
+                "segments": [
+                    segment("AMS", "LHR", "2026-09-15T08:00:00", "2026-09-15T09:00:00", "1", one_bag_each()),
+                    segment("LGW", "DUB", "2026-09-15T15:00:00", "2026-09-15T16:30:00", "2", one_bag_each())
+                ]
+            }]
+        }]}})
+        .to_string();
+
+        let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
+        assert!(
+            leg.itinerary.contains("LHR/LGW"),
+            "a change of airport must be visible in the strip, got: {}",
+            leg.itinerary
+        );
+    }
+
+    #[test]
+    fn a_strip_leaves_out_what_the_offer_did_not_state() {
+        // Half a timestamp is worse than none: it invites the reader to
+        // assume the missing half.
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_vague", "total_amount": "200.00", "total_currency": "EUR",
+            "owner": {"name": "Whoever", "iata_code": "ZZ"},
+            "slices": [{
+                "duration": "PT12H",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "HKG"},
+                "segments": [
+                    {"origin": {"iata_code": "AMS"}, "destination": {"iata_code": "PVG"},
+                     "marketing_carrier": {"iata_code": "MU"}, "marketing_carrier_flight_number": "772",
+                     "stops": [], "passengers": [{"baggages": []}]},
+                    segment("PVG", "HKG", "2026-09-16T17:50:00", "2026-09-16T20:35:00", "0505", one_bag_each())
+                ]
+            }]
+        }]}})
+        .to_string();
+
+        let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
+        assert_eq!(leg.itinerary, "AMS → ✈ → PVG → ✈ → HKG 20:35 16.09");
     }
 
     #[test]

@@ -99,7 +99,15 @@ and what matters about the option, then the line. Prices are the whole trip for 
 what its notes say when they matter: a cheapest option that takes hours \
 longer, bags that are not included, offers left out for being in another \
 currency. found: 0 means nothing flies that route that day - say so plainly \
-rather than apologising or guessing at alternatives. A flight price expires \
+rather than apologising or guessing at alternatives. When the traveller says their dates are flexible, or asks whether \
+another day is cheaper, pass flex_days (max 3) instead of searching each \
+date yourself: it prices the whole window in one call and returns by_date, \
+the cheapest fare per day. Present that as a short list, cheapest day \
+marked, and say which days were covered - the route field ends in ±N. Do \
+NOT ask for flex_days on an ordinary search: each day in the window is a \
+separate paid search. Nobody can price a whole month; if that is what is \
+wanted, say a week either side is the most that can be checked and pick the \
+part that matters. A flight price expires \
 within minutes, so never repeat one from earlier in the conversation; search \
 again. Scout cannot book flights either: give the numbers and let the user \
 buy from the airline.

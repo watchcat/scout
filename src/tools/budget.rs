@@ -55,8 +55,10 @@ impl Default for SearchBudget {
 /// Duffel searches allowed per user request. Every one is billed — with no
 /// bookings the 1500-per-order allowance is zero — and a model comparing
 /// dates will happily ask for a dozen. Enough for a return plus a few
-/// nearby days, and a ceiling on a loop that has lost its way.
-pub const FLIGHT_SEARCHES_PER_REQUEST: usize = 6;
+/// nearby days, and a ceiling on a loop that has lost its way. Eight
+/// because a ±3 day flexible search is seven, and leaving no headroom
+/// would make the commonest flexible question spend the whole allowance.
+pub const FLIGHT_SEARCHES_PER_REQUEST: usize = 8;
 
 /// A per-request allowance of Duffel searches, plus a memo of what each one
 /// returned.

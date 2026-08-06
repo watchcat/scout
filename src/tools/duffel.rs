@@ -55,30 +55,36 @@ impl rig::tool::Tool for FlightSearchTool {
                 "return_date": {"type": "string", "description": "YYYY-MM-DD; omit for a one-way"},
                 "adults": {"type": "integer", "description": "adult passengers, default 1"},
                 "cabin_class": {"type": "string", "enum": CABIN_CLASSES},
-                "max_connections": {"type": "integer", "description": "0 for direct flights only, up to 2"}
+                "max_connections": {"type": "integer", "description": "0 for direct flights only, up to 2"},
+                "flex_days": {"type": "integer", "description": "also price this many days either side of departure_date, max 3. Each day is a separate paid search, so ask for it only when the traveller says their dates are flexible. Returns by_date: the cheapest fare per day."}
             },
             "required": ["origin", "destination", "departure_date"]
         })
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // Checked before anything is bought, so a bad query costs nothing
-        // and an already-answered one costs nothing twice.
+        // Checked before anything is bought, so a bad query costs nothing.
         args.validate()?;
-        let key = args.cache_key();
 
-        // A route this request has already paid for. Served whatever the
-        // budget says: the allowance limits what is bought, not what is
-        // already known.
-        if let Some(flights) = self.budget.recall(&key) {
-            tracing::info!(
-                route = %key,
-                bought = self.budget.spent(),
-                "flight search served from this request's memo, not bought again"
-            );
-            return Ok(FlightSearchOutput::new(&args, rank(flights)));
+        // One day, or one per day of a flexible window. Nearest the
+        // requested date first, so a short allowance costs the far edge
+        // rather than the day that was actually asked for.
+        let window = args.window()?;
+        let flexible = window.len() > 1;
+
+        let mut affordable = Vec::new();
+        let mut unaffordable = Vec::new();
+        for day in window {
+            let key = day.cache_key();
+            // The allowance limits what is bought, not what is already
+            // known — a day this request has paid for is always served.
+            if self.budget.recall(&key).is_some() || self.budget.claim_one() {
+                affordable.push((key, day));
+            } else {
+                unaffordable.push(day.departure_date.clone());
+            }
         }
-        if !self.budget.claim_one() {
+        if affordable.is_empty() {
             return Err(DuffelError::Invalid(format!(
                 "this request has already used its {} flight searches — answer now with the \
                  routes you have already looked up rather than searching another",
@@ -86,18 +92,76 @@ impl rig::tool::Tool for FlightSearchTool {
             )));
         }
 
-        let found = self.client.search(&args).await;
-        // Counted whenever the request actually left the machine. A search
-        // Duffel then refused is assumed billable: understating the bill is
-        // the worse of the two errors.
-        self.note_search().await;
-        let flights = found?;
-        self.budget.remember(key, flights.clone());
-        Ok(FlightSearchOutput::new(&args, rank(flights)))
+        // Run together: seven sequential searches would be half a minute of
+        // silence, and Duffel's rate limit is far above this.
+        let searched = futures::future::join_all(
+            affordable.into_iter().map(|(key, day)| self.one_day(key, day)),
+        )
+        .await;
+
+        let mut all = Vec::new();
+        let mut by_date = Vec::new();
+        let mut failures = Vec::new();
+        for (day, result) in searched {
+            match result {
+                Ok(flights) => {
+                    by_date.push(DayPrice::new(&day.departure_date, &flights));
+                    all.extend(flights);
+                }
+                // One bad day must not sink a whole window; a single-date
+                // search still surfaces its error as before.
+                Err(e) if flexible => failures.push(format!("{} ({e})", day.departure_date)),
+                Err(e) => return Err(e),
+            }
+        }
+        by_date.sort_by(|a, b| a.date.cmp(&b.date));
+
+        let mut out = FlightSearchOutput::new(&args, rank(all));
+        if flexible {
+            out.by_date = by_date;
+            if !unaffordable.is_empty() {
+                unaffordable.sort();
+                out.notes.push(format!(
+                    "this request could not afford to check {} — only the days listed were \
+                     searched, so say which window the answer covers",
+                    unaffordable.join(", ")
+                ));
+            }
+            if !failures.is_empty() {
+                out.notes.push(format!("no prices came back for {}", failures.join(", ")));
+            }
+        }
+        Ok(out)
     }
 }
 
 impl FlightSearchTool {
+    /// One day of the window: from this request's memo if it is there,
+    /// otherwise bought from Duffel and remembered.
+    async fn one_day(
+        &self,
+        key: String,
+        day: FlightQuery,
+    ) -> (FlightQuery, Result<Vec<Flight>, DuffelError>) {
+        if let Some(flights) = self.budget.recall(&key) {
+            tracing::info!(
+                route = %key,
+                bought = self.budget.spent(),
+                "flight search served from this request's memo, not bought again"
+            );
+            return (day, Ok(flights));
+        }
+        let found = self.client.search(&day).await;
+        // Counted whenever the request actually left the machine. A search
+        // Duffel then refused is assumed billable: understating the bill is
+        // the worse of the two errors.
+        self.note_search().await;
+        if let Ok(flights) = &found {
+            self.budget.remember(key, flights.clone());
+        }
+        (day, found)
+    }
+
     /// Records one billable search. A failure here is logged and swallowed:
     /// the search has already been paid for, and losing the answer as well
     /// would make a bookkeeping problem into a user-facing one.
@@ -366,6 +430,10 @@ const DUFFEL_VERSION: &str = "v2";
 const MAX_ADULTS: u32 = 9;
 /// The only values Duffel accepts; anything else is a 422.
 const CABIN_CLASSES: [&str; 4] = ["economy", "premium_economy", "business", "first"];
+/// Widest flexible window. Duffel prices one day per search, so ±3 is
+/// already seven of them; a month would be thirty, which is what the big
+/// sites answer from a cache of indicative fares rather than live offers.
+pub const MAX_FLEX_DAYS: u8 = 3;
 
 /// What the model asks for. IATA codes because that is what Duffel takes —
 /// resolving "Lisbon" to LIS is the model's job, and getting it wrong is
@@ -384,6 +452,11 @@ pub struct FlightQuery {
     pub cabin_class: Option<String>,
     #[serde(default)]
     pub max_connections: Option<u8>,
+    /// Also search this many days either side of `departure_date`. Duffel
+    /// has no calendar endpoint, so a window costs one search per day —
+    /// `Some(3)` is seven searches. Capped at [`MAX_FLEX_DAYS`].
+    #[serde(default)]
+    pub flex_days: Option<u8>,
 }
 
 impl FlightQuery {
@@ -435,7 +508,52 @@ impl FlightQuery {
                 )));
             }
         }
+        if let Some(flex) = self.flex_days {
+            if flex > MAX_FLEX_DAYS {
+                return Err(DuffelError::Invalid(format!(
+                    "flex_days must be at most {MAX_FLEX_DAYS}, got {flex} — each extra day is \
+                     a separate paid search, so a wider window is not available; search the \
+                     dates that matter most"
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// One query per day of the window, nearest the requested date first.
+    ///
+    /// The order is the priority order: if the allowance runs out part way,
+    /// what is lost is the far edge of the window rather than the day the
+    /// traveller actually named.
+    fn window(&self) -> Result<Vec<FlightQuery>, DuffelError> {
+        let flex = i64::from(self.flex_days.unwrap_or(0));
+        let parse = |label: &str, s: &str| {
+            chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                .map_err(|_| DuffelError::Invalid(format!("{label} is not a real date: {s:?}")))
+        };
+        let out_date = parse("departure_date", &self.departure_date)?;
+        let back_date = self.return_date.as_deref().map(|d| parse("return_date", d)).transpose()?;
+
+        // 0, -1, +1, -2, +2 … so the requested day is always bought first.
+        let offsets = std::iter::once(0)
+            .chain((1..=flex).flat_map(|n| [-n, n]))
+            .collect::<Vec<i64>>();
+
+        Ok(offsets
+            .into_iter()
+            .map(|offset| {
+                let shift = chrono::Duration::days(offset);
+                FlightQuery {
+                    departure_date: (out_date + shift).format("%Y-%m-%d").to_string(),
+                    // The return moves with the outbound, so a week away
+                    // stays a week away — and the window stays seven
+                    // searches instead of forty-nine.
+                    return_date: back_date.map(|d| (d + shift).format("%Y-%m-%d").to_string()),
+                    flex_days: None,
+                    ..self.clone()
+                }
+            })
+            .collect())
     }
 
     /// Identity of this search for the per-request memo. Normalised so the
@@ -571,7 +689,36 @@ pub struct FlightSearchOutput {
     pub cheapest: Option<Flight>,
     pub fastest: Option<Flight>,
     pub rows: Vec<Flight>,
+    /// Cheapest per day across a flexible window, in date order. Empty for
+    /// an ordinary single-date search.
+    pub by_date: Vec<DayPrice>,
     pub notes: Vec<String>,
+}
+
+/// What one day of a flexible window cost. `cheapest` is `None` when
+/// nothing flew that day — which is an answer, not a gap.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct DayPrice {
+    pub date: String,
+    pub cheapest: Option<f64>,
+    pub currency: Option<String>,
+    pub airline: Option<String>,
+    pub found: usize,
+}
+
+impl DayPrice {
+    fn new(date: &str, flights: &[Flight]) -> Self {
+        let cheapest = flights
+            .iter()
+            .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+        Self {
+            date: date.to_string(),
+            cheapest: cheapest.map(|f| f.price),
+            currency: cheapest.map(|f| f.currency.clone()),
+            airline: cheapest.map(|f| f.airline.clone()),
+            found: flights.len(),
+        }
+    }
 }
 
 impl FlightSearchOutput {
@@ -585,6 +732,11 @@ impl FlightSearchOutput {
         if let Some(back) = &query.return_date {
             route.push_str(&format!(", back {}", back.trim()));
         }
+        // The window is part of what was asked, so it belongs in the label
+        // the reply quotes — otherwise a range reads as a single date.
+        if let Some(flex) = query.flex_days.filter(|f| *f > 0) {
+            route.push_str(&format!(" ±{flex}"));
+        }
 
         match ranked {
             Some(r) => Self {
@@ -594,6 +746,7 @@ impl FlightSearchOutput {
                 cheapest: Some(r.cheapest),
                 fastest: r.fastest,
                 rows: r.rows,
+                by_date: Vec::new(),
                 notes: r.notes,
             },
             None => Self {
@@ -608,6 +761,7 @@ impl FlightSearchOutput {
                 cheapest: None,
                 fastest: None,
                 rows: Vec::new(),
+                by_date: Vec::new(),
             },
         }
     }
@@ -1534,6 +1688,7 @@ mod tests {
             adults: None,
             cabin_class: None,
             max_connections: None,
+            flex_days: None,
         }
     }
 
@@ -1656,6 +1811,7 @@ mod client_tests {
             adults: None,
             cabin_class: None,
             max_connections: None,
+            flex_days: None,
         }
     }
 
@@ -1758,6 +1914,203 @@ mod client_tests {
             .get(&7)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Matches a search whose outbound date is `date`.
+    fn body_json_departure(date: &'static str) -> impl wiremock::Match {
+        move |req: &wiremock::Request| {
+            serde_json::from_slice::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|b| b["data"]["slices"][0]["departure_date"].as_str().map(String::from))
+                .is_some_and(|d| d == date)
+        }
+    }
+
+    /// The dates every request in `server`'s log asked for, in the order the
+    /// bodies were received.
+    async fn dates_asked_for(server: &MockServer) -> Vec<(String, Option<String>)> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                let slices = body["data"]["slices"].as_array().unwrap().clone();
+                (
+                    slices[0]["departure_date"].as_str().unwrap().to_string(),
+                    slices.get(1).map(|s| s["departure_date"].as_str().unwrap().to_string()),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_flexible_search_covers_the_whole_window_one_day_at_a_time() {
+        // Duffel has no calendar endpoint — a range is N searches. Seven is
+        // what +/-3 days costs, which is why the per-request cap is eight.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .expect(7)
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        let mut flexible = query();
+        flexible.flex_days = Some(3);
+        let out = rig::tool::Tool::call(&tool, flexible).await.unwrap();
+
+        let mut asked: Vec<String> = dates_asked_for(&server).await.into_iter().map(|(d, _)| d).collect();
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec![
+                "2026-09-11", "2026-09-12", "2026-09-13", "2026-09-14",
+                "2026-09-15", "2026-09-16", "2026-09-17"
+            ]
+        );
+        // Reported back in date order, whatever order they came home in.
+        assert_eq!(
+            out.by_date.iter().map(|d| d.date.as_str()).collect::<Vec<_>>(),
+            vec![
+                "2026-09-11", "2026-09-12", "2026-09-13", "2026-09-14",
+                "2026-09-15", "2026-09-16", "2026-09-17"
+            ]
+        );
+        assert!(out.route.contains("±3"), "the window belongs in the route: {}", out.route);
+    }
+
+    #[tokio::test]
+    async fn a_flexible_return_trip_shifts_both_dates_and_keeps_its_length() {
+        // Someone asking for a week away wants the same week moved, not a
+        // ten-day trip — and flexing both ends independently would be 49
+        // searches instead of 7.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        let mut flexible = query();
+        flexible.return_date = Some("2026-09-21".to_string());
+        flexible.flex_days = Some(1);
+        rig::tool::Tool::call(&tool, flexible).await.unwrap();
+
+        let mut pairs = dates_asked_for(&server).await;
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("2026-09-13".to_string(), Some("2026-09-20".to_string())),
+                ("2026-09-14".to_string(), Some("2026-09-21".to_string())),
+                ("2026-09-15".to_string(), Some("2026-09-22".to_string())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cheapest_is_the_cheapest_of_any_day_in_the_window() {
+        let server = MockServer::start().await;
+        let offer = |id: &str, amount: &str| {
+            json!({"data": {"offers": [{
+                "id": id, "total_amount": amount, "total_currency": "EUR",
+                "owner": {"name": "KLM"}, "slices": []
+            }]}})
+        };
+        // The requested day is dear; the day before is not.
+        Mock::given(method("POST"))
+            .and(body_json_departure("2026-09-14"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(offer("dear", "300.00")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_json_departure("2026-09-13"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(offer("cheap", "180.00")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        let mut flexible = query();
+        flexible.flex_days = Some(1);
+        let out = rig::tool::Tool::call(&tool, flexible).await.unwrap();
+
+        assert_eq!(out.cheapest.unwrap().offer_id, "cheap");
+        let day = |d: &str| out.by_date.iter().find(|x| x.date == d).unwrap().cheapest;
+        assert_eq!(day("2026-09-13"), Some(180.00));
+        assert_eq!(day("2026-09-14"), Some(300.00));
+        assert_eq!(day("2026-09-15"), None, "a day with nothing says so");
+    }
+
+    #[tokio::test]
+    async fn a_window_wider_than_the_allowance_keeps_the_days_nearest_the_one_asked_for() {
+        // Losing the far edges of the window beats losing the date the
+        // traveller actually named.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        // Spend all but three of the allowance on unrelated routes. Real
+        // codes: a made-up one with a digit is rejected before it costs
+        // anything, which is the whole point of validating first.
+        let elsewhere = ["OPO", "MAD", "BCN", "FCO", "ATH", "VIE", "PRG"];
+        for code in &elsewhere[..crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST - 3] {
+            let mut q = query();
+            q.destination = code.to_string();
+            rig::tool::Tool::call(&tool, q).await.unwrap();
+        }
+        assert_eq!(tool.budget.spent(), crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST - 3);
+
+        let mut flexible = query();
+        flexible.flex_days = Some(3);
+        let out = rig::tool::Tool::call(&tool, flexible).await.unwrap();
+
+        let covered: Vec<&str> = out.by_date.iter().map(|d| d.date.as_str()).collect();
+        assert_eq!(covered, vec!["2026-09-13", "2026-09-14", "2026-09-15"]);
+        assert!(
+            out.notes.iter().any(|n| n.contains("2026-09-11") || n.contains("could not")),
+            "the days it could not check must be named, got: {:?}",
+            out.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn a_window_wider_than_three_days_is_refused_before_anything_is_bought() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        let mut wide = query();
+        wide.flex_days = Some(15);
+        let err = rig::tool::Tool::call(&tool, wide).await.unwrap_err().to_string();
+        assert!(err.contains('3'), "the limit should be stated, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn without_flex_days_nothing_changes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        let out = rig::tool::Tool::call(&tool, query()).await.unwrap();
+        assert!(out.by_date.is_empty(), "a single-date search has no calendar");
+        assert_eq!(out.route, "AMS-LIS 2026-09-14");
     }
 
     #[tokio::test]
@@ -1953,6 +2306,7 @@ mod output_tests {
             adults: None,
             cabin_class: None,
             max_connections: None,
+            flex_days: None,
         }
     }
 
@@ -2034,7 +2388,35 @@ mod live {
             adults: None,
             cabin_class: None,
             max_connections: None,
+            flex_days: std::env::var("SCOUT_PROBE_FLEX").ok().and_then(|f| f.parse().ok()),
         };
+
+        // A flexible window is a fan-out over days, so it is exercised
+        // through the tool rather than the single-date client call.
+        if query.flex_days.is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let tool = FlightSearchTool {
+                client: client.clone(),
+                store: crate::store::Store::open(dir.path().join("probe.duckdb")).unwrap(),
+                user_id: 1,
+                budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+            };
+            let out = rig::tool::Tool::call(&tool, query).await.unwrap();
+            println!("LIVE route={} bought={}", out.route, tool.budget.spent());
+            for day in &out.by_date {
+                println!(
+                    "  {} {:>8} {} ({} offers) {}",
+                    day.date,
+                    day.cheapest.map(|p| format!("{p:.2}")).unwrap_or_else(|| "-".into()),
+                    day.currency.clone().unwrap_or_default(),
+                    day.found,
+                    day.airline.clone().unwrap_or_default(),
+                );
+            }
+            assert_eq!(out.by_date.len(), 7, "a ±3 window is seven days");
+            assert!(out.by_date.iter().any(|d| d.cheapest.is_some()));
+            return;
+        }
 
         let flights = client.search(&query).await.unwrap();
         println!("LIVE offers={}", flights.len());

@@ -306,9 +306,12 @@ pub enum DuffelError {
     Invalid(String),
 }
 
-/// At most this many options in a reply; Duffel routinely returns dozens of
-/// near-identical offers and a chat cannot show them.
-const ROW_CAP: usize = 5;
+/// At most this many options in a reply. One search comes back with
+/// hundreds — 1,416 on a measured AMS-HKG return — and Duffel bills for the
+/// search, not the offers, so showing more costs nothing at their end and
+/// about a tenth of a cent in tokens. Seven is set by what stays readable
+/// on a phone once each option carries an itinerary line, not by price.
+const ROW_CAP: usize = 7;
 /// A cheaper flight that costs this much extra time is worth pointing out
 /// rather than presenting as simply "the cheapest".
 const MUCH_SLOWER_MINUTES: u32 = 180;

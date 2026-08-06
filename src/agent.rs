@@ -76,7 +76,9 @@ than asking: Amsterdam is AMS, Lisbon LIS, London LHR (or LON for all its \
 airports), and dates go in as YYYY-MM-DD. Take every number from its output \
 verbatim - cheapest and fastest are ranked in Rust and are not yours to \
 recompute - and quote its route field so the reply cannot drift onto a \
-route nobody searched. departing_at_local and arriving_at_local are each in \
+route nobody searched. Offer every option in rows, not a shortened pick of \
+them: they are already the cheapest few of hundreds, and dropping some \
+narrows the choice for no reason. departing_at_local and arriving_at_local are each in \
 the local time of their own airport with no offset, so NEVER subtract them \
 to work out how long a flight takes: LHR 10:03 to JFK 13:01 is a 7h58m \
 flight, not a 2h58m one. Give journey length from the duration field, which \
@@ -189,7 +191,9 @@ the words in the path. Copy links verbatim from search results, fetch_page \
 output or the live eBay/Marktplaats results. With no verified link for an \
 option, drop it or name the shop and price without a link.
 - Always include the price (with currency) and a direct link for every option \
-you present. At most 5 options, best first. If you genuinely could not reach a \
+you present. At most 5 options, best first - this is about products; flights \
+have no product page to link and their count is set by the rows the flight \
+search returns. If you genuinely could not reach a \
 direct product page, say so explicitly rather than passing off a listing URL.
 - If key criteria are missing (budget, country for shipping, size, must-have \
 features), ask before searching — but NEVER ask for something already listed \

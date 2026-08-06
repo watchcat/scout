@@ -135,6 +135,56 @@ impl rig::tool::Tool for FlightSearchTool {
     }
 }
 
+/// Hands the traveller a Duffel-hosted checkout. Registered alongside
+/// `search_flights` whenever flights are configured.
+pub struct BookingLinkTool {
+    pub client: DuffelClient,
+    pub user_id: i64,
+    /// Where Duffel sends the traveller when they are done — the bot's own
+    /// Telegram address, so they land back in the conversation.
+    pub return_url: String,
+}
+
+impl rig::tool::Tool for BookingLinkTool {
+    const NAME: &'static str = "create_booking_link";
+    type Error = DuffelError;
+    type Args = serde_json::Value;
+    type Output = BookingLink;
+
+    fn description(&self) -> String {
+        "Give the user a link to book a flight. Call this ONLY when they say \
+         they want to book, never as part of showing prices. The link opens \
+         Duffel's own checkout, where they search, pick their flight and pay \
+         — Scout never handles passenger details or card details. The link \
+         is single-use and expires, so ask for a fresh one each time rather \
+         than repeating an old one. It does not carry the flight already \
+         found: tell the user the route, date and price to re-enter, because \
+         the checkout starts at its own search box."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+        Ok(BookingLink {
+            url: self.client.booking_link(self.user_id, &self.return_url).await?,
+            expires_in: "24 hours if unopened, 20 minutes once opened",
+            note: "the checkout opens on its own search box — it cannot be \
+                   pre-filled, so repeat the route, date and price for the \
+                   user to enter",
+        })
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BookingLink {
+    pub url: String,
+    pub expires_in: &'static str,
+    pub note: &'static str,
+}
+
 impl FlightSearchTool {
     /// One day of the window: from this request's memo if it is there,
     /// otherwise bought from Duffel and remembered.
@@ -611,11 +661,72 @@ pub struct DuffelClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
+    /// Booking fee as a rate (0.03 = 3%). Applied to quoted prices *and*
+    /// sent to Duffel Links, so what Scout says and what the checkout
+    /// charges are the same number by construction. Zero means none.
+    markup_rate: f64,
 }
 
 impl DuffelClient {
     pub fn new(http: reqwest::Client, api_key: String, base_url: String) -> Self {
-        Self { http, api_key, base_url }
+        Self { http, api_key, base_url, markup_rate: 0.0 }
+    }
+
+    pub fn with_markup(mut self, rate: f64) -> Self {
+        self.markup_rate = rate.max(0.0);
+        self
+    }
+
+    pub fn markup_rate(&self) -> f64 {
+        self.markup_rate
+    }
+
+    /// A Duffel-hosted checkout for one traveller.
+    ///
+    /// Single-use and short-lived: unused sessions die after 24 hours, and
+    /// a used one after 20 minutes. So this is called when someone asks to
+    /// book, never in advance.
+    pub async fn booking_link(&self, user_id: i64, return_url: &str) -> Result<String, DuffelError> {
+        let mut data = serde_json::json!({
+            // Comes back on the order, so a booking can be traced to
+            // whoever asked for the link.
+            "reference": user_id.to_string(),
+            "success_url": return_url,
+            "failure_url": return_url,
+            "abandonment_url": return_url,
+            "flights": {"enabled": true},
+            // Scout knows nothing about hotels and should not sell them.
+            "stays": {"enabled": false},
+        });
+        if self.markup_rate > 0.0 {
+            // A rate the operator never configured must not be sent as an
+            // explicit zero.
+            data["markup_rate"] = serde_json::json!(format!("{:.2}", self.markup_rate));
+        }
+
+        let resp = self
+            .http
+            .post(format!("{}/links/sessions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .header("Duffel-Version", DUFFEL_VERSION)
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({"data": data}))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(DuffelError::Api {
+                status: status.as_u16(),
+                body: text.chars().take(300).collect(),
+            });
+        }
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["data"]["url"].as_str().map(String::from))
+            .ok_or_else(|| DuffelError::Decode {
+                detail: format!("no session url in: {}", text.chars().take(200).collect::<String>()),
+            })
     }
 
     pub async fn search(&self, query: &FlightQuery) -> Result<Vec<Flight>, DuffelError> {
@@ -642,8 +753,24 @@ impl DuffelClient {
                 body: text.chars().take(300).collect(),
             });
         }
-        parse_offers(&text)
+        let mut flights = parse_offers(&text)?;
+        // Quoted with the fee already on, because Duffel Links will charge
+        // it: saying 600 and billing 618 is exactly the gap this project
+        // exists to close. A uniform rate cannot reorder the set, so the
+        // ranking means the same thing either way.
+        if self.markup_rate > 0.0 {
+            for flight in &mut flights {
+                flight.price = round_money(flight.price * (1.0 + self.markup_rate));
+            }
+        }
+        Ok(flights)
     }
+}
+
+/// Money, to the cent. A markup multiplication otherwise produces prices
+/// like 205.99999999999997.
+fn round_money(amount: f64) -> f64 {
+    (amount * 100.0).round() / 100.0
 }
 
 /// Duffel takes IATA codes only, so "Amsterdam" is a 422 and a wasted search
@@ -2364,6 +2491,120 @@ mod output_tests {
         let out = FlightSearchOutput::new(&query(), rank(many));
         assert_eq!(out.found, 8);
         assert_eq!(out.rows.len(), ROW_CAP);
+    }
+}
+
+#[cfg(test)]
+mod links_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn client(server: &MockServer, markup: f64) -> DuffelClient {
+        DuffelClient::new(reqwest::Client::new(), "k".to_string(), server.uri()).with_markup(markup)
+    }
+
+    #[tokio::test]
+    async fn a_booking_session_carries_the_markup_and_the_way_back_to_the_chat() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/links/sessions"))
+            .and(header("Duffel-Version", DUFFEL_VERSION))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "data": {"url": "https://links.duffel.com/s/abc123"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = client(&server, 0.03)
+            .booking_link(42, "https://t.me/scoutbot")
+            .await
+            .unwrap();
+        assert_eq!(url, "https://links.duffel.com/s/abc123");
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        let data = &body["data"];
+        // The markup is the whole point: it is what a booking earns.
+        assert_eq!(data["markup_rate"], "0.03");
+        // Reference ties an order back to whoever asked for it.
+        assert_eq!(data["reference"], "42");
+        for key in ["success_url", "failure_url", "abandonment_url"] {
+            assert_eq!(data[key], "https://t.me/scoutbot", "{key} should return to the chat");
+        }
+        // Flights only — Scout knows nothing about hotels.
+        assert_eq!(data["flights"]["enabled"], true);
+        assert_eq!(data["stays"]["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn without_a_configured_markup_none_is_sent() {
+        // Absent is not the same as zero: a markup field the operator never
+        // set should not appear in the request at all.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/links/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "data": {"url": "https://links.duffel.com/s/x"}
+            })))
+            .mount(&server)
+            .await;
+
+        client(&server, 0.0).booking_link(1, "https://t.me/b").await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(body["data"].get("markup_rate").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_session_surfaces_its_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("not enabled"))
+            .mount(&server)
+            .await;
+        let err = client(&server, 0.0).booking_link(1, "https://t.me/b").await.unwrap_err();
+        assert!(matches!(err, DuffelError::Api { status: 403, .. }), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn quoted_prices_already_include_the_markup_the_traveller_will_pay() {
+        // Otherwise Scout says 600 and the checkout says 618, which is
+        // exactly the kind of gap this whole project exists to close.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": [
+                {"id": "a", "total_amount": "100.00", "total_currency": "EUR",
+                 "owner": {"name": "KLM"}, "slices": []},
+                {"id": "b", "total_amount": "200.00", "total_currency": "EUR",
+                 "owner": {"name": "TAP"}, "slices": []}
+            ]}})))
+            .mount(&server)
+            .await;
+
+        let flights = client(&server, 0.03).search(&query()).await.unwrap();
+        assert_eq!(flights[0].price, 103.00);
+        assert_eq!(flights[1].price, 206.00);
+        // A uniform rate cannot reorder anything, so the ranking is
+        // untouched by whatever the operator charges.
+        let ranked = rank(flights).unwrap();
+        assert_eq!(ranked.cheapest.offer_id, "a");
+    }
+
+    fn query() -> FlightQuery {
+        FlightQuery {
+            origin: "AMS".to_string(),
+            destination: "LIS".to_string(),
+            departure_date: "2026-09-14".to_string(),
+            return_date: None,
+            adults: None,
+            cabin_class: None,
+            max_connections: None,
+            flex_days: None,
+        }
     }
 }
 

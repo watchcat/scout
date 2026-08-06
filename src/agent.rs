@@ -109,8 +109,19 @@ separate paid search. Nobody can price a whole month; if that is what is \
 wanted, say a week either side is the most that can be checked and pick the \
 part that matters. A flight price expires \
 within minutes, so never repeat one from earlier in the conversation; search \
-again. Scout cannot book flights either: give the numbers and let the user \
-buy from the airline.
+again. When create_booking_link is available and the user says they want to \
+book, call it and give them the link on its own line. Say plainly what it \
+is: Duffel's own checkout, where they pick the flight and pay; Scout never \
+sees passenger or card details. It CANNOT be pre-filled - it opens on its \
+own search box - so repeat the route, date and price for them to enter, and \
+say the link is single-use and short-lived. Never re-send an old one; ask \
+for a fresh link each time. Without that tool, Scout cannot book at all: \
+give the numbers and let the user buy from the airline.
+- If a booking fee is listed below, every flight price you are given \
+ALREADY includes it, and it is what the checkout will charge - quote the \
+numbers unchanged. Say once, in plain words, that prices include that \
+booking fee. Never hide it, never add it on yourself, and never quote a \
+price without it.
 - Some users list favourite shops below, each with the kind of product it \
 is for. When what you are searching for falls in that kind - judge it \
 sensibly, a stain remover is a cleaning product - spend one of search_web's \
@@ -241,6 +252,12 @@ pub struct AgentDeps {
     /// Scout never creates an order, so no passenger details or payment
     /// ever pass through it.
     pub duffel: Option<crate::tools::duffel::DuffelClient>,
+    /// Where Duffel Links returns the traveller — the bot's own Telegram
+    /// address, read from `getMe` at startup. `None` disables booking
+    /// links rather than sending people somewhere that is not ours.
+    pub return_url: Option<String>,
+    /// Whether Duffel has enabled Links on this account.
+    pub links_enabled: bool,
     pub marktplaats: MarktplaatsClient,
     pub store: Store,
     pub secondhand_sites: Vec<String>,
@@ -394,7 +411,7 @@ fn capitalize(s: &str) -> String {
 /// The system prompt plus the user's long-term profile. Injecting facts here
 /// (instead of behind a recall tool) means the agent can never forget to
 /// check them.
-pub fn preamble_with_profile(facts: &[(String, String)]) -> String {
+pub fn preamble_with_profile(facts: &[(String, String)], markup_rate: f64) -> String {
     let mut p = PREAMBLE.to_string();
     if !facts.is_empty() {
         p.push_str("\n\nKnown about this user (long-term profile):\n");
@@ -416,7 +433,25 @@ pub fn preamble_with_profile(facts: &[(String, String)]) -> String {
             }
         }
     }
+    // Named here because the flight rules above tell the model that quoted
+    // prices already include it; without the number that instruction has
+    // nothing to point at.
+    if markup_rate > 0.0 {
+        p.push_str(&format!(
+            "\nBooking fee: flight prices you are shown already include a \
+             {} booking fee, which is what the checkout charges.\n",
+            percentage(markup_rate)
+        ));
+    }
     p
+}
+
+/// A rate as a percentage a person would say aloud: 0.03 -> "3%",
+/// 0.035 -> "3.5%". Trailing zeros make it read like a spec, not a fee.
+fn percentage(rate: f64) -> String {
+    let pct = format!("{:.2}", rate * 100.0);
+    let pct = pct.trim_end_matches('0').trim_end_matches('.');
+    format!("{pct}%")
 }
 
 /// Note handed to the wrap-up agent when the turn budget runs out.
@@ -436,9 +471,14 @@ pub fn wrap_up_agent(
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     d.llm
         .agent(MODEL)
-        .preamble(&preamble_with_profile(facts))
+        .preamble(&preamble_with_profile(facts, markup_rate(d)))
         .default_max_turns(1)
         .build()
+}
+
+/// The booking fee in force, or nothing when flights are not configured.
+fn markup_rate(d: &AgentDeps) -> f64 {
+    d.duffel.as_ref().map_or(0.0, |c| c.markup_rate())
 }
 
 /// Built per incoming message: tools capture the requesting user's identity,
@@ -454,7 +494,7 @@ pub fn build_agent(
     let mut builder = d
         .llm
         .agent(MODEL)
-        .preamble(&preamble_with_profile(facts))
+        .preamble(&preamble_with_profile(facts, markup_rate(d)))
         .tool(WebSearchTool {
             kagi: d.kagi.clone(),
             perplexity: d.perplexity.clone(),
@@ -491,6 +531,16 @@ pub fn build_agent(
             // budget above.
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
         });
+        // Offered only when Duffel has enabled Links on the account and
+        // there is somewhere to send people back to. Registering it
+        // otherwise means the model promises a booking it cannot deliver.
+        if let Some(return_url) = d.return_url.as_ref().filter(|_| d.links_enabled) {
+            builder = builder.tool(crate::tools::duffel::BookingLinkTool {
+                client: duffel.clone(),
+                user_id,
+                return_url: return_url.clone(),
+            });
+        }
     }
     builder.default_max_turns(MAX_TURNS).build()
 }
@@ -500,8 +550,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_booking_fee_is_stated_in_the_preamble_when_one_is_charged() {
+        // The rule above tells the model prices "already include it", which
+        // is only actionable if the preamble says what it is.
+        let free = preamble_with_profile(&[], 0.0);
+        assert!(!free.contains("Booking fee"), "no fee, no line");
+
+        let charged = preamble_with_profile(&[], 0.03);
+        assert!(charged.contains("Booking fee"), "got: {charged}");
+        assert!(charged.contains("3%"), "stated as a percentage, got: {charged}");
+    }
+
+    #[test]
     fn profile_is_appended_when_present() {
-        let plain = preamble_with_profile(&[]);
+        let plain = preamble_with_profile(&[], 0.0);
         assert!(plain.starts_with(PREAMBLE));
         // with nothing known, the only search language is English
         assert!(plain.contains("Search languages for this user: English."));
@@ -511,7 +573,7 @@ mod tests {
             ("delivery_country".to_string(), "NL".to_string()),
             ("shoe_size".to_string(), "44".to_string()),
         ];
-        let with = preamble_with_profile(&facts);
+        let with = preamble_with_profile(&facts, 0.0);
         assert!(with.starts_with(PREAMBLE));
         assert!(with.contains("- delivery_country: NL"));
         assert!(with.contains("- shoe_size: 44"));
@@ -590,19 +652,19 @@ mod tests {
         let p = preamble_with_profile(&facts(&[(
             "favourite_shops",
             "123schoon.nl:cleaning products, bol.com",
-        )]));
+        )]), 0.0);
         assert!(p.contains("- 123schoon.nl: cleaning products"), "got: {p}");
         assert!(p.contains("- bol.com: any product"), "got: {p}");
 
         // Nothing listed, nothing said: the rule must not invite a site:
         // query at a shop the user never named.
-        let none = preamble_with_profile(&[]);
+        let none = preamble_with_profile(&[], 0.0);
         assert!(!none.contains("Shops this user wants searched"));
     }
 
     #[test]
     fn profile_block_states_the_search_languages() {
-        let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]));
+        let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]), 0.0);
         assert!(p.contains("Search languages for this user: English, Dutch."), "got: {p}");
     }
 }

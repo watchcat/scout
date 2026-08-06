@@ -85,10 +85,16 @@ async fn main() -> Result<()> {
             key,
             tools::duffel::DUFFEL_API_BASE.to_string(),
         )
+        .with_markup(cfg.duffel_markup_rate)
     });
-    tracing::info!(duffel_api = duffel.is_some(), "flight search (search only)");
+    tracing::info!(
+        duffel_api = duffel.is_some(),
+        markup_rate = cfg.duffel_markup_rate,
+        links = cfg.duffel_links_enabled,
+        "flight search"
+    );
 
-    let deps = AgentDeps {
+    let mut deps = AgentDeps {
         llm,
         kagi,
         renderer,
@@ -100,9 +106,25 @@ async fn main() -> Result<()> {
         marktplaats,
         store: store.clone(),
         secondhand_sites: cfg.secondhand_sites.clone(),
+        // Filled in below, once the bot has told us its username.
+        return_url: None,
+        links_enabled: cfg.duffel_links_enabled,
     };
 
     let telegram = Bot::new(cfg.telegram_bot_token.clone());
+
+    // Duffel Links needs somewhere to send the traveller afterwards, and
+    // the bot's own chat is the only address Scout owns. Asked for at
+    // startup rather than configured, so it cannot drift from the token.
+    let return_url = match teloxide::prelude::Requester::get_me(&telegram).await {
+        Ok(me) => me.username.as_ref().map(|u| format!("https://t.me/{u}")),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the bot's username; booking links disabled");
+            None
+        }
+    };
+    deps.return_url = return_url;
+
     tokio::spawn(scheduler::run(telegram.clone(), store));
 
     let app = Arc::new(bot::App {

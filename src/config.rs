@@ -25,6 +25,14 @@ pub struct Config {
     /// A `duffel_test_`-prefixed key searches Duffel's fake airline and
     /// costs nothing, which is the right key for trying this out.
     pub duffel_api_key: Option<String>,
+    /// Booking fee added to flight prices and passed to Duffel Links, as a
+    /// rate (0.03 = 3%). Applied to what Scout quotes as well, so the price
+    /// shown is the price charged. Absent means no fee.
+    pub duffel_markup_rate: f64,
+    /// Whether Duffel has enabled Links on this account. A fresh account
+    /// answers 403 `unavailable_feature` until they turn it on, so the
+    /// booking tool is only offered when this says it will work.
+    pub duffel_links_enabled: bool,
 }
 
 impl Config {
@@ -72,6 +80,35 @@ impl Config {
             _ => bail!("EBAY_CLIENT_ID and EBAY_CLIENT_SECRET must be set together"),
         };
 
+        // A rate, not a percentage: 0.03 is 3%. Anything at or above 1
+        // would more than double every fare, which is a typo rather than a
+        // pricing decision.
+        let duffel_links_enabled = non_empty("DUFFEL_LINKS_ENABLED")
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        let duffel_markup_rate = match non_empty("DUFFEL_MARKUP_RATE") {
+            Some(raw) => {
+                let rate: f64 = raw
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("DUFFEL_MARKUP_RATE is not a number: {raw:?}"))?;
+                if !(0.0..1.0).contains(&rate) {
+                    bail!(
+                        "DUFFEL_MARKUP_RATE must be a rate between 0 and 1 \
+                         (0.03 means 3%), got {rate}"
+                    );
+                }
+                if rate > 0.0 && !duffel_links_enabled {
+                    bail!(
+                        "DUFFEL_MARKUP_RATE is set but DUFFEL_LINKS_ENABLED is not: without a \
+                         checkout of your own, nobody ever charges that fee, so marking prices \
+                         up would only overstate them"
+                    );
+                }
+                rate
+            }
+            None => 0.0,
+        };
+
         Ok(Self {
             telegram_bot_token: required("TELEGRAM_BOT_TOKEN")?,
             allowed_user_ids,
@@ -86,6 +123,8 @@ impl Config {
             ebay_credentials,
             ebay_marketplace: get("EBAY_MARKETPLACE").unwrap_or_else(|| "EBAY_NL".to_string()),
             duffel_api_key: non_empty("DUFFEL_API_KEY"),
+            duffel_markup_rate,
+            duffel_links_enabled,
         })
     }
 }
@@ -244,6 +283,51 @@ mod tests {
         // Blank is the same as unset, not an empty bearer token.
         env.insert("DUFFEL_API_KEY", "   ");
         assert!(load(&env).unwrap().duffel_api_key.is_none());
+    }
+
+    #[test]
+    fn a_markup_without_a_checkout_to_charge_it_is_refused() {
+        // Duffel Links is off by default — a new account gets 403
+        // unavailable_feature until they enable it. Marking prices up while
+        // everyone still books at the airline would simply overstate every
+        // fare, so the two settings have to travel together.
+        let mut env = base_env();
+        env.insert("DUFFEL_API_KEY", "duffel_live_x");
+        env.insert("DUFFEL_MARKUP_RATE", "0.03");
+        let err = load(&env).unwrap_err().to_string();
+        assert!(err.contains("DUFFEL_LINKS_ENABLED"), "got: {err}");
+
+        env.insert("DUFFEL_LINKS_ENABLED", "true");
+        let cfg = load(&env).unwrap();
+        assert_eq!(cfg.duffel_markup_rate, 0.03);
+        assert!(cfg.duffel_links_enabled);
+
+        // Links without a markup is perfectly reasonable: sell at cost.
+        let mut env = base_env();
+        env.insert("DUFFEL_API_KEY", "duffel_live_x");
+        env.insert("DUFFEL_LINKS_ENABLED", "true");
+        assert_eq!(load(&env).unwrap().duffel_markup_rate, 0.0);
+    }
+
+    #[test]
+    fn the_markup_defaults_to_nothing_and_is_refused_if_it_is_not_a_rate() {
+        assert_eq!(load(&base_env()).unwrap().duffel_markup_rate, 0.0);
+
+        let mut env = base_env();
+        // A markup needs a checkout to charge it; see the test above.
+        env.insert("DUFFEL_LINKS_ENABLED", "true");
+        env.insert("DUFFEL_MARKUP_RATE", "0.03");
+        assert_eq!(load(&env).unwrap().duffel_markup_rate, 0.03);
+
+        // A percentage typed as a percentage would charge 300%.
+        env.insert("DUFFEL_MARKUP_RATE", "3");
+        assert!(load(&env).is_err(), "3 means 300% and is almost certainly a typo for 0.03");
+
+        env.insert("DUFFEL_MARKUP_RATE", "-0.1");
+        assert!(load(&env).is_err());
+
+        env.insert("DUFFEL_MARKUP_RATE", "three percent");
+        assert!(load(&env).is_err());
     }
 
     #[test]

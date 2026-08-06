@@ -155,6 +155,34 @@ pub struct Leg {
     pub stops: u32,
     /// Marketing flight numbers in order, e.g. `["KL1693"]`.
     pub flights: Vec<String>,
+    /// Where the traveller changes plane and for how long, in order. Empty
+    /// on a direct flight.
+    pub connections: Vec<Connection>,
+}
+
+/// A change of plane part-way through a leg.
+///
+/// Without this a two-flight itinerary reads as two flight numbers and a
+/// total, which cannot answer "where do I change and how long have I got?"
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Connection {
+    /// Where the inbound flight lands.
+    pub airport: String,
+    /// Where the onward flight leaves from, when that is a different
+    /// airport; `None` when it is the same one.
+    pub departs_from: Option<String>,
+    /// Landing and next departure, both local to this airport — so unlike
+    /// the times on `Leg`, these two *are* comparable, which is what makes
+    /// `layover_minutes` trustworthy.
+    pub arriving_at_local: String,
+    pub departing_at_local: String,
+    pub layover_minutes: Option<u32>,
+    /// The wait written out ("3h 20m"). `None` means the offer did not
+    /// state both times — never zero, which would read as no wait at all.
+    pub layover: Option<String>,
+    /// True when the onward flight leaves from a different airport. That is
+    /// a coach transfer with your own bags, and no airline protects it.
+    pub changes_airport: bool,
 }
 
 /// One priced offer. `price` is the whole trip for all passengers, as Duffel
@@ -593,7 +621,48 @@ fn leg(slice: &RawSlice) -> Option<Leg> {
                 format!("{carrier}{}", s.marketing_carrier_flight_number.clone().unwrap_or_default())
             })
             .collect(),
+        connections: slice
+            .segments
+            .windows(2)
+            .map(|pair| connection(&pair[0], &pair[1]))
+            .collect(),
     })
+}
+
+/// The gap between landing on one flight and leaving on the next.
+fn connection(inbound: &RawSegment, onward: &RawSegment) -> Connection {
+    let iata = |p: &Option<RawPlace>| p.as_ref().and_then(|p| p.iata_code.clone());
+    let landed_at = iata(&inbound.destination).unwrap_or_default();
+    let leaves_from = iata(&onward.origin).unwrap_or_default();
+    let changes_airport = !leaves_from.is_empty() && leaves_from != landed_at;
+
+    let arriving = inbound.arriving_at.clone().unwrap_or_default();
+    let departing = onward.departing_at.clone().unwrap_or_default();
+    // Both stamps belong to this one airport, so the subtraction is sound
+    // here even though it is meaningless between the ends of a leg. A DST
+    // shift during the wait would move it by an hour; nothing in the
+    // response says which zone this is, so that is left alone.
+    let layover_minutes = minutes_between(&arriving, &departing);
+
+    Connection {
+        airport: landed_at,
+        departs_from: changes_airport.then_some(leaves_from),
+        arriving_at_local: arriving,
+        departing_at_local: departing,
+        layover_minutes,
+        layover: layover_minutes.map(human_duration),
+        changes_airport,
+    }
+}
+
+/// Whole minutes from `from` to `to`, both as Duffel writes them
+/// (`2026-09-16T14:30:00`). `None` unless both parse and time moves
+/// forwards — a backwards gap means the two are not the same clock, and a
+/// negative wait is worse than no answer.
+fn minutes_between(from: &str, to: &str) -> Option<u32> {
+    let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok();
+    let minutes = (parse(to)? - parse(from)?).num_minutes();
+    u32::try_from(minutes).ok()
 }
 
 /// Bags of `kind` included for the whole trip, per passenger.
@@ -947,6 +1016,7 @@ mod tests {
                 duration: Some("3h 5m".into()),
                 stops: 0,
                 flights: vec!["KL1693".into()],
+                connections: Vec::new(),
             }]
         );
     }
@@ -1011,6 +1081,133 @@ mod tests {
         assert_eq!(leg.arriving_at_local, "2026-09-14T12:10:00");
         assert_eq!(leg.stops, 1);
         assert_eq!(leg.flights, vec!["KL1241", "KL1024"]);
+    }
+
+    #[test]
+    fn a_connection_states_its_airport_and_how_long_the_wait_is() {
+        // Reported from a live chat: AMS-HKG on China Eastern came back as
+        // two flight numbers and a total, so the reply could not say where
+        // the change was or how long it lasted, and offered to go and look
+        // it up elsewhere. Duffel sends both segments; the old leg() threw
+        // their airports and times away.
+        //
+        // The layover arithmetic is safe where the journey arithmetic is
+        // not: arrival and next departure are both local to the *same*
+        // airport, so subtracting them is meaningful.
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_mu",
+            "total_amount": "612.00",
+            "total_currency": "EUR",
+            "owner": {"name": "China Eastern", "iata_code": "MU"},
+            "slices": [{
+                "duration": "PT20H35M",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "HKG"},
+                "segments": [
+                    segment("AMS", "PVG", "2026-09-15T20:15:00", "2026-09-16T14:30:00", "0772", one_bag_each()),
+                    segment("PVG", "HKG", "2026-09-16T17:50:00", "2026-09-16T20:35:00", "0505", one_bag_each())
+                ]
+            }]
+        }]}})
+        .to_string();
+
+        let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
+        assert_eq!(leg.connections.len(), 1);
+        let stop = &leg.connections[0];
+        assert_eq!(stop.airport, "PVG");
+        assert_eq!(stop.arriving_at_local, "2026-09-16T14:30:00");
+        assert_eq!(stop.departing_at_local, "2026-09-16T17:50:00");
+        assert_eq!(stop.layover.as_deref(), Some("3h 20m"));
+        assert!(!stop.changes_airport);
+    }
+
+    #[test]
+    fn a_layover_that_runs_past_midnight_is_still_counted_correctly() {
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_night",
+            "total_amount": "300.00",
+            "total_currency": "EUR",
+            "owner": {"name": "Ethiopian Airlines", "iata_code": "ET"},
+            "slices": [{
+                "duration": "PT19H5M",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "CPT"},
+                "segments": [
+                    segment("AMS", "ADD", "2026-10-12T17:55:00", "2026-10-13T01:40:00", "4365", one_bag_each()),
+                    segment("ADD", "CPT", "2026-10-13T08:10:00", "2026-10-13T13:00:00", "0845", one_bag_each())
+                ]
+            }]
+        }]}})
+        .to_string();
+
+        let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
+        assert_eq!(leg.connections[0].layover.as_deref(), Some("6h 30m"));
+    }
+
+    #[test]
+    fn a_connection_that_changes_airport_is_flagged_because_you_carry_your_bags() {
+        // Landing at LHR and leaving from LGW is a coach ride, not a walk
+        // between gates, and no airline protects it.
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_split",
+            "total_amount": "200.00",
+            "total_currency": "EUR",
+            "owner": {"name": "Whoever", "iata_code": "ZZ"},
+            "slices": [{
+                "duration": "PT12H",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "DUB"},
+                "segments": [
+                    segment("AMS", "LHR", "2026-09-15T08:00:00", "2026-09-15T09:00:00", "1", one_bag_each()),
+                    segment("LGW", "DUB", "2026-09-15T15:00:00", "2026-09-15T16:30:00", "2", one_bag_each())
+                ]
+            }]
+        }]}})
+        .to_string();
+
+        let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
+        let stop = &leg.connections[0];
+        assert!(stop.changes_airport);
+        assert_eq!(stop.airport, "LHR");
+        assert_eq!(stop.departs_from.as_deref(), Some("LGW"));
+    }
+
+    #[test]
+    fn a_direct_flight_has_no_connections_at_all() {
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_direct", "total_amount": "184.30", "total_currency": "EUR",
+            "owner": {"name": "KLM", "iata_code": "KL"},
+            "slices": [{
+                "duration": "PT3H5M",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "LIS"},
+                "segments": [segment("AMS", "LIS", "2026-09-14T09:15:00", "2026-09-14T11:20:00", "1693", one_bag_each())]
+            }]
+        }]}})
+        .to_string();
+        assert!(parse_offers(&body).unwrap()[0].legs[0].connections.is_empty());
+    }
+
+    #[test]
+    fn a_connection_with_no_stated_times_has_no_layover_rather_than_a_zero() {
+        // Zero would read as "no wait at all", which is the opposite of
+        // "nobody said".
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_vague", "total_amount": "200.00", "total_currency": "EUR",
+            "owner": {"name": "Whoever", "iata_code": "ZZ"},
+            "slices": [{
+                "duration": "PT12H",
+                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "HKG"},
+                "segments": [
+                    {"origin": {"iata_code": "AMS"}, "destination": {"iata_code": "PVG"},
+                     "marketing_carrier": {"iata_code": "MU"}, "marketing_carrier_flight_number": "772",
+                     "stops": [], "passengers": [{"baggages": []}]},
+                    segment("PVG", "HKG", "2026-09-16T17:50:00", "2026-09-16T20:35:00", "0505", one_bag_each())
+                ]
+            }]
+        }]}})
+        .to_string();
+
+        let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
+        assert_eq!(leg.connections[0].airport, "PVG");
+        assert_eq!(leg.connections[0].layover, None);
+        assert_eq!(leg.connections[0].layover_minutes, None);
     }
 
     #[test]

@@ -80,7 +80,15 @@ route nobody searched. departing_at_local and arriving_at_local are each in \
 the local time of their own airport with no offset, so NEVER subtract them \
 to work out how long a flight takes: LHR 10:03 to JFK 13:01 is a 7h58m \
 flight, not a 2h58m one. Give journey length from the duration field, which \
-is already written out for you. Prices are the whole trip for all passengers. Say \
+is already written out for you. For any flight with a change of plane, name \
+the connection airport and the wait from the connections list - 'changes at \
+PVG, 3h 20m' - because that is what makes one itinerary better than another \
+at the same price; never work a layover out from flight numbers or from your \
+own knowledge of an airline's network. When changes_airport is true, say so \
+loudly: the traveller lands at one airport and departs from another, with \
+their own bags and no protection if the first flight is late. A connection \
+whose layover is null means the offer did not state the times - say that \
+rather than guessing, and do not offer to go and look it up elsewhere. Prices are the whole trip for all passengers. Say \
 what its notes say when they matter: a cheapest option that takes hours \
 longer, bags that are not included, offers left out for being in another \
 currency. found: 0 means nothing flies that route that day - say so plainly \

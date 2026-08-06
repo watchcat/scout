@@ -70,10 +70,25 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   get read the same way as any other page
 - Second-hand search across eBay / Marktplaats / Vinted in parallel, with
   sold and deleted listings filtered out
-- **Flights**, when a Duffel key is set: live fares straight from the
-  airlines with times, stops, flight numbers and included baggage, ranked
-  cheapest-first in Rust. Search only — Scout never books, so no passenger
-  or card details exist to leak
+
+**Flies you places** *(optional — needs a Duffel and/or Ignav key)*
+- Live fares with times, stops, flight numbers and baggage, ranked
+  cheapest-first **in Rust**. Each leg draws itself on one line:
+  `AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09` — copied into the reply
+  verbatim, because a model retyping departure times is a model that can get
+  one wrong
+- Says **where you change and how long you wait**, and shouts when a
+  connection moves you between airports or the trip is two separate tickets
+- `flex_days` prices a **±3 day window** in one call and reports the cheapest
+  fare per day. Measured on AMS–LIS: €101 to €143 across one week
+- **Two providers, merged and labelled.** Duffel sells live bookable offers;
+  Ignav sells fare data that its own docs say to show as *"from $299"*. Every
+  row carries its source and whether the price is bookable, and Rust says so
+  loudly when an approximate fare undercuts one somebody could actually pay
+- **Booking links** open the airline's own page with the flight already
+  selected. The fare is re-checked at that moment, and a price that moved
+  since it was quoted is reported rather than glossed over
+- Scout never takes a payment or a passenger detail — there is nothing to leak
 
 **Remembers things**
 - Purchase history: *"where did I buy this last time?"* — react 👍 to a
@@ -82,7 +97,8 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   Injected into every request so it stops re-asking
 - Reorder reminders for things you buy periodically, delivered in Telegram
 - `/stat` for usage with a text bar chart — your own numbers, or everyone's
-  if you're the admin
+  if you're the admin. Flight searches are counted separately, because
+  those are the ones a provider bills for
 
 **Behaves itself**
 - Streams progress live — which tool is running and on what — then the answer
@@ -91,7 +107,11 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - Sessions reset after 10 idle minutes, with an LLM check that restores
   context when you're clearly continuing the same topic
 - Hard caps on searches, page opens and turns per request, so no single
-  question can run away with your API budget
+  question can run away with your API budget. Asking the same route twice in
+  one request is answered from memory rather than bought twice
+- **Deploys without cutting anyone off.** `scripts/deploy.sh` builds the new
+  image while the old one is still serving, then hands over: the bot stops
+  taking messages and finishes what it is already doing before it exits
 
 ---
 
@@ -131,6 +151,9 @@ compiles from source.
 | `BOL_CLIENT_ID` + `BOL_CLIENT_SECRET` | no | — | bol.com Catalog API; needs an **approved** affiliate account, which bol.com may decline |
 | `BOL_COUNTRY` | no | `NL` | `NL` or `BE` |
 | `DUFFEL_API_KEY` | no | — | flight search. A `duffel_test_` key is free and returns Duffel's fake airline; a live key bills per search |
+| `DUFFEL_MARKUP_RATE` | no | — | booking fee as a rate (`0.03` = 3%). Applied to quoted prices **and** the checkout, so they cannot diverge; refuses to start without `DUFFEL_LINKS_ENABLED` |
+| `DUFFEL_LINKS_ENABLED` | no | `false` | Duffel gates hosted checkout on new accounts — set once they enable it |
+| `IGNAV_API_KEY` | no | — | second flights provider. 1,000 free requests, then $0.002 each. Prices are approximate, not bookable, and labelled as such |
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
 | `SCOUT_CHROME` | no | auto-detected | Chrome/Chromium for the headless fallback |
 | `SCOUT_DB_PATH` | no | `scout.duckdb` | DuckDB file |
@@ -143,14 +166,16 @@ lives in the `scout-data` volume and survives rebuilds.
 ## How it works
 
 ```
-Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 13 tools
+Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 15 tools
                 │                                    │
                 │  streams progress + answer         ├─ search_web        Kagi + Perplexity, merged
                 │  back into one edited message      ├─ search_secondhand eBay / Marktplaats / Vinted
                 │                                    ├─ search_bol        bol.com catalogue *
-                ▼                                    ├─ search_flights    Duffel, live fares *
-        link verification                            ├─ fetch_page        + headless-Chrome fallback
-        (nothing dead ships)                         ├─ compare_prices    deterministic, in Rust
+                ▼                                    ├─ search_flights    Duffel + Ignav, merged *
+        link verification                            ├─ flight_booking_links  airline pages, pre-filled *
+        (nothing dead ships)                         ├─ create_booking_link   Duffel hosted checkout *
+                                                     ├─ fetch_page        + headless-Chrome fallback
+                                                     ├─ compare_prices    deterministic, in Rust
                                                      ├─ query_purchases   ─┐
                                                      ├─ record_purchase    ├─ DuckDB
                                                      ├─ remember_fact      │
@@ -159,16 +184,17 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 13 tools
 
         * registered only when its credentials are set — bol.com needs an
           approved affiliate account, and they do reject applications;
-          Duffel hands out free test keys to anyone
+          Duffel and Ignav both hand out free keys, though Duffel gates
+          hosted checkout until they enable it for you
 ```
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **216 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **274 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness.
 
-Roughly 10,600 lines of Rust across a dozen focused modules.
+Roughly 14,000 lines of Rust across a dozen focused modules.
 
 ---
 
@@ -183,9 +209,15 @@ Roughly 10,600 lines of Rust across a dozen focused modules.
   being an ordinary page found by search and read for its structured data.
 - **Flight prices are quotes, not seats.** A Duffel offer expires minutes
   after it is made, so a fare Scout quoted is a fare that *was* available.
-  It never books, and it never repeats a price from earlier in the
-  conversation — it searches again. Airport codes are the model's job, so a
-  wrong one is a wrong answer rather than a silent one.
+  Ignav's are weaker still — approximate by its own documentation, which is
+  why they are labelled rather than merged in silently. Scout never books, and
+  never repeats a price from earlier in the conversation; it searches again.
+  Airport codes are the model's job, so a wrong one is a wrong answer rather
+  than a silent one.
+- **Nobody can price a whole month.** Neither provider has a calendar
+  endpoint, so a range costs one search per day. ±3 days is the ceiling; the
+  big sites answer month views from caches of indicative fares, which is a
+  different and less honest product.
 - **Not every wall falls.** Headless Chrome clears Cloudflare on some shops and
   not others. When a page can't be verified, Scout says so rather than
   guessing.
@@ -195,19 +227,32 @@ Roughly 10,600 lines of Rust across a dozen focused modules.
 - **Allowlist only.** This is built as a personal/household bot. Conversation
   state, purchase memory and `/stat` are scoped per user — but everyone on
   the allowlist shares one process, one database file and one API budget.
-- **Costs real money.** Kagi bills per query and MiniMax per token. Budgets are
-  capped per request (15 search queries, 5 page opens, 20 model turns) — but
-  it's not free.
+- **Costs real money.** Kagi bills per query, MiniMax per token, and each
+  flight search is billed by whichever provider answered it. Budgets are
+  capped per request (15 search queries, 5 page opens, 8 flight searches,
+  20 model turns) — but it's not free. Measured: a flight question with
+  seven options runs about **1.4 cents** end to end.
 
 ---
 
 ## Development
 
 ```bash
-cargo test                  # 216 tests, no network needed
+cargo test                  # 274 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now
+scripts/deploy.sh           # test, build, drain, hand over
+scripts/deploy.sh --dry-run # show the plan, change nothing
+```
+
+A handful of tests are `#[ignore]`d because they call the real APIs. They are
+how the local-time trap, the USD-instead-of-EUR default and a booking lookup
+that rejects its own market parameter were all found — each after a mocked
+test had happily asserted the opposite:
+
+```bash
+cargo test -- --ignored --nocapture   # needs the relevant keys in .env
 ```
 
 Docker builds use BuildKit cache mounts: a code change rebuilds in **~20s**, a

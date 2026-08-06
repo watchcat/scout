@@ -24,6 +24,10 @@ pub struct FlightSearchTool {
     /// Shared across one user request: caps how many searches it can buy,
     /// and remembers what each one returned so a repeat costs nothing.
     pub budget: std::sync::Arc<crate::tools::budget::FlightBudget>,
+    /// Second provider, when configured. Its fares are approximate rather
+    /// than bookable, so they arrive labelled and the ranking warns when
+    /// one of them undercuts a price somebody could actually pay.
+    pub ignav: Option<crate::tools::ignav::IgnavClient>,
 }
 
 impl rig::tool::Tool for FlightSearchTool {
@@ -211,15 +215,39 @@ impl FlightSearchTool {
             );
             return (day, Ok(flights));
         }
-        let found = self.client.search(&day).await;
-        // Counted whenever the request actually left the machine. A search
-        // Duffel then refused is assumed billable: understating the bill is
-        // the worse of the two errors.
+
+        // Both providers answer the same day at once. They are separate
+        // bills but one search as far as the traveller and the allowance
+        // are concerned.
+        let (duffel, ignav) = match &self.ignav {
+            Some(ignav) => {
+                let (a, b) =
+                    futures::future::join(self.client.search(&day), ignav.search(&day)).await;
+                (a, Some(b))
+            }
+            None => (self.client.search(&day).await, None),
+        };
         self.note_search().await;
-        if let Ok(flights) = &found {
-            self.budget.remember(key, flights.clone());
+
+        let mut flights = match duffel {
+            Ok(flights) => flights,
+            // One provider failing must not lose the other's answer; only
+            // both failing is a failed search.
+            Err(e) if ignav.as_ref().is_some_and(|r| r.is_ok()) => {
+                tracing::warn!(error = %e, "duffel search failed; answering from ignav alone");
+                Vec::new()
+            }
+            Err(e) => return (day, Err(e)),
+        };
+        if let Some(ignav) = ignav {
+            match ignav {
+                Ok(fares) => flights.extend(fares),
+                Err(e) => tracing::warn!(error = %e, "ignav search failed; answering from duffel alone"),
+            }
         }
-        (day, found)
+
+        self.budget.remember(key, flights.clone());
+        (day, Ok(flights))
     }
 
     /// Records one billable search. A failure here is logged and swallowed:
@@ -372,11 +400,52 @@ pub struct Connection {
     pub changes_airport: bool,
 }
 
-/// One priced offer. `price` is the whole trip for all passengers, as Duffel
-/// states it.
+/// Who found this flight. Kept on every row because two providers now
+/// answer the same question with different kinds of number, and a reply has
+/// to be able to say which it is quoting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    Duffel,
+    Ignav,
+}
+
+/// How much a price can be relied on.
+///
+/// The distinction is the whole reason the two providers cannot be treated
+/// alike: a bookable price is one somebody can pay right now, an
+/// approximate one is a claim about a price somewhere else. Ignav's own
+/// docs say to show theirs as "from $299" and send the traveller to a page
+/// where they see the real number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceStatus {
+    /// Duffel: a live offer, payable at this price until it expires.
+    Bookable,
+    /// Ignav `verified`: checked against the seller, but still a price
+    /// elsewhere rather than one held for this traveller.
+    Approximate,
+    /// Ignav `unverified`: the weakest claim either provider makes.
+    Unconfirmed,
+}
+
+impl PriceStatus {
+    pub fn is_bookable(self) -> bool {
+        matches!(self, PriceStatus::Bookable)
+    }
+}
+
+/// One priced offer. `price` is the whole trip for all passengers, as the
+/// provider states it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Flight {
     pub offer_id: String,
+    pub source: Source,
+    pub price_status: PriceStatus,
+    /// Two separate tickets: the traveller collects their bags, checks in
+    /// again, and carries the risk themselves if the first leg is late. No
+    /// Duffel offer is one of these.
+    pub self_transfer: bool,
     pub airline: String,
     pub price: f64,
     pub currency: String,
@@ -474,6 +543,38 @@ pub fn rank(flights: Vec<Flight>) -> Option<FlightResults> {
                 with_bags.checked_bags.unwrap_or(0)
             ));
         }
+    }
+    // Two providers answer the same question with different kinds of
+    // number. The list is ranked on price alone, so an approximate fare can
+    // sit above one somebody could actually pay — and presented flat, that
+    // is the carousel price all over again.
+    if !cheapest.price_status.is_bookable() {
+        let bookable = rows.iter().find(|f| f.price_status.is_bookable());
+        let mut note = format!(
+            "the cheapest row is an approximate {} price, not a bookable one — quote it as \
+             'from {:.2} {currency}' and say it is a fare seen elsewhere that still has to be \
+             checked on the seller's own page",
+            provider(cheapest.source),
+            cheapest.price
+        );
+        if let Some(sure) = bookable {
+            note.push_str(&format!(
+                "; the cheapest price anyone can actually pay right now is {:.2} {currency} with \
+                 {}, so present that as the real option and this as a lead worth chasing",
+                sure.price, sure.airline
+            ));
+        }
+        notes.push(note);
+    }
+    // Two tickets rather than one: bags collected and re-checked, and the
+    // traveller carrying the risk if the first leg runs late.
+    if let Some(split) = rows.iter().find(|f| f.self_transfer) {
+        notes.push(format!(
+            "the {:.2} {currency} option with {} is booked as separate tickets — the traveller \
+             collects their bags, checks in again, and has no protection if the first flight is \
+             late; say so plainly wherever it appears",
+            split.price, split.airline
+        ));
     }
     if rows.len() > ROW_CAP {
         notes.push(format!(
@@ -936,6 +1037,11 @@ fn flight(raw: RawOffer) -> Option<Flight> {
     };
     Some(Flight {
         offer_id: raw.id.unwrap_or_default(),
+        source: Source::Duffel,
+        // Every Duffel offer is a live, payable price — that is what the
+        // API is for, so this is a constant rather than something parsed.
+        price_status: PriceStatus::Bookable,
+        self_transfer: false,
         airline: raw
             .owner
             .and_then(|a| a.name.or(a.iata_code))
@@ -1023,7 +1129,6 @@ fn itinerary(
     last: &RawSegment,
     connections: &[Connection],
 ) -> String {
-    const HOP: &str = " ✈ ";
     let mut parts = vec![stamped(origin, first.departing_at.as_deref())];
     for stop in connections {
         // A change of airport shows both, because it is the difference
@@ -1041,8 +1146,12 @@ fn itinerary(
     parts.join(HOP)
 }
 
+/// What separates one point of an itinerary strip from the next. Shared so
+/// both providers draw the same line.
+pub(crate) const HOP: &str = " ✈ ";
+
 /// `AMS 20:15 15.09`, or bare `AMS` when there is no usable timestamp.
-fn stamped(airport: &str, at: Option<&str>) -> String {
+pub(crate) fn stamped(airport: &str, at: Option<&str>) -> String {
     let clock = at
         .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
         .map(|t| t.format("%H:%M %d.%m").to_string());
@@ -1082,7 +1191,7 @@ fn connection(inbound: &RawSegment, onward: &RawSegment) -> Connection {
 /// (`2026-09-16T14:30:00`). `None` unless both parse and time moves
 /// forwards — a backwards gap means the two are not the same clock, and a
 /// negative wait is worse than no answer.
-fn minutes_between(from: &str, to: &str) -> Option<u32> {
+pub(crate) fn minutes_between(from: &str, to: &str) -> Option<u32> {
     let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok();
     let minutes = (parse(to)? - parse(from)?).num_minutes();
     u32::try_from(minutes).ok()
@@ -1199,6 +1308,15 @@ struct RawBaggage {
     quantity: Option<u32>,
 }
 
+/// Who to name in a note. The provider is part of the claim: "approximate,
+/// from Ignav" is checkable in a way that "approximate" alone is not.
+fn provider(source: Source) -> &'static str {
+    match source {
+        Source::Duffel => "Duffel",
+        Source::Ignav => "Ignav",
+    }
+}
+
 /// The currency most offers are priced in. Ties keep the one seen first, so
 /// the same response always ranks the same way.
 fn dominant_currency(flights: &[Flight]) -> Option<String> {
@@ -1216,7 +1334,7 @@ fn dominant_currency(flights: &[Flight]) -> Option<String> {
 }
 
 /// Minutes as a traveller reads them: "9h", "1h 25m", "45m".
-fn human_duration(minutes: u32) -> String {
+pub(crate) fn human_duration(minutes: u32) -> String {
     match (minutes / 60, minutes % 60) {
         (0, m) => format!("{m}m"),
         (h, 0) => format!("{h}h"),
@@ -1231,6 +1349,9 @@ mod tests {
     fn flight(id: &str, price: f64, currency: &str, minutes: Option<u32>) -> Flight {
         Flight {
             offer_id: id.to_string(),
+            source: Source::Duffel,
+            price_status: PriceStatus::Bookable,
+            self_transfer: false,
             airline: "KLM".to_string(),
             price,
             currency: currency.to_string(),
@@ -1356,6 +1477,83 @@ mod tests {
         assert!(rank(vec![a, b]).unwrap().notes.is_empty());
     }
 
+    fn approximate(id: &str, price: f64) -> Flight {
+        let mut f = flight(id, price, "EUR", Some(300));
+        f.source = Source::Ignav;
+        f.price_status = PriceStatus::Approximate;
+        f.airline = "Ryanair".to_string();
+        f
+    }
+
+    #[test]
+    fn an_approximate_price_undercutting_a_bookable_one_is_called_out() {
+        // The merged list is ranked on price, so a "from EUR 180" can sit
+        // above a EUR 220 anyone can actually pay. That is the carousel
+        // price and the 3-pack-versus-single trap wearing a third hat, and
+        // the reply must not present it as simply "the cheapest".
+        let ranked = rank(vec![
+            approximate("ig", 180.0),
+            flight("duffel", 220.0, "EUR", Some(280)),
+        ])
+        .unwrap();
+
+        assert_eq!(ranked.cheapest.offer_id, "ig");
+        assert!(
+            ranked.notes.iter().any(|n| n.contains("180") && n.contains("220")),
+            "the note must name both prices so the gap is visible, got: {:?}",
+            ranked.notes
+        );
+        assert!(
+            ranked.notes.iter().any(|n| n.to_lowercase().contains("approximate")),
+            "got: {:?}",
+            ranked.notes
+        );
+    }
+
+    #[test]
+    fn a_bookable_cheapest_needs_no_such_warning() {
+        let ranked = rank(vec![
+            flight("duffel", 180.0, "EUR", Some(280)),
+            approximate("ig", 220.0),
+        ])
+        .unwrap();
+        assert_eq!(ranked.cheapest.offer_id, "duffel");
+        assert!(
+            !ranked.notes.iter().any(|n| n.to_lowercase().contains("approximate")),
+            "nothing to warn about, got: {:?}",
+            ranked.notes
+        );
+    }
+
+    #[test]
+    fn an_all_approximate_result_says_so_once_rather_than_comparing_against_nothing() {
+        // With no bookable option in the set there is no gap to quantify,
+        // but the reply still must not quote these as prices.
+        let ranked = rank(vec![approximate("a", 180.0), approximate("b", 200.0)]).unwrap();
+        assert!(
+            ranked.notes.iter().any(|n| n.to_lowercase().contains("approximate")),
+            "got: {:?}",
+            ranked.notes
+        );
+        assert!(
+            !ranked.notes.iter().any(|n| n.contains("200")),
+            "no bookable price to compare against, so no comparison: {:?}",
+            ranked.notes
+        );
+    }
+
+    #[test]
+    fn a_self_transfer_option_is_flagged_wherever_it_lands_in_the_ranking() {
+        let mut cheap = approximate("split", 150.0);
+        cheap.self_transfer = true;
+        let ranked = rank(vec![cheap, flight("duffel", 300.0, "EUR", Some(280))]).unwrap();
+        assert!(
+            ranked.notes.iter().any(|n| n.contains("separate tickets")),
+            "got: {:?}",
+            ranked.notes
+        );
+    }
+
     #[test]
     fn rows_are_capped_but_the_count_is_stated() {
         let many: Vec<Flight> = (0..9)
@@ -1394,6 +1592,23 @@ mod tests {
             {"type": "carry_on", "quantity": 1},
             {"type": "checked", "quantity": 1}
         ])
+    }
+
+    #[test]
+    fn a_duffel_offer_is_marked_bookable_because_that_is_what_makes_it_different() {
+        // Once a second provider's approximate fares sit in the same list,
+        // "where did this price come from and can I actually pay it" has to
+        // travel with every row rather than be inferred from context.
+        let body = serde_json::json!({"data": {"offers": [{
+            "id": "off_1", "total_amount": "184.30", "total_currency": "EUR",
+            "owner": {"name": "KLM"}, "slices": []
+        }]}})
+        .to_string();
+
+        let f = parse_offers(&body).unwrap().remove(0);
+        assert_eq!(f.source, Source::Duffel);
+        assert_eq!(f.price_status, PriceStatus::Bookable);
+        assert!(!f.self_transfer, "Duffel sells one ticket, not two");
     }
 
     #[test]
@@ -2049,6 +2264,7 @@ mod client_tests {
                 store,
                 user_id: 7,
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+                ignav: None,
             },
             dir,
         )
@@ -2460,6 +2676,9 @@ mod output_tests {
     fn flight(price: f64) -> Flight {
         Flight {
             offer_id: "off_1".to_string(),
+            source: Source::Duffel,
+            price_status: PriceStatus::Bookable,
+            self_transfer: false,
             airline: "KLM".to_string(),
             price,
             currency: "EUR".to_string(),
@@ -2601,6 +2820,7 @@ mod links_tests {
             store: crate::store::Store::open(dir.path().join("t.duckdb")).unwrap(),
             user_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+            ignav: None,
         };
         let out = rig::tool::Tool::call(&tool, query()).await.unwrap();
         assert!(
@@ -2615,6 +2835,7 @@ mod links_tests {
             store: crate::store::Store::open(dir.path().join("u.duckdb")).unwrap(),
             user_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+            ignav: None,
         };
         let out = rig::tool::Tool::call(&plain, query()).await.unwrap();
         assert!(!out.notes.iter().any(|n| n.contains("booking fee")), "got: {:?}", out.notes);
@@ -2703,6 +2924,7 @@ mod live {
                 store: crate::store::Store::open(dir.path().join("probe.duckdb")).unwrap(),
                 user_id: 1,
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+                ignav: None,
             };
             let out = rig::tool::Tool::call(&tool, query).await.unwrap();
             println!("LIVE route={} bought={}", out.route, tool.budget.spent());

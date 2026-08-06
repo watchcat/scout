@@ -33,6 +33,11 @@ pub struct Config {
     /// answers 403 `unavailable_feature` until they turn it on, so the
     /// booking tool is only offered when this says it will work.
     pub duffel_links_enabled: bool,
+    /// Ignav fare-search key. A second flights provider whose prices are
+    /// approximate rather than bookable (their docs say to show them as
+    /// "from $299"), so its rows arrive labelled. 1,000 free requests,
+    /// then $0.002 each.
+    pub ignav_api_key: Option<String>,
 }
 
 impl Config {
@@ -125,6 +130,7 @@ impl Config {
             duffel_api_key: non_empty("DUFFEL_API_KEY"),
             duffel_markup_rate,
             duffel_links_enabled,
+            ignav_api_key: non_empty("IGNAV_API_KEY"),
         })
     }
 }

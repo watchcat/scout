@@ -78,7 +78,16 @@ verbatim - cheapest and fastest are ranked in Rust and are not yours to \
 recompute - and quote its route field so the reply cannot drift onto a \
 route nobody searched. Offer every option in rows, not a shortened pick of \
 them: they are already the cheapest few of hundreds, and dropping some \
-narrows the choice for no reason. departing_at_local and arriving_at_local are each in \
+narrows the choice for no reason. Rows can come from two providers and \
+every one carries price_status, which changes how you are allowed to quote \
+it. 'bookable' is a live offer someone can pay right now: quote it as a \
+price. 'approximate' and 'unconfirmed' are fares seen elsewhere that still \
+have to be checked on the seller's page: quote those as 'from EUR 180' and \
+say where they came from - NEVER present one as a plain price and never as \
+'the cheapest' without saying it is not bookable. When self_transfer is \
+true the trip is two separate tickets: the traveller re-checks their bags \
+and carries the risk if the first flight is late, so say that every time it \
+appears, however cheap it looks. departing_at_local and arriving_at_local are each in \
 the local time of their own airport with no offset, so NEVER subtract them \
 to work out how long a flight takes: LHR 10:03 to JFK 13:01 is a 7h58m \
 flight, not a 2h58m one. Give journey length from the duration field, which \
@@ -262,6 +271,8 @@ pub struct AgentDeps {
     pub return_url: Option<String>,
     /// Whether Duffel has enabled Links on this account.
     pub links_enabled: bool,
+    /// Second flights provider; see `tools::ignav`.
+    pub ignav: Option<crate::tools::ignav::IgnavClient>,
     pub marktplaats: MarktplaatsClient,
     pub store: Store,
     pub secondhand_sites: Vec<String>,
@@ -534,6 +545,7 @@ pub fn build_agent(
             // One allowance and one memo per user request, like the search
             // budget above.
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+            ignav: d.ignav.clone(),
         });
         // Offered only when Duffel has enabled Links on the account and
         // there is somewhere to send people back to. Registering it

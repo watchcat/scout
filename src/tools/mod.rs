@@ -4,6 +4,7 @@ pub mod budget;
 pub mod duffel;
 pub mod ebay;
 pub mod fetch;
+pub mod ignav;
 pub mod kagi;
 pub mod marktplaats;
 pub mod memory;

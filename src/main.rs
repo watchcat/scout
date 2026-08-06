@@ -91,9 +91,11 @@ async fn main() -> Result<()> {
         duffel_api = duffel.is_some(),
         markup_rate = cfg.duffel_markup_rate,
         links = cfg.duffel_links_enabled,
+        ignav = cfg.ignav_api_key.is_some(),
         "flight search"
     );
 
+    let http_for_ignav = http.clone();
     let mut deps = AgentDeps {
         llm,
         kagi,
@@ -109,6 +111,13 @@ async fn main() -> Result<()> {
         // Filled in below, once the bot has told us its username.
         return_url: None,
         links_enabled: cfg.duffel_links_enabled,
+        ignav: cfg.ignav_api_key.clone().map(|key| {
+            tools::ignav::IgnavClient::new(
+                http_for_ignav,
+                key,
+                tools::ignav::IGNAV_API_BASE.to_string(),
+            )
+        }),
     };
 
     let telegram = Bot::new(cfg.telegram_bot_token.clone());

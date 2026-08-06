@@ -37,11 +37,27 @@ pub struct IgnavClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
+    /// Two-letter country whose currency and locale the fares come back
+    /// in. Ignav defaults to US, which answers in dollars — merged against
+    /// Duffel's euros, the currency guard then drops every row here and
+    /// the provider silently contributes nothing.
+    market: String,
 }
 
 impl IgnavClient {
     pub fn new(http: reqwest::Client, api_key: String, base_url: String) -> Self {
-        Self { http, api_key, base_url }
+        Self { http, api_key, base_url, market: "US".to_string() }
+    }
+
+    /// Sets the market, e.g. `NL`. Uppercased because Ignav wants a
+    /// two-letter country code and the caller may have it from a profile
+    /// fact typed in any case.
+    pub fn with_market(mut self, market: &str) -> Self {
+        let market = market.trim().to_ascii_uppercase();
+        if market.len() == 2 {
+            self.market = market;
+        }
+        self
     }
 
     /// Fares for one journey. Round trips go to a different endpoint than
@@ -60,6 +76,7 @@ impl IgnavClient {
             "origin": origin,
             "destination": destination,
             "departure_date": query.departure_date.trim(),
+            "market": self.market,
         });
         // One-way and round-trip are different endpoints here, not a
         // second slice as Duffel has it.
@@ -300,6 +317,56 @@ struct RawBags {
 }
 
 #[cfg(test)]
+mod live {
+    //! Ignored by default: needs `IGNAV_API_KEY` and network.
+    use super::*;
+    use crate::tools::duffel::FlightQuery;
+
+    #[tokio::test]
+    #[ignore]
+    async fn searches_a_real_route() {
+        let key = std::env::var("IGNAV_API_KEY").expect("IGNAV_API_KEY");
+        let client = IgnavClient::new(reqwest::Client::new(), key, IGNAV_API_BASE.to_string())
+            .with_market(&std::env::var("SCOUT_PROBE_MARKET").unwrap_or_else(|_| "US".into()));
+        let query = FlightQuery {
+            origin: std::env::var("SCOUT_PROBE_ORIGIN").unwrap_or_else(|_| "AMS".into()),
+            destination: std::env::var("SCOUT_PROBE_DESTINATION").unwrap_or_else(|_| "LIS".into()),
+            departure_date: std::env::var("SCOUT_PROBE_DATE")
+                .unwrap_or_else(|_| "2026-09-14".into()),
+            return_date: std::env::var("SCOUT_PROBE_RETURN").ok(),
+            adults: None,
+            cabin_class: None,
+            max_connections: None,
+            flex_days: None,
+        };
+
+        let flights = client.search(&query).await.unwrap();
+        println!("LIVE ignav fares={}", flights.len());
+        for f in flights.iter().take(5) {
+            println!(
+                "  {:>8.2} {} {:?} {:<24} {:?} bags(c={:?} h={:?}) self={}",
+                f.price, f.currency, f.price_status, f.airline, f.total_duration,
+                f.carry_on_bags, f.checked_bags, f.self_transfer
+            );
+            for leg in &f.legs {
+                println!("    {}", leg.itinerary);
+            }
+        }
+
+        assert!(!flights.is_empty(), "a busy route should return fares");
+        let f = &flights[0];
+        assert!(f.price > 0.0);
+        assert_eq!(f.source, Source::Ignav);
+        assert!(!f.price_status.is_bookable(), "ignav never sells a bookable price");
+        assert!(!f.airline.is_empty(), "carrier did not parse");
+        assert!(!f.legs.is_empty(), "outbound leg did not parse");
+        assert_eq!(f.legs[0].origin, query.origin, "segment airports did not parse");
+        assert!(f.legs[0].duration_minutes.is_some(), "duration did not parse");
+        assert!(f.legs[0].itinerary.contains('✈'), "strip did not draw: {}", f.legs[0].itinerary);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::duffel::FlightQuery;
@@ -364,7 +431,9 @@ mod tests {
             .and(path("/fares/one-way"))
             .and(header("X-Api-Key", "key"))
             .and(body_json(json!({
-                "origin": "SFO", "destination": "JFK", "departure_date": "2026-09-05"
+                "origin": "SFO", "destination": "JFK", "departure_date": "2026-09-05",
+                // Always sent; US is Ignav's own default and ours.
+                "market": "US"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(one_itinerary(299.0, "verified")))
             .expect(1)
@@ -389,6 +458,26 @@ mod tests {
         assert_eq!(f.legs[0].destination, "JFK");
         assert_eq!(f.legs[0].flights, vec!["AA100"]);
         assert_eq!(f.legs[0].itinerary, "SFO 08:00 05.09 ✈ JFK 16:30 05.09");
+    }
+
+    #[tokio::test]
+    async fn the_market_is_sent_so_fares_come_back_in_the_travellers_currency() {
+        // Measured live: without a market, Ignav answers in USD while
+        // Duffel answers in EUR — and the currency guard in rank() then
+        // drops every Ignav row, so the whole provider silently does
+        // nothing. The market is what makes the two comparable at all.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_json(json!({
+                "origin": "SFO", "destination": "JFK",
+                "departure_date": "2026-09-05", "market": "NL"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(one_itinerary(299.0, "verified")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client(&server).with_market("nl").search(&query()).await.unwrap();
     }
 
     #[tokio::test]
@@ -421,7 +510,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/fares/round-trip"))
             .and(body_json(json!({
-                "origin": "SFO", "destination": "JFK",
+                "origin": "SFO", "destination": "JFK", "market": "US",
                 "departure_date": "2026-09-05", "return_date": "2026-09-12"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))

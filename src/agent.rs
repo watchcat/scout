@@ -491,6 +491,38 @@ pub fn wrap_up_agent(
         .build()
 }
 
+/// The country whose currency fare prices should come back in.
+///
+/// Ignav defaults to US, which answers in dollars. Merged against Duffel's
+/// euros the currency guard then drops every Ignav row, so the provider
+/// contributes nothing at all — measured live before this existed. The
+/// delivery country the user already told us is the right answer.
+pub fn fare_market(facts: &[(String, String)]) -> Option<String> {
+    let value = facts
+        .iter()
+        .find(|(k, _)| k.starts_with("delivery_"))
+        .map(|(_, v)| v.trim().to_ascii_uppercase())?;
+    // "NL" as given, and "Netherlands" resolved through the same table
+    // that decides search languages.
+    if value.len() == 2 && value.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Some(value);
+    }
+    let lower = value.to_lowercase();
+    COUNTRY_LANGUAGES
+        .iter()
+        .find(|(name, _)| name.len() > 2 && lower.contains(*name))
+        .and_then(|(name, _)| match *name {
+            "netherlands" | "nederland" | "holland" => Some("NL".to_string()),
+            "belgium" => Some("BE".to_string()),
+            "germany" | "deutschland" => Some("DE".to_string()),
+            "france" => Some("FR".to_string()),
+            "spain" => Some("ES".to_string()),
+            "italy" => Some("IT".to_string()),
+            "poland" => Some("PL".to_string()),
+            _ => None,
+        })
+}
+
 /// The booking fee in force, or nothing when flights are not configured.
 fn markup_rate(d: &AgentDeps) -> f64 {
     d.duffel.as_ref().map_or(0.0, |c| c.markup_rate())
@@ -545,7 +577,15 @@ pub fn build_agent(
             // One allowance and one memo per user request, like the search
             // budget above.
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
-            ignav: d.ignav.clone(),
+            // Priced in the traveller's own currency, or Duffel's euros
+            // and Ignav's dollars never get compared.
+            ignav: d
+                .ignav
+                .clone()
+                .map(|c| match fare_market(facts) {
+                    Some(market) => c.with_market(&market),
+                    None => c,
+                }),
         });
         // Offered only when Duffel has enabled Links on the account and
         // there is somewhere to send people back to. Registering it
@@ -575,6 +615,24 @@ mod tests {
         let charged = preamble_with_profile(&[], 0.03);
         assert!(charged.contains("Booking fee"), "got: {charged}");
         assert!(charged.contains("3%"), "stated as a percentage, got: {charged}");
+    }
+
+    #[test]
+    fn the_fare_market_comes_from_the_delivery_country() {
+        // Without this Ignav answers in USD, rank() drops every row for
+        // being in another currency, and the second provider silently does
+        // nothing at all.
+        assert_eq!(fare_market(&facts(&[("delivery_country", "NL")])).as_deref(), Some("NL"));
+        assert_eq!(fare_market(&facts(&[("delivery_country", "nl")])).as_deref(), Some("NL"));
+        assert_eq!(
+            fare_market(&facts(&[("delivery_country", "Netherlands")])).as_deref(),
+            Some("NL")
+        );
+        assert_eq!(fare_market(&facts(&[("delivery_country", "Germany")])).as_deref(), Some("DE"));
+        // Nothing known: leave the client on its own default rather than
+        // guessing a country for someone.
+        assert_eq!(fare_market(&[]), None);
+        assert_eq!(fare_market(&facts(&[("shoe_size", "44")])), None);
     }
 
     #[test]

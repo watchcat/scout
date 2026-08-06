@@ -90,10 +90,10 @@ their own bags and no protection if the first flight is late. A connection \
 whose layover is null means the offer did not state the times - say that \
 rather than guessing, and do not offer to go and look it up elsewhere. \
 Every leg carries an itinerary line already drawn for you - 'AMS 20:15 \
-15.09 → ✈ → PVG 3h 20m → ✈ → HKG 20:35 16.09'. Put it on its own line \
-under the option it belongs to, copied EXACTLY as given: do not retype the \
-times, reorder it, translate it, change the arrows or the plane, or rebuild \
-it from the other fields. A return trip has one such line per leg, outbound \
+15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09'. Put it on its own line under the \
+option it belongs to, copied EXACTLY as given: do not retype the times, \
+reorder it, translate it, add or remove the plane symbols, or rebuild it \
+from the other fields. A return trip has one such line per leg, outbound \
 first. It replaces listing the times in prose - say the price, the airline \
 and what matters about the option, then the line. Prices are the whole trip for all passengers. Say \
 what its notes say when they matter: a cheapest option that takes hours \

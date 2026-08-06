@@ -186,7 +186,7 @@ pub struct Leg {
     /// on a direct flight.
     pub connections: Vec<Connection>,
     /// The whole leg drawn on one line, for the reply to print unchanged:
-    /// `AMS 20:15 15.09 → ✈ → PVG 3h 20m → ✈ → HKG 20:35 16.09`.
+    /// `AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09`.
     ///
     /// Built here rather than by the model for the same reason the ranking
     /// is: a model retyping departure times is a model that can get one
@@ -680,7 +680,7 @@ fn itinerary(
     last: &RawSegment,
     connections: &[Connection],
 ) -> String {
-    const HOP: &str = " → ✈ → ";
+    const HOP: &str = " ✈ ";
     let mut parts = vec![stamped(origin, first.departing_at.as_deref())];
     for stop in connections {
         // A change of airport shows both, because it is the difference
@@ -1097,7 +1097,7 @@ mod tests {
                 stops: 0,
                 flights: vec!["KL1693".into()],
                 connections: Vec::new(),
-                itinerary: "AMS 09:15 14.09 → ✈ → LIS 11:20 14.09".into(),
+                itinerary: "AMS 09:15 14.09 ✈ LIS 11:20 14.09".into(),
             }]
         );
     }
@@ -1223,7 +1223,7 @@ mod tests {
         let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
         assert_eq!(
             leg.itinerary,
-            "AMS 20:15 15.09 → ✈ → PVG 3h 20m → ✈ → HKG 20:35 16.09"
+            "AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09"
         );
     }
 
@@ -1241,7 +1241,7 @@ mod tests {
         .to_string();
 
         let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
-        assert_eq!(leg.itinerary, "AMS 09:15 14.09 → ✈ → LIS 11:20 14.09");
+        assert_eq!(leg.itinerary, "AMS 09:15 14.09 ✈ LIS 11:20 14.09");
     }
 
     #[test]
@@ -1264,7 +1264,7 @@ mod tests {
         let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
         assert_eq!(
             leg.itinerary,
-            "AMS 17:55 12.10 → ✈ → ADD 6h 30m → ✈ → JNB 55m → ✈ → CPT 13:00 13.10"
+            "AMS 17:55 12.10 ✈ ADD 6h 30m ✈ JNB 55m ✈ CPT 13:00 13.10"
         );
     }
 
@@ -1313,7 +1313,7 @@ mod tests {
         .to_string();
 
         let leg = parse_offers(&body).unwrap().remove(0).legs.remove(0);
-        assert_eq!(leg.itinerary, "AMS → ✈ → PVG → ✈ → HKG 20:35 16.09");
+        assert_eq!(leg.itinerary, "AMS ✈ PVG ✈ HKG 20:35 16.09");
     }
 
     #[test]

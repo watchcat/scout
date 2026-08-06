@@ -117,6 +117,16 @@ impl rig::tool::Tool for FlightSearchTool {
         by_date.sort_by(|a, b| a.date.cmp(&b.date));
 
         let mut out = FlightSearchOutput::new(&args, rank(all));
+        // Travels with the prices it is baked into. Relying on the preamble
+        // alone was measured failing in production: a reply quoted a fare
+        // that silently included the fee and never mentioned it.
+        if self.client.markup_rate() > 0.0 {
+            out.notes.push(format!(
+                "every price here already includes a {} booking fee, which is what the checkout \
+                 charges — say so in the reply rather than quoting the number bare",
+                percentage(self.client.markup_rate())
+            ));
+        }
         if flexible {
             out.by_date = by_date;
             if !unaffordable.is_empty() {
@@ -765,6 +775,13 @@ impl DuffelClient {
         }
         Ok(flights)
     }
+}
+
+/// A rate as a percentage a person would say aloud: 0.03 -> "3%".
+fn percentage(rate: f64) -> String {
+    let pct = format!("{:.2}", rate * 100.0);
+    let pct = pct.trim_end_matches('0').trim_end_matches('.');
+    format!("{pct}%")
 }
 
 /// Money, to the cent. A markup multiplication otherwise produces prices
@@ -2556,6 +2573,48 @@ mod links_tests {
         let body: serde_json::Value =
             serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
         assert!(body["data"].get("markup_rate").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fee_is_disclosed_in_the_results_not_only_in_the_preamble() {
+        // Measured in production: with a 3% fee configured, the reply quoted
+        // "EUR 669.40" and never mentioned the fee. The preamble said to
+        // disclose it, but that instruction sits in the longest bullet in
+        // the prompt. Notes attached to the results are the channel the
+        // model actually echoes — the baggage warning proves it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": [
+                {"id": "a", "total_amount": "100.00", "total_currency": "EUR",
+                 "owner": {"name": "KLM"}, "slices": []}
+            ]}})))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool = FlightSearchTool {
+            client: client(&server, 0.03),
+            store: crate::store::Store::open(dir.path().join("t.duckdb")).unwrap(),
+            user_id: 1,
+            budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+        };
+        let out = rig::tool::Tool::call(&tool, query()).await.unwrap();
+        assert!(
+            out.notes.iter().any(|n| n.contains("3%") && n.contains("booking fee")),
+            "the fee must travel with the prices it is baked into, got: {:?}",
+            out.notes
+        );
+
+        // No fee, no note: nothing to disclose and nothing to explain away.
+        let plain = FlightSearchTool {
+            client: client(&server, 0.0),
+            store: crate::store::Store::open(dir.path().join("u.duckdb")).unwrap(),
+            user_id: 1,
+            budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+        };
+        let out = rig::tool::Tool::call(&plain, query()).await.unwrap();
+        assert!(!out.notes.iter().any(|n| n.contains("booking fee")), "got: {:?}", out.notes);
     }
 
     #[tokio::test]

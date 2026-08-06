@@ -188,13 +188,39 @@ pub async fn run(bot: Bot, app: Arc<App>) {
         .branch(messages)
         .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction));
 
-    Dispatcher::builder(bot, handler)
+    let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![app])
         .default_handler(|_| async {})
         .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+        .build();
+
+    // A deploy must not cut someone off mid-answer. On shutdown the
+    // dispatcher stops taking new updates and then awaits every handler
+    // still running, so a request that has already started gets to finish.
+    // Ctrl-C is covered above; this is the one Docker actually sends.
+    #[cfg(unix)]
+    {
+        let shutdown = dispatcher.shutdown_token();
+        tokio::spawn(async move {
+            let mut term =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(term) => term,
+                    Err(e) => {
+                        tracing::error!(error = %e, "no SIGTERM handler; deploys will cut requests off");
+                        return;
+                    }
+                };
+            term.recv().await;
+            tracing::info!("SIGTERM received; finishing in-flight requests before exit");
+            let started = std::time::Instant::now();
+            if let Ok(drained) = shutdown.shutdown() {
+                drained.await;
+            }
+            tracing::info!(seconds = started.elapsed().as_secs(), "in-flight requests finished");
+        });
+    }
+
+    dispatcher.dispatch().await;
 }
 
 fn is_allowed(app: &App, msg: &Message) -> bool {

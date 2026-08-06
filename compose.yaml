@@ -12,6 +12,12 @@ services:
     # ends in an exhausted PID table.
     init: true
     restart: unless-stopped
+    # How long Docker waits after SIGTERM before SIGKILL. One request is
+    # bounded by RUN_BUDGET (300s) plus link verification and wrap-up, so
+    # this has to exceed that or a deploy still kills the slowest answers.
+    # Reached only when something is actually running; an idle bot exits at
+    # once. See the SIGTERM handler in bot::run.
+    stop_grace_period: 330s
 
 volumes:
   scout-data:

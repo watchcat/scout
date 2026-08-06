@@ -9,7 +9,7 @@ repository = "https://github.com/watchcat/scout"
 [dependencies]
 rig = "0.40"
 teloxide = { version = "0.17", features = ["macros"] }
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
 duckdb = { version = "1", features = ["bundled"] }
 dashmap = "6"
 dotenvy = "0.15"

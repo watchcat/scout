@@ -260,6 +260,11 @@ impl Store {
     }
 
     /// Record one handled request for usage statistics.
+    /// `request_log.kind` for one billable Duffel search. Kept here beside
+    /// the table it is written into, because `/stat` reads it back by name
+    /// and a typo on either side would silently report zero.
+    pub const FLIGHT_SEARCH: &'static str = "flight_search";
+
     pub fn log_request(&self, user_id: i64, kind: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -327,6 +332,41 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![cutoff], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Flight searches per user since `cutoff`, scoped to one user. See
+    /// [`FLIGHT_SEARCH`].
+    pub fn flight_searches_for(&self, cutoff: &str, user_id: i64) -> Result<BTreeMap<i64, i64>> {
+        self.kind_counts(cutoff, Self::FLIGHT_SEARCH, Some(user_id))
+    }
+
+    /// The same across every user. Reachable from `/stat` only when the
+    /// caller is an admin — like `usage_stats_all`, this method and its
+    /// callers are the access-control surface for cross-user data.
+    pub fn flight_searches_all(&self, cutoff: &str) -> Result<BTreeMap<i64, i64>> {
+        self.kind_counts(cutoff, Self::FLIGHT_SEARCH, None)
+    }
+
+    /// Requests of one `kind` per user, optionally narrowed to a single
+    /// user. `None` means every user, so callers pass `Some` unless they
+    /// have already checked the caller is allowed to see everyone.
+    fn kind_counts(
+        &self,
+        cutoff: &str,
+        kind: &str,
+        user_id: Option<i64>,
+    ) -> Result<BTreeMap<i64, i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_id, count(*) FROM request_log
+             WHERE kind = ? AND created_at >= CAST(? AS TIMESTAMP)
+               AND (? IS NULL OR user_id = ?)
+             GROUP BY user_id ORDER BY user_id ASC",
+        )?;
+        let rows = stmt.query_map(params![kind, cutoff, user_id, user_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
         })?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
@@ -538,6 +578,33 @@ mod tests {
 
         let empty = s.usage_stats_for("2026-07-25 00:00:00", 99).unwrap();
         assert!(empty.is_empty(), "unknown user sees nothing");
+    }
+
+    #[test]
+    fn flight_searches_are_counted_apart_from_ordinary_requests() {
+        // Every flight search is billed by Duffel, so these need their own
+        // number rather than being buried in the request total.
+        let (s, _d) = test_store();
+        s.log_request_at(1, "text", "2026-07-25 10:00:00").unwrap();
+        s.log_request_at(1, Store::FLIGHT_SEARCH, "2026-07-25 10:01:00").unwrap();
+        s.log_request_at(1, Store::FLIGHT_SEARCH, "2026-07-25 10:02:00").unwrap();
+        s.log_request_at(2, Store::FLIGHT_SEARCH, "2026-07-25 12:00:00").unwrap();
+        s.log_request_at(1, Store::FLIGHT_SEARCH, "2026-07-20 09:00:00").unwrap(); // before cutoff
+
+        let all = s.flight_searches_all("2026-07-25 00:00:00").unwrap();
+        assert_eq!(all.get(&1), Some(&2), "the text request must not be counted");
+        assert_eq!(all.get(&2), Some(&1));
+
+        // Same access-control split as usage_stats: an ordinary caller sees
+        // only their own.
+        let mine = s.flight_searches_for("2026-07-25 00:00:00", 1).unwrap();
+        assert_eq!(mine.get(&1), Some(&2));
+        assert_eq!(mine.get(&2), None, "user 1 must not see user 2's searches");
+
+        assert!(s
+            .flight_searches_for("2026-07-25 00:00:00", 99)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

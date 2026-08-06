@@ -17,6 +17,10 @@
 /// model never sees a tool that cannot work.
 pub struct FlightSearchTool {
     pub client: DuffelClient,
+    /// Every search is billed, so each one is recorded against the user who
+    /// caused it and shown in `/stat`.
+    pub store: crate::store::Store,
+    pub user_id: i64,
 }
 
 impl rig::tool::Tool for FlightSearchTool {
@@ -55,8 +59,31 @@ impl rig::tool::Tool for FlightSearchTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let flights = self.client.search(&args).await?;
-        Ok(FlightSearchOutput::new(&args, rank(flights)))
+        let found = self.client.search(&args).await;
+        // Counted whenever the request actually left the machine — which is
+        // everything except a query rejected before it was sent. A search
+        // Duffel then refused is assumed billable: understating the bill is
+        // the worse of the two errors.
+        if !matches!(found, Err(DuffelError::Invalid(_))) {
+            self.note_search().await;
+        }
+        Ok(FlightSearchOutput::new(&args, rank(found?)))
+    }
+}
+
+impl FlightSearchTool {
+    /// Records one billable search. A failure here is logged and swallowed:
+    /// the search has already been paid for, and losing the answer as well
+    /// would make a bookkeeping problem into a user-facing one.
+    async fn note_search(&self) {
+        let (store, user_id) = (self.store.clone(), self.user_id);
+        let logged = tokio::task::spawn_blocking(move || {
+            store.log_request(user_id, crate::store::Store::FLIGHT_SEARCH)
+        })
+        .await;
+        if let Err(e) = logged.map_err(anyhow::Error::from).and_then(|r| r) {
+            tracing::warn!(error = %e, "could not record a flight search for /stat");
+        }
     }
 }
 
@@ -1496,6 +1523,73 @@ mod client_tests {
         let mut bad = query();
         bad.origin = "Amsterdam".to_string();
         assert!(client(&server).search(&bad).await.is_err());
+    }
+
+    /// A tool wired to a temp-file store, so the logging can be asserted.
+    fn tool(server: &MockServer) -> (crate::tools::duffel::FlightSearchTool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path().join("t.duckdb")).unwrap();
+        (FlightSearchTool { client: client(server), store, user_id: 7 }, dir)
+    }
+
+    fn searches_logged(tool: &crate::tools::duffel::FlightSearchTool) -> i64 {
+        tool.store
+            .flight_searches_all("2000-01-01 00:00:00")
+            .unwrap()
+            .get(&7)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn every_search_that_reaches_duffel_is_counted_against_the_user() {
+        // Duffel bills per search and Scout makes no bookings, so the
+        // allowance is zero and each of these is real money. /stat cannot
+        // report what was never recorded.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        assert_eq!(searches_logged(&tool), 0);
+        rig::tool::Tool::call(&tool, query()).await.unwrap();
+        rig::tool::Tool::call(&tool, query()).await.unwrap();
+        assert_eq!(searches_logged(&tool), 2);
+    }
+
+    #[tokio::test]
+    async fn a_query_rejected_before_the_request_is_not_counted() {
+        // Nothing left the machine, so nothing was charged. Counting it
+        // would make /stat overstate the bill.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        let mut bad = query();
+        bad.origin = "Amsterdam".to_string();
+        assert!(rig::tool::Tool::call(&tool, bad).await.is_err());
+        assert_eq!(searches_logged(&tool), 0);
+    }
+
+    #[tokio::test]
+    async fn a_search_duffel_rejected_is_still_counted() {
+        // The request was made, so assume it was billable. Undercounting
+        // spend is the worse error of the two.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        assert!(rig::tool::Tool::call(&tool, query()).await.is_err());
+        assert_eq!(searches_logged(&tool), 1);
     }
 
     #[tokio::test]

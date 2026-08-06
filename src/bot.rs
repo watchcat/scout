@@ -265,21 +265,28 @@ async fn handle_command(
             let data = {
                 let store = app.deps.store.clone();
                 tokio::task::spawn_blocking(move || {
-                    let rows = if admin {
-                        store.usage_stats_all(&cutoff)?
+                    // Both reads take the same admin branch, so a
+                    // non-admin can never see another user's flight
+                    // spending either.
+                    let (rows, flights) = if admin {
+                        (store.usage_stats_all(&cutoff)?, store.flight_searches_all(&cutoff)?)
                     } else {
-                        store.usage_stats_for(&cutoff, user_id)?
+                        (
+                            store.usage_stats_for(&cutoff, user_id)?,
+                            store.flight_searches_for(&cutoff, user_id)?,
+                        )
                     };
-                    Ok::<_, anyhow::Error>((rows, store.display_names()?))
+                    Ok::<_, anyhow::Error>((rows, store.display_names()?, flights))
                 })
                 .await
                 .map_err(anyhow::Error::from)
                 .and_then(|r| r)
             };
             match data {
-                Ok((rows, mut names)) => {
+                Ok((rows, mut names, flights)) => {
                     backfill_names(&bot, &app, &rows, &mut names).await;
-                    let report = crate::stats::format_stats(&rows, days, today, user_id, &names);
+                    let report =
+                        crate::stats::format_stats(&rows, days, today, user_id, &names, &flights);
                     bot.send_message(msg.chat.id, format!("<pre>{report}</pre>"))
                         .parse_mode(ParseMode::Html)
                         .await?;

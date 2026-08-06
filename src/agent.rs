@@ -468,7 +468,11 @@ pub fn build_agent(
         builder = builder.tool(crate::tools::bol::BolSearchTool { client: bol.clone() });
     }
     if let Some(duffel) = &d.duffel {
-        builder = builder.tool(crate::tools::duffel::FlightSearchTool { client: duffel.clone() });
+        builder = builder.tool(crate::tools::duffel::FlightSearchTool {
+            client: duffel.clone(),
+            store: d.store.clone(),
+            user_id,
+        });
     }
     builder.default_max_turns(MAX_TURNS).build()
 }

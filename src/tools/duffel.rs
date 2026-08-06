@@ -21,6 +21,9 @@ pub struct FlightSearchTool {
     /// caused it and shown in `/stat`.
     pub store: crate::store::Store,
     pub user_id: i64,
+    /// Shared across one user request: caps how many searches it can buy,
+    /// and remembers what each one returned so a repeat costs nothing.
+    pub budget: std::sync::Arc<crate::tools::budget::FlightBudget>,
 }
 
 impl rig::tool::Tool for FlightSearchTool {
@@ -59,15 +62,38 @@ impl rig::tool::Tool for FlightSearchTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Checked before anything is bought, so a bad query costs nothing
+        // and an already-answered one costs nothing twice.
+        args.validate()?;
+        let key = args.cache_key();
+
+        // A route this request has already paid for. Served whatever the
+        // budget says: the allowance limits what is bought, not what is
+        // already known.
+        if let Some(flights) = self.budget.recall(&key) {
+            tracing::info!(
+                route = %key,
+                bought = self.budget.spent(),
+                "flight search served from this request's memo, not bought again"
+            );
+            return Ok(FlightSearchOutput::new(&args, rank(flights)));
+        }
+        if !self.budget.claim_one() {
+            return Err(DuffelError::Invalid(format!(
+                "this request has already used its {} flight searches — answer now with the \
+                 routes you have already looked up rather than searching another",
+                crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST
+            )));
+        }
+
         let found = self.client.search(&args).await;
-        // Counted whenever the request actually left the machine — which is
-        // everything except a query rejected before it was sent. A search
+        // Counted whenever the request actually left the machine. A search
         // Duffel then refused is assumed billable: understating the bill is
         // the worse of the two errors.
-        if !matches!(found, Err(DuffelError::Invalid(_))) {
-            self.note_search().await;
-        }
-        Ok(FlightSearchOutput::new(&args, rank(found?)))
+        self.note_search().await;
+        let flights = found?;
+        self.budget.remember(key, flights.clone());
+        Ok(FlightSearchOutput::new(&args, rank(flights)))
     }
 }
 
@@ -410,6 +436,22 @@ impl FlightQuery {
             }
         }
         Ok(())
+    }
+
+    /// Identity of this search for the per-request memo. Normalised so the
+    /// same journey asked twice — "ams" then "AMS", `adults: null` then
+    /// `adults: 1` — is recognised as one search rather than bought twice.
+    pub fn cache_key(&self) -> String {
+        format!(
+            "{}-{}|{}|{}|{}|{}|{}",
+            self.origin.trim().to_ascii_uppercase(),
+            self.destination.trim().to_ascii_uppercase(),
+            self.departure_date.trim(),
+            self.return_date.as_deref().unwrap_or("").trim(),
+            self.adults.unwrap_or(1),
+            self.cabin_class.as_deref().unwrap_or("").trim().to_ascii_lowercase(),
+            self.max_connections.map(|m| m.to_string()).unwrap_or_default(),
+        )
     }
 
     /// The `POST /air/offer_requests` body.
@@ -1698,7 +1740,15 @@ mod client_tests {
     fn tool(server: &MockServer) -> (crate::tools::duffel::FlightSearchTool, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open(dir.path().join("t.duckdb")).unwrap();
-        (FlightSearchTool { client: client(server), store, user_id: 7 }, dir)
+        (
+            FlightSearchTool {
+                client: client(server),
+                store,
+                user_id: 7,
+                budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+            },
+            dir,
+        )
     }
 
     fn searches_logged(tool: &crate::tools::duffel::FlightSearchTool) -> i64 {
@@ -1708,6 +1758,120 @@ mod client_tests {
             .get(&7)
             .copied()
             .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn the_same_search_twice_in_one_request_only_reaches_duffel_once() {
+        // The model re-asks a route while it works through a comparison.
+        // Seconds apart the offers are the same offers, and the second ask
+        // is a second charge for an answer already in hand.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": [
+                {"id": "off_1", "total_amount": "184.30", "total_currency": "EUR",
+                 "owner": {"name": "KLM"}, "slices": []}
+            ]}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        let first = rig::tool::Tool::call(&tool, query()).await.unwrap();
+        let second = rig::tool::Tool::call(&tool, query()).await.unwrap();
+        assert_eq!(first, second, "the repeat must return the same answer");
+        // Billing is per request sent, so the repeat is not counted either.
+        assert_eq!(searches_logged(&tool), 1);
+        assert_eq!(tool.budget.spent(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_repeat_is_recognised_however_the_model_spells_it() {
+        // "ams" today and "AMS" a turn later are one route, and adults: 1
+        // is what adults: null already meant.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        rig::tool::Tool::call(&tool, query()).await.unwrap();
+
+        let mut same = query();
+        same.origin = "ams".to_string();
+        same.destination = " LIS ".to_string();
+        same.adults = Some(1);
+        rig::tool::Tool::call(&tool, same).await.unwrap();
+        assert_eq!(tool.budget.spent(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_different_date_is_a_different_search() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        rig::tool::Tool::call(&tool, query()).await.unwrap();
+        let mut later = query();
+        later.departure_date = "2026-09-15".to_string();
+        rig::tool::Tool::call(&tool, later).await.unwrap();
+        assert_eq!(tool.budget.spent(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_hits_the_cap_stops_spending_and_says_why() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .expect(crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST as u64)
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        for day in 1..=crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST {
+            let mut q = query();
+            q.departure_date = format!("2026-09-{day:02}");
+            rig::tool::Tool::call(&tool, q).await.unwrap();
+        }
+
+        let mut over = query();
+        over.departure_date = "2026-10-01".to_string();
+        let err = rig::tool::Tool::call(&tool, over).await.unwrap_err().to_string();
+        assert!(
+            err.contains("answer") || err.contains("already"),
+            "the message should tell the model to answer with what it has, got: {err}"
+        );
+        // Nothing further was sent, so nothing further was billed.
+        assert_eq!(searches_logged(&tool), crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST as i64);
+    }
+
+    #[tokio::test]
+    async fn a_repeat_still_answers_after_the_cap_is_reached() {
+        // The allowance limits what is bought, not what is already known —
+        // refusing a route we hold results for would throw away money
+        // already spent.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
+            .expect(crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST as u64)
+            .mount(&server)
+            .await;
+
+        let (tool, _dir) = tool(&server);
+        for day in 1..=crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST {
+            let mut q = query();
+            q.departure_date = format!("2026-09-{day:02}");
+            rig::tool::Tool::call(&tool, q).await.unwrap();
+        }
+
+        let mut repeat = query();
+        repeat.departure_date = "2026-09-01".to_string();
+        assert!(rig::tool::Tool::call(&tool, repeat).await.is_ok());
     }
 
     #[tokio::test]
@@ -1723,8 +1887,12 @@ mod client_tests {
 
         let (tool, _dir) = tool(&server);
         assert_eq!(searches_logged(&tool), 0);
+        // Two genuinely different journeys: a repeat is served from the memo
+        // and deliberately not counted (see the dedupe tests above).
         rig::tool::Tool::call(&tool, query()).await.unwrap();
-        rig::tool::Tool::call(&tool, query()).await.unwrap();
+        let mut other = query();
+        other.destination = "OPO".to_string();
+        rig::tool::Tool::call(&tool, other).await.unwrap();
         assert_eq!(searches_logged(&tool), 2);
     }
 

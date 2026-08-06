@@ -479,6 +479,9 @@ pub fn build_agent(
             client: duffel.clone(),
             store: d.store.clone(),
             user_id,
+            // One allowance and one memo per user request, like the search
+            // budget above.
+            budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
         });
     }
     builder.default_max_turns(MAX_TURNS).build()

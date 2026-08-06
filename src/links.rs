@@ -168,27 +168,27 @@ mod tests {
         // the way an ordinary product URL is verified would hand the
         // traveller a link already consumed by our own probe.
         let server = MockServer::start().await;
+        // Exactly one probe is expected here: the lookalike host at the end.
+        // Every links.duffel.com URL must reach this server zero times.
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(0)
+            .expect(1)
             .mount(&server)
             .await;
 
+        // The shape Duffel actually returns, measured 2026-08-06: the token
+        // is a query parameter and there is no path at all. An exemption
+        // that only recognised "links.duffel.com/<something>" would probe
+        // — and spend — every real booking link.
+        let real = "https://links.duffel.com?token=U0ZNeU5UWS5nMmdEYlFBQUFCWXdNREF3UWpr";
         let http = reqwest::Client::new();
-        for url in [
-            "https://links.duffel.com/abc123",
-            "https://book.example.com/session",
-        ]
-        .iter()
-        .take(1)
-        {
-            assert!(!is_dead_link(&http, url).await);
-        }
-        assert!(dead_links_in(&http, "book here: https://links.duffel.com/abc123")
-            .await
-            .is_empty());
-        // The exemption is by host, not by any URL that mentions duffel.
-        assert!(!extract_urls("https://links.duffel.com/x").is_empty());
+        assert!(!is_dead_link(&http, real).await);
+        assert!(dead_links_in(&http, &format!("book here: {real}")).await.is_empty());
+        // Path form too, in case they ever change it.
+        assert!(!is_dead_link(&http, "https://links.duffel.com/s/abc123").await);
+
+        // The exemption is by host: a lookalike elsewhere is still probed.
+        assert!(is_dead_link(&http, &format!("{}/links.duffel.com", server.uri())).await);
     }
 
     #[test]

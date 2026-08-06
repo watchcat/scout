@@ -9,6 +9,56 @@
 //! for the same reason `compare_prices` exists. Duffel returns
 //! `total_amount` as a *string*, and sorting those lexically puts "1000.00"
 //! below "62.19".
+//!
+//! The tool the agent calls is first; everything below it is what that call
+//! is made of — the query, the client, the response parsing, the ranking.
+
+/// Live flight search. Registered only when `DUFFEL_API_KEY` is set, so the
+/// model never sees a tool that cannot work.
+pub struct FlightSearchTool {
+    pub client: DuffelClient,
+}
+
+impl rig::tool::Tool for FlightSearchTool {
+    const NAME: &'static str = "search_flights";
+    type Error = DuffelError;
+    type Args = FlightQuery;
+    type Output = FlightSearchOutput;
+
+    fn description(&self) -> String {
+        "Search live flight prices and schedules for a route and date. \
+         Returns real, bookable offers from the airlines themselves — prices, \
+         times, stops, flight numbers and included baggage — ranked cheapest \
+         first in Rust. Use this for any 'flights to X', 'how much to fly to \
+         X', or 'cheapest flight' question instead of searching the web: \
+         fares change hourly and a search result page cannot be trusted for \
+         one. Give airports as 3-letter IATA codes and dates as YYYY-MM-DD. \
+         Scout cannot book: quote the numbers and let the user buy from the \
+         airline."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "origin": {"type": "string", "description": "departure airport or city, 3-letter IATA code (AMS, LHR, NYC)"},
+                "destination": {"type": "string", "description": "arrival airport or city, 3-letter IATA code"},
+                "departure_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "return_date": {"type": "string", "description": "YYYY-MM-DD; omit for a one-way"},
+                "adults": {"type": "integer", "description": "adult passengers, default 1"},
+                "cabin_class": {"type": "string", "enum": CABIN_CLASSES},
+                "max_connections": {"type": "integer", "description": "0 for direct flights only, up to 2"}
+            },
+            "required": ["origin", "destination", "departure_date"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let flights = self.client.search(&args).await?;
+        Ok(FlightSearchOutput::new(&args, rank(flights)))
+    }
+}
 
 /// Duffel writes durations as ISO 8601 ("PT2H30M"), including a day part on
 /// overnight itineraries ("P1DT2H5M"). Whole minutes is all a traveller
@@ -456,53 +506,6 @@ impl FlightSearchOutput {
                 rows: Vec::new(),
             },
         }
-    }
-}
-
-/// Live flight search. Registered only when `DUFFEL_API_KEY` is set, so the
-/// model never sees a tool that cannot work.
-pub struct FlightSearchTool {
-    pub client: DuffelClient,
-}
-
-impl rig::tool::Tool for FlightSearchTool {
-    const NAME: &'static str = "search_flights";
-    type Error = DuffelError;
-    type Args = FlightQuery;
-    type Output = FlightSearchOutput;
-
-    fn description(&self) -> String {
-        "Search live flight prices and schedules for a route and date. \
-         Returns real, bookable offers from the airlines themselves — prices, \
-         times, stops, flight numbers and included baggage — ranked cheapest \
-         first in Rust. Use this for any 'flights to X', 'how much to fly to \
-         X', or 'cheapest flight' question instead of searching the web: \
-         fares change hourly and a search result page cannot be trusted for \
-         one. Give airports as 3-letter IATA codes and dates as YYYY-MM-DD. \
-         Scout cannot book: quote the numbers and let the user buy from the \
-         airline."
-            .to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "origin": {"type": "string", "description": "departure airport or city, 3-letter IATA code (AMS, LHR, NYC)"},
-                "destination": {"type": "string", "description": "arrival airport or city, 3-letter IATA code"},
-                "departure_date": {"type": "string", "description": "YYYY-MM-DD"},
-                "return_date": {"type": "string", "description": "YYYY-MM-DD; omit for a one-way"},
-                "adults": {"type": "integer", "description": "adult passengers, default 1"},
-                "cabin_class": {"type": "string", "enum": CABIN_CLASSES},
-                "max_connections": {"type": "integer", "description": "0 for direct flights only, up to 2"}
-            },
-            "required": ["origin", "destination", "departure_date"]
-        })
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let flights = self.client.search(&args).await?;
-        Ok(FlightSearchOutput::new(&args, rank(flights)))
     }
 }
 

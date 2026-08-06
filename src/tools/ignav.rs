@@ -118,6 +118,158 @@ impl IgnavClient {
         })?;
         Ok(parsed.itineraries.into_iter().filter_map(flight).collect())
     }
+
+    /// Where a flight found earlier can be bought.
+    ///
+    /// The lookup returns a *refreshed* itinerary, so the price here is
+    /// today's rather than the one the search quoted — the caller compares
+    /// the two and says so when it has moved.
+    pub async fn booking_links(&self, ignav_id: &str) -> Result<BookingLinks, IgnavError> {
+        let resp = self
+            .http
+            .post(format!("{}/fares/booking-links", self.base_url))
+            .header("X-Api-Key", &self.api_key)
+            .header("Accept", "application/json")
+            // Deliberately just the id. Measured live: sending `market`
+            // alongside it is a 400 — "ignav_id lookups do not accept
+            // passenger or market fields" — because the id already carries
+            // the market and passengers of the search that produced it.
+            .json(&serde_json::json!({"ignav_id": ignav_id}))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(IgnavError::Api {
+                status: status.as_u16(),
+                body: text.chars().take(300).collect(),
+            });
+        }
+        let parsed: RawBookingResponse =
+            serde_json::from_str(&text).map_err(|e| IgnavError::Decode {
+                detail: format!("{e}; body: {}", text.chars().take(200).collect::<String>()),
+            })?;
+
+        let itinerary = parsed.itinerary;
+        let self_transfer = itinerary
+            .as_ref()
+            .and_then(|i| i.requires_self_transfer)
+            .unwrap_or(false);
+
+        let mut options: Vec<BookingOption> = parsed
+            .booking_options
+            .into_iter()
+            .flat_map(|o| o.links)
+            .filter(|l| !l.url.trim().is_empty())
+            .map(|l| BookingOption {
+                provider: l.provider_name.unwrap_or_default(),
+                provider_type: l.provider_type.unwrap_or_default(),
+                fare_name: l.fare_name,
+                price: l.price.as_ref().and_then(|p| p.amount),
+                currency: l.price.as_ref().and_then(|p| p.currency.clone()),
+                url: l.url,
+            })
+            .collect();
+        // Airlines first, then by price. Booking direct means one party to
+        // deal with when the flight changes, which is worth more than a
+        // few euro to most travellers — but see the note below.
+        options.sort_by(|a, b| {
+            let rank = |o: &BookingOption| u8::from(o.provider_type != "airline");
+            rank(a)
+                .cmp(&rank(b))
+                .then(a.price.unwrap_or(f64::MAX).total_cmp(&b.price.unwrap_or(f64::MAX)))
+        });
+
+        let mut notes = Vec::new();
+        if self_transfer {
+            notes.push(
+                "this itinerary is booked as separate tickets — the traveller collects their \
+                 bags, checks in again, and has no protection if the first flight is late"
+                    .to_string(),
+            );
+        }
+        // Airline-first is a default, not a verdict: say when it costs more.
+        let cheapest_airline = options
+            .iter()
+            .filter(|o| o.provider_type == "airline")
+            .filter_map(|o| o.price)
+            .fold(f64::MAX, f64::min);
+        if let Some(cheaper) = options
+            .iter()
+            .filter(|o| o.provider_type != "airline")
+            .filter(|o| o.price.is_some_and(|p| p < cheapest_airline))
+            .min_by(|a, b| a.price.unwrap().total_cmp(&b.price.unwrap()))
+        {
+            notes.push(format!(
+                "{} sells it for {:.2} {}, below the airline's own {:.2} — say both and let the \
+                 user choose; booking direct means one party to deal with if the flight changes",
+                cheaper.provider,
+                cheaper.price.unwrap_or_default(),
+                cheaper.currency.clone().unwrap_or_default(),
+                cheapest_airline
+            ));
+        }
+
+        Ok(BookingLinks {
+            price_now: itinerary.as_ref().and_then(|i| i.price.amount),
+            currency: itinerary.as_ref().and_then(|i| i.price.currency.clone()),
+            self_transfer,
+            options,
+            notes,
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RawBookingResponse {
+    #[serde(default)]
+    itinerary: Option<RawItinerary>,
+    #[serde(default)]
+    booking_options: Vec<RawBookingOption>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawBookingOption {
+    #[serde(default)]
+    links: Vec<RawBookingLink>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawBookingLink {
+    #[serde(default)]
+    provider_name: Option<String>,
+    #[serde(default)]
+    provider_type: Option<String>,
+    #[serde(default)]
+    fare_name: Option<String>,
+    #[serde(default)]
+    price: Option<RawPrice>,
+    #[serde(default)]
+    url: String,
+}
+
+/// Where one flight can actually be bought, and for how much.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct BookingLinks {
+    /// The price Ignav states now. The lookup refreshes the itinerary, so
+    /// this can differ from what the search returned.
+    pub price_now: Option<f64>,
+    pub currency: Option<String>,
+    pub self_transfer: bool,
+    /// Sellers, airlines first.
+    pub options: Vec<BookingOption>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct BookingOption {
+    pub provider: String,
+    /// `airline` or `third_party`.
+    pub provider_type: String,
+    pub fare_name: Option<String>,
+    pub price: Option<f64>,
+    pub currency: Option<String>,
+    pub url: String,
 }
 
 /// Turns one Ignav itinerary into the shape the ranking already speaks.
@@ -316,6 +468,275 @@ struct RawBags {
     checked: Option<u32>,
 }
 
+/// Hands over where a flight already shown can actually be bought.
+///
+/// Registered alongside `search_flights` whenever Ignav is configured.
+/// Unlike Duffel's hosted checkout, these links open the seller's own page
+/// with the flight already selected.
+pub struct BookingLinksTool {
+    pub client: IgnavClient,
+    /// The same memo the search filled, so what Scout quoted can be
+    /// compared against what the seller says now without asking the model
+    /// to remember a number.
+    pub budget: std::sync::Arc<crate::tools::budget::FlightBudget>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BookingLinksArgs {
+    /// The `offer_id` of an Ignav row already shown to the user.
+    pub ignav_id: String,
+}
+
+impl rig::tool::Tool for BookingLinksTool {
+    const NAME: &'static str = "flight_booking_links";
+    type Error = IgnavError;
+    type Args = BookingLinksArgs;
+    type Output = BookingLinks;
+
+    fn description(&self) -> String {
+        "Where a flight you already showed can be bought. Pass the offer_id \
+         of a row from search_flights whose source is 'ignav'. Returns the \
+         airline's own booking page and any resellers, each with their \
+         price, opening with the flight already selected — the user does not \
+         re-enter anything. Call it only when the user says which flight \
+         they want. The price is re-checked at this point, so read the notes: \
+         a fare that has moved since you quoted it must be reported, not \
+         glossed over. Does not work for Duffel rows — those use \
+         create_booking_link."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ignav_id": {"type": "string", "description": "offer_id of an ignav row from search_flights"}
+            },
+            "required": ["ignav_id"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let mut found = self.client.booking_links(&args.ignav_id).await?;
+        // What this request actually put in front of the user, kept by
+        // Rust rather than recalled by the model.
+        if let (Some((quoted, currency)), Some(now)) =
+            (self.budget.quoted_price(&args.ignav_id), found.price_now)
+        {
+            if (now - quoted).abs() >= 0.01 {
+                let direction = if now > quoted { "risen" } else { "fallen" };
+                found.notes.push(format!(
+                    "the fare has {direction} since it was quoted: {quoted:.2} {currency} then, \
+                     {now:.2} {} now — tell the user the new price plainly before they open the \
+                     link, do not repeat the old one",
+                    found.currency.clone().unwrap_or(currency.clone())
+                ));
+            }
+        }
+        Ok(found)
+    }
+}
+
+#[cfg(test)]
+mod booking_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn client(server: &MockServer) -> IgnavClient {
+        IgnavClient::new(reqwest::Client::new(), "key".to_string(), server.uri())
+            .with_market("nl")
+    }
+
+    /// Two sellers for one flight, at different prices — which is the
+    /// normal case and the reason this endpoint is worth calling.
+    fn options(searched: f64, airline: f64, ota: f64) -> serde_json::Value {
+        json!({
+            "itinerary": {
+                "price": {"amount": searched, "currency": "EUR", "status": "verified"},
+                "outbound": {"carrier": "Transavia", "duration_minutes": 185, "segments": [{
+                    "marketing_carrier_code": "HV", "flight_number": "5955",
+                    "departure_airport": "AMS", "departure_time_local": "2026-09-14T17:40:00",
+                    "arrival_airport": "LIS", "arrival_time_local": "2026-09-14T19:45:00",
+                    "duration_minutes": 185
+                }]},
+                "requires_self_transfer": false
+            },
+            "booking_options": [{
+                "legs": [0],
+                "links": [
+                    {"provider_name": "Gotogate", "provider_type": "third_party",
+                     "fare_name": "Basic", "price": {"amount": ota, "currency": "EUR", "status": "verified"},
+                     "url": "https://www.gotogate.com/x"},
+                    {"provider_name": "Transavia", "provider_type": "airline",
+                     "fare_name": "Basic", "price": {"amount": airline, "currency": "EUR", "status": "verified"},
+                     "url": "https://www.transavia.com/y"}
+                ]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_booking_lookup_asks_by_id_and_puts_the_airline_first() {
+        // Booking direct is the safer default: one party to deal with when
+        // the flight changes, and no OTA between the traveller and the
+        // airline. Cheaper elsewhere is worth saying, not worth silently
+        // preferring.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/fares/booking-links"))
+            // Just the id: adding `market` here is a 400 from the real API,
+            // since the id already carries the search's market. The first
+            // version of this test asserted the opposite and passed.
+            .and(body_json(json!({"ignav_id": "abc123"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(options(118.0, 121.0, 118.0)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let found = client(&server).booking_links("abc123").await.unwrap();
+        assert_eq!(found.options[0].provider, "Transavia");
+        assert_eq!(found.options[0].provider_type, "airline");
+        assert_eq!(found.options[1].provider, "Gotogate");
+        assert_eq!(found.price_now, Some(118.0));
+        assert_eq!(found.currency.as_deref(), Some("EUR"));
+    }
+
+    #[tokio::test]
+    async fn a_cheaper_third_party_is_pointed_out_rather_than_buried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(options(118.0, 140.0, 118.0)))
+            .mount(&server)
+            .await;
+
+        let found = client(&server).booking_links("abc123").await.unwrap();
+        assert!(
+            found.notes.iter().any(|n| n.contains("Gotogate") && n.contains("118")),
+            "the cheaper seller must be named with its price, got: {:?}",
+            found.notes
+        );
+        // Still airline-first in the list; the note carries the trade-off.
+        assert_eq!(found.options[0].provider_type, "airline");
+    }
+
+    #[tokio::test]
+    async fn a_self_transfer_itinerary_still_says_so_at_booking_time() {
+        let server = MockServer::start().await;
+        let mut body = options(90.0, 90.0, 95.0);
+        body["itinerary"]["requires_self_transfer"] = json!(true);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let found = client(&server).booking_links("abc123").await.unwrap();
+        assert!(found.self_transfer);
+        assert!(
+            found.notes.iter().any(|n| n.contains("separate tickets")),
+            "got: {:?}",
+            found.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fare_that_moved_since_it_was_quoted_is_reported_not_glossed_over() {
+        // The lookup refreshes the itinerary, so the number the user was
+        // shown a minute ago can be wrong by the time they tap the link.
+        // The old price comes from Rust's own memo, never from the model.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(options(139.0, 139.0, 145.0)))
+            .mount(&server)
+            .await;
+
+        let budget = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
+        let mut quoted = crate::tools::duffel::Flight {
+            offer_id: "abc123".to_string(),
+            source: Source::Ignav,
+            price_status: PriceStatus::Approximate,
+            self_transfer: false,
+            airline: "Transavia".to_string(),
+            price: 118.0,
+            currency: "EUR".to_string(),
+            legs: Vec::new(),
+            total_minutes: None,
+            total_duration: None,
+            checked_bags: None,
+            carry_on_bags: None,
+            expires_at: None,
+        };
+        quoted.price = 118.0;
+        budget.remember("AMS-LIS".to_string(), vec![quoted]);
+
+        let tool = BookingLinksTool { client: client(&server), budget };
+        let found = rig::tool::Tool::call(
+            &tool,
+            BookingLinksArgs { ignav_id: "abc123".to_string() },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            found.notes.iter().any(|n| n.contains("118") && n.contains("139") && n.contains("risen")),
+            "both prices and the direction must be stated, got: {:?}",
+            found.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_fare_needs_no_warning() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(options(118.0, 118.0, 125.0)))
+            .mount(&server)
+            .await;
+
+        let budget = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
+        budget.remember(
+            "AMS-LIS".to_string(),
+            vec![crate::tools::duffel::Flight {
+                offer_id: "abc123".to_string(),
+                source: Source::Ignav,
+                price_status: PriceStatus::Approximate,
+                self_transfer: false,
+                airline: "Transavia".to_string(),
+                price: 118.0,
+                currency: "EUR".to_string(),
+                legs: Vec::new(),
+                total_minutes: None,
+                total_duration: None,
+                checked_bags: None,
+                carry_on_bags: None,
+                expires_at: None,
+            }],
+        );
+
+        let tool = BookingLinksTool { client: client(&server), budget };
+        let found =
+            rig::tool::Tool::call(&tool, BookingLinksArgs { ignav_id: "abc123".to_string() })
+                .await
+                .unwrap();
+        assert!(
+            !found.notes.iter().any(|n| n.contains("risen") || n.contains("fallen")),
+            "got: {:?}",
+            found.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_fails_says_so_rather_than_returning_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unknown id"))
+            .mount(&server)
+            .await;
+        let err = client(&server).booking_links("gone").await.unwrap_err();
+        assert!(matches!(err, IgnavError::Api { status: 404, .. }), "got: {err}");
+    }
+}
+
 #[cfg(test)]
 mod live {
     //! Ignored by default: needs `IGNAV_API_KEY` and network.
@@ -363,6 +784,24 @@ mod live {
         assert_eq!(f.legs[0].origin, query.origin, "segment airports did not parse");
         assert!(f.legs[0].duration_minutes.is_some(), "duration did not parse");
         assert!(f.legs[0].itinerary.contains('✈'), "strip did not draw: {}", f.legs[0].itinerary);
+
+        // Where the cheapest one can actually be bought.
+        let found = client.booking_links(&f.offer_id).await.unwrap();
+        println!(
+            "LIVE booking links for {} — now {:?} {:?}, self_transfer={}",
+            f.offer_id, found.price_now, found.currency, found.self_transfer
+        );
+        for o in &found.options {
+            println!(
+                "  {:<14} {:<12} {:?} {:?}\n      {}",
+                o.provider, o.provider_type, o.fare_name, o.price, o.url
+            );
+        }
+        for n in &found.notes {
+            println!("  note: {n}");
+        }
+        assert!(!found.options.is_empty(), "a bookable fare should have somewhere to buy it");
+        assert!(found.options.iter().all(|o| o.url.starts_with("http")), "links must be real URLs");
     }
 }
 

@@ -108,6 +108,22 @@ impl FlightBudget {
     pub fn spent(&self) -> usize {
         self.spent.load(Ordering::Relaxed)
     }
+
+    /// What this request quoted for one flight, by its provider id.
+    ///
+    /// Booking links come back with a refreshed price, and the only
+    /// trustworthy record of what the user was actually shown is the one
+    /// Rust kept. Asking the model to pass the old price back would let a
+    /// changed fare be reported as unchanged.
+    pub fn quoted_price(&self, offer_id: &str) -> Option<(f64, String)> {
+        self.seen
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .find(|f| f.offer_id == offer_id)
+            .map(|f| (f.price, f.currency.clone()))
+    }
 }
 
 #[cfg(test)]

@@ -120,8 +120,16 @@ separate paid search. Nobody can price a whole month; if that is what is \
 wanted, say a week either side is the most that can be checked and pick the \
 part that matters. A flight price expires \
 within minutes, so never repeat one from earlier in the conversation; search \
-again. When create_booking_link is available and the user says they want to \
-book, call it and give them the link on its own line. Say plainly what it \
+again. When the user picks an ignav row to book, call \
+flight_booking_links with that row's offer_id. It returns the airline's own \
+page and any resellers, each with a price, and they open with the flight \
+already selected - so unlike the Duffel link, there is nothing for the user \
+to re-enter. Give the airline's link first and name any reseller that is \
+cheaper, with both prices, rather than choosing for them. The fare is \
+re-checked at that moment: if a note says it has risen or fallen, tell them \
+the new price before they open anything and never repeat the old one. \
+When create_booking_link is available and the user says they want to \
+book a Duffel row, call it and give them the link on its own line. Say plainly what it \
 is: Duffel's own checkout, where they pick the flight and pay; Scout never \
 sees passenger or card details. It CANNOT be pre-filled - it opens on its \
 own search box - so repeat the route, date and price for them to enter, and \
@@ -538,6 +546,9 @@ pub fn build_agent(
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     // One allowance per request, shared by both searching tools.
     let budget = std::sync::Arc::new(crate::tools::budget::SearchBudget::default());
+    // One memo per request, shared by the flight search and the booking
+    // lookup so the latter can compare against what was actually quoted.
+    let flights = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
     let mut builder = d
         .llm
         .agent(MODEL)
@@ -587,6 +598,17 @@ pub fn build_agent(
                     None => c,
                 }),
         });
+        // Where an Ignav row can actually be bought. Unlike Duffel's
+        // hosted checkout these open with the flight already selected.
+        if let Some(ignav) = &d.ignav {
+            builder = builder.tool(crate::tools::ignav::BookingLinksTool {
+                // No market here: an ignav_id lookup rejects one, because
+                // the id already carries the market of the search that
+                // produced it.
+                client: ignav.clone(),
+                budget: flights.clone(),
+            });
+        }
         // Offered only when Duffel has enabled Links on the account and
         // there is somewhere to send people back to. Registering it
         // otherwise means the model promises a booking it cannot deliver.

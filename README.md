@@ -70,6 +70,10 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   get read the same way as any other page
 - Second-hand search across eBay / Marktplaats / Vinted in parallel, with
   sold and deleted listings filtered out
+- **Flights**, when a Duffel key is set: live fares straight from the
+  airlines with times, stops, flight numbers and included baggage, ranked
+  cheapest-first in Rust. Search only — Scout never books, so no passenger
+  or card details exist to leak
 
 **Remembers things**
 - Purchase history: *"where did I buy this last time?"* — react 👍 to a
@@ -126,6 +130,7 @@ compiles from source.
 | `EBAY_MARKETPLACE` | no | `EBAY_NL` | eBay marketplace id |
 | `BOL_CLIENT_ID` + `BOL_CLIENT_SECRET` | no | — | bol.com Catalog API; needs an **approved** affiliate account, which bol.com may decline |
 | `BOL_COUNTRY` | no | `NL` | `NL` or `BE` |
+| `DUFFEL_API_KEY` | no | — | flight search. A `duffel_test_` key is free and returns Duffel's fake airline; a live key bills per search |
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
 | `SCOUT_CHROME` | no | auto-detected | Chrome/Chromium for the headless fallback |
 | `SCOUT_DB_PATH` | no | `scout.duckdb` | DuckDB file |
@@ -138,30 +143,32 @@ lives in the `scout-data` volume and survives rebuilds.
 ## How it works
 
 ```
-Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 12 tools
+Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 13 tools
                 │                                    │
                 │  streams progress + answer         ├─ search_web        Kagi + Perplexity, merged
                 │  back into one edited message      ├─ search_secondhand eBay / Marktplaats / Vinted
                 │                                    ├─ search_bol        bol.com catalogue *
-                ▼                                    ├─ fetch_page        + headless-Chrome fallback
-        link verification                            ├─ compare_prices    deterministic, in Rust
-        (nothing dead ships)                         ├─ query_purchases   ─┐
+                ▼                                    ├─ search_flights    Duffel, live fares *
+        link verification                            ├─ fetch_page        + headless-Chrome fallback
+        (nothing dead ships)                         ├─ compare_prices    deterministic, in Rust
+                                                     ├─ query_purchases   ─┐
                                                      ├─ record_purchase    ├─ DuckDB
                                                      ├─ remember_fact      │
                                                      ├─ forget_fact       ─┘
                                                      └─ reminders (create/list/cancel)
 
         * registered only when its credentials are set — bol.com needs an
-          approved affiliate account, and they do reject applications
+          approved affiliate account, and they do reject applications;
+          Duffel hands out free test keys to anyone
 ```
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **181 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **216 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness.
 
-Roughly 8,500 lines of Rust across a dozen focused modules.
+Roughly 10,600 lines of Rust across a dozen focused modules.
 
 ---
 
@@ -174,6 +181,11 @@ Roughly 8,500 lines of Rust across a dozen focused modules.
   affiliate accounts, and bol.com turns applications down. Each integration
   is optional and Scout runs fine without it — the shop just goes back to
   being an ordinary page found by search and read for its structured data.
+- **Flight prices are quotes, not seats.** A Duffel offer expires minutes
+  after it is made, so a fare Scout quoted is a fare that *was* available.
+  It never books, and it never repeats a price from earlier in the
+  conversation — it searches again. Airport codes are the model's job, so a
+  wrong one is a wrong answer rather than a silent one.
 - **Not every wall falls.** Headless Chrome clears Cloudflare on some shops and
   not others. When a page can't be verified, Scout says so rather than
   guessing.
@@ -192,7 +204,7 @@ Roughly 8,500 lines of Rust across a dozen focused modules.
 ## Development
 
 ```bash
-cargo test                  # 181 tests, no network needed
+cargo test                  # 216 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

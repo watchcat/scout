@@ -68,6 +68,26 @@ furniture, bikes, tools...).
 directly, so the title, price and product URL are current and need no \
 fetch_page. Search it in Dutch. Its delivery text is timing, not shipping \
 cost, so shipping stays unknown for compare_prices unless a page states it.
+- When search_flights is available, use it for every flight question - never \
+a web search, and never compare_prices, whose per-unit arithmetic means \
+nothing for a flight. It asks the airlines directly, so its prices, times \
+and flight numbers are current. Work out the airport codes yourself rather \
+than asking: Amsterdam is AMS, Lisbon LIS, London LHR (or LON for all its \
+airports), and dates go in as YYYY-MM-DD. Take every number from its output \
+verbatim - cheapest and fastest are ranked in Rust and are not yours to \
+recompute - and quote its route field so the reply cannot drift onto a \
+route nobody searched. departing_at_local and arriving_at_local are each in \
+the local time of their own airport with no offset, so NEVER subtract them \
+to work out how long a flight takes: LHR 10:03 to JFK 13:01 is a 7h58m \
+flight, not a 2h58m one. Give journey length from the duration field, which \
+is already written out for you. Prices are the whole trip for all passengers. Say \
+what its notes say when they matter: a cheapest option that takes hours \
+longer, bags that are not included, offers left out for being in another \
+currency. found: 0 means nothing flies that route that day - say so plainly \
+rather than apologising or guessing at alternatives. A flight price expires \
+within minutes, so never repeat one from earlier in the conversation; search \
+again. Scout cannot book flights either: give the numbers and let the user \
+buy from the airline.
 - Some users list favourite shops below, each with the kind of product it \
 is for. When what you are searching for falls in that kind - judge it \
 sensibly, a stain remover is a cleaning product - spend one of search_web's \
@@ -194,6 +214,10 @@ pub struct AgentDeps {
     pub perplexity: Option<crate::tools::perplexity::PerplexityClient>,
     pub http: reqwest::Client,
     pub ebay: Option<EbayClient>,
+    /// Live flight search when a Duffel key is configured. Search only —
+    /// Scout never creates an order, so no passenger details or payment
+    /// ever pass through it.
+    pub duffel: Option<crate::tools::duffel::DuffelClient>,
     pub marktplaats: MarktplaatsClient,
     pub store: Store,
     pub secondhand_sites: Vec<String>,
@@ -434,6 +458,9 @@ pub fn build_agent(
     // cannot work.
     if let Some(bol) = &d.bol {
         builder = builder.tool(crate::tools::bol::BolSearchTool { client: bol.clone() });
+    }
+    if let Some(duffel) = &d.duffel {
+        builder = builder.tool(crate::tools::duffel::FlightSearchTool { client: duffel.clone() });
     }
     builder.default_max_turns(MAX_TURNS).build()
 }

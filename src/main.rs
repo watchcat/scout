@@ -79,6 +79,15 @@ async fn main() -> Result<()> {
         "second search engine (Kagi always on)"
     );
 
+    let duffel = cfg.duffel_api_key.clone().map(|key| {
+        tools::duffel::DuffelClient::new(
+            http.clone(),
+            key,
+            tools::duffel::DUFFEL_API_BASE.to_string(),
+        )
+    });
+    tracing::info!(duffel_api = duffel.is_some(), "flight search (search only)");
+
     let deps = AgentDeps {
         llm,
         kagi,
@@ -87,6 +96,7 @@ async fn main() -> Result<()> {
         perplexity,
         http,
         ebay,
+        duffel,
         marktplaats,
         store: store.clone(),
         secondhand_sites: cfg.secondhand_sites.clone(),

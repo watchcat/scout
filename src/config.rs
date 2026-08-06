@@ -21,6 +21,10 @@ pub struct Config {
     /// eBay Browse API credentials; both set or feature disabled.
     pub ebay_credentials: Option<(String, String)>,
     pub ebay_marketplace: String,
+    /// Duffel API key; without it the flight search tool is not offered.
+    /// A `duffel_test_`-prefixed key searches Duffel's fake airline and
+    /// costs nothing, which is the right key for trying this out.
+    pub duffel_api_key: Option<String>,
 }
 
 impl Config {
@@ -81,6 +85,7 @@ impl Config {
             bol_country: get("BOL_COUNTRY").unwrap_or_else(|| "NL".to_string()),
             ebay_credentials,
             ebay_marketplace: get("EBAY_MARKETPLACE").unwrap_or_else(|| "EBAY_NL".to_string()),
+            duffel_api_key: non_empty("DUFFEL_API_KEY"),
         })
     }
 }
@@ -221,6 +226,24 @@ mod tests {
         // Blank is the same as unset: fall back to the first allowed id.
         env.insert("SCOUT_ADMIN_USER_IDS", "  ");
         assert_eq!(load(&env).unwrap().admin_user_ids, HashSet::from([111]));
+    }
+
+    #[test]
+    fn the_duffel_key_is_optional_and_turns_on_flight_search() {
+        // Absent is the normal case: everything else in Scout still works,
+        // and the model is never shown a tool that cannot run.
+        assert!(load(&base_env()).unwrap().duffel_api_key.is_none());
+
+        let mut env = base_env();
+        env.insert("DUFFEL_API_KEY", "duffel_test_abc");
+        assert_eq!(
+            load(&env).unwrap().duffel_api_key.as_deref(),
+            Some("duffel_test_abc")
+        );
+
+        // Blank is the same as unset, not an empty bearer token.
+        env.insert("DUFFEL_API_KEY", "   ");
+        assert!(load(&env).unwrap().duffel_api_key.is_none());
     }
 
     #[test]

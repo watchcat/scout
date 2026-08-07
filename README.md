@@ -1,10 +1,22 @@
 # Scout
 
-**A Telegram shopping researcher that doesn't make things up.**
+**A Telegram shopping and flight researcher that doesn't make things up.**
 
-Scout finds products, compares real prices, and remembers what you bought. It
-never buys anything — you get verified links and honest comparisons, and the
-purchase stays in your hands.
+Scout finds products and flights, compares real prices, and remembers what you
+bought. It never buys anything — you get verified links, arithmetic done in
+Rust rather than guessed at, and the purchase stays in your hands.
+
+Ask it to fly you somewhere and a flight gets the same suspicion as a bottle of
+detergent. Live fares from the airlines themselves, every connection and how
+long you wait there, bags counted, the whole trip drawn on one line:
+
+```
+AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09
+```
+
+And every price labelled by whether you can actually pay it — because "from
+€180" somewhere else and €220 you can book right now are not the same number,
+and putting them in one list without saying so is how a comparison lies.
 
 Built in Rust with [teloxide](https://github.com/teloxide/teloxide),
 [rig](https://rig.rs), DuckDB, and a deep suspicion of what language models

@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
         // Filled in below, once the bot has told us its username.
         return_url: None,
         links_enabled: cfg.duffel_links_enabled,
+        shown: std::sync::Arc::new(tools::shown::ShownFlights::default()),
         ignav: cfg.ignav_api_key.clone().map(|key| {
             tools::ignav::IgnavClient::new(
                 http_for_ignav,

@@ -281,6 +281,9 @@ pub struct AgentDeps {
     pub links_enabled: bool,
     /// Second flights provider; see `tools::ignav`.
     pub ignav: Option<crate::tools::ignav::IgnavClient>,
+    /// What each chat was last shown, so a booking lookup a turn later can
+    /// tell a real offer id from an invented one. Shared across requests.
+    pub shown: std::sync::Arc<crate::tools::shown::ShownFlights>,
     pub marktplaats: MarktplaatsClient,
     pub store: Store,
     pub secondhand_sites: Vec<String>,
@@ -546,8 +549,8 @@ pub fn build_agent(
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     // One allowance per request, shared by both searching tools.
     let budget = std::sync::Arc::new(crate::tools::budget::SearchBudget::default());
-    // One memo per request, shared by the flight search and the booking
-    // lookup so the latter can compare against what was actually quoted.
+    // One memo per request: a route asked for twice in one question is
+    // answered from it rather than bought again.
     let flights = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
     let mut builder = d
         .llm
@@ -587,7 +590,11 @@ pub fn build_agent(
             user_id,
             // One allowance and one memo per user request, like the search
             // budget above.
-            budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+            budget: flights,
+            // Outlives the request: booking happens a turn later, when the
+            // memo above is gone.
+            shown: d.shown.clone(),
+            chat_id,
             // Priced in the traveller's own currency, or Duffel's euros
             // and Ignav's dollars never get compared.
             ignav: d
@@ -606,7 +613,8 @@ pub fn build_agent(
                 // the id already carries the market of the search that
                 // produced it.
                 client: ignav.clone(),
-                budget: flights.clone(),
+                shown: d.shown.clone(),
+                chat_id,
             });
         }
         // Offered only when Duffel has enabled Links on the account and

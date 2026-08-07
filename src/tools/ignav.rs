@@ -475,10 +475,11 @@ struct RawBags {
 /// with the flight already selected.
 pub struct BookingLinksTool {
     pub client: IgnavClient,
-    /// The same memo the search filled, so what Scout quoted can be
-    /// compared against what the seller says now without asking the model
-    /// to remember a number.
-    pub budget: std::sync::Arc<crate::tools::budget::FlightBudget>,
+    /// What this chat was actually shown, which is the only record of the
+    /// quoted price by the time a booking is asked for — that happens a
+    /// turn later, when the per-request memo is already gone.
+    pub shown: std::sync::Arc<crate::tools::shown::ShownFlights>,
+    pub chat_id: i64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -517,12 +518,54 @@ impl rig::tool::Tool for BookingLinksTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let mut found = self.client.booking_links(&args.ignav_id).await?;
-        // What this request actually put in front of the user, kept by
-        // Rust rather than recalled by the model.
-        if let (Some((quoted, currency)), Some(now)) =
-            (self.budget.quoted_price(&args.ignav_id), found.price_now)
-        {
+        let at = std::time::Instant::now();
+        // Refused before it costs anything. A 32-character hex id carried
+        // across a turn by a model is the invented-ASIN problem again, and
+        // a made-up one answers 404 only after the request is paid for.
+        let Some(quoted) = self.shown.find(self.chat_id, &args.ignav_id, at) else {
+            let known = self.shown.offer_ids(self.chat_id, at);
+            tracing::warn!(
+                ignav_id = %args.ignav_id,
+                chat_id = self.chat_id,
+                "booking link asked for an offer id this chat was never shown"
+            );
+            return Err(IgnavError::Decode {
+                detail: match known.is_empty() {
+                    true => "no flights have been shown in this chat recently, so there is \
+                             nothing to book — search first, then offer a link for one of the \
+                             rows that comes back"
+                        .to_string(),
+                    false => format!(
+                        "{:?} is not an offer_id from this conversation's search results. Copy \
+                         one exactly from the rows you were given — never retype or reconstruct \
+                         it. Available: {}",
+                        args.ignav_id,
+                        known.join(", ")
+                    ),
+                },
+            });
+        };
+        if quoted.source != Source::Ignav {
+            return Err(IgnavError::Decode {
+                detail: format!(
+                    "that row came from {:?}, not Ignav, and only Ignav rows have booking links \
+                     here — tell the user to buy from the airline, or offer a Duffel booking \
+                     link if one is available",
+                    quoted.source
+                ),
+            });
+        }
+
+        let mut found = self.client.booking_links(&args.ignav_id).await.inspect_err(|e| {
+            // Otherwise a failed lookup is visible only to the model, and
+            // the only way anyone learns of it is a user pasting the reply.
+            tracing::warn!(error = %e, ignav_id = %args.ignav_id, "booking link lookup failed");
+        })?;
+
+        // The price this chat was actually shown, kept by Rust rather than
+        // recalled by the model.
+        if let (quoted, Some(now)) = ((quoted.price, quoted.currency.clone()), found.price_now) {
+            let (quoted, currency) = quoted;
             if (now - quoted).abs() >= 0.01 {
                 let direction = if now > quoted { "risen" } else { "fallen" };
                 found.notes.push(format!(
@@ -651,8 +694,8 @@ mod booking_tests {
             .mount(&server)
             .await;
 
-        let budget = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
-        let mut quoted = crate::tools::duffel::Flight {
+        let shown = std::sync::Arc::new(crate::tools::shown::ShownFlights::default());
+        let quoted = crate::tools::duffel::Flight {
             offer_id: "abc123".to_string(),
             source: Source::Ignav,
             price_status: PriceStatus::Approximate,
@@ -667,10 +710,9 @@ mod booking_tests {
             carry_on_bags: None,
             expires_at: None,
         };
-        quoted.price = 118.0;
-        budget.remember("AMS-LIS".to_string(), vec![quoted]);
+        shown.remember(7, vec![quoted], std::time::Instant::now());
 
-        let tool = BookingLinksTool { client: client(&server), budget };
+        let tool = BookingLinksTool { client: client(&server), shown, chat_id: 7 };
         let found = rig::tool::Tool::call(
             &tool,
             BookingLinksArgs { ignav_id: "abc123".to_string() },
@@ -693,9 +735,9 @@ mod booking_tests {
             .mount(&server)
             .await;
 
-        let budget = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
-        budget.remember(
-            "AMS-LIS".to_string(),
+        let shown = std::sync::Arc::new(crate::tools::shown::ShownFlights::default());
+        shown.remember(
+            7,
             vec![crate::tools::duffel::Flight {
                 offer_id: "abc123".to_string(),
                 source: Source::Ignav,
@@ -711,9 +753,10 @@ mod booking_tests {
                 carry_on_bags: None,
                 expires_at: None,
             }],
+            std::time::Instant::now(),
         );
 
-        let tool = BookingLinksTool { client: client(&server), budget };
+        let tool = BookingLinksTool { client: client(&server), shown, chat_id: 7 };
         let found =
             rig::tool::Tool::call(&tool, BookingLinksArgs { ignav_id: "abc123".to_string() })
                 .await

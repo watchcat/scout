@@ -28,6 +28,10 @@ pub struct FlightSearchTool {
     /// than bookable, so they arrive labelled and the ranking warns when
     /// one of them undercuts a price somebody could actually pay.
     pub ignav: Option<crate::tools::ignav::IgnavClient>,
+    /// What this chat was last shown, so a booking lookup in a later
+    /// message can tell a real offer id from an invented one.
+    pub shown: std::sync::Arc<crate::tools::shown::ShownFlights>,
+    pub chat_id: i64,
 }
 
 impl rig::tool::Tool for FlightSearchTool {
@@ -121,6 +125,11 @@ impl rig::tool::Tool for FlightSearchTool {
         by_date.sort_by(|a, b| a.date.cmp(&b.date));
 
         let mut out = FlightSearchOutput::new(&args, rank(all));
+        // Kept for the booking lookup, which happens in a later message
+        // when the per-request memo above is long gone.
+        let now = std::time::Instant::now();
+        self.shown.evict_expired(now);
+        self.shown.remember(self.chat_id, out.rows.clone(), now);
         // Travels with the prices it is baked into. Relying on the preamble
         // alone was measured failing in production: a reply quoted a fare
         // that silently included the fee and never mentioned it.
@@ -497,6 +506,12 @@ pub fn rank(flights: Vec<Flight>) -> Option<FlightResults> {
     // Prices are finite by construction (see `amount`), so an unorderable
     // pair cannot arise; treating one as equal keeps the sort total anyway.
     rows.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+    let mut notes = Vec::new();
+    // Both providers sell the same airlines, so the same seats arrive
+    // twice. Measured in production: Etihad EY44/EY870 as "from EUR 696"
+    // and "EUR 696.71", identical strips, two of seven slots for one
+    // itinerary.
+    dedupe_itineraries(&mut rows, &mut notes, &currency);
     let found = rows.len();
 
     let cheapest = rows.first()?.clone();
@@ -506,7 +521,6 @@ pub fn rank(flights: Vec<Flight>) -> Option<FlightResults> {
         .min_by_key(|(m, _)| *m)
         .map(|(_, f)| f.clone());
 
-    let mut notes = Vec::new();
     if !dropped.is_empty() {
         notes.push(format!(
             "prices came back in more than one currency; {} offers priced in {} were left out \
@@ -1308,6 +1322,88 @@ struct RawBaggage {
     quantity: Option<u32>,
 }
 
+/// Collapses offers for the same journey down to one row.
+///
+/// Two providers selling the same airline return the same seats, and shown
+/// side by side they look like a choice. They are not: it is one aeroplane
+/// at one time, quoted twice.
+///
+/// The bookable copy wins even when it costs more — a price someone can
+/// actually pay beats a cheaper claim about one — and the cheaper
+/// duplicate's price is still reported so the gap is not hidden.
+fn dedupe_itineraries(rows: &mut Vec<Flight>, notes: &mut Vec<String>, currency: &str) {
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    let mut drop_at: Vec<usize> = Vec::new();
+
+    for index in 0..rows.len() {
+        // An offer that states no itinerary has nothing to match on;
+        // collapsing those together would hide real options.
+        let Some(key) = itinerary_key(&rows[index]) else { continue };
+        let Some((_, kept)) = seen.iter_mut().find(|(k, _)| *k == key) else {
+            seen.push((key, index));
+            continue;
+        };
+        // Sorted by price, so the earlier row is the cheaper one. It only
+        // loses its place if the later one can actually be booked.
+        let (winner, loser) = match (
+            rows[*kept].price_status.is_bookable(),
+            rows[index].price_status.is_bookable(),
+        ) {
+            (false, true) => {
+                let previous = *kept;
+                *kept = index;
+                (index, previous)
+            }
+            _ => (*kept, index),
+        };
+        if rows[winner].price_status.is_bookable() && !rows[loser].price_status.is_bookable() {
+            notes.push(format!(
+                "{} is quoted at {:.2} {currency} by {} as an approximate fare and {:.2} \
+                 {currency} by {} as a bookable one — the same flights, so it is listed once at \
+                 the price that can be paid; mention the cheaper quote only as a reason to check \
+                 the airline directly",
+                rows[winner].airline,
+                rows[loser].price,
+                provider(rows[loser].source),
+                rows[winner].price,
+                provider(rows[winner].source),
+            ));
+        }
+        drop_at.push(loser);
+    }
+
+    drop_at.sort_unstable();
+    drop_at.dedup();
+    for index in drop_at.into_iter().rev() {
+        rows.remove(index);
+    }
+}
+
+/// What makes two offers the same journey: the marketing flight numbers, in
+/// order, with the day each leg leaves. Same flights on another date are a
+/// different option, and so are different flights on the same date.
+fn itinerary_key(flight: &Flight) -> Option<String> {
+    if flight.legs.is_empty() || flight.legs.iter().all(|l| l.flights.is_empty()) {
+        return None;
+    }
+    Some(
+        flight
+            .legs
+            .iter()
+            .map(|l| {
+                format!(
+                    "{}@{}",
+                    l.flights.join("-"),
+                    // The date alone: the same flight number leaves at the
+                    // same time, and providers round differently.
+                    l.departing_at_local.split('T').next().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
+    )
+}
+
 /// Who to name in a note. The provider is part of the claim: "approximate,
 /// from Ignav" is checkable in a way that "approximate" alone is not.
 fn provider(source: Source) -> &'static str {
@@ -1483,6 +1579,79 @@ mod tests {
         f.price_status = PriceStatus::Approximate;
         f.airline = "Ryanair".to_string();
         f
+    }
+
+    /// A leg on the given flights, so duplicates can be built by identity
+    /// rather than by hoping two literals match.
+    fn with_leg(mut f: Flight, flights: &[&str], departs: &str) -> Flight {
+        f.legs = vec![Leg {
+            origin: "AMS".into(),
+            destination: "HKG".into(),
+            departing_at_local: departs.into(),
+            arriving_at_local: "2026-09-14T09:00:00".into(),
+            duration_minutes: Some(300),
+            duration: Some("5h".into()),
+            stops: 0,
+            flights: flights.iter().map(|s| s.to_string()).collect(),
+            connections: Vec::new(),
+            itinerary: "AMS ✈ HKG".into(),
+        }];
+        f
+    }
+
+    #[test]
+    fn the_same_flight_from_both_providers_is_shown_once() {
+        // Measured in production: Etihad EY44/EY870 came back as "from EUR
+        // 696" from Ignav and "EUR 696.71" from Duffel, with identical
+        // strips, and both were listed — two of seven slots spent on one
+        // itinerary. They are the same seats on the same aeroplane.
+        let ignav = with_leg(approximate("ig", 696.00), &["EY44", "EY870"], "2026-09-13T10:25:00");
+        let duffel =
+            with_leg(flight("duf", 696.71, "EUR", Some(300)), &["EY44", "EY870"], "2026-09-13T10:25:00");
+
+        let ranked = rank(vec![ignav, duffel]).unwrap();
+        assert_eq!(ranked.rows.len(), 1, "one itinerary, one row");
+        // The bookable one survives even though it costs more: a price
+        // someone can actually pay beats a cheaper claim about one.
+        assert_eq!(ranked.rows[0].offer_id, "duf");
+        assert_eq!(ranked.cheapest.offer_id, "duf");
+        assert!(
+            ranked.notes.iter().any(|n| n.contains("696.00") && n.contains("696.71")),
+            "the cheaper duplicate's price should still be mentioned, got: {:?}",
+            ranked.notes
+        );
+    }
+
+    #[test]
+    fn different_itineraries_on_the_same_flights_are_not_collapsed() {
+        // Same flight numbers, different day: a real second option.
+        let monday = with_leg(flight("mon", 500.0, "EUR", Some(300)), &["EY44"], "2026-09-13T10:25:00");
+        let tuesday = with_leg(flight("tue", 520.0, "EUR", Some(300)), &["EY44"], "2026-09-14T10:25:00");
+        assert_eq!(rank(vec![monday, tuesday]).unwrap().rows.len(), 2);
+
+        // Different flights, same day: also two options.
+        let a = with_leg(flight("a", 500.0, "EUR", Some(300)), &["EY44"], "2026-09-13T10:25:00");
+        let b = with_leg(flight("b", 520.0, "EUR", Some(300)), &["KL887"], "2026-09-13T10:25:00");
+        assert_eq!(rank(vec![a, b]).unwrap().rows.len(), 2);
+    }
+
+    #[test]
+    fn two_approximate_duplicates_keep_the_cheaper_one() {
+        // With nothing bookable to prefer, price decides.
+        let dear = with_leg(approximate("dear", 720.0), &["EY44"], "2026-09-13T10:25:00");
+        let cheap = with_leg(approximate("cheap", 690.0), &["EY44"], "2026-09-13T10:25:00");
+        let ranked = rank(vec![dear, cheap]).unwrap();
+        assert_eq!(ranked.rows.len(), 1);
+        assert_eq!(ranked.rows[0].offer_id, "cheap");
+    }
+
+    #[test]
+    fn a_flight_with_no_legs_is_never_treated_as_a_duplicate_of_another() {
+        // Two offers that state no itinerary at all have nothing in common
+        // to match on; collapsing them would hide a real option.
+        let a = flight("a", 100.0, "EUR", Some(200));
+        let b = flight("b", 120.0, "EUR", Some(200));
+        assert_eq!(rank(vec![a, b]).unwrap().rows.len(), 2);
     }
 
     #[test]
@@ -2265,6 +2434,8 @@ mod client_tests {
                 user_id: 7,
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
                 ignav: None,
+                shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
+                chat_id: 1,
             },
             dir,
         )
@@ -2821,6 +2992,8 @@ mod links_tests {
             user_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             ignav: None,
+            shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
+            chat_id: 1,
         };
         let out = rig::tool::Tool::call(&tool, query()).await.unwrap();
         assert!(
@@ -2836,6 +3009,8 @@ mod links_tests {
             user_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             ignav: None,
+            shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
+            chat_id: 1,
         };
         let out = rig::tool::Tool::call(&plain, query()).await.unwrap();
         assert!(!out.notes.iter().any(|n| n.contains("booking fee")), "got: {:?}", out.notes);
@@ -2925,6 +3100,8 @@ mod live {
                 user_id: 1,
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
                 ignav: None,
+                shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
+                chat_id: 1,
             };
             let out = rig::tool::Tool::call(&tool, query).await.unwrap();
             println!("LIVE route={} bought={}", out.route, tool.budget.spent());

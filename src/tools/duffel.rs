@@ -16,7 +16,11 @@
 /// Live flight search. Registered only when `DUFFEL_API_KEY` is set, so the
 /// model never sees a tool that cannot work.
 pub struct FlightSearchTool {
-    pub client: DuffelClient,
+    /// Either provider alone can answer a flight question. Registered on
+    /// "at least one is configured", never on Duffel specifically —
+    /// gating it on Duffel is how the tool once vanished while the
+    /// preamble still told the model to call it.
+    pub duffel: Option<DuffelClient>,
     /// Every search is billed, so each one is recorded against the user who
     /// caused it and shown in `/stat`.
     pub store: crate::store::Store,
@@ -133,11 +137,11 @@ impl rig::tool::Tool for FlightSearchTool {
         // Travels with the prices it is baked into. Relying on the preamble
         // alone was measured failing in production: a reply quoted a fare
         // that silently included the fee and never mentioned it.
-        if self.client.markup_rate() > 0.0 {
+        if self.markup_rate() > 0.0 {
             out.notes.push(format!(
                 "every price here already includes a {} booking fee, which is what the checkout \
                  charges — say so in the reply rather than quoting the number bare",
-                percentage(self.client.markup_rate())
+                percentage(self.markup_rate())
             ));
         }
         if flexible {
@@ -209,6 +213,11 @@ pub struct BookingLink {
 }
 
 impl FlightSearchTool {
+    /// The booking fee in force, or none when Duffel is not configured.
+    fn markup_rate(&self) -> f64 {
+        self.duffel.as_ref().map_or(0.0, |c| c.markup_rate())
+    }
+
     /// One day of the window: from this request's memo if it is there,
     /// otherwise bought from Duffel and remembered.
     async fn one_day(
@@ -225,33 +234,45 @@ impl FlightSearchTool {
             return (day, Ok(flights));
         }
 
-        // Both providers answer the same day at once. They are separate
-        // bills but one search as far as the traveller and the allowance
-        // are concerned.
-        let (duffel, ignav) = match &self.ignav {
-            Some(ignav) => {
-                let (a, b) =
-                    futures::future::join(self.client.search(&day), ignav.search(&day)).await;
-                (a, Some(b))
-            }
-            None => (self.client.search(&day).await, None),
-        };
+        // Whichever providers are configured answer the same day at once.
+        // Separate bills, but one search as far as the traveller and the
+        // allowance are concerned.
+        let (duffel, ignav) = futures::future::join(
+            async {
+                match &self.duffel {
+                    Some(client) => Some(client.search(&day).await),
+                    None => None,
+                }
+            },
+            async {
+                match &self.ignav {
+                    Some(client) => Some(client.search(&day).await),
+                    None => None,
+                }
+            },
+        )
+        .await;
         self.note_search().await;
 
-        let mut flights = match duffel {
-            Ok(flights) => flights,
-            // One provider failing must not lose the other's answer; only
-            // both failing is a failed search.
-            Err(e) if ignav.as_ref().is_some_and(|r| r.is_ok()) => {
-                tracing::warn!(error = %e, "duffel search failed; answering from ignav alone");
-                Vec::new()
+        // One provider failing must not lose the other's answer; only
+        // every configured provider failing is a failed search.
+        let mut flights = Vec::new();
+        let mut failure = None;
+        let duffel = duffel.map(|r| r.map_err(|e| e.to_string()));
+        let ignav = ignav.map(|r| r.map_err(|e| e.to_string()));
+        for (name, result) in [("duffel", duffel), ("ignav", ignav)] {
+            match result {
+                Some(Ok(found)) => flights.extend(found),
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, provider = name, "flight provider failed");
+                    failure = Some(DuffelError::Provider(format!("{name}: {e}")));
+                }
+                None => {}
             }
-            Err(e) => return (day, Err(e)),
-        };
-        if let Some(ignav) = ignav {
-            match ignav {
-                Ok(fares) => flights.extend(fares),
-                Err(e) => tracing::warn!(error = %e, "ignav search failed; answering from duffel alone"),
+        }
+        if flights.is_empty() {
+            if let Some(e) = failure {
+                return (day, Err(e));
             }
         }
 
@@ -341,6 +362,10 @@ pub enum DuffelError {
     /// Phrased as an instruction to the model, not a diagnostic.
     #[error("{0}")]
     Invalid(String),
+    /// A second provider's failure, carried in the one error type the
+    /// flight tool returns.
+    #[error("flight search failed: {0}")]
+    Provider(String),
 }
 
 /// At most this many options in a reply. One search comes back with
@@ -2429,7 +2454,7 @@ mod client_tests {
         let store = crate::store::Store::open(dir.path().join("t.duckdb")).unwrap();
         (
             FlightSearchTool {
-                client: client(server),
+                duffel: Some(client(server)),
                 store,
                 user_id: 7,
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -2477,6 +2502,57 @@ mod client_tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn flights_still_search_when_only_ignav_is_configured() {
+        // Reported live: with the Duffel key commented out the whole tool
+        // disappeared, because it was registered on Duffel alone — and the
+        // preamble still told the model to call search_flights, so the
+        // request died with UnknownToolCall. Either provider is enough to
+        // answer a flight question.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/fares/one-way"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"itineraries": [{
+                "price": {"amount": 118.0, "currency": "EUR", "status": "verified"},
+                "outbound": {"carrier": "Transavia", "duration_minutes": 185, "segments": [{
+                    "marketing_carrier_code": "HV", "flight_number": "5955",
+                    "departure_airport": "AMS", "departure_time_local": "2026-09-14T17:40:00",
+                    "arrival_airport": "LIS", "arrival_time_local": "2026-09-14T19:45:00",
+                    "duration_minutes": 185}]},
+                "ignav_id": "abc"
+            }]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool = FlightSearchTool {
+            duffel: None,
+            store: crate::store::Store::open(dir.path().join("t.duckdb")).unwrap(),
+            user_id: 7,
+            budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+            shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
+            chat_id: 1,
+            ignav: Some(crate::tools::ignav::IgnavClient::new(
+                reqwest::Client::new(),
+                "k".to_string(),
+                server.uri(),
+            )),
+        };
+
+        let out = rig::tool::Tool::call(&tool, query()).await.unwrap();
+        assert_eq!(out.found, 1);
+        let cheapest = out.cheapest.unwrap();
+        assert_eq!(cheapest.source, Source::Ignav);
+        // Nothing bookable in the set at all, so the reply must not quote
+        // any of it as a plain price.
+        assert!(
+            out.notes.iter().any(|n| n.to_lowercase().contains("approximate")),
+            "got: {:?}",
+            out.notes
+        );
     }
 
     #[tokio::test]
@@ -2987,7 +3063,7 @@ mod links_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let tool = FlightSearchTool {
-            client: client(&server, 0.03),
+            duffel: Some(client(&server, 0.03)),
             store: crate::store::Store::open(dir.path().join("t.duckdb")).unwrap(),
             user_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -3004,7 +3080,7 @@ mod links_tests {
 
         // No fee, no note: nothing to disclose and nothing to explain away.
         let plain = FlightSearchTool {
-            client: client(&server, 0.0),
+            duffel: Some(client(&server, 0.0)),
             store: crate::store::Store::open(dir.path().join("u.duckdb")).unwrap(),
             user_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -3095,7 +3171,7 @@ mod live {
         if query.flex_days.is_some() {
             let dir = tempfile::tempdir().unwrap();
             let tool = FlightSearchTool {
-                client: client.clone(),
+                duffel: Some(client.clone()),
                 store: crate::store::Store::open(dir.path().join("probe.duckdb")).unwrap(),
                 user_id: 1,
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),

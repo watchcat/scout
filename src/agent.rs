@@ -583,9 +583,12 @@ pub fn build_agent(
     if let Some(bol) = &d.bol {
         builder = builder.tool(crate::tools::bol::BolSearchTool { client: bol.clone() });
     }
-    if let Some(duffel) = &d.duffel {
+    // Either provider can answer a flight question, so the tool is offered
+    // whenever at least one is configured. Gating it on Duffel alone left
+    // the model calling a tool that was not there.
+    if d.duffel.is_some() || d.ignav.is_some() {
         builder = builder.tool(crate::tools::duffel::FlightSearchTool {
-            client: duffel.clone(),
+            duffel: d.duffel.clone(),
             store: d.store.clone(),
             user_id,
             // One allowance and one memo per user request, like the search
@@ -617,16 +620,19 @@ pub fn build_agent(
                 chat_id,
             });
         }
-        // Offered only when Duffel has enabled Links on the account and
-        // there is somewhere to send people back to. Registering it
-        // otherwise means the model promises a booking it cannot deliver.
-        if let Some(return_url) = d.return_url.as_ref().filter(|_| d.links_enabled) {
-            builder = builder.tool(crate::tools::duffel::BookingLinkTool {
-                client: duffel.clone(),
-                user_id,
-                return_url: return_url.clone(),
-            });
-        }
+    }
+    // Duffel's hosted checkout: needs Duffel itself, Links enabled on the
+    // account, and somewhere to send people back to. Registering it
+    // without all three means the model promises a booking it cannot make.
+    if let (Some(duffel), Some(return_url)) = (
+        &d.duffel,
+        d.return_url.as_ref().filter(|_| d.links_enabled),
+    ) {
+        builder = builder.tool(crate::tools::duffel::BookingLinkTool {
+            client: duffel.clone(),
+            user_id,
+            return_url: return_url.clone(),
+        });
     }
     builder.default_max_turns(MAX_TURNS).build()
 }

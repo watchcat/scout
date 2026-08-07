@@ -845,6 +845,37 @@ mod live {
         }
         assert!(!found.options.is_empty(), "a bookable fare should have somewhere to buy it");
         assert!(found.options.iter().all(|o| o.url.starts_with("http")), "links must be real URLs");
+
+        // The production path with only this provider configured, so the
+        // grouping can be seen on real fares.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = crate::tools::duffel::FlightSearchTool {
+            duffel: None,
+            store: crate::store::Store::open(dir.path().join("probe.duckdb")).unwrap(),
+            user_id: 1,
+            budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
+            shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
+            chat_id: 1,
+            ignav: Some(client.clone()),
+        };
+        let out = rig::tool::Tool::call(&tool, query).await.unwrap();
+        println!("\nLIVE picks for {} (of {} compared)", out.route, out.found);
+        for (label, group) in [
+            ("Cheapest", &out.picks.cheapest),
+            ("Fastest", &out.picks.fastest),
+            ("Best balance", &out.picks.balanced),
+        ] {
+            for f in group {
+                println!(
+                    "  {label:<13} {:>7.2} {} {:>8}  {:<22} {:?}",
+                    f.price, f.currency, f.total_duration.clone().unwrap_or_default(),
+                    f.airline, f.price_status
+                );
+            }
+        }
+        for n in &out.notes {
+            println!("  note: {n}");
+        }
     }
 }
 

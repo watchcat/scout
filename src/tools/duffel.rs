@@ -133,7 +133,7 @@ impl rig::tool::Tool for FlightSearchTool {
         // when the per-request memo above is long gone.
         let now = std::time::Instant::now();
         self.shown.evict_expired(now);
-        self.shown.remember(self.chat_id, out.rows.clone(), now);
+        self.shown.remember(self.chat_id, out.picks.all(), now);
         // Travels with the prices it is baked into. Relying on the preamble
         // alone was measured failing in production: a reply quoted a fare
         // that silently included the fee and never mentioned it.
@@ -510,7 +510,46 @@ pub struct FlightResults {
     pub fastest: Option<Flight>,
     /// Every comparable offer, cheapest first, capped at [`ROW_CAP`].
     pub rows: Vec<Flight>,
+    /// The same offers grouped into the three questions people actually
+    /// ask. This is what a reply should present.
+    pub picks: Picks,
     pub notes: Vec<String>,
+}
+
+/// At most this many options under each heading. Two gives a choice
+/// without turning a group back into the list it replaced.
+const PER_GROUP: usize = 2;
+
+/// Options grouped by what someone is choosing between.
+///
+/// A flat list of seven leaves the reader to do the comparing. These are
+/// the three questions worth answering: what is cheap, what is quick, and
+/// what is neither compromise. No option appears twice — repeating one
+/// under two headings reads as two choices.
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+pub struct Picks {
+    pub cheapest: Vec<Flight>,
+    /// Empty when nothing stated a duration; there is no speed to sort by.
+    pub fastest: Vec<Flight>,
+    /// Closest to being both the cheapest and the quickest — price and
+    /// duration scaled across this set, then the shortest distance to the
+    /// corner where both are best. Not the median price: an option can be
+    /// mid-priced and still slow, and that is nobody's choice.
+    pub balanced: Vec<Flight>,
+}
+
+impl Picks {
+    /// Every option across the groups, in the order they are presented.
+    /// This is what the user actually saw, so it is what a later booking
+    /// request is allowed to name.
+    pub fn all(&self) -> Vec<Flight> {
+        self.cheapest
+            .iter()
+            .chain(&self.fastest)
+            .chain(&self.balanced)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Ranks offers by price, in Rust, so the model never does this arithmetic.
@@ -617,12 +656,13 @@ pub fn rank(flights: Vec<Flight>) -> Option<FlightResults> {
     }
     if rows.len() > ROW_CAP {
         notes.push(format!(
-            "{found} offers were returned; these are the {ROW_CAP} cheapest"
+            "{found} comparable offers were found; the picks below are chosen from them"
         ));
         rows.truncate(ROW_CAP);
     }
 
-    Some(FlightResults { currency, found, cheapest, fastest, rows, notes })
+    let picks = group(&rows, &mut notes);
+    Some(FlightResults { currency, found, cheapest, fastest, rows, picks, notes })
 }
 
 pub const DUFFEL_API_BASE: &str = "https://api.duffel.com";
@@ -975,7 +1015,10 @@ pub struct FlightSearchOutput {
     pub currency: Option<String>,
     pub cheapest: Option<Flight>,
     pub fastest: Option<Flight>,
-    pub rows: Vec<Flight>,
+    /// What to present: the options grouped by cheapest, fastest and best
+    /// compromise. Replaces a flat list, which left the reader to do the
+    /// comparing and repeated the same flights the named picks already had.
+    pub picks: Picks,
     /// Cheapest per day across a flexible window, in date order. Empty for
     /// an ordinary single-date search.
     pub by_date: Vec<DayPrice>,
@@ -1032,7 +1075,7 @@ impl FlightSearchOutput {
                 currency: Some(r.currency),
                 cheapest: Some(r.cheapest),
                 fastest: r.fastest,
-                rows: r.rows,
+                picks: r.picks,
                 by_date: Vec::new(),
                 notes: r.notes,
             },
@@ -1047,7 +1090,7 @@ impl FlightSearchOutput {
                 currency: None,
                 cheapest: None,
                 fastest: None,
-                rows: Vec::new(),
+                picks: Picks::default(),
                 by_date: Vec::new(),
             },
         }
@@ -1429,6 +1472,108 @@ fn itinerary_key(flight: &Flight) -> Option<String> {
     )
 }
 
+/// Splits the ranked options into cheapest, fastest and balanced.
+///
+/// Assigned in that order, and never twice: an option already named as the
+/// cheapest is not offered again as the quickest, because two headings over
+/// one flight reads as two choices.
+fn group(rows: &[Flight], notes: &mut Vec<String>) -> Picks {
+    // Anything both dearer and slower than some other option is nobody's
+    // pick; carrying it into a group only pads the answer.
+    let worth_showing: Vec<&Flight> = rows.iter().filter(|f| !is_dominated(f, rows)).collect();
+
+    let mut by_price = worth_showing.clone();
+    by_price.sort_by(|a, b| a.price.total_cmp(&b.price).then_with(|| a.offer_id.cmp(&b.offer_id)));
+
+    let mut by_time: Vec<&Flight> =
+        worth_showing.iter().copied().filter(|f| f.total_minutes.is_some()).collect();
+    by_time.sort_by(|a, b| {
+        a.total_minutes.cmp(&b.total_minutes).then_with(|| a.offer_id.cmp(&b.offer_id))
+    });
+
+    // Price and duration mean nothing to each other until both are scaled
+    // to the same range; then the best compromise is the point nearest the
+    // corner where both are at their best.
+    let (min_price, price_span) = span(by_time.iter().map(|f| f.price));
+    let (min_time, time_span) = span(by_time.iter().filter_map(|f| f.total_minutes).map(f64::from));
+    let distance = |f: &Flight| {
+        let p = (f.price - min_price) / price_span;
+        let t = (f64::from(f.total_minutes.unwrap_or_default()) - min_time) / time_span;
+        (p * p + t * t).sqrt()
+    };
+    // A compromise only earns the heading if it is genuinely closer to
+    // ideal than either extreme. Measured live: an option 113 dearer than
+    // the cheapest for 25 minutes saved is on the trade-off curve and is
+    // still nobody's choice — it was being shown only because it was what
+    // remained once the other groups were filled.
+    let extremes = by_price
+        .first()
+        .map(|f| distance(f))
+        .into_iter()
+        .chain(by_time.first().map(|f| distance(f)))
+        .fold(f64::MAX, f64::min);
+    let mut by_balance: Vec<&Flight> =
+        by_time.iter().copied().filter(|f| distance(f) < extremes).collect();
+    by_balance.sort_by(|a, b| {
+        distance(a).total_cmp(&distance(b)).then_with(|| a.offer_id.cmp(&b.offer_id))
+    });
+
+    if let (Some(cheapest), Some(quickest)) = (by_price.first(), by_time.first()) {
+        if cheapest.offer_id == quickest.offer_id {
+            notes.push(
+                "the cheapest option is also the quickest, so it is listed once — say that, \
+                 because it makes the other groups a comparison rather than a choice"
+                    .to_string(),
+            );
+        }
+    }
+
+    // Each group gets its defining option before any group gets a second,
+    // or the cheapest pair would swallow whatever the balanced pick should
+    // have been.
+    let mut picks = Picks::default();
+    let mut taken: Vec<String> = Vec::new();
+    for _ in 0..PER_GROUP {
+        for (candidates, into) in [
+            (&by_price, &mut picks.cheapest),
+            (&by_time, &mut picks.fastest),
+            (&by_balance, &mut picks.balanced),
+        ] {
+            if let Some(next) =
+                candidates.iter().find(|f| !taken.contains(&f.offer_id))
+            {
+                taken.push(next.offer_id.clone());
+                into.push((*next).clone());
+            }
+        }
+    }
+    picks
+}
+
+/// Whether some other option beats this one on both counts at once.
+///
+/// Only comparable when both state a duration: an offer that does not say
+/// how long it takes cannot be ruled out on speed, so it stays.
+fn is_dominated(flight: &Flight, rows: &[Flight]) -> bool {
+    let Some(minutes) = flight.total_minutes else { return false };
+    rows.iter().any(|other| {
+        let Some(other_minutes) = other.total_minutes else { return false };
+        other.offer_id != flight.offer_id
+            && other.price <= flight.price
+            && other_minutes <= minutes
+            && (other.price < flight.price || other_minutes < minutes)
+    })
+}
+
+/// Smallest value and the span above it, with a floor so a set where every
+/// value is identical divides by something rather than by zero.
+fn span(values: impl Iterator<Item = f64>) -> (f64, f64) {
+    let values: Vec<f64> = values.collect();
+    let lo = values.iter().copied().fold(f64::MAX, f64::min);
+    let hi = values.iter().copied().fold(f64::MIN, f64::max);
+    (lo, (hi - lo).max(f64::EPSILON))
+}
+
 /// Who to name in a note. The provider is part of the claim: "approximate,
 /// from Ignav" is checkable in a way that "approximate" alone is not.
 fn provider(source: Source) -> &'static str {
@@ -1584,18 +1729,21 @@ mod tests {
             "expected a baggage note, got: {notes:?}"
         );
 
-        // Both without bags is not a difference worth a note.
+        // Both without bags is not a difference worth a note. Other notes
+        // may fire here, so this asks only about baggage.
         let mut a = flight("a", 100.0, "EUR", Some(200));
         a.checked_bags = Some(0);
         let mut b = flight("b", 120.0, "EUR", Some(200));
         b.checked_bags = Some(0);
-        assert!(rank(vec![a, b]).unwrap().notes.is_empty());
+        let notes = rank(vec![a, b]).unwrap().notes;
+        assert!(!notes.iter().any(|n| n.contains("bag")), "got: {notes:?}");
 
         // Nor is an offer that simply did not say.
         let mut a = flight("a", 100.0, "EUR", Some(200));
         a.checked_bags = None;
         let b = flight("b", 120.0, "EUR", Some(200));
-        assert!(rank(vec![a, b]).unwrap().notes.is_empty());
+        let notes = rank(vec![a, b]).unwrap().notes;
+        assert!(!notes.iter().any(|n| n.contains("bag")), "got: {notes:?}");
     }
 
     fn approximate(id: &str, price: f64) -> Flight {
@@ -1746,6 +1894,130 @@ mod tests {
             "got: {:?}",
             ranked.notes
         );
+    }
+
+    /// A flight at a given price and duration, with a leg so it is a
+    /// distinct itinerary rather than a duplicate.
+    fn option(id: &str, price: f64, minutes: u32) -> Flight {
+        with_leg(flight(id, price, "EUR", Some(minutes)), &[id], "2026-09-13T10:00:00")
+    }
+
+    #[test]
+    fn options_arrive_grouped_as_cheapest_fastest_and_balanced() {
+        // A flat list of seven makes the reader do the comparing. Three
+        // small groups answer the question people actually have: what is
+        // cheap, what is quick, and what is neither compromise.
+        let ranked = rank(vec![
+            option("cheap", 400.0, 2000),  // cheapest, and very slow
+            option("quick", 900.0, 600),   // fastest, and dear
+            option("middle", 500.0, 700),  // the knee: near both
+            option("dull", 850.0, 1900),   // dear and slow: nobody's pick
+        ])
+        .unwrap();
+
+        assert_eq!(ids(&ranked.picks.cheapest), vec!["cheap"]);
+        assert_eq!(ids(&ranked.picks.fastest), vec!["quick"]);
+        assert_eq!(
+            ids(&ranked.picks.balanced),
+            vec!["middle"],
+            "the balanced pick is the one closest to being both, not the median price"
+        );
+        // Nothing dominated on both counts should surface at all.
+        assert!(!ids(&ranked.picks.balanced).contains(&"dull"));
+    }
+
+    #[test]
+    fn a_balanced_pick_has_to_beat_both_extremes_or_there_is_none() {
+        // Measured live on AMS-HKG: Etihad 696 in 34h15m, Lufthansa 897 in
+        // 30h40m, Air France 809 in 33h50m. The Air France fare is a
+        // genuine trade-off point, but it costs 113 more than the cheapest
+        // to save 25 minutes — nobody's idea of the sensible middle. It was
+        // being shown as "Best balance" purely because it was what remained
+        // after the other two groups were filled.
+        let ranked = rank(vec![
+            option("etihad", 696.0, 2055),
+            option("lufthansa", 897.0, 1840),
+            option("airfrance", 809.0, 2030),
+        ])
+        .unwrap();
+
+        assert_eq!(ranked.picks.cheapest.first().map(|f| f.offer_id.as_str()), Some("etihad"));
+        assert_eq!(ranked.picks.fastest.first().map(|f| f.offer_id.as_str()), Some("lufthansa"));
+        assert!(
+            ranked.picks.balanced.is_empty(),
+            "no middle ground worth the name, so the heading should not appear: {:?}",
+            ids(&ranked.picks.balanced)
+        );
+        // Listing it as the second-cheapest is fine — that is what it is.
+        // Calling it the best balance was the lie.
+        assert!(ids(&ranked.picks.cheapest).contains(&"airfrance"));
+    }
+
+    #[test]
+    fn no_option_appears_in_two_groups() {
+        // Repeating one flight under two headings reads as two choices.
+        let ranked = rank(vec![
+            option("a", 400.0, 600),
+            option("b", 450.0, 650),
+            option("c", 500.0, 700),
+            option("d", 900.0, 1800),
+        ])
+        .unwrap();
+
+        let mut all: Vec<&str> = ranked
+            .picks
+            .cheapest
+            .iter()
+            .chain(&ranked.picks.fastest)
+            .chain(&ranked.picks.balanced)
+            .map(|f| f.offer_id.as_str())
+            .collect();
+        let before = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), before, "an option was listed under two headings");
+    }
+
+    #[test]
+    fn each_group_holds_at_most_two() {
+        let many: Vec<Flight> = (0..12)
+            .map(|i| option(&format!("o{i}"), 400.0 + i as f64 * 10.0, 600 + i * 90))
+            .collect();
+        let picks = rank(many).unwrap().picks;
+        assert!(picks.cheapest.len() <= 2 && !picks.cheapest.is_empty());
+        assert!(picks.fastest.len() <= 2);
+        assert!(picks.balanced.len() <= 2);
+    }
+
+    #[test]
+    fn one_option_that_is_both_cheapest_and_quickest_is_said_once_and_named() {
+        // Presenting it twice would invent a choice; not saying it is both
+        // would hide the best fact in the whole answer.
+        let ranked = rank(vec![option("best", 400.0, 600), option("worse", 900.0, 1800)]).unwrap();
+        assert_eq!(ids(&ranked.picks.cheapest), vec!["best"]);
+        assert!(!ids(&ranked.picks.fastest).contains(&"best"));
+        assert!(
+            ranked.notes.iter().any(|n| n.contains("also the quickest")),
+            "got: {:?}",
+            ranked.notes
+        );
+    }
+
+    #[test]
+    fn without_durations_there_is_nothing_to_balance_against() {
+        // Grouping by speed needs a speed. Cheapest still works.
+        let ranked = rank(vec![
+            with_leg(flight("a", 400.0, "EUR", None), &["a"], "2026-09-13T10:00:00"),
+            with_leg(flight("b", 500.0, "EUR", None), &["b"], "2026-09-13T10:00:00"),
+        ])
+        .unwrap();
+        assert_eq!(ids(&ranked.picks.cheapest), vec!["a", "b"]);
+        assert!(ranked.picks.fastest.is_empty());
+        assert!(ranked.picks.balanced.is_empty());
+    }
+
+    fn ids(flights: &[Flight]) -> Vec<&str> {
+        flights.iter().map(|f| f.offer_id.as_str()).collect()
     }
 
     #[test]
@@ -2946,7 +3218,7 @@ mod output_tests {
         let out = FlightSearchOutput::new(&query(), None);
         assert_eq!(out.found, 0);
         assert!(out.cheapest.is_none());
-        assert!(out.rows.is_empty());
+        assert!(out.picks.all().is_empty());
         assert!(
             out.notes.iter().any(|n| n.contains("no flights")),
             "got: {:?}",
@@ -2975,8 +3247,8 @@ mod output_tests {
     fn the_count_is_before_capping_so_the_reply_can_say_what_it_left_out() {
         let many: Vec<Flight> = (0..8).map(|i| flight(100.0 + i as f64)).collect();
         let out = FlightSearchOutput::new(&query(), rank(many));
-        assert_eq!(out.found, 8);
-        assert_eq!(out.rows.len(), ROW_CAP);
+        assert_eq!(out.found, 8, "the count is what was compared, not what is shown");
+        assert!(out.picks.all().len() <= 3 * 2, "at most two under each heading");
     }
 }
 
@@ -3181,6 +3453,19 @@ mod live {
             };
             let out = rig::tool::Tool::call(&tool, query).await.unwrap();
             println!("LIVE route={} bought={}", out.route, tool.budget.spent());
+            for (label, group) in [
+                ("Cheapest", &out.picks.cheapest),
+                ("Fastest", &out.picks.fastest),
+                ("Best balance", &out.picks.balanced),
+            ] {
+                for f in group {
+                    println!(
+                        "  {label:<13} {:>8.2} {} {:>8} {:<22} {:?}",
+                        f.price, f.currency,
+                        f.total_duration.clone().unwrap_or_default(), f.airline, f.price_status
+                    );
+                }
+            }
             for day in &out.by_date {
                 println!(
                     "  {} {:>8} {} ({} offers) {}",

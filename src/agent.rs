@@ -76,9 +76,15 @@ than asking: Amsterdam is AMS, Lisbon LIS, London LHR (or LON for all its \
 airports), and dates go in as YYYY-MM-DD. Take every number from its output \
 verbatim - cheapest and fastest are ranked in Rust and are not yours to \
 recompute - and quote its route field so the reply cannot drift onto a \
-route nobody searched. Offer every option in rows, not a shortened pick of \
-them: they are already the cheapest few of hundreds, and dropping some \
-narrows the choice for no reason. Rows can come from two providers and \
+route nobody searched. Present the picks under their own headings - Cheapest, Fastest, Best \
+balance - one to two options each, in that order, and offer every one you \
+are given. They are already chosen from hundreds and no option appears \
+under two headings, so anything you drop is a choice removed for no reason. \
+Best balance is the option closest to being both the cheapest and the \
+quickest, worked out in Rust; do not recompute it or argue with it. When a \
+group is empty, leave the heading out rather than explaining its absence, \
+and when one option is both cheapest and quickest say so - it is the best \
+fact in the answer. Options can come from two providers and \
 every one carries price_status, which changes how you are allowed to quote \
 it. 'bookable' is a live offer someone can pay right now: quote it as a \
 price. 'approximate' and 'unconfirmed' are fares seen elsewhere that still \

@@ -83,6 +83,11 @@ impl rig::tool::Tool for FlightSearchTool {
         // rather than the day that was actually asked for.
         let window = args.window()?;
         let flexible = window.len() > 1;
+        // The allowance follows what was actually asked for: a ±3 window is
+        // seven separate searches because neither provider prices a
+        // calendar, and a fixed cap has to be either mean to that or
+        // generous to a loop.
+        self.budget.grant_window(args.flex_days.unwrap_or(0));
 
         let mut affordable = Vec::new();
         let mut unaffordable = Vec::new();
@@ -100,7 +105,7 @@ impl rig::tool::Tool for FlightSearchTool {
             return Err(DuffelError::Invalid(format!(
                 "this request has already used its {} flight searches — answer now with the \
                  routes you have already looked up rather than searching another",
-                crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST
+                self.budget.allowance()
             )));
         }
 
@@ -2931,8 +2936,10 @@ mod client_tests {
 
     #[tokio::test]
     async fn a_window_wider_than_the_allowance_keeps_the_days_nearest_the_one_asked_for() {
-        // Losing the far edges of the window beats losing the date the
-        // traveller actually named.
+        // Losing the far edges of a window beats losing the date the
+        // traveller actually named. Reached by asking for a second window
+        // after the first has used most of the allowance — which is what
+        // exhaustion looks like now that the allowance follows the window.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
@@ -2940,20 +2947,17 @@ mod client_tests {
             .await;
 
         let (tool, _dir) = tool(&server);
-        // Spend all but three of the allowance on unrelated routes. Real
-        // codes: a made-up one with a digit is rejected before it costs
-        // anything, which is the whole point of validating first.
-        let elsewhere = ["OPO", "MAD", "BCN", "FCO", "ATH", "VIE", "PRG"];
-        for code in &elsewhere[..crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST - 3] {
-            let mut q = query();
-            q.destination = code.to_string();
-            rig::tool::Tool::call(&tool, q).await.unwrap();
-        }
-        assert_eq!(tool.budget.spent(), crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST - 3);
+        let mut first = query();
+        first.flex_days = Some(3);
+        rig::tool::Tool::call(&tool, first).await.unwrap();
+        assert_eq!(tool.budget.spent(), 7, "a ±3 window is seven days");
+        assert_eq!(tool.budget.allowance(), crate::tools::budget::BASE_FLIGHT_SEARCHES + 6);
 
-        let mut flexible = query();
-        flexible.flex_days = Some(3);
-        let out = rig::tool::Tool::call(&tool, flexible).await.unwrap();
+        // Three left, and a second window wants seven.
+        let mut second = query();
+        second.destination = "OPO".to_string();
+        second.flex_days = Some(3);
+        let out = rig::tool::Tool::call(&tool, second).await.unwrap();
 
         let covered: Vec<&str> = out.by_date.iter().map(|d| d.date.as_str()).collect();
         assert_eq!(covered, vec!["2026-09-13", "2026-09-14", "2026-09-15"]);
@@ -3063,12 +3067,12 @@ mod client_tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
-            .expect(crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST as u64)
+            .expect(crate::tools::budget::BASE_FLIGHT_SEARCHES as u64)
             .mount(&server)
             .await;
 
         let (tool, _dir) = tool(&server);
-        for day in 1..=crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST {
+        for day in 1..=crate::tools::budget::BASE_FLIGHT_SEARCHES {
             let mut q = query();
             q.departure_date = format!("2026-09-{day:02}");
             rig::tool::Tool::call(&tool, q).await.unwrap();
@@ -3082,7 +3086,7 @@ mod client_tests {
             "the message should tell the model to answer with what it has, got: {err}"
         );
         // Nothing further was sent, so nothing further was billed.
-        assert_eq!(searches_logged(&tool), crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST as i64);
+        assert_eq!(searches_logged(&tool), crate::tools::budget::BASE_FLIGHT_SEARCHES as i64);
     }
 
     #[tokio::test]
@@ -3093,12 +3097,12 @@ mod client_tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"offers": []}})))
-            .expect(crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST as u64)
+            .expect(crate::tools::budget::BASE_FLIGHT_SEARCHES as u64)
             .mount(&server)
             .await;
 
         let (tool, _dir) = tool(&server);
-        for day in 1..=crate::tools::budget::FLIGHT_SEARCHES_PER_REQUEST {
+        for day in 1..=crate::tools::budget::BASE_FLIGHT_SEARCHES {
             let mut q = query();
             q.departure_date = format!("2026-09-{day:02}");
             rig::tool::Tool::call(&tool, q).await.unwrap();

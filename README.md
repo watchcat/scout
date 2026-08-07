@@ -84,8 +84,10 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   sold and deleted listings filtered out
 
 **Flies you places** *(optional — needs a Duffel and/or Ignav key)*
-- Live fares with times, stops, flight numbers and baggage, ranked
-  cheapest-first **in Rust**. Each leg draws itself on one line:
+- Live fares with times, stops, flight numbers and baggage, grouped **in
+  Rust** into cheapest, fastest and best balance — one to two each, never
+  the same flight twice, and the balance heading is dropped when no option
+  genuinely beats both extremes. Each leg draws itself on one line:
   `AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09` — copied into the reply
   verbatim, because a model retyping departure times is a model that can get
   one wrong
@@ -205,7 +207,7 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 15 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **289 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **299 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness.
 
@@ -244,16 +246,17 @@ Roughly 14,000 lines of Rust across a dozen focused modules.
   the allowlist shares one process, one database file and one API budget.
 - **Costs real money.** Kagi bills per query, MiniMax per token, and each
   flight search is billed by whichever provider answered it. Budgets are
-  capped per request (15 search queries, 5 page opens, 8 flight searches,
-  20 model turns) — but it's not free. Measured: a flight question with
-  seven options runs about **1.4 cents** end to end.
+  capped per request: 15 search queries, 5 page opens, 20 model turns, and
+  flight searches that start at 4 and grow with the date window you asked
+  for — a ±3 day window is seven searches because neither provider prices a
+  calendar. Measured: a flight question runs about **1.4 cents** end to end.
 
 ---
 
 ## Development
 
 ```bash
-cargo test                  # 289 tests, no network needed
+cargo test                  # 299 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

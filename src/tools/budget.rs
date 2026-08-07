@@ -52,13 +52,17 @@ impl Default for SearchBudget {
     }
 }
 
-/// Duffel searches allowed per user request. Every one is billed — with no
-/// bookings the 1500-per-order allowance is zero — and a model comparing
-/// dates will happily ask for a dozen. Enough for a return plus a few
-/// nearby days, and a ceiling on a loop that has lost its way. Eight
-/// because a ±3 day flexible search is seven, and leaving no headroom
-/// would make the commonest flexible question spend the whole allowance.
-pub const FLIGHT_SEARCHES_PER_REQUEST: usize = 8;
+/// Day-searches a request starts with, before any flexible window.
+///
+/// Every one is billed, and a model comparing routes will happily ask for a
+/// dozen. Four covers a question and a couple of follow-ups; a window that
+/// legitimately needs more says so through [`FlightBudget::grant_window`].
+///
+/// Note this counts *days*, not API calls: a return trip is one request at
+/// both providers, so the number of legs costs nothing here. Dates are the
+/// only thing that multiplies searches, because neither provider prices a
+/// calendar.
+pub const BASE_FLIGHT_SEARCHES: usize = 4;
 
 /// A per-request allowance of Duffel searches, plus a memo of what each one
 /// returned.
@@ -70,6 +74,8 @@ pub const FLIGHT_SEARCHES_PER_REQUEST: usize = 8;
 #[derive(Debug, Default)]
 pub struct FlightBudget {
     spent: AtomicUsize,
+    /// Extra days granted for the widest flexible window asked for.
+    window: AtomicUsize,
     seen: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::tools::duffel::Flight>>>,
 }
 
@@ -79,14 +85,30 @@ impl FlightBudget {
         self.seen.lock().unwrap().get(key).cloned()
     }
 
+    /// Room for the days either side of a date the traveller asked to see.
+    ///
+    /// The widest window wins rather than the sum: otherwise asking twice
+    /// would buy headroom twice, and a loop could widen its own budget by
+    /// repeating itself.
+    pub fn grant_window(&self, flex_days: u8) {
+        let extra = 2 * usize::from(flex_days);
+        self.window.fetch_max(extra, Ordering::Relaxed);
+    }
+
+    /// Day-searches this request may buy, given what has been asked for.
+    pub fn allowance(&self) -> usize {
+        BASE_FLIGHT_SEARCHES + self.window.load(Ordering::Relaxed)
+    }
+
     /// Reserves one search. False when the request has spent its allowance,
     /// in which case nothing should be sent to Duffel.
     pub fn claim_one(&self) -> bool {
         // Compare-and-swap rather than fetch_add: a refused claim must not
         // still count, or `spent` overstates what was actually billed.
+        let allowance = self.allowance();
         let mut spent = self.spent.load(Ordering::Relaxed);
         loop {
-            if spent >= FLIGHT_SEARCHES_PER_REQUEST {
+            if spent >= allowance {
                 return false;
             }
             match self.spent.compare_exchange_weak(
@@ -115,13 +137,54 @@ mod flight_budget_tests {
     use super::*;
 
     #[test]
+    fn a_flexible_window_raises_the_allowance_by_what_it_actually_needs() {
+        // A fixed cap has to be either mean to a wide search or generous to
+        // a runaway loop. The window is the only thing that legitimately
+        // multiplies searches — neither provider prices a calendar, so ±3
+        // days is seven separate requests — so the allowance follows it.
+        let budget = FlightBudget::default();
+        assert_eq!(budget.allowance(), BASE_FLIGHT_SEARCHES);
+
+        budget.grant_window(3);
+        assert_eq!(
+            budget.allowance(),
+            BASE_FLIGHT_SEARCHES + 6,
+            "±3 needs six days beyond the one that was asked for"
+        );
+        // Seven days plus room to follow up, rather than seven and nothing.
+        assert!(budget.allowance() > 7);
+    }
+
+    #[test]
+    fn the_widest_window_sets_the_allowance_rather_than_the_sum_of_them() {
+        // Otherwise asking for ±3 twice would buy headroom for thirteen
+        // days, and a loop could widen its own budget by repeating itself.
+        let budget = FlightBudget::default();
+        budget.grant_window(3);
+        budget.grant_window(3);
+        budget.grant_window(1);
+        assert_eq!(budget.allowance(), BASE_FLIGHT_SEARCHES + 6);
+    }
+
+    #[test]
+    fn a_search_with_no_window_gets_no_extra_room() {
+        let budget = FlightBudget::default();
+        budget.grant_window(0);
+        assert_eq!(budget.allowance(), BASE_FLIGHT_SEARCHES);
+        for _ in 0..BASE_FLIGHT_SEARCHES {
+            assert!(budget.claim_one());
+        }
+        assert!(!budget.claim_one());
+    }
+
+    #[test]
     fn searches_are_allowed_up_to_the_cap_and_then_refused() {
         let budget = FlightBudget::default();
-        for _ in 0..FLIGHT_SEARCHES_PER_REQUEST {
+        for _ in 0..BASE_FLIGHT_SEARCHES {
             assert!(budget.claim_one());
         }
         assert!(!budget.claim_one(), "the cap is what stops a runaway loop");
-        assert_eq!(budget.spent(), FLIGHT_SEARCHES_PER_REQUEST);
+        assert_eq!(budget.spent(), BASE_FLIGHT_SEARCHES);
     }
 
     #[test]

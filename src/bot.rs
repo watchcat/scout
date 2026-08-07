@@ -150,6 +150,8 @@ enum Command {
     Reset,
     #[command(description = "usage statistics: /stat [days]")]
     Stat(String),
+    #[command(description = "admin only: send a message to everyone: /advert <text>")]
+    Advert(String),
 }
 
 const HELP: &str = "\
@@ -167,6 +169,10 @@ Commands:
 /reset - forget this conversation right now
 /stat [days] - your usage statistics (default 7 days)
 /help - this message";
+
+/// Appended to `/help` for admins only, so the command is discoverable by
+/// the person who can use it without advertising itself to everyone else.
+const ADMIN_HELP: &str = "\n/advert <text> - send an announcement to everyone (admin)";
 
 pub async fn run(bot: Bot, app: Arc<App>) {
     let messages = Update::filter_message()
@@ -256,7 +262,12 @@ async fn handle_command(
     note_sender(&app, &msg);
     match cmd {
         Command::Start | Command::Help => {
-            bot.send_message(msg.chat.id, HELP).await?;
+            let admin = sender_id(&msg).is_some_and(|id| app.cfg.admin_user_ids.contains(&id));
+            let help = match admin {
+                true => format!("{HELP}{ADMIN_HELP}"),
+                false => HELP.to_string(),
+            };
+            bot.send_message(msg.chat.id, help).await?;
         }
         Command::Reset => {
             // Only the caller's session in this chat is cleared; other
@@ -267,6 +278,70 @@ async fn handle_command(
             };
             app.chats.remove(&chat_key(msg.chat.id.0, user_id));
             bot.send_message(msg.chat.id, "Conversation cleared.").await?;
+        }
+        Command::Advert(body) => {
+            let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+            // Same gate as the cross-user /stat view: the admin list is
+            // the whole access-control surface for anything that reaches
+            // beyond the caller.
+            if !app.cfg.admin_user_ids.contains(&user_id) {
+                bot.send_message(msg.chat.id, "That command is for the bot's admin.").await?;
+                return Ok(());
+            }
+            let body = match check_advert(&body) {
+                Ok(body) => body.to_string(),
+                Err(problem) => {
+                    bot.send_message(msg.chat.id, problem).await?;
+                    return Ok(());
+                }
+            };
+
+            let store = app.deps.store.clone();
+            let targets = tokio::task::spawn_blocking(move || store.broadcast_targets())
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r);
+            let targets = match targets {
+                Ok(targets) => targets,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not read broadcast targets");
+                    bot.send_message(msg.chat.id, "Sorry, couldn't work out who to send to.")
+                        .await?;
+                    return Ok(());
+                }
+            };
+
+            let from = msg
+                .from
+                .as_ref()
+                .map(display_name)
+                .unwrap_or_else(|| "the admin".to_string());
+            let text = advert_message(&body, &from);
+            let (mut sent, mut failed) = (0usize, Vec::new());
+            for (recipient, chat_id) in targets {
+                // Sequential on purpose: a household is a handful of chats,
+                // and one at a time keeps well clear of Telegram's rate
+                // limits without any pacing logic.
+                match bot.send_message(ChatId(chat_id), text.clone()).await {
+                    Ok(_) => sent += 1,
+                    Err(e) => {
+                        // Blocked the bot, deleted the chat, left the group:
+                        // all ordinary, none of them worth aborting for.
+                        tracing::warn!(error = %e, recipient, chat_id, "advert not delivered");
+                        failed.push(recipient);
+                    }
+                }
+            }
+
+            let mut report = format!("Sent to {sent} chat(s).");
+            if !failed.is_empty() {
+                report.push_str(&format!(
+                    "\nCould not reach {}: {}",
+                    failed.len(),
+                    failed.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            bot.send_message(msg.chat.id, report).await?;
         }
         Command::Stat(arg) => {
             let days = match crate::stats::parse_days(&arg) {
@@ -447,7 +522,50 @@ fn note_user(app: &Arc<App>, user_id: i64, name: String) {
 fn note_sender(app: &Arc<App>, msg: &Message) {
     if let Some(user) = msg.from.as_ref() {
         note_user(app, user.id.0 as i64, display_name(user));
+        note_chat(app, user.id.0 as i64, msg.chat.id.0);
     }
+}
+
+/// Records where this person is talking, so `/advert` can reach them. A
+/// user id is only the same as a chat id in a private chat.
+fn note_chat(app: &Arc<App>, user_id: i64, chat_id: i64) {
+    let store = app.deps.store.clone();
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || store.remember_chat(user_id, chat_id)).await {
+            Ok(Err(e)) => tracing::warn!(error = %e, "could not record the user's chat"),
+            Err(e) => tracing::warn!(error = %e, "chat recording task failed"),
+            Ok(Ok(())) => {}
+        }
+    });
+}
+
+/// How an announcement reads when it lands. Marked as one, because it
+/// arrives unprompted in a chat that is otherwise only ever a reply — and
+/// says who sent it, so nobody has to wonder whether the bot has started
+/// messaging people on its own.
+pub fn advert_message(body: &str, from: &str) -> String {
+    format!("Announcement from {from}:\n\n{}", body.trim())
+}
+
+/// What `/advert` refuses to send, with the reason as the user will read it.
+pub fn check_advert(body: &str) -> Result<&str, String> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Err(
+            "usage: /advert <message> — sends it to everyone who has used this bot. \
+             Nothing is sent until you give it something to say."
+                .to_string(),
+        );
+    }
+    // Telegram rejects anything over 4096 characters, and the prefix has to
+    // fit too. Better to say so than to have the send fail per recipient.
+    if body.chars().count() > 3500 {
+        return Err(format!(
+            "that is {} characters; keep an announcement under 3500 so it fits in one message",
+            body.chars().count()
+        ));
+    }
+    Ok(body)
 }
 
 async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
@@ -1187,6 +1305,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_advert_says_it_is_one_and_who_sent_it() {
+        // It lands unprompted in a chat that is otherwise only ever a
+        // reply, so it has to be obvious that a person sent it and the bot
+        // has not started messaging people on its own.
+        let out = advert_message("  Flights are live now.  ", "@watchcat");
+        assert!(out.starts_with("Announcement from @watchcat:"), "got: {out}");
+        assert!(out.contains("Flights are live now."));
+        assert!(!out.contains("  Flights"), "the body should be trimmed: {out}");
+    }
+
+    #[test]
+    fn an_advert_with_nothing_to_say_is_refused_before_anyone_is_messaged() {
+        // Sending a bare "/advert" to the whole household would be
+        // unrecallable and meaningless.
+        for empty in ["", "   ", "\n"] {
+            let problem = check_advert(empty).unwrap_err();
+            assert!(problem.contains("usage:"), "got: {problem}");
+        }
+        assert_eq!(check_advert("  hello  ").unwrap(), "hello");
+    }
+
+    #[test]
+    fn an_advert_too_long_for_telegram_is_refused_rather_than_failing_per_recipient() {
+        let long = "x".repeat(3501);
+        let problem = check_advert(&long).unwrap_err();
+        assert!(problem.contains("3500"), "got: {problem}");
+        assert!(check_advert(&"x".repeat(3500)).is_ok());
+    }
     use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
     use rig::message::ToolCall;
     use rig::one_or_many::OneOrMany;

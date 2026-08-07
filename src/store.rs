@@ -49,6 +49,14 @@ CREATE TABLE IF NOT EXISTS users (
     display_name TEXT NOT NULL,
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
+-- Where each person last spoke to the bot, so an announcement can reach
+-- them. A separate table rather than a column on `users`: that one already
+-- holds live data, and adding to it means altering it in place.
+CREATE TABLE IF NOT EXISTS user_chats (
+    user_id BIGINT PRIMARY KEY,
+    chat_id BIGINT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
 "#;
 
 /// A purchase as the agent sees it. `purchased_at` is an ISO `YYYY-MM-DD`
@@ -336,6 +344,30 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Records where this person last spoke, for announcements.
+    ///
+    /// A user id and a chat id are the same number in a private chat and
+    /// different in a group, so the chat is stored rather than derived.
+    pub fn remember_chat(&self, user_id: i64, chat_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_chats (user_id, chat_id) VALUES (?, ?)
+             ON CONFLICT (user_id)
+             DO UPDATE SET chat_id = excluded.chat_id, updated_at = now()",
+            params![user_id, chat_id],
+        )?;
+        Ok(())
+    }
+
+    /// Everyone the bot could announce something to, as (user, chat).
+    pub fn broadcast_targets(&self) -> Result<Vec<(i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT user_id, chat_id FROM user_chats ORDER BY user_id ASC")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     /// Flight searches per user since `cutoff`, scoped to one user. See
     /// [`FLIGHT_SEARCH`].
     pub fn flight_searches_for(&self, cutoff: &str, user_id: i64) -> Result<BTreeMap<i64, i64>> {
@@ -578,6 +610,23 @@ mod tests {
 
         let empty = s.usage_stats_for("2026-07-25 00:00:00", 99).unwrap();
         assert!(empty.is_empty(), "unknown user sees nothing");
+    }
+
+    #[test]
+    fn broadcast_targets_are_the_chats_people_actually_talk_in() {
+        // A user id is not a chat id — they coincide in a private chat and
+        // do not in a group. Announcements have to go where the
+        // conversation happened, so the chat is recorded rather than
+        // assumed.
+        let (s, _d) = test_store();
+        s.remember_chat(1, 1).unwrap();
+        s.remember_chat(2, -100200300).unwrap();
+        assert_eq!(s.broadcast_targets().unwrap(), vec![(1, 1), (2, -100200300)]);
+
+        // Moving chats replaces the old one: an announcement should follow
+        // the person, not accumulate copies.
+        s.remember_chat(1, -999).unwrap();
+        assert_eq!(s.broadcast_targets().unwrap(), vec![(1, -999), (2, -100200300)]);
     }
 
     #[test]

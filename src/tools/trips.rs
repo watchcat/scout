@@ -167,14 +167,15 @@ fn calendar_date(value: &str) -> Result<String, StoreToolError> {
 /// different journey.
 pub fn match_candidate<'a>(candidate: &TripCandidate, offers: &'a [Flight]) -> Option<&'a Flight> {
     let wanted = candidate.flight_numbers.trim();
-    offers.iter().find(|offer| {
-        let numbers = offer
-            .legs
-            .iter()
-            .flat_map(|leg| leg.flights.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(",");
-        numbers == wanted
+    offers.iter().find(|offer| match offer.legs.as_slice() {
+        // A stored candidate can only ever have come from a single leg —
+        // add_trip_option refuses to bind a return offer to a segment — so
+        // this is symmetric with how the data was created, not an extra
+        // restriction. Without it, a two-leg return with one flight number
+        // per leg joins to the same string as a genuine one-leg, two-flight
+        // connection and the two become indistinguishable.
+        [leg] => leg.flights.join(",") == wanted,
+        _ => false,
     })
 }
 
@@ -196,6 +197,12 @@ pub struct PricedOption {
     pub quoted_price: Option<f64>,
     pub quoted_currency: Option<String>,
     pub price_now: Option<f64>,
+    /// The currency `price_now` is actually stated in. Never assumed to be
+    /// `quoted_currency`: that is what this itinerary cost when it was
+    /// parked, and finalisation exists precisely because that figure is
+    /// stale. A total summed from `price_now` has to be labelled from this
+    /// field, not that one.
+    pub price_now_currency: Option<String>,
     pub moved: Option<f64>,
     /// False when this itinerary is not sold on that date any more.
     pub still_offered: bool,
@@ -234,14 +241,35 @@ pub struct FinaliseArgs {
 
 /// The sum of the chosen options, or why there isn't one.
 ///
-/// A total is only meaningful when every segment is priced and priced in the
-/// same currency. Forcing one out of mixed currencies would need a rate
-/// nobody supplied.
+/// A total is only meaningful when every segment is priced *now*, and every
+/// one of those current prices agrees on a currency. Agreement is checked
+/// against `price_now_currency`, never `quoted_currency`: the parked
+/// currency is what an itinerary cost before finalisation re-priced it, and
+/// summing today's numbers under yesterday's label is the exact laundering
+/// this function exists to refuse — a trip parked all in EUR does not mean
+/// its live prices still are. Forcing a total out of mixed currencies, or
+/// out of a price with no stated currency of its own, would need a
+/// conversion rate nobody supplied.
 pub fn separate_total(segments: &[PricedSegment]) -> Result<(f64, String), String> {
-    let mut currencies: Vec<String> = segments
-        .iter()
-        .filter_map(|s| s.chosen.quoted_currency.clone())
-        .collect();
+    let mut currencies: Vec<String> = Vec::new();
+    let mut total = 0.0;
+    for segment in segments {
+        let price = segment.chosen.price_now.ok_or_else(|| {
+            format!(
+                "segment {} ({}) could not be priced now, so the trip has no total",
+                segment.position, segment.route
+            )
+        })?;
+        let currency = segment.chosen.price_now_currency.clone().ok_or_else(|| {
+            format!(
+                "segment {} ({}) has a current price but no stated currency, so it cannot be \
+                 added to a total",
+                segment.position, segment.route
+            )
+        })?;
+        currencies.push(currency);
+        total += price;
+    }
     currencies.sort();
     currencies.dedup();
     if currencies.len() > 1 {
@@ -252,17 +280,6 @@ pub fn separate_total(segments: &[PricedSegment]) -> Result<(f64, String), Strin
         ));
     }
     let currency = currencies.pop().ok_or_else(|| "no segment states a currency".to_string())?;
-
-    let mut total = 0.0;
-    for segment in segments {
-        let price = segment.chosen.price_now.ok_or_else(|| {
-            format!(
-                "segment {} ({}) could not be priced now, so the trip has no total",
-                segment.position, segment.route
-            )
-        })?;
-        total += price;
-    }
     Ok((((total * 100.0).round() / 100.0), currency))
 }
 
@@ -288,27 +305,42 @@ pub fn comparison_notes(
     match (separate, one_ticket) {
         (Some(sep), Some(one)) => {
             let gap = ((one - sep) * 100.0).round() / 100.0;
+            // The currency code is dropped rather than printed empty:
+            // "42.00  more" (double space, no code) reads like a rendering
+            // bug and undermines trust in the number sitting right next to
+            // it. The caller only ever passes "" when no currency could be
+            // determined, so there is nothing correct to print anyway.
+            let amount = match currency.is_empty() {
+                true => format!("{:.2}", gap.abs()),
+                false => format!("{:.2} {currency}", gap.abs()),
+            };
             notes.push(match gap > 0.0 {
                 true => format!(
-                    "one ticket costs {gap:.2} {currency} more than booking separately, and \
-                     that is what the protection above is worth"
+                    "one ticket costs {amount} more than booking separately, and that is \
+                     what the protection above is worth"
                 ),
                 false => format!(
-                    "one ticket is {:.2} {currency} cheaper than booking separately, and \
-                     carries the protection as well",
-                    gap.abs()
+                    "one ticket is {amount} cheaper than booking separately, and carries \
+                     the protection as well"
                 ),
             });
         }
-        // A missing comparison must never read as a verdict for separate
-        // booking — that silence is exactly what would cost somebody money.
-        (_, None) => notes.push(
+        // A missing comparison must never read as a verdict either way —
+        // that silence is exactly what would cost somebody money, whichever
+        // side turns out to be the one that is actually missing.
+        (Some(_), None) => notes.push(
             "the single-ticket comparison could not be made, so nothing here says whether \
              booking the whole trip on one ticket would be better — this is a missing \
              answer, not an argument for separate bookings"
                 .to_string(),
         ),
-        _ => {}
+        (None, Some(_)) => notes.push(
+            "the separate-booking total could not be given, so nothing here says whether \
+             booking each segment apart would be better — this is a missing answer, not an \
+             argument for the single ticket"
+                .to_string(),
+        ),
+        (None, None) => {}
     }
     notes
 }
@@ -1599,6 +1631,19 @@ mod tests {
     }
 
     #[test]
+    fn a_return_offer_is_never_mistaken_for_a_single_leg_connection() {
+        // add_trip_option refuses to bind a return offer to a segment, so a
+        // stored candidate can only ever have come from a single leg.
+        // Flattening every leg before joining — the old behaviour — makes a
+        // two-leg return with one flight number each join to the same
+        // string as a genuine one-leg, two-flight connection.
+        let mut round_trip = one_way("both-ways", "AMS", "NRT", "2026-09-03", &["KL861"]);
+        round_trip.legs.push(one_way("x", "NRT", "AMS", "2026-09-10", &["KL862"]).legs.remove(0));
+        let offers = vec![round_trip];
+        assert!(match_candidate(&parked("KL861,KL862", 780.0), &offers).is_none());
+    }
+
+    #[test]
     fn a_price_that_moved_is_reported_with_its_sign() {
         // The number the traveller opens this output for.
         assert_eq!(price_move(Some(118.0), Some(131.0)), Some(13.0));
@@ -1610,7 +1655,13 @@ mod tests {
         assert_eq!(price_move(Some(118.01), Some(131.0)), Some(12.99));
     }
 
-    fn priced(price: Option<f64>, currency: &str) -> PricedSegment {
+    // The currency a segment's total is labelled with must come from the
+    // same place as the number itself: `price_now`, today's search result.
+    // `quoted_currency` is only what this cost when it was parked, and the
+    // whole point of finalisation is that figure is stale, so this helper
+    // keeps the two independent — a caller that wants them to agree passes
+    // the same string twice; a caller testing the laundering bug does not.
+    fn priced_now(quoted_currency: &str, price_now: Option<f64>, price_now_currency: Option<&str>) -> PricedSegment {
         PricedSegment {
             position: 1,
             route: "AMS→LIS".to_string(),
@@ -1620,14 +1671,21 @@ mod tests {
                 flight_numbers: "TP675".to_string(),
                 itinerary: "AMS 10:05 ✈ LIS 12:15".to_string(),
                 quoted_price: Some(118.0),
-                quoted_currency: Some(currency.to_string()),
-                price_now: price,
+                quoted_currency: Some(quoted_currency.to_string()),
+                price_now,
+                price_now_currency: price_now_currency.map(str::to_string),
                 moved: None,
-                still_offered: price.is_some(),
+                still_offered: price_now.is_some(),
             },
             also_considered: Vec::new(),
             booking: Vec::new(),
         }
+    }
+
+    /// A segment priced now in the same currency it was parked in — the
+    /// ordinary case, and what most tests here want.
+    fn priced(price: Option<f64>, currency: &str) -> PricedSegment {
+        priced_now(currency, price, price.map(|_| currency))
     }
 
     #[test]
@@ -1648,6 +1706,31 @@ mod tests {
     }
 
     #[test]
+    fn a_price_with_no_stated_current_currency_refuses_rather_than_being_summed_under_the_parked_one() {
+        // The bug this guards: both were parked in EUR, so the old check —
+        // which looked at quoted_currency — saw agreement and summed anyway,
+        // labelling the total EUR even though this segment's live price
+        // carries no currency of its own. Nothing in "600.00 EUR" would say
+        // that half of it was never actually priced in EUR.
+        let unlabelled = priced_now("EUR", Some(500.0), None);
+        let segments = vec![priced(Some(100.0), "EUR"), unlabelled];
+        assert!(separate_total(&segments).is_err(), "a price with no currency must not be summed");
+    }
+
+    #[test]
+    fn segments_whose_current_currencies_disagree_refuse_even_when_the_parked_ones_matched() {
+        // Both were parked in EUR, but the market has moved and one is now
+        // only sold in USD. A total has to be labelled with what was
+        // actually summed, not with a currency from before either price on
+        // it went live.
+        let now_usd = priced_now("EUR", Some(200.0), Some("USD"));
+        let segments = vec![priced(Some(100.0), "EUR"), now_usd];
+        let problem = separate_total(&segments).unwrap_err();
+        assert!(problem.contains("EUR"), "got: {problem}");
+        assert!(problem.contains("USD"), "got: {problem}");
+    }
+
+    #[test]
     fn a_separate_total_never_travels_without_what_it_costs_the_traveller() {
         // Four links is four tickets: bags collected and re-checked at every
         // join, and nobody obliged to rebook you when a leg is late.
@@ -1661,6 +1744,50 @@ mod tests {
         let notes = comparison_notes(3, Some(770.0), None, "EUR");
         let joined = notes.join(" ");
         assert!(joined.contains("could not"), "got: {joined}");
+    }
+
+    #[test]
+    fn every_combination_of_the_two_totals_reads_unambiguously() {
+        // Both present: a stated comparison.
+        let both = comparison_notes(2, Some(100.0), Some(142.0), "EUR").join(" ");
+        assert!(both.contains("more") || both.contains("cheaper"), "got: {both}");
+
+        // Separate present, one-ticket missing: says the comparison could
+        // not be made — the case the original tests already covered.
+        let only_separate = comparison_notes(2, Some(100.0), None, "EUR").join(" ");
+        assert!(only_separate.contains("could not"), "got: {only_separate}");
+        assert!(
+            !only_separate.contains("more") && !only_separate.contains("cheaper"),
+            "a missing comparison must not read as a verdict: {only_separate}"
+        );
+
+        // One-ticket present, separate missing: the case this function used
+        // to say nothing about at all, letting a real one-ticket price sit
+        // there with no explanation for why there was nothing to compare it
+        // against.
+        let only_one_ticket = comparison_notes(2, None, Some(142.0), "EUR").join(" ");
+        assert!(only_one_ticket.contains("could not"), "got: {only_one_ticket}");
+        assert!(
+            !only_one_ticket.contains("more") && !only_one_ticket.contains("cheaper"),
+            "a missing comparison must not read as a verdict either way: {only_one_ticket}"
+        );
+
+        // Neither present: nothing to compare, so nothing to say here — the
+        // reasons each total is missing are reported by their own callers.
+        let neither = comparison_notes(2, None, None, "EUR");
+        assert!(neither.is_empty(), "got: {neither:?}");
+    }
+
+    #[test]
+    fn an_unknown_currency_does_not_leave_a_double_space_in_the_comparison() {
+        // The caller passes "" when no currency could be determined at all.
+        // Dropping the placeholder cleanly matters more here than it looks:
+        // "one ticket costs 42.00  more" reads like a copy-paste error, which
+        // undermines trust in the number right next to it.
+        let notes = comparison_notes(2, Some(100.0), Some(142.0), "");
+        let joined = notes.join(" ");
+        assert!(!joined.contains("  "), "no double space when the currency is unknown: {joined}");
+        assert!(joined.contains("42.00"), "got: {joined}");
     }
 
     #[test]

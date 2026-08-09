@@ -128,13 +128,28 @@ pub fn dates_run_forwards(segments: &[TripSegment]) -> Result<(), String> {
 #[derive(Debug, PartialEq, serde::Serialize)]
 pub struct TripView {
     pub trip: Trip,
+    /// Why this trip could not be priced yet, or absent when it could be.
+    ///
+    /// Computed by the same functions `finalise_trip` refuses on, so the
+    /// two can never disagree about whether a trip is finished. It rides on
+    /// every answer about a trip for a reason: the bot once listed four
+    /// legs as decided while holding none of them, because three bindings
+    /// had been refused and it described its intent rather than the tool's
+    /// reply. A model can forget an instruction to check; it cannot easily
+    /// assert "all four are booked" in the same breath as data saying
+    /// segment 2 has no flight on it.
+    pub not_ready: Option<String>,
     pub notes: Vec<String>,
 }
 
 impl TripView {
     fn of(trip: Trip) -> Self {
+        // Exactly what finalisation checks, in the order it checks it.
+        let not_ready = ready_to_price(&trip.segments)
+            .err()
+            .or_else(|| dates_run_forwards(&trip.segments).err());
         let notes = itinerary_notes(&trip.segments);
-        Self { trip, notes }
+        Self { trip, not_ready, notes }
     }
 }
 
@@ -1885,6 +1900,111 @@ mod tests {
 
         let missing = show.call(ShowTripArgs { trip: Some("Peru".into()) }).await.unwrap_err();
         assert!(missing.to_string().contains("Japan direct"), "unknown names list the real ones: {missing}");
+    }
+
+    #[tokio::test]
+    async fn every_answer_about_a_trip_carries_whether_it_is_actually_ready() {
+        // Reported in production: the bot listed four legs as decided and
+        // had none of them, because three bindings had been refused and it
+        // narrated its intent instead of the tool's answer. A claim about a
+        // trip has to come from the trip, so the state travels with every
+        // reply rather than living in the model's memory of one.
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "HKG", "2026-09-15", &["EY78"])], Instant::now());
+
+        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let view = add
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "HKG".into(),
+                departure_date: "2026-09-15".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let waiting = view.not_ready.expect("a segment with no flight is not ready");
+        assert!(waiting.contains("segment 1"), "and it says which: {waiting}");
+
+        let view = AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "a".into(),
+                decided: None,
+            })
+            .await
+            .unwrap();
+        assert!(view.not_ready.is_none(), "every segment decided, so it is ready: {view:?}");
+
+        // A second segment with nothing on it puts it back to not-ready, so
+        // "the trip is done" cannot survive adding a leg to it.
+        let view = add
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "HKG".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-19".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let waiting = view.not_ready.expect("the new leg has no flight");
+        assert!(waiting.contains("segment 2"), "got: {waiting}");
+    }
+
+    #[tokio::test]
+    async fn a_trip_whose_dates_run_backwards_is_reported_as_not_ready() {
+        // not_ready must be everything finalise_trip would refuse on, or a
+        // trip can read as ready and then be turned away.
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(
+            99,
+            vec![
+                one_way("out", "AMS", "HKG", "2026-09-19", &["EY78"]),
+                one_way("on", "HKG", "NRT", "2026-09-15", &["CX500"]),
+            ],
+            Instant::now(),
+        );
+        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let park = AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 };
+        // Both legs decided, so the only thing left wrong is their order.
+        for (position, o, d, date, offer) in [
+            (1, "AMS", "HKG", "2026-09-19", "out"),
+            (2, "HKG", "NRT", "2026-09-15", "on"),
+        ] {
+            add.call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: o.into(),
+                destination: d.into(),
+                departure_date: date.into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+            park.call(AddOptionArgs {
+                trip: "Japan".into(),
+                position,
+                offer_id: offer.into(),
+                decided: None,
+            })
+            .await
+            .unwrap();
+        }
+        let view = ShowTripTool { store, user_id: 7 }
+            .call(ShowTripArgs { trip: Some("Japan".into()) })
+            .await
+            .unwrap();
+        let waiting = view.trips[0].not_ready.as_deref().expect("backwards dates are not ready");
+        assert!(waiting.contains("2026-09-15"), "got: {waiting}");
     }
 
     #[tokio::test]

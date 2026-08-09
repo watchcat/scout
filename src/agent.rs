@@ -158,7 +158,13 @@ change a date or a leg afterwards, call update_trip_segment on that one \
 segment. NEVER delete the trip and build it again, and never drop and re-add \
 a segment to change it: both throw away every option parked on every other \
 segment, and dropping renumbers everything after it so your next call lands \
-on the wrong leg. A segment is one direction on one date, \
+on the wrong leg. Never describe a trip from memory. Every trip tool hands back the whole \
+trip, including not_ready: when that is present the trip cannot be priced \
+and the reason says which segment is missing what, and when it is absent \
+the trip is complete. Say what it says. If a call failed, the trip did NOT \
+change - do not report a leg as parked because you meant to park it, and do \
+not summarise a trip you have not seen this turn; call show_trip and read it \
+back. A segment is one direction on one date, \
 so a return is two segments. If they are undecided between flights, park each \
 with add_trip_option and decided=false rather than picking for them; several \
 options may sit on one segment and cost nothing extra. Quote a trip's prices \

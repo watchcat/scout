@@ -7,7 +7,9 @@
 
 use crate::store::{ExpectedSegment, NewCandidate, Store, Trip, TripCandidate, TripSegment};
 use crate::tools::budget::FlightBudget;
-use crate::tools::duffel::{merged_search, DuffelClient, Flight, FlightQuery, MultiCityQuery, Slice, Source};
+use crate::tools::duffel::{
+    dominant_currency, merged_search, DuffelClient, Flight, FlightQuery, MultiCityQuery, Slice, Source,
+};
 use crate::tools::ignav::IgnavClient;
 use crate::tools::purchases::{internal, StoreToolError};
 use crate::tools::shown::ShownFlights;
@@ -231,8 +233,19 @@ pub struct FinalisedTrip {
     pub adults: i64,
     pub segments: Vec<PricedSegment>,
     pub separate_total: Option<f64>,
-    pub one_ticket_total: Option<f64>,
+    /// The currency `separate_total` was actually summed in.
     pub currency: Option<String>,
+    /// The cheapest single-ticket price Duffel quoted for the whole
+    /// itinerary. Real whenever a multi-city offer came back — never
+    /// nulled out just because it happens to be in a different currency
+    /// from `separate_total`; that is `one_ticket_currency`'s job to say,
+    /// and `notes` is where a mismatch gets explained rather than
+    /// subtracted.
+    pub one_ticket_total: Option<f64>,
+    /// The currency `one_ticket_total` is actually in. Not assumed to
+    /// equal `currency`: a single ticket for the same itinerary can price
+    /// in a currency none of the separate segments do.
+    pub one_ticket_currency: Option<String>,
     pub notes: Vec<String>,
 }
 
@@ -285,6 +298,30 @@ pub fn separate_total(segments: &[PricedSegment]) -> Result<(f64, String), Strin
     Ok((((total * 100.0).round() / 100.0), currency))
 }
 
+/// The cheapest single-ticket price worth reporting, with the currency it is
+/// actually in.
+///
+/// Never the global minimum across a currency mix: Duffel's own JPY figures
+/// run about a hundred times the EUR ones for the same trip, so taking the
+/// cheapest number across currencies would just be picking whichever unit
+/// happens to look smallest, not the cheapest fare. `want` is the currency
+/// `separate_total` was summed in, when there is one — the only currency
+/// this figure could actually be subtracted from — so a match there is
+/// preferred over whichever currency most of the offers merely happen to
+/// share.
+fn cheapest_one_ticket(offers: &[Flight], want: Option<&str>) -> Option<(f64, String)> {
+    let currency = want
+        .filter(|w| offers.iter().any(|o| o.currency == *w))
+        .map(str::to_string)
+        .or_else(|| dominant_currency(offers))?;
+    offers
+        .iter()
+        .filter(|o| o.currency == currency)
+        .map(|o| o.price)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|price| (price, currency))
+}
+
 /// What has to be said alongside the two totals.
 ///
 /// These live in the tool's output rather than the preamble because the
@@ -292,9 +329,8 @@ pub fn separate_total(segments: &[PricedSegment]) -> Result<(f64, String), Strin
 /// to make is one it sometimes doesn't.
 pub fn comparison_notes(
     segment_count: usize,
-    separate: Option<f64>,
-    one_ticket: Option<f64>,
-    currency: &str,
+    separate: Option<(f64, &str)>,
+    one_ticket: Option<(f64, &str)>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
     if separate.is_some() {
@@ -305,17 +341,9 @@ pub fn comparison_notes(
         ));
     }
     match (separate, one_ticket) {
-        (Some(sep), Some(one)) => {
+        (Some((sep, sep_currency)), Some((one, one_currency))) if sep_currency == one_currency => {
             let gap = ((one - sep) * 100.0).round() / 100.0;
-            // The currency code is dropped rather than printed empty:
-            // "42.00  more" (double space, no code) reads like a rendering
-            // bug and undermines trust in the number sitting right next to
-            // it. The caller only ever passes "" when no currency could be
-            // determined, so there is nothing correct to print anyway.
-            let amount = match currency.is_empty() {
-                true => format!("{:.2}", gap.abs()),
-                false => format!("{:.2} {currency}", gap.abs()),
-            };
+            let amount = format!("{:.2} {sep_currency}", gap.abs());
             notes.push(match gap > 0.0 {
                 true => format!(
                     "one ticket costs {amount} more than booking separately, and that is \
@@ -326,6 +354,19 @@ pub fn comparison_notes(
                      the protection as well"
                 ),
             });
+        }
+        // Both figures exist but were never in the same unit — subtracting
+        // them would be the same error as doing arithmetic on two local
+        // departure times. This is a missing comparison, not a verdict:
+        // both figures are still given, each with its own label, so nothing
+        // is hidden, only the (nonsensical) difference.
+        (Some((sep, sep_currency)), Some((one, one_currency))) => {
+            notes.push(format!(
+                "booking separately comes to {sep:.2} {sep_currency} and the single ticket is \
+                 {one:.2} {one_currency} — different currencies, so the two cannot be \
+                 compared without a conversion rate nobody has supplied; this is a missing \
+                 comparison, not a verdict for either approach"
+            ));
         }
         // A missing comparison must never read as a verdict either way —
         // that silence is exactly what would cost somebody money, whichever
@@ -524,11 +565,12 @@ impl Tool for FinaliseTripTool {
                 adults,
                 cabin_class: cabin.clone(),
             };
+            // The raw offers, not a price picked out of them yet: which
+            // currency is worth reporting depends on what the segments
+            // themselves priced in, and that is not known until the loop
+            // below has run.
             match duffel.search_multi_city(&query).await {
-                Ok(offers) => offers
-                    .iter()
-                    .map(|o| o.price)
-                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
+                Ok(offers) => Some(offers),
                 Err(e) => {
                     tracing::warn!(error = %e, "single-ticket pricing failed");
                     None
@@ -536,7 +578,8 @@ impl Tool for FinaliseTripTool {
             }
         };
 
-        let (segment_results, one_ticket_total) = futures::future::join(per_segment, one_ticket).await;
+        let (segment_results, one_ticket_offers) = futures::future::join(per_segment, one_ticket).await;
+        let one_ticket_offers = one_ticket_offers.unwrap_or_default();
 
         let mut segments = Vec::new();
         let mut notes = Vec::new();
@@ -586,11 +629,18 @@ impl Tool for FinaliseTripTool {
                 (None, None)
             }
         };
+        // Prefers a single-ticket offer in the currency the segments were
+        // actually summed in — the only one this figure could honestly be
+        // subtracted from — over whichever currency happens to be cheapest.
+        let (one_ticket_total, one_ticket_currency) =
+            match cheapest_one_ticket(&one_ticket_offers, currency.as_deref()) {
+                Some((price, currency)) => (Some(price), Some(currency)),
+                None => (None, None),
+            };
         notes.extend(comparison_notes(
             segments.len(),
-            separate_total,
-            one_ticket_total,
-            currency.as_deref().unwrap_or(""),
+            separate_total.zip(currency.as_deref()),
+            one_ticket_total.zip(one_ticket_currency.as_deref()),
         ));
         if self.duffel.is_none() {
             notes.push(
@@ -616,8 +666,9 @@ impl Tool for FinaliseTripTool {
             adults: trip.adults,
             segments,
             separate_total,
-            one_ticket_total,
             currency,
+            one_ticket_total,
+            one_ticket_currency,
             notes,
         })
     }
@@ -1943,6 +1994,36 @@ mod tests {
     }
 
     #[test]
+    fn the_cheapest_one_ticket_price_is_never_the_global_minimum_across_a_currency_mix() {
+        let mostly_eur = vec![
+            Flight { price: 500.0, currency: "EUR".to_string(), ..one_way("a", "AMS", "NRT", "2026-09-03", &["KL1"]) },
+            Flight { price: 480.0, currency: "EUR".to_string(), ..one_way("b", "AMS", "NRT", "2026-09-03", &["KL2"]) },
+            // Numerically the smallest figure in the set, but in a currency
+            // nothing else here is — and not what the separate total was
+            // summed in. Taking this because the number is smaller would be
+            // the exact class of error separate_total was fixed against.
+            Flight { price: 300.0, currency: "USD".to_string(), ..one_way("c", "AMS", "NRT", "2026-09-03", &["KL3"]) },
+        ];
+        assert_eq!(
+            cheapest_one_ticket(&mostly_eur, Some("EUR")),
+            Some((480.0, "EUR".to_string())),
+            "the EUR group is preferred over a nominally cheaper USD offer, because EUR is \
+             what the separate total could actually be subtracted from"
+        );
+
+        // No preferred currency to match — the separate total could not be
+        // computed at all, say — so this falls back to whichever currency
+        // most of the offers share, never a blind global minimum.
+        assert_eq!(
+            cheapest_one_ticket(&mostly_eur, None),
+            Some((480.0, "EUR".to_string())),
+            "falls back to the dominant currency, not the smallest number regardless of unit"
+        );
+
+        assert_eq!(cheapest_one_ticket(&[], Some("EUR")), None, "nothing offered, nothing to report");
+    }
+
+    #[test]
     fn a_total_is_only_produced_when_every_segment_agrees_on_a_currency() {
         let same = vec![priced(Some(131.0), "EUR"), priced(Some(200.0), "EUR")];
         assert_eq!(separate_total(&same), Ok((331.0, "EUR".to_string())));
@@ -1988,27 +2069,27 @@ mod tests {
     fn a_separate_total_never_travels_without_what_it_costs_the_traveller() {
         // Four links is four tickets: bags collected and re-checked at every
         // join, and nobody obliged to rebook you when a leg is late.
-        let notes = comparison_notes(3, Some(770.0), Some(812.0), "EUR");
+        let notes = comparison_notes(3, Some((770.0, "EUR")), Some((812.0, "EUR")));
         let joined = notes.join(" ");
         assert!(joined.contains("3 separate"), "got: {joined}");
         assert!(joined.to_lowercase().contains("late"), "got: {joined}");
 
         // And an absent comparison says why, rather than letting the separate
         // total look like a verdict.
-        let notes = comparison_notes(3, Some(770.0), None, "EUR");
+        let notes = comparison_notes(3, Some((770.0, "EUR")), None);
         let joined = notes.join(" ");
         assert!(joined.contains("could not"), "got: {joined}");
     }
 
     #[test]
     fn every_combination_of_the_two_totals_reads_unambiguously() {
-        // Both present: a stated comparison.
-        let both = comparison_notes(2, Some(100.0), Some(142.0), "EUR").join(" ");
+        // Both present, same currency: a stated comparison.
+        let both = comparison_notes(2, Some((100.0, "EUR")), Some((142.0, "EUR"))).join(" ");
         assert!(both.contains("more") || both.contains("cheaper"), "got: {both}");
 
         // Separate present, one-ticket missing: says the comparison could
         // not be made — the case the original tests already covered.
-        let only_separate = comparison_notes(2, Some(100.0), None, "EUR").join(" ");
+        let only_separate = comparison_notes(2, Some((100.0, "EUR")), None).join(" ");
         assert!(only_separate.contains("could not"), "got: {only_separate}");
         assert!(
             !only_separate.contains("more") && !only_separate.contains("cheaper"),
@@ -2019,7 +2100,7 @@ mod tests {
         // to say nothing about at all, letting a real one-ticket price sit
         // there with no explanation for why there was nothing to compare it
         // against.
-        let only_one_ticket = comparison_notes(2, None, Some(142.0), "EUR").join(" ");
+        let only_one_ticket = comparison_notes(2, None, Some((142.0, "EUR"))).join(" ");
         assert!(only_one_ticket.contains("could not"), "got: {only_one_ticket}");
         assert!(
             !only_one_ticket.contains("more") && !only_one_ticket.contains("cheaper"),
@@ -2028,20 +2109,24 @@ mod tests {
 
         // Neither present: nothing to compare, so nothing to say here — the
         // reasons each total is missing are reported by their own callers.
-        let neither = comparison_notes(2, None, None, "EUR");
+        let neither = comparison_notes(2, None, None);
         assert!(neither.is_empty(), "got: {neither:?}");
     }
 
     #[test]
-    fn an_unknown_currency_does_not_leave_a_double_space_in_the_comparison() {
-        // The caller passes "" when no currency could be determined at all.
-        // Dropping the placeholder cleanly matters more here than it looks:
-        // "one ticket costs 42.00  more" reads like a copy-paste error, which
-        // undermines trust in the number right next to it.
-        let notes = comparison_notes(2, Some(100.0), Some(142.0), "");
-        let joined = notes.join(" ");
-        assert!(!joined.contains("  "), "no double space when the currency is unknown: {joined}");
-        assert!(joined.contains("42.00"), "got: {joined}");
+    fn two_totals_in_different_currencies_are_never_subtracted() {
+        // Doing this arithmetic across currencies is the same class of
+        // error as subtracting two local departure times: the numbers look
+        // comparable and are not. Both figures are still given, each with
+        // its own label — this is a missing comparison, not a verdict for
+        // either approach.
+        let notes = comparison_notes(2, Some((770.0, "EUR")), Some((900.0, "USD"))).join(" ");
+        assert!(
+            !notes.contains("more") && !notes.contains("cheaper"),
+            "a currency mismatch must never read as a stated difference: {notes}"
+        );
+        assert!(notes.contains("770.00 EUR"), "the separate total is still given: {notes}");
+        assert!(notes.contains("900.00 USD"), "the single-ticket price is still given: {notes}");
     }
 
     #[test]
@@ -2589,6 +2674,285 @@ mod tests {
             out.segments[0].also_considered[0].price_now,
             Some(820.0),
             "priced from the same search as the chosen option, at no extra cost"
+        );
+    }
+
+    // The single-ticket total has its own currency, independent of the
+    // separate total's. Two mocks distinguish the per-segment re-price
+    // requests (one slice each) from the multi-city comparison (every
+    // slice at once) so each can be answered differently — the whole point
+    // of these two tests.
+
+    /// One Duffel offer as raw JSON, with currency and flight numbers a
+    /// test controls directly — `duffel_offer` above is fixed to EUR, which
+    /// is the one thing these two tests need to vary.
+    fn offer(id: &str, total: &str, currency: &str, numbers: &[&str]) -> serde_json::Value {
+        let segments: Vec<serde_json::Value> = numbers
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "marketing_carrier_flight_number": n.trim_start_matches(char::is_alphabetic),
+                    "marketing_carrier": {"iata_code": &n[..2], "name": "TAP"},
+                    "origin": {"iata_code": "AMS"},
+                    "destination": {"iata_code": "LIS"},
+                    "departing_at": "2026-09-03T10:05:00",
+                    "arriving_at": "2026-09-03T12:15:00",
+                    "duration": "PT2H10M"
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "id": id,
+            "total_amount": total,
+            "total_currency": currency,
+            "owner": {"name": "TAP"},
+            "slices": [{
+                "origin": {"iata_code": "AMS"},
+                "destination": {"iata_code": "LIS"},
+                "duration": "PT2H10M",
+                "segments": segments
+            }]
+        })
+    }
+
+    /// The multi-city comparison, and only that request: every other
+    /// request finalising sends carries exactly one slice.
+    fn is_multi_slice_request() -> impl wiremock::Match {
+        move |req: &wiremock::Request| {
+            serde_json::from_slice::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|b| b["data"]["slices"].as_array().map(|s| s.len()))
+                .is_some_and(|n| n >= 2)
+        }
+    }
+
+    /// A per-segment re-price, never the multi-city comparison.
+    fn is_single_slice_request() -> impl wiremock::Match {
+        move |req: &wiremock::Request| {
+            serde_json::from_slice::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|b| b["data"]["slices"].as_array().map(|s| s.len()))
+                .is_some_and(|n| n == 1)
+        }
+    }
+
+    /// Builds the two-segment "Lisbon" trip both of the currency tests
+    /// below share: AMS→LIS on TP675, LIS→FCO on TP676, both parked in EUR.
+    async fn lisbon_trip(store: &Store) {
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(
+            99,
+            vec![
+                one_way("a", "AMS", "LIS", "2026-09-03", &["TP675"]),
+                one_way("b", "LIS", "FCO", "2026-09-07", &["TP676"]),
+            ],
+            Instant::now(),
+        );
+        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Lisbon".into(),
+                origin: "AMS".into(),
+                destination: "LIS".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Lisbon".into(),
+                origin: "LIS".into(),
+                destination: "FCO".into(),
+                departure_date: "2026-09-07".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let add_opt = AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 };
+        add_opt
+            .call(AddOptionArgs { trip: "Lisbon".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap();
+        add_opt
+            .call(AddOptionArgs { trip: "Lisbon".into(), position: 2, offer_id: "b".into(), decided: None })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_single_ticket_price_in_a_different_currency_is_never_subtracted_from_the_separate_total() {
+        // Both segments re-price in EUR; the multi-city comparison comes
+        // back in USD. Stating a "difference" across those would be the
+        // exact laundering bug separate_total was already fixed against —
+        // this pins the same fix on the other side of the comparison.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .and(is_single_slice_request())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {
+                "offers": [offer("a-now", "130.00", "EUR", &["TP675"]), offer("b-now", "140.00", "EUR", &["TP676"])]
+            }})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .and(is_multi_slice_request())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {
+                "offers": [offer("one-ticket", "340.00", "USD", &["TP675", "TP676"])]
+            }})))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        lisbon_trip(&store).await;
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store,
+            user_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Lisbon".into() })
+        .await
+        .unwrap();
+
+        assert_eq!(out.separate_total, Some(270.0), "both segments still total in EUR");
+        assert_eq!(out.currency.as_deref(), Some("EUR"));
+        assert_eq!(out.one_ticket_total, Some(340.0), "the single-ticket price is still reported");
+        assert_eq!(out.one_ticket_currency.as_deref(), Some("USD"), "in the currency it actually came back in");
+        let joined = out.notes.join(" ");
+        assert!(
+            !joined.contains("more") && !joined.contains("cheaper"),
+            "a currency mismatch must never read as a stated difference: {joined}"
+        );
+        assert!(
+            joined.to_lowercase().contains("different currenc"),
+            "the mismatch has to be explained, not just silently absent: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_ticket_price_in_the_same_currency_still_states_the_difference() {
+        // The control for the test above: nothing about carrying the
+        // currency through should stop an ordinary same-currency
+        // comparison from working exactly as it did before.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .and(is_single_slice_request())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {
+                "offers": [offer("a-now", "130.00", "EUR", &["TP675"]), offer("b-now", "140.00", "EUR", &["TP676"])]
+            }})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .and(is_multi_slice_request())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {
+                "offers": [offer("one-ticket", "300.00", "EUR", &["TP675", "TP676"])]
+            }})))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        lisbon_trip(&store).await;
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store,
+            user_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Lisbon".into() })
+        .await
+        .unwrap();
+
+        assert_eq!(out.separate_total, Some(270.0));
+        assert_eq!(out.one_ticket_total, Some(300.0));
+        assert_eq!(out.one_ticket_currency.as_deref(), Some("EUR"), "same currency as the separate total");
+        let joined = out.notes.join(" ");
+        assert!(
+            joined.contains("30.00 EUR more"),
+            "a same-currency comparison still states the gap exactly as before: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duffel_sourced_segment_gets_no_invented_booking_link() {
+        // Ignav resolves its own ids to sellers; a Duffel offer has nowhere
+        // to send anyone while Duffel Links is disabled. That asymmetry is
+        // by design — nothing may paper over it with a plausible-looking
+        // fallback link.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(duffel_offer("980.00", &["KL861"])))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+            .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store,
+            user_id: 7,
+            duffel: Some(duffel),
+            // No Ignav configured at all, so nothing could invent a link
+            // even by mistake — the same result as an Ignav-less deploy.
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap();
+
+        assert!(
+            out.segments[0].chosen.still_offered,
+            "the match has to succeed for this to be a meaningful check of the booking list"
+        );
+        assert!(
+            out.segments[0].booking.is_empty(),
+            "a Duffel-sourced match must never carry an invented booking link: {:?}",
+            out.segments[0].booking
         );
     }
 }

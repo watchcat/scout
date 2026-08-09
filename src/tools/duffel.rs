@@ -1690,7 +1690,12 @@ fn provider(source: Source) -> &'static str {
 
 /// The currency most offers are priced in. Ties keep the one seen first, so
 /// the same response always ranks the same way.
-fn dominant_currency(flights: &[Flight]) -> Option<String> {
+///
+/// `pub(crate)` rather than private: trip finalisation reuses this to pick a
+/// currency to report a single-ticket price in, for the same reason `rank`
+/// needs it here — a mixed-currency response must not be reduced to a global
+/// minimum, which would just reward whichever unit happens to be smallest.
+pub(crate) fn dominant_currency(flights: &[Flight]) -> Option<String> {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for f in flights {
         match counts.iter_mut().find(|(c, _)| *c == f.currency) {

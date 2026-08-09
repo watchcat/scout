@@ -8,6 +8,10 @@ use crate::tools::prices::ComparePricesTool;
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
 use crate::tools::secondhand::{effective_sites, SecondhandSearchTool};
+use crate::tools::trips::{
+    AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
+    DropTripSegmentTool, ShowTripTool,
+};
 use anyhow::Result;
 use rig::client::CompletionClient;
 use rig::providers::openai;
@@ -142,6 +146,14 @@ own search box - so repeat the route, date and price for them to enter, and \
 say the link is single-use and short-lived. Never re-send an old one; ask \
 for a fresh link each time. Without that tool, Scout cannot book at all: \
 give the numbers and let the user buy from the airline.
+- When someone is planning more than one flight — a multi-city route, or a trip \
+they are assembling over several messages — build it with the trip tools \
+rather than holding it in your head. A segment is one direction on one date, \
+so a return is two segments. If they are undecided between flights, park each \
+with add_trip_option and decided=false rather than picking for them; several \
+options may sit on one segment and cost nothing extra. Quote a trip's prices \
+as of when each option was parked, never as a current total: they are stale \
+by construction and only finalising re-prices them.
 - If a booking fee is listed below, every flight price you are given \
 ALREADY includes it, and it is what the checkout will charge - quote the \
 numbers unchanged. Say once, in plain words, that prices include that \
@@ -583,7 +595,20 @@ pub fn build_agent(
         .tool(ListRemindersTool { store: d.store.clone(), user_id })
         .tool(CancelReminderTool { store: d.store.clone(), user_id })
         .tool(RememberFactTool { store: d.store.clone(), user_id })
-        .tool(ForgetFactTool { store: d.store.clone(), user_id });
+        .tool(ForgetFactTool { store: d.store.clone(), user_id })
+        // Trip planning. Registered unconditionally: a trip is a plan, and
+        // planning one needs no provider at all. Only finalising does.
+        .tool(AddTripSegmentTool { store: d.store.clone(), user_id })
+        .tool(AddTripOptionTool {
+            store: d.store.clone(),
+            user_id,
+            shown: d.shown.clone(),
+            chat_id,
+        })
+        .tool(ChooseTripOptionTool { store: d.store.clone(), user_id })
+        .tool(ShowTripTool { store: d.store.clone(), user_id })
+        .tool(DropTripSegmentTool { store: d.store.clone(), user_id })
+        .tool(DeleteTripTool { store: d.store.clone(), user_id });
     // Offered only when configured, so the model never sees a tool that
     // cannot work.
     if let Some(bol) = &d.bol {

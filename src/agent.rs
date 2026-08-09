@@ -663,11 +663,21 @@ pub fn build_agent(
             store: d.store.clone(),
             user_id,
             duffel: d.duffel.clone(),
-            // Unlike FlightSearchTool, no per-user market wrapper: booking
-            // links are resolved by ignav_id, and Ignav rejects a market
-            // sent alongside one (measured: a 400
-            // conflicting_booking_lookup_mode).
-            ignav: d.ignav.clone(),
+            // Same wrapper as FlightSearchTool above, and for the same
+            // reason: finalising re-prices every segment through
+            // IgnavClient::search, which reads self.market, so an
+            // unwrapped client would silently re-price a Dutch traveller's
+            // trip in Ignav's default US market. Safe to reuse for booking
+            // links too — IgnavClient::booking_links hardcodes its request
+            // to {"ignav_id": ...} and never reads the market, since the id
+            // already carries it.
+            ignav: d
+                .ignav
+                .clone()
+                .map(|c| match fare_market(facts) {
+                    Some(market) => c.with_market(&market),
+                    None => c,
+                }),
             // The same allowance the search tool got: one request, one cap.
             budget: flights.clone(),
         });

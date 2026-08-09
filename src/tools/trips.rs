@@ -184,9 +184,24 @@ pub fn match_candidate<'a>(candidate: &TripCandidate, offers: &'a [Flight]) -> O
 }
 
 /// What the price did since it was parked, to the cent. `None` when either
-/// end is unknown — an unknown movement must not read as no movement.
-pub fn price_move(quoted: Option<f64>, now: Option<f64>) -> Option<f64> {
+/// end is unknown, or when the two currencies disagree — an unknown
+/// movement must not read as no movement, and here a *wrong* movement would
+/// read as a real one. This is the same refusal `separate_total` makes
+/// against summing mismatched currencies, applied to a single subtraction:
+/// a segment can now legitimately re-price in a different currency than it
+/// was quoted in (Ignav's market follows the traveller), so this is no
+/// longer a defensive check against data that can't happen.
+pub fn price_move(
+    quoted: Option<f64>,
+    quoted_currency: Option<&str>,
+    now: Option<f64>,
+    now_currency: Option<&str>,
+) -> Option<f64> {
     let (quoted, now) = (quoted?, now?);
+    let (quoted_currency, now_currency) = (quoted_currency?, now_currency?);
+    if quoted_currency != now_currency {
+        return None;
+    }
     Some(((now - quoted) * 100.0).round() / 100.0)
 }
 
@@ -333,7 +348,10 @@ pub fn comparison_notes(
     one_ticket: Option<(f64, &str)>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
-    if separate.is_some() {
+    // A single segment has no join to warn about — the note exists to stop
+    // somebody underestimating a real connection risk, and asserting one
+    // that cannot exist is the same failure pointed the other way.
+    if separate.is_some() && segment_count >= 2 {
         notes.push(format!(
             "booking these links means {segment_count} separate tickets: bags are collected \
              and checked in again at every join, and if one leg runs late the next airline \
@@ -446,7 +464,12 @@ fn price_option(candidate: &TripCandidate, offers: &[Flight]) -> PricedOption {
         quoted_currency: candidate.quoted_currency.clone(),
         price_now: found.map(|f| f.price),
         price_now_currency: found.map(|f| f.currency.clone()),
-        moved: price_move(candidate.quoted_price, found.map(|f| f.price)),
+        moved: price_move(
+            candidate.quoted_price,
+            candidate.quoted_currency.as_deref(),
+            found.map(|f| f.price),
+            found.map(|f| f.currency.as_str()),
+        ),
         still_offered: found.is_some(),
     }
 }
@@ -462,10 +485,16 @@ pub struct FinaliseTripTool {
     pub store: Store,
     pub user_id: i64,
     pub duffel: Option<DuffelClient>,
-    /// Takes the id straight from `AgentDeps`, not the per-user market
-    /// wrapper `FlightSearchTool` uses: booking links are resolved by
-    /// `ignav_id`, and Ignav rejects a market sent alongside one (measured:
-    /// a 400 `conflicting_booking_lookup_mode`).
+    /// The same per-user market wrapper `FlightSearchTool` uses, not the
+    /// bare client `AgentDeps` holds. `merged_search` calls
+    /// `IgnavClient::search` to re-price every segment, and that method
+    /// reads `self.market` — without the wrapper a re-price for a Dutch
+    /// traveller silently lands in Ignav's default US market, and if every
+    /// segment is Ignav-sourced the currencies still agree with each other
+    /// (all USD), so `separate_total` says nothing is wrong. Booking-link
+    /// lookups are unaffected either way: `IgnavClient::booking_links`
+    /// hardcodes its request body to `{"ignav_id": ...}` and never reads
+    /// the market, because the id already carries it.
     pub ignav: Option<IgnavClient>,
     /// Shared with `FlightSearchTool` so one user request draws on one cap,
     /// not two.
@@ -1951,13 +1980,28 @@ mod tests {
     #[test]
     fn a_price_that_moved_is_reported_with_its_sign() {
         // The number the traveller opens this output for.
-        assert_eq!(price_move(Some(118.0), Some(131.0)), Some(13.0));
-        assert_eq!(price_move(Some(131.0), Some(118.0)), Some(-13.0));
-        assert_eq!(price_move(None, Some(131.0)), None);
-        assert_eq!(price_move(Some(118.0), None), None);
+        assert_eq!(price_move(Some(118.0), Some("EUR"), Some(131.0), Some("EUR")), Some(13.0));
+        assert_eq!(price_move(Some(131.0), Some("EUR"), Some(118.0), Some("EUR")), Some(-13.0));
+        assert_eq!(price_move(None, Some("EUR"), Some(131.0), Some("EUR")), None);
+        assert_eq!(price_move(Some(118.0), Some("EUR"), None, Some("EUR")), None);
         // Rounded to the cent: a float subtraction otherwise reports
         // 12.999999999999986.
-        assert_eq!(price_move(Some(118.01), Some(131.0)), Some(12.99));
+        assert_eq!(price_move(Some(118.01), Some("EUR"), Some(131.0), Some("EUR")), Some(12.99));
+    }
+
+    #[test]
+    fn a_price_move_across_currencies_is_never_subtracted() {
+        // Parked in EUR, re-priced in USD because — after the Ignav market
+        // fix — a segment can genuinely come back in a different currency
+        // than it was quoted in. Subtracting the two raw numbers would
+        // print a real-looking movement that is not a price change at all,
+        // just two different units. An unknown movement must read as
+        // unknown, never as no movement and never as a wrong one.
+        assert_eq!(price_move(Some(118.0), Some("EUR"), Some(131.0), Some("USD")), None);
+        // Missing a currency on either side is the same problem: nothing
+        // established that the two numbers are comparable.
+        assert_eq!(price_move(Some(118.0), None, Some(131.0), Some("EUR")), None);
+        assert_eq!(price_move(Some(118.0), Some("EUR"), Some(131.0), None), None);
     }
 
     // The currency a segment's total is labelled with must come from the
@@ -2079,6 +2123,29 @@ mod tests {
         let notes = comparison_notes(3, Some((770.0, "EUR")), None);
         let joined = notes.join(" ");
         assert!(joined.contains("could not"), "got: {joined}");
+    }
+
+    #[test]
+    fn a_single_segment_trip_is_never_told_it_carries_connection_risk() {
+        // A one-segment trip has no join at all, so "bags collected and
+        // checked in again at every join" describes a risk that cannot
+        // exist here. Asserting it anyway is the same failure as missing a
+        // real one, pointed the other way, and it costs the rest of the
+        // output's credibility.
+        let notes = comparison_notes(1, Some((118.0, "EUR")), Some((131.0, "EUR")));
+        let joined = notes.join(" ");
+        assert!(
+            !joined.contains("separate tickets") && !joined.contains("every join"),
+            "a single segment has no connection to warn about: {joined}"
+        );
+        // The comparison itself is unaffected — only the connection-risk
+        // warning is segment-count-gated.
+        assert!(joined.contains("more") || joined.contains("cheaper"), "got: {joined}");
+
+        // Two segments is a real join, so the warning still has to appear.
+        let notes = comparison_notes(2, Some((118.0, "EUR")), Some((131.0, "EUR")));
+        let joined = notes.join(" ");
+        assert!(joined.contains("2 separate"), "a real join is still warned about: {joined}");
     }
 
     #[test]

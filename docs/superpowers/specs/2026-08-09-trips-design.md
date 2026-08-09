@@ -17,7 +17,9 @@ and links that are true at the moment they are handed over.
 
 **In scope:**
 - Named trips per user, several alive at once
-- Ordered segments, each an intent that a chosen flight can be bound to
+- Ordered segments, each an intent that flights can be bound to
+- Several candidate flights on one segment, at most one of them chosen, so a
+  decision can be deferred without losing the options
 - Building, amending and inspecting a trip from chat
 - Finalising: re-pricing every segment and pricing the whole itinerary as a
   single ticket, then presenting both
@@ -31,6 +33,12 @@ and links that are true at the moment they are handed over.
   segment's arrival airport and the next one's departure is *noticed and
   reported*, not modelled
 - Converting currencies to force a total out of a mixed-currency trip
+- Branches or variants *inside* a trip. Two routings — a stopover in Hong
+  Kong against a nonstop — are two different segment lists, so they are two
+  named trips, which is what naming them bought. Modelling them as branches
+  would duplicate every shared segment or introduce sharing between them,
+  and would make the model address a trip *and* a branch right after it was
+  given several trips to confuse in the first place.
 
 ## The constraint that shapes everything
 
@@ -74,28 +82,48 @@ CREATE TABLE IF NOT EXISTS trips (
     updated_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
     UNIQUE (user_id, name_key)
 );
+-- The intent: where and when, which is all that gets re-searched.
 CREATE TABLE IF NOT EXISTS trip_segments (
+    trip_id        BIGINT NOT NULL,
+    position       BIGINT NOT NULL,
+    origin         TEXT NOT NULL,
+    destination    TEXT NOT NULL,
+    departure_date TEXT NOT NULL,
+    PRIMARY KEY (trip_id, position)
+);
+-- The options on that segment. Several may sit here undecided; at most one
+-- carries `chosen`.
+CREATE TABLE IF NOT EXISTS segment_candidates (
     trip_id            BIGINT NOT NULL,
     position           BIGINT NOT NULL,
-    -- The intent. Always present; this is what gets re-searched.
-    origin             TEXT NOT NULL,
-    destination        TEXT NOT NULL,
-    departure_date     TEXT NOT NULL,
-    -- The choice. Null until a flight is bound to this segment.
-    airline            TEXT,
-    flight_numbers     TEXT,
-    itinerary          TEXT,
+    candidate          BIGINT NOT NULL,
+    chosen             BOOLEAN NOT NULL DEFAULT false,
+    airline            TEXT NOT NULL,
+    flight_numbers     TEXT NOT NULL,
+    itinerary          TEXT NOT NULL,
     departing_at_local TEXT,
     arriving_at_local  TEXT,
     duration_minutes   BIGINT,
-    -- What it cost when chosen, so finalisation can say the price moved.
+    -- What it cost when parked, so finalisation can say the price moved.
     quoted_price       DOUBLE,
     quoted_currency    TEXT,
     quoted_at          TIMESTAMP,
     source             TEXT,
-    PRIMARY KEY (trip_id, position)
+    PRIMARY KEY (trip_id, position, candidate)
 );
 ```
+
+Splitting the two tables is what candidates force, and it is better than
+what it replaces: the intent columns are required and the option columns are
+required *within an option*. The single-table version had every choice column
+nullable, which is a way of writing "this row is in one of two states" and
+hoping the reader notices.
+
+"At most one chosen per position" is not expressible as a `UNIQUE` — `false`
+repeats. It is enforced in Rust instead, by clearing the position's flags and
+setting one inside a single `Store` method: the connection is behind one
+mutex, so that method is atomic by construction, the same property the
+finalisation refusals rely on.
 
 `UNIQUE (user_id, name_key)` is enforced by DuckDB — verified against 1.4.5
 before relying on it — so a duplicate name is a constraint violation rather
@@ -134,7 +162,7 @@ precisely the number a traveller is looking at it for.
 
 ## Tools
 
-Six, which is a real cost against a tool list that is already long. Each is
+Seven, which is a real cost against a tool list that is already long. Each is
 small, and the alternative — one fat `edit_trip` with an action parameter —
 trades that for a model choosing wrongly between modes.
 
@@ -144,15 +172,25 @@ trades that for a model choosing wrongly between modes.
   validated by the existing helpers before anything is written. `position`
   inserts rather than appends, shifting the rest. `adults` and `cabin_class`
   apply to the whole trip whenever supplied.
-- **`choose_trip_flight`** `{ trip, position, offer_id }`
-  Binds a flight to a segment. `offer_id` must be one `ShownFlights` holds
-  for *this chat* — the same guard `BookingLinksTool` uses, for the same
-  reason: a model carrying a 32-character id across a turn is the
-  invented-ASIN problem in different clothing.
+- **`add_trip_option`** `{ trip, position, offer_id, decided? }`
+  Parks a flight against a segment as a candidate. `offer_id` must be one
+  `ShownFlights` holds for *this chat* — the same guard `BookingLinksTool`
+  uses, for the same reason: a model carrying a 32-character id across a
+  turn is the invented-ASIN problem in different clothing. `decided`
+  defaults to true and also marks the candidate chosen, so the ordinary
+  "this is the flight" path is still one call; `decided: false` is "keep
+  this one in the running".
+- **`choose_trip_option`** `{ trip, position, candidate }`
+  Settles a segment later, by candidate number. It exists because deciding
+  happens after the offer that produced the option has expired, so there is
+  no id left to name it by.
 - **`show_trip`** `{ trip? }`
   One trip in full, or with no name, the list of them with status and
-  segment count.
-- **`drop_trip_segment`** `{ trip, position }`
+  segment count. Undecided segments are shown as such, with their
+  candidates numbered — those numbers are what `choose_trip_option` takes.
+- **`drop_trip_segment`** `{ trip, position, candidate? }`
+  Without `candidate`, the whole segment. With one, just that option, so a
+  rejected choice can be cleared without losing the segment.
 - **`delete_trip`** `{ trip }`
   Exists because creating a trip is a side effect of a typo, and a typo
   needs an undo.
@@ -178,6 +216,29 @@ the model has to relay does.
 Segments are added in travel order and may be added out of order and fixed
 later, so ordering is not enforced while planning — only at finalisation.
 
+### Undecided segments
+
+"Via Hong Kong or direct, I haven't decided" is two different requests
+depending on what "via" means, and only one of them is about candidates.
+
+**A connection through Hong Kong** is an ordinary one-stop flight. It is the
+*same segment* as the nonstop — same origin, destination and date — and the
+two are simply different offers on it. `search_flights` already has
+`max_connections`, and `Leg.connections` already carries the airport and
+layover. Both go on one segment as candidates, and the decision is deferred
+until `choose_trip_option`.
+
+**A stopover in Hong Kong** — days there on the way — is not one segment at
+all. It is AMS→HKG and HKG→NRT against a single AMS→NRT: two different
+segment lists, and therefore two named trips, finalised and compared.
+
+Candidates cost nothing at finalisation, which is the property that makes
+them worth having. A segment is re-priced by one search of its route and
+date, and that one search returns every candidate sitting on it. Pricing
+three options for a segment is the same paid request as pricing one, so the
+finalisation output can show what each of them costs now — which is exactly
+the number the decision was waiting for.
+
 Two things are noticed and reported rather than refused:
 
 - **A gap between segments.** Landing at FCO and departing from FLR is a
@@ -192,7 +253,12 @@ Two things are noticed and reported rather than refused:
 
 `finalise_trip` refuses before it spends anything if:
 
-- any segment has no chosen flight — naming which ones, by position
+- any segment has no candidates at all — naming which ones, by position
+- any segment has more than one candidate and none chosen — naming the
+  segment and listing its options, since that refusal is a question. A
+  segment with exactly one candidate needs no `chosen` flag: it is the pick
+  by elimination, and demanding a decision nobody has a choice about is
+  ceremony
 - the departure dates do not run forwards — a multi-slice request built from
   out-of-order dates is meaningless, and silently sorting them would change
   the trip the traveller asked for
@@ -210,8 +276,11 @@ Ignav has one-way and round-trip endpoints only, so step 2 is Duffel-only.
 
 ### Output
 
-Per segment: what was chosen, the price when chosen against the price now
-with the difference, and where to buy it. Then both totals:
+Per segment: what was chosen, the price when parked against the price now
+with the difference, and where to buy it. Where a segment carried more than
+one candidate, the runners-up are listed with *their* prices now too — they
+came free with the same search, and a decision made a week ago deserves to
+be checked against what the alternatives cost today. Then both totals:
 
 - **as N separate bookings** — the sum of the segments
 - **as one ticket** — the multi-slice offer
@@ -256,6 +325,12 @@ one request must not buy headroom twice. The two grants are summed rather
 than maxed because a flexible-date search and a finalisation are different
 work, and a request that genuinely does both needs both.
 
+Note `segments`, not candidates. A segment carrying three options is still
+one search, so the allowance does not move when an option is parked. That is
+a property worth a test rather than a comment: if it ever stopped being
+true, deferring a decision would start costing money and nothing would say
+so.
+
 ## Error handling
 
 - **Unknown trip name**, anywhere but `add_trip_segment` → refuse and list
@@ -287,6 +362,9 @@ Store, against a temp database:
 - Segments and trips are scoped per user
 - Finalising sets `status`, and the next edit puts it back to `planning`
 - Finalisation leaves `quoted_price` and `quoted_at` alone
+- Several candidates sit on one position, and at most one is ever `chosen`
+- Choosing a second candidate clears the first
+- Dropping a candidate leaves the segment; dropping the segment takes them all
 
 Pure functions:
 
@@ -300,14 +378,21 @@ Pure functions:
 
 Tools:
 
-- `choose_trip_flight` refuses an id shown in another chat
-- `finalise_trip` refuses an incomplete trip and names the segments
+- `add_trip_option` refuses an id shown in another chat
+- `add_trip_option` with `decided` defaulted marks the candidate chosen, so
+  the one-option path needs no second call
+- `choose_trip_option` refuses a candidate number the segment does not have
+- `finalise_trip` refuses a segment with two candidates and no choice, and
+  lists them
+- `finalise_trip` accepts a segment with one undecided candidate
+- `finalise_trip` refuses an empty segment and names it
 - `finalise_trip` output states why a single-ticket comparison is absent
 - Every mutating tool returns the trip name and its full state
 
 Budget:
 
 - `grant_trip` raises the allowance by segments + 1
+- Parking extra candidates does not raise it
 - Two grants in one request do not stack
 - A window grant and a trip grant do
 
@@ -333,7 +418,7 @@ That is the right default — one household member should not be able to bind
 another's search — but it will read as a bug the first time it happens, so
 the refusal message says which chat the flight was shown in.
 
-**The tool list grows by six.** That is the largest single addition to the
+**The tool list grows by seven.** That is the largest single addition to the
 agent's surface so far. It is the cost of the trip being a noun the model
 can manipulate rather than a shape it has to hold in its head across twenty
 turns, but it is worth re-measuring tool-selection quality afterwards.

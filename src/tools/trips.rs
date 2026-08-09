@@ -486,6 +486,182 @@ impl Tool for ChooseTripOptionTool {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ShowTripArgs {
+    #[serde(default)]
+    pub trip: Option<String>,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct TripList {
+    pub trips: Vec<TripView>,
+}
+
+pub struct ShowTripTool {
+    pub store: Store,
+    pub user_id: i64,
+}
+
+impl Tool for ShowTripTool {
+    const NAME: &'static str = "show_trip";
+    type Error = StoreToolError;
+    type Args = ShowTripArgs;
+    type Output = TripList;
+
+    fn description(&self) -> String {
+        "Show one trip in full, or every trip the traveller has if no name is \
+         given. Each segment's options are numbered; those numbers are what \
+         choose_trip_option takes. Call this before editing a trip so the \
+         positions and option numbers you use are the current ones."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "trip": {"type": "string", "description": "the trip's name; omit to list them all"}
+            }
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let store = self.store.clone();
+        let user_id = self.user_id;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Trip>> {
+            match &args.trip {
+                None => store.list_trips(user_id),
+                Some(name) => match store.find_trip(user_id, name)? {
+                    Some(trip) => Ok(vec![trip]),
+                    // Naming the real trips is the difference between the
+                    // model correcting itself and it inventing a new one.
+                    None => {
+                        let names: Vec<String> =
+                            store.list_trips(user_id)?.into_iter().map(|t| t.name).collect();
+                        anyhow::bail!(
+                            "no trip called {name:?}. This traveller has: {}",
+                            match names.is_empty() {
+                                true => "none yet".to_string(),
+                                false => names.join(", "),
+                            }
+                        )
+                    }
+                },
+            }
+        })
+        .await
+        .map_err(internal)?
+        .map(|trips| TripList { trips: trips.into_iter().map(TripView::of).collect() })
+        .map_err(internal)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DropSegmentArgs {
+    pub trip: String,
+    pub position: i64,
+    /// Without this, the whole segment goes.
+    #[serde(default)]
+    pub candidate: Option<i64>,
+}
+
+pub struct DropTripSegmentTool {
+    pub store: Store,
+    pub user_id: i64,
+}
+
+impl Tool for DropTripSegmentTool {
+    const NAME: &'static str = "drop_trip_segment";
+    type Error = StoreToolError;
+    type Args = DropSegmentArgs;
+    type Output = TripView;
+
+    fn description(&self) -> String {
+        "Remove a segment from a trip, or with candidate given, just one of \
+         that segment's parked options. Later segments are renumbered, so call \
+         show_trip afterwards before using positions again."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "trip": {"type": "string", "description": "the trip's name"},
+                "position": {"type": "integer", "description": "which segment, 1-based"},
+                "candidate": {"type": "integer", "description": "drop only this option, leaving the segment"}
+            },
+            "required": ["trip", "position"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let store = self.store.clone();
+        let user_id = self.user_id;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
+            let trip = store
+                .find_trip(user_id, &args.trip)?
+                .ok_or_else(|| anyhow::anyhow!("no trip called {:?}", args.trip))?;
+            match args.candidate {
+                Some(candidate) => store.drop_candidate(trip.id, args.position, candidate),
+                None => store.drop_segment(trip.id, args.position),
+            }
+        })
+        .await
+        .map_err(internal)?
+        .map(TripView::of)
+        .map_err(internal)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteTripArgs {
+    pub trip: String,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct DeleteTripResult {
+    pub deleted: bool,
+    pub trip: String,
+}
+
+pub struct DeleteTripTool {
+    pub store: Store,
+    pub user_id: i64,
+}
+
+impl Tool for DeleteTripTool {
+    const NAME: &'static str = "delete_trip";
+    type Error = StoreToolError;
+    type Args = DeleteTripArgs;
+    type Output = DeleteTripResult;
+
+    fn description(&self) -> String {
+        "Delete a whole trip and everything on it. Use when the traveller \
+         abandons a plan, or to clear one created by a mistyped name."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {"trip": {"type": "string", "description": "the trip's name"}},
+            "required": ["trip"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let store = self.store.clone();
+        let user_id = self.user_id;
+        let name = args.trip.clone();
+        tokio::task::spawn_blocking(move || store.delete_trip(user_id, &args.trip))
+            .await
+            .map_err(internal)?
+            .map(|deleted| DeleteTripResult { deleted, trip: name })
+            .map_err(internal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,5 +1173,97 @@ mod tests {
             "the gap must be visible rather than silent: {:?}",
             view.notes
         );
+    }
+
+    #[tokio::test]
+    async fn show_lists_every_trip_when_no_name_is_given() {
+        let (store, _d) = setup();
+        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        for name in ["Japan via HK", "Japan direct"] {
+            add.call(AddSegmentArgs {
+                trip: name.into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let show = ShowTripTool { store: store.clone(), user_id: 7 };
+        let all = show.call(ShowTripArgs { trip: None }).await.unwrap();
+        assert_eq!(all.trips.len(), 2);
+
+        let one = show.call(ShowTripArgs { trip: Some("japan direct".into()) }).await.unwrap();
+        assert_eq!(one.trips.len(), 1);
+        assert_eq!(one.trips[0].trip.name, "Japan direct");
+
+        let missing = show.call(ShowTripArgs { trip: Some("Peru".into()) }).await.unwrap_err();
+        assert!(missing.to_string().contains("Japan direct"), "unknown names list the real ones: {missing}");
+    }
+
+    #[tokio::test]
+    async fn dropping_takes_an_option_or_the_whole_segment() {
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add.call(AddSegmentArgs {
+            trip: "Japan".into(),
+            origin: "AMS".into(),
+            destination: "NRT".into(),
+            departure_date: "2026-09-03".into(),
+            position: None,
+            adults: None,
+            cabin_class: None,
+        })
+        .await
+        .unwrap();
+        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "a".into(),
+                decided: None,
+            })
+            .await
+            .unwrap();
+
+        let drop = DropTripSegmentTool { store: store.clone(), user_id: 7 };
+        let view = drop
+            .call(DropSegmentArgs { trip: "Japan".into(), position: 1, candidate: Some(1) })
+            .await
+            .unwrap();
+        assert_eq!(view.trip.segments.len(), 1, "the segment survives losing its option");
+        assert!(view.trip.segments[0].candidates.is_empty());
+
+        let view = drop
+            .call(DropSegmentArgs { trip: "Japan".into(), position: 1, candidate: None })
+            .await
+            .unwrap();
+        assert!(view.trip.segments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_trip_reports_when_there_was_nothing_to_delete() {
+        let (store, _d) = setup();
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Setpember".into(),
+                origin: "AMS".into(),
+                destination: "LIS".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let delete = DeleteTripTool { store: store.clone(), user_id: 7 };
+        assert!(delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
+        assert!(!delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
     }
 }

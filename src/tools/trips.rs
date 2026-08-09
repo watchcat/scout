@@ -158,6 +158,33 @@ fn calendar_date(value: &str) -> Result<String, StoreToolError> {
         .map_err(|_| StoreToolError(format!("departure_date must be YYYY-MM-DD, not {value:?}")))
 }
 
+/// The offer in `offers` that is the same itinerary as `candidate`, if it is
+/// still sold.
+///
+/// Flight numbers in order are the identity: they are what survives an offer
+/// expiring, which is the whole reason a trip stores them instead of an id.
+/// Order is part of it — the same two numbers flown the other way round is a
+/// different journey.
+pub fn match_candidate<'a>(candidate: &TripCandidate, offers: &'a [Flight]) -> Option<&'a Flight> {
+    let wanted = candidate.flight_numbers.trim();
+    offers.iter().find(|offer| {
+        let numbers = offer
+            .legs
+            .iter()
+            .flat_map(|leg| leg.flights.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(",");
+        numbers == wanted
+    })
+}
+
+/// What the price did since it was parked, to the cent. `None` when either
+/// end is unknown — an unknown movement must not read as no movement.
+pub fn price_move(quoted: Option<f64>, now: Option<f64>) -> Option<f64> {
+    let (quoted, now) = (quoted?, now?);
+    Some(((now - quoted) * 100.0).round() / 100.0)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AddSegmentArgs {
     pub trip: String,
@@ -1367,6 +1394,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Japan"), "unknown names list the real ones: {err}");
+    }
+
+    fn parked(numbers: &str, price: f64) -> TripCandidate {
+        TripCandidate {
+            candidate: 1,
+            chosen: true,
+            airline: "KLM".to_string(),
+            flight_numbers: numbers.to_string(),
+            itinerary: "somewhere".to_string(),
+            departing_at_local: None,
+            arriving_at_local: None,
+            duration_minutes: None,
+            quoted_price: Some(price),
+            quoted_currency: Some("EUR".to_string()),
+            source: Some("duffel".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_parked_option_is_recognised_by_its_flight_numbers() {
+        let offers = vec![
+            one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"]),
+            one_way("b", "AMS", "NRT", "2026-09-03", &["CX270", "CX500"]),
+        ];
+        let found = match_candidate(&parked("CX270,CX500", 780.0), &offers).unwrap();
+        assert_eq!(found.offer_id, "b");
+
+        // Order matters: the same two numbers flown the other way round is a
+        // different itinerary.
+        assert!(match_candidate(&parked("CX500,CX270", 780.0), &offers).is_none());
+        assert!(match_candidate(&parked("KL999", 780.0), &offers).is_none());
+    }
+
+    #[test]
+    fn a_price_that_moved_is_reported_with_its_sign() {
+        // The number the traveller opens this output for.
+        assert_eq!(price_move(Some(118.0), Some(131.0)), Some(13.0));
+        assert_eq!(price_move(Some(131.0), Some(118.0)), Some(-13.0));
+        assert_eq!(price_move(None, Some(131.0)), None);
+        assert_eq!(price_move(Some(118.0), None), None);
+        // Rounded to the cent: a float subtraction otherwise reports
+        // 12.999999999999986.
+        assert_eq!(price_move(Some(118.01), Some(131.0)), Some(12.99));
     }
 
     #[tokio::test]

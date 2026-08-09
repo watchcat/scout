@@ -76,6 +76,9 @@ pub struct FlightBudget {
     spent: AtomicUsize,
     /// Extra days granted for the widest flexible window asked for.
     window: AtomicUsize,
+    /// Extra searches granted for finalising a trip: one per segment, plus
+    /// the multi-city request that prices the whole thing as one ticket.
+    trip: AtomicUsize,
     seen: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::tools::duffel::Flight>>>,
 }
 
@@ -95,9 +98,18 @@ impl FlightBudget {
         self.window.fetch_max(extra, Ordering::Relaxed);
     }
 
+    /// Room for pricing a whole trip. Counts segments, not candidates: a
+    /// segment carrying three options is still one search, so deferring a
+    /// decision never costs anything.
+    pub fn grant_trip(&self, segments: usize) {
+        self.trip.fetch_max(segments + 1, Ordering::Relaxed);
+    }
+
     /// Day-searches this request may buy, given what has been asked for.
     pub fn allowance(&self) -> usize {
-        BASE_FLIGHT_SEARCHES + self.window.load(Ordering::Relaxed)
+        BASE_FLIGHT_SEARCHES
+            + self.window.load(Ordering::Relaxed)
+            + self.trip.load(Ordering::Relaxed)
     }
 
     /// Reserves one search. False when the request has spent its allowance,
@@ -194,6 +206,39 @@ mod flight_budget_tests {
         budget.remember("AMS-LIS".to_string(), Vec::new());
         assert_eq!(budget.recall("AMS-LIS"), Some(Vec::new()));
         assert_eq!(budget.spent(), 0, "recall must not count as a search");
+    }
+
+    #[test]
+    fn finalising_a_trip_buys_the_searches_it_needs() {
+        // A four-segment trip is four re-prices plus one multi-city request.
+        // Against a base of four it would be refused halfway through, with
+        // half a trip priced and no way to say which half.
+        let budget = FlightBudget::default();
+        budget.grant_trip(4);
+        assert_eq!(budget.allowance(), BASE_FLIGHT_SEARCHES + 5);
+        for _ in 0..BASE_FLIGHT_SEARCHES + 5 {
+            assert!(budget.claim_one());
+        }
+        assert!(!budget.claim_one());
+    }
+
+    #[test]
+    fn finalising_twice_does_not_buy_headroom_twice() {
+        let budget = FlightBudget::default();
+        budget.grant_trip(4);
+        budget.grant_trip(4);
+        budget.grant_trip(2);
+        assert_eq!(budget.allowance(), BASE_FLIGHT_SEARCHES + 5);
+    }
+
+    #[test]
+    fn a_flexible_search_and_a_finalisation_each_get_their_own_room() {
+        // Different work, so they add rather than compete: a request that
+        // genuinely does both needs both.
+        let budget = FlightBudget::default();
+        budget.grant_window(1);
+        budget.grant_trip(2);
+        assert_eq!(budget.allowance(), BASE_FLIGHT_SEARCHES + 2 + 3);
     }
 }
 

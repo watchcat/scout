@@ -6,7 +6,9 @@
 //! airports, dates, flight numbers — and finalisation re-prices it.
 
 use crate::store::{ExpectedSegment, NewCandidate, Store, Trip, TripCandidate, TripSegment};
-use crate::tools::duffel::{Flight, Source};
+use crate::tools::budget::FlightBudget;
+use crate::tools::duffel::{merged_search, DuffelClient, Flight, FlightQuery, MultiCityQuery, Slice, Source};
+use crate::tools::ignav::IgnavClient;
 use crate::tools::purchases::{internal, StoreToolError};
 use crate::tools::shown::ShownFlights;
 use rig::tool::Tool;
@@ -386,6 +388,258 @@ pub fn ready_to_price(segments: &[TripSegment]) -> Result<Vec<(&TripSegment, &Tr
         ready.push((segment, chosen));
     }
     Ok(ready)
+}
+
+/// One candidate against today's offers.
+///
+/// `price_now_currency` comes from the matched offer's own `currency`, never
+/// from `quoted_currency` — see `separate_total`'s comment for why that
+/// distinction is the whole point.
+fn price_option(candidate: &TripCandidate, offers: &[Flight]) -> PricedOption {
+    let found = match_candidate(candidate, offers);
+    PricedOption {
+        airline: candidate.airline.clone(),
+        flight_numbers: candidate.flight_numbers.clone(),
+        itinerary: candidate.itinerary.clone(),
+        quoted_price: candidate.quoted_price,
+        quoted_currency: candidate.quoted_currency.clone(),
+        price_now: found.map(|f| f.price),
+        price_now_currency: found.map(|f| f.currency.clone()),
+        moved: price_move(candidate.quoted_price, found.map(|f| f.price)),
+        still_offered: found.is_some(),
+    }
+}
+
+/// Re-prices a built trip: every segment against today's market, and the
+/// whole itinerary against Duffel as a single ticket.
+///
+/// This is a re-pricing pass, never a checkout — a trip stores an itinerary,
+/// not an offer, because offers expire in minutes and a plan outlives the
+/// conversation that made it. Nothing here is bookable; everything quoted is
+/// fetched fresh, on every call.
+pub struct FinaliseTripTool {
+    pub store: Store,
+    pub user_id: i64,
+    pub duffel: Option<DuffelClient>,
+    /// Takes the id straight from `AgentDeps`, not the per-user market
+    /// wrapper `FlightSearchTool` uses: booking links are resolved by
+    /// `ignav_id`, and Ignav rejects a market sent alongside one (measured:
+    /// a 400 `conflicting_booking_lookup_mode`).
+    pub ignav: Option<IgnavClient>,
+    /// Shared with `FlightSearchTool` so one user request draws on one cap,
+    /// not two.
+    pub budget: Arc<FlightBudget>,
+}
+
+impl Tool for FinaliseTripTool {
+    const NAME: &'static str = "finalise_trip";
+    type Error = StoreToolError;
+    type Args = FinaliseArgs;
+    type Output = FinalisedTrip;
+
+    fn description(&self) -> String {
+        "Price a finished trip: every segment is searched again for today's \
+         price and where to buy it, and the whole itinerary is also priced as \
+         a single ticket so the two can be compared. Call this only when every \
+         segment has a flight decided. Prices stored on a trip are stale by \
+         construction — this is the only thing that produces current ones."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {"trip": {"type": "string", "description": "the trip's name"}},
+            "required": ["trip"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let store = self.store.clone();
+        let user_id = self.user_id;
+        let name = args.trip.clone();
+        let trip = tokio::task::spawn_blocking(move || find_trip_or_list(&store, user_id, &name))
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
+
+        // Everything that can refuse, refuses before a single paid search: a
+        // trip that cannot be priced must cost nothing to discover.
+        let ready = ready_to_price(&trip.segments).map_err(StoreToolError)?;
+        dates_run_forwards(&trip.segments).map_err(StoreToolError)?;
+        self.budget.grant_trip(trip.segments.len());
+
+        let adults = u32::try_from(trip.adults).unwrap_or(1).max(1);
+        let cabin = trip.cabin_class.clone();
+
+        // Each segment's re-price, and the whole-trip request, at once —
+        // sequentially this would be several seconds of silence for no
+        // reason.
+        let per_segment = futures::future::join_all(ready.iter().map(|(segment, chosen)| {
+            // Owned, not borrowed: these outlive `trip` inside the async
+            // block below, and `TripSegment`/`TripCandidate` are cheap to
+            // clone next to a network round trip.
+            let segment = (*segment).clone();
+            let chosen = (*chosen).clone();
+            let day = FlightQuery {
+                origin: segment.origin.clone(),
+                destination: segment.destination.clone(),
+                departure_date: segment.departure_date.clone(),
+                return_date: None,
+                adults: Some(adults),
+                cabin_class: cabin.clone(),
+                max_connections: None,
+                flex_days: None,
+            };
+            async move {
+                if !self.budget.claim_one() {
+                    return (segment, chosen, Vec::new());
+                }
+                let offers = merged_search(self.duffel.as_ref(), self.ignav.as_ref(), &day).await;
+                let offers = offers.unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        position = segment.position,
+                        "segment re-price failed"
+                    );
+                    Vec::new()
+                });
+                (segment, chosen, offers)
+            }
+        }));
+
+        let one_ticket = async {
+            let duffel = self.duffel.as_ref()?;
+            // A single slice is an ordinary search, not a comparison — and
+            // the budget was only ever granted for a real multi-city request.
+            if trip.segments.len() < 2 || !self.budget.claim_one() {
+                return None;
+            }
+            let query = MultiCityQuery {
+                slices: trip
+                    .segments
+                    .iter()
+                    .map(|s| Slice::new(&s.origin, &s.destination, &s.departure_date))
+                    .collect(),
+                adults,
+                cabin_class: cabin.clone(),
+            };
+            match duffel.search_multi_city(&query).await {
+                Ok(offers) => offers
+                    .iter()
+                    .map(|o| o.price)
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "single-ticket pricing failed");
+                    None
+                }
+            }
+        };
+
+        let (segment_results, one_ticket_total) = futures::future::join(per_segment, one_ticket).await;
+
+        let mut segments = Vec::new();
+        let mut notes = Vec::new();
+        for (segment, chosen, offers) in segment_results {
+            let priced = price_option(&chosen, &offers);
+            if !priced.still_offered {
+                // The traveller chose a flight, not a price band: reported,
+                // never quietly substituted for something else that matched
+                // the route.
+                notes.push(format!(
+                    "segment {} ({}→{}): {} is not sold on {} any more, so this trip has no \
+                     current total. Search that route again and pick a replacement.",
+                    segment.position,
+                    segment.origin,
+                    segment.destination,
+                    chosen.flight_numbers,
+                    segment.departure_date
+                ));
+            }
+            // Runners-up come free with the same search: a decision made a
+            // week ago deserves checking against what the alternatives cost
+            // today.
+            let also_considered = segment
+                .candidates
+                .iter()
+                .filter(|c| c.candidate != chosen.candidate)
+                .map(|c| price_option(c, &offers))
+                .collect();
+            let booking = match match_candidate(&chosen, &offers) {
+                Some(offer) => self.sellers(offer).await,
+                None => Vec::new(),
+            };
+            segments.push(PricedSegment {
+                position: segment.position,
+                route: format!("{}→{}", segment.origin, segment.destination),
+                departure_date: segment.departure_date.clone(),
+                chosen: priced,
+                also_considered,
+                booking,
+            });
+        }
+
+        let (separate_total, currency) = match separate_total(&segments) {
+            Ok((total, currency)) => (Some(total), Some(currency)),
+            Err(problem) => {
+                notes.push(problem);
+                (None, None)
+            }
+        };
+        notes.extend(comparison_notes(
+            segments.len(),
+            separate_total,
+            one_ticket_total,
+            currency.as_deref().unwrap_or(""),
+        ));
+        if self.duffel.is_none() {
+            notes.push(
+                "Duffel is not configured here, so no single-ticket price could be fetched at \
+                 all — this trip can only be compared against itself"
+                    .to_string(),
+            );
+        }
+
+        // quoted_price and quoted_at are never touched here — see
+        // TripCandidate's own comment. Only the status changes, to record
+        // that this trip has been priced.
+        let store = self.store.clone();
+        let trip_id = trip.id;
+        match tokio::task::spawn_blocking(move || store.set_trip_status(trip_id, "finalised")).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "could not record that a trip was finalised"),
+            Err(e) => tracing::warn!(error = %e, "could not record that a trip was finalised"),
+        }
+
+        Ok(FinalisedTrip {
+            trip: trip.name,
+            adults: trip.adults,
+            segments,
+            separate_total,
+            one_ticket_total,
+            currency,
+            notes,
+        })
+    }
+}
+
+impl FinaliseTripTool {
+    /// Where a matched offer can actually be bought. Ignav resolves its own
+    /// ids to sellers; a Duffel offer has nowhere to send anyone while Duffel
+    /// Links is disabled, so it comes back empty and the reply says to book
+    /// with the airline instead.
+    async fn sellers(&self, offer: &Flight) -> Vec<crate::tools::ignav::BookingOption> {
+        let (Some(ignav), Source::Ignav) = (self.ignav.as_ref(), offer.source) else {
+            return Vec::new();
+        };
+        match ignav.booking_links(&offer.offer_id).await {
+            Ok(links) => links.options,
+            Err(e) => {
+                tracing::warn!(error = %e, "booking links failed for a finalised segment");
+                Vec::new()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1858,6 +2112,479 @@ mod tests {
             result.notes.iter().any(|n| n.contains("Japan")),
             "unknown names list the real ones: {:?}",
             result.notes
+        );
+    }
+
+    // finalise_trip: a re-pricing pass, never a checkout. Every segment is
+    // searched again for today's price, and the same offer_request response
+    // stands in for both providers here since the tool is only asked to
+    // search Duffel in these tests (ignav: None).
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A Duffel offer-request response with one offer on the given flight
+    /// numbers, for the given total.
+    fn duffel_offer(total: &str, numbers: &[&str]) -> serde_json::Value {
+        let segments: Vec<serde_json::Value> = numbers
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "marketing_carrier_flight_number": n.trim_start_matches(char::is_alphabetic),
+                    "marketing_carrier": {"iata_code": &n[..2], "name": "KLM"},
+                    "origin": {"iata_code": "AMS"},
+                    "destination": {"iata_code": "NRT"},
+                    "departing_at": "2026-09-03T10:05:00",
+                    "arriving_at": "2026-09-03T12:15:00",
+                    "duration": "PT2H10M"
+                })
+            })
+            .collect();
+        serde_json::json!({"data": {"offers": [{
+            "id": "off_fresh",
+            "total_amount": total,
+            "total_currency": "EUR",
+            "owner": {"name": "KLM"},
+            "slices": [{
+                "origin": {"iata_code": "AMS"},
+                "destination": {"iata_code": "NRT"},
+                "duration": "PT2H10M",
+                "segments": segments
+            }]
+        }]}})
+    }
+
+    #[tokio::test]
+    async fn finalising_prices_every_segment_and_says_what_moved() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(duffel_offer("980.00", &["KL861"])))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "a".into(),
+                decided: None,
+            })
+            .await
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let tool = FinaliseTripTool {
+            store: store.clone(),
+            user_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        };
+        let out = tool.call(FinaliseArgs { trip: "Japan".into() }).await.unwrap();
+
+        assert_eq!(out.segments.len(), 1);
+        let chosen = &out.segments[0].chosen;
+        assert_eq!(chosen.quoted_price, Some(940.0), "what it cost when parked");
+        assert_eq!(chosen.price_now, Some(980.0));
+        assert_eq!(chosen.price_now_currency.as_deref(), Some("EUR"), "the currency the fresh price is actually in");
+        assert_eq!(chosen.moved, Some(40.0));
+        assert!(chosen.still_offered);
+        // One segment, so there is no single-ticket comparison to make, and
+        // the output has to say so rather than let the separate total stand
+        // alone.
+        assert!(out.one_ticket_total.is_none());
+        assert!(out.notes.iter().any(|n| n.contains("could not")), "notes: {:?}", out.notes);
+
+        // Priced means priced: the trip records it, and the parked price is
+        // left exactly as it was.
+        let trip = store.find_trip(7, "Japan").unwrap().unwrap();
+        assert_eq!(trip.status, "finalised");
+        assert_eq!(
+            trip.segments[0].candidates[0].quoted_price,
+            Some(940.0),
+            "quoted_price is never overwritten by a re-price"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flight_that_is_no_longer_sold_is_reported_not_substituted() {
+        // The traveller chose a flight, not a price band. Quietly swapping it
+        // is how a 06:00 departure turns up in an itinerary nobody agreed to.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(duffel_offer("640.00", &["KL999"])))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+            .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store,
+            user_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap();
+
+        let chosen = &out.segments[0].chosen;
+        assert!(!chosen.still_offered);
+        assert_eq!(chosen.price_now, None);
+        assert_eq!(chosen.flight_numbers, "KL861", "still says what they picked");
+        assert!(out.separate_total.is_none(), "no total when a segment cannot be priced");
+        assert!(
+            out.notes.iter().any(|n| n.contains("KL861")),
+            "the traveller has to be told: {:?}",
+            out.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecided_trip_is_refused_before_any_search_is_bought() {
+        // Everything that can refuse, refuses before a single paid search: a
+        // trip that cannot be priced must cost nothing to discover. The
+        // server below has no mock mounted, so any request to it fails —
+        // proving the tool never got that far.
+        let server = MockServer::start().await;
+        let (store, _d) = setup();
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let err = FinaliseTripTool {
+            store,
+            user_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no flight"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_single_ticket_price_never_reads_as_a_verdict_for_separate_booking() {
+        // Two segments, so a single-ticket comparison is attempted, but the
+        // multi-city endpoint returns nothing usable here — no offer at all.
+        // The output must say the comparison is missing, not let the
+        // separate total stand alone as if it had won.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {"offers": []}})))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(
+            99,
+            vec![
+                one_way("a", "AMS", "LIS", "2026-09-03", &["TP675"]),
+                one_way("b", "LIS", "AMS", "2026-09-07", &["TP676"]),
+            ],
+            Instant::now(),
+        );
+        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Lisbon".into(),
+                origin: "AMS".into(),
+                destination: "LIS".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Lisbon".into(),
+                origin: "LIS".into(),
+                destination: "AMS".into(),
+                departure_date: "2026-09-07".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let add_opt = AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 };
+        add_opt
+            .call(AddOptionArgs { trip: "Lisbon".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap();
+        add_opt
+            .call(AddOptionArgs { trip: "Lisbon".into(), position: 2, offer_id: "b".into(), decided: None })
+            .await
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store,
+            user_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Lisbon".into() })
+        .await
+        .unwrap();
+
+        assert!(out.one_ticket_total.is_none(), "no offer came back, so there is no single-ticket total");
+        assert!(
+            out.notes.iter().any(|n| n.contains("could not")),
+            "a missing comparison must say so rather than reading as a verdict: {:?}",
+            out.notes
+        );
+        assert!(
+            !out.notes.iter().any(|n| n.to_lowercase().contains("better")),
+            "no note may claim separate booking won by default: {:?}",
+            out.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn finalising_never_overwrites_what_a_candidate_was_quoted_at() {
+        // quoted_price and quoted_currency mean "what this cost when it was
+        // chosen"; refreshing them on every finalise would make price_move
+        // shrink to nothing every time anyone looked, which is the one
+        // number this feature exists to produce.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(duffel_offer("1200.00", &["KL861"])))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+            .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let tool = FinaliseTripTool {
+            store: store.clone(),
+            user_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        };
+        tool.call(FinaliseArgs { trip: "Japan".into() }).await.unwrap();
+        tool.call(FinaliseArgs { trip: "Japan".into() }).await.unwrap();
+
+        let trip = store.find_trip(7, "Japan").unwrap().unwrap();
+        assert_eq!(
+            trip.segments[0].candidates[0].quoted_price,
+            Some(940.0),
+            "two finalisations in a row must not move the parked price at all"
+        );
+        assert_eq!(trip.segments[0].candidates[0].quoted_currency.as_deref(), Some("EUR"));
+    }
+
+    #[tokio::test]
+    async fn a_runner_up_option_is_priced_from_the_same_search_as_the_chosen_one() {
+        // Runners-up come free with the same search: a decision made a week
+        // ago deserves checking against what the alternatives cost today.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {"offers": [
+                {
+                    "id": "off_1", "total_amount": "980.00", "total_currency": "EUR",
+                    "owner": {"name": "KLM"},
+                    "slices": [{
+                        "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "NRT"},
+                        "duration": "PT2H10M",
+                        "segments": [{
+                            "marketing_carrier_flight_number": "861",
+                            "marketing_carrier": {"iata_code": "KL", "name": "KLM"},
+                            "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "NRT"},
+                            "departing_at": "2026-09-03T10:05:00", "arriving_at": "2026-09-03T12:15:00",
+                            "duration": "PT2H10M"
+                        }]
+                    }]
+                },
+                {
+                    "id": "off_2", "total_amount": "820.00", "total_currency": "EUR",
+                    "owner": {"name": "Cathay Pacific"},
+                    "slices": [{
+                        "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "NRT"},
+                        "duration": "PT4H00M",
+                        "segments": [
+                            {
+                                "marketing_carrier_flight_number": "270",
+                                "marketing_carrier": {"iata_code": "CX", "name": "Cathay Pacific"},
+                                "origin": {"iata_code": "AMS"}, "destination": {"iata_code": "HKG"},
+                                "departing_at": "2026-09-03T10:05:00", "arriving_at": "2026-09-03T12:15:00",
+                                "duration": "PT2H10M"
+                            },
+                            {
+                                "marketing_carrier_flight_number": "500",
+                                "marketing_carrier": {"iata_code": "CX", "name": "Cathay Pacific"},
+                                "origin": {"iata_code": "HKG"}, "destination": {"iata_code": "NRT"},
+                                "departing_at": "2026-09-03T14:05:00", "arriving_at": "2026-09-03T16:15:00",
+                                "duration": "PT1H50M"
+                            }
+                        ]
+                    }]
+                }
+            ]}})))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(
+            99,
+            vec![
+                one_way("nonstop", "AMS", "NRT", "2026-09-03", &["KL861"]),
+                one_way("via-hkg", "AMS", "NRT", "2026-09-03", &["CX270", "CX500"]),
+            ],
+            Instant::now(),
+        );
+        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let add_opt =
+            AddTripOptionTool { store: store.clone(), user_id: 7, shown: shown.clone(), chat_id: 99 };
+        add_opt
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "nonstop".into(),
+                decided: Some(true),
+            })
+            .await
+            .unwrap();
+        add_opt
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "via-hkg".into(),
+                decided: Some(false),
+            })
+            .await
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store,
+            user_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap();
+
+        assert_eq!(out.segments[0].also_considered.len(), 1, "the runner-up is priced too");
+        assert_eq!(out.segments[0].also_considered[0].flight_numbers, "CX270,CX500");
+        assert_eq!(
+            out.segments[0].also_considered[0].price_now,
+            Some(820.0),
+            "priced from the same search as the chosen option, at no extra cost"
         );
     }
 }

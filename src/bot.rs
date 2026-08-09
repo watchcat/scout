@@ -1054,13 +1054,48 @@ pub(crate) fn trim_history(history: &mut Vec<LlmMessage>, cap: usize) {
     if history.len() <= cap {
         return;
     }
-    history.drain(..history.len() - cap);
-    match history.iter().position(is_plain_user_text) {
-        Some(0) => {}
+    let full = std::mem::take(history);
+    let mut window = full[full.len() - cap..].to_vec();
+    match window.iter().position(is_plain_user_text) {
+        Some(0) => *history = window,
         Some(i) => {
-            history.drain(..i);
+            window.drain(..i);
+            *history = window;
         }
-        None => history.clear(),
+        // One turn produced more tool traffic than the whole cap, so the
+        // window is tool calls all the way up and there is no safe head in
+        // it. Clearing here is what turned a four-leg trip search into "I
+        // don't have a recent flight search in our conversation", with the
+        // search still on screen above the reply.
+        //
+        // Keep the prose instead. Text carries no call/result pairing, so
+        // it cannot be orphaned however it is cut, and it is the part worth
+        // remembering — what was asked and what was answered.
+        None => {
+            let mut text: Vec<LlmMessage> = full.into_iter().filter(is_text_only).collect();
+            if text.len() > cap {
+                text.drain(..text.len() - cap);
+            }
+            *history = text;
+        }
+    }
+}
+
+/// A message that is prose and nothing else.
+///
+/// Providers reject a tool result whose call was trimmed away; text has no
+/// such pairing to break, so a history of text alone is safe to send no
+/// matter where it was cut.
+fn is_text_only(msg: &LlmMessage) -> bool {
+    match msg {
+        LlmMessage::User { content } => {
+            content.iter().all(|c| matches!(c, rig::message::UserContent::Text(_)))
+        }
+        LlmMessage::Assistant { content, .. } => {
+            content.iter().all(|c| matches!(c, rig::message::AssistantContent::Text(_)))
+        }
+        // Instruction text, and never part of a call/result pair.
+        LlmMessage::System { .. } => true,
     }
 }
 
@@ -1464,13 +1499,51 @@ mod tests {
     }
 
     #[test]
-    fn no_safe_head_after_drain_yields_empty_history_without_panicking() {
+    fn no_safe_head_after_drain_falls_back_to_the_text_of_the_conversation() {
+        // Not empty: an answer with nothing to anchor it is still worth
+        // keeping, and dropping it is how a reply becomes "I don't have a
+        // recent search in our conversation".
         let mut history = vec![
             assistant_tool_call("call-1", "search"),
             tool_result("call-1"),
             assistant_text("final answer"),
         ];
         trim_history(&mut history, 1);
-        assert!(history.is_empty());
+        assert_eq!(history.len(), 1);
+        assert!(matches!(&history[0], LlmMessage::Assistant { .. }));
+    }
+
+    #[test]
+    fn one_turn_of_heavy_tool_use_does_not_erase_the_conversation() {
+        // Measured in production: a four-leg trip search ran twelve searches
+        // in one turn. Twenty-five messages of tool traffic pushed the
+        // user's own message out of the capped window, no plain user text
+        // was left to start from, and the whole history was cleared. The
+        // next reply was "I don't have a recent flight search in our
+        // conversation" — with the search still on screen above it.
+        let mut history = vec![
+            user_text("flights to Japan via Hong Kong"),
+            assistant_text("let me look"),
+            user_text("around 15 September"),
+        ];
+        for i in 0..12 {
+            history.push(assistant_tool_call(&format!("call-{i}"), "search_flights"));
+            history.push(tool_result(&format!("call-{i}")));
+        }
+        history.push(assistant_text("AMS to HKG on Etihad, EUR 369.94"));
+
+        trim_history(&mut history, HISTORY_CAP);
+
+        assert!(!history.is_empty(), "a turn must not be able to erase the conversation");
+        assert!(
+            is_plain_user_text(&history[0]),
+            "whatever survives still has to start somewhere a provider accepts"
+        );
+        // The substance survives even though the tool traffic does not.
+        let text = format!("{history:?}");
+        assert!(text.contains("Hong Kong"), "the question is still there: {text}");
+        assert!(text.contains("369.94"), "and so is the answer: {text}");
+        assert!(!text.contains("ToolCall"), "but the tool calls are gone");
+        assert!(!text.contains("ToolResult"), "and so are their results");
     }
 }

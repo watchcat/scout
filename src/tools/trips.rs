@@ -294,8 +294,8 @@ pub fn comparison_notes(
                      that is what the protection above is worth"
                 ),
                 false => format!(
-                    "one ticket is {} {currency} cheaper than booking separately, and carries \
-                     the protection as well",
+                    "one ticket is {:.2} {currency} cheaper than booking separately, and \
+                     carries the protection as well",
                     gap.abs()
                 ),
             });

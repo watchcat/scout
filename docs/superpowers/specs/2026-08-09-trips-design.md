@@ -125,6 +125,16 @@ setting one inside a single `Store` method: the connection is behind one
 mutex, so that method is atomic by construction, the same property the
 finalisation refusals rely on.
 
+**Candidate numbers are handed out from a per-segment counter and never
+taken back.** The obvious implementation — one more than the highest number
+currently on the segment — recycles a number the moment the highest option
+is dropped, and the number is precisely what a later "go with option 2"
+refers to. Somebody shown two options, who drops the second and adds
+another, would be given a different flight under a name they already had an
+opinion about, with nothing signalling the substitution. So the counter
+lives on the segment row, rises only, and travels with the segment through
+position shifts.
+
 `UNIQUE (user_id, name_key)` is enforced by DuckDB — verified against 1.4.5
 before relying on it — so a duplicate name is a constraint violation rather
 than a check somebody can forget to write.

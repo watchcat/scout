@@ -99,6 +99,11 @@ CREATE TABLE IF NOT EXISTS trip_segments (
     origin         TEXT NOT NULL,
     destination    TEXT NOT NULL,
     departure_date TEXT NOT NULL,
+    -- Hands out candidate numbers and never takes one back. Deriving the
+    -- next number from max(candidate) over live rows recycles it the moment
+    -- the highest is dropped, and a traveller who was shown "option 2" would
+    -- then be handed a different flight under the same name.
+    next_candidate BIGINT NOT NULL DEFAULT 1,
     PRIMARY KEY (trip_id, position)
 );
 -- The options on a segment. Several may sit here undecided; at most one
@@ -618,9 +623,16 @@ pub fn add_candidate(
     if exists == 0 {
         anyhow::bail!("this trip has no segment {position}");
     }
+    // From the segment's high-water mark, not from max() over live rows:
+    // that recycles a number as soon as the highest candidate is dropped,
+    // and the number is what a later "go with option 2" refers to.
+    //
+    // Safe only because the existence check above already ran: with no
+    // matching row this UPDATE returns zero rows and query_row fails with a
+    // message that says nothing about the missing segment.
     let next: i64 = conn.query_row(
-        "SELECT coalesce(max(candidate), 0) + 1 FROM segment_candidates
-         WHERE trip_id = ? AND position = ?",
+        "UPDATE trip_segments SET next_candidate = next_candidate + 1
+         WHERE trip_id = ? AND position = ? RETURNING next_candidate - 1",
         params![trip_id, position],
         |row| row.get(0),
     )?;

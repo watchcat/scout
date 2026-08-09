@@ -622,6 +622,18 @@ impl Store {
         departure_date: &str,
     ) -> Result<Trip> {
         let conn = self.conn.lock().unwrap();
+        // Checked before anything is written: without this, a bad trip_id
+        // still passed the count query (as 0) and reached the INSERT below,
+        // leaving a segment row for a trip that does not exist — and no read
+        // path can ever find it again, because every read goes through a trip.
+        let known: i64 = conn.query_row(
+            "SELECT count(*) FROM trips WHERE id = ?",
+            params![trip_id],
+            |row| row.get(0),
+        )?;
+        if known == 0 {
+            anyhow::bail!("no such trip");
+        }
         let count: i64 = conn.query_row(
             "SELECT count(*) FROM trip_segments WHERE trip_id = ?",
             params![trip_id],
@@ -630,9 +642,12 @@ impl Store {
         let at = match position {
             Some(p) if p >= 1 && p <= count => p,
             Some(p) if p == count + 1 => p,
-            Some(p) => anyhow::bail!(
-                "this trip has {count} segment(s), so position {p} is not somewhere to put one"
-            ),
+            Some(p) => {
+                let noun = if count == 1 { "segment" } else { "segments" };
+                anyhow::bail!(
+                    "this trip has {count} {noun}, so position {p} is not somewhere to put one"
+                )
+            }
             None => count + 1,
         };
         if at <= count {
@@ -1189,5 +1204,34 @@ mod tests {
 
         let trip = store.add_segment(trip.id, None, "LIS", "AMS", "2026-09-10").unwrap();
         assert_eq!(trip.status, "planning", "the trip changed, so its pricing no longer describes it");
+    }
+
+    #[test]
+    fn adding_a_segment_to_a_nonexistent_trip_fails_without_writing_anything() {
+        // The insert used to run before any existence check, so a bad
+        // trip_id left a segment row that could never be read back — every
+        // read path goes through a trip, and this trip does not exist.
+        let (store, _d) = test_store();
+        assert!(store.add_segment(999, None, "AMS", "LIS", "2026-09-03").is_err());
+
+        let conn = store.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM trip_segments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "a failed add_segment must not leave an orphaned row");
+    }
+
+    #[test]
+    fn the_bounds_error_reads_correctly_with_exactly_one_segment() {
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
+
+        let err = store.add_segment(trip.id, Some(5), "LIS", "FCO", "2026-09-07").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "this trip has 1 segment, so position 5 is not somewhere to put one",
+            "1 segment(s) reads wrong at one"
+        );
     }
 }

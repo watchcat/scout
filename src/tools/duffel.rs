@@ -1175,14 +1175,22 @@ impl FlightSearchOutput {
 
         match ranked {
             Some(r) => Self {
-                route,
+                // Ranking notes are about *this* leg, and a trip answers
+                // four searches in one turn. Measured: the model read one
+                // leg's "the cheapest option is also the quickest" — true
+                // there, that leg had a single option — as a claim about
+                // another leg, concluded the tool contradicted its own
+                // data, and argued with it for the rest of the turn. A note
+                // that cannot say what it is about gets read against the
+                // wrong thing.
+                notes: r.notes.iter().map(|n| format!("{route}: {n}")).collect(),
                 found: r.found,
                 currency: Some(r.currency),
                 cheapest: Some(r.cheapest),
                 fastest: r.fastest,
                 picks: r.picks,
                 by_date: Vec::new(),
-                notes: r.notes,
+                route,
             },
             None => Self {
                 notes: vec![format!(
@@ -3386,6 +3394,38 @@ mod output_tests {
         assert_eq!(out.found, 1);
         assert_eq!(out.currency.as_deref(), Some("EUR"));
         assert_eq!(out.cheapest.unwrap().price, 184.30);
+    }
+
+    #[test]
+    fn a_ranking_note_says_which_route_it_is_about() {
+        // Measured: building a four-leg trip, the model read the Okinawa
+        // leg's "the cheapest option is also the quickest" — true there,
+        // because that leg returned one option — as a statement about the
+        // Amsterdam leg, decided the tool contradicted itself, and spent
+        // the rest of the turn arguing with it. Four searches answer in one
+        // turn, so a note that cannot say what it is about will be read
+        // against the wrong one.
+        let only_one = FlightSearchOutput::new(&query(), rank(vec![flight(184.30)]));
+        assert!(!only_one.notes.is_empty(), "one option produces the cheapest-is-quickest note");
+        for note in &only_one.notes {
+            assert!(
+                note.starts_with("AMS-LIS 2026-09-14: "),
+                "every ranking note names its own route: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_wide_note_is_not_labelled_with_one_route() {
+        // The booking fee and the unaffordable-days note are about the
+        // request, not about a leg, so labelling them with one route would
+        // be a small lie.
+        let out = FlightSearchOutput::new(&query(), None);
+        assert!(
+            out.notes.iter().all(|n| !n.starts_with("AMS-LIS 2026-09-14: ")),
+            "the no-flights note already names the route in its own words: {:?}",
+            out.notes
+        );
     }
 
     #[test]

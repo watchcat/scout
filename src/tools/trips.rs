@@ -5,7 +5,7 @@
 //! outlives the conversation that made it, so a trip holds the itinerary —
 //! airports, dates, flight numbers — and finalisation re-prices it.
 
-use crate::store::{NewCandidate, Store, Trip, TripCandidate, TripSegment};
+use crate::store::{ExpectedSegment, NewCandidate, Store, Trip, TripCandidate, TripSegment};
 use crate::tools::duffel::{Flight, Source};
 use crate::tools::purchases::{internal, StoreToolError};
 use crate::tools::shown::ShownFlights;
@@ -241,16 +241,17 @@ impl Tool for AddTripSegmentTool {
     }
 }
 
-/// `upsert_trip` and `add_segment` above are two separate lock acquisitions,
-/// so a concurrent `delete_trip` landing between them makes `add_segment`
-/// fail with a bare "no such trip" — on a tool documented to create the
-/// trip when the name is new, which reads as nonsense. Nothing was written
-/// either way, so retrying is exactly the right advice; only the wording
-/// needed fixing.
+/// A trip lookup and the write that follows it are two separate lock
+/// acquisitions in every one of these tools, so a concurrent `delete_trip`
+/// landing between them makes the write fail with a bare "no such trip" —
+/// on a tool that just confirmed the trip exists, which reads as nonsense.
+/// Nothing was written either way, so retrying is exactly the right advice;
+/// only the wording needed fixing. Shared by every tool with this shape so
+/// the same race reads the same way wherever it turns up.
 fn lost_trip_race(e: anyhow::Error) -> anyhow::Error {
     match e.to_string().as_str() {
         "no such trip" => anyhow::anyhow!(
-            "the trip was deleted while this segment was being added — nothing was written, try again"
+            "the trip was deleted while this change was being made — nothing was written, try again"
         ),
         _ => e,
     }
@@ -336,25 +337,30 @@ impl Tool for AddTripOptionTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // One instant for both the lookup and its error path, as
+        // `BookingLinksTool` does — two calls a few instructions apart could
+        // in principle straddle the expiry, and answering "not shown" while
+        // also listing the very id in `offer_ids` would be worse than
+        // either answer alone.
+        let now = Instant::now();
+
         // Guard 1: the offer must be one this chat was actually shown. A
         // model carrying a 32-character id across a turn is the invented-id
         // problem again, and a made-up one otherwise costs a paid lookup to
         // discover. Chat-scoped, too — otherwise one household member could
         // bind a flight from another's search.
-        let flight = self.shown.find(self.chat_id, &args.offer_id, Instant::now()).ok_or_else(
-            || {
-                let ids = self.shown.offer_ids(self.chat_id, Instant::now());
-                StoreToolError(format!(
-                    "{:?} was not shown in this conversation, so it cannot be added. \
-                     Search first, then use one of these offer_ids: {}",
-                    args.offer_id,
-                    match ids.is_empty() {
-                        true => "(nothing has been searched yet)".to_string(),
-                        false => ids.join(", "),
-                    }
-                ))
-            },
-        )?;
+        let flight = self.shown.find(self.chat_id, &args.offer_id, now).ok_or_else(|| {
+            let ids = self.shown.offer_ids(self.chat_id, now);
+            StoreToolError(format!(
+                "{:?} was not shown in this conversation, so it cannot be added. \
+                 Search first, then use one of these offer_ids: {}",
+                args.offer_id,
+                match ids.is_empty() {
+                    true => "(nothing has been searched yet)".to_string(),
+                    false => ids.join(", "),
+                }
+            ))
+        })?;
 
         // Guard 2: a segment is one direction on one date. A return offer
         // has two legs, and binding it here would price the return twice
@@ -369,35 +375,60 @@ impl Tool for AddTripOptionTool {
         let leg = &flight.legs[0];
         let candidate = candidate_from(&flight);
 
+        // Guard 3 (route, and now date) is enforced inside
+        // `Store::add_candidate`, in the same lock acquisition as the
+        // insert — checking it here, against a `Trip` read a moment
+        // earlier, would leave a window for a concurrent add_trip_segment
+        // or drop_trip_segment to renumber positions in between. What is
+        // decided here is only whether there is a date to check at all:
+        // `departing_at_local` can be an empty string — Duffel's parser
+        // falls back to one when an offer's leg states no departure time —
+        // and that is "nothing to check", not "checked and fine", so it
+        // must not be silently skipped or wrongly treated as a mismatch.
+        let leg_date = leg.departing_at_local.get(0..10).map(str::to_string);
+        let date_unchecked = leg_date.is_none();
+
         let store = self.store.clone();
         let user_id = self.user_id;
         let (leg_origin, leg_destination) = (leg.origin.clone(), leg.destination.clone());
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
+        let position = args.position;
+        let trip_name = args.trip;
+        let decided = args.decided.unwrap_or(true);
+        let trip = tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
             let trip = store
-                .find_trip(user_id, &args.trip)?
-                .ok_or_else(|| anyhow::anyhow!("no trip called {:?}", args.trip))?;
-            let segment = trip
-                .segments
-                .iter()
-                .find(|s| s.position == args.position)
-                .ok_or_else(|| anyhow::anyhow!("this trip has no segment {}", args.position))?;
-            // Guard 3: nothing else stops an AMS→LIS offer being attached
-            // to an AMS→NRT segment, and it would then be re-priced against
-            // the wrong route at finalisation.
-            if segment.origin != leg_origin || segment.destination != leg_destination {
-                anyhow::bail!(
-                    "segment {} is {}→{} but that flight is {leg_origin}→{leg_destination}",
-                    segment.position,
-                    segment.origin,
-                    segment.destination
-                );
-            }
-            store.add_candidate(trip.id, args.position, candidate, args.decided.unwrap_or(true))
+                .find_trip(user_id, &trip_name)?
+                .ok_or_else(|| anyhow::anyhow!("no trip called {:?}", trip_name))?;
+            let expected = ExpectedSegment {
+                origin: &leg_origin,
+                destination: &leg_destination,
+                departure_date: leg_date.as_deref(),
+            };
+            store.add_candidate(trip.id, position, expected, candidate, decided).map_err(lost_trip_race)
         })
         .await
         .map_err(internal)?
-        .map(TripView::of)
-        .map_err(internal)
+        .map_err(internal)?;
+
+        let mut view = TripView::of(trip);
+        if date_unchecked {
+            // Reported rather than swallowed: an itinerary that looks
+            // entirely correct is exactly the failure mode the date guard
+            // exists to close, and skipping the check silently would be
+            // that failure mode with extra steps.
+            let segment_date = view
+                .trip
+                .segments
+                .iter()
+                .find(|s| s.position == position)
+                .map(|s| s.departure_date.as_str())
+                .unwrap_or("?");
+            view.notes.push(format!(
+                "the flight just added to segment {position} stated no departure time, so its \
+                 date could not be checked against the segment's ({segment_date}) — confirm it \
+                 is really on that date before relying on this"
+            ));
+        }
+        Ok(view)
     }
 }
 
@@ -446,7 +477,7 @@ impl Tool for ChooseTripOptionTool {
             let trip = store
                 .find_trip(user_id, &args.trip)?
                 .ok_or_else(|| anyhow::anyhow!("no trip called {:?}", args.trip))?;
-            store.choose_candidate(trip.id, args.position, args.candidate)
+            store.choose_candidate(trip.id, args.position, args.candidate).map_err(lost_trip_race)
         })
         .await
         .map_err(internal)?
@@ -880,5 +911,91 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("AMS→NRT"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_option_for_the_right_route_but_the_wrong_date_is_refused() {
+        // Finalisation re-searches a segment on its own departure_date and
+        // matches the stored flight numbers against that day's results. A
+        // date-mismatched bind either reports a flight as no longer sold,
+        // or — because airlines reuse flight numbers day to day — silently
+        // matches a different flight that happens to share the number.
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("wrong-date", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-05".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let err = add_opt
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "wrong-date".into(),
+                decided: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("2026-09-03"), "got: {err}");
+        assert!(err.to_string().contains("2026-09-05"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_flight_with_no_stated_departure_time_is_added_with_a_note_not_a_refusal() {
+        // Duffel's own parser falls back to an empty string when an offer's
+        // leg states no departure time (see `duffel::leg`). That is
+        // "nothing to check", not "checked and failed" — refusing it would
+        // be wrong. But saying nothing would leave the date silently
+        // unverified, which is the exact failure the guard exists to close.
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        let mut flight = one_way("no-time", "AMS", "NRT", "2026-09-03", &["KL861"]);
+        flight.legs[0].departing_at_local = String::new();
+        shown.remember(99, vec![flight], Instant::now());
+        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-05".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let view = add_opt
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "no-time".into(),
+                decided: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            view.trip.segments[0].candidates.len(),
+            1,
+            "must not be refused for a date check that cannot run"
+        );
+        assert!(
+            view.notes.iter().any(|n| n.contains("date could not be checked")),
+            "the gap must be visible rather than silent: {:?}",
+            view.notes
+        );
     }
 }

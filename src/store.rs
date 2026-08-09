@@ -207,6 +207,17 @@ pub struct NewCandidate {
     pub source: Option<String>,
 }
 
+/// What a caller has already checked a flight against, for `add_candidate`
+/// to verify again inside the same lock as the write it guards — see that
+/// method's own comment for why the check cannot live only in the caller.
+pub struct ExpectedSegment<'a> {
+    pub origin: &'a str,
+    pub destination: &'a str,
+    /// `None` when the flight being added had no usable date to check —
+    /// "nothing to verify", not "verified".
+    pub departure_date: Option<&'a str>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -709,6 +720,14 @@ impl Store {
     /// Parks a flight against a segment. `decided` also marks it chosen, so
     /// the common single-option path is one call.
     ///
+    /// `expected` is checked against the segment's row in this same lock
+    /// acquisition, not against a `Trip` the caller read earlier: that read
+    /// and this write are two separate lock acquisitions, so a concurrent
+    /// `add_trip_segment` or `drop_trip_segment` renumbering positions in
+    /// between could otherwise land a candidate validated against one route
+    /// onto a segment that is now something else. The caller passes what it
+    /// validated; this re-checks that it is still true.
+    ///
     /// Candidate numbers are never reused: they are what the traveller sees and
     /// what `choose_candidate` takes, and recycling one would silently retarget
     /// a decision made against the old numbering.
@@ -716,6 +735,7 @@ impl Store {
         &self,
         trip_id: i64,
         position: i64,
+        expected: ExpectedSegment,
         new: NewCandidate,
         decided: bool,
     ) -> Result<Trip> {
@@ -730,13 +750,36 @@ impl Store {
         if known == 0 {
             anyhow::bail!("no such trip");
         }
-        let exists: i64 = conn.query_row(
-            "SELECT count(*) FROM trip_segments WHERE trip_id = ? AND position = ?",
-            params![trip_id, position],
-            |row| row.get(0),
+        let mut stmt = conn.prepare(
+            "SELECT origin, destination, departure_date FROM trip_segments
+             WHERE trip_id = ? AND position = ?",
         )?;
-        if exists == 0 {
+        let segment: Option<(String, String, String)> = stmt
+            .query_map(params![trip_id, position], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .next()
+            .transpose()?;
+        drop(stmt);
+        let Some((origin, destination, departure_date)) = segment else {
             anyhow::bail!("this trip has no segment {position}");
+        };
+        // The route and date guard: nothing else stops a flight validated
+        // against one segment being written to a different one by the time
+        // this lock is taken.
+        if origin != expected.origin || destination != expected.destination {
+            anyhow::bail!(
+                "segment {position} is {origin}→{destination} but that flight is \
+                 {}→{}",
+                expected.origin,
+                expected.destination
+            );
+        }
+        if let Some(expected_date) = expected.departure_date {
+            if departure_date != expected_date {
+                anyhow::bail!(
+                    "segment {position} departs {departure_date} but that flight departs \
+                     {expected_date}"
+                );
+            }
         }
         // next_candidate is a high-water mark on the segment row: read and
         // advance it here, inside the lock this method already holds, so a
@@ -781,6 +824,19 @@ impl Store {
 
     pub fn choose_candidate(&self, trip_id: i64, position: i64, candidate: i64) -> Result<Trip> {
         let conn = self.conn.lock().unwrap();
+        // choose_within only checks the segment_candidates row, which a
+        // deleted trip has none of — indistinguishable, from there, from a
+        // numbering mistake on a trip that still exists. Checked here,
+        // separately, so a trip gone by the time this runs reads as "no
+        // such trip" rather than a bad option number.
+        let known: i64 = conn.query_row(
+            "SELECT count(*) FROM trips WHERE id = ?",
+            params![trip_id],
+            |row| row.get(0),
+        )?;
+        if known == 0 {
+            anyhow::bail!("no such trip");
+        }
         choose_within(&conn, trip_id, position, candidate)?;
         touch(&conn, trip_id)?;
         load_trip(&conn, trip_id)
@@ -1386,8 +1442,24 @@ mod tests {
 
         // Parked undecided: the traveller is comparing a nonstop against a
         // one-stop through Hong Kong.
-        store.add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), false).unwrap();
-        let trip = store.add_candidate(trip.id, 1, candidate("Cathay", "CX270,CX500", 780.0), false).unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                false,
+            )
+            .unwrap();
+        let trip = store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("Cathay", "CX270,CX500", 780.0),
+                false,
+            )
+            .unwrap();
         let options = &trip.segments[0].candidates;
         assert_eq!(options.len(), 2);
         assert_eq!(options.iter().map(|c| c.candidate).collect::<Vec<_>>(), vec![1, 2]);
@@ -1426,12 +1498,36 @@ mod tests {
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
-        store.add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), false).unwrap();
-        store.add_candidate(trip.id, 1, candidate("Cathay", "CX270,CX500", 780.0), false).unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                false,
+            )
+            .unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("Cathay", "CX270,CX500", 780.0),
+                false,
+            )
+            .unwrap();
 
         // Drop the highest-numbered candidate, then add a fresh one.
         store.drop_candidate(trip.id, 1, 2).unwrap();
-        let trip = store.add_candidate(trip.id, 1, candidate("ANA", "NH205", 900.0), false).unwrap();
+        let trip = store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("ANA", "NH205", 900.0),
+                false,
+            )
+            .unwrap();
 
         let numbers: Vec<i64> = trip.segments[0].candidates.iter().map(|c| c.candidate).collect();
         assert_eq!(
@@ -1450,13 +1546,25 @@ mod tests {
         // going to exist.
         let (store, _d) = test_store();
         let err = store
-            .add_candidate(999, 1, candidate("KLM", "KL861", 940.0), false)
+            .add_candidate(
+                999,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                false,
+            )
             .unwrap_err();
         assert_eq!(err.to_string(), "no such trip", "a nonexistent trip must not be reported as a missing segment");
 
         let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
         let err = store
-            .add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), false)
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                false,
+            )
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -1472,7 +1580,15 @@ mod tests {
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
-        let trip = store.add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), true).unwrap();
+        let trip = store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                true,
+            )
+            .unwrap();
         assert!(trip.segments[0].candidates[0].chosen);
     }
 
@@ -1492,9 +1608,33 @@ mod tests {
             store.add_segment(trip.id, None, o, d, date).unwrap();
         }
         // One chosen candidate per segment, identifiable by flight number.
-        store.add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), true).unwrap();
-        store.add_candidate(trip.id, 2, candidate("ANA", "NH2001", 210.0), true).unwrap();
-        store.add_candidate(trip.id, 3, candidate("KLM", "KL862", 980.0), true).unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                true,
+            )
+            .unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                2,
+                ExpectedSegment { origin: "NRT", destination: "OSA", departure_date: Some("2026-09-10") },
+                candidate("ANA", "NH2001", 210.0),
+                true,
+            )
+            .unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                3,
+                ExpectedSegment { origin: "OSA", destination: "AMS", departure_date: Some("2026-09-17") },
+                candidate("KLM", "KL862", 980.0),
+                true,
+            )
+            .unwrap();
 
         // Insert a new segment at position 1: AMS-NRT, NRT-OSA, OSA-AMS all
         // shift down one.
@@ -1561,12 +1701,107 @@ mod tests {
     }
 
     #[test]
+    fn add_candidate_refuses_when_the_route_or_date_no_longer_matches_what_was_checked() {
+        // The caller validates a flight against a `Trip` it read earlier,
+        // but that read and this write are two separate lock acquisitions —
+        // a concurrent add_trip_segment or drop_trip_segment could
+        // renumber positions in between. So the check has to run again
+        // here, inside the same lock as the insert, against what the
+        // caller says it validated rather than trusting the earlier read
+        // to still be true.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+
+        let err = store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "LIS", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                false,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("AMS") && err.to_string().contains("NRT"), "got: {err}");
+
+        let err = store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-05") },
+                candidate("KLM", "KL861", 940.0),
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("2026-09-03") && err.to_string().contains("2026-09-05"),
+            "got: {err}"
+        );
+
+        // Matching values still insert.
+        let trip = store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                false,
+            )
+            .unwrap();
+        assert_eq!(trip.segments[0].candidates.len(), 1);
+
+        // No usable date to check is not the same as a checked mismatch.
+        let trip = store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: None },
+                candidate("ANA", "NH205", 900.0),
+                false,
+            )
+            .unwrap();
+        assert_eq!(trip.segments[0].candidates.len(), 2, "None means nothing to check, not a refusal");
+    }
+
+    #[test]
+    fn choosing_an_option_after_the_trip_is_deleted_says_so_rather_than_no_such_option() {
+        // choose_within only ever checks the segment_candidates row, which
+        // a deleted trip has none of — indistinguishable, from there, from
+        // a numbering mistake on a trip that still exists. choose_candidate
+        // has to check the trip itself first so the two are told apart.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                false,
+            )
+            .unwrap();
+        store.delete_trip(7, "Japan").unwrap();
+
+        let err = store.choose_candidate(trip.id, 1, 1).unwrap_err();
+        assert_eq!(err.to_string(), "no such trip", "a deleted trip must not read as a bad option number");
+    }
+
+    #[test]
     fn deleting_a_trip_takes_its_segments_and_options_with_it() {
         // Creating a trip is a side effect of a typo, so a typo needs an undo.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Setpember", None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
-        store.add_candidate(trip.id, 1, candidate("TAP", "TP675", 118.0), true).unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "LIS", departure_date: Some("2026-09-03") },
+                candidate("TAP", "TP675", 118.0),
+                true,
+            )
+            .unwrap();
 
         assert!(store.delete_trip(7, "setpember").unwrap());
         assert!(store.find_trip(7, "Setpember").unwrap().is_none());

@@ -150,10 +150,15 @@ the trip back, so a change to either is visible in the reply rather than
 discovered at finalisation.
 
 `status` is `planning` until `finalise_trip` succeeds, and returns to
-`planning` the moment any segment changes: the prices it was finalised at
-stopped describing the trip when the trip stopped being that trip. It is a
-label on what has been priced, not a lock — a finalised trip stays fully
-editable.
+`planning` on any edit that changes what would be priced: a segment, its
+options, the passenger count, or the cabin. The prices it was finalised at
+stopped describing the trip when the trip stopped being that trip, and a
+trip priced for one adult is not priced for two. It is a label on what has
+been priced, not a lock — a finalised trip stays fully editable.
+
+An upsert that supplies no new values changes nothing and must not reset
+anything: that call is how find-or-create works, and making it destructive
+would mean merely naming a trip un-priced it.
 
 `quoted_price` and `quoted_at` are never overwritten by finalisation. They
 mean "what this cost when you chose it", and refreshing them would make the

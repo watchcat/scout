@@ -484,16 +484,11 @@ pub fn drop_segment(&self, trip_id: i64, position: i64) -> Result<Trip> {
     load_trip(&conn, trip_id)
 }
 
-/// Used by finalisation to record that a trip has been priced.
-pub fn set_trip_status(&self, trip_id: i64, status: &str) -> Result<()> {
-    let conn = self.conn.lock().unwrap();
-    conn.execute(
-        "UPDATE trips SET status = ?, updated_at = current_timestamp WHERE id = ?",
-        params![status, trip_id],
-    )?;
-    Ok(())
-}
 ```
+
+`set_trip_status` was pulled forward into Task 1 during review — a test there needed to
+put a trip into `finalised` to prove that changing the passenger count takes it back out.
+It already exists; do not add it again.
 
 And the helper, next to `load_trip`:
 

@@ -14,3 +14,4 @@ pub mod purchases;
 pub mod reminders;
 pub mod secondhand;
 pub mod shown;
+pub mod trips;

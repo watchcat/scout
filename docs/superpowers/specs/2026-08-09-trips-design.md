@@ -195,6 +195,14 @@ trades that for a model choosing wrongly between modes.
   defaults to true and also marks the candidate chosen, so the ordinary
   "this is the flight" path is still one call; `decided: false` is "keep
   this one in the running".
+  A flight must match the segment it is bound to on **origin, destination
+  and date**. Route alone is not enough: airlines reuse flight numbers day
+  to day, so a flight parked against the wrong date does not merely fail to
+  re-price — at finalisation it can match a different aircraft carrying the
+  same number, and price that instead. The check happens inside the same
+  critical section as the write, because a position shift between validating
+  and writing would otherwise land a validated candidate on a segment that
+  is no longer the one that was checked.
 - **`choose_trip_option`** `{ trip, position, candidate }`
   Settles a segment later, by candidate number. It exists because deciding
   happens after the offer that produced the option has expired, so there is

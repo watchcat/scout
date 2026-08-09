@@ -2079,3 +2079,30 @@ git commit -m "feat: give the agent the trip planning tools"
 - `cargo clippy --all-targets` is silent
 - A trip can be created, given segments, given several options per segment, have one chosen, be shown, amended and deleted — all from tool calls
 - No offer id is stored anywhere in the schema
+
+---
+
+## Corrections made during implementation
+
+Review found defects in this plan's own code, most of them mine. The committed source is
+ahead of the code blocks above; where they disagree, the source is right. Recorded here so
+the reasoning is not lost:
+
+- **`set_trip_status` moved to Task 1** — a test there needed to put a trip into `finalised`
+  to prove that changing the passenger count takes it back out.
+- **Editing `adults` or `cabin_class` resets `status` to `planning`.** A trip finalised for
+  one adult is not priced for two. An upsert supplying nothing stays inert, because that call
+  is how find-or-create works.
+- **`add_segment` gained a trip-existence check.** Without it a bad `trip_id` wrote a segment
+  row and only failed later at `load_trip`, orphaning it.
+- **Candidate numbers come from a `next_candidate` high-water column**, not `max()` over live
+  rows, which handed a number back as soon as the highest option was dropped.
+- **`itinerary_notes` reports an impossible turnaround separately from a tight one.** The
+  original `(0..TIGHT).contains()` excluded negatives, so an itinerary that departs before it
+  lands produced no note at all.
+- **`calendar_date` returns the reformatted date**, not the trimmed input. chrono accepts
+  `2026-9-3`, and `dates_run_forwards` compares dates as text, where that sorts after
+  `2026-10-01`.
+- **Binding a flight checks the date as well as the route**, inside the same critical section
+  as the write. See the spec for why route alone is not enough.
+- **Task 7's code block omits `use std::time::Instant;`**, which `call()` needs.

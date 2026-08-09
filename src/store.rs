@@ -57,6 +57,51 @@ CREATE TABLE IF NOT EXISTS user_chats (
     chat_id BIGINT NOT NULL,
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
+-- A named plan. The itinerary is durable; prices are not, so nothing here
+-- holds an offer id — see the trips design doc.
+CREATE SEQUENCE IF NOT EXISTS trips_id_seq;
+CREATE TABLE IF NOT EXISTS trips (
+    id          BIGINT PRIMARY KEY DEFAULT nextval('trips_id_seq'),
+    user_id     BIGINT NOT NULL,
+    name        TEXT NOT NULL,
+    -- lowercased `name`: the trip is addressed by what the traveller calls
+    -- it, and "September" and "september" are the same trip.
+    name_key    TEXT NOT NULL,
+    adults      BIGINT NOT NULL DEFAULT 1,
+    cabin_class TEXT,
+    status      TEXT NOT NULL DEFAULT 'planning',
+    created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (user_id, name_key)
+);
+-- Where and when. This is all that gets re-searched.
+CREATE TABLE IF NOT EXISTS trip_segments (
+    trip_id        BIGINT NOT NULL,
+    position       BIGINT NOT NULL,
+    origin         TEXT NOT NULL,
+    destination    TEXT NOT NULL,
+    departure_date TEXT NOT NULL,
+    PRIMARY KEY (trip_id, position)
+);
+-- The options on a segment. Several may sit here undecided; at most one
+-- carries `chosen`, which is enforced in Rust because `false` repeats.
+CREATE TABLE IF NOT EXISTS segment_candidates (
+    trip_id            BIGINT NOT NULL,
+    position           BIGINT NOT NULL,
+    candidate          BIGINT NOT NULL,
+    chosen             BOOLEAN NOT NULL DEFAULT false,
+    airline            TEXT NOT NULL,
+    flight_numbers     TEXT NOT NULL,
+    itinerary          TEXT NOT NULL,
+    departing_at_local TEXT,
+    arriving_at_local  TEXT,
+    duration_minutes   BIGINT,
+    quoted_price       DOUBLE,
+    quoted_currency    TEXT,
+    quoted_at          TIMESTAMP,
+    source             TEXT,
+    PRIMARY KEY (trip_id, position, candidate)
+);
 "#;
 
 /// A purchase as the agent sees it. `purchased_at` is an ISO `YYYY-MM-DD`
@@ -95,6 +140,65 @@ pub struct Reminder {
     pub item: String,
     pub interval_days: i64,
     pub next_due: String, // YYYY-MM-DD
+}
+
+/// A named plan. `id` is not serialised: it is noise to the model, and
+/// exposing it invites addressing a trip by something the traveller never
+/// said.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Trip {
+    #[serde(skip)]
+    pub id: i64,
+    pub name: String,
+    pub adults: i64,
+    pub cabin_class: Option<String>,
+    /// `planning` or `finalised`. Any edit returns it to `planning`: the
+    /// prices it was finalised at stopped describing the trip when the trip
+    /// stopped being that trip.
+    pub status: String,
+    pub segments: Vec<TripSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TripSegment {
+    pub position: i64,
+    pub origin: String,
+    pub destination: String,
+    pub departure_date: String,
+    pub candidates: Vec<TripCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TripCandidate {
+    pub candidate: i64,
+    pub chosen: bool,
+    pub airline: String,
+    /// Comma-separated and in order (`KL1007,KL0805`), because finalisation
+    /// matches this against fresh search results.
+    pub flight_numbers: String,
+    /// The rendered line `Leg::itinerary` produces, for showing.
+    pub itinerary: String,
+    pub departing_at_local: Option<String>,
+    pub arriving_at_local: Option<String>,
+    pub duration_minutes: Option<i64>,
+    /// What it cost when parked. Never refreshed — see the design doc.
+    pub quoted_price: Option<f64>,
+    pub quoted_currency: Option<String>,
+    pub source: Option<String>,
+}
+
+/// A candidate on its way into the database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewCandidate {
+    pub airline: String,
+    pub flight_numbers: String,
+    pub itinerary: String,
+    pub departing_at_local: Option<String>,
+    pub arriving_at_local: Option<String>,
+    pub duration_minutes: Option<i64>,
+    pub quoted_price: Option<f64>,
+    pub quoted_currency: Option<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Clone)]
@@ -411,6 +515,143 @@ impl Store {
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
+
+    /// Creates the trip if the name is new, otherwise updates only what was
+    /// supplied. Two statements rather than one `ON CONFLICT DO UPDATE`: with
+    /// upsert, an unsupplied `adults` would arrive as the insert's default and
+    /// overwrite a value already set.
+    pub fn upsert_trip(
+        &self,
+        user_id: i64,
+        name: &str,
+        adults: Option<i64>,
+        cabin_class: Option<&str>,
+    ) -> Result<Trip> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("a trip needs a name — ask the traveller what to call it");
+        }
+        let key = name.to_lowercase();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO trips (user_id, name, name_key) VALUES (?, ?, ?)
+             ON CONFLICT (user_id, name_key) DO NOTHING",
+            params![user_id, name, key],
+        )?;
+        if let Some(adults) = adults {
+            conn.execute(
+                "UPDATE trips SET adults = ?, updated_at = current_timestamp
+                 WHERE user_id = ? AND name_key = ?",
+                params![adults, user_id, key],
+            )?;
+        }
+        if let Some(cabin) = cabin_class {
+            conn.execute(
+                "UPDATE trips SET cabin_class = ?, updated_at = current_timestamp
+                 WHERE user_id = ? AND name_key = ?",
+                params![cabin, user_id, key],
+            )?;
+        }
+        let id: i64 = conn.query_row(
+            "SELECT id FROM trips WHERE user_id = ? AND name_key = ?",
+            params![user_id, key],
+            |row| row.get(0),
+        )?;
+        load_trip(&conn, id)
+    }
+
+    pub fn find_trip(&self, user_id: i64, name: &str) -> Result<Option<Trip>> {
+        let key = name.trim().to_lowercase();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id FROM trips WHERE user_id = ? AND name_key = ?")?;
+        let mut ids = stmt.query_map(params![user_id, key], |row| row.get::<_, i64>(0))?;
+        match ids.next() {
+            Some(id) => Ok(Some(load_trip(&conn, id?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every trip this user has, newest activity first.
+    pub fn list_trips(&self, user_id: i64) -> Result<Vec<Trip>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM trips WHERE user_id = ? ORDER BY updated_at DESC, id DESC")?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![user_id], |row| row.get(0))?
+            .collect::<duckdb::Result<_>>()?;
+        ids.into_iter().map(|id| load_trip(&conn, id)).collect()
+    }
+}
+
+/// Reads one whole trip. Takes `&Connection` rather than `&Store` so it can
+/// be called by a method that already holds the lock — every trip-mutating
+/// method returns the trip it just changed, and re-locking would deadlock.
+fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
+    let (name, adults, cabin_class, status) = conn.query_row(
+        "SELECT name, adults, cabin_class, status FROM trips WHERE id = ?",
+        params![id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT position, origin, destination, departure_date FROM trip_segments
+         WHERE trip_id = ? ORDER BY position",
+    )?;
+    let rows: Vec<(i64, String, String, String)> = stmt
+        .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<duckdb::Result<_>>()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT position, candidate, chosen, airline, flight_numbers, itinerary,
+                departing_at_local, arriving_at_local, duration_minutes,
+                quoted_price, quoted_currency, source
+         FROM segment_candidates WHERE trip_id = ? ORDER BY position, candidate",
+    )?;
+    let candidates: Vec<(i64, TripCandidate)> = stmt
+        .query_map(params![id], |r| {
+            Ok((
+                r.get(0)?,
+                TripCandidate {
+                    candidate: r.get(1)?,
+                    chosen: r.get(2)?,
+                    airline: r.get(3)?,
+                    flight_numbers: r.get(4)?,
+                    itinerary: r.get(5)?,
+                    departing_at_local: r.get(6)?,
+                    arriving_at_local: r.get(7)?,
+                    duration_minutes: r.get(8)?,
+                    quoted_price: r.get(9)?,
+                    quoted_currency: r.get(10)?,
+                    source: r.get(11)?,
+                },
+            ))
+        })?
+        .collect::<duckdb::Result<_>>()?;
+
+    let segments = rows
+        .into_iter()
+        .map(|(position, origin, destination, departure_date)| TripSegment {
+            position,
+            origin,
+            destination,
+            departure_date,
+            candidates: candidates
+                .iter()
+                .filter(|(p, _)| *p == position)
+                .map(|(_, c)| c.clone())
+                .collect(),
+        })
+        .collect();
+
+    Ok(Trip { id, name, adults, cabin_class, status, segments })
 }
 
 fn row_to_purchase(row: &Row) -> duckdb::Result<Purchase> {
@@ -721,5 +962,30 @@ mod tests {
         assert!(s.forget_fact(1, "budget_style").unwrap());
         assert!(!s.forget_fact(1, "budget_style").unwrap());
         assert!(s.list_facts(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_trip_is_found_by_name_case_insensitively_and_scoped_to_its_owner() {
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        assert_eq!(trip.name, "September");
+        assert_eq!(trip.adults, 1, "one adult unless said otherwise");
+        assert_eq!(trip.status, "planning");
+        assert!(trip.segments.is_empty());
+
+        assert!(store.find_trip(7, "september").unwrap().is_some(), "names are not case-sensitive");
+        assert!(store.find_trip(8, "September").unwrap().is_none(), "another user has no such trip");
+
+        // Same name twice is the same trip, not a second one.
+        store.upsert_trip(7, "SEPTEMBER", Some(2), Some("business")).unwrap();
+        assert_eq!(store.list_trips(7).unwrap().len(), 1);
+        let trip = store.find_trip(7, "September").unwrap().unwrap();
+        assert_eq!(trip.adults, 2);
+        assert_eq!(trip.cabin_class.as_deref(), Some("business"));
+        assert_eq!(trip.name, "September", "the original spelling is kept");
+
+        // Two users may each have a "September".
+        store.upsert_trip(8, "September", None, None).unwrap();
+        assert_eq!(store.list_trips(8).unwrap().len(), 1);
     }
 }

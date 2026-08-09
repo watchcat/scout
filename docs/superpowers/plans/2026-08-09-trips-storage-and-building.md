@@ -99,6 +99,11 @@ CREATE TABLE IF NOT EXISTS trip_segments (
     origin         TEXT NOT NULL,
     destination    TEXT NOT NULL,
     departure_date TEXT NOT NULL,
+    -- Hands out candidate numbers and never takes one back. Deriving the
+    -- next number from max(candidate) over live rows recycles it the moment
+    -- the highest is dropped, and a traveller who was shown "option 2" would
+    -- then be handed a different flight under the same name.
+    next_candidate BIGINT NOT NULL DEFAULT 1,
     PRIMARY KEY (trip_id, position)
 );
 -- The options on a segment. Several may sit here undecided; at most one
@@ -484,16 +489,11 @@ pub fn drop_segment(&self, trip_id: i64, position: i64) -> Result<Trip> {
     load_trip(&conn, trip_id)
 }
 
-/// Used by finalisation to record that a trip has been priced.
-pub fn set_trip_status(&self, trip_id: i64, status: &str) -> Result<()> {
-    let conn = self.conn.lock().unwrap();
-    conn.execute(
-        "UPDATE trips SET status = ?, updated_at = current_timestamp WHERE id = ?",
-        params![status, trip_id],
-    )?;
-    Ok(())
-}
 ```
+
+`set_trip_status` was pulled forward into Task 1 during review — a test there needed to
+put a trip into `finalised` to prove that changing the passenger count takes it back out.
+It already exists; do not add it again.
 
 And the helper, next to `load_trip`:
 
@@ -623,9 +623,16 @@ pub fn add_candidate(
     if exists == 0 {
         anyhow::bail!("this trip has no segment {position}");
     }
+    // From the segment's high-water mark, not from max() over live rows:
+    // that recycles a number as soon as the highest candidate is dropped,
+    // and the number is what a later "go with option 2" refers to.
+    //
+    // Safe only because the existence check above already ran: with no
+    // matching row this UPDATE returns zero rows and query_row fails with a
+    // message that says nothing about the missing segment.
     let next: i64 = conn.query_row(
-        "SELECT coalesce(max(candidate), 0) + 1 FROM segment_candidates
-         WHERE trip_id = ? AND position = ?",
+        "UPDATE trip_segments SET next_candidate = next_candidate + 1
+         WHERE trip_id = ? AND position = ? RETURNING next_candidate - 1",
         params![trip_id, position],
         |row| row.get(0),
     )?;
@@ -968,17 +975,24 @@ pub fn itinerary_notes(segments: &[TripSegment]) -> Vec<String> {
             // those, so the gap note is all there is to say.
             continue;
         }
-        if let Some(minutes) = turnaround_minutes(before, after) {
-            if (0..TIGHT_TURNAROUND_MINUTES).contains(&minutes) {
-                notes.push(format!(
-                    "only {}h {:02}m at {} between segment {} landing and segment {} leaving",
-                    minutes / 60,
-                    minutes % 60,
-                    before.destination,
-                    before.position,
-                    after.position
-                ));
-            }
+        match turnaround_minutes(before, after) {
+            // Not a small number — a wrong one. Folding this into the range
+            // below hides it, because `0..TIGHT` excludes negatives and an
+            // itinerary that cannot be flown then reads as perfectly fine.
+            Some(minutes) if minutes < 0 => notes.push(format!(
+                "segment {} leaves {} before segment {} has landed there — this itinerary \
+                 cannot be flown as written",
+                after.position, before.destination, before.position
+            )),
+            Some(minutes) if minutes < TIGHT_TURNAROUND_MINUTES => notes.push(format!(
+                "only {}h {:02}m at {} between segment {} landing and segment {} leaving",
+                minutes / 60,
+                minutes % 60,
+                before.destination,
+                before.position,
+                after.position
+            )),
+            _ => {}
         }
     }
     notes
@@ -1158,11 +1172,16 @@ fn iata(label: &str, value: &str) -> Result<String, StoreToolError> {
     }
 }
 
+/// Returns the date *reformatted*, not the input echoed back.
+///
+/// chrono accepts "2026-9-3" for "%Y-%m-%d", and `dates_run_forwards`
+/// compares dates as text — where "2026-9-3" sorts after "2026-10-01".
+/// This function is where that invariant is established, so it has to
+/// produce the padded form rather than merely accept the loose one.
 fn calendar_date(value: &str) -> Result<String, StoreToolError> {
-    let date = value.trim();
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map_err(|_| StoreToolError(format!("departure_date must be YYYY-MM-DD, not {value:?}")))?;
-    Ok(date.to_string())
+    chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .map_err(|_| StoreToolError(format!("departure_date must be YYYY-MM-DD, not {value:?}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2060,3 +2079,30 @@ git commit -m "feat: give the agent the trip planning tools"
 - `cargo clippy --all-targets` is silent
 - A trip can be created, given segments, given several options per segment, have one chosen, be shown, amended and deleted — all from tool calls
 - No offer id is stored anywhere in the schema
+
+---
+
+## Corrections made during implementation
+
+Review found defects in this plan's own code, most of them mine. The committed source is
+ahead of the code blocks above; where they disagree, the source is right. Recorded here so
+the reasoning is not lost:
+
+- **`set_trip_status` moved to Task 1** — a test there needed to put a trip into `finalised`
+  to prove that changing the passenger count takes it back out.
+- **Editing `adults` or `cabin_class` resets `status` to `planning`.** A trip finalised for
+  one adult is not priced for two. An upsert supplying nothing stays inert, because that call
+  is how find-or-create works.
+- **`add_segment` gained a trip-existence check.** Without it a bad `trip_id` wrote a segment
+  row and only failed later at `load_trip`, orphaning it.
+- **Candidate numbers come from a `next_candidate` high-water column**, not `max()` over live
+  rows, which handed a number back as soon as the highest option was dropped.
+- **`itinerary_notes` reports an impossible turnaround separately from a tight one.** The
+  original `(0..TIGHT).contains()` excluded negatives, so an itinerary that departs before it
+  lands produced no note at all.
+- **`calendar_date` returns the reformatted date**, not the trimmed input. chrono accepts
+  `2026-9-3`, and `dates_run_forwards` compares dates as text, where that sorts after
+  `2026-10-01`.
+- **Binding a flight checks the date as well as the route**, inside the same critical section
+  as the write. See the spec for why route alone is not enough.
+- **Task 7's code block omits `use std::time::Instant;`**, which `call()` needs.

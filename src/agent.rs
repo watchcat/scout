@@ -8,6 +8,10 @@ use crate::tools::prices::ComparePricesTool;
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
 use crate::tools::secondhand::{effective_sites, SecondhandSearchTool};
+use crate::tools::trips::{
+    AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
+    DropTripSegmentTool, ShowTripTool,
+};
 use anyhow::Result;
 use rig::client::CompletionClient;
 use rig::providers::openai;
@@ -142,6 +146,20 @@ own search box - so repeat the route, date and price for them to enter, and \
 say the link is single-use and short-lived. Never re-send an old one; ask \
 for a fresh link each time. Without that tool, Scout cannot book at all: \
 give the numbers and let the user buy from the airline.
+- When someone is planning more than one flight — a multi-city route, or a trip \
+they are assembling over several messages — build it with the trip tools \
+rather than holding it in your head. A segment is one direction on one date, \
+so a return is two segments. If they are undecided between flights, park each \
+with add_trip_option and decided=false rather than picking for them; several \
+options may sit on one segment and cost nothing extra. Quote a trip's prices \
+as of when each option was parked, never as a current total: they are stale \
+by construction and only finalising re-prices them. Finalising is the only \
+thing that produces current prices, and it costs a search per segment, so \
+call it when the trip is settled rather than to check on it. Present both \
+totals it returns and never drop the note about separate tickets: a link \
+per segment is a ticket per segment, and the traveller is carrying the risk \
+at every join. If the single-ticket total is missing, say that it is \
+missing — it is not evidence that separate booking is better.
 - If a booking fee is listed below, every flight price you are given \
 ALREADY includes it, and it is what the checkout will charge - quote the \
 numbers unchanged. Say once, in plain words, that prices include that \
@@ -583,7 +601,20 @@ pub fn build_agent(
         .tool(ListRemindersTool { store: d.store.clone(), user_id })
         .tool(CancelReminderTool { store: d.store.clone(), user_id })
         .tool(RememberFactTool { store: d.store.clone(), user_id })
-        .tool(ForgetFactTool { store: d.store.clone(), user_id });
+        .tool(ForgetFactTool { store: d.store.clone(), user_id })
+        // Trip planning. Registered unconditionally: a trip is a plan, and
+        // planning one needs no provider at all. Only finalising does.
+        .tool(AddTripSegmentTool { store: d.store.clone(), user_id })
+        .tool(AddTripOptionTool {
+            store: d.store.clone(),
+            user_id,
+            shown: d.shown.clone(),
+            chat_id,
+        })
+        .tool(ChooseTripOptionTool { store: d.store.clone(), user_id })
+        .tool(ShowTripTool { store: d.store.clone(), user_id })
+        .tool(DropTripSegmentTool { store: d.store.clone(), user_id })
+        .tool(DeleteTripTool { store: d.store.clone(), user_id });
     // Offered only when configured, so the model never sees a tool that
     // cannot work.
     if let Some(bol) = &d.bol {
@@ -598,8 +629,10 @@ pub fn build_agent(
             store: d.store.clone(),
             user_id,
             // One allowance and one memo per user request, like the search
-            // budget above.
-            budget: flights,
+            // budget above. Cloned, not moved: finalise_trip below shares
+            // this same allowance, so a request that searches and then
+            // finalises draws on one cap rather than two.
+            budget: flights.clone(),
             // Outlives the request: booking happens a turn later, when the
             // memo above is gone.
             shown: d.shown.clone(),
@@ -626,6 +659,28 @@ pub fn build_agent(
                 chat_id,
             });
         }
+        builder = builder.tool(crate::tools::trips::FinaliseTripTool {
+            store: d.store.clone(),
+            user_id,
+            duffel: d.duffel.clone(),
+            // Same wrapper as FlightSearchTool above, and for the same
+            // reason: finalising re-prices every segment through
+            // IgnavClient::search, which reads self.market, so an
+            // unwrapped client would silently re-price a Dutch traveller's
+            // trip in Ignav's default US market. Safe to reuse for booking
+            // links too — IgnavClient::booking_links hardcodes its request
+            // to {"ignav_id": ...} and never reads the market, since the id
+            // already carries it.
+            ignav: d
+                .ignav
+                .clone()
+                .map(|c| match fare_market(facts) {
+                    Some(market) => c.with_market(&market),
+                    None => c,
+                }),
+            // The same allowance the search tool got: one request, one cap.
+            budget: flights.clone(),
+        });
     }
     // Duffel's hosted checkout: needs Duffel itself, Links enabled on the
     // account, and somewhere to send people back to. Registering it

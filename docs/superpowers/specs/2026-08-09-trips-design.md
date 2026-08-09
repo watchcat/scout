@@ -125,6 +125,16 @@ setting one inside a single `Store` method: the connection is behind one
 mutex, so that method is atomic by construction, the same property the
 finalisation refusals rely on.
 
+**Candidate numbers are handed out from a per-segment counter and never
+taken back.** The obvious implementation — one more than the highest number
+currently on the segment — recycles a number the moment the highest option
+is dropped, and the number is precisely what a later "go with option 2"
+refers to. Somebody shown two options, who drops the second and adds
+another, would be given a different flight under a name they already had an
+opinion about, with nothing signalling the substitution. So the counter
+lives on the segment row, rises only, and travels with the segment through
+position shifts.
+
 `UNIQUE (user_id, name_key)` is enforced by DuckDB — verified against 1.4.5
 before relying on it — so a duplicate name is a constraint violation rather
 than a check somebody can forget to write.
@@ -150,10 +160,15 @@ the trip back, so a change to either is visible in the reply rather than
 discovered at finalisation.
 
 `status` is `planning` until `finalise_trip` succeeds, and returns to
-`planning` the moment any segment changes: the prices it was finalised at
-stopped describing the trip when the trip stopped being that trip. It is a
-label on what has been priced, not a lock — a finalised trip stays fully
-editable.
+`planning` on any edit that changes what would be priced: a segment, its
+options, the passenger count, or the cabin. The prices it was finalised at
+stopped describing the trip when the trip stopped being that trip, and a
+trip priced for one adult is not priced for two. It is a label on what has
+been priced, not a lock — a finalised trip stays fully editable.
+
+An upsert that supplies no new values changes nothing and must not reset
+anything: that call is how find-or-create works, and making it destructive
+would mean merely naming a trip un-priced it.
 
 `quoted_price` and `quoted_at` are never overwritten by finalisation. They
 mean "what this cost when you chose it", and refreshing them would make the
@@ -180,6 +195,14 @@ trades that for a model choosing wrongly between modes.
   defaults to true and also marks the candidate chosen, so the ordinary
   "this is the flight" path is still one call; `decided: false` is "keep
   this one in the running".
+  A flight must match the segment it is bound to on **origin, destination
+  and date**. Route alone is not enough: airlines reuse flight numbers day
+  to day, so a flight parked against the wrong date does not merely fail to
+  re-price — at finalisation it can match a different aircraft carrying the
+  same number, and price that instead. The check happens inside the same
+  critical section as the write, because a position shift between validating
+  and writing would otherwise land a validated candidate on a segment that
+  is no longer the one that was checked.
 - **`choose_trip_option`** `{ trip, position, candidate }`
   Settles a segment later, by candidate number. It exists because deciding
   happens after the offer that produced the option has expired, so there is
@@ -302,6 +325,13 @@ trip lists per-segment prices and says there is no total because the
 segments are priced in different currencies — inventing a rate to force one
 number would be the same class of error as the model doing arithmetic on
 local times.
+
+The currency checked is the one attached to **today's** price, not the one
+recorded when the option was parked. The sum is of current prices, so
+labelling it with a stale currency would be asserting something the
+arithmetic does not support — and a segment carrying a price with no
+currency at all is refused rather than quietly folded into a total that
+then names a currency it never had.
 
 ## Budget
 

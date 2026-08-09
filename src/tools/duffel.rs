@@ -239,47 +239,12 @@ impl FlightSearchTool {
             return (day, Ok(flights));
         }
 
-        // Whichever providers are configured answer the same day at once.
-        // Separate bills, but one search as far as the traveller and the
-        // allowance are concerned.
-        let (duffel, ignav) = futures::future::join(
-            async {
-                match &self.duffel {
-                    Some(client) => Some(client.search(&day).await),
-                    None => None,
-                }
-            },
-            async {
-                match &self.ignav {
-                    Some(client) => Some(client.search(&day).await),
-                    None => None,
-                }
-            },
-        )
-        .await;
+        let found = merged_search(self.duffel.as_ref(), self.ignav.as_ref(), &day).await;
         self.note_search().await;
-
-        // One provider failing must not lose the other's answer; only
-        // every configured provider failing is a failed search.
-        let mut flights = Vec::new();
-        let mut failure = None;
-        let duffel = duffel.map(|r| r.map_err(|e| e.to_string()));
-        let ignav = ignav.map(|r| r.map_err(|e| e.to_string()));
-        for (name, result) in [("duffel", duffel), ("ignav", ignav)] {
-            match result {
-                Some(Ok(found)) => flights.extend(found),
-                Some(Err(e)) => {
-                    tracing::warn!(error = %e, provider = name, "flight provider failed");
-                    failure = Some(DuffelError::Provider(format!("{name}: {e}")));
-                }
-                None => {}
-            }
-        }
-        if flights.is_empty() {
-            if let Some(e) = failure {
-                return (day, Err(e));
-            }
-        }
+        let flights = match found {
+            Ok(flights) => flights,
+            Err(e) => return (day, Err(e)),
+        };
 
         self.budget.remember(key, flights.clone());
         (day, Ok(flights))
@@ -298,6 +263,52 @@ impl FlightSearchTool {
             tracing::warn!(error = %e, "could not record a flight search for /stat");
         }
     }
+}
+
+/// Both configured providers, asked for the same slice at once.
+///
+/// One provider failing must not lose the other's answer; only every
+/// configured provider failing is a failed search. Shared by `search_flights`
+/// and by trip finalisation so a re-price sees what the original search saw.
+pub async fn merged_search(
+    duffel: Option<&DuffelClient>,
+    ignav: Option<&crate::tools::ignav::IgnavClient>,
+    day: &FlightQuery,
+) -> Result<Vec<Flight>, DuffelError> {
+    let (from_duffel, from_ignav) = futures::future::join(
+        async {
+            match duffel {
+                Some(client) => Some(client.search(day).await.map_err(|e| e.to_string())),
+                None => None,
+            }
+        },
+        async {
+            match ignav {
+                Some(client) => Some(client.search(day).await.map_err(|e| e.to_string())),
+                None => None,
+            }
+        },
+    )
+    .await;
+
+    let mut flights = Vec::new();
+    let mut failure = None;
+    for (name, result) in [("duffel", from_duffel), ("ignav", from_ignav)] {
+        match result {
+            Some(Ok(found)) => flights.extend(found),
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, provider = name, "flight provider failed");
+                failure = Some(DuffelError::Provider(format!("{name}: {e}")));
+            }
+            None => {}
+        }
+    }
+    if flights.is_empty() {
+        if let Some(e) = failure {
+            return Err(e);
+        }
+    }
+    Ok(flights)
 }
 
 /// Duffel writes durations as ISO 8601 ("PT2H30M"), including a day part on
@@ -853,6 +864,79 @@ impl FlightQuery {
     }
 }
 
+/// One direction on one date. The unit a trip segment is priced in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Slice {
+    pub origin: String,
+    pub destination: String,
+    pub departure_date: String,
+}
+
+impl Slice {
+    pub fn new(origin: &str, destination: &str, departure_date: &str) -> Self {
+        Self {
+            origin: origin.to_string(),
+            destination: destination.to_string(),
+            departure_date: departure_date.to_string(),
+        }
+    }
+}
+
+/// A whole itinerary priced as a single ticket.
+///
+/// This is the half of finalisation that separate per-segment searches
+/// cannot answer: connections on one ticket are protected, and the fare is
+/// often not the sum of its parts in either direction.
+#[derive(Debug, Clone)]
+pub struct MultiCityQuery {
+    pub slices: Vec<Slice>,
+    pub adults: u32,
+    pub cabin_class: Option<String>,
+}
+
+impl MultiCityQuery {
+    pub fn validate(&self) -> Result<(), DuffelError> {
+        if self.slices.len() < 2 {
+            return Err(DuffelError::Invalid(
+                "a single-ticket comparison needs at least two slices; one is an ordinary search"
+                    .to_string(),
+            ));
+        }
+        for slice in &self.slices {
+            let origin = iata_code("origin", &slice.origin)?;
+            let destination = iata_code("destination", &slice.destination)?;
+            if origin == destination {
+                return Err(DuffelError::Invalid(format!(
+                    "a slice leaves and arrives at {origin}"
+                )));
+            }
+            calendar_date("departure_date", &slice.departure_date)?;
+        }
+        Ok(())
+    }
+
+    pub fn body(&self) -> serde_json::Value {
+        let slices: Vec<serde_json::Value> = self
+            .slices
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "origin": s.origin.trim().to_ascii_uppercase(),
+                    "destination": s.destination.trim().to_ascii_uppercase(),
+                    "departure_date": s.departure_date.trim(),
+                })
+            })
+            .collect();
+        let passengers: Vec<serde_json::Value> =
+            (0..self.adults.max(1)).map(|_| serde_json::json!({"type": "adult"})).collect();
+        let mut data = serde_json::json!({"slices": slices, "passengers": passengers});
+        if let Some(cabin) = &self.cabin_class {
+            data["cabin_class"] = serde_json::json!(cabin.trim().to_ascii_lowercase());
+        }
+        serde_json::json!({"data": data})
+    }
+}
+
 /// Duffel offer-request client. Search only — it has no method that books.
 #[derive(Clone)]
 pub struct DuffelClient {
@@ -931,6 +1015,22 @@ impl DuffelClient {
         // Checked before the request, not after: Duffel bills per search, so
         // a call the model got wrong should cost nothing.
         query.validate()?;
+        self.offer_request(query.body()).await
+    }
+
+    /// The whole itinerary as one ticket.
+    pub async fn search_multi_city(
+        &self,
+        query: &MultiCityQuery,
+    ) -> Result<Vec<Flight>, DuffelError> {
+        query.validate()?;
+        self.offer_request(query.body()).await
+    }
+
+    /// `POST /air/offer_requests` for any body. Shared so a one-way, a
+    /// return and a multi-city trip cannot drift apart in how they are sent
+    /// or how their prices get the markup applied.
+    async fn offer_request(&self, body: serde_json::Value) -> Result<Vec<Flight>, DuffelError> {
         let resp = self
             .http
             .post(format!("{}/air/offer_requests", self.base_url))
@@ -940,7 +1040,7 @@ impl DuffelClient {
             // Without this the offers arrive empty and each search needs a
             // second round trip to be worth anything.
             .query(&[("return_offers", "true")])
-            .json(&query.body())
+            .json(&body)
             .send()
             .await?;
         let status = resp.status();
@@ -1590,7 +1690,12 @@ fn provider(source: Source) -> &'static str {
 
 /// The currency most offers are priced in. Ties keep the one seen first, so
 /// the same response always ranks the same way.
-fn dominant_currency(flights: &[Flight]) -> Option<String> {
+///
+/// `pub(crate)` rather than private: trip finalisation reuses this to pick a
+/// currency to report a single-ticket price in, for the same reason `rank`
+/// needs it here — a mixed-currency response must not be reduced to a global
+/// minimum, which would just reward whichever unit happens to be smallest.
+pub(crate) fn dominant_currency(flights: &[Flight]) -> Option<String> {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for f in flights {
         match counts.iter_mut().find(|(c, _)| *c == f.currency) {
@@ -2621,6 +2726,50 @@ mod tests {
             q.cabin_class = Some(real.to_string());
             q.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn a_multi_city_request_carries_every_slice_in_one_offer_request() {
+        // One request, so the airlines can build it as a single fare with
+        // protected connections. Four separate requests cannot produce that
+        // answer no matter how they are added up.
+        let query = MultiCityQuery {
+            slices: vec![
+                Slice::new("AMS", "LIS", "2026-09-03"),
+                Slice::new("LIS", "FCO", "2026-09-07"),
+                Slice::new("FCO", "AMS", "2026-09-12"),
+            ],
+            adults: 2,
+            cabin_class: Some("business".to_string()),
+        };
+        let body = query.body();
+        let slices = body["data"]["slices"].as_array().unwrap();
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[1]["origin"], "LIS");
+        assert_eq!(slices[1]["destination"], "FCO");
+        assert_eq!(slices[2]["departure_date"], "2026-09-12");
+        assert_eq!(body["data"]["passengers"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"]["cabin_class"], "business");
+    }
+
+    #[test]
+    fn a_multi_city_request_needs_at_least_two_slices() {
+        // One slice is an ordinary search, and sending it here would bill a
+        // second time for an answer already in hand.
+        let query = MultiCityQuery {
+            slices: vec![Slice::new("AMS", "LIS", "2026-09-03")],
+            adults: 1,
+            cabin_class: None,
+        };
+        assert!(query.validate().is_err());
+
+        let bad = MultiCityQuery {
+            slices: vec![Slice::new("Amsterdam", "LIS", "2026-09-03"), Slice::new("LIS", "AMS", "2026-09-07")],
+            adults: 1,
+            cabin_class: None,
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("IATA"), "got: {err}");
     }
 }
 

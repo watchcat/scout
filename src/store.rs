@@ -798,6 +798,25 @@ impl Store {
         touch(&conn, trip_id)?;
         load_trip(&conn, trip_id)
     }
+
+    /// False when there was no such trip. Deleting something already gone is
+    /// the state the caller wanted, not a failure.
+    pub fn delete_trip(&self, user_id: i64, name: &str) -> Result<bool> {
+        let key = name.trim().to_lowercase();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id FROM trips WHERE user_id = ? AND name_key = ?")?;
+        let mut ids = stmt.query_map(params![user_id, key], |row| row.get::<_, i64>(0))?;
+        let Some(id) = ids.next().transpose()? else {
+            return Ok(false);
+        };
+        drop(ids);
+        drop(stmt);
+        conn.execute("DELETE FROM segment_candidates WHERE trip_id = ?", params![id])?;
+        conn.execute("DELETE FROM trip_segments WHERE trip_id = ?", params![id])?;
+        conn.execute("DELETE FROM trips WHERE id = ?", params![id])?;
+        Ok(true)
+    }
 }
 
 /// Clears the position's flags and sets one. "At most one chosen" cannot be
@@ -1539,5 +1558,23 @@ mod tests {
             "this trip has 1 segment, so position 5 is not somewhere to put one",
             "1 segment(s) reads wrong at one"
         );
+    }
+
+    #[test]
+    fn deleting_a_trip_takes_its_segments_and_options_with_it() {
+        // Creating a trip is a side effect of a typo, so a typo needs an undo.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Setpember", None, None).unwrap();
+        let trip = store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
+        store.add_candidate(trip.id, 1, candidate("TAP", "TP675", 118.0), true).unwrap();
+
+        assert!(store.delete_trip(7, "setpember").unwrap());
+        assert!(store.find_trip(7, "Setpember").unwrap().is_none());
+        assert!(!store.delete_trip(7, "Setpember").unwrap(), "deleting twice is not an error");
+
+        // Another user's trip of the same name is untouched.
+        store.upsert_trip(8, "Setpember", None, None).unwrap();
+        assert!(!store.delete_trip(7, "Setpember").unwrap());
+        assert!(store.find_trip(8, "Setpember").unwrap().is_some());
     }
 }

@@ -257,6 +257,27 @@ fn lost_trip_race(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// "none yet", or the traveller's trip names joined for a human to read.
+fn trip_names(store: &Store, user_id: i64) -> anyhow::Result<String> {
+    let names: Vec<String> = store.list_trips(user_id)?.into_iter().map(|t| t.name).collect();
+    Ok(match names.is_empty() {
+        true => "none yet".to_string(),
+        false => names.join(", "),
+    })
+}
+
+/// The named trip, or an error naming the trips that do exist.
+///
+/// The list is the point: a model that mistypes a name can correct itself
+/// from the reply instead of spending another call finding out, or asking
+/// the traveller a question it could have answered.
+fn find_trip_or_list(store: &Store, user_id: i64, name: &str) -> anyhow::Result<Trip> {
+    match store.find_trip(user_id, name)? {
+        Some(trip) => Ok(trip),
+        None => anyhow::bail!("no trip called {name:?}. This traveller has: {}", trip_names(store, user_id)?),
+    }
+}
+
 /// Turns a shown flight into something durable. Everything perishable is
 /// dropped here, the offer id above all: it is the one field that looks
 /// useful and is guaranteed to be wrong later.
@@ -395,9 +416,7 @@ impl Tool for AddTripOptionTool {
         let trip_name = args.trip;
         let decided = args.decided.unwrap_or(true);
         let trip = tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
-            let trip = store
-                .find_trip(user_id, &trip_name)?
-                .ok_or_else(|| anyhow::anyhow!("no trip called {:?}", trip_name))?;
+            let trip = find_trip_or_list(&store, user_id, &trip_name)?;
             let expected = ExpectedSegment {
                 origin: &leg_origin,
                 destination: &leg_destination,
@@ -474,9 +493,7 @@ impl Tool for ChooseTripOptionTool {
         let store = self.store.clone();
         let user_id = self.user_id;
         tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
-            let trip = store
-                .find_trip(user_id, &args.trip)?
-                .ok_or_else(|| anyhow::anyhow!("no trip called {:?}", args.trip))?;
+            let trip = find_trip_or_list(&store, user_id, &args.trip)?;
             store.choose_candidate(trip.id, args.position, args.candidate).map_err(lost_trip_race)
         })
         .await
@@ -531,22 +548,7 @@ impl Tool for ShowTripTool {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Trip>> {
             match &args.trip {
                 None => store.list_trips(user_id),
-                Some(name) => match store.find_trip(user_id, name)? {
-                    Some(trip) => Ok(vec![trip]),
-                    // Naming the real trips is the difference between the
-                    // model correcting itself and it inventing a new one.
-                    None => {
-                        let names: Vec<String> =
-                            store.list_trips(user_id)?.into_iter().map(|t| t.name).collect();
-                        anyhow::bail!(
-                            "no trip called {name:?}. This traveller has: {}",
-                            match names.is_empty() {
-                                true => "none yet".to_string(),
-                                false => names.join(", "),
-                            }
-                        )
-                    }
-                },
+                Some(name) => find_trip_or_list(&store, user_id, name).map(|trip| vec![trip]),
             }
         })
         .await
@@ -599,9 +601,7 @@ impl Tool for DropTripSegmentTool {
         let store = self.store.clone();
         let user_id = self.user_id;
         tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
-            let trip = store
-                .find_trip(user_id, &args.trip)?
-                .ok_or_else(|| anyhow::anyhow!("no trip called {:?}", args.trip))?;
+            let trip = find_trip_or_list(&store, user_id, &args.trip)?;
             match args.candidate {
                 Some(candidate) => store.drop_candidate(trip.id, args.position, candidate),
                 None => store.drop_segment(trip.id, args.position),
@@ -623,6 +623,12 @@ pub struct DeleteTripArgs {
 pub struct DeleteTripResult {
     pub deleted: bool,
     pub trip: String,
+    /// The traveller's real trip names, filled in only when nothing was
+    /// deleted. Not an error - deleting something already gone is the
+    /// state the caller wanted - but a mistyped name still needs
+    /// somewhere to go. Same convention as `TripView::notes`: empty when
+    /// there is nothing to add.
+    pub notes: Vec<String>,
 }
 
 pub struct DeleteTripTool {
@@ -654,11 +660,24 @@ impl Tool for DeleteTripTool {
         let store = self.store.clone();
         let user_id = self.user_id;
         let name = args.trip.clone();
-        tokio::task::spawn_blocking(move || store.delete_trip(user_id, &args.trip))
-            .await
-            .map_err(internal)?
-            .map(|deleted| DeleteTripResult { deleted, trip: name })
-            .map_err(internal)
+        tokio::task::spawn_blocking(move || -> anyhow::Result<DeleteTripResult> {
+            let deleted = store.delete_trip(user_id, &args.trip)?;
+            let notes = match deleted {
+                true => Vec::new(),
+                // A mistyped name is indistinguishable here from one
+                // already deleted, so both get the same real names to
+                // correct against rather than a silent no-op.
+                false => vec![format!(
+                    "nothing called {:?} to delete. This traveller has: {}",
+                    args.trip,
+                    trip_names(&store, user_id)?
+                )],
+            };
+            Ok(DeleteTripResult { deleted, trip: name, notes })
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)
     }
 }
 
@@ -1265,5 +1284,116 @@ mod tests {
         let delete = DeleteTripTool { store: store.clone(), user_id: 7 };
         assert!(delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
         assert!(!delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
+    }
+
+    // The four tests below are the ones that would have caught the spec
+    // clause that shipped unimplemented: every tool that refuses an
+    // unknown trip name must say which ones actually exist, not just that
+    // the given one doesn't. Only `show_trip`'s missing-name path had a
+    // test before this; the other three bailed with a bare "no trip
+    // called X" and nothing checked for the list.
+
+    #[tokio::test]
+    async fn drop_trip_segment_on_an_unknown_name_lists_the_real_ones() {
+        let (store, _d) = setup();
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let drop = DropTripSegmentTool { store, user_id: 7 };
+        let err = drop
+            .call(DropSegmentArgs { trip: "Japen".into(), position: 1, candidate: None })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Japan"), "unknown names list the real ones: {err}");
+    }
+
+    #[tokio::test]
+    async fn choose_trip_option_on_an_unknown_name_lists_the_real_ones() {
+        let (store, _d) = setup();
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let choose = ChooseTripOptionTool { store, user_id: 7 };
+        let err = choose
+            .call(ChooseOptionArgs { trip: "Japen".into(), position: 1, candidate: 1 })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Japan"), "unknown names list the real ones: {err}");
+    }
+
+    #[tokio::test]
+    async fn add_trip_option_on_an_unknown_name_lists_the_real_ones() {
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        // The offer must be a real, shown one so the two guards ahead of
+        // the trip lookup both pass and it is that lookup being tested.
+        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let err = add_opt
+            .call(AddOptionArgs { trip: "Japen".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Japan"), "unknown names list the real ones: {err}");
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unknown_trip_lists_the_real_ones_in_notes() {
+        // Not an error - deleting something already gone is the state the
+        // caller wanted - but a mistyped name still needs somewhere to go.
+        let (store, _d) = setup();
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let delete = DeleteTripTool { store, user_id: 7 };
+        let result = delete.call(DeleteTripArgs { trip: "Japen".into() }).await.unwrap();
+        assert!(!result.deleted);
+        assert!(
+            result.notes.iter().any(|n| n.contains("Japan")),
+            "unknown names list the real ones: {:?}",
+            result.notes
+        );
     }
 }

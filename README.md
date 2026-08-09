@@ -208,7 +208,7 @@ lives in the `scout-data` volume and survives rebuilds.
 ## How it works
 
 ```
-Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 22 tools
+Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 23 tools
                 │                                    │
                 │  streams progress + answer         ├─ search_web        Kagi + Perplexity, merged
                 │  back into one edited message      ├─ search_secondhand eBay / Marktplaats / Vinted
@@ -222,7 +222,8 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 22 tools
                                                      ├─ add_trip_option    │
                                                      ├─ choose_trip_option │  a named multi-city
                                                      ├─ show_trip          ├─ plan, built over many
-                                                     ├─ drop_trip_segment  │  messages
+                                                     ├─ update_trip_segment│  messages
+                                                     ├─ drop_trip_segment  │
                                                      ├─ delete_trip        │
                                                      ├─ finalise_trip     ─┘  re-prices it all *
                                                      ├─ query_purchases   ─┐
@@ -239,7 +240,7 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 22 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **369 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **374 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness.
 
@@ -299,7 +300,7 @@ Roughly 19,500 lines of Rust across a dozen focused modules.
 ## Development
 
 ```bash
-cargo test                  # 369 tests, no network needed
+cargo test                  # 374 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

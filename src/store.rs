@@ -689,6 +689,62 @@ impl Store {
         load_trip(&conn, trip_id)
     }
 
+    /// Changes where or when one segment goes, leaving the rest alone.
+    ///
+    /// Returns the trip and how many parked options were dropped by the
+    /// change. They have to go: an option is a flight on a particular route
+    /// and day, and `add_candidate` would refuse to attach it to these
+    /// values now for exactly that reason. Reporting the count is what stops
+    /// them vanishing silently.
+    ///
+    /// A change that changes nothing keeps them — restating a date must not
+    /// cost the traveller their shortlist.
+    pub fn update_segment(
+        &self,
+        trip_id: i64,
+        position: i64,
+        origin: Option<&str>,
+        destination: Option<&str>,
+        departure_date: Option<&str>,
+    ) -> Result<(Trip, usize)> {
+        let conn = self.conn.lock().unwrap();
+        let current = conn
+            .query_row(
+                "SELECT origin, destination, departure_date FROM trip_segments
+                 WHERE trip_id = ? AND position = ?",
+                params![trip_id, position],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("this trip has no segment {position}"))?;
+
+        let wanted = (
+            origin.unwrap_or(&current.0).to_string(),
+            destination.unwrap_or(&current.1).to_string(),
+            departure_date.unwrap_or(&current.2).to_string(),
+        );
+        if wanted == current {
+            return Ok((load_trip(&conn, trip_id)?, 0));
+        }
+
+        conn.execute(
+            "UPDATE trip_segments SET origin = ?, destination = ?, departure_date = ?
+             WHERE trip_id = ? AND position = ?",
+            params![wanted.0, wanted.1, wanted.2, trip_id, position],
+        )?;
+        let dropped = conn.execute(
+            "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ?",
+            params![trip_id, position],
+        )?;
+        touch(&conn, trip_id)?;
+        Ok((load_trip(&conn, trip_id)?, dropped))
+    }
+
     pub fn drop_segment(&self, trip_id: i64, position: i64) -> Result<Trip> {
         let conn = self.conn.lock().unwrap();
         let removed = conn.execute(
@@ -1785,6 +1841,69 @@ mod tests {
 
         let err = store.choose_candidate(trip.id, 1, 1).unwrap_err();
         assert_eq!(err.to_string(), "no such trip", "a deleted trip must not read as a bad option number");
+    }
+
+    #[test]
+    fn moving_a_segment_to_another_date_drops_the_options_it_invalidates() {
+        // "Make it the 26th" is the commonest edit there is, and without it
+        // the only way to honour one was to delete the trip and rebuild —
+        // which is exactly what happened in production.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.add_segment(trip.id, None, "HND", "AMS", "2026-09-27").unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment {
+                    origin: "HND",
+                    destination: "AMS",
+                    departure_date: Some("2026-09-27"),
+                },
+                candidate("China Southern", "CZ324,CZ307", 408.69),
+                true,
+            )
+            .unwrap();
+
+        let (trip, dropped) =
+            store.update_segment(trip.id, 1, None, None, Some("2026-09-26")).unwrap();
+        assert_eq!(trip.segments[0].departure_date, "2026-09-26");
+        assert_eq!(dropped, 1, "an option for the 27th is not an option for the 26th");
+        assert!(
+            trip.segments[0].candidates.is_empty(),
+            "keeping it would leave a flight bound to a day it does not fly"
+        );
+        assert_eq!(trip.segments[0].origin, "HND", "what was not asked for does not change");
+    }
+
+    #[test]
+    fn a_segment_edit_that_changes_nothing_keeps_the_options() {
+        // Restating the same date must not throw away work, the same way an
+        // upsert that supplies nothing leaves a trip alone.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.add_segment(trip.id, None, "HND", "AMS", "2026-09-27").unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment {
+                    origin: "HND",
+                    destination: "AMS",
+                    departure_date: Some("2026-09-27"),
+                },
+                candidate("China Southern", "CZ324,CZ307", 408.69),
+                true,
+            )
+            .unwrap();
+
+        let (trip, dropped) =
+            store.update_segment(trip.id, 1, Some("HND"), None, Some("2026-09-27")).unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(trip.segments[0].candidates.len(), 1, "nothing changed, so nothing is lost");
+
+        // And a position that does not exist is refused rather than ignored.
+        assert!(store.update_segment(trip.id, 9, None, None, Some("2026-09-26")).is_err());
     }
 
     #[test]

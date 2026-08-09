@@ -1131,6 +1131,100 @@ pub struct DropSegmentArgs {
     pub candidate: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateSegmentArgs {
+    pub trip: String,
+    pub position: i64,
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub destination: Option<String>,
+    #[serde(default)]
+    pub departure_date: Option<String>,
+}
+
+pub struct UpdateTripSegmentTool {
+    pub store: Store,
+    pub user_id: i64,
+}
+
+impl Tool for UpdateTripSegmentTool {
+    const NAME: &'static str = "update_trip_segment";
+    type Error = StoreToolError;
+    type Args = UpdateSegmentArgs;
+    type Output = TripView;
+
+    fn description(&self) -> String {
+        "Change one segment's date, origin or destination, leaving the rest of \
+         the trip alone. This is how you honour \"make it the 26th\" or \"fly \
+         out of Narita instead\" — do NOT delete the trip and rebuild it, and \
+         do not drop and re-add the segment, which renumbers everything after \
+         it. Options parked on that segment are dropped, because a flight on \
+         the old date is not a flight on the new one; the reply says how many \
+         went so you can tell the traveller."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "trip": {"type": "string", "description": "the trip's name"},
+                "position": {"type": "integer", "description": "which segment, 1-based"},
+                "origin": {"type": "string", "description": "new 3-letter IATA code; omit to leave it"},
+                "destination": {"type": "string", "description": "new 3-letter IATA code; omit to leave it"},
+                "departure_date": {"type": "string", "description": "new YYYY-MM-DD; omit to leave it"}
+            },
+            "required": ["trip", "position"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Validated before anything is written, as in add_trip_segment: a
+        // mistyped code must not half-edit a trip.
+        let origin = args.origin.as_deref().map(|o| iata("origin", o)).transpose()?;
+        let destination =
+            args.destination.as_deref().map(|d| iata("destination", d)).transpose()?;
+        let date = args.departure_date.as_deref().map(calendar_date).transpose()?;
+        if origin.is_none() && destination.is_none() && date.is_none() {
+            return Err(StoreToolError(
+                "say what to change: origin, destination or departure_date".to_string(),
+            ));
+        }
+
+        let store = self.store.clone();
+        let user_id = self.user_id;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(Trip, usize)> {
+            let trip = find_trip_or_list(&store, user_id, &args.trip)?;
+            store
+                .update_segment(
+                    trip.id,
+                    args.position,
+                    origin.as_deref(),
+                    destination.as_deref(),
+                    date.as_deref(),
+                )
+                .map_err(lost_trip_race)
+        })
+        .await
+        .map_err(internal)?
+        .map(|(trip, dropped)| {
+            let mut view = TripView::of(trip);
+            if dropped > 0 {
+                // Said out loud rather than left for the traveller to notice
+                // a shortlist had quietly emptied.
+                view.notes.push(format!(
+                    "segment {} moved, so {dropped} option(s) parked on it were dropped — \
+                     they were flights for the old route or date. Search again to refill it.",
+                    args.position
+                ));
+            }
+            view
+        })
+        .map_err(internal)
+    }
+}
+
 pub struct DropTripSegmentTool {
     pub store: Store,
     pub user_id: i64,
@@ -1786,6 +1880,89 @@ mod tests {
 
         let missing = show.call(ShowTripArgs { trip: Some("Peru".into()) }).await.unwrap_err();
         assert!(missing.to_string().contains("Japan direct"), "unknown names list the real ones: {missing}");
+    }
+
+    #[tokio::test]
+    async fn a_date_change_edits_the_segment_instead_of_rebuilding_the_trip() {
+        // What production did instead: with no way to change a date, the
+        // model deleted the trip and built it again from scratch. Every
+        // option on every other segment went with it.
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "HND", "AMS", "2026-09-27", &["CZ324"])], Instant::now());
+        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        for (o, d, date) in [("AMS", "HKG", "2026-09-15"), ("HND", "AMS", "2026-09-27")] {
+            add.call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: o.into(),
+                destination: d.into(),
+                departure_date: date.into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        }
+        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 2,
+                offer_id: "a".into(),
+                decided: None,
+            })
+            .await
+            .unwrap();
+
+        let update = UpdateTripSegmentTool { store: store.clone(), user_id: 7 };
+        let view = update
+            .call(UpdateSegmentArgs {
+                trip: "Japan".into(),
+                position: 2,
+                origin: None,
+                destination: None,
+                departure_date: Some("2026-09-26".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(view.trip.segments.len(), 2, "the trip is edited, not rebuilt");
+        assert_eq!(view.trip.segments[0].departure_date, "2026-09-15", "leg 1 is untouched");
+        assert_eq!(view.trip.segments[1].departure_date, "2026-09-26");
+        assert!(view.trip.segments[1].candidates.is_empty());
+        assert!(
+            view.notes.iter().any(|n| n.contains("dropped")),
+            "a shortlist must not empty silently: {:?}",
+            view.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_naming_nothing_to_change_is_refused() {
+        let (store, _d) = setup();
+        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "HKG".into(),
+                departure_date: "2026-09-15".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let err = UpdateTripSegmentTool { store, user_id: 7 }
+            .call(UpdateSegmentArgs {
+                trip: "Japan".into(),
+                position: 1,
+                origin: None,
+                destination: None,
+                departure_date: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("say what to change"), "got: {err}");
     }
 
     #[tokio::test]

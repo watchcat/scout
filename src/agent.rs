@@ -10,7 +10,7 @@ use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemind
 use crate::tools::secondhand::{effective_sites, SecondhandSearchTool};
 use crate::tools::trips::{
     AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
-    DropTripSegmentTool, ShowTripTool,
+    DropTripSegmentTool, ShowTripTool, UpdateTripSegmentTool,
 };
 use anyhow::Result;
 use rig::client::CompletionClient;
@@ -153,9 +153,12 @@ reply you propose it in: call add_trip_segment for each leg the moment you \
 have a route and a date, and add_trip_option for each flight you found, \
 before you ask them to confirm anything. Do not wait for approval to record \
 a plan — approval is what finalise_trip is for, and a plan you are still \
-holding in your head is one that is gone by the next message. If they change \
-a date or a leg afterwards, edit the trip; that is cheaper than rebuilding \
-it and it is why the trip exists. A segment is one direction on one date, \
+holding in your head is one that is gone by the next message. When they \
+change a date or a leg afterwards, call update_trip_segment on that one \
+segment. NEVER delete the trip and build it again, and never drop and re-add \
+a segment to change it: both throw away every option parked on every other \
+segment, and dropping renumbers everything after it so your next call lands \
+on the wrong leg. A segment is one direction on one date, \
 so a return is two segments. If they are undecided between flights, park each \
 with add_trip_option and decided=false rather than picking for them; several \
 options may sit on one segment and cost nothing extra. Quote a trip's prices \
@@ -620,6 +623,7 @@ pub fn build_agent(
         })
         .tool(ChooseTripOptionTool { store: d.store.clone(), user_id })
         .tool(ShowTripTool { store: d.store.clone(), user_id })
+        .tool(UpdateTripSegmentTool { store: d.store.clone(), user_id })
         .tool(DropTripSegmentTool { store: d.store.clone(), user_id })
         .tool(DeleteTripTool { store: d.store.clone(), user_id });
     // Offered only when configured, so the model never sees a tool that

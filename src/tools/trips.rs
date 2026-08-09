@@ -5,11 +5,15 @@
 //! outlives the conversation that made it, so a trip holds the itinerary —
 //! airports, dates, flight numbers — and finalisation re-prices it.
 
-use crate::store::{Store, Trip, TripCandidate, TripSegment};
+use crate::store::{NewCandidate, Store, Trip, TripCandidate, TripSegment};
+use crate::tools::duffel::{Flight, Source};
 use crate::tools::purchases::{internal, StoreToolError};
+use crate::tools::shown::ShownFlights;
 use rig::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
+use std::time::Instant;
 
 /// Less than this between landing and the next departure is the shape of an
 /// itinerary somebody misses.
@@ -252,11 +256,214 @@ fn lost_trip_race(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Turns a shown flight into something durable. Everything perishable is
+/// dropped here, the offer id above all: it is the one field that looks
+/// useful and is guaranteed to be wrong later.
+fn candidate_from(flight: &Flight) -> NewCandidate {
+    NewCandidate {
+        airline: flight.airline.clone(),
+        flight_numbers: flight
+            .legs
+            .iter()
+            .flat_map(|leg| leg.flights.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(","),
+        itinerary: flight
+            .legs
+            .iter()
+            .map(|leg| leg.itinerary.clone())
+            .collect::<Vec<_>>()
+            .join(" / "),
+        departing_at_local: flight.legs.first().map(|l| l.departing_at_local.clone()),
+        arriving_at_local: flight.legs.last().map(|l| l.arriving_at_local.clone()),
+        duration_minutes: flight.total_minutes.map(i64::from),
+        quoted_price: Some(flight.price),
+        quoted_currency: Some(flight.currency.clone()),
+        source: Some(
+            match flight.source {
+                Source::Duffel => "duffel",
+                Source::Ignav => "ignav",
+            }
+            .to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddOptionArgs {
+    pub trip: String,
+    pub position: i64,
+    pub offer_id: String,
+    /// Defaults to true: "this is the flight" must not need a second call.
+    #[serde(default)]
+    pub decided: Option<bool>,
+}
+
+pub struct AddTripOptionTool {
+    pub store: Store,
+    pub user_id: i64,
+    /// What this chat was shown, so an invented id costs nothing to refuse.
+    pub shown: Arc<ShownFlights>,
+    pub chat_id: i64,
+}
+
+impl Tool for AddTripOptionTool {
+    const NAME: &'static str = "add_trip_option";
+    type Error = StoreToolError;
+    type Args = AddOptionArgs;
+    type Output = TripView;
+
+    fn description(&self) -> String {
+        "Attach a flight from a recent search_flights result to one segment of \
+         a trip. Pass decided=false to keep it as an option the traveller has \
+         not settled on yet — several options may sit on one segment, and \
+         choose_trip_option picks between them later. The offer_id must come \
+         from a search in this conversation."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "trip": {"type": "string", "description": "the trip's name"},
+                "position": {"type": "integer", "description": "which segment, 1-based"},
+                "offer_id": {"type": "string", "description": "offer_id from a search_flights result in this conversation"},
+                "decided": {"type": "boolean", "description": "false to park it as an undecided option; default true"}
+            },
+            "required": ["trip", "position", "offer_id"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Guard 1: the offer must be one this chat was actually shown. A
+        // model carrying a 32-character id across a turn is the invented-id
+        // problem again, and a made-up one otherwise costs a paid lookup to
+        // discover. Chat-scoped, too — otherwise one household member could
+        // bind a flight from another's search.
+        let flight = self.shown.find(self.chat_id, &args.offer_id, Instant::now()).ok_or_else(
+            || {
+                let ids = self.shown.offer_ids(self.chat_id, Instant::now());
+                StoreToolError(format!(
+                    "{:?} was not shown in this conversation, so it cannot be added. \
+                     Search first, then use one of these offer_ids: {}",
+                    args.offer_id,
+                    match ids.is_empty() {
+                        true => "(nothing has been searched yet)".to_string(),
+                        false => ids.join(", "),
+                    }
+                ))
+            },
+        )?;
+
+        // Guard 2: a segment is one direction on one date. A return offer
+        // has two legs, and binding it here would price the return twice
+        // and misdescribe the trip.
+        if flight.legs.len() != 1 {
+            return Err(StoreToolError(format!(
+                "that offer is a return with {} legs, and a trip segment is one direction. \
+                 Add each direction as its own segment and pick a one-way for each.",
+                flight.legs.len()
+            )));
+        }
+        let leg = &flight.legs[0];
+        let candidate = candidate_from(&flight);
+
+        let store = self.store.clone();
+        let user_id = self.user_id;
+        let (leg_origin, leg_destination) = (leg.origin.clone(), leg.destination.clone());
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
+            let trip = store
+                .find_trip(user_id, &args.trip)?
+                .ok_or_else(|| anyhow::anyhow!("no trip called {:?}", args.trip))?;
+            let segment = trip
+                .segments
+                .iter()
+                .find(|s| s.position == args.position)
+                .ok_or_else(|| anyhow::anyhow!("this trip has no segment {}", args.position))?;
+            // Guard 3: nothing else stops an AMS→LIS offer being attached
+            // to an AMS→NRT segment, and it would then be re-priced against
+            // the wrong route at finalisation.
+            if segment.origin != leg_origin || segment.destination != leg_destination {
+                anyhow::bail!(
+                    "segment {} is {}→{} but that flight is {leg_origin}→{leg_destination}",
+                    segment.position,
+                    segment.origin,
+                    segment.destination
+                );
+            }
+            store.add_candidate(trip.id, args.position, candidate, args.decided.unwrap_or(true))
+        })
+        .await
+        .map_err(internal)?
+        .map(TripView::of)
+        .map_err(internal)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChooseOptionArgs {
+    pub trip: String,
+    pub position: i64,
+    pub candidate: i64,
+}
+
+pub struct ChooseTripOptionTool {
+    pub store: Store,
+    pub user_id: i64,
+}
+
+impl Tool for ChooseTripOptionTool {
+    const NAME: &'static str = "choose_trip_option";
+    type Error = StoreToolError;
+    type Args = ChooseOptionArgs;
+    type Output = TripView;
+
+    fn description(&self) -> String {
+        "Settle which of a segment's parked options the traveller is taking, \
+         by its option number as shown by show_trip. Use this when they decide \
+         later — by then the offer that produced the option has expired, so \
+         there is no offer_id left to name it by."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "trip": {"type": "string", "description": "the trip's name"},
+                "position": {"type": "integer", "description": "which segment, 1-based"},
+                "candidate": {"type": "integer", "description": "which option on that segment, as numbered by show_trip"}
+            },
+            "required": ["trip", "position", "candidate"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let store = self.store.clone();
+        let user_id = self.user_id;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
+            let trip = store
+                .find_trip(user_id, &args.trip)?
+                .ok_or_else(|| anyhow::anyhow!("no trip called {:?}", args.trip))?;
+            store.choose_candidate(trip.id, args.position, args.candidate)
+        })
+        .await
+        .map_err(internal)?
+        .map(TripView::of)
+        .map_err(internal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{Store, TripCandidate, TripSegment};
+    use crate::tools::duffel::{Flight, Leg, PriceStatus, Source};
+    use crate::tools::shown::ShownFlights;
     use rig::tool::Tool;
+    use std::sync::Arc;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     fn setup() -> (Store, TempDir) {
@@ -480,5 +687,198 @@ mod tests {
             segment(2, "LIS", "FCO", "2026-09-03"),
         ];
         assert!(dates_run_forwards(&same_day).is_ok());
+    }
+
+    fn one_way(id: &str, origin: &str, destination: &str, date: &str, numbers: &[&str]) -> Flight {
+        Flight {
+            offer_id: id.to_string(),
+            source: Source::Duffel,
+            price_status: PriceStatus::Bookable,
+            self_transfer: false,
+            airline: "KLM".to_string(),
+            price: 940.0,
+            currency: "EUR".to_string(),
+            legs: vec![Leg {
+                origin: origin.to_string(),
+                destination: destination.to_string(),
+                departing_at_local: format!("{date}T10:05:00"),
+                arriving_at_local: format!("{date}T12:15:00"),
+                duration_minutes: Some(130),
+                duration: Some("2h 10m".to_string()),
+                stops: 0,
+                flights: numbers.iter().map(|s| s.to_string()).collect(),
+                connections: Vec::new(),
+                itinerary: format!("{origin} 10:05 ✈ {destination} 12:15"),
+            }],
+            total_minutes: Some(130),
+            total_duration: Some("2h 10m".to_string()),
+            checked_bags: Some(1),
+            carry_on_bags: Some(1),
+            expires_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn two_options_can_sit_on_one_segment_until_a_choice_is_made() {
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(
+            99,
+            vec![
+                one_way("nonstop", "AMS", "NRT", "2026-09-03", &["KL861"]),
+                one_way("via-hkg", "AMS", "NRT", "2026-09-03", &["CX270", "CX500"]),
+            ],
+            Instant::now(),
+        );
+        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let add_opt =
+            AddTripOptionTool { store: store.clone(), user_id: 7, shown: shown.clone(), chat_id: 99 };
+        for id in ["nonstop", "via-hkg"] {
+            add_opt
+                .call(AddOptionArgs {
+                    trip: "Japan".into(),
+                    position: 1,
+                    offer_id: id.into(),
+                    decided: Some(false),
+                })
+                .await
+                .unwrap();
+        }
+        let view = add_opt
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "nonstop".into(),
+                decided: Some(false),
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.trip.segments[0].candidates.len(), 3, "the same flight may be parked twice");
+        assert_eq!(view.trip.segments[0].candidates[1].flight_numbers, "CX270,CX500");
+        assert!(view.trip.segments[0].candidates.iter().all(|c| !c.chosen));
+
+        let choose = ChooseTripOptionTool { store: store.clone(), user_id: 7 };
+        let view = choose
+            .call(ChooseOptionArgs { trip: "Japan".into(), position: 1, candidate: 2 })
+            .await
+            .unwrap();
+        assert!(view.trip.segments[0].candidates[1].chosen);
+    }
+
+    #[tokio::test]
+    async fn a_flight_this_chat_was_not_shown_is_refused_without_touching_the_trip() {
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("real", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        // Another chat's tool, holding the same store.
+        let elsewhere =
+            AddTripOptionTool { store: store.clone(), user_id: 7, shown: shown.clone(), chat_id: 12 };
+        let err = elsewhere
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "real".into(),
+                decided: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("was not shown"), "got: {err}");
+        assert!(store.find_trip(7, "Japan").unwrap().unwrap().segments[0].candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_return_offer_cannot_be_bound_to_a_single_segment() {
+        // A segment is one direction. A two-leg offer bound to it would price
+        // the return twice and quietly misdescribe the trip.
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        let mut round_trip = one_way("both-ways", "AMS", "NRT", "2026-09-03", &["KL861"]);
+        round_trip.legs.push(one_way("x", "NRT", "AMS", "2026-09-10", &["KL862"]).legs.remove(0));
+        shown.remember(99, vec![round_trip], Instant::now());
+
+        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let err = add_opt
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "both-ways".into(),
+                decided: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("return"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_option_for_a_different_route_is_refused() {
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("wrong", "AMS", "LIS", "2026-09-03", &["TP675"])], Instant::now());
+        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        add_seg
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let err = add_opt
+            .call(AddOptionArgs {
+                trip: "Japan".into(),
+                position: 1,
+                offer_id: "wrong".into(),
+                decided: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("AMS→NRT"), "got: {err}");
     }
 }

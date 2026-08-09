@@ -81,6 +81,11 @@ CREATE TABLE IF NOT EXISTS trip_segments (
     origin         TEXT NOT NULL,
     destination    TEXT NOT NULL,
     departure_date TEXT NOT NULL,
+    -- Hands out candidate numbers and never takes one back. Deriving the next
+    -- number from max(candidate) over live rows recycles it as soon as the
+    -- highest is dropped, and a traveller who was shown "option 2" would
+    -- then be given a different flight under the same name.
+    next_candidate BIGINT NOT NULL DEFAULT 1,
     PRIMARY KEY (trip_id, position)
 );
 -- The options on a segment. Several may sit here undecided; at most one
@@ -715,6 +720,16 @@ impl Store {
         decided: bool,
     ) -> Result<Trip> {
         let conn = self.conn.lock().unwrap();
+        // Distinguished from the segment check below: "no such trip" and
+        // "this trip has no segment N" point the caller at different fixes.
+        let known: i64 = conn.query_row(
+            "SELECT count(*) FROM trips WHERE id = ?",
+            params![trip_id],
+            |row| row.get(0),
+        )?;
+        if known == 0 {
+            anyhow::bail!("no such trip");
+        }
         let exists: i64 = conn.query_row(
             "SELECT count(*) FROM trip_segments WHERE trip_id = ? AND position = ?",
             params![trip_id, position],
@@ -723,11 +738,18 @@ impl Store {
         if exists == 0 {
             anyhow::bail!("this trip has no segment {position}");
         }
+        // next_candidate is a high-water mark on the segment row: read and
+        // advance it here, inside the lock this method already holds, so a
+        // dropped candidate's number is never handed to the next insert.
         let next: i64 = conn.query_row(
-            "SELECT coalesce(max(candidate), 0) + 1 FROM segment_candidates
-             WHERE trip_id = ? AND position = ?",
+            "SELECT next_candidate FROM trip_segments WHERE trip_id = ? AND position = ?",
             params![trip_id, position],
             |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE trip_segments SET next_candidate = next_candidate + 1
+             WHERE trip_id = ? AND position = ?",
+            params![trip_id, position],
         )?;
         conn.execute(
             "INSERT INTO segment_candidates (
@@ -1368,7 +1390,60 @@ mod tests {
 
         let trip = store.drop_candidate(trip.id, 1, 1).unwrap();
         assert_eq!(trip.segments[0].candidates.len(), 1, "the segment survives losing an option");
-        assert_eq!(trip.segments[0].candidates[0].candidate, 2, "numbers are not reused");
+        assert_eq!(
+            trip.segments[0].candidates[0].candidate, 2,
+            "dropping the lower-numbered candidate must not renumber the one that is left"
+        );
+    }
+
+    #[test]
+    fn a_dropped_candidate_number_is_never_handed_to_a_later_one() {
+        // Candidate numbers are traveller-facing: "go with option 2" refers
+        // to a number, not a position in a list. Deriving the next number
+        // from max(candidate) over the *live* rows recycles a number the
+        // moment its holder is dropped — so a traveller who was shown
+        // "option 2", dropped it, and later says "go with option 2" would
+        // silently be given a different flight under the same name.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        store.add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), false).unwrap();
+        store.add_candidate(trip.id, 1, candidate("Cathay", "CX270,CX500", 780.0), false).unwrap();
+
+        // Drop the highest-numbered candidate, then add a fresh one.
+        store.drop_candidate(trip.id, 1, 2).unwrap();
+        let trip = store.add_candidate(trip.id, 1, candidate("ANA", "NH205", 900.0), false).unwrap();
+
+        let numbers: Vec<i64> = trip.segments[0].candidates.iter().map(|c| c.candidate).collect();
+        assert_eq!(
+            numbers,
+            vec![1, 3],
+            "the new candidate must take the next never-used number, not the one just dropped (2)"
+        );
+    }
+
+    #[test]
+    fn adding_a_candidate_reports_a_missing_trip_separately_from_a_missing_segment() {
+        // Both counts can read 0, but they call for different fixes — one
+        // means the trip id is wrong, the other that the segment position
+        // is. Collapsing them into one message ("no segment N") would send
+        // a caller with a bad trip id looking for a segment that was never
+        // going to exist.
+        let (store, _d) = test_store();
+        let err = store
+            .add_candidate(999, 1, candidate("KLM", "KL861", 940.0), false)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no such trip", "a nonexistent trip must not be reported as a missing segment");
+
+        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let err = store
+            .add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), false)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "this trip has no segment 1",
+            "a real trip with no such segment must not be reported as no such trip"
+        );
     }
 
     #[test]

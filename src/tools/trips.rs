@@ -936,12 +936,17 @@ impl Tool for AddTripOptionTool {
         // bind a flight from another's search.
         let flight = self.shown.find(self.chat_id, &args.offer_id, now).ok_or_else(|| {
             let ids = self.shown.offer_ids(self.chat_id, now);
+            let total = self.shown.remembered(self.chat_id, now);
             StoreToolError(format!(
                 "{:?} was not shown in this conversation, so it cannot be added. \
                  Search first, then use one of these offer_ids: {}",
                 args.offer_id,
                 match ids.is_empty() {
                     true => "(nothing has been searched yet)".to_string(),
+                    // Named newest first, and honest about the ones it did
+                    // not list rather than implying the list is all there is.
+                    false if total > ids.len() =>
+                        format!("{} (and {} more)", ids.join(", "), total - ids.len()),
                     false => ids.join(", "),
                 }
             ))

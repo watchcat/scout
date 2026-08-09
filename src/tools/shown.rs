@@ -23,21 +23,58 @@ use std::time::{Duration, Instant};
 /// problem here: the lookup re-checks it and says when it moved.
 const REMEMBER_FOR: Duration = Duration::from_secs(45 * 60);
 
-/// The last set of flights shown in each chat.
+/// Most flights kept per chat.
+///
+/// A trip conversation searches a dozen routes at seven rows each, and all
+/// of them have to stay bindable — this holds that comfortably while still
+/// bounding a chat that never stops asking.
+const MAX_PER_CHAT: usize = 200;
+
+/// How many ids a refusal names. Enough to correct a wrong one, few enough
+/// that the sentence telling the model what to do is still readable.
+const IDS_IN_AN_ERROR: usize = 12;
+
+/// One flight and when it was last put in front of the chat.
+struct Seen {
+    at: Instant,
+    flight: Flight,
+}
+
+/// Every flight shown in each chat recently, oldest first.
 #[derive(Default)]
 pub struct ShownFlights {
-    by_chat: DashMap<i64, (Instant, Vec<Flight>)>,
+    by_chat: DashMap<i64, Vec<Seen>>,
 }
 
 impl ShownFlights {
-    /// Replaces whatever that chat was last shown. Only the most recent
-    /// search is kept: an older one is a different question, and its
-    /// prices are the ones most likely to have moved.
+    /// Adds to what the chat has been shown rather than replacing it.
+    ///
+    /// Replacing was right while a search was followed by booking one of
+    /// its own rows. Building a trip is four searches and then four
+    /// bindings, and under replacement three of those came back "was not
+    /// shown in this conversation" — measured in production, nine refusals
+    /// in two hours, every one of them a request that should have worked.
+    ///
+    /// Keeping an older sighting costs nothing in honesty, because nothing
+    /// downstream quotes it from here: binding stores the itinerary and
+    /// re-prices at finalisation, and a booking lookup re-checks the fare
+    /// and says what moved.
     pub fn remember(&self, chat_id: i64, flights: Vec<Flight>, now: Instant) {
         if flights.is_empty() {
             return;
         }
-        self.by_chat.insert(chat_id, (now, flights));
+        let mut entry = self.by_chat.entry(chat_id).or_default();
+        entry.retain(|seen| now.duration_since(seen.at) <= REMEMBER_FOR);
+        for flight in flights {
+            // A route searched twice keeps one entry, refreshed — the newer
+            // sighting is the one the traveller was actually shown.
+            entry.retain(|seen| seen.flight.offer_id != flight.offer_id);
+            entry.push(Seen { at: now, flight });
+        }
+        if entry.len() > MAX_PER_CHAT {
+            let excess = entry.len() - MAX_PER_CHAT;
+            entry.drain(..excess);
+        }
     }
 
     /// A flight this chat was actually shown, by provider id.
@@ -46,29 +83,55 @@ impl ShownFlights {
     /// caller treats the same way: refuse rather than spend a request on
     /// an id that may have been invented.
     pub fn find(&self, chat_id: i64, offer_id: &str, now: Instant) -> Option<Flight> {
-        let entry = self.by_chat.get(&chat_id)?;
-        let (shown_at, flights) = entry.value();
-        if now.duration_since(*shown_at) > REMEMBER_FOR {
-            return None;
-        }
-        flights.iter().find(|f| f.offer_id == offer_id).cloned()
+        self.by_chat
+            .get(&chat_id)?
+            .iter()
+            .find(|seen| {
+                seen.flight.offer_id == offer_id
+                    && now.duration_since(seen.at) <= REMEMBER_FOR
+            })
+            .map(|seen| seen.flight.clone())
     }
 
-    /// The ids this chat could legitimately ask to book, for an error
-    /// message that tells the model what it should have used.
+    /// The ids this chat could legitimately ask to book, newest first, for
+    /// an error message that tells the model what it should have used.
+    ///
+    /// Capped: since these accumulate across a whole trip conversation,
+    /// listing every one would bury the instruction under a wall of hex.
+    /// The newest are the ones a confused call was most likely reaching for.
     pub fn offer_ids(&self, chat_id: i64, now: Instant) -> Vec<String> {
+        self.recent_ids(chat_id, now, IDS_IN_AN_ERROR)
+    }
+
+    /// How many ids are answerable right now, whether or not they were all
+    /// listed.
+    pub fn remembered(&self, chat_id: i64, now: Instant) -> usize {
+        self.recent_ids(chat_id, now, usize::MAX).len()
+    }
+
+    fn recent_ids(&self, chat_id: i64, now: Instant, limit: usize) -> Vec<String> {
         self.by_chat
             .get(&chat_id)
-            .filter(|e| now.duration_since(e.value().0) <= REMEMBER_FOR)
-            .map(|e| e.value().1.iter().map(|f| f.offer_id.clone()).collect())
+            .map(|entry| {
+                entry
+                    .iter()
+                    .rev()
+                    .filter(|seen| now.duration_since(seen.at) <= REMEMBER_FOR)
+                    .take(limit)
+                    .map(|seen| seen.flight.offer_id.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    /// Drops chats whose flights have expired. Called when a search is
-    /// recorded, so the map cannot grow without bound in a long-lived bot.
+    /// Drops flights that have expired, and chats left with none. Called
+    /// when a search is recorded, so the map cannot grow without bound in a
+    /// long-lived bot.
     pub fn evict_expired(&self, now: Instant) {
-        self.by_chat
-            .retain(|_, (shown_at, _)| now.duration_since(*shown_at) <= REMEMBER_FOR);
+        self.by_chat.retain(|_, seen| {
+            seen.retain(|s| now.duration_since(s.at) <= REMEMBER_FOR);
+            !seen.is_empty()
+        });
     }
 }
 
@@ -139,15 +202,61 @@ mod tests {
     }
 
     #[test]
-    fn a_new_search_replaces_the_last_one() {
-        // The older search answered a different question and its prices are
-        // the ones most likely to have moved.
+    fn a_new_search_adds_to_what_the_chat_has_been_shown() {
+        // This replaced whatever came before it, which was right when a
+        // search was followed by booking one of its own rows. A trip is
+        // four searches and then four bindings, and replacing meant three
+        // of them came back "was not shown in this conversation" — measured
+        // in production, nine times in two hours.
+        //
+        // Staleness is not the reason to forget: nothing here is quoted
+        // from memory. A binding stores the itinerary and re-prices at
+        // finalisation, and a booking lookup re-checks the fare and reports
+        // what moved.
         let shown = ShownFlights::default();
         let now = Instant::now();
-        shown.remember(7, vec![flight("old", 100.0)], now);
-        shown.remember(7, vec![flight("new", 200.0)], now);
-        assert!(shown.find(7, "old", now).is_none());
-        assert!(shown.find(7, "new", now).is_some());
+        shown.remember(7, vec![flight("leg-1", 100.0)], now);
+        shown.remember(7, vec![flight("leg-2", 200.0)], now);
+        shown.remember(7, vec![flight("leg-3", 300.0)], now);
+        for id in ["leg-1", "leg-2", "leg-3"] {
+            assert!(shown.find(7, id, now).is_some(), "{id} should still be bindable");
+        }
+    }
+
+    #[test]
+    fn seeing_the_same_flight_again_does_not_duplicate_it() {
+        let shown = ShownFlights::default();
+        let now = Instant::now();
+        shown.remember(7, vec![flight("same", 100.0)], now);
+        shown.remember(7, vec![flight("same", 120.0)], now);
+        assert_eq!(shown.offer_ids(7, now), vec!["same".to_string()]);
+        assert_eq!(
+            shown.find(7, "same", now).unwrap().price,
+            120.0,
+            "the newer sighting is the one that counts"
+        );
+    }
+
+    #[test]
+    fn a_chat_that_never_stops_searching_cannot_grow_without_bound() {
+        let shown = ShownFlights::default();
+        let now = Instant::now();
+        for i in 0..(MAX_PER_CHAT + 25) {
+            shown.remember(7, vec![flight(&format!("f{i}"), 1.0)], now);
+        }
+        assert_eq!(shown.remembered(7, now), MAX_PER_CHAT, "the store is bounded");
+        assert!(shown.find(7, "f0", now).is_none(), "the oldest go first");
+        assert!(shown.find(7, &format!("f{}", MAX_PER_CHAT + 24), now).is_some());
+
+        // A refusal names a handful, not two hundred: the sentence telling
+        // the model what to do has to survive the list.
+        let listed = shown.offer_ids(7, now);
+        assert_eq!(listed.len(), IDS_IN_AN_ERROR);
+        assert_eq!(
+            listed[0],
+            format!("f{}", MAX_PER_CHAT + 24),
+            "newest first — that is what a wrong call was reaching for"
+        );
     }
 
     #[test]

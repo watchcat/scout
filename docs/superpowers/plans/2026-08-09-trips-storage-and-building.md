@@ -975,17 +975,24 @@ pub fn itinerary_notes(segments: &[TripSegment]) -> Vec<String> {
             // those, so the gap note is all there is to say.
             continue;
         }
-        if let Some(minutes) = turnaround_minutes(before, after) {
-            if (0..TIGHT_TURNAROUND_MINUTES).contains(&minutes) {
-                notes.push(format!(
-                    "only {}h {:02}m at {} between segment {} landing and segment {} leaving",
-                    minutes / 60,
-                    minutes % 60,
-                    before.destination,
-                    before.position,
-                    after.position
-                ));
-            }
+        match turnaround_minutes(before, after) {
+            // Not a small number — a wrong one. Folding this into the range
+            // below hides it, because `0..TIGHT` excludes negatives and an
+            // itinerary that cannot be flown then reads as perfectly fine.
+            Some(minutes) if minutes < 0 => notes.push(format!(
+                "segment {} leaves {} before segment {} has landed there — this itinerary \
+                 cannot be flown as written",
+                after.position, before.destination, before.position
+            )),
+            Some(minutes) if minutes < TIGHT_TURNAROUND_MINUTES => notes.push(format!(
+                "only {}h {:02}m at {} between segment {} landing and segment {} leaving",
+                minutes / 60,
+                minutes % 60,
+                before.destination,
+                before.position,
+                after.position
+            )),
+            _ => {}
         }
     }
     notes

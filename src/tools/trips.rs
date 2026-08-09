@@ -137,16 +137,21 @@ fn iata(label: &str, value: &str) -> Result<String, StoreToolError> {
     match code.len() == 3 && code.chars().all(|c| c.is_ascii_alphabetic()) {
         true => Ok(code.to_ascii_uppercase()),
         false => Err(StoreToolError(format!(
-            "{label} must be a 3-letter IATA airport or city code (AMS, LHR, NYC), not {value:?}"
+            "{label} must be a 3-letter IATA airport or city code (AMS, LHR, NYC), not {value:?} \
+             — use the code for the place the traveller named"
         ))),
     }
 }
 
+/// Reformats through the parsed date rather than returning the trimmed
+/// input: `chrono` accepts "2026-9-3", but `dates_run_forwards` compares
+/// `departure_date` as text, which only agrees with date order when every
+/// date is zero-padded. This is the one place that padding is established.
 fn calendar_date(value: &str) -> Result<String, StoreToolError> {
     let date = value.trim();
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map_err(|_| StoreToolError(format!("departure_date must be YYYY-MM-DD, not {value:?}")))?;
-    Ok(date.to_string())
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .map_err(|_| StoreToolError(format!("departure_date must be YYYY-MM-DD, not {value:?}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,7 +198,7 @@ impl Tool for AddTripSegmentTool {
                 "destination": {"type": "string", "description": "3-letter IATA code"},
                 "departure_date": {"type": "string", "description": "YYYY-MM-DD"},
                 "position": {"type": "integer", "description": "insert at this 1-based position; omit to append"},
-                "adults": {"type": "integer", "description": "passengers for the whole trip, default 1"},
+                "adults": {"type": "integer", "description": "passengers for the whole trip; 1 on a new trip, otherwise left as it was unless given"},
                 "cabin_class": {"type": "string", "description": "economy, premium_economy, business or first, for the whole trip"}
             },
             "required": ["trip", "origin", "destination", "departure_date"]
@@ -221,12 +226,29 @@ impl Tool for AddTripSegmentTool {
                 args.adults,
                 args.cabin_class.as_deref(),
             )?;
-            store.add_segment(trip.id, args.position, &origin, &destination, &date)
+            store
+                .add_segment(trip.id, args.position, &origin, &destination, &date)
+                .map_err(lost_trip_race)
         })
         .await
         .map_err(internal)?
         .map(TripView::of)
         .map_err(internal)
+    }
+}
+
+/// `upsert_trip` and `add_segment` above are two separate lock acquisitions,
+/// so a concurrent `delete_trip` landing between them makes `add_segment`
+/// fail with a bare "no such trip" — on a tool documented to create the
+/// trip when the name is new, which reads as nonsense. Nothing was written
+/// either way, so retrying is exactly the right advice; only the wording
+/// needed fixing.
+fn lost_trip_race(e: anyhow::Error) -> anyhow::Error {
+    match e.to_string().as_str() {
+        "no such trip" => anyhow::anyhow!(
+            "the trip was deleted while this segment was being added — nothing was written, try again"
+        ),
+        _ => e,
     }
 }
 
@@ -287,6 +309,45 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("IATA"), "got: {err}");
         assert!(store.find_trip(7, "September").unwrap().is_none(), "nothing was created");
+    }
+
+    #[tokio::test]
+    async fn an_unpadded_date_is_stored_zero_padded() {
+        // dates_run_forwards compares departure_date as text, which only
+        // agrees with date order when every date is zero-padded — that
+        // invariant is established here, at the tool boundary, or nowhere.
+        let (store, _d) = setup();
+        let tool = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let trip = tool
+            .call(AddSegmentArgs {
+                trip: "September".into(),
+                origin: "AMS".into(),
+                destination: "LIS".into(),
+                departure_date: "2026-9-3".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            trip.trip.segments[0].departure_date, "2026-09-03",
+            "unpadded input must be normalised, not stored as typed"
+        );
+    }
+
+    #[test]
+    fn a_trip_deleted_between_creating_and_writing_the_segment_explains_itself() {
+        // upsert_trip and add_segment are two separate lock acquisitions, so
+        // a concurrent delete_trip landing between them makes add_segment's
+        // plain "no such trip" surface — on a tool documented to create the
+        // trip when the name is new, which reads as nonsense here.
+        let wrapped = lost_trip_race(anyhow::anyhow!("no such trip"));
+        assert!(wrapped.to_string().contains("try again"), "got: {wrapped}");
+
+        // Only that one message is relabelled; anything else passes through.
+        let other = lost_trip_race(anyhow::anyhow!("origin and destination are both AMS"));
+        assert_eq!(other.to_string(), "origin and destination are both AMS");
     }
 
     fn segment(position: i64, origin: &str, destination: &str, date: &str) -> TripSegment {

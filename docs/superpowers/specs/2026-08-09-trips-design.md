@@ -326,6 +326,13 @@ segments are priced in different currencies — inventing a rate to force one
 number would be the same class of error as the model doing arithmetic on
 local times.
 
+The currency checked is the one attached to **today's** price, not the one
+recorded when the option was parked. The sum is of current prices, so
+labelling it with a stale currency would be asserting something the
+arithmetic does not support — and a segment carrying a price with no
+currency at all is refused rather than quietly folded into a total that
+then names a currency it never had.
+
 ## Budget
 
 Finalising an N-segment trip is N+1 paid searches against a base allowance

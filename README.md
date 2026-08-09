@@ -18,6 +18,10 @@ And every price labelled by whether you can actually pay it — because "from
 €180" somewhere else and €220 you can book right now are not the same number,
 and putting them in one list without saying so is how a comparison lies.
 
+Multi-city trips get built a message at a time and priced only when you say
+they're done — because an offer expires in minutes and a plan doesn't, so the
+only honest thing to do with a week-old itinerary is search it again.
+
 Built in Rust with [teloxide](https://github.com/teloxide/teloxide),
 [rig](https://rig.rs), DuckDB, and a deep suspicion of what language models
 say about prices.
@@ -104,6 +108,27 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   since it was quoted is reported rather than glossed over
 - Scout never takes a payment or a passenger detail — there is nothing to leak
 
+**Plans whole trips** *(same keys)*
+- A **trip** is a named multi-city plan you build across as many messages as
+  it takes — "Amsterdam → Lisbon on the 3rd, Lisbon → Rome on the 7th, home
+  on the 12th, call it September" — and come back to tomorrow
+- Undecided between a nonstop and a connection? Park **both** on the same
+  segment and choose later. Extra options cost nothing: a segment is priced
+  by one search, and that search returns every option sitting on it
+- A trip stores the **itinerary**, never an offer. Offers expire in minutes
+  and a plan outlives the conversation that made it, so finalising re-prices
+  every segment from scratch rather than repeating a number from Tuesday
+- Finalising also asks Duffel what the **whole itinerary costs as one
+  ticket**, and shows both totals. Booking a link per segment is buying a
+  ticket per segment: bags re-checked at every join, and nobody obliged to
+  rebook you when a leg runs late. That difference is priced, not implied
+- A flight you chose that is **no longer sold** is reported, never
+  substituted. You picked a flight, not a price band
+- Totals refuse rather than lie: no sum across mixed currencies, and no
+  comparison between two prices quoted in different ones. A missing
+  single-ticket price says it is missing — it never reads as a verdict for
+  booking separately
+
 **Remembers things**
 - Purchase history: *"where did I buy this last time?"* — react 👍 to a
   suggestion and Scout offers to save it
@@ -183,7 +208,7 @@ lives in the `scout-data` volume and survives rebuilds.
 ## How it works
 
 ```
-Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 15 tools
+Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 22 tools
                 │                                    │
                 │  streams progress + answer         ├─ search_web        Kagi + Perplexity, merged
                 │  back into one edited message      ├─ search_secondhand eBay / Marktplaats / Vinted
@@ -193,6 +218,13 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 15 tools
         (nothing dead ships)                         ├─ create_booking_link   Duffel hosted checkout *
                                                      ├─ fetch_page        + headless-Chrome fallback
                                                      ├─ compare_prices    deterministic, in Rust
+                                                     ├─ add_trip_segment  ─┐
+                                                     ├─ add_trip_option    │
+                                                     ├─ choose_trip_option │  a named multi-city
+                                                     ├─ show_trip          ├─ plan, built over many
+                                                     ├─ drop_trip_segment  │  messages
+                                                     ├─ delete_trip        │
+                                                     ├─ finalise_trip     ─┘  re-prices it all *
                                                      ├─ query_purchases   ─┐
                                                      ├─ record_purchase    ├─ DuckDB
                                                      ├─ remember_fact      │
@@ -207,11 +239,11 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 15 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **299 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **369 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness.
 
-Roughly 14,000 lines of Rust across a dozen focused modules.
+Roughly 19,500 lines of Rust across a dozen focused modules.
 
 ---
 
@@ -235,6 +267,14 @@ Roughly 14,000 lines of Rust across a dozen focused modules.
   endpoint, so a range costs one search per day. ±3 days is the ceiling; the
   big sites answer month views from caches of indicative fares, which is a
   different and less honest product.
+- **A finalised trip hands out links unevenly.** Ignav segments resolve to
+  real sellers; Duffel segments give you the airline and the flight numbers
+  and nothing to click, because Duffel gates hosted checkout until they
+  enable it for an account. The single-ticket comparison is Duffel-only for
+  the same shape of reason — Ignav has one-way and round-trip endpoints and
+  no way to price a multi-city itinerary at all. Without a Duffel key that
+  half of finalising simply says it could not be done, which is deliberately
+  not the same as saying separate booking won.
 - **Not every wall falls.** Headless Chrome clears Cloudflare on some shops and
   not others. When a page can't be verified, Scout says so rather than
   guessing.
@@ -247,16 +287,19 @@ Roughly 14,000 lines of Rust across a dozen focused modules.
 - **Costs real money.** Kagi bills per query, MiniMax per token, and each
   flight search is billed by whichever provider answered it. Budgets are
   capped per request: 15 search queries, 5 page opens, 20 model turns, and
-  flight searches that start at 4 and grow with the date window you asked
-  for — a ±3 day window is seven searches because neither provider prices a
-  calendar. Measured: a flight question runs about **1.4 cents** end to end.
+  flight searches that start at 4 and grow with what you actually asked for —
+  a ±3 day window is seven searches because neither provider prices a
+  calendar, and finalising an N-segment trip is N+1. Parking extra options on
+  a segment adds nothing, because they are all priced by the one search that
+  segment was going to cost anyway. Measured: a flight question runs about
+  **1.4 cents** end to end.
 
 ---
 
 ## Development
 
 ```bash
-cargo test                  # 299 tests, no network needed
+cargo test                  # 369 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

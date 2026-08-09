@@ -1172,11 +1172,16 @@ fn iata(label: &str, value: &str) -> Result<String, StoreToolError> {
     }
 }
 
+/// Returns the date *reformatted*, not the input echoed back.
+///
+/// chrono accepts "2026-9-3" for "%Y-%m-%d", and `dates_run_forwards`
+/// compares dates as text — where "2026-9-3" sorts after "2026-10-01".
+/// This function is where that invariant is established, so it has to
+/// produce the padded form rather than merely accept the loose one.
 fn calendar_date(value: &str) -> Result<String, StoreToolError> {
-    let date = value.trim();
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map_err(|_| StoreToolError(format!("departure_date must be YYYY-MM-DD, not {value:?}")))?;
-    Ok(date.to_string())
+    chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .map_err(|_| StoreToolError(format!("departure_date must be YYYY-MM-DD, not {value:?}")))
 }
 
 #[derive(Debug, Deserialize)]

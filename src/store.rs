@@ -152,9 +152,10 @@ pub struct Trip {
     pub name: String,
     pub adults: i64,
     pub cabin_class: Option<String>,
-    /// `planning` or `finalised`. Any edit returns it to `planning`: the
-    /// prices it was finalised at stopped describing the trip when the trip
-    /// stopped being that trip.
+    /// `planning` or `finalised`. Any edit that changes what would be
+    /// priced — a segment, its options, the passenger count or the cabin —
+    /// returns it to `planning`: the prices it was finalised at stopped
+    /// describing the trip when the trip stopped being that trip.
     pub status: String,
     pub segments: Vec<TripSegment>,
 }
@@ -533,11 +534,16 @@ impl Store {
         }
         let key = name.to_lowercase();
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let inserted = conn.execute(
             "INSERT INTO trips (user_id, name, name_key) VALUES (?, ?, ?)
              ON CONFLICT (user_id, name_key) DO NOTHING",
             params![user_id, name, key],
         )?;
+        // A freshly created trip already starts in `planning`, and a call
+        // that supplies neither field is how find-or-create works — it must
+        // stay inert. Only an edit to an *existing* trip's price-relevant
+        // fields can invalidate prices it was finalised at.
+        let invalidates_prices = inserted == 0 && (adults.is_some() || cabin_class.is_some());
         if let Some(adults) = adults {
             conn.execute(
                 "UPDATE trips SET adults = ?, updated_at = current_timestamp
@@ -552,6 +558,13 @@ impl Store {
                 params![cabin, user_id, key],
             )?;
         }
+        if invalidates_prices {
+            conn.execute(
+                "UPDATE trips SET status = 'planning', updated_at = current_timestamp
+                 WHERE user_id = ? AND name_key = ?",
+                params![user_id, key],
+            )?;
+        }
         let id: i64 = conn.query_row(
             "SELECT id FROM trips WHERE user_id = ? AND name_key = ?",
             params![user_id, key],
@@ -560,14 +573,27 @@ impl Store {
         load_trip(&conn, id)
     }
 
+    /// Used by finalisation to record that a trip has been priced.
+    pub fn set_trip_status(&self, trip_id: i64, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE trips SET status = ?, updated_at = current_timestamp WHERE id = ?",
+            params![status, trip_id],
+        )?;
+        Ok(())
+    }
+
     pub fn find_trip(&self, user_id: i64, name: &str) -> Result<Option<Trip>> {
         let key = name.trim().to_lowercase();
         let conn = self.conn.lock().unwrap();
         let mut stmt =
             conn.prepare("SELECT id FROM trips WHERE user_id = ? AND name_key = ?")?;
-        let mut ids = stmt.query_map(params![user_id, key], |row| row.get::<_, i64>(0))?;
-        match ids.next() {
-            Some(id) => Ok(Some(load_trip(&conn, id?)?)),
+        let id: Option<i64> = stmt
+            .query_map(params![user_id, key], |row| row.get(0))?
+            .next()
+            .transpose()?;
+        match id {
+            Some(id) => Ok(Some(load_trip(&conn, id)?)),
             None => Ok(None),
         }
     }
@@ -987,5 +1013,54 @@ mod tests {
         // Two users may each have a "September".
         store.upsert_trip(8, "September", None, None).unwrap();
         assert_eq!(store.list_trips(8).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upserting_one_field_leaves_the_other_field_untouched() {
+        // Regression guard for the two-statement design: a naive single
+        // `ON CONFLICT DO UPDATE SET adults = ?, cabin_class = ?` would
+        // silently null out whichever field this call didn't mention.
+        let (store, _d) = test_store();
+        store.upsert_trip(7, "September", Some(2), Some("business")).unwrap();
+
+        let trip = store.upsert_trip(7, "September", Some(3), None).unwrap();
+        assert_eq!(trip.adults, 3);
+        assert_eq!(
+            trip.cabin_class.as_deref(),
+            Some("business"),
+            "cabin class must survive an upsert that didn't mention it"
+        );
+
+        let trip = store.upsert_trip(7, "September", None, Some("economy")).unwrap();
+        assert_eq!(trip.adults, 3, "adults must survive an upsert that didn't mention it");
+        assert_eq!(trip.cabin_class.as_deref(), Some("economy"));
+    }
+
+    #[test]
+    fn changing_adults_or_cabin_class_resets_a_finalised_trip_to_planning() {
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", Some(2), Some("business")).unwrap();
+
+        store.set_trip_status(trip.id, "finalised").unwrap();
+        let trip = store.upsert_trip(7, "September", Some(3), None).unwrap();
+        assert_eq!(
+            trip.status, "planning",
+            "changing the passenger count invalidates a finalised trip's prices"
+        );
+
+        store.set_trip_status(trip.id, "finalised").unwrap();
+        let trip = store.upsert_trip(7, "September", None, Some("economy")).unwrap();
+        assert_eq!(
+            trip.status, "planning",
+            "changing cabin class invalidates a finalised trip's prices"
+        );
+
+        // find-or-create — supplying neither field — must stay inert.
+        store.set_trip_status(trip.id, "finalised").unwrap();
+        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        assert_eq!(
+            trip.status, "finalised",
+            "an upsert with nothing to change must not reset status"
+        );
     }
 }

@@ -700,6 +700,108 @@ impl Store {
         touch(&conn, trip_id)?;
         load_trip(&conn, trip_id)
     }
+
+    /// Parks a flight against a segment. `decided` also marks it chosen, so
+    /// the common single-option path is one call.
+    ///
+    /// Candidate numbers are never reused: they are what the traveller sees and
+    /// what `choose_candidate` takes, and recycling one would silently retarget
+    /// a decision made against the old numbering.
+    pub fn add_candidate(
+        &self,
+        trip_id: i64,
+        position: i64,
+        new: NewCandidate,
+        decided: bool,
+    ) -> Result<Trip> {
+        let conn = self.conn.lock().unwrap();
+        let exists: i64 = conn.query_row(
+            "SELECT count(*) FROM trip_segments WHERE trip_id = ? AND position = ?",
+            params![trip_id, position],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            anyhow::bail!("this trip has no segment {position}");
+        }
+        let next: i64 = conn.query_row(
+            "SELECT coalesce(max(candidate), 0) + 1 FROM segment_candidates
+             WHERE trip_id = ? AND position = ?",
+            params![trip_id, position],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO segment_candidates (
+                 trip_id, position, candidate, chosen, airline, flight_numbers, itinerary,
+                 departing_at_local, arriving_at_local, duration_minutes,
+                 quoted_price, quoted_currency, quoted_at, source)
+             VALUES (?, ?, ?, false, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp, ?)",
+            params![
+                trip_id,
+                position,
+                next,
+                new.airline,
+                new.flight_numbers,
+                new.itinerary,
+                new.departing_at_local,
+                new.arriving_at_local,
+                new.duration_minutes,
+                new.quoted_price,
+                new.quoted_currency,
+                new.source
+            ],
+        )?;
+        if decided {
+            choose_within(&conn, trip_id, position, next)?;
+        }
+        touch(&conn, trip_id)?;
+        load_trip(&conn, trip_id)
+    }
+
+    pub fn choose_candidate(&self, trip_id: i64, position: i64, candidate: i64) -> Result<Trip> {
+        let conn = self.conn.lock().unwrap();
+        choose_within(&conn, trip_id, position, candidate)?;
+        touch(&conn, trip_id)?;
+        load_trip(&conn, trip_id)
+    }
+
+    pub fn drop_candidate(&self, trip_id: i64, position: i64, candidate: i64) -> Result<Trip> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ? AND candidate = ?",
+            params![trip_id, position, candidate],
+        )?;
+        if removed == 0 {
+            anyhow::bail!("segment {position} has no option {candidate}");
+        }
+        touch(&conn, trip_id)?;
+        load_trip(&conn, trip_id)
+    }
+}
+
+/// Clears the position's flags and sets one. "At most one chosen" cannot be
+/// a `UNIQUE` constraint because `false` repeats, so it is this function's
+/// job — and the caller always holds the connection lock, which is what
+/// makes the pair of statements indivisible.
+fn choose_within(conn: &Connection, trip_id: i64, position: i64, candidate: i64) -> Result<()> {
+    let known: i64 = conn.query_row(
+        "SELECT count(*) FROM segment_candidates
+         WHERE trip_id = ? AND position = ? AND candidate = ?",
+        params![trip_id, position, candidate],
+        |row| row.get(0),
+    )?;
+    if known == 0 {
+        anyhow::bail!("segment {position} has no option {candidate}");
+    }
+    conn.execute(
+        "UPDATE segment_candidates SET chosen = false WHERE trip_id = ? AND position = ?",
+        params![trip_id, position],
+    )?;
+    conn.execute(
+        "UPDATE segment_candidates SET chosen = true
+         WHERE trip_id = ? AND position = ? AND candidate = ?",
+        params![trip_id, position, candidate],
+    )?;
+    Ok(())
 }
 
 /// Marks a trip edited. Status goes back to `planning` because whatever it
@@ -1219,6 +1321,65 @@ mod tests {
             .query_row("SELECT count(*) FROM trip_segments", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "a failed add_segment must not leave an orphaned row");
+    }
+
+    fn candidate(airline: &str, numbers: &str, price: f64) -> NewCandidate {
+        NewCandidate {
+            airline: airline.to_string(),
+            flight_numbers: numbers.to_string(),
+            itinerary: format!("{numbers} somewhere"),
+            departing_at_local: Some("2026-09-03T10:05:00".to_string()),
+            arriving_at_local: Some("2026-09-03T12:15:00".to_string()),
+            duration_minutes: Some(130),
+            quoted_price: Some(price),
+            quoted_currency: Some("EUR".to_string()),
+            source: Some("duffel".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_segment_holds_several_options_and_at_most_one_is_chosen() {
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+
+        // Parked undecided: the traveller is comparing a nonstop against a
+        // one-stop through Hong Kong.
+        store.add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), false).unwrap();
+        let trip = store.add_candidate(trip.id, 1, candidate("Cathay", "CX270,CX500", 780.0), false).unwrap();
+        let options = &trip.segments[0].candidates;
+        assert_eq!(options.len(), 2);
+        assert_eq!(options.iter().map(|c| c.candidate).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(options.iter().all(|c| !c.chosen), "nothing decided yet");
+
+        let trip = store.choose_candidate(trip.id, 1, 2).unwrap();
+        let options = &trip.segments[0].candidates;
+        assert!(!options[0].chosen);
+        assert!(options[1].chosen);
+
+        // Choosing again moves the flag rather than setting a second one.
+        let trip = store.choose_candidate(trip.id, 1, 1).unwrap();
+        let options = &trip.segments[0].candidates;
+        assert_eq!(options.iter().filter(|c| c.chosen).count(), 1);
+        assert!(options[0].chosen);
+
+        // A candidate the segment does not have.
+        assert!(store.choose_candidate(trip.id, 1, 9).is_err());
+
+        let trip = store.drop_candidate(trip.id, 1, 1).unwrap();
+        assert_eq!(trip.segments[0].candidates.len(), 1, "the segment survives losing an option");
+        assert_eq!(trip.segments[0].candidates[0].candidate, 2, "numbers are not reused");
+    }
+
+    #[test]
+    fn adding_a_decided_option_marks_it_chosen_in_one_call() {
+        // The ordinary path — "book me on this one" — must not need a second
+        // call to say what it obviously meant.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        let trip = store.add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), true).unwrap();
+        assert!(trip.segments[0].candidates[0].chosen);
     }
 
     #[test]

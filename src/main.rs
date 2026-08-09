@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
         deps,
         chats: DashMap::new(),
         replies: DashMap::new(),
+        streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     tracing::info!("scout is up");

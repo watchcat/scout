@@ -5,6 +5,8 @@
 //! front and edited as work happens — first with what the agent is doing,
 //! then with its answer as it streams in.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ParseMode};
@@ -12,6 +14,61 @@ use teloxide::types::{MessageId, ParseMode};
 /// Telegram rate-limits edits; this is comfortably under what it tolerates
 /// while still feeling live.
 const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(1200);
+
+/// What Telegram allows one bot across *all* of its chats, not per chat.
+/// teloxide's own throttle adaptor carries the same figure as its default.
+const TELEGRAM_EDITS_PER_SECOND: usize = 30;
+
+/// Slice of that budget each reply in flight is entitled to.
+///
+/// Derived from the ceiling with a couple of milliseconds of margin, so the
+/// arithmetic lands under it rather than exactly on it — at a hundred
+/// replies an exact share divides out to 30.0003 edits a second, and being
+/// right on the line is how you find out where the line really is.
+const PER_STREAM: Duration = Duration::from_millis(1000 / TELEGRAM_EDITS_PER_SECOND as u64 + 2);
+
+/// How long to wait between frames, given how many replies are streaming.
+///
+/// [`MIN_EDIT_INTERVAL`] alone is a per-chat rule, and Telegram's harder
+/// limit is per bot: at 1.2s a frame it takes only thirty-six simultaneous
+/// replies to saturate the whole token, and the rest come back 429. This
+/// starts widening at thirty-five and changes nothing below that; above it
+/// every reply slows down together, which is the cheapest fair way to stay
+/// inside one shared budget.
+///
+/// Note that teloxide's `throttle` adaptor would not cover this. It forwards
+/// `edit_message_text` to the inner requester unthrottled, and edits are
+/// nearly all of what a streaming reply sends.
+fn edit_interval(active: usize) -> Duration {
+    let active = u32::try_from(active).unwrap_or(u32::MAX);
+    MIN_EDIT_INTERVAL.max(PER_STREAM.saturating_mul(active))
+}
+
+/// Counts one reply for as long as it is in flight.
+///
+/// A guard rather than a pair of calls in the handler: a request can end by
+/// early return, by `?`, or by panic, and every one of those has to give the
+/// slot back. A count that only ever rises would throttle the bot to a
+/// standstill and look like Telegram's fault.
+struct StreamSlot(Arc<AtomicUsize>);
+
+impl StreamSlot {
+    fn take(streams: Arc<AtomicUsize>) -> Self {
+        streams.fetch_add(1, Ordering::Relaxed);
+        Self(streams)
+    }
+
+    fn active(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// How much of the model's reasoning to keep on screen. It runs to
 /// paragraphs; the newest sentence or two is the part worth reading.
 const THINKING_TAIL: usize = 220;
@@ -42,11 +99,23 @@ pub struct Live {
     message: Option<MessageId>,
     last_edit: Option<Instant>,
     shown: String,
+    /// Held for the lifetime of the reply; see [`StreamSlot`].
+    slot: StreamSlot,
 }
 
 impl Live {
-    pub fn new(bot: Bot, chat_id: ChatId) -> Self {
-        Self { bot, chat_id, message: None, last_edit: None, shown: String::new() }
+    /// `streams` is the process-wide count of replies in flight, shared by
+    /// every `Live`. Telegram's ceiling is per bot token, so pacing can only
+    /// be decided from what the whole process is doing.
+    pub fn new(bot: Bot, chat_id: ChatId, streams: Arc<AtomicUsize>) -> Self {
+        Self {
+            bot,
+            chat_id,
+            message: None,
+            last_edit: None,
+            shown: String::new(),
+            slot: StreamSlot::take(streams),
+        }
     }
 
     /// The message being edited, once it exists — needed to remember what was
@@ -80,7 +149,7 @@ impl Live {
         if text.is_empty() || text == self.shown {
             return;
         }
-        if !force && !self.due(Instant::now()) {
+        if !force && !self.due(Instant::now(), self.slot.active()) {
             return;
         }
         // Long answers are chunked by the caller; a frame that overflows is
@@ -110,9 +179,9 @@ impl Live {
         }
     }
 
-    fn due(&self, now: Instant) -> bool {
+    fn due(&self, now: Instant, active: usize) -> bool {
         self.last_edit
-            .is_none_or(|last| now.duration_since(last) >= MIN_EDIT_INTERVAL)
+            .is_none_or(|last| now.duration_since(last) >= edit_interval(active))
     }
 }
 
@@ -221,12 +290,50 @@ mod tests {
 
     #[test]
     fn edits_are_rate_limited_but_the_first_is_immediate() {
-        let mut live = Live::new(Bot::new("token"), ChatId(1));
+        let mut live = Live::new(Bot::new("token"), ChatId(1), Arc::new(AtomicUsize::new(0)));
         let now = Instant::now();
-        assert!(live.due(now), "nothing shown yet, so the first frame goes out at once");
+        assert!(live.due(now, 1), "nothing shown yet, so the first frame goes out at once");
 
         live.last_edit = Some(now);
-        assert!(!live.due(now + Duration::from_millis(300)));
-        assert!(live.due(now + MIN_EDIT_INTERVAL));
+        assert!(!live.due(now + Duration::from_millis(300), 1));
+        assert!(live.due(now + MIN_EDIT_INTERVAL, 1));
+    }
+
+    #[test]
+    fn a_crowd_of_replies_paces_itself_under_telegrams_ceiling() {
+        // One reply on its own is unaffected: the interval is what it always
+        // was, and the answer still feels live.
+        assert_eq!(edit_interval(1), MIN_EDIT_INTERVAL);
+        assert_eq!(edit_interval(30), MIN_EDIT_INTERVAL, "below the crossover nothing changes");
+
+        // A hundred replies each editing every 1.2s would be 83 edits a
+        // second, nearly three times what Telegram allows one bot across all
+        // of its chats. Backing off to 3.5s brings the fleet inside it.
+        assert_eq!(edit_interval(100), Duration::from_millis(3500));
+
+        // The property that actually matters, at every size: whatever the
+        // load, the whole process stays under Telegram's 30 a second.
+        for active in [1usize, 10, 29, 30, 31, 36, 100, 500, 5000] {
+            let per_second = active as f64 / edit_interval(active).as_secs_f64();
+            assert!(
+                per_second <= TELEGRAM_EDITS_PER_SECOND as f64,
+                "{active} streams would send {per_second:.1} edits/sec"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_reply_counts_itself_while_it_is_in_flight() {
+        let streams = Arc::new(AtomicUsize::new(0));
+        {
+            let _first = Live::new(Bot::new("token"), ChatId(1), streams.clone());
+            assert_eq!(streams.load(Ordering::Relaxed), 1);
+            let _second = Live::new(Bot::new("token"), ChatId(2), streams.clone());
+            assert_eq!(streams.load(Ordering::Relaxed), 2);
+        }
+        // Dropped on the way out of the block — including when the handler
+        // above it returned early or panicked, which is the whole reason the
+        // count lives in a guard rather than in the handler.
+        assert_eq!(streams.load(Ordering::Relaxed), 0, "a finished reply frees its slot");
     }
 }

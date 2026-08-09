@@ -7,8 +7,10 @@
 //! extractors that read every other shop.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 
 /// Chrome fast-forwards page timers up to this budget, so a challenge that
 /// waits several seconds of wall time clears in a fraction of it.
@@ -16,9 +18,19 @@ const VIRTUAL_TIME_BUDGET_MS: u32 = 30_000;
 /// Once the DOM starts arriving it comes in one burst; a lull this long
 /// means Chrome has finished and is merely refusing to exit.
 const QUIET_AFTER_OUTPUT: Duration = Duration::from_secs(3);
-/// Everything about one render is bounded by this. A page worth more than
-/// this is not worth blocking a chat reply for.
+/// Everything about one render is bounded by this — the wait for a free slot
+/// included. A page worth more than this is not worth blocking a chat reply
+/// for.
 pub const RENDER_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Renders allowed at once across the whole process.
+///
+/// Each one is a separate Chrome, and the module doc's "a few hundred MB per
+/// page" is per process: ten people asking for a walled page at the same
+/// moment is several gigabytes, on a box that has already been killed by the
+/// out-of-memory reaper for less. Two keeps a single slow render from
+/// blocking every other request while staying inside what the container has.
+const MAX_CONCURRENT_RENDERS: usize = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
@@ -26,6 +38,8 @@ pub enum BrowserError {
     Launch(String),
     #[error("rendering timed out")]
     Timeout,
+    #[error("too many pages are already rendering")]
+    Busy,
 }
 
 /// Marks of an interstitial rather than the page asked for.
@@ -89,18 +103,33 @@ pub fn find_chrome() -> Option<PathBuf> {
 }
 
 /// Renders `url` and returns the DOM after scripts have run.
+///
+/// Cloned into every `fetch_page` tool, so the slots are shared: the limit is
+/// on Chromes alive in this process, not on renders per request.
 #[derive(Clone)]
 pub struct Renderer {
     chrome: PathBuf,
+    slots: Arc<Semaphore>,
 }
 
 impl Renderer {
     pub fn new(chrome: PathBuf) -> Self {
-        Self { chrome }
+        Self { chrome, slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RENDERS)) }
     }
 
     pub async fn render(&self, url: &str) -> Result<String, BrowserError> {
-        tokio::time::timeout(RENDER_TIMEOUT, self.render_inner(url))
+        let started = Instant::now();
+        // Queueing is part of the deadline rather than added to it, so a
+        // busy renderer cannot turn a 45-second ceiling into ninety.
+        let _slot = match tokio::time::timeout(RENDER_TIMEOUT, self.slots.acquire()).await {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(e)) => return Err(BrowserError::Launch(e.to_string())),
+            Err(_) => return Err(BrowserError::Busy),
+        };
+        let left = RENDER_TIMEOUT.saturating_sub(started.elapsed());
+        // Waited so long there is no point starting: `timeout` fires before
+        // the first poll, so no Chrome is spawned only to be killed.
+        tokio::time::timeout(left, self.render_inner(url))
             .await
             .map_err(|_| BrowserError::Timeout)?
     }
@@ -223,6 +252,35 @@ mod tests {
         temp_env_var("SCOUT_CHROME", "/definitely/not/here", || {
             assert!(find_chrome().is_none());
         });
+    }
+
+    #[tokio::test]
+    async fn a_failed_render_hands_its_slot_back() {
+        // A leaked permit is worse than no limit at all: the renderer would
+        // work until the first failure and be wedged shut afterwards.
+        let renderer = Renderer::new(PathBuf::from("/definitely/not/chrome"));
+        assert!(renderer.render("https://example.com").await.is_err());
+        assert_eq!(renderer.slots.available_permits(), MAX_CONCURRENT_RENDERS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_render_with_no_slot_free_gives_up_rather_than_starting_another_chrome() {
+        // Each render is a Chrome process of a few hundred megabytes. Ten at
+        // once is several gigabytes, which is how this box runs out of memory
+        // rather than how it serves ten people.
+        let renderer = Renderer::new(PathBuf::from("/definitely/not/chrome"));
+        let held: Vec<_> = (0..MAX_CONCURRENT_RENDERS)
+            .map(|_| renderer.slots.try_acquire().expect("a free slot"))
+            .collect();
+        assert_eq!(renderer.slots.available_permits(), 0);
+
+        let err = renderer.render("https://example.com").await.unwrap_err();
+        assert!(matches!(err, BrowserError::Busy), "got: {err}");
+
+        drop(held);
+        // And the queue reopens the moment a slot frees, rather than staying
+        // shut because something counted wrong.
+        assert_eq!(renderer.slots.available_permits(), MAX_CONCURRENT_RENDERS);
     }
 
     /// Sets an env var for the duration of `f`. Tests run in threads, so this

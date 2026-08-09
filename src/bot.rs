@@ -31,6 +31,10 @@ pub struct App {
     /// Separate from `chats` so removing one user's session doesn't drop
     /// another user's ability to react to historical replies.
     pub replies: DashMap<i64, std::collections::VecDeque<(i32, String)>>,
+    /// Replies streaming right now, across every chat. Telegram's throughput
+    /// limit is per bot token rather than per chat, so progress edits pace
+    /// themselves against this rather than against their own chat alone.
+    pub streams: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// How many of the bot's own recent replies to keep per chat so reactions
@@ -633,7 +637,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
 
     let _typing = Typing::start(bot.clone(), chat_id);
 
-    let mut live = Live::new(bot.clone(), chat_id);
+    let mut live = Live::new(bot.clone(), chat_id, app.streams.clone());
     match run_agent(&app, &mut live, user_id, chat_id.0, &prompt).await {
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
@@ -832,7 +836,7 @@ async fn handle_reaction(
          short numbered list and ask which one to save. Do NOT call \
          record_purchase until they confirm."
     );
-    let mut live = Live::new(bot.clone(), chat_id);
+    let mut live = Live::new(bot.clone(), chat_id, app.streams.clone());
     match run_agent(&app, &mut live, user_id, chat_id.0, &prompt).await {
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {

@@ -2580,7 +2580,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(out.segments[0].also_considered.len(), 1, "the runner-up is priced too");
-        assert_eq!(out.segments[0].also_considered[0].flight_numbers, "CX270,CX500");
+        assert_eq!(
+            out.segments[0].also_considered[0].flight_numbers,
+            "CX270,CX500",
+            "the runner-up carried forward is the one that was parked, not the chosen one"
+        );
         assert_eq!(
             out.segments[0].also_considered[0].price_now,
             Some(820.0),

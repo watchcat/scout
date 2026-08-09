@@ -153,7 +153,13 @@ so a return is two segments. If they are undecided between flights, park each \
 with add_trip_option and decided=false rather than picking for them; several \
 options may sit on one segment and cost nothing extra. Quote a trip's prices \
 as of when each option was parked, never as a current total: they are stale \
-by construction and only finalising re-prices them.
+by construction and only finalising re-prices them. Finalising is the only \
+thing that produces current prices, and it costs a search per segment, so \
+call it when the trip is settled rather than to check on it. Present both \
+totals it returns and never drop the note about separate tickets: a link \
+per segment is a ticket per segment, and the traveller is carrying the risk \
+at every join. If the single-ticket total is missing, say that it is \
+missing — it is not evidence that separate booking is better.
 - If a booking fee is listed below, every flight price you are given \
 ALREADY includes it, and it is what the checkout will charge - quote the \
 numbers unchanged. Say once, in plain words, that prices include that \
@@ -623,8 +629,10 @@ pub fn build_agent(
             store: d.store.clone(),
             user_id,
             // One allowance and one memo per user request, like the search
-            // budget above.
-            budget: flights,
+            // budget above. Cloned, not moved: finalise_trip below shares
+            // this same allowance, so a request that searches and then
+            // finalises draws on one cap rather than two.
+            budget: flights.clone(),
             // Outlives the request: booking happens a turn later, when the
             // memo above is gone.
             shown: d.shown.clone(),
@@ -651,6 +659,18 @@ pub fn build_agent(
                 chat_id,
             });
         }
+        builder = builder.tool(crate::tools::trips::FinaliseTripTool {
+            store: d.store.clone(),
+            user_id,
+            duffel: d.duffel.clone(),
+            // Unlike FlightSearchTool, no per-user market wrapper: booking
+            // links are resolved by ignav_id, and Ignav rejects a market
+            // sent alongside one (measured: a 400
+            // conflicting_booking_lookup_mode).
+            ignav: d.ignav.clone(),
+            // The same allowance the search tool got: one request, one cap.
+            budget: flights.clone(),
+        });
     }
     // Duffel's hosted checkout: needs Duffel itself, Links enabled on the
     // account, and somewhere to send people back to. Registering it

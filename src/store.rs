@@ -608,6 +608,93 @@ impl Store {
             .collect::<duckdb::Result<_>>()?;
         ids.into_iter().map(|id| load_trip(&conn, id)).collect()
     }
+
+    /// Appends when `position` is None, otherwise inserts there and shifts the
+    /// rest down. Candidates move with their segment: they are keyed by
+    /// position, so a shift that forgot them would reattach somebody's chosen
+    /// flight to a different route.
+    pub fn add_segment(
+        &self,
+        trip_id: i64,
+        position: Option<i64>,
+        origin: &str,
+        destination: &str,
+        departure_date: &str,
+    ) -> Result<Trip> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM trip_segments WHERE trip_id = ?",
+            params![trip_id],
+            |row| row.get(0),
+        )?;
+        let at = match position {
+            Some(p) if p >= 1 && p <= count => p,
+            Some(p) if p == count + 1 => p,
+            Some(p) => anyhow::bail!(
+                "this trip has {count} segment(s), so position {p} is not somewhere to put one"
+            ),
+            None => count + 1,
+        };
+        if at <= count {
+            // Descending is not needed: DuckDB applies this set-wise, so no
+            // intermediate state can collide with the primary key.
+            conn.execute(
+                "UPDATE trip_segments SET position = position + 1
+                 WHERE trip_id = ? AND position >= ?",
+                params![trip_id, at],
+            )?;
+            conn.execute(
+                "UPDATE segment_candidates SET position = position + 1
+                 WHERE trip_id = ? AND position >= ?",
+                params![trip_id, at],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO trip_segments (trip_id, position, origin, destination, departure_date)
+             VALUES (?, ?, ?, ?, ?)",
+            params![trip_id, at, origin, destination, departure_date],
+        )?;
+        touch(&conn, trip_id)?;
+        load_trip(&conn, trip_id)
+    }
+
+    pub fn drop_segment(&self, trip_id: i64, position: i64) -> Result<Trip> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM trip_segments WHERE trip_id = ? AND position = ?",
+            params![trip_id, position],
+        )?;
+        if removed == 0 {
+            anyhow::bail!("this trip has no segment {position}");
+        }
+        conn.execute(
+            "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ?",
+            params![trip_id, position],
+        )?;
+        // Closing the gap keeps positions contiguous, which is the invariant
+        // that makes the shift above correct.
+        conn.execute(
+            "UPDATE trip_segments SET position = position - 1 WHERE trip_id = ? AND position > ?",
+            params![trip_id, position],
+        )?;
+        conn.execute(
+            "UPDATE segment_candidates SET position = position - 1
+             WHERE trip_id = ? AND position > ?",
+            params![trip_id, position],
+        )?;
+        touch(&conn, trip_id)?;
+        load_trip(&conn, trip_id)
+    }
+}
+
+/// Marks a trip edited. Status goes back to `planning` because whatever it
+/// was priced at no longer describes it.
+fn touch(conn: &Connection, trip_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE trips SET status = 'planning', updated_at = current_timestamp WHERE id = ?",
+        params![trip_id],
+    )?;
+    Ok(())
 }
 
 /// Reads one whole trip. Takes `&Connection` rather than `&Store` so it can
@@ -1062,5 +1149,45 @@ mod tests {
             trip.status, "finalised",
             "an upsert with nothing to change must not reset status"
         );
+    }
+
+    #[test]
+    fn segments_stay_contiguous_through_inserts_and_drops() {
+        // Positions are how the traveller refers to a segment ("drop the
+        // second leg"), so a hole would make every later instruction target
+        // the wrong row.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
+            store.add_segment(trip.id, None, o, d, date).unwrap();
+        }
+        let trip = store.add_segment(trip.id, Some(2), "BCN", "MAD", "2026-09-05").unwrap();
+        assert_eq!(
+            trip.segments.iter().map(|s| (s.position, s.origin.as_str())).collect::<Vec<_>>(),
+            vec![(1, "AMS"), (2, "BCN"), (3, "LIS")],
+            "inserting at 2 shifts the rest down rather than colliding"
+        );
+
+        let trip = store.drop_segment(trip.id, 1).unwrap();
+        assert_eq!(
+            trip.segments.iter().map(|s| (s.position, s.origin.as_str())).collect::<Vec<_>>(),
+            vec![(1, "BCN"), (2, "LIS")],
+            "dropping the first renumbers what is left from 1"
+        );
+
+        // A position nobody has is refused rather than silently doing nothing.
+        assert!(store.drop_segment(trip.id, 9).is_err());
+    }
+
+    #[test]
+    fn editing_a_trip_puts_it_back_to_planning() {
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
+        store.set_trip_status(trip.id, "finalised").unwrap();
+        assert_eq!(store.find_trip(7, "September").unwrap().unwrap().status, "finalised");
+
+        let trip = store.add_segment(trip.id, None, "LIS", "AMS", "2026-09-10").unwrap();
+        assert_eq!(trip.status, "planning", "the trip changed, so its pricing no longer describes it");
     }
 }

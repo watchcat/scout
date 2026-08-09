@@ -185,6 +185,134 @@ pub fn price_move(quoted: Option<f64>, now: Option<f64>) -> Option<f64> {
     Some(((now - quoted) * 100.0).round() / 100.0)
 }
 
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct PricedOption {
+    pub airline: String,
+    pub flight_numbers: String,
+    pub itinerary: String,
+    /// What it cost when it was parked. Never refreshed in the database —
+    /// refreshing it would make the movement below shrink to nothing every
+    /// time somebody looked.
+    pub quoted_price: Option<f64>,
+    pub quoted_currency: Option<String>,
+    pub price_now: Option<f64>,
+    pub moved: Option<f64>,
+    /// False when this itinerary is not sold on that date any more.
+    pub still_offered: bool,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct PricedSegment {
+    pub position: i64,
+    pub route: String,
+    pub departure_date: String,
+    pub chosen: PricedOption,
+    /// The options that were not taken, priced from the same search. They
+    /// cost nothing extra, and a decision made a week ago deserves checking
+    /// against what the alternatives cost today.
+    pub also_considered: Vec<PricedOption>,
+    /// Sellers, when the provider offers any. Empty for Duffel-sourced
+    /// segments while Duffel Links is disabled.
+    pub booking: Vec<crate::tools::ignav::BookingOption>,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct FinalisedTrip {
+    pub trip: String,
+    pub adults: i64,
+    pub segments: Vec<PricedSegment>,
+    pub separate_total: Option<f64>,
+    pub one_ticket_total: Option<f64>,
+    pub currency: Option<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FinaliseArgs {
+    pub trip: String,
+}
+
+/// The sum of the chosen options, or why there isn't one.
+///
+/// A total is only meaningful when every segment is priced and priced in the
+/// same currency. Forcing one out of mixed currencies would need a rate
+/// nobody supplied.
+pub fn separate_total(segments: &[PricedSegment]) -> Result<(f64, String), String> {
+    let mut currencies: Vec<String> = segments
+        .iter()
+        .filter_map(|s| s.chosen.quoted_currency.clone())
+        .collect();
+    currencies.sort();
+    currencies.dedup();
+    if currencies.len() > 1 {
+        return Err(format!(
+            "these segments are priced in {}, so there is no total to give without a \
+             conversion rate nobody has supplied",
+            currencies.join(" and ")
+        ));
+    }
+    let currency = currencies.pop().ok_or_else(|| "no segment states a currency".to_string())?;
+
+    let mut total = 0.0;
+    for segment in segments {
+        let price = segment.chosen.price_now.ok_or_else(|| {
+            format!(
+                "segment {} ({}) could not be priced now, so the trip has no total",
+                segment.position, segment.route
+            )
+        })?;
+        total += price;
+    }
+    Ok((((total * 100.0).round() / 100.0), currency))
+}
+
+/// What has to be said alongside the two totals.
+///
+/// These live in the tool's output rather than the preamble because the
+/// booking fee already proved the difference: a disclosure the model is told
+/// to make is one it sometimes doesn't.
+pub fn comparison_notes(
+    segment_count: usize,
+    separate: Option<f64>,
+    one_ticket: Option<f64>,
+    currency: &str,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if separate.is_some() {
+        notes.push(format!(
+            "booking these links means {segment_count} separate tickets: bags are collected \
+             and checked in again at every join, and if one leg runs late the next airline \
+             is not obliged to wait or to rebook you"
+        ));
+    }
+    match (separate, one_ticket) {
+        (Some(sep), Some(one)) => {
+            let gap = ((one - sep) * 100.0).round() / 100.0;
+            notes.push(match gap > 0.0 {
+                true => format!(
+                    "one ticket costs {gap:.2} {currency} more than booking separately, and \
+                     that is what the protection above is worth"
+                ),
+                false => format!(
+                    "one ticket is {} {currency} cheaper than booking separately, and carries \
+                     the protection as well",
+                    gap.abs()
+                ),
+            });
+        }
+        // A missing comparison must never read as a verdict for separate
+        // booking — that silence is exactly what would cost somebody money.
+        (_, None) => notes.push(
+            "the single-ticket comparison could not be made, so nothing here says whether \
+             booking the whole trip on one ticket would be better — this is a missing \
+             answer, not an argument for separate bookings"
+                .to_string(),
+        ),
+        _ => {}
+    }
+    notes
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AddSegmentArgs {
     pub trip: String,
@@ -1437,6 +1565,59 @@ mod tests {
         // Rounded to the cent: a float subtraction otherwise reports
         // 12.999999999999986.
         assert_eq!(price_move(Some(118.01), Some(131.0)), Some(12.99));
+    }
+
+    fn priced(price: Option<f64>, currency: &str) -> PricedSegment {
+        PricedSegment {
+            position: 1,
+            route: "AMS→LIS".to_string(),
+            departure_date: "2026-09-03".to_string(),
+            chosen: PricedOption {
+                airline: "TAP".to_string(),
+                flight_numbers: "TP675".to_string(),
+                itinerary: "AMS 10:05 ✈ LIS 12:15".to_string(),
+                quoted_price: Some(118.0),
+                quoted_currency: Some(currency.to_string()),
+                price_now: price,
+                moved: None,
+                still_offered: price.is_some(),
+            },
+            also_considered: Vec::new(),
+            booking: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_total_is_only_produced_when_every_segment_agrees_on_a_currency() {
+        let same = vec![priced(Some(131.0), "EUR"), priced(Some(200.0), "EUR")];
+        assert_eq!(separate_total(&same), Ok((331.0, "EUR".to_string())));
+
+        // Inventing a rate here would be the same class of error as doing
+        // arithmetic on two local departure times.
+        let mixed = vec![priced(Some(131.0), "EUR"), priced(Some(200.0), "USD")];
+        let problem = separate_total(&mixed).unwrap_err();
+        assert!(problem.contains("EUR"), "got: {problem}");
+        assert!(problem.contains("USD"), "got: {problem}");
+
+        // A segment nobody can price now has no total either.
+        let gone = vec![priced(Some(131.0), "EUR"), priced(None, "EUR")];
+        assert!(separate_total(&gone).is_err());
+    }
+
+    #[test]
+    fn a_separate_total_never_travels_without_what_it_costs_the_traveller() {
+        // Four links is four tickets: bags collected and re-checked at every
+        // join, and nobody obliged to rebook you when a leg is late.
+        let notes = comparison_notes(3, Some(770.0), Some(812.0), "EUR");
+        let joined = notes.join(" ");
+        assert!(joined.contains("3 separate"), "got: {joined}");
+        assert!(joined.to_lowercase().contains("late"), "got: {joined}");
+
+        // And an absent comparison says why, rather than letting the separate
+        // total look like a verdict.
+        let notes = comparison_notes(3, Some(770.0), None, "EUR");
+        let joined = notes.join(" ");
+        assert!(joined.contains("could not"), "got: {joined}");
     }
 
     #[tokio::test]

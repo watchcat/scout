@@ -164,7 +164,11 @@ and the reason says which segment is missing what, and when it is absent \
 the trip is complete. Say what it says. If a call failed, the trip did NOT \
 change - do not report a leg as parked because you meant to park it, and do \
 not summarise a trip you have not seen this turn; call show_trip and read it \
-back. A segment is one direction on one date, \
+back. When you make several edits in one turn, trust each call's own \
+'changed' line over the trip snapshot beside it: a snapshot is from the \
+moment that call ran, so an earlier one does not show a later edit and that \
+is not a failure. Believe the last snapshot, or call show_trip once at the \
+end. A segment is one direction on one date, \
 so a return is two segments. If they are undecided between flights, park each \
 with add_trip_option and decided=false rather than picking for them; several \
 options may sit on one segment and cost nothing extra. Quote a trip's prices \

@@ -706,7 +706,7 @@ impl Store {
         origin: Option<&str>,
         destination: Option<&str>,
         departure_date: Option<&str>,
-    ) -> Result<(Trip, usize)> {
+    ) -> Result<(Trip, usize, bool)> {
         let conn = self.conn.lock().unwrap();
         let current = conn
             .query_row(
@@ -729,7 +729,9 @@ impl Store {
             departure_date.unwrap_or(&current.2).to_string(),
         );
         if wanted == current {
-            return Ok((load_trip(&conn, trip_id)?, 0));
+            // Asking for what is already true is not a failure, and the
+            // caller has to be able to tell the two apart.
+            return Ok((load_trip(&conn, trip_id)?, 0, false));
         }
 
         conn.execute(
@@ -742,7 +744,7 @@ impl Store {
             params![trip_id, position],
         )?;
         touch(&conn, trip_id)?;
-        Ok((load_trip(&conn, trip_id)?, dropped))
+        Ok((load_trip(&conn, trip_id)?, dropped, true))
     }
 
     pub fn drop_segment(&self, trip_id: i64, position: i64) -> Result<Trip> {
@@ -1865,8 +1867,9 @@ mod tests {
             )
             .unwrap();
 
-        let (trip, dropped) =
+        let (trip, dropped, changed) =
             store.update_segment(trip.id, 1, None, None, Some("2026-09-26")).unwrap();
+        assert!(changed);
         assert_eq!(trip.segments[0].departure_date, "2026-09-26");
         assert_eq!(dropped, 1, "an option for the 27th is not an option for the 26th");
         assert!(
@@ -1897,8 +1900,9 @@ mod tests {
             )
             .unwrap();
 
-        let (trip, dropped) =
+        let (trip, dropped, changed) =
             store.update_segment(trip.id, 1, Some("HND"), None, Some("2026-09-27")).unwrap();
+        assert!(!changed, "nothing differed, so nothing was written");
         assert_eq!(dropped, 0);
         assert_eq!(trip.segments[0].candidates.len(), 1, "nothing changed, so nothing is lost");
 

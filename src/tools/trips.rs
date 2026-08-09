@@ -139,6 +139,15 @@ pub struct TripView {
     /// assert "all four are booked" in the same breath as data saying
     /// segment 2 has no flight on it.
     pub not_ready: Option<String>,
+    /// What the call that produced this view actually did.
+    ///
+    /// The trip below is a snapshot, and when a turn makes two edits the
+    /// first call's snapshot legitimately predates the second call's write.
+    /// Reading it made the bot announce that an edit had not taken effect
+    /// when it had. A call is never stale about its own change, so it says
+    /// so here — and says so distinctly when there was nothing to change,
+    /// which is not a failure either.
+    pub changed: Option<String>,
     pub notes: Vec<String>,
 }
 
@@ -149,7 +158,12 @@ impl TripView {
             .err()
             .or_else(|| dates_run_forwards(&trip.segments).err());
         let notes = itinerary_notes(&trip.segments);
-        Self { trip, not_ready, notes }
+        Self { trip, not_ready, changed: None, notes }
+    }
+
+    /// The same view, with a note of what this call did to get it.
+    fn after(trip: Trip, changed: String) -> Self {
+        Self { changed: Some(changed), ..Self::of(trip) }
     }
 }
 
@@ -1012,7 +1026,30 @@ impl Tool for AddTripOptionTool {
         .map_err(internal)?
         .map_err(internal)?;
 
-        let mut view = TripView::of(trip);
+        let parked = trip
+            .segments
+            .iter()
+            .find(|s| s.position == position)
+            .and_then(|s| s.candidates.last().map(|c| (s, c)))
+            .map_or_else(
+                || format!("segment {position}"),
+                |(s, c)| {
+                    format!(
+                        "option {} on segment {} ({}→{}): {} {}{}",
+                        c.candidate,
+                        s.position,
+                        s.origin,
+                        s.destination,
+                        c.airline,
+                        c.flight_numbers,
+                        match c.chosen {
+                            true => ", chosen",
+                            false => ", still undecided",
+                        }
+                    )
+                },
+            );
+        let mut view = TripView::after(trip, parked);
         if date_unchecked {
             // Reported rather than swallowed: an itinerary that looks
             // entirely correct is exactly the failure mode the date guard
@@ -1076,13 +1113,20 @@ impl Tool for ChooseTripOptionTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
         let user_id = self.user_id;
+        let (chosen_position, chosen_candidate) = (args.position, args.candidate);
         tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
             let trip = find_trip_or_list(&store, user_id, &args.trip)?;
             store.choose_candidate(trip.id, args.position, args.candidate).map_err(lost_trip_race)
         })
         .await
         .map_err(internal)?
-        .map(TripView::of)
+        .map(|trip| {
+            let said = format!(
+                "option {} is now the choice on segment {}",
+                chosen_candidate, chosen_position
+            );
+            TripView::after(trip, said)
+        })
         .map_err(internal)
     }
 }
@@ -1214,7 +1258,7 @@ impl Tool for UpdateTripSegmentTool {
 
         let store = self.store.clone();
         let user_id = self.user_id;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<(Trip, usize)> {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(Trip, usize, bool)> {
             let trip = find_trip_or_list(&store, user_id, &args.trip)?;
             store
                 .update_segment(
@@ -1228,8 +1272,22 @@ impl Tool for UpdateTripSegmentTool {
         })
         .await
         .map_err(internal)?
-        .map(|(trip, dropped)| {
-            let mut view = TripView::of(trip);
+        .map(|(trip, dropped, changed)| {
+            let at = trip.segments.iter().find(|s| s.position == args.position);
+            let now = at.map_or_else(
+                || format!("segment {}", args.position),
+                |s| {
+                    format!(
+                        "segment {} is {}→{} on {}",
+                        s.position, s.origin, s.destination, s.departure_date
+                    )
+                },
+            );
+            let said = match changed {
+                true => now,
+                false => format!("{now} already — nothing to change"),
+            };
+            let mut view = TripView::after(trip, said);
             if dropped > 0 {
                 // Said out loud rather than left for the traveller to notice
                 // a shortlist had quietly emptied.
@@ -2060,6 +2118,73 @@ mod tests {
             "a shortlist must not empty silently: {:?}",
             view.notes
         );
+    }
+
+    #[tokio::test]
+    async fn an_edit_says_what_it_did_so_a_stale_snapshot_cannot_read_as_failure() {
+        // Reported in production: asked to shift two legs by a day, the bot
+        // announced "the second update didn't take effect". Two edits in one
+        // turn hand back two trip snapshots, and the earlier call's snapshot
+        // legitimately predates the later call's write — read it and the
+        // later edit looks lost. A call reporting its own change is never
+        // stale about that change.
+        let (store, _d) = setup();
+        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        for (o, d, date) in [("OKA", "HND", "2026-09-21"), ("HND", "AMS", "2026-09-25")] {
+            add.call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: o.into(),
+                destination: d.into(),
+                departure_date: date.into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        }
+        let update = UpdateTripSegmentTool { store, user_id: 7 };
+
+        let first = update
+            .call(UpdateSegmentArgs {
+                trip: "Japan".into(),
+                position: 1,
+                origin: None,
+                destination: None,
+                departure_date: Some("2026-09-22".into()),
+            })
+            .await
+            .unwrap();
+        let said = first.changed.expect("an edit must say what it changed");
+        assert!(said.contains("segment 1") && said.contains("2026-09-22"), "got: {said}");
+
+        let second = update
+            .call(UpdateSegmentArgs {
+                trip: "Japan".into(),
+                position: 2,
+                origin: None,
+                destination: None,
+                departure_date: Some("2026-09-26".into()),
+            })
+            .await
+            .unwrap();
+        let said = second.changed.expect("and so must the second");
+        assert!(said.contains("segment 2") && said.contains("2026-09-26"), "got: {said}");
+
+        // Asking for what is already true is not a failure, and must not
+        // read as one either.
+        let again = update
+            .call(UpdateSegmentArgs {
+                trip: "Japan".into(),
+                position: 2,
+                origin: None,
+                destination: None,
+                departure_date: Some("2026-09-26".into()),
+            })
+            .await
+            .unwrap();
+        let said = again.changed.expect("a no-op still reports");
+        assert!(said.contains("already"), "a no-op is not a failure: {said}");
     }
 
     #[tokio::test]

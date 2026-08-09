@@ -5,7 +5,11 @@
 //! outlives the conversation that made it, so a trip holds the itinerary —
 //! airports, dates, flight numbers — and finalisation re-prices it.
 
-use crate::store::{TripCandidate, TripSegment};
+use crate::store::{Store, Trip, TripCandidate, TripSegment};
+use crate::tools::purchases::{internal, StoreToolError};
+use rig::tool::Tool;
+use serde::Deserialize;
+use serde_json::json;
 
 /// Less than this between landing and the next departure is the shape of an
 /// itinerary somebody misses.
@@ -109,10 +113,181 @@ pub fn dates_run_forwards(segments: &[TripSegment]) -> Result<(), String> {
     Ok(())
 }
 
+/// What every trip tool hands back: the trip in full, plus anything worth
+/// saying about it. The notes travel in the output rather than the preamble
+/// for the reason the booking fee taught — a disclosure the model is *told*
+/// to make is a disclosure it sometimes doesn't.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct TripView {
+    pub trip: Trip,
+    pub notes: Vec<String>,
+}
+
+impl TripView {
+    fn of(trip: Trip) -> Self {
+        let notes = itinerary_notes(&trip.segments);
+        Self { trip, notes }
+    }
+}
+
+/// Duffel and Ignav both take IATA codes only; "Amsterdam" is a 422 and a
+/// wasted search fee, so it is rejected at the point it is typed.
+fn iata(label: &str, value: &str) -> Result<String, StoreToolError> {
+    let code = value.trim();
+    match code.len() == 3 && code.chars().all(|c| c.is_ascii_alphabetic()) {
+        true => Ok(code.to_ascii_uppercase()),
+        false => Err(StoreToolError(format!(
+            "{label} must be a 3-letter IATA airport or city code (AMS, LHR, NYC), not {value:?}"
+        ))),
+    }
+}
+
+fn calendar_date(value: &str) -> Result<String, StoreToolError> {
+    let date = value.trim();
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|_| StoreToolError(format!("departure_date must be YYYY-MM-DD, not {value:?}")))?;
+    Ok(date.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddSegmentArgs {
+    pub trip: String,
+    pub origin: String,
+    pub destination: String,
+    pub departure_date: String,
+    #[serde(default)]
+    pub position: Option<i64>,
+    #[serde(default)]
+    pub adults: Option<i64>,
+    #[serde(default)]
+    pub cabin_class: Option<String>,
+}
+
+pub struct AddTripSegmentTool {
+    pub store: Store,
+    pub user_id: i64,
+}
+
+impl Tool for AddTripSegmentTool {
+    const NAME: &'static str = "add_trip_segment";
+    type Error = StoreToolError;
+    type Args = AddSegmentArgs;
+    type Output = TripView;
+
+    fn description(&self) -> String {
+        "Add one flight leg to a named trip, creating the trip if that name is \
+         new. Use this to build a multi-city itinerary the traveller is \
+         planning across several messages. A segment is one direction on one \
+         date: a return is two segments. Airports are 3-letter IATA codes, \
+         dates are YYYY-MM-DD. Segments are numbered from 1 in travel order; \
+         pass position to insert rather than append."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "trip": {"type": "string", "description": "what the traveller calls this trip; a new name starts a new trip"},
+                "origin": {"type": "string", "description": "3-letter IATA code"},
+                "destination": {"type": "string", "description": "3-letter IATA code"},
+                "departure_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "position": {"type": "integer", "description": "insert at this 1-based position; omit to append"},
+                "adults": {"type": "integer", "description": "passengers for the whole trip, default 1"},
+                "cabin_class": {"type": "string", "description": "economy, premium_economy, business or first, for the whole trip"}
+            },
+            "required": ["trip", "origin", "destination", "departure_date"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Validated before anything is written, so a mistyped code cannot
+        // leave a half-built trip behind.
+        let origin = iata("origin", &args.origin)?;
+        let destination = iata("destination", &args.destination)?;
+        if origin == destination {
+            return Err(StoreToolError(format!(
+                "origin and destination are both {origin}; a flight needs two different places"
+            )));
+        }
+        let date = calendar_date(&args.departure_date)?;
+
+        let store = self.store.clone();
+        let user_id = self.user_id;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
+            let trip = store.upsert_trip(
+                user_id,
+                &args.trip,
+                args.adults,
+                args.cabin_class.as_deref(),
+            )?;
+            store.add_segment(trip.id, args.position, &origin, &destination, &date)
+        })
+        .await
+        .map_err(internal)?
+        .map(TripView::of)
+        .map_err(internal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{TripCandidate, TripSegment};
+    use crate::store::{Store, TripCandidate, TripSegment};
+    use rig::tool::Tool;
+    use tempfile::TempDir;
+
+    fn setup() -> (Store, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.duckdb")).unwrap();
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn adding_a_segment_creates_the_trip_and_returns_all_of_it() {
+        // Returning the whole trip is the mitigation for several named trips:
+        // editing "Setpember" comes back as an unfamiliar one-segment trip, in
+        // the reply, where the traveller sees it.
+        let (store, _d) = setup();
+        let tool = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let trip = tool
+            .call(AddSegmentArgs {
+                trip: "September".into(),
+                origin: "ams".into(),
+                destination: "lis".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: Some(2),
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(trip.trip.name, "September");
+        assert_eq!(trip.trip.adults, 2);
+        assert_eq!(trip.trip.segments.len(), 1);
+        assert_eq!(trip.trip.segments[0].origin, "AMS", "codes are normalised on the way in");
+        assert_eq!(trip.trip.segments[0].destination, "LIS");
+    }
+
+    #[tokio::test]
+    async fn a_bad_airport_code_is_refused_before_anything_is_written() {
+        let (store, _d) = setup();
+        let tool = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let err = tool
+            .call(AddSegmentArgs {
+                trip: "September".into(),
+                origin: "Amsterdam".into(),
+                destination: "LIS".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("IATA"), "got: {err}");
+        assert!(store.find_trip(7, "September").unwrap().is_none(), "nothing was created");
+    }
 
     fn segment(position: i64, origin: &str, destination: &str, date: &str) -> TripSegment {
         TripSegment {

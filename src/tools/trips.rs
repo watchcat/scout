@@ -313,6 +313,49 @@ pub fn comparison_notes(
     notes
 }
 
+/// Each segment paired with the option that will be priced, or why the trip
+/// is not ready.
+///
+/// A segment holding exactly one undecided option needs no decision: it is
+/// the pick by elimination. Two or more without one is a question, so the
+/// refusal lists them and asks it.
+pub fn ready_to_price(segments: &[TripSegment]) -> Result<Vec<(&TripSegment, &TripCandidate)>, String> {
+    if segments.is_empty() {
+        return Err("this trip has no segments yet, so there is nothing to price".to_string());
+    }
+    let mut ready = Vec::new();
+    for segment in segments {
+        let chosen = match segment.candidates.iter().find(|c| c.chosen) {
+            Some(chosen) => chosen,
+            None => match segment.candidates.as_slice() {
+                [] => {
+                    return Err(format!(
+                        "segment {} ({}→{} on {}) has no flight on it yet — search that route \
+                         and add one before pricing the trip",
+                        segment.position, segment.origin, segment.destination, segment.departure_date
+                    ))
+                }
+                [only] => only,
+                many => {
+                    let options: Vec<String> =
+                        many.iter().map(|c| format!("{} ({})", c.candidate, c.flight_numbers)).collect();
+                    return Err(format!(
+                        "segment {} ({}→{}) still has {} options and none chosen: {}. \
+                         Ask which one before pricing the trip.",
+                        segment.position,
+                        segment.origin,
+                        segment.destination,
+                        many.len(),
+                        options.join(", ")
+                    ));
+                }
+            },
+        };
+        ready.push((segment, chosen));
+    }
+    Ok(ready)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AddSegmentArgs {
     pub trip: String,
@@ -1618,6 +1661,49 @@ mod tests {
         let notes = comparison_notes(3, Some(770.0), None, "EUR");
         let joined = notes.join(" ");
         assert!(joined.contains("could not"), "got: {joined}");
+    }
+
+    #[test]
+    fn a_trip_that_cannot_be_priced_is_refused_before_anything_is_bought() {
+        use crate::store::TripSegment as Seg;
+
+        let empty = vec![Seg {
+            position: 1,
+            origin: "AMS".into(),
+            destination: "NRT".into(),
+            departure_date: "2026-09-03".into(),
+            candidates: vec![],
+        }];
+        let problem = ready_to_price(&empty).unwrap_err();
+        assert!(problem.contains("segment 1"), "got: {problem}");
+        assert!(problem.contains("no flight"), "got: {problem}");
+
+        // Two options and no decision is a question, so the refusal asks it.
+        let mut undecided = empty.clone();
+        undecided[0].candidates = vec![
+            TripCandidate { candidate: 1, chosen: false, ..parked("KL861", 940.0) },
+            TripCandidate { candidate: 2, chosen: false, ..parked("CX270,CX500", 780.0) },
+        ];
+        let problem = ready_to_price(&undecided).unwrap_err();
+        assert!(problem.contains("KL861"), "the options are listed: {problem}");
+        assert!(problem.contains("CX270,CX500"), "got: {problem}");
+
+        // One option and no decision is the pick by elimination. Demanding a
+        // choice nobody has is ceremony.
+        let mut lone = empty.clone();
+        lone[0].candidates = vec![TripCandidate { candidate: 1, chosen: false, ..parked("KL861", 940.0) }];
+        assert!(ready_to_price(&lone).is_ok());
+
+        let mut decided = undecided.clone();
+        decided[0].candidates[1].chosen = true;
+        let chosen = ready_to_price(&decided).unwrap();
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].1.flight_numbers, "CX270,CX500");
+    }
+
+    #[test]
+    fn a_trip_with_no_segments_is_refused() {
+        assert!(ready_to_price(&[]).is_err());
     }
 
     #[tokio::test]

@@ -1383,6 +1383,76 @@ mod tests {
     }
 
     #[test]
+    fn a_shifted_segment_keeps_its_own_options() {
+        // segment_candidates is keyed by (trip_id, position), the same way
+        // trip_segments is — so a shift that moved segments but not their
+        // candidates would silently reattach somebody's chosen flight to a
+        // different route while the trip still looked perfectly well-formed.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        for (o, d, date) in [
+            ("AMS", "NRT", "2026-09-03"),
+            ("NRT", "OSA", "2026-09-10"),
+            ("OSA", "AMS", "2026-09-17"),
+        ] {
+            store.add_segment(trip.id, None, o, d, date).unwrap();
+        }
+        // One chosen candidate per segment, identifiable by flight number.
+        store.add_candidate(trip.id, 1, candidate("KLM", "KL861", 940.0), true).unwrap();
+        store.add_candidate(trip.id, 2, candidate("ANA", "NH2001", 210.0), true).unwrap();
+        store.add_candidate(trip.id, 3, candidate("KLM", "KL862", 980.0), true).unwrap();
+
+        // Insert a new segment at position 1: AMS-NRT, NRT-OSA, OSA-AMS all
+        // shift down one.
+        let trip = store.add_segment(trip.id, Some(1), "AMS", "HEL", "2026-09-02").unwrap();
+        let by_route: Vec<(String, String, Vec<String>)> = trip
+            .segments
+            .iter()
+            .map(|s| {
+                (
+                    s.origin.clone(),
+                    s.destination.clone(),
+                    s.candidates.iter().map(|c| c.flight_numbers.clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_route,
+            vec![
+                ("AMS".to_string(), "HEL".to_string(), vec![]),
+                ("AMS".to_string(), "NRT".to_string(), vec!["KL861".to_string()]),
+                ("NRT".to_string(), "OSA".to_string(), vec!["NH2001".to_string()]),
+                ("OSA".to_string(), "AMS".to_string(), vec!["KL862".to_string()]),
+            ],
+            "each segment's chosen flight must move with its own route, not stay pinned to its old position"
+        );
+
+        // Now drop a middle segment (NRT-OSA, now at position 3) and check
+        // again: the remaining segments must still carry their own options.
+        let trip = store.drop_segment(trip.id, 3).unwrap();
+        let by_route: Vec<(String, String, Vec<String>)> = trip
+            .segments
+            .iter()
+            .map(|s| {
+                (
+                    s.origin.clone(),
+                    s.destination.clone(),
+                    s.candidates.iter().map(|c| c.flight_numbers.clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_route,
+            vec![
+                ("AMS".to_string(), "HEL".to_string(), vec![]),
+                ("AMS".to_string(), "NRT".to_string(), vec!["KL861".to_string()]),
+                ("OSA".to_string(), "AMS".to_string(), vec!["KL862".to_string()]),
+            ],
+            "after closing the gap each surviving segment must still carry its own chosen flight, not a neighbour's"
+        );
+    }
+
+    #[test]
     fn the_bounds_error_reads_correctly_with_exactly_one_segment() {
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "September", None, None).unwrap();

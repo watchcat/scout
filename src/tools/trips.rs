@@ -31,7 +31,17 @@ pub fn itinerary_notes(segments: &[TripSegment]) -> Vec<String> {
             continue;
         }
         if let Some(minutes) = turnaround_minutes(before, after) {
-            if (0..TIGHT_TURNAROUND_MINUTES).contains(&minutes) {
+            if minutes < 0 {
+                // Same airport, so these times are comparable, and the next
+                // departure is before the previous arrival. No schedule
+                // makes that flyable — say so plainly rather than as a
+                // negative number of minutes, which would read as a typo.
+                notes.push(format!(
+                    "segment {} is scheduled to leave before segment {} lands — this \
+                     itinerary cannot be flown as written",
+                    after.position, before.position
+                ));
+            } else if minutes < TIGHT_TURNAROUND_MINUTES {
                 notes.push(format!(
                     "only {}h {:02}m at {} between segment {} landing and segment {} leaving",
                     minutes / 60,
@@ -75,6 +85,12 @@ fn taken(segment: &TripSegment) -> Option<&TripCandidate> {
 
 /// Dates must run forwards before an itinerary can be priced as one ticket.
 /// Equal dates are fine: a same-day connection is an ordinary thing.
+///
+/// Assumes every `departure_date` is zero-padded `YYYY-MM-DD` — the one
+/// shape under which comparing them as text agrees with comparing them as
+/// dates. That is enforced at the tool boundary before a segment is ever
+/// stored, not here, so a caller that bypasses it gets a wrong answer
+/// instead of an error.
 pub fn dates_run_forwards(segments: &[TripSegment]) -> Result<(), String> {
     for pair in segments.windows(2) {
         // ISO dates compare correctly as text, which is the one place that
@@ -165,6 +181,29 @@ mod tests {
         // Comfortable, so nothing to say.
         segments[1].candidates = vec![chosen("TP830", "2026-09-03T22:00:00", "2026-09-03T19:30:00")];
         assert!(itinerary_notes(&segments).is_empty());
+    }
+
+    #[test]
+    fn a_turnaround_that_leaves_before_it_lands_is_impossible_not_tight() {
+        // Same airport, so these times really are comparable, and the next
+        // flight leaves 2.5 hours before the previous one lands. That is a
+        // different problem from a tight connection and must not be
+        // silently swallowed by a range check that only looks at positive
+        // minutes.
+        let mut segments = vec![
+            segment(1, "AMS", "LIS", "2026-09-03"),
+            segment(2, "LIS", "FCO", "2026-09-03"),
+        ];
+        segments[0].candidates = vec![chosen("TP675", "2026-09-03T14:00:00", "2026-09-03T10:05:00")];
+        segments[1].candidates = vec![chosen("TP830", "2026-09-03T16:00:00", "2026-09-03T11:30:00")];
+        let notes = itinerary_notes(&segments);
+        assert_eq!(notes.len(), 1, "got: {notes:?}");
+        assert!(notes[0].contains("cannot be flown"), "got: {}", notes[0]);
+        assert!(
+            !notes[0].contains("only"),
+            "an impossible connection must not read as a merely tight one: {}",
+            notes[0]
+        );
     }
 
     #[test]

@@ -481,8 +481,65 @@ fn capitalize(s: &str) -> String {
 /// The system prompt plus the user's long-term profile. Injecting facts here
 /// (instead of behind a recall tool) means the agent can never forget to
 /// check them.
-pub fn preamble_with_profile(facts: &[(String, String)], markup_rate: f64) -> String {
-    let mut p = PREAMBLE.to_string();
+/// The conditional tools this agent actually gets, for the preamble.
+///
+/// Derived from the same `is_some()` checks that register them below, so a
+/// rule cannot outlive its tool. Getting this wrong is not a cosmetic
+/// problem: the model reads the preamble, calls what it describes, and the
+/// whole request dies with `UnknownToolCall`.
+fn available_tools(d: &AgentDeps) -> Vec<&'static str> {
+    ALL_TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| match *tool {
+            "search_bol" => d.bol.is_some(),
+            "search_flights" | "finalise_trip" => d.duffel.is_some() || d.ignav.is_some(),
+            // A name in ALL_TOOLS with no arm here is a rule that would
+            // never be shown; `every_conditional_rule_is_wired_up` catches
+            // the reverse, a rule with no name.
+            _ => false,
+        })
+        .collect()
+}
+
+/// Every tool the preamble may describe, for callers that have them all.
+pub const ALL_TOOLS: &[&str] = &["search_bol", "search_flights", "finalise_trip"];
+
+/// Drops the rules for tools this agent was not given.
+///
+/// A rule opening "When `<tool>` is available," is exactly and only about
+/// that tool, so it goes when the tool does. Without this the preamble
+/// advertises whatever the const happens to mention and the model calls it:
+/// measured twice in production, `UnknownToolCall: search_flights` when the
+/// tool was gated on Duffel alone, and `UnknownToolCall: search_bol` on an
+/// install with no bol.com credentials, which cost a user their answer for
+/// a glasses wipe kit.
+///
+/// The conditional phrasing was already there. It was addressed to the
+/// model, which cannot check, rather than to the code, which can.
+fn rules_for_available_tools(preamble: &str, available: &[&str]) -> String {
+    preamble
+        .split("\n- ")
+        .enumerate()
+        .filter(|(i, rule)| {
+            // The head is the intro, not a rule.
+            *i == 0
+                || rule
+                    .strip_prefix("When ")
+                    .and_then(|r| r.split_once(" is available,"))
+                    .is_none_or(|(tool, _)| available.contains(&tool))
+        })
+        .map(|(_, rule)| rule)
+        .collect::<Vec<_>>()
+        .join("\n- ")
+}
+
+pub fn preamble_with_profile(
+    facts: &[(String, String)],
+    markup_rate: f64,
+    available: &[&str],
+) -> String {
+    let mut p = rules_for_available_tools(PREAMBLE, available);
     if !facts.is_empty() {
         p.push_str("\n\nKnown about this user (long-term profile):\n");
         for (key, value) in facts.iter().take(MAX_PROFILE_FACTS) {
@@ -541,7 +598,7 @@ pub fn wrap_up_agent(
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     d.llm
         .agent(MODEL)
-        .preamble(&preamble_with_profile(facts, markup_rate(d)))
+        .preamble(&preamble_with_profile(facts, markup_rate(d), &available_tools(d)))
         .default_max_turns(1)
         .build()
 }
@@ -599,7 +656,7 @@ pub fn build_agent(
     let mut builder = d
         .llm
         .agent(MODEL)
-        .preamble(&preamble_with_profile(facts, markup_rate(d)))
+        .preamble(&preamble_with_profile(facts, markup_rate(d), &available_tools(d)))
         .tool(WebSearchTool {
             kagi: d.kagi.clone(),
             perplexity: d.perplexity.clone(),
@@ -724,13 +781,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_conditional_rule_is_wired_up() {
+        // The guard against a third UnknownToolCall. Adding a rule that
+        // opens "When <tool> is available," without listing the tool in
+        // ALL_TOOLS would leave it permanently visible — described to the
+        // model whether or not the tool exists, which is the bug this all
+        // came from.
+        for rule in PREAMBLE.split("\n- ").skip(1) {
+            if let Some((tool, _)) =
+                rule.strip_prefix("When ").and_then(|r| r.split_once(" is available,"))
+            {
+                assert!(
+                    ALL_TOOLS.contains(&tool),
+                    "the preamble offers {tool:?} conditionally but nothing decides whether \
+                     it is there; add it to ALL_TOOLS and to available_tools"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_preamble_never_describes_a_tool_this_agent_lacks() {
+        // Measured twice in production: `UnknownToolCall: search_flights`
+        // when the tool was gated on Duffel alone, and `UnknownToolCall:
+        // search_bol` on an install with no bol.com credentials — that one
+        // cost a user their answer for a glasses wipe kit. The preamble said
+        // "When search_bol is available", which asks the model to check
+        // something only the code can know.
+        let without_bol: Vec<&str> =
+            ALL_TOOLS.iter().copied().filter(|t| *t != "search_bol").collect();
+        let p = preamble_with_profile(&[], 0.0, &without_bol);
+        assert!(!p.contains("search_bol"), "an absent tool is not mentioned at all");
+        assert!(p.contains("search_flights"), "the ones it does have stay");
+        assert!(p.contains("compare_prices"), "and so do the unconditional rules");
+
+        // With everything, nothing is lost.
+        let all = preamble_with_profile(&[], 0.0, ALL_TOOLS);
+        assert!(all.contains("search_bol") && all.contains("search_flights"));
+
+        // The rule really is dropped whole, not just its first line.
+        // The whole rule goes, not just the sentence naming the tool.
+        assert!(!p.contains("Search it in Dutch"), "the rest of the rule went too: {p}");
+        // But an unconditional rule that merely mentions the shop stays —
+        // bol.com pages still arrive through ordinary web search.
+        assert!(p.contains("the page text is not"), "the stock rule is untouched");
+    }
+
+    #[test]
     fn the_booking_fee_is_stated_in_the_preamble_when_one_is_charged() {
         // The rule above tells the model prices "already include it", which
         // is only actionable if the preamble says what it is.
-        let free = preamble_with_profile(&[], 0.0);
+        let free = preamble_with_profile(&[], 0.0, ALL_TOOLS);
         assert!(!free.contains("Booking fee"), "no fee, no line");
 
-        let charged = preamble_with_profile(&[], 0.03);
+        let charged = preamble_with_profile(&[], 0.03, ALL_TOOLS);
         assert!(charged.contains("Booking fee"), "got: {charged}");
         assert!(charged.contains("3%"), "stated as a percentage, got: {charged}");
     }
@@ -755,7 +859,7 @@ mod tests {
 
     #[test]
     fn profile_is_appended_when_present() {
-        let plain = preamble_with_profile(&[], 0.0);
+        let plain = preamble_with_profile(&[], 0.0, ALL_TOOLS);
         assert!(plain.starts_with(PREAMBLE));
         // with nothing known, the only search language is English
         assert!(plain.contains("Search languages for this user: English."));
@@ -765,7 +869,7 @@ mod tests {
             ("delivery_country".to_string(), "NL".to_string()),
             ("shoe_size".to_string(), "44".to_string()),
         ];
-        let with = preamble_with_profile(&facts, 0.0);
+        let with = preamble_with_profile(&facts, 0.0, ALL_TOOLS);
         assert!(with.starts_with(PREAMBLE));
         assert!(with.contains("- delivery_country: NL"));
         assert!(with.contains("- shoe_size: 44"));
@@ -844,19 +948,19 @@ mod tests {
         let p = preamble_with_profile(&facts(&[(
             "favourite_shops",
             "123schoon.nl:cleaning products, bol.com",
-        )]), 0.0);
+        )]), 0.0, ALL_TOOLS);
         assert!(p.contains("- 123schoon.nl: cleaning products"), "got: {p}");
         assert!(p.contains("- bol.com: any product"), "got: {p}");
 
         // Nothing listed, nothing said: the rule must not invite a site:
         // query at a shop the user never named.
-        let none = preamble_with_profile(&[], 0.0);
+        let none = preamble_with_profile(&[], 0.0, ALL_TOOLS);
         assert!(!none.contains("Shops this user wants searched"));
     }
 
     #[test]
     fn profile_block_states_the_search_languages() {
-        let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]), 0.0);
+        let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]), 0.0, ALL_TOOLS);
         assert!(p.contains("Search languages for this user: English, Dutch."), "got: {p}");
     }
 }

@@ -11,9 +11,19 @@ use std::time::{Duration, Instant};
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ParseMode};
 
-/// Telegram rate-limits edits; this is comfortably under what it tolerates
-/// while still feeling live.
-const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(1200);
+/// Slowest a single chat's message is rewritten.
+///
+/// Was 1200ms, on the reasoning that Telegram allows about a message a
+/// second to one chat and 0.83 is under it. That held for short answers and
+/// failed for long ones: a research run that went several minutes, editing
+/// the same message ~50 times a minute throughout, drew `RetryAfter(238s)`
+/// — a four-minute ban that cost the traveller the answer.
+///
+/// So it is paced to teloxide's own `messages_per_min_chat` default of 20,
+/// with a little margin. A frame every three seconds still reads as alive,
+/// which is all this is for; the per-second figure was never the binding
+/// constraint on a run that lasts minutes.
+const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(3200);
 
 /// What Telegram allows one bot across *all* of its chats, not per chat.
 /// teloxide's own throttle adaptor carries the same figure as its default.
@@ -99,6 +109,13 @@ pub struct Live {
     message: Option<MessageId>,
     last_edit: Option<Instant>,
     shown: String,
+    /// When Telegram's flood control said to leave this chat alone until.
+    ///
+    /// Measured: a long run drew `RetryAfter(238s)` on one chat. Editing
+    /// through a penalty only deepens it, so ordinary progress frames stop
+    /// until it lifts. A forced frame — the answer itself — still tries,
+    /// and its caller falls back to a send that waits properly.
+    quiet_until: Option<Instant>,
     /// Held for the lifetime of the reply; see [`StreamSlot`].
     slot: StreamSlot,
 }
@@ -114,6 +131,7 @@ impl Live {
             message: None,
             last_edit: None,
             shown: String::new(),
+            quiet_until: None,
             slot: StreamSlot::take(streams),
         }
     }
@@ -133,24 +151,28 @@ impl Live {
     /// edit was too recent, unless `force` (the final answer must always
     /// land). Failures are logged, never fatal: losing a progress frame must
     /// not lose the answer.
-    pub async fn show(&mut self, text: &str, force: bool) {
+    /// True when the message now shows `text`.
+    pub async fn show(&mut self, text: &str, force: bool) -> bool {
         self.render(text, force, None).await
     }
 
     /// The model's reasoning, in italics — it is worth watching while the
     /// search runs, but it must never read as part of the answer.
-    pub async fn show_thinking(&mut self, text: &str) {
+    pub async fn show_thinking(&mut self, text: &str) -> bool {
         let text = tail(text, THINKING_TAIL);
         self.render(&text, false, Some(format!("<i>💭 {}</i>", escape_html(&text)))).await
     }
 
-    async fn render(&mut self, text: &str, force: bool, html: Option<String>) {
+    async fn render(&mut self, text: &str, force: bool, html: Option<String>) -> bool {
         let text = text.trim();
-        if text.is_empty() || text == self.shown {
-            return;
+        if text.is_empty() {
+            return false;
+        }
+        if text == self.shown {
+            return true;
         }
         if !force && !self.due(Instant::now(), self.slot.active()) {
-            return;
+            return false;
         }
         // Long answers are chunked by the caller; a frame that overflows is
         // clipped rather than dropped.
@@ -174,12 +196,28 @@ impl Live {
                 self.message = Some(id);
                 self.shown = text;
                 self.last_edit = Some(Instant::now());
+                true
             }
-            Err(e) => tracing::debug!(error = %e, "progress update failed"),
+            Err(e) => {
+                if let teloxide::RequestError::RetryAfter(after) = &e {
+                    // Telegram named a number; keep off this chat until it
+                    // passes rather than making the penalty worse.
+                    self.quiet_until = Some(Instant::now() + after.duration());
+                    tracing::warn!(
+                        seconds = after.duration().as_secs(),
+                        "flood control; pausing progress on this chat"
+                    );
+                }
+                tracing::debug!(error = %e, "progress update failed");
+                false
+            }
         }
     }
 
     fn due(&self, now: Instant, active: usize) -> bool {
+        if self.quiet_until.is_some_and(|until| now < until) {
+            return false;
+        }
         self.last_edit
             .is_none_or(|last| now.duration_since(last) >= edit_interval(active))
     }
@@ -297,6 +335,24 @@ mod tests {
         live.last_edit = Some(now);
         assert!(!live.due(now + Duration::from_millis(300), 1));
         assert!(live.due(now + MIN_EDIT_INTERVAL, 1));
+    }
+
+    #[test]
+    fn progress_stops_while_telegram_says_to_leave_the_chat_alone() {
+        // Measured: a long run drew RetryAfter(238s) on one chat. Editing
+        // through a penalty only deepens it, and the answer is what has to
+        // survive — so ordinary frames stop, and a forced one still tries
+        // so its caller learns it failed and can send instead.
+        let mut live = Live::new(Bot::new("token"), ChatId(1), Arc::new(AtomicUsize::new(0)));
+        let now = Instant::now();
+        assert!(live.due(now, 1), "nothing is holding it back yet");
+
+        live.quiet_until = Some(now + Duration::from_secs(238));
+        assert!(!live.due(now + Duration::from_secs(10), 1), "still inside the penalty");
+        assert!(
+            live.due(now + Duration::from_secs(239), 1),
+            "and it lifts once the wait Telegram named has passed"
+        );
     }
 
     #[test]

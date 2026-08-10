@@ -1135,11 +1135,51 @@ async fn deliver(
         live.show("(no answer - please try again)", true).await;
         return Ok(());
     };
-    live.show(&first, true).await;
-    if let Some(id) = live.message_id() {
-        remember_chat_reply(&app.replies, chat_id.0, id.0, live.shown());
+    // The answer goes into the progress message when it can. When it
+    // cannot — flood control, most often, after a long run has been editing
+    // the same message for minutes — `Live` swallows the failure, so
+    // without this the finished answer would vanish and the chat would keep
+    // whatever half-written frame was on screen. Sending it instead goes
+    // through the path that waits as long as Telegram asked.
+    if live.show(&first, true).await {
+        if let Some(id) = live.message_id() {
+            remember_chat_reply(&app.replies, chat_id.0, id.0, live.shown());
+        }
+    } else {
+        tracing::warn!(chat_id = chat_id.0, "could not edit the answer in; sending it instead");
+        send_chunked(bot, app, chat_id, &first).await?;
     }
     send_chunked(bot, app, chat_id, &chunks.collect::<Vec<_>>().join("\n")).await
+}
+
+/// A guess at how long to wait before trying a failed send again.
+const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The longest this will sit waiting on Telegram's flood control.
+///
+/// A deploy gives handlers 330s to drain, so a wait longer than this would
+/// hold one open past its welcome. Beyond it the answer is given up on
+/// rather than blocking a shutdown.
+const MAX_FLOOD_WAIT: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// How long to wait before retrying a send, given why it failed.
+///
+/// `None` means do not retry — the wait Telegram asked for is longer than
+/// this is willing to hold a handler open.
+///
+/// Measured in production: a long research run drew `RetryAfter(238s)` on
+/// one chat. The old code paused a flat 500ms and tried again, which cannot
+/// possibly satisfy a 238-second penalty, so the second attempt failed too
+/// and `?` threw away a finished answer the user never saw. When Telegram
+/// names a number, that number is the only one that works.
+fn retry_delay(error: &teloxide::RequestError) -> Option<std::time::Duration> {
+    match error {
+        teloxide::RequestError::RetryAfter(after) => {
+            let wait = after.duration();
+            (wait <= MAX_FLOOD_WAIT).then_some(wait)
+        }
+        _ => Some(RETRY_PAUSE),
+    }
 }
 
 /// Send in <=4096-char chunks; each chunk gets one retry. Sent chunks are
@@ -1151,8 +1191,12 @@ async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> Resp
         let sent = match bot.send_message(chat_id, chunk.clone()).await {
             Ok(sent) => sent,
             Err(e) => {
-                tracing::warn!(error = %e, "send failed, retrying once");
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let Some(wait) = retry_delay(&e) else {
+                    tracing::error!(error = %e, "flood wait too long to hold the answer for");
+                    return Err(e);
+                };
+                tracing::warn!(error = %e, seconds = wait.as_secs(), "send failed; waiting as asked");
+                tokio::time::sleep(wait).await;
                 bot.send_message(chat_id, chunk.clone()).await?
             }
         };
@@ -1496,6 +1540,36 @@ mod tests {
         ] {
             assert!(!looks_like_price_request(other), "false positive: {other}");
         }
+    }
+
+    #[test]
+    fn a_flood_wait_is_honoured_for_as_long_as_telegram_asked() {
+        use teloxide::types::Seconds;
+        use teloxide::RequestError;
+
+        // The measured case: Telegram answered RetryAfter(238s) and the old
+        // code slept 500ms, so the retry could not succeed and the finished
+        // answer was thrown away with the error.
+        let flood = RequestError::RetryAfter(Seconds::from_seconds(238));
+        assert_eq!(
+            retry_delay(&flood),
+            Some(std::time::Duration::from_secs(238)),
+            "wait what it asked for, not a guess"
+        );
+
+        // Long enough to outlast a deploy's drain window is not worth
+        // holding a handler open for.
+        let forever = RequestError::RetryAfter(Seconds::from_seconds(3600));
+        assert_eq!(retry_delay(&forever), None);
+
+        // Anything else keeps the short retry it always had.
+        let other = RequestError::InvalidJson {
+            source: std::sync::Arc::new(
+                serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            ),
+            raw: String::new().into(),
+        };
+        assert_eq!(retry_delay(&other), Some(RETRY_PAUSE));
     }
 
     #[test]

@@ -33,6 +33,12 @@ pub struct Config {
     /// answers 403 `unavailable_feature` until they turn it on, so the
     /// booking tool is only offered when this says it will work.
     pub duffel_links_enabled: bool,
+    /// How many requests one invited member may make per day, counted over
+    /// text and photo messages since midnight UTC. Ids in
+    /// `allowed_user_ids` are exempt — founders are the people paying for
+    /// the bot. Bounds volume per person; rounds bound how many people
+    /// there are.
+    pub invite_daily_requests: i64,
     /// Ignav fare-search key. A second flights provider whose prices are
     /// approximate rather than bookable (their docs say to show them as
     /// "from $299"), so its rows arrive labelled. 1,000 free requests,
@@ -114,6 +120,23 @@ impl Config {
             None => 0.0,
         };
 
+        // A cap of zero would mute every invited member without saying so,
+        // which is a typo rather than a policy: closing a round is how you
+        // stop admitting people, and revoking is how you remove one.
+        let invite_daily_requests = match non_empty("INVITE_DAILY_REQUESTS") {
+            Some(raw) => {
+                let n: i64 = raw
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("INVITE_DAILY_REQUESTS is not a number: {raw:?}"))?;
+                if n < 1 {
+                    bail!("INVITE_DAILY_REQUESTS must be at least 1, got {n}");
+                }
+                n
+            }
+            None => 20,
+        };
+
         Ok(Self {
             telegram_bot_token: required("TELEGRAM_BOT_TOKEN")?,
             allowed_user_ids,
@@ -131,6 +154,7 @@ impl Config {
             duffel_markup_rate,
             duffel_links_enabled,
             ignav_api_key: non_empty("IGNAV_API_KEY"),
+            invite_daily_requests,
         })
     }
 }
@@ -333,6 +357,30 @@ mod tests {
         assert!(load(&env).is_err());
 
         env.insert("DUFFEL_MARKUP_RATE", "three percent");
+        assert!(load(&env).is_err());
+    }
+
+    #[test]
+    fn the_daily_cap_defaults_to_twenty_and_refuses_nonsense() {
+        assert_eq!(load(&base_env()).unwrap().invite_daily_requests, 20);
+
+        let mut env = base_env();
+        env.insert("INVITE_DAILY_REQUESTS", "50");
+        assert_eq!(load(&env).unwrap().invite_daily_requests, 50);
+
+        // Blank is unset, not zero.
+        env.insert("INVITE_DAILY_REQUESTS", "   ");
+        assert_eq!(load(&env).unwrap().invite_daily_requests, 20);
+
+        // Zero would silently mute everyone who was invited. Closing a
+        // round is how you stop admitting people; this is not that.
+        env.insert("INVITE_DAILY_REQUESTS", "0");
+        assert!(load(&env).is_err());
+
+        env.insert("INVITE_DAILY_REQUESTS", "-5");
+        assert!(load(&env).is_err());
+
+        env.insert("INVITE_DAILY_REQUESTS", "twenty");
         assert!(load(&env).is_err());
     }
 

@@ -57,6 +57,35 @@ CREATE TABLE IF NOT EXISTS user_chats (
     chat_id BIGINT NOT NULL,
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
+-- Admission. `ALLOWED_TELEGRAM_USER_IDS` stays the founder list; these three
+-- tables are where growth lives — see the invite-links design doc.
+--
+-- A round is a named code with a capacity, shared as a t.me deep link.
+CREATE TABLE IF NOT EXISTS invite_rounds (
+    code       TEXT PRIMARY KEY,
+    capacity   BIGINT NOT NULL,
+    open       BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+-- One row per person admitted, ever. `user_id` is the key, so a person
+-- belongs to one round; `revoked_at` set means removed, and the row stays
+-- put so the seat is not handed back.
+CREATE TABLE IF NOT EXISTS members (
+    user_id    BIGINT PRIMARY KEY,
+    code       TEXT NOT NULL,
+    joined_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    revoked_at TIMESTAMP
+);
+-- People a full or unknown round turned away. `chat_id` is stored because
+-- reaching them later is the whole point, and the START they pressed is the
+-- permission to do it.
+CREATE TABLE IF NOT EXISTS waitlist (
+    user_id    BIGINT PRIMARY KEY,
+    chat_id    BIGINT NOT NULL,
+    code       TEXT NOT NULL,
+    seen_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    invited_at TIMESTAMP
+);
 -- A named plan. The itinerary is durable; prices are not, so nothing here
 -- holds an offer id — see the trips design doc.
 CREATE SEQUENCE IF NOT EXISTS trips_id_seq;
@@ -216,6 +245,31 @@ pub struct ExpectedSegment<'a> {
     /// `None` when the flight being added had no usable date to check —
     /// "nothing to verify", not "verified".
     pub departure_date: Option<&'a str>,
+}
+
+/// What happened when somebody pressed START on an invite link.
+///
+/// The three refusals that share one reply — unknown code, closed round,
+/// full round — are one variant on purpose. Collapsing them here rather than
+/// at the call site means no caller can accidentally tell a stranger which
+/// of the three it was, and so whether a code they guessed exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    Admitted,
+    AlreadyIn,
+    Revoked,
+    NoRoom,
+}
+
+/// One round as `/invite status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundStatus {
+    pub code: String,
+    pub capacity: i64,
+    /// Seats taken, counting revoked members: a round of 100 admits 100
+    /// people once.
+    pub used: i64,
+    pub open: bool,
 }
 
 #[derive(Clone)]
@@ -487,6 +541,209 @@ impl Store {
             conn.prepare("SELECT user_id, chat_id FROM user_chats ORDER BY user_id ASC")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Everyone admitted and not since revoked. Read once at startup to
+    /// build the membership set the gate actually consults; the table is
+    /// the durable record, the set is the hot path.
+    pub fn active_members(&self) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_id FROM members WHERE revoked_at IS NULL ORDER BY user_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Try to take a seat in `code` for `user_id`.
+    ///
+    /// One method, one lock acquisition, so check-and-insert is atomic by
+    /// construction: a round of 100 admits exactly 100 however many people
+    /// press START at the same moment. There is no counter to drift from
+    /// the rows — seats used *is* `count(*)` over them.
+    pub fn claim_seat(&self, user_id: i64, chat_id: i64, code: &str) -> Result<Claim> {
+        let conn = self.conn.lock().unwrap();
+
+        // Membership decides before the round does. Checking the round
+        // first would let a revoked person be told "that round is full",
+        // and a member re-clicking a link consume a second seat.
+        let mut stmt = conn.prepare("SELECT revoked_at IS NULL FROM members WHERE user_id = ?")?;
+        let standing: Option<bool> = stmt
+            .query_map(params![user_id], |row| row.get(0))?
+            .next()
+            .transpose()?;
+        match standing {
+            Some(true) => return Ok(Claim::AlreadyIn),
+            // Without this, revoking is theatre: the next link would let
+            // them straight back in.
+            Some(false) => return Ok(Claim::Revoked),
+            None => {}
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT r.open, r.capacity, (SELECT count(*) FROM members m WHERE m.code = r.code)
+             FROM invite_rounds r WHERE r.code = ?",
+        )?;
+        let round: Option<(bool, i64, i64)> = stmt
+            .query_map(params![code], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .next()
+            .transpose()?;
+
+        // Unknown code, closed round and full round are one outcome on
+        // purpose: telling a stranger which it was says whether a code they
+        // guessed exists, and that is information with no use.
+        if !matches!(round, Some((true, capacity, used)) if used < capacity) {
+            conn.execute(
+                "INSERT INTO waitlist (user_id, chat_id, code) VALUES (?, ?, ?)
+                 ON CONFLICT (user_id) DO UPDATE SET
+                     chat_id = excluded.chat_id,
+                     code = excluded.code,
+                     -- They tried again and were turned away again, so they
+                     -- are waiting again — but `seen_at` is untouched, so a
+                     -- second attempt does not cost them their place.
+                     invited_at = NULL",
+                params![user_id, chat_id, code],
+            )?;
+            return Ok(Claim::NoRoom);
+        }
+
+        conn.execute(
+            "INSERT INTO members (user_id, code) VALUES (?, ?)",
+            params![user_id, code],
+        )?;
+        // Nobody who is inside should be chased by a later announce.
+        conn.execute("DELETE FROM waitlist WHERE user_id = ?", params![user_id])?;
+        Ok(Claim::Admitted)
+    }
+
+    /// Opens a round. False when the name is already taken — reusing one
+    /// would silently pool two rounds' seats under a single capacity.
+    pub fn create_round(&self, code: &str, capacity: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "INSERT INTO invite_rounds (code, capacity) VALUES (?, ?)
+             ON CONFLICT (code) DO NOTHING",
+            params![code, capacity],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Stops or resumes admitting. False when there is no such round.
+    pub fn set_round_open(&self, code: &str, open: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE invite_rounds SET open = ? WHERE code = ?",
+            params![open, code],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Every round, oldest first, with seats counted from the member rows.
+    pub fn rounds(&self) -> Result<Vec<RoundStatus>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.code, r.capacity, r.open,
+                    (SELECT count(*) FROM members m WHERE m.code = r.code)
+             FROM invite_rounds r ORDER BY r.created_at ASC, r.code ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RoundStatus {
+                code: row.get(0)?,
+                capacity: row.get(1)?,
+                open: row.get(2)?,
+                used: row.get(3)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// How many people are queued and have not been told about a new round.
+    pub fn waiting_count(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT count(*) FROM waitlist WHERE invited_at IS NULL")?;
+        let n: i64 = stmt.query_map([], |row| row.get(0))?.next().transpose()?.unwrap_or(0);
+        Ok(n)
+    }
+
+    /// Removes a member. False when they were not one (or already were
+    /// removed). The row stays: the seat is spent, and moderation must not
+    /// quietly reopen a round.
+    pub fn revoke(&self, user_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE members SET revoked_at = current_timestamp
+             WHERE user_id = ? AND revoked_at IS NULL",
+            params![user_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Undoes a revoke. False when they were not revoked. Consumes no seat,
+    /// for the same reason revoking returned none.
+    pub fn restore(&self, user_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE members SET revoked_at = NULL WHERE user_id = ? AND revoked_at IS NOT NULL",
+            params![user_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Who an announce should reach, as (user, chat), oldest first — so if
+    /// the new round is smaller than the queue, the people who have waited
+    /// longest hear first.
+    pub fn waitlist_to_invite(&self) -> Result<Vec<(i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_id, chat_id FROM waitlist WHERE invited_at IS NULL
+             ORDER BY seen_at ASC, user_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Stamped per successful send, so re-running an announce reaches only
+    /// the people the first run missed.
+    pub fn mark_invited(&self, user_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE waitlist SET invited_at = current_timestamp WHERE user_id = ?",
+            params![user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Drops somebody from the queue. Used when a send proves they cannot
+    /// be reached at all — they blocked the bot or deleted the chat, which
+    /// is an opt-out, and carrying them forward would mean retrying that
+    /// same failure at every future round.
+    pub fn forget_waitlist(&self, user_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM waitlist WHERE user_id = ?", params![user_id])?;
+        Ok(())
+    }
+
+    /// Requests this user has made since midnight, for the daily cap.
+    ///
+    /// Reactions and flight searches are excluded: a reaction is not a
+    /// request, and a flight search is a sub-event of a message already
+    /// counted, so counting it would charge one message twice.
+    ///
+    /// `current_date` is the container clock, which runs UTC — the same
+    /// midnight the reply tells the user about.
+    pub fn requests_today(&self, user_id: i64) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT count(*) FROM request_log
+             WHERE user_id = ? AND kind IN ('text', 'photo') AND created_at >= current_date",
+        )?;
+        let n: i64 = stmt
+            .query_map(params![user_id], |row| row.get(0))?
+            .next()
+            .transpose()?
+            .unwrap_or(0);
+        Ok(n)
     }
 
     /// Flight searches per user since `cutoff`, scoped to one user. See
@@ -1934,5 +2191,220 @@ mod tests {
         store.upsert_trip(8, "Setpember", None, None).unwrap();
         assert!(!store.delete_trip(7, "Setpember").unwrap());
         assert!(store.find_trip(8, "Setpember").unwrap().is_some());
+    }
+
+    // ---- invite rounds, membership, waitlist ----
+
+    #[test]
+    fn a_round_admits_its_capacity_and_not_one_more() {
+        let (s, _d) = test_store();
+        assert!(s.create_round("autumn", 3).unwrap());
+        for user in 1..=3 {
+            assert_eq!(s.claim_seat(user, user, "autumn").unwrap(), Claim::Admitted);
+        }
+        assert_eq!(s.claim_seat(4, 4, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.active_members().unwrap(), vec![1, 2, 3]);
+
+        let rounds = s.rounds().unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!((rounds[0].used, rounds[0].capacity, rounds[0].open), (3, 3, true));
+    }
+
+    #[test]
+    fn concurrent_claims_never_oversell() {
+        // The whole reason claiming is one method: check-and-insert happens
+        // under a single lock, so a rush on a link cannot overfill a round.
+        let (s, _d) = test_store();
+        assert!(s.create_round("rush", 5).unwrap());
+
+        let admitted: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (1..=40)
+                .map(|user| {
+                    let s = s.clone();
+                    scope.spawn(move || s.claim_seat(user, user, "rush").unwrap())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|claim| *claim == Claim::Admitted)
+                .count()
+        });
+
+        assert_eq!(admitted, 5, "a round of 5 admits exactly 5");
+        assert_eq!(s.active_members().unwrap().len(), 5);
+        assert_eq!(s.rounds().unwrap()[0].used, 5);
+    }
+
+    #[test]
+    fn a_second_claim_by_the_same_person_spends_no_seat() {
+        let (s, _d) = test_store();
+        s.create_round("autumn", 2).unwrap();
+        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::Admitted);
+        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::AlreadyIn);
+        // A member opening a *later* round's link is also already in.
+        s.create_round("winter", 5).unwrap();
+        assert_eq!(s.claim_seat(1, 1, "winter").unwrap(), Claim::AlreadyIn);
+
+        assert_eq!(s.rounds().unwrap()[0].used, 1, "one person, one seat");
+        assert_eq!(s.claim_seat(2, 2, "autumn").unwrap(), Claim::Admitted);
+    }
+
+    #[test]
+    fn a_revoked_member_cannot_rejoin_through_any_link() {
+        // Without this, revoking is theatre.
+        let (s, _d) = test_store();
+        s.create_round("autumn", 10).unwrap();
+        s.claim_seat(1, 1, "autumn").unwrap();
+        assert!(s.revoke(1).unwrap());
+        assert!(s.active_members().unwrap().is_empty());
+
+        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::Revoked);
+        s.create_round("winter", 10).unwrap();
+        assert_eq!(s.claim_seat(1, 1, "winter").unwrap(), Claim::Revoked);
+
+        // And being refused does not put them on the waitlist to be
+        // announced back in later.
+        assert_eq!(s.waiting_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn revoking_returns_no_seat_and_restoring_takes_none() {
+        let (s, _d) = test_store();
+        s.create_round("autumn", 2).unwrap();
+        s.claim_seat(1, 1, "autumn").unwrap();
+        s.claim_seat(2, 2, "autumn").unwrap();
+
+        assert!(s.revoke(1).unwrap());
+        assert_eq!(s.rounds().unwrap()[0].used, 2, "a round of 2 admitted 2 people, once");
+        assert_eq!(s.claim_seat(3, 3, "autumn").unwrap(), Claim::NoRoom);
+
+        assert!(s.restore(1).unwrap());
+        assert_eq!(s.rounds().unwrap()[0].used, 2, "restoring consumes nothing either");
+        assert_eq!(s.active_members().unwrap(), vec![1, 2]);
+
+        // Neither is an error to repeat, and neither invents a member.
+        assert!(!s.restore(1).unwrap(), "already restored");
+        assert!(!s.revoke(999).unwrap(), "never a member");
+        assert!(!s.restore(999).unwrap());
+    }
+
+    #[test]
+    fn an_unknown_code_and_a_closed_round_are_refused_alike() {
+        let (s, _d) = test_store();
+        s.create_round("autumn", 10).unwrap();
+        assert!(s.set_round_open("autumn", false).unwrap());
+
+        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.claim_seat(2, 2, "no-such-round").unwrap(), Claim::NoRoom);
+        assert!(s.active_members().unwrap().is_empty());
+        // Both are people who tried to reach us, so both are queued.
+        assert_eq!(s.waiting_count().unwrap(), 2);
+
+        assert!(!s.set_round_open("no-such-round", true).unwrap());
+    }
+
+    #[test]
+    fn a_reopened_round_admits_again() {
+        let (s, _d) = test_store();
+        s.create_round("autumn", 10).unwrap();
+        s.set_round_open("autumn", false).unwrap();
+        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::NoRoom);
+
+        assert!(s.set_round_open("autumn", true).unwrap());
+        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::Admitted);
+    }
+
+    #[test]
+    fn a_round_name_cannot_be_reused() {
+        // Otherwise two rounds pool their seats under one capacity.
+        let (s, _d) = test_store();
+        assert!(s.create_round("autumn", 10).unwrap());
+        assert!(!s.create_round("autumn", 500).unwrap());
+        assert_eq!(s.rounds().unwrap()[0].capacity, 10, "the first round is untouched");
+    }
+
+    #[test]
+    fn being_turned_away_queues_you_and_getting_in_clears_it() {
+        let (s, _d) = test_store();
+        s.create_round("autumn", 1).unwrap();
+        s.claim_seat(1, 1, "autumn").unwrap();
+
+        assert_eq!(s.claim_seat(2, 8002, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.waitlist_to_invite().unwrap(), vec![(2, 8002)]);
+
+        // A second attempt keeps their place rather than costing it.
+        assert_eq!(s.claim_seat(2, 8002, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.waiting_count().unwrap(), 1);
+
+        // Getting in through a later round takes them off the queue, so a
+        // future announce does not chase somebody already inside.
+        s.create_round("winter", 5).unwrap();
+        assert_eq!(s.claim_seat(2, 8002, "winter").unwrap(), Claim::Admitted);
+        assert_eq!(s.waiting_count().unwrap(), 0);
+        assert!(s.waitlist_to_invite().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_announce_stamps_only_the_rows_it_reached() {
+        let (s, _d) = test_store();
+        s.create_round("autumn", 0).unwrap();
+        for user in [1, 2, 3] {
+            s.claim_seat(user, 9000 + user, "autumn").unwrap();
+        }
+        assert_eq!(
+            s.waitlist_to_invite().unwrap(),
+            vec![(1, 9001), (2, 9002), (3, 9003)],
+            "oldest first: if the next round is smaller than the queue, the \
+             people who waited longest hear first"
+        );
+
+        // One reached, one unreachable, one that simply failed this time.
+        s.mark_invited(1).unwrap();
+        s.forget_waitlist(2).unwrap();
+
+        assert_eq!(
+            s.waitlist_to_invite().unwrap(),
+            vec![(3, 9003)],
+            "a re-run reaches only the people the first run missed"
+        );
+        assert_eq!(s.waiting_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn someone_turned_away_after_being_announced_to_is_queued_again() {
+        // They pressed START on the new link and it was full too. They are
+        // still waiting, so the next announce has to reach them.
+        let (s, _d) = test_store();
+        s.create_round("autumn", 0).unwrap();
+        s.claim_seat(1, 9001, "autumn").unwrap();
+        s.mark_invited(1).unwrap();
+        assert!(s.waitlist_to_invite().unwrap().is_empty());
+
+        s.create_round("winter", 0).unwrap();
+        assert_eq!(s.claim_seat(1, 9001, "winter").unwrap(), Claim::NoRoom);
+        assert_eq!(s.waitlist_to_invite().unwrap(), vec![(1, 9001)]);
+    }
+
+    #[test]
+    fn the_daily_cap_counts_messages_and_only_todays() {
+        let (s, _d) = test_store();
+        let today = chrono::Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+
+        s.log_request(1, "text").unwrap();
+        s.log_request(1, "photo").unwrap();
+        // Not requests: a reaction is not one, and a flight search is a
+        // sub-event of a message that was already counted.
+        s.log_request(1, "reaction").unwrap();
+        s.log_request(1, Store::FLIGHT_SEARCH).unwrap();
+        // Another user's traffic is not this user's.
+        s.log_request(2, "text").unwrap();
+        // Yesterday is spent.
+        s.log_request_at(1, "text", &format!("{yesterday} 23:59:59")).unwrap();
+
+        assert_eq!(s.requests_today(1).unwrap(), 2);
+        assert_eq!(s.requests_today(2).unwrap(), 1);
+        assert_eq!(s.requests_today(999).unwrap(), 0);
     }
 }

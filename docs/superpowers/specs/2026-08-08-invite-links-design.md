@@ -175,10 +175,26 @@ announce does not chase somebody who is already inside.
 
 Case 4 records `(user_id, chat_id, code)` with `invited_at` null.
 
-`/invite announce <name>` sends the new round's link to every waitlist row
-with `invited_at IS NULL`, oldest first, and stamps `invited_at` on each
-success. Sending in claim order means that if the new round is smaller than
-the queue, the people who waited longest hear first.
+`/invite announce <name>` reaches every waitlist row with `invited_at IS
+NULL`, oldest first, and stamps `invited_at` on each success. Sending in
+claim order means that if the new round is smaller than the queue, the
+people who waited longest hear first.
+
+**Amended during implementation (2026-08-16): the announce sends the join
+command, not the link.** This design's own reasoning rules the link out for
+this audience and the first draft did not follow it through. START is the
+only thing that delivers a payload, START only appears in a chat with no
+history, and every person on the waitlist has history — being turned away is
+itself a message. A link would have opened a chat and carried nothing, for
+every single recipient. What the message carries instead is
+`/start <code>` in a `<code>` span, which Telegram makes tap-to-copy;
+sending it by hand delivers the same payload and always works. The link
+still belongs in `/invite new`'s reply, because a public post is read by
+people with empty chats, and that reply now carries both.
+
+The announce refuses a round that is closed or already full. Announcing one
+spends the whole queue's single notification on a dead end, and would stamp
+`invited_at` as though those people had been told about something real.
 
 A send that fails because the person blocked the bot or deleted the chat
 deletes their waitlist row: they have opted out, and carrying them forward

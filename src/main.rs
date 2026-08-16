@@ -135,6 +135,16 @@ async fn main() -> Result<()> {
     };
     deps.return_url = return_url;
 
+    // The gate reads this set on every update, so it is built once here
+    // from the table that survives restarts.
+    let members: dashmap::DashSet<i64> = store.active_members()?.into_iter().collect();
+    tracing::info!(
+        founders = cfg.allowed_user_ids.len(),
+        members = members.len(),
+        daily_cap = cfg.invite_daily_requests,
+        "who may talk to this bot"
+    );
+
     tokio::spawn(scheduler::run(telegram.clone(), store));
 
     let app = Arc::new(bot::App {
@@ -143,6 +153,7 @@ async fn main() -> Result<()> {
         chats: DashMap::new(),
         replies: DashMap::new(),
         streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        members,
     });
 
     tracing::info!("scout is up");

@@ -142,6 +142,26 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   used the bot. It goes to the chat each person actually talks in, says who
   sent it, and reports who could not be reached
 
+**Lets people in without a redeploy**
+- **Invite rounds.** `/invite new autumn 100` opens a named round and hands
+  back a `t.me` link. The first 100 people who press START are admitted;
+  everyone after them is told the round is full — and put on a waitlist
+- **A click is not a countable event.** Telegram never reports that a link
+  was opened, so a round counts arrivals, which is the better number anyway
+- `/invite status` shows every round, its seats and its state, plus how many
+  people are waiting. It is the answer to *"why can this person talk to the
+  bot?"*
+- `/invite announce autumn` tells the waitlist a round is open, oldest first,
+  so if the round is smaller than the queue the people who waited longest
+  hear first. It stamps each person as it reaches them, so running it again
+  retries only the ones it missed, and drops anyone who has blocked the bot
+- `/kick` and `/unkick`, both reversible. A revoked seat stays spent — a
+  round of 100 admits 100 people **once**, and moderation never quietly
+  reopens it
+- A daily request cap per invited member (`INVITE_DAILY_REQUESTS`, default
+  20), so a hundred strangers cannot run up an unbounded bill. Founders are
+  exempt; they are the ones paying
+
 **Behaves itself**
 - Streams progress live — which tool is running and on what — then the answer
   as it's written, all in one edited message, with the typing indicator held
@@ -184,7 +204,8 @@ compiles from source.
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | **yes** | — | bot token from @BotFather |
 | `ALLOWED_TELEGRAM_USER_IDS` | **yes** | — | comma-separated numeric ids |
-| `SCOUT_ADMIN_USER_IDS` | no | first allowed id | who sees everyone's numbers in `/stat`; everyone else sees only their own |
+| `SCOUT_ADMIN_USER_IDS` | no | first allowed id | who sees everyone's numbers in `/stat` and may run `/advert`, `/invite` and `/kick`; everyone else sees only their own |
+| `INVITE_DAILY_REQUESTS` | no | `20` | messages per day for someone admitted through `/invite`. Founders are exempt |
 | `MINIMAX_API_KEY` | **yes** | — | the LLM |
 | `KAGI_API_KEY` | **yes** | — | search: small-retailer coverage, `site:` scoping |
 | `PERPLEXITY_API_KEY` | no | — | second engine, merged with Kagi; carries the multi-language fan-out cheaply |
@@ -240,7 +261,7 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 23 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **374 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **412 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness.
 
@@ -282,9 +303,19 @@ Roughly 19,500 lines of Rust across a dozen focused modules.
 - **A shop that lies convincingly wins.** If a page publishes only a
   bare-integer cents price with nothing to cross-check, Scout reports that
   number instead of inventing a division.
-- **Allowlist only.** This is built as a personal/household bot. Conversation
-  state, purchase memory and `/stat` are scoped per user — but everyone on
-  the allowlist shares one process, one database file and one API budget.
+- **An invite link only works on an empty chat.** Telegram delivers a deep
+  link's payload through the START button, and START only appears to someone
+  who has never messaged the bot. So a link is right for a public post and
+  wrong for anyone already in a conversation — including everyone on the
+  waitlist, since being turned away is itself a message. That is why
+  `/invite announce` sends the join *command* (`/start autumn`, tap to copy)
+  rather than a link, and why a dead round's link stays dead: codes do not
+  carry between rounds.
+- **Invited, not isolated.** Conversation state, purchase memory and `/stat`
+  are scoped per user — but everyone admitted shares one process, one
+  database file and one API budget. Rounds bound how many people there are
+  and the daily cap bounds each of them; neither bounds what a single
+  question can cost.
 - **Costs real money.** Kagi bills per query, MiniMax per token, and each
   flight search is billed by whichever provider answered it. Budgets are
   capped per request: 15 search queries, 5 page opens, 20 model turns, and
@@ -300,7 +331,7 @@ Roughly 19,500 lines of Rust across a dozen focused modules.
 ## Development
 
 ```bash
-cargo test                  # 374 tests, no network needed
+cargo test                  # 412 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

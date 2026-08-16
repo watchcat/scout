@@ -35,6 +35,16 @@ pub struct App {
     /// limit is per bot token rather than per chat, so progress edits pace
     /// themselves against this rather than against their own chat alone.
     pub streams: Arc<std::sync::atomic::AtomicUsize>,
+    /// Everyone admitted through an invite round and not since revoked,
+    /// loaded from `members` at startup. The table is the durable record;
+    /// this is what the gate reads.
+    ///
+    /// Not premature caching: the gate runs on *every* update, including
+    /// every message from someone who was never invited. Reading DuckDB
+    /// there would take the connection mutex on each one, so anybody who
+    /// found the bot could contend with real work just by typing at it.
+    /// Disk is touched only when membership actually changes.
+    pub members: dashmap::DashSet<i64>,
 }
 
 /// How many of the bot's own recent replies to keep per chat so reactions
@@ -143,11 +153,13 @@ fn chat_reply_text(
         .and_then(|r| r.iter().find(|(id, _)| *id == message_id).map(|(_, t)| t.clone()))
 }
 
+/// `/start` is deliberately absent: it is the one command that has to reach
+/// people the gate rejects, so it is routed by `is_start` on its own branch
+/// ahead of this enum. Leaving a variant here that the router never feeds
+/// would let a member's `/start` fall through to the LLM.
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 enum Command {
-    #[command(description = "what this bot does")]
-    Start,
     #[command(description = "show help")]
     Help,
     #[command(description = "forget this conversation and any pending photo draft")]
@@ -156,6 +168,12 @@ enum Command {
     Stat(String),
     #[command(description = "admin only: send a message to everyone: /advert <text>")]
     Advert(String),
+    #[command(description = "admin only: invite rounds: /invite new|status|open|close|announce")]
+    Invite(String),
+    #[command(description = "admin only: remove a member: /kick <user_id>")]
+    Kick(String),
+    #[command(description = "admin only: undo a kick: /unkick <user_id>")]
+    Unkick(String),
 }
 
 const HELP: &str = "\
@@ -174,23 +192,69 @@ Commands:
 /stat [days] - your usage statistics (default 7 days)
 /help - this message";
 
-/// Appended to `/help` for admins only, so the command is discoverable by
-/// the person who can use it without advertising itself to everyone else.
-const ADMIN_HELP: &str = "\n/advert <text> - send an announcement to everyone (admin)";
+/// Appended to `/help` for admins only, so the commands are discoverable by
+/// the person who can use them without advertising themselves to everyone
+/// else.
+const ADMIN_HELP: &str = "\n\
+/advert <text> - send an announcement to everyone (admin)\n\
+/invite new <name> [capacity] - open a round and get its link (admin)\n\
+/invite status - rounds, seats used, and who is waiting (admin)\n\
+/invite open|close <name> - resume or stop admitting (admin)\n\
+/invite announce <name> - tell the waitlist a round is open (admin)\n\
+/kick <user_id> - remove a member (admin)\n\
+/unkick <user_id> - undo a kick (admin)";
+
+/// What a stranger who sends a bare `/start` is told. The one message a
+/// non-member gets unprompted: silence here reads as broken rather than as
+/// closed, and pressing START is the single most likely thing a person does
+/// with a bot link.
+///
+/// It does *not* tell them to go and open an invite link. By the time
+/// anyone reads this they have messaged Scout — this reply is the answer to
+/// their own `/start` — and a chat with history never shows the START
+/// button again, so a link would carry no code. Sending the command by hand
+/// is the route that still works for them.
+const INVITE_ONLY: &str = "Scout is invite-only right now.\n\n\
+If you have an invite code, send it to me like this:\n/start your-code-here";
+
+/// Shown when a round cannot take them — full, closed, or a code that never
+/// existed. One reply for all three: which it was is information with no
+/// use to the person reading it, and telling them would say whether a code
+/// they guessed exists.
+const ROUND_FULL: &str = "All invites are gone — wait for the next round. \
+I'll message you here when one opens.";
+
+const ACCESS_REMOVED: &str = "Your access was removed.";
+
+/// A claim that could not be written down is refused rather than granted.
+/// Failing closed is right here: a failure that admits people is a failure
+/// that overfills the round.
+const CLAIM_FAILED: &str = "Sorry, something went wrong on my side. \
+Please try that link again in a minute.";
 
 pub async fn run(bot: Bot, app: Arc<App>) {
+    // `/start` is a sibling of the gate, not a child of it: the join path
+    // has to reach people the gate would reject. The branch owns the whole
+    // `/start` surface — payload or not — because splitting it would leave
+    // a stranger's bare `/start` falling through to a gate that drops it
+    // silently, and one handler with five cases means no message can take
+    // the wrong path.
     let messages = Update::filter_message()
-        .filter(|msg: Message, app: Arc<App>| is_allowed(&app, &msg))
+        .branch(dptree::filter(|msg: Message| is_start(&msg)).endpoint(handle_start))
         .branch(
             dptree::entry()
-                .filter_command::<Command>()
-                .endpoint(handle_command),
-        )
-        .branch(
-            dptree::filter(|msg: Message| msg.photo().is_some()).endpoint(handle_photo),
-        )
-        .branch(
-            dptree::filter(|msg: Message| msg.text().is_some()).endpoint(handle_text),
+                .filter(|msg: Message, app: Arc<App>| is_member(&app, &msg))
+                .branch(
+                    dptree::entry()
+                        .filter_command::<Command>()
+                        .endpoint(handle_command),
+                )
+                .branch(
+                    dptree::filter(|msg: Message| msg.photo().is_some()).endpoint(handle_photo),
+                )
+                .branch(
+                    dptree::filter(|msg: Message| msg.text().is_some()).endpoint(handle_text),
+                ),
         );
     // Adding this branch makes the dispatcher request message_reaction
     // updates from Telegram automatically (allowed_updates hinting).
@@ -233,10 +297,41 @@ pub async fn run(bot: Bot, app: Arc<App>) {
     dispatcher.dispatch().await;
 }
 
-fn is_allowed(app: &App, msg: &Message) -> bool {
-    sender_id(msg)
-        .map(|id| app.cfg.allowed_user_ids.contains(&id))
-        .unwrap_or(false)
+fn is_member(app: &App, msg: &Message) -> bool {
+    sender_id(msg).is_some_and(|id| is_member_id(app, id))
+}
+
+/// The gate: founders from `ALLOWED_TELEGRAM_USER_IDS`, plus everyone
+/// admitted through an invite round and not since revoked.
+fn is_member_id(app: &App, user_id: i64) -> bool {
+    app.cfg.allowed_user_ids.contains(&user_id) || app.members.contains(&user_id)
+}
+
+/// True for `/start`, with or without an `@bot` suffix and with or without
+/// a payload — the whole `/start` surface, since one handler answers all of
+/// it.
+fn is_start(msg: &Message) -> bool {
+    msg.text().is_some_and(|t| start_payload(t).is_some())
+}
+
+/// `Some(payload)` — possibly empty — when `text` is a `/start` command.
+fn start_payload(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let (head, rest) = match text.split_once(char::is_whitespace) {
+        Some((head, rest)) => (head, rest.trim()),
+        None => (text, ""),
+    };
+    let suffix = head.strip_prefix("/start")?;
+    // "/start@scout_bot" is the command; "/started" is a word.
+    if !suffix.is_empty() && !suffix.starts_with('@') {
+        return None;
+    }
+    Some(rest)
+}
+
+/// The invite code carried by a `/start` message, if it carries one.
+fn join_code(text: &str) -> Option<&str> {
+    start_payload(text).filter(|p| !p.is_empty())
 }
 
 fn sender_id(msg: &Message) -> Option<i64> {
@@ -255,6 +350,93 @@ fn display_name(user: &teloxide::types::User) -> String {
     }
 }
 
+/// `/help`'s text for one person: admins get their own commands appended.
+fn help_for(app: &App, user_id: i64) -> String {
+    match app.cfg.admin_user_ids.contains(&user_id) {
+        true => format!("{HELP}{ADMIN_HELP}"),
+        false => HELP.to_string(),
+    }
+}
+
+/// The whole `/start` surface, for members and strangers alike — this is the
+/// one handler that runs ahead of the gate.
+///
+/// Five cases: someone already in, a bare start from a stranger, and the
+/// three outcomes of claiming a seat.
+async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
+    let chat_id = msg.chat.id;
+    let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    let code = msg.text().and_then(join_code).map(str::to_string);
+
+    // Founders and members: `/start` is just help, as it always was.
+    if is_member_id(&app, user_id) {
+        note_sender(&app, &msg);
+        let intro = match code.is_some() {
+            true => "You're already in.\n\n",
+            false => "",
+        };
+        bot.send_message(chat_id, format!("{intro}{}", help_for(&app, user_id))).await?;
+        return Ok(());
+    }
+
+    let Some(code) = code else {
+        // A stranger's bare `/start`. Everything else they send is met with
+        // silence; this is the deliberate exception.
+        bot.send_message(chat_id, INVITE_ONLY).await?;
+        return Ok(());
+    };
+
+    let claim = {
+        let store = app.deps.store.clone();
+        let code = code.clone();
+        tokio::task::spawn_blocking(move || store.claim_seat(user_id, chat_id.0, &code))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r)
+    };
+    let claim = match claim {
+        Ok(claim) => claim,
+        Err(e) => {
+            tracing::error!(error = %e, user_id, code, "could not record an invite claim");
+            bot.send_message(chat_id, CLAIM_FAILED).await?;
+            return Ok(());
+        }
+    };
+    tracing::info!(user_id, code, outcome = ?claim, "invite claim");
+
+    match claim {
+        crate::store::Claim::Admitted => {
+            app.members.insert(user_id);
+            // Only now: `user_chats` is /advert's address book, and a
+            // person turned away at the door has not used this bot.
+            note_sender(&app, &msg);
+            bot.send_message(
+                chat_id,
+                format!("You're in — welcome to Scout.\n\n{}", help_for(&app, user_id)),
+            )
+            .await?;
+        }
+        // The table is the authority when it and the set disagree, so a
+        // claim that says they are in puts them in.
+        crate::store::Claim::AlreadyIn => {
+            app.members.insert(user_id);
+            note_sender(&app, &msg);
+            bot.send_message(
+                chat_id,
+                format!("You're already in.\n\n{}", help_for(&app, user_id)),
+            )
+            .await?;
+        }
+        crate::store::Claim::Revoked => {
+            bot.send_message(chat_id, ACCESS_REMOVED).await?;
+        }
+        crate::store::Claim::NoRoom => {
+            bot.send_message(chat_id, ROUND_FULL).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_command(
     bot: Bot,
     msg: Message,
@@ -265,14 +447,15 @@ async fn handle_command(
     // asking — without this, running /stat never records your own name.
     note_sender(&app, &msg);
     match cmd {
-        Command::Start | Command::Help => {
-            let admin = sender_id(&msg).is_some_and(|id| app.cfg.admin_user_ids.contains(&id));
-            let help = match admin {
-                true => format!("{HELP}{ADMIN_HELP}"),
-                false => HELP.to_string(),
-            };
+        Command::Help => {
+            let help = sender_id(&msg)
+                .map(|id| help_for(&app, id))
+                .unwrap_or_else(|| HELP.to_string());
             bot.send_message(msg.chat.id, help).await?;
         }
+        Command::Invite(arg) => handle_invite(&bot, &msg, &app, &arg).await?,
+        Command::Kick(arg) => handle_kick(&bot, &msg, &app, &arg, true).await?,
+        Command::Unkick(arg) => handle_kick(&bot, &msg, &app, &arg, false).await?,
         Command::Reset => {
             // Only the caller's session in this chat is cleared; other
             // allowed users keep theirs intact.
@@ -288,8 +471,8 @@ async fn handle_command(
             // Same gate as the cross-user /stat view: the admin list is
             // the whole access-control surface for anything that reaches
             // beyond the caller.
-            if !app.cfg.admin_user_ids.contains(&user_id) {
-                bot.send_message(msg.chat.id, "That command is for the bot's admin.").await?;
+            if !is_admin(&app, user_id) {
+                bot.send_message(msg.chat.id, NOT_ADMIN).await?;
                 return Ok(());
             }
             let body = match check_advert(&body) {
@@ -321,21 +504,13 @@ async fn handle_command(
                 .map(display_name)
                 .unwrap_or_else(|| "the admin".to_string());
             let text = advert_message(&body, &from);
-            let (mut sent, mut failed) = (0usize, Vec::new());
-            for (recipient, chat_id) in targets {
-                // Sequential on purpose: a household is a handful of chats,
-                // and one at a time keeps well clear of Telegram's rate
-                // limits without any pacing logic.
-                match bot.send_message(ChatId(chat_id), text.clone()).await {
-                    Ok(_) => sent += 1,
-                    Err(e) => {
-                        // Blocked the bot, deleted the chat, left the group:
-                        // all ordinary, none of them worth aborting for.
-                        tracing::warn!(error = %e, recipient, chat_id, "advert not delivered");
-                        failed.push(recipient);
-                    }
-                }
-            }
+            let results = broadcast(&bot, &targets, &text, None).await;
+            let sent = results.iter().filter(|(_, d)| *d == Delivered::Ok).count();
+            let failed: Vec<i64> = results
+                .iter()
+                .filter(|(_, d)| *d != Delivered::Ok)
+                .map(|(recipient, _)| *recipient)
+                .collect();
 
             let mut report = format!("Sent to {sent} chat(s).");
             if !failed.is_empty() {
@@ -572,10 +747,539 @@ pub fn check_advert(body: &str) -> Result<&str, String> {
     Ok(body)
 }
 
+const NOT_ADMIN: &str = "That command is for the bot's admin.";
+
+fn is_admin(app: &App, user_id: i64) -> bool {
+    app.cfg.admin_user_ids.contains(&user_id)
+}
+
+/// Capacity when `/invite new` is given a name and no number.
+const DEFAULT_CAPACITY: i64 = 100;
+
+/// A Telegram start parameter is 1-64 characters long.
+const MAX_ROUND_NAME: usize = 64;
+
+const INVITE_USAGE: &str = "usage:\n\
+/invite new <name> [capacity] - open a round (capacity defaults to 100)\n\
+/invite status - rounds, seats used, and who is waiting\n\
+/invite open <name> | /invite close <name>\n\
+/invite announce <name> - tell the waitlist a round is open";
+
+#[derive(Debug, PartialEq, Eq)]
+enum InviteCmd {
+    New { code: String, capacity: i64 },
+    Status,
+    SetOpen { code: String, open: bool },
+    Announce(String),
+}
+
+fn parse_invite(arg: &str) -> Result<InviteCmd, String> {
+    let mut words = arg.split_whitespace();
+    let Some(verb) = words.next() else {
+        return Err(INVITE_USAGE.to_string());
+    };
+    let cmd = match verb.to_ascii_lowercase().as_str() {
+        "status" => InviteCmd::Status,
+        "new" => {
+            let code = check_round_name(words.next())?;
+            let capacity = match words.next() {
+                Some(raw) => check_capacity(raw)?,
+                None => DEFAULT_CAPACITY,
+            };
+            InviteCmd::New { code, capacity }
+        }
+        "open" => InviteCmd::SetOpen { code: check_round_name(words.next())?, open: true },
+        "close" => InviteCmd::SetOpen { code: check_round_name(words.next())?, open: false },
+        "announce" => InviteCmd::Announce(check_round_name(words.next())?),
+        other => return Err(format!("I don't know \"{other}\".\n\n{INVITE_USAGE}")),
+    };
+    // A trailing word is a typo, not something to ignore: silently dropping
+    // it is how "/invite new autumn 100 seats" opens a round nobody meant.
+    if let Some(extra) = words.next() {
+        return Err(format!("I didn't expect \"{extra}\".\n\n{INVITE_USAGE}"));
+    }
+    Ok(cmd)
+}
+
+/// A round name is also a Telegram start parameter, so it is checked
+/// against exactly what one may contain — 1-64 characters of `A-Za-z0-9_-`.
+/// Refusing at the point the admin types it beats discovering it when
+/// nobody can join.
+fn check_round_name(name: Option<&str>) -> Result<String, String> {
+    let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+        return Err(format!("that needs a round name.\n\n{INVITE_USAGE}"));
+    };
+    if name.chars().count() > MAX_ROUND_NAME {
+        return Err(format!(
+            "\"{name}\" is {} characters; an invite link carries at most {MAX_ROUND_NAME}.",
+            name.chars().count()
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!(
+            "\"{name}\" has characters an invite link can't carry. \
+             Use letters, digits, - and _ only."
+        ));
+    }
+    Ok(name.to_string())
+}
+
+fn check_capacity(raw: &str) -> Result<i64, String> {
+    let n: i64 = raw
+        .parse()
+        .map_err(|_| format!("\"{raw}\" is not a number of seats."))?;
+    if n < 1 {
+        return Err("a round needs at least one seat.".to_string());
+    }
+    Ok(n)
+}
+
+fn parse_user_id(arg: &str) -> Result<i64, String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Err("that needs a numeric user id — /stat lists them.".to_string());
+    }
+    match arg.parse::<i64>() {
+        Ok(id) if id > 0 => Ok(id),
+        _ => Err(format!("\"{arg}\" is not a Telegram user id. /stat lists them.")),
+    }
+}
+
+/// How someone already in a chat with Scout joins a round.
+///
+/// The link is not that route. Telegram only shows the START button — and
+/// only START delivers the payload — in a chat with no history, so anyone
+/// who has ever messaged the bot (which is everyone on the waitlist, since
+/// being turned away is itself a message) opens a link to nothing. Sending
+/// the command by hand delivers the same payload and always works.
+fn join_instruction(code: &str) -> String {
+    format!("/start {code}")
+}
+
+/// The invite link itself, for posting somewhere public where the people
+/// reading it have never messaged Scout — which is where it does work.
+fn join_link(username: &str, code: &str) -> String {
+    format!("https://t.me/{username}?start={code}")
+}
+
+/// What the waitlist is sent when a round opens. HTML so the command sits
+/// in a `<code>` span, which Telegram makes tap-to-copy — the code is
+/// validated to `A-Za-z0-9_-`, so there is nothing in it to escape.
+pub fn announce_message(code: &str) -> String {
+    format!(
+        "A new round of Scout invites just opened — you asked to be told.\n\n\
+         Send me this to claim a seat:\n<code>{}</code>\n\n\
+         (Tap it to copy.) Seats are first come, first served.",
+        join_instruction(code)
+    )
+}
+
+/// One recipient's outcome in a broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivered {
+    Ok,
+    /// Cannot be reached again, ever: blocked the bot, deleted the account,
+    /// or the chat is gone. Kept apart from `Failed` because it is
+    /// permanent — a waitlist row for one of these would otherwise be
+    /// retried at every future round, forever.
+    Gone,
+    Failed,
+}
+
+/// Telegram's bulk limit is around 30 messages per second across the whole
+/// token. `/advert` was written when everyone who used this bot lived in
+/// one house and a sequential loop stayed under that by accident; a hundred
+/// members is where that stops being true. 20 per second leaves room for
+/// the ordinary replies the bot is still sending while a broadcast runs.
+const BROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Sends `text` to each `(recipient, chat)` in turn and reports what
+/// happened to each, so a caller that has bookkeeping to do — the announce
+/// stamps who it reached and drops who it never can — knows which is which.
+async fn broadcast(
+    bot: &Bot,
+    targets: &[(i64, i64)],
+    text: &str,
+    parse_mode: Option<ParseMode>,
+) -> Vec<(i64, Delivered)> {
+    let mut out = Vec::with_capacity(targets.len());
+    for (i, (recipient, chat_id)) in targets.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(BROADCAST_INTERVAL).await;
+        }
+        let outcome = send_once(bot, ChatId(*chat_id), text, parse_mode).await;
+        if outcome != Delivered::Ok {
+            tracing::warn!(recipient, chat_id, ?outcome, "broadcast message not delivered");
+        }
+        out.push((*recipient, outcome));
+    }
+    out
+}
+
+async fn send_once(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    parse_mode: Option<ParseMode>,
+) -> Delivered {
+    let attempt = async |bot: &Bot| {
+        let req = bot.send_message(chat_id, text.to_string());
+        match parse_mode {
+            Some(mode) => req.parse_mode(mode).await.map(|_| ()),
+            None => req.await.map(|_| ()),
+        }
+    };
+    let Err(e) = attempt(bot).await else {
+        return Delivered::Ok;
+    };
+    // Flood control is Telegram asking the *bot* to slow down, not a
+    // recipient who cannot be reached. Counting it as a failure would
+    // report a delivered-later message as lost; waiting the time it named
+    // is the only thing that works.
+    if let teloxide::RequestError::RetryAfter(after) = &e {
+        let wait = after.duration();
+        if wait <= MAX_FLOOD_WAIT {
+            tracing::warn!(
+                seconds = wait.as_secs(),
+                chat_id = chat_id.0,
+                "broadcast throttled; waiting as asked"
+            );
+            tokio::time::sleep(wait).await;
+            return match attempt(bot).await {
+                Ok(()) => Delivered::Ok,
+                Err(e) => classify_send(&e),
+            };
+        }
+    }
+    classify_send(&e)
+}
+
+fn classify_send(e: &teloxide::RequestError) -> Delivered {
+    use teloxide::{ApiError, RequestError};
+    match e {
+        RequestError::Api(
+            ApiError::BotBlocked | ApiError::UserDeactivated | ApiError::ChatNotFound,
+        ) => Delivered::Gone,
+        _ => Delivered::Failed,
+    }
+}
+
+async fn handle_invite(
+    bot: &Bot,
+    msg: &Message,
+    app: &Arc<App>,
+    arg: &str,
+) -> ResponseResult<()> {
+    let Some(user_id) = sender_id(msg) else { return Ok(()) };
+    if !is_admin(app, user_id) {
+        bot.send_message(msg.chat.id, NOT_ADMIN).await?;
+        return Ok(());
+    }
+    let cmd = match parse_invite(arg) {
+        Ok(cmd) => cmd,
+        Err(problem) => {
+            bot.send_message(msg.chat.id, problem).await?;
+            return Ok(());
+        }
+    };
+    let store = app.deps.store.clone();
+    match cmd {
+        InviteCmd::New { code, capacity } => {
+            let created = {
+                let (store, code) = (store.clone(), code.clone());
+                blocking(move || store.create_round(&code, capacity)).await
+            };
+            let reply = match created {
+                Err(e) => {
+                    tracing::error!(error = %e, code, "could not open a round");
+                    "Sorry, I couldn't open that round.".to_string()
+                }
+                Ok(false) => format!(
+                    "There is already a round called \"{code}\". \
+                     Pick another name — reusing one would pool two rounds' \
+                     seats under a single capacity."
+                ),
+                Ok(true) => {
+                    // Losing the round because a username lookup blipped
+                    // would be worse than a reply without a link.
+                    let username = match teloxide::prelude::Requester::get_me(bot).await {
+                        Ok(me) => me.username.clone(),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "could not read the bot's username");
+                            None
+                        }
+                    };
+                    new_round_reply(&code, capacity, username.as_deref())
+                }
+            };
+            bot.send_message(msg.chat.id, reply).await?;
+        }
+        InviteCmd::Status => {
+            let status = blocking(move || Ok((store.rounds()?, store.waiting_count()?))).await;
+            let reply = match status {
+                Ok((rounds, waiting)) => status_report(&rounds, waiting),
+                Err(e) => {
+                    tracing::error!(error = %e, "could not read invite status");
+                    "Sorry, I couldn't read the rounds.".to_string()
+                }
+            };
+            bot.send_message(msg.chat.id, reply).await?;
+        }
+        InviteCmd::SetOpen { code, open } => {
+            let changed = {
+                let code = code.clone();
+                blocking(move || store.set_round_open(&code, open)).await
+            };
+            let reply = match changed {
+                Err(e) => {
+                    tracing::error!(error = %e, code, "could not change a round");
+                    "Sorry, I couldn't change that round.".to_string()
+                }
+                Ok(false) => format!("There's no round called \"{code}\"."),
+                Ok(true) if open => format!("Round \"{code}\" is admitting again."),
+                Ok(true) => format!(
+                    "Round \"{code}\" is closed. Its seats stay spent; \
+                     /invite open {code} resumes it."
+                ),
+            };
+            bot.send_message(msg.chat.id, reply).await?;
+        }
+        InviteCmd::Announce(code) => announce_round(bot, msg, app, &code).await?,
+    }
+    Ok(())
+}
+
+/// Runs a `Store` call off the async executor. The connection is behind a
+/// blocking mutex, so every one of these has to leave the reactor thread.
+async fn blocking<T, F>(f: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+}
+
+fn new_round_reply(code: &str, capacity: i64, username: Option<&str>) -> String {
+    let mut reply = format!("Round \"{code}\" is open for {capacity}.\n\n");
+    match username {
+        Some(username) => reply.push_str(&format!("{}\n\n", join_link(username, code))),
+        None => reply.push_str(
+            "I couldn't read my own username just now, so I can't build the \
+             link — it is https://t.me/<botname>?start= followed by the name.\n\n",
+        ),
+    }
+    reply.push_str(&format!(
+        "The link only works for people who have never messaged Scout: \
+         Telegram shows the START button only in an empty chat, and only \
+         START carries the code. Anyone who has already talked to Scout \
+         joins by sending\n{}\n\n\
+         /invite announce {code} tells the waitlist, using that same command.",
+        join_instruction(code)
+    ));
+    reply
+}
+
+fn status_report(rounds: &[crate::store::RoundStatus], waiting: i64) -> String {
+    if rounds.is_empty() {
+        return "No rounds yet. /invite new <name> [capacity] opens one.".to_string();
+    }
+    let mut out = String::new();
+    for r in rounds {
+        out.push_str(&format!(
+            "{} — {}/{} seats, {}\n",
+            r.code,
+            r.used,
+            r.capacity,
+            if r.open { "open" } else { "closed" }
+        ));
+    }
+    out.push_str(&format!("\n{waiting} waiting."));
+    out
+}
+
+async fn announce_round(
+    bot: &Bot,
+    msg: &Message,
+    app: &Arc<App>,
+    code: &str,
+) -> ResponseResult<()> {
+    let store = app.deps.store.clone();
+    let rounds = match blocking(move || store.rounds()).await {
+        Ok(rounds) => rounds,
+        Err(e) => {
+            tracing::error!(error = %e, "could not read the rounds to announce");
+            bot.send_message(msg.chat.id, "Sorry, I couldn't read the rounds.").await?;
+            return Ok(());
+        }
+    };
+    // Announcing a round that cannot admit anybody spends the whole
+    // waitlist's one notification on a dead end, and `invited_at` would be
+    // stamped as though they had been told about something real.
+    let refusal = match rounds.iter().find(|r| r.code == code) {
+        None => Some(format!("There's no round called \"{code}\".")),
+        Some(r) if !r.open => Some(format!(
+            "Round \"{code}\" is closed, so nobody could join through it. \
+             /invite open {code} first."
+        )),
+        Some(r) if r.used >= r.capacity => Some(format!(
+            "Round \"{code}\" is full ({}/{}), so nobody could join through it. \
+             Open a bigger round instead.",
+            r.used, r.capacity
+        )),
+        Some(_) => None,
+    };
+    if let Some(refusal) = refusal {
+        bot.send_message(msg.chat.id, refusal).await?;
+        return Ok(());
+    }
+
+    let store = app.deps.store.clone();
+    let targets = match blocking(move || store.waitlist_to_invite()).await {
+        Ok(targets) => targets,
+        Err(e) => {
+            tracing::error!(error = %e, "could not read the waitlist");
+            bot.send_message(msg.chat.id, "Sorry, I couldn't read the waitlist.").await?;
+            return Ok(());
+        }
+    };
+    if targets.is_empty() {
+        bot.send_message(msg.chat.id, "Nobody is waiting to be told.").await?;
+        return Ok(());
+    }
+
+    let text = announce_message(code);
+    let results = broadcast(bot, &targets, &text, Some(ParseMode::Html)).await;
+
+    let (mut sent, mut dropped, mut retryable) = (0usize, 0usize, 0usize);
+    for (recipient, outcome) in results {
+        let store = app.deps.store.clone();
+        match outcome {
+            Delivered::Ok => {
+                sent += 1;
+                // Per success, so a re-run reaches only who was missed.
+                if let Err(e) = blocking(move || store.mark_invited(recipient)).await {
+                    tracing::warn!(error = %e, recipient, "could not stamp an invite as sent");
+                }
+            }
+            Delivered::Gone => {
+                dropped += 1;
+                if let Err(e) = blocking(move || store.forget_waitlist(recipient)).await {
+                    tracing::warn!(error = %e, recipient, "could not drop a waitlist row");
+                }
+            }
+            Delivered::Failed => retryable += 1,
+        }
+    }
+
+    let mut report = format!("Told {sent} of {} people about \"{code}\".", targets.len());
+    if dropped > 0 {
+        report.push_str(&format!(
+            "\nDropped {dropped} who have blocked Scout or deleted the chat."
+        ));
+    }
+    if retryable > 0 {
+        report.push_str(&format!(
+            "\n{retryable} couldn't be reached this time; run it again to retry them."
+        ));
+    }
+    report.push_str("\n\nThe message asks them to send the join command rather \
+                     than tap a link, because a link carries no code into a chat \
+                     that already has history.");
+    bot.send_message(msg.chat.id, report).await?;
+    Ok(())
+}
+
+async fn handle_kick(
+    bot: &Bot,
+    msg: &Message,
+    app: &Arc<App>,
+    arg: &str,
+    kicking: bool,
+) -> ResponseResult<()> {
+    let Some(user_id) = sender_id(msg) else { return Ok(()) };
+    if !is_admin(app, user_id) {
+        bot.send_message(msg.chat.id, NOT_ADMIN).await?;
+        return Ok(());
+    }
+    let reply = match parse_user_id(arg) {
+        Err(problem) => problem,
+        Ok(target) => {
+            let store = app.deps.store.clone();
+            let changed = blocking(move || match kicking {
+                true => store.revoke(target),
+                false => store.restore(target),
+            })
+            .await;
+            match changed {
+                Err(e) => {
+                    tracing::error!(error = %e, target, kicking, "membership change failed");
+                    "Sorry, I couldn't write that down, so nothing changed.".to_string()
+                }
+                // The table is the record; the set follows it.
+                Ok(true) if kicking => {
+                    app.members.remove(&target);
+                    format!(
+                        "{target} is out. Their seat stays spent, so the round \
+                         does not quietly reopen."
+                    )
+                }
+                Ok(true) => {
+                    app.members.insert(target);
+                    format!("{target} is back in. That consumed no seat.")
+                }
+                Ok(false) if kicking => format!(
+                    "{target} isn't a member, so there's nothing to remove. \
+                     Founders listed in ALLOWED_TELEGRAM_USER_IDS aren't \
+                     members — remove those from .env instead."
+                ),
+                Ok(false) => format!("{target} isn't a revoked member, so there's nothing to undo."),
+            }
+        }
+    };
+    bot.send_message(msg.chat.id, reply).await?;
+    Ok(())
+}
+
+/// `Some(reply)` when this person has spent today's allowance.
+///
+/// Founders are exempt: they are the people paying for the bot.
+///
+/// A failed count lets the message through. The cap is a cost guard, not an
+/// access control — the gate above it already decided this person is
+/// allowed here — and a database blip should not silence everyone at once.
+async fn over_daily_cap(app: &Arc<App>, user_id: i64) -> Option<String> {
+    if app.cfg.allowed_user_ids.contains(&user_id) {
+        return None;
+    }
+    let cap = app.cfg.invite_daily_requests;
+    let store = app.deps.store.clone();
+    let used = match blocking(move || store.requests_today(user_id)).await {
+        Ok(used) => used,
+        Err(e) => {
+            tracing::warn!(error = %e, user_id, "daily cap check failed; letting it through");
+            return None;
+        }
+    };
+    (used >= cap).then(|| {
+        tracing::info!(user_id, used, cap, "daily cap reached");
+        format!("You've used today's {cap} requests. It resets at midnight UTC.")
+    })
+}
+
 async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let text = msg.text().unwrap_or_default().to_string();
     let chat_id = msg.chat.id;
     let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    // Checked before the request is logged: otherwise somebody over their
+    // cap would push their own count up by being told they are over it, and
+    // /stat would report refusals as work.
+    if let Some(refusal) = over_daily_cap(&app, user_id).await {
+        bot.send_message(chat_id, refusal).await?;
+        return Ok(());
+    }
     log_request(&app, user_id, "text");
     note_sender(&app, &msg);
 
@@ -728,6 +1432,13 @@ fn agent_error_message(e: &anyhow::Error) -> &'static str {
 async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
     let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    // Before the session is touched as well as before the request is
+    // logged: a refused photo should leave the conversation exactly as it
+    // was, not clear a history and disarm a draft on its way out.
+    if let Some(refusal) = over_daily_cap(&app, user_id).await {
+        bot.send_message(chat_id, refusal).await?;
+        return Ok(());
+    }
     let key = chat_key(chat_id.0, user_id);
     {
         // A photo after a long gap always starts fresh (no continuation
@@ -805,7 +1516,10 @@ async fn handle_reaction(
     );
     let Some(user) = reaction.user() else { return Ok(()) };
     let user_id = user.id.0 as i64;
-    if !app.cfg.allowed_user_ids.contains(&user_id) {
+    // The same gate the message branches use. Reactions are routed on their
+    // own branch, so an allowlist check left behind here would have dropped
+    // every invited member's 👍 while their messages worked fine.
+    if !is_member_id(&app, user_id) {
         return Ok(());
     }
     if !thumbs_up_added(&reaction.old_reaction, &reaction.new_reaction) {
@@ -1619,5 +2333,199 @@ mod tests {
         assert!(text.contains("369.94"), "and so is the answer: {text}");
         assert!(!text.contains("ToolCall"), "but the tool calls are gone");
         assert!(!text.contains("ToolResult"), "and so are their results");
+    }
+
+    #[test]
+    fn start_is_recognised_across_every_form_telegram_sends() {
+        // A bare start and a start with a payload, each with and without
+        // the @bot suffix a group chat adds.
+        assert_eq!(start_payload("/start"), Some(""));
+        assert_eq!(start_payload("/start@scout_bot"), Some(""));
+        assert_eq!(start_payload("/start autumn-drop"), Some("autumn-drop"));
+        assert_eq!(start_payload("/start@scout_bot autumn-drop"), Some("autumn-drop"));
+        // Telegram clients are tidy but people are not.
+        assert_eq!(start_payload("  /start   autumn-drop  "), Some("autumn-drop"));
+
+        // A message that merely begins with the word is not the command.
+        assert_eq!(start_payload("start"), None);
+        assert_eq!(start_payload("started looking for a bike"), None);
+        assert_eq!(start_payload("/started"), None);
+        assert_eq!(start_payload("please /start"), None);
+        assert_eq!(start_payload(""), None);
+    }
+
+    #[test]
+    fn join_code_is_the_payload_and_nothing_else() {
+        assert_eq!(join_code("/start autumn-drop"), Some("autumn-drop"));
+        assert_eq!(join_code("/start@scout_bot autumn-drop"), Some("autumn-drop"));
+        // A bare start carries no code — that is the "invite-only" case,
+        // not a claim against a round named "".
+        assert_eq!(join_code("/start"), None);
+        assert_eq!(join_code("/start   "), None);
+        assert_eq!(join_code("find me a bike"), None);
+    }
+
+    #[test]
+    fn round_names_are_held_to_what_an_invite_link_can_carry() {
+        // Telegram start parameters are 1-64 of A-Za-z0-9_-. Refused where
+        // it is typed, rather than discovered when nobody can join.
+        assert_eq!(check_round_name(Some("autumn-drop_2")).unwrap(), "autumn-drop_2");
+        assert_eq!(check_round_name(Some(&"a".repeat(64))).unwrap().len(), 64);
+
+        assert!(check_round_name(None).is_err());
+        assert!(check_round_name(Some("")).is_err());
+        assert!(check_round_name(Some("   ")).is_err());
+        assert!(check_round_name(Some(&"a".repeat(65))).is_err());
+        for bad in ["autumn drop", "autumn.drop", "осень", "autumn/drop", "autumn?x=1"] {
+            assert!(check_round_name(Some(bad)).is_err(), "accepted: {bad}");
+        }
+    }
+
+    #[test]
+    fn capacity_defaults_to_a_hundred_and_refuses_nonsense() {
+        assert_eq!(
+            parse_invite("new autumn").unwrap(),
+            InviteCmd::New { code: "autumn".to_string(), capacity: 100 }
+        );
+        assert_eq!(
+            parse_invite("new autumn 250").unwrap(),
+            InviteCmd::New { code: "autumn".to_string(), capacity: 250 }
+        );
+        assert!(parse_invite("new autumn lots").is_err());
+        assert!(parse_invite("new autumn 0").is_err(), "a round with no seats admits nobody");
+        assert!(parse_invite("new autumn -5").is_err());
+    }
+
+    #[test]
+    fn invite_subcommands_parse_and_a_stray_word_is_refused() {
+        assert_eq!(parse_invite("status").unwrap(), InviteCmd::Status);
+        assert_eq!(parse_invite("  STATUS ").unwrap(), InviteCmd::Status);
+        assert_eq!(
+            parse_invite("open autumn").unwrap(),
+            InviteCmd::SetOpen { code: "autumn".to_string(), open: true }
+        );
+        assert_eq!(
+            parse_invite("close autumn").unwrap(),
+            InviteCmd::SetOpen { code: "autumn".to_string(), open: false }
+        );
+        assert_eq!(
+            parse_invite("announce autumn").unwrap(),
+            InviteCmd::Announce("autumn".to_string())
+        );
+
+        // Nothing at all, an unknown verb, and a missing name all say how
+        // to use it rather than doing something surprising.
+        for bad in ["", "   ", "delete autumn", "open", "announce", "new"] {
+            assert!(parse_invite(bad).is_err(), "accepted: {bad:?}");
+        }
+        // A trailing word is a typo. Ignoring it is how "/invite new autumn
+        // 100 seats" opens a round nobody meant.
+        assert!(parse_invite("new autumn 100 seats").is_err());
+        assert!(parse_invite("status now").is_err());
+    }
+
+    #[test]
+    fn a_kick_needs_a_real_user_id() {
+        assert_eq!(parse_user_id(" 123456 ").unwrap(), 123456);
+        for bad in ["", "  ", "@watchcat", "0", "-1", "12.5"] {
+            assert!(parse_user_id(bad).is_err(), "accepted: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_announce_asks_for_the_command_because_a_link_would_not_work() {
+        // Everyone on the waitlist has chat history with Scout — being
+        // turned away is itself a message — and Telegram only delivers a
+        // start payload through the START button, which only appears in an
+        // empty chat. A link here would open a chat and carry nothing.
+        let out = announce_message("autumn-drop");
+        assert!(out.contains("/start autumn-drop"), "got: {out}");
+        assert!(
+            !out.contains("t.me/"),
+            "a link is the one route this audience cannot use: {out}"
+        );
+        // Tap-to-copy, so nobody has to retype a code by hand.
+        assert!(out.contains("<code>/start autumn-drop</code>"), "got: {out}");
+    }
+
+    #[test]
+    fn a_stranger_is_told_the_route_that_still_works_for_them() {
+        // Anyone reading this reply has just messaged Scout, so their chat
+        // has history and Telegram will never show them the START button
+        // again — a link would open a chat carrying no code. Telling them
+        // to go and tap one would be advice that cannot work.
+        assert!(INVITE_ONLY.contains("/start "), "got: {INVITE_ONLY}");
+        assert!(
+            !INVITE_ONLY.to_lowercase().contains("press start"),
+            "the button they are being pointed at will not appear: {INVITE_ONLY}"
+        );
+    }
+
+    #[test]
+    fn opening_a_round_gives_the_link_and_the_command_it_falls_back_to() {
+        let reply = new_round_reply("autumn", 100, Some("scout_bot"));
+        assert!(reply.contains("https://t.me/scout_bot?start=autumn"), "got: {reply}");
+        assert!(reply.contains("/start autumn"), "got: {reply}");
+        assert!(reply.contains("100"));
+
+        // get_me can blip. Losing the round over it would be worse than a
+        // reply without a link, so the round is still open and the code is
+        // still in the message.
+        let reply = new_round_reply("autumn", 100, None);
+        assert!(reply.contains("autumn"), "got: {reply}");
+        assert!(reply.contains("/start autumn"), "got: {reply}");
+    }
+
+    #[test]
+    fn status_shows_seats_capacity_and_the_queue() {
+        use crate::store::RoundStatus;
+        let rounds = vec![
+            RoundStatus { code: "autumn".into(), capacity: 100, used: 100, open: true },
+            RoundStatus { code: "winter".into(), capacity: 50, used: 3, open: false },
+        ];
+        let out = status_report(&rounds, 12);
+        assert!(out.contains("autumn — 100/100 seats, open"), "got: {out}");
+        assert!(out.contains("winter — 3/50 seats, closed"), "got: {out}");
+        assert!(out.contains("12 waiting"), "got: {out}");
+
+        let empty = status_report(&[], 0);
+        assert!(empty.contains("/invite new"), "got: {empty}");
+    }
+
+    #[test]
+    fn broadcast_pacing_stays_under_telegrams_bulk_limit() {
+        // ~30 messages per second across the whole token. The delay is what
+        // keeps a hundred-member announce from finding that ceiling.
+        let per_second = 1000.0 / BROADCAST_INTERVAL.as_millis() as f64;
+        assert!(per_second <= 30.0, "{per_second} messages/second is over the limit");
+    }
+
+    #[test]
+    fn a_blocked_recipient_is_told_apart_from_a_failed_send() {
+        use teloxide::{ApiError, RequestError};
+        // Permanent: carrying these forward would retry the same failure at
+        // every future round, forever.
+        for gone in [ApiError::BotBlocked, ApiError::UserDeactivated, ApiError::ChatNotFound] {
+            assert_eq!(classify_send(&RequestError::Api(gone)), Delivered::Gone);
+        }
+        // Transient: leave the waitlist row alone so a re-run retries it.
+        assert_eq!(
+            classify_send(&RequestError::Api(ApiError::Unknown("server oops".into()))),
+            Delivered::Failed
+        );
+    }
+
+    #[test]
+    fn start_is_not_a_command_the_router_can_reach() {
+        // /start has to answer people the gate rejects, so it lives on its
+        // own branch. A Start variant left in the enum would be routed
+        // behind the gate, and a stranger's /start would fall through to
+        // silence — or a member's would reach the LLM.
+        assert!(
+            <Command as BotCommands>::bot_commands()
+                .iter()
+                .all(|c| c.command != "/start"),
+            "/start must not be a gated command"
+        );
     }
 }

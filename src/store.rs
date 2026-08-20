@@ -287,8 +287,61 @@ enum Step {
     Code(fn(&Connection) -> Result<()>),
 }
 
+const STEP_1_NEW_TABLES: &str = r#"
+CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
+-- A person, independent of how they reach Scout. Deliberately almost empty:
+-- everything knowable about someone belongs to one of their identities or to
+-- their data, not here.
+CREATE TABLE IF NOT EXISTS accounts (
+    id         BIGINT PRIMARY KEY DEFAULT nextval('accounts_id_seq'),
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+-- One row per way of proving you are that account. `kind` is 'telegram'
+-- today; a web login is a second kind. The primary key is what stops one
+-- Telegram id from being claimed by two accounts.
+CREATE TABLE IF NOT EXISTS identities (
+    account_id  BIGINT NOT NULL,
+    kind        TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (kind, external_id)
+);
+-- Where to reach an account on a channel, when nothing more specific says
+-- otherwise. Replaces `user_chats`.
+CREATE TABLE IF NOT EXISTS deliveries (
+    account_id BIGINT NOT NULL,
+    channel    TEXT NOT NULL,
+    address    TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (account_id, channel)
+);
+CREATE SEQUENCE IF NOT EXISTS conversations_id_seq;
+-- A rolling thread. `scope` keeps a group chat's history out of the
+-- account's private thread: 'direct' is the 1:1 chat and the web app, which
+-- share; a group is 'telegram:<chat_id>'.
+CREATE TABLE IF NOT EXISTS conversations (
+    id            BIGINT PRIMARY KEY DEFAULT nextval('conversations_id_seq'),
+    account_id    BIGINT NOT NULL,
+    scope         TEXT NOT NULL,
+    pending_draft TEXT,
+    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE SEQUENCE IF NOT EXISTS messages_id_seq;
+-- `body` is a serde_json `rig::completion::Message`. Storing the whole
+-- message rather than plain text keeps tool calls and their results paired,
+-- which `trim_history` depends on.
+CREATE TABLE IF NOT EXISTS messages (
+    id              BIGINT PRIMARY KEY DEFAULT nextval('messages_id_seq'),
+    conversation_id BIGINT NOT NULL,
+    position        BIGINT NOT NULL,
+    body            TEXT NOT NULL,
+    created_at      TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
-    vec![]
+    vec![(1, Step::Sql(STEP_1_NEW_TABLES))]
 }
 
 fn apply_steps(conn: &Connection) -> Result<()> {
@@ -1401,6 +1454,22 @@ mod tests {
             currency: Some("EUR".to_string()),
             notes: None,
             purchased_at: purchased_at.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_new_tables_exist_after_opening() {
+        let (s, _d) = test_store();
+        let conn = s.conn.lock().unwrap();
+        for table in ["accounts", "identities", "deliveries", "conversations", "messages"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table} should exist");
         }
     }
 

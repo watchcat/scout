@@ -65,7 +65,6 @@ fn chat_key(chat_id: i64, user_id: i64) -> (i64, i64) {
 
 #[derive(Default)]
 pub struct ChatSession {
-    pub history: Vec<LlmMessage>,
     pub pending_draft: Option<String>,
     /// When this chat last had activity; None until the first message.
     pub last_seen: Option<std::time::Instant>,
@@ -83,17 +82,13 @@ fn session_expired(last_seen: Option<std::time::Instant>, now: std::time::Instan
 /// the caller's own context. A draft is dropped whenever the session ages
 /// out, whether or not the history comes back: otherwise a photo drafted
 /// before the gap stays armed and the next bare "ok" searches for it.
-fn take_expired_session(
-    chat: &mut ChatSession,
-    now: std::time::Instant,
-) -> Option<Vec<LlmMessage>> {
+fn take_expired_session(chat: &mut ChatSession, now: std::time::Instant) -> bool {
     let expired = session_expired(chat.last_seen, now);
     chat.last_seen = Some(now);
-    if !expired {
-        return None;
+    if expired {
+        chat.pending_draft = None;
     }
-    chat.pending_draft = None;
-    (!chat.history.is_empty()).then(|| std::mem::take(&mut chat.history))
+    expired
 }
 
 /// The last `n` plain-text messages of a history, rendered as
@@ -468,6 +463,21 @@ async fn handle_command(
                 return Ok(());
             };
             app.chats.remove(&chat_key(msg.chat.id.0, user_id));
+            // History lives in the store now, so clearing the slot alone
+            // would leave the thread intact and /reset would do nothing.
+            // A fresh conversation is what "cleared" has to mean.
+            let scope = conversation_scope(msg.chat.id.0, user_id);
+            let store = app.deps.store.clone();
+            let started = blocking(move || {
+                let account_id = store.account_for_telegram(user_id)?;
+                store.start_conversation(account_id, &scope)
+            })
+            .await;
+            if let Err(e) = started {
+                tracing::error!(error = %e, user_id, "could not clear the conversation");
+                bot.send_message(msg.chat.id, CLAIM_FAILED).await?;
+                return Ok(());
+            }
             bot.send_message(msg.chat.id, "Conversation cleared.").await?;
         }
         Command::Advert(body) => {
@@ -1070,6 +1080,68 @@ async fn handle_invite(
 
 /// Runs a `Store` call off the async executor. The connection is behind a
 /// blocking mutex, so every one of these has to leave the reactor thread.
+/// Which conversation this message belongs to.
+///
+/// After a long gap the old thread is set aside and a quick LLM check
+/// decides whether the new message continues it — the same rule the
+/// in-memory session used, now applied to stored conversations so it
+/// survives a restart.
+async fn resolve_conversation(
+    app: &App,
+    user_id: i64,
+    scope: &str,
+    text: &str,
+) -> anyhow::Result<i64> {
+    let account_id = account_of(app, user_id).await?;
+    let ttl = SESSION_TTL.as_secs() as i64;
+    let store = app.deps.store.clone();
+    let (scope_owned, latest) = {
+        let scope_owned = scope.to_string();
+        let s = scope_owned.clone();
+        let store = store.clone();
+        (
+            scope_owned,
+            blocking(move || store.latest_conversation(account_id, &s, ttl)).await?,
+        )
+    };
+
+    let Some((id, aged_out)) = latest else {
+        let store = app.deps.store.clone();
+        return blocking(move || store.start_conversation(account_id, &scope_owned)).await;
+    };
+    if !aged_out {
+        return Ok(id);
+    }
+
+    let excerpt = {
+        let store = app.deps.store.clone();
+        let history = blocking(move || load_history(&store, id, HISTORY_CAP)).await?;
+        last_messages_text(&history, 6)
+    };
+    if excerpt.trim().is_empty() {
+        let store = app.deps.store.clone();
+        return blocking(move || store.start_conversation(account_id, &scope_owned)).await;
+    }
+    match crate::agent::continues_previous(&app.deps.llm, &excerpt, text).await {
+        Ok(true) => {
+            tracing::info!(user_id, id, "session expired but topic continues; keeping context");
+            let store = app.deps.store.clone();
+            blocking(move || store.touch_conversation(id)).await?;
+            Ok(id)
+        }
+        Ok(false) => {
+            tracing::info!(user_id, "session expired; starting fresh");
+            let store = app.deps.store.clone();
+            blocking(move || store.start_conversation(account_id, &scope_owned)).await
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, user_id, "continuation check failed; starting fresh");
+            let store = app.deps.store.clone();
+            blocking(move || store.start_conversation(account_id, &scope_owned)).await
+        }
+    }
+}
+
 /// Rewrites a conversation's stored messages to match `history`.
 ///
 /// A whole rewrite rather than an append: `trim_history` drops messages
@@ -1363,26 +1435,19 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     // always the caller's own context — in a group, user B can never inherit
     // user A's.
     let key = chat_key(chat_id.0, user_id);
-    let stale_history = {
+    {
+        // The draft is still in memory and still dies with the gap.
         let mut chat = app.chats.entry(key).or_default();
-        take_expired_session(&mut chat, std::time::Instant::now())
-    };
-    if let Some(old_history) = stale_history {
-        let excerpt = last_messages_text(&old_history, 6);
-        match crate::agent::continues_previous(&app.deps.llm, &excerpt, &text).await {
-            Ok(true) => {
-                tracing::info!(chat_id = chat_id.0, user_id, "session expired but topic continues; restoring context");
-                app.chats.entry(key).or_default().history = old_history;
-            }
-            Ok(false) => {
-                tracing::info!(chat_id = chat_id.0, user_id, "session expired; starting fresh");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, chat_id = chat_id.0, user_id,
-                    "continuation check failed; starting fresh");
-            }
-        }
+        take_expired_session(&mut chat, std::time::Instant::now());
     }
+    let scope = conversation_scope(chat_id.0, user_id);
+    let conversation_id = match resolve_conversation(&app, user_id, &scope, &text).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not open a conversation");
+            return Ok(());
+        }
+    };
 
     let pending = app
         .chats
@@ -1416,7 +1481,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     let _typing = Typing::start(bot.clone(), chat_id);
 
     let mut live = Live::new(bot.clone(), chat_id, app.streams.clone());
-    match run_agent(&app, &mut live, user_id, chat_id.0, &prompt).await {
+    match run_agent(&app, &mut live, user_id, chat_id.0, conversation_id, &prompt).await {
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "agent request failed");
@@ -1519,11 +1584,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         // check — a new photo is a new product hunt), and any stale draft
         // is dropped either way.
         let mut chat = app.chats.entry(key).or_default();
-        let now = std::time::Instant::now();
-        if session_expired(chat.last_seen, now) {
-            chat.history.clear();
-        }
-        chat.last_seen = Some(now);
+        chat.last_seen = Some(std::time::Instant::now());
         chat.pending_draft = None;
     }
     // Sizes are ordered smallest to largest; take the largest.
@@ -1624,8 +1685,19 @@ async fn handle_reaction(
          short numbered list and ask which one to save. Do NOT call \
          record_purchase until they confirm."
     );
+    // A reaction continues whatever thread this chat is already in, so it
+    // never starts one: an empty excerpt would just make the classifier
+    // guess.
+    let scope = conversation_scope(chat_id.0, user_id);
+    let conversation_id = match resolve_conversation(&app, user_id, &scope, &prompt).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, "could not open a conversation");
+            return Ok(());
+        }
+    };
     let mut live = Live::new(bot.clone(), chat_id, app.streams.clone());
-    match run_agent(&app, &mut live, user_id, chat_id.0, &prompt).await {
+    match run_agent(&app, &mut live, user_id, chat_id.0, conversation_id, &prompt).await {
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "reaction follow-up failed");
@@ -1666,6 +1738,7 @@ async fn run_agent(
     live: &mut Live,
     user_id: i64,
     chat_id: i64,
+    conversation_id: i64,
     prompt: &str,
 ) -> anyhow::Result<String> {
     let account_id = account_of(app, user_id).await?;
@@ -1674,15 +1747,13 @@ async fn run_agent(
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
     let agent = build_agent(&app.deps, account_id, chat_id, &facts);
-    // Per-(chat,user) history. Reading here; the matching writeback at the
-    // end of this function uses the same key, so an in-flight run always
-    // populates the caller's own session, never anyone else's.
-    let history_key = chat_key(chat_id, user_id);
-    let mut history = app
-        .chats
-        .get(&history_key)
-        .map(|c| c.history.clone())
-        .unwrap_or_default();
+    // History comes from the conversation the caller opened, so an
+    // in-flight run always reads and writes that thread and never anyone
+    // else's — the isolation the (chat, user) map used to provide.
+    let mut history = {
+        let store = app.deps.store.clone();
+        blocking(move || load_history(&store, conversation_id, HISTORY_CAP)).await?
+    };
 
     let mut streamed = String::new();
     // Reasoning arrives on its own channel, separate from the answer text.
@@ -1829,7 +1900,12 @@ async fn run_agent(
     }
 
     trim_history(&mut history, HISTORY_CAP);
-    app.chats.entry(history_key).or_default().history = history;
+    let store = app.deps.store.clone();
+    if let Err(e) = blocking(move || save_history(&store, conversation_id, &history)).await {
+        // The answer is already on its way to the user; losing the thread is
+        // worse than not saving it, but it is not worth failing the reply.
+        tracing::warn!(error = %e, conversation_id, "could not save the conversation");
+    }
     Ok(reply)
 }
 
@@ -2000,7 +2076,7 @@ mod tests {
     fn history_survives_being_dropped_and_reloaded() {
         let (s, _d) = crate::store::tests::test_store();
         let a = s.account_for_telegram(11).unwrap();
-        let c = s.current_conversation(a, "direct").unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
 
         let original = vec![LlmMessage::user("cheapest beans"), LlmMessage::assistant("here")];
         save_history(&s, c, &original).unwrap();
@@ -2024,7 +2100,7 @@ mod tests {
     fn saving_replaces_rather_than_appends() {
         let (s, _d) = crate::store::tests::test_store();
         let a = s.account_for_telegram(11).unwrap();
-        let c = s.current_conversation(a, "direct").unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
 
         save_history(&s, c, &[LlmMessage::user("one"), LlmMessage::assistant("two")]).unwrap();
         // trim_history can drop from the front; the store must follow it
@@ -2112,33 +2188,26 @@ mod tests {
         let alice_key = chat_key(9001, 111);
         let bob_key = chat_key(9001, 222);
 
-        // Alice writes a history and a draft.
+        // Alice arms a draft. History no longer lives here — it is scoped
+        // per (account, conversation scope) in the store — but the draft
+        // still is, and it must stay hers.
         {
             let mut s = chats.entry(alice_key).or_default();
-            s.history.push(user_text("find me a USB hub"));
             s.pending_draft = Some("USB hub".to_string());
         }
 
         // Bob's entry is independent — same chat, different user.
         assert!(chats.get(&bob_key).is_none());
-        chats.entry(bob_key).or_default().history.push(user_text("where is my bike?"));
+        chats.entry(bob_key).or_default().last_seen = Some(std::time::Instant::now());
 
-        // Each slot holds exactly its own owner's exchange. Guards are
-        // scoped: DashMap deadlocks against itself if a read guard is still
-        // alive when the same shard is written below.
+        // Guards are scoped: DashMap deadlocks against itself if a read
+        // guard is still alive when the same shard is written below.
         {
             let alice = chats.get(&alice_key).unwrap();
-            assert_eq!(alice.history.len(), 1);
             assert_eq!(alice.pending_draft.as_deref(), Some("USB hub"));
 
             let bob = chats.get(&bob_key).unwrap();
-            assert_eq!(bob.history.len(), 1);
             assert_eq!(bob.pending_draft, None, "Alice's draft must not reach Bob");
-            assert_eq!(
-                last_messages_text(&bob.history, 1),
-                "user: where is my bike?",
-                "Bob must not see Alice's chat"
-            );
         }
 
         // /reset drops one user's slot and leaves the others alone.
@@ -2158,35 +2227,22 @@ mod tests {
         // Aged out with history: hand it back for the continuation check,
         // and drop the draft — a photo drafted before the gap must not be
         // confirmed by the next bare "ok".
+        // Aged out: report it, and drop the draft — a photo drafted before
+        // the gap must not be confirmed by the next bare "ok".
         let mut chat = ChatSession {
-            history: vec![user_text("find me a USB hub")],
             pending_draft: Some("USB hub, 4-port, black".to_string()),
             last_seen: Some(stale),
         };
-        let taken = take_expired_session(&mut chat, now).expect("expired session yields history");
-        assert_eq!(taken.len(), 1);
-        assert!(chat.history.is_empty(), "history moved out of the slot");
+        assert!(take_expired_session(&mut chat, now), "the gap should be reported");
         assert_eq!(chat.pending_draft, None, "stale draft must be disarmed");
         assert_eq!(chat.last_seen, Some(now));
 
-        // Aged out with no history: still disarms the draft. This is the
-        // photo-then-silence case, and the one the gate used to miss.
-        let mut chat = ChatSession {
-            history: vec![],
-            pending_draft: Some("USB hub, 4-port, black".to_string()),
-            last_seen: Some(stale),
-        };
-        assert!(take_expired_session(&mut chat, now).is_none());
-        assert_eq!(chat.pending_draft, None);
-
         // Still inside the TTL: nothing is touched.
         let mut chat = ChatSession {
-            history: vec![user_text("find me a USB hub")],
             pending_draft: Some("USB hub, 4-port, black".to_string()),
             last_seen: Some(now - SESSION_TTL / 2),
         };
-        assert!(take_expired_session(&mut chat, now).is_none());
-        assert_eq!(chat.history.len(), 1, "live session keeps its history");
+        assert!(!take_expired_session(&mut chat, now));
         assert_eq!(chat.pending_draft.as_deref(), Some("USB hub, 4-port, black"));
     }
 

@@ -923,40 +923,36 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
-    /// The live conversation for this account in this scope, never expiring.
-    pub fn current_conversation(&self, account_id: i64, scope: &str) -> Result<i64> {
-        self.current_conversation_after(account_id, scope, 0)
-    }
-
-    /// The live conversation, or a new one when the last went quiet for
-    /// longer than `ttl_secs`. A `ttl_secs` of 0 means never expire.
-    ///
-    /// The TTL is passed in rather than read here so that session expiry
-    /// stays one rule owned by the caller, exactly as it was when history
-    /// lived in memory.
-    pub fn current_conversation_after(
+    /// The most recent conversation for this scope, and whether it has gone
+    /// quiet for longer than `ttl_secs`. Creates nothing — whether an
+    /// aged-out thread is resumed or replaced is a judgement the store has
+    /// no business making.
+    pub fn latest_conversation(
         &self,
         account_id: i64,
         scope: &str,
         ttl_secs: i64,
-    ) -> Result<i64> {
+    ) -> Result<Option<(i64, bool)>> {
         let conn = self.conn.lock().unwrap();
         // The cast is load-bearing: `current_timestamp` is TIMESTAMPTZ and
-        // DuckDB has no `TIMESTAMPTZ - INTERVAL` overload, so the uncast
-        // form fails to bind.
+        // DuckDB has no `TIMESTAMPTZ - INTERVAL` overload.
         let mut stmt = conn.prepare(
-            "SELECT id FROM conversations WHERE account_id = ? AND scope = ?
-             AND (? = 0 OR updated_at > CAST(current_timestamp AS TIMESTAMP) - to_seconds(?))
+            "SELECT id,
+                    updated_at <= CAST(current_timestamp AS TIMESTAMP) - to_seconds(?)
+             FROM conversations WHERE account_id = ? AND scope = ?
              ORDER BY updated_at DESC LIMIT 1",
         )?;
-        let found: Option<i64> = stmt
-            .query_map(params![account_id, scope, ttl_secs, ttl_secs], |r| r.get(0))?
+        let row: Option<(i64, bool)> = stmt
+            .query_map(params![ttl_secs, account_id, scope], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .next()
             .transpose()?;
-        drop(stmt);
-        if let Some(id) = found {
-            return Ok(id);
-        }
+        Ok(row)
+    }
+
+    pub fn start_conversation(&self, account_id: i64, scope: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
         Ok(conn.query_row(
             "INSERT INTO conversations (id, account_id, scope)
              VALUES (nextval('conversations_id_seq'), ?, ?) RETURNING id",
@@ -965,15 +961,9 @@ impl Store {
         )?)
     }
 
-    pub fn append_message(&self, conversation_id: i64, body: &str) -> Result<()> {
+    /// Marks a conversation as spoken in, so its TTL runs from now.
+    pub fn touch_conversation(&self, conversation_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO messages (id, conversation_id, position, body)
-             VALUES (nextval('messages_id_seq'), ?,
-                     coalesce((SELECT max(position) + 1 FROM messages WHERE conversation_id = ?), 0),
-                     ?)",
-            params![conversation_id, conversation_id, body],
-        )?;
         conn.execute(
             "UPDATE conversations SET updated_at = now() WHERE id = ?",
             params![conversation_id],
@@ -1027,25 +1017,6 @@ impl Store {
         }
         conn.execute_batch("COMMIT")?;
         Ok(())
-    }
-
-    pub fn set_pending_draft(&self, conversation_id: i64, draft: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE conversations SET pending_draft = ? WHERE id = ?",
-            params![draft, conversation_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn pending_draft(&self, conversation_id: i64) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT pending_draft FROM conversations WHERE id = ?")?;
-        let row: Option<Option<String>> = stmt
-            .query_map(params![conversation_id], |r| r.get(0))?
-            .next()
-            .transpose()?;
-        Ok(row.flatten())
     }
 
     /// The account behind a Telegram user, creating one the first time.
@@ -2018,54 +1989,72 @@ CREATE TABLE segment_candidates (
         let (s, _d) = test_store();
         let a = s.account_for_telegram(11).unwrap();
 
-        let direct = s.current_conversation(a, "direct").unwrap();
-        let group = s.current_conversation(a, "telegram:-100").unwrap();
+        let direct = s.start_conversation(a, "direct").unwrap();
+        let group = s.start_conversation(a, "telegram:-100").unwrap();
         assert_ne!(direct, group, "a group must not share the private thread");
 
-        s.append_message(direct, r#"{"role":"user","content":"hi"}"#).unwrap();
-        s.append_message(direct, r#"{"role":"assistant","content":"hello"}"#).unwrap();
+        s.replace_messages(
+            direct,
+            &[
+                r#"{"role":"user","content":"hi"}"#.to_string(),
+                r#"{"role":"assistant","content":"hello"}"#.to_string(),
+            ],
+        )
+        .unwrap();
 
         let bodies = s.conversation_messages(direct, 20).unwrap();
         assert_eq!(bodies.len(), 2);
         assert!(bodies[0].contains("hi"), "oldest first");
 
         assert!(s.conversation_messages(group, 20).unwrap().is_empty());
+        // Each scope reports its own newest thread, never the other's.
+        assert_eq!(s.latest_conversation(a, "direct", 0).unwrap().unwrap().0, direct);
+        assert_eq!(s.latest_conversation(a, "telegram:-100", 0).unwrap().unwrap().0, group);
     }
 
     #[test]
     fn a_conversation_returns_only_the_last_n_messages_oldest_first() {
         let (s, _d) = test_store();
         let a = s.account_for_telegram(11).unwrap();
-        let c = s.current_conversation(a, "direct").unwrap();
-        for i in 0..25 {
-            s.append_message(c, &format!(r#"{{"n":{i}}}"#)).unwrap();
-        }
-        let bodies = s.conversation_messages(c, 20).unwrap();
-        assert_eq!(bodies.len(), 20);
-        assert!(bodies[0].contains(r#""n":5"#), "should drop the oldest five");
-        assert!(bodies[19].contains(r#""n":24"#), "and end at the newest");
+        let c = s.start_conversation(a, "direct").unwrap();
+        let bodies: Vec<String> = (0..25).map(|i| format!(r#"{{"n":{i}}}"#)).collect();
+        s.replace_messages(c, &bodies).unwrap();
+
+        let got = s.conversation_messages(c, 20).unwrap();
+        assert_eq!(got.len(), 20);
+        assert!(got[0].contains(r#""n":5"#), "should drop the oldest five");
+        assert!(got[19].contains(r#""n":24"#), "and end at the newest");
     }
 
     #[test]
-    fn a_quiet_conversation_ages_out_and_a_live_one_continues() {
+    fn a_quiet_conversation_ages_out_and_a_live_one_does_not() {
         let (s, _d) = test_store();
         let a = s.account_for_telegram(11).unwrap();
-        let first = s.current_conversation(a, "direct").unwrap();
+        let first = s.start_conversation(a, "direct").unwrap();
 
-        // Still inside the TTL: the same thread continues.
-        assert_eq!(s.current_conversation_after(a, "direct", 600).unwrap(), first);
+        // Inside the TTL: reported as live, so the caller keeps using it.
+        assert_eq!(s.latest_conversation(a, "direct", 600).unwrap(), Some((first, false)));
 
-        // Push it back beyond the TTL and a new thread starts instead.
+        // Push it back beyond the TTL and the same call reports it stale.
         {
             let conn = s.conn.lock().unwrap();
             conn.execute(
-                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(3600) WHERE id = ?",
+                "UPDATE conversations
+                 SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(3600)
+                 WHERE id = ?",
                 params![first],
             )
             .unwrap();
         }
-        let second = s.current_conversation_after(a, "direct", 600).unwrap();
-        assert_ne!(second, first, "a conversation older than the TTL is not resumed");
+        assert_eq!(s.latest_conversation(a, "direct", 600).unwrap(), Some((first, true)));
+
+        // Speaking in it makes it live again without starting a new one.
+        s.touch_conversation(first).unwrap();
+        assert_eq!(s.latest_conversation(a, "direct", 600).unwrap(), Some((first, false)));
+
+        // An account with nothing has nothing — the caller starts the thread.
+        let b = s.account_for_telegram(22).unwrap();
+        assert_eq!(s.latest_conversation(b, "direct", 600).unwrap(), None);
     }
 
     #[test]

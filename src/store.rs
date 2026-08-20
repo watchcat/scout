@@ -272,6 +272,60 @@ pub struct RoundStatus {
     pub open: bool,
 }
 
+/// A numbered change to an existing database. `MIGRATIONS` above creates
+/// tables and is safe to re-run; these are not, so each one runs at most
+/// once and the number it reached is recorded.
+///
+/// Never renumber or edit a step that has shipped, and never insert one
+/// below a number that has already run — the runner skips anything at or
+/// below the recorded version, so it would be silently ignored. Append.
+enum Step {
+    Sql(&'static str),
+    /// For work that needs a loop or a returned id — plain SQL cannot ask
+    /// DuckDB for `nextval` per row and keep the mapping.
+    #[allow(dead_code)]
+    Code(fn(&Connection) -> Result<()>),
+}
+
+fn steps() -> Vec<(i64, Step)> {
+    vec![]
+}
+
+fn apply_steps(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL)")?;
+    let mut stmt = conn.prepare("SELECT version FROM schema_version")?;
+    let current: Option<i64> = stmt.query_map([], |r| r.get(0))?.next().transpose()?;
+    drop(stmt);
+    let mut current = match current {
+        Some(v) => v,
+        None => {
+            conn.execute("INSERT INTO schema_version (version) VALUES (0)", [])?;
+            0
+        }
+    };
+    for (n, step) in steps() {
+        if n <= current {
+            continue;
+        }
+        // DDL is transactional in DuckDB v1.5.1 (measured), so a step that
+        // fails half-way leaves the database exactly as it was.
+        conn.execute_batch("BEGIN")?;
+        let result = match step {
+            Step::Sql(sql) => conn.execute_batch(sql).map_err(anyhow::Error::from),
+            Step::Code(f) => f(conn),
+        };
+        if let Err(e) = result {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e.context(format!("migration step {n} failed")));
+        }
+        conn.execute("UPDATE schema_version SET version = ?", params![n])?;
+        conn.execute_batch("COMMIT")?;
+        current = n;
+        tracing::info!(step = n, "applied migration step");
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -281,9 +335,16 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path.as_ref())?;
         conn.execute_batch(MIGRATIONS)?;
+        apply_steps(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Highest migration step applied to this database.
+    pub fn schema_version(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?)
     }
 
     pub fn record_purchase(&self, user_id: i64, p: NewPurchase) -> Result<Purchase> {
@@ -1341,6 +1402,21 @@ mod tests {
             notes: None,
             purchased_at: purchased_at.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn migration_steps_run_once_and_only_once() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.duckdb");
+
+        let s = Store::open(&path).unwrap();
+        let first = s.schema_version().unwrap();
+        drop(s);
+
+        // Re-opening must not re-run anything. A step that ran twice would
+        // duplicate backfilled rows, so the version is the guard.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), first);
     }
 
     #[test]

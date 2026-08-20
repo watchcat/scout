@@ -2,6 +2,7 @@ mod agent;
 mod bot;
 mod config;
 mod draft;
+mod events;
 mod links;
 mod progress;
 mod scheduler;

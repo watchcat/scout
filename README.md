@@ -271,13 +271,13 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 23 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **425 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **430 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,
 and the row counts were compared either side.
 
-Roughly 23,200 lines of Rust across 30 focused modules.
+Roughly 23,400 lines of Rust across 31 focused modules.
 
 ---
 
@@ -343,7 +343,7 @@ Roughly 23,200 lines of Rust across 30 focused modules.
 ## Development
 
 ```bash
-cargo test                  # 425 tests, no network needed
+cargo test                  # 430 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

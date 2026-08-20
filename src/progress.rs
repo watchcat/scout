@@ -393,3 +393,120 @@ mod tests {
         assert_eq!(streams.load(Ordering::Relaxed), 0, "a finished reply frees its slot");
     }
 }
+
+/// Somewhere progress can be shown.
+///
+/// `Live` is the real one. A test can supply a different one, which is what
+/// makes the pacing and flood-control path reachable without a bot token.
+///
+/// Async fn in a trait, used only through generics — this is never a
+/// `dyn Renderer`, so its futures needing no `Send` bound costs nothing.
+///
+/// Named `render*` rather than `show*` on purpose: `Live` already has
+/// inherent `show`/`show_thinking`, and a trait method of the same name
+/// would make `self.show(..)` inside the impl depend on inherent methods
+/// winning name resolution. If that ever resolved the other way it would be
+/// unbounded recursion — a stack overflow at runtime, not a compile error.
+/// Different names cannot go wrong.
+pub trait Renderer {
+    /// Returns whether anything was actually shown.
+    async fn render(&mut self, text: &str, force: bool) -> bool;
+    async fn render_thinking(&mut self, text: &str) -> bool;
+}
+
+impl Renderer for Live {
+    async fn render(&mut self, text: &str, force: bool) -> bool {
+        self.show(text, force).await
+    }
+    async fn render_thinking(&mut self, text: &str) -> bool {
+        self.show_thinking(text).await
+    }
+}
+
+/// Draws every event the run produces, then hands the renderer back.
+///
+/// Ends when the channel closes, which happens when `run_agent` returns and
+/// drops its sink — so the loop needs no shutdown signal of its own.
+pub async fn render_events<R: Renderer>(
+    mut renderer: R,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<crate::events::AgentEvent>,
+) -> R {
+    use crate::events::AgentEvent;
+    while let Some(event) = events.recv().await {
+        match event {
+            AgentEvent::Tool(text) | AgentEvent::Answer(text) | AgentEvent::Notice(text) => {
+                renderer.render(&text, false).await;
+            }
+            AgentEvent::Thinking(text) => {
+                renderer.render_thinking(&text).await;
+            }
+        }
+    }
+    renderer
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::events::AgentEvent;
+
+    /// A renderer that writes to a list instead of to Telegram. This is the
+    /// thing phase two was for: progress rendering can now be tested with no
+    /// bot token, no network and no rate limiter.
+    #[derive(Default)]
+    struct Recorder {
+        frames: Vec<(String, bool)>,
+    }
+
+    impl Renderer for Recorder {
+        async fn render(&mut self, text: &str, _force: bool) -> bool {
+            self.frames.push((text.to_string(), false));
+            true
+        }
+        async fn render_thinking(&mut self, text: &str) -> bool {
+            self.frames.push((text.to_string(), true));
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn every_event_reaches_the_renderer_in_order_and_in_the_right_mode() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::events::emit(&tx, AgentEvent::Tool("searching Kagi".into()));
+        crate::events::emit(&tx, AgentEvent::Thinking("comparing fares".into()));
+        crate::events::emit(&tx, AgentEvent::Answer("The cheapest".into()));
+        crate::events::emit(&tx, AgentEvent::Notice("wrapping up".into()));
+        drop(tx);
+
+        let rec = render_events(Recorder::default(), rx).await;
+        assert_eq!(
+            rec.frames,
+            vec![
+                ("searching Kagi".to_string(), false),
+                ("comparing fares".to_string(), true),
+                ("The cheapest".to_string(), false),
+                ("wrapping up".to_string(), false),
+            ],
+            "thinking renders in its own mode; everything else is ordinary text"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_renderer_is_handed_back_when_the_run_ends() {
+        // The caller needs it afterwards to send the final answer, so the
+        // loop must return it rather than consume it.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::events::emit(&tx, AgentEvent::Answer("done".into()));
+        drop(tx);
+        let rec = render_events(Recorder::default(), rx).await;
+        assert_eq!(rec.frames.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_says_nothing_still_returns() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        drop(tx);
+        let rec = render_events(Recorder::default(), rx).await;
+        assert!(rec.frames.is_empty());
+    }
+}

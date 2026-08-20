@@ -1480,8 +1480,16 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
 
     let _typing = Typing::start(bot.clone(), chat_id);
 
-    let mut live = Live::new(bot.clone(), chat_id, app.streams.clone());
-    match run_agent(&app, &mut live, user_id, chat_id.0, conversation_id, &prompt).await {
+    let (events, incoming) = tokio::sync::mpsc::unbounded_channel();
+    let live = Live::new(bot.clone(), chat_id, app.streams.clone());
+    // join! rather than spawn: both futures run in this task, so the
+    // renderer's futures need no Send bound. `events` moves into the run and
+    // drops when it returns, which is what ends the renderer.
+    let (result, mut live) = tokio::join!(
+        run_agent(&app, events, user_id, chat_id.0, conversation_id, &prompt),
+        crate::progress::render_events(live, incoming),
+    );
+    match result {
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "agent request failed");
@@ -1696,8 +1704,13 @@ async fn handle_reaction(
             return Ok(());
         }
     };
-    let mut live = Live::new(bot.clone(), chat_id, app.streams.clone());
-    match run_agent(&app, &mut live, user_id, chat_id.0, conversation_id, &prompt).await {
+    let (events, incoming) = tokio::sync::mpsc::unbounded_channel();
+    let live = Live::new(bot.clone(), chat_id, app.streams.clone());
+    let (result, mut live) = tokio::join!(
+        run_agent(&app, events, user_id, chat_id.0, conversation_id, &prompt),
+        crate::progress::render_events(live, incoming),
+    );
+    match result {
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "reaction follow-up failed");
@@ -1730,12 +1743,16 @@ async fn download_photo(
 /// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
 /// from being held across awaits.
 ///
-/// The run is streamed: `live` shows which tool is running and then the
-/// answer as it is written, because the tool calls alone take most of a
-/// minute and an idle chat looks broken.
+/// The run reports progress as events rather than drawing them, because the
+/// tool calls alone take most of a minute and an idle chat looks broken —
+/// but who draws them is not this function's business.
+///
+/// `events` is taken by value: returning drops it, which closes the channel
+/// and ends whoever is rendering. That is the only shutdown signal the
+/// renderer gets, so it must not be held anywhere else.
 async fn run_agent(
     app: &App,
-    live: &mut Live,
+    events: crate::events::EventSink,
     user_id: i64,
     chat_id: i64,
     conversation_id: i64,
@@ -1788,8 +1805,13 @@ async fn run_agent(
                 match item {
                 MultiTurnStreamItem::ToolExecutionStart { tool_call, .. } => {
                     let args = &tool_call.function.arguments;
-                    live.show(&crate::progress::describe(&tool_call.function.name, args), false)
-                        .await;
+                    crate::events::emit(
+                        &events,
+                        crate::events::AgentEvent::Tool(crate::progress::describe(
+                            &tool_call.function.name,
+                            args,
+                        )),
+                    );
                 }
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
                     streamed.push_str(&t.text);
@@ -1797,7 +1819,7 @@ async fn run_agent(
                     // reasoning never reaches the chat as answer text.
                     let answer = strip_thinking(&streamed);
                     if !answer.is_empty() {
-                        live.show(&answer, false).await;
+                        crate::events::emit(&events, crate::events::AgentEvent::Answer(answer));
                     }
                 }
                 // MiniMax streams its reasoning on a separate channel. Shown
@@ -1807,7 +1829,10 @@ async fn run_agent(
                 ) => {
                     thinking.push_str(&reasoning);
                     if strip_thinking(&streamed).is_empty() {
-                        live.show_thinking(&thinking).await;
+                        crate::events::emit(
+                            &events,
+                            crate::events::AgentEvent::Thinking(thinking.clone()),
+                        );
                     }
                 }
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
@@ -1820,7 +1845,10 @@ async fn run_agent(
                         }
                     }
                     if strip_thinking(&streamed).is_empty() {
-                        live.show_thinking(&thinking).await;
+                        crate::events::emit(
+                            &events,
+                            crate::events::AgentEvent::Thinking(thinking.clone()),
+                        );
                     }
                 }
                 MultiTurnStreamItem::FinalResponse(res) => {
@@ -1857,7 +1885,12 @@ async fn run_agent(
 
     if let Some(reason) = salvage {
         tracing::warn!(chat_id, reason, "run interrupted; writing up from notes");
-        live.show("✍️ wrapping up with what I found so far", false).await;
+        crate::events::emit(
+            &events,
+            crate::events::AgentEvent::Notice(
+                "✍️ wrapping up with what I found so far".to_string(),
+            ),
+        );
         // The history of an interrupted run is never returned, so the
         // model's own notes are the material: its reasoning already lists
         // the prices it confirmed.

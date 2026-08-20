@@ -1902,7 +1902,7 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::TempDir;
 

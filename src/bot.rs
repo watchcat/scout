@@ -2,6 +2,7 @@ use crate::agent::{build_agent, wrap_up_agent, AgentDeps, HISTORY_CAP, WRAP_UP_N
 use crate::config::Config;
 use crate::draft::{resolve_draft, DraftResolution};
 use crate::progress::Live;
+use crate::store::Store;
 use crate::text::{split_message, strip_thinking, TELEGRAM_LIMIT};
 use crate::vision::describe_photo;
 use dashmap::DashMap;
@@ -1069,6 +1070,45 @@ async fn handle_invite(
 
 /// Runs a `Store` call off the async executor. The connection is behind a
 /// blocking mutex, so every one of these has to leave the reactor thread.
+/// Rewrites a conversation's stored messages to match `history`.
+///
+/// A whole rewrite rather than an append: `trim_history` drops messages
+/// from the front, so what is stored has to be what the agent will actually
+/// be sent next time, not a growing log that disagrees with it.
+fn save_history(store: &Store, conversation_id: i64, history: &[LlmMessage]) -> anyhow::Result<()> {
+    let bodies = history
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    store.replace_messages(conversation_id, &bodies)
+}
+
+/// Stored messages, oldest first. A row that no longer deserializes —
+/// because rig changed shape under us — is dropped rather than fatal:
+/// losing some context is survivable, refusing to answer at all is not.
+fn load_history(store: &Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
+    let bodies = store.conversation_messages(conversation_id, cap)?;
+    let mut out = Vec::with_capacity(bodies.len());
+    for body in bodies {
+        match serde_json::from_str::<LlmMessage>(&body) {
+            Ok(m) => out.push(m),
+            Err(e) => tracing::warn!(error = %e, "dropping an unreadable stored message"),
+        }
+    }
+    Ok(out)
+}
+
+/// In a 1:1 chat Telegram makes the chat id equal the user id, and that is
+/// the thread the web app will share. Anywhere else is a room with other
+/// people in it and keeps its own history.
+fn conversation_scope(chat_id: i64, user_id: i64) -> String {
+    if chat_id == user_id {
+        "direct".to_string()
+    } else {
+        format!("telegram:{chat_id}")
+    }
+}
+
 /// The account behind a Telegram user, created on first sight.
 ///
 /// Everything below the adapter is keyed by account id; `sender_id` is a
@@ -1956,6 +1996,51 @@ async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> Resp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn history_survives_being_dropped_and_reloaded() {
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.current_conversation(a, "direct").unwrap();
+
+        let original = vec![LlmMessage::user("cheapest beans"), LlmMessage::assistant("here")];
+        save_history(&s, c, &original).unwrap();
+        let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
+
+        // Not compared struct-for-struct: rig leaves `additional_params`
+        // as None when a message is built in code but deserializes it to
+        // Some({}), so a round trip is never byte-identical. What has to
+        // hold is that the words and their roles survive, and that a second
+        // trip changes nothing further — otherwise history would drift a
+        // little every time it was reloaded.
+        assert_eq!(loaded.len(), original.len());
+        assert_eq!(last_messages_text(&loaded, 2), last_messages_text(&original, 2));
+
+        save_history(&s, c, &loaded).unwrap();
+        let again = load_history(&s, c, HISTORY_CAP).unwrap();
+        assert_eq!(again, loaded, "reloading must reach a fixed point");
+    }
+
+    #[test]
+    fn saving_replaces_rather_than_appends() {
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.current_conversation(a, "direct").unwrap();
+
+        save_history(&s, c, &[LlmMessage::user("one"), LlmMessage::assistant("two")]).unwrap();
+        // trim_history can drop from the front; the store must follow it
+        // down rather than keeping the messages the agent will never see.
+        save_history(&s, c, &[LlmMessage::assistant("two")]).unwrap();
+
+        let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
+        assert_eq!(loaded.len(), 1, "a trimmed history must not grow back");
+    }
+
+    #[test]
+    fn a_scope_string_separates_a_group_from_a_private_chat() {
+        assert_eq!(conversation_scope(4242, 4242), "direct");
+        assert_eq!(conversation_scope(-100123, 4242), "telegram:-100123");
+    }
+
     use super::{thumbs_up_added, ChatSession, SENT_REPLY_CAP};
     use dashmap::DashMap;
     use teloxide::types::ReactionType;

@@ -1,7 +1,6 @@
 use crate::agent::{build_agent, wrap_up_agent, HISTORY_CAP, WRAP_UP_NOTE};
 use crate::draft::{resolve_draft, DraftResolution};
 use crate::progress::Live;
-use crate::store::Store;
 use crate::text::{split_message, strip_thinking, TELEGRAM_LIMIT};
 use crate::vision::describe_photo;
 use dashmap::DashMap;
@@ -55,7 +54,6 @@ const SENT_REPLY_CAP: usize = 30;
 /// A chat quiet for longer than this starts a fresh session on the next
 /// message; for text messages an LLM check may restore the old context if
 /// the new message continues the same topic.
-const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Key for the per-(chat,user) session map. Extracted here so the same
 /// tuple is built everywhere; in 1:1 chats the same value is reused.
@@ -72,7 +70,7 @@ pub struct ChatSession {
 
 /// True when the gap since `last_seen` exceeds the session TTL.
 fn session_expired(last_seen: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    last_seen.is_some_and(|t| now.duration_since(t) > SESSION_TTL)
+    last_seen.is_some_and(|t| now.duration_since(t) > crate::session::SESSION_TTL)
 }
 
 /// Apply session expiry to one slot and hand back the aged-out history, if
@@ -91,36 +89,6 @@ fn take_expired_session(chat: &mut ChatSession, now: std::time::Instant) -> bool
     expired
 }
 
-/// The last `n` plain-text messages of a history, rendered as
-/// "user:/assistant:" lines for the continuation classifier.
-fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
-    let mut lines: Vec<String> = history
-        .iter()
-        .rev()
-        .filter_map(|m| match m {
-            LlmMessage::User { content } => content
-                .iter()
-                .filter_map(|c| match c {
-                    rig::message::UserContent::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .reduce(|a, b| format!("{a}\n{b}"))
-                .map(|t| format!("user: {t}")),
-            LlmMessage::Assistant { content, .. } => content
-                .iter()
-                .filter_map(|c| match c {
-                    rig::message::AssistantContent::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .reduce(|a, b| format!("{a}\n{b}"))
-                .map(|t| format!("assistant: {t}")),
-            _ => None,
-        })
-        .take(n)
-        .collect();
-    lines.reverse();
-    lines.join("\n")
-}
 
 /// Stash a sent reply against the per-chat ring buffer. Every bot reply in
 /// `chat_id` is appended, with FIFO eviction past `SENT_REPLY_CAP`. Used by
@@ -466,7 +434,7 @@ async fn handle_command(
             // History lives in the store now, so clearing the slot alone
             // would leave the thread intact and /reset would do nothing.
             // A fresh conversation is what "cleared" has to mean.
-            let scope = conversation_scope(msg.chat.id.0, user_id);
+            let scope = crate::session::conversation_scope(msg.chat.id.0, user_id);
             let store = app.core.deps.store.clone();
             let started = blocking(move || {
                 let account_id = store.account_for_telegram(user_id)?;
@@ -1078,119 +1046,10 @@ async fn handle_invite(
     Ok(())
 }
 
-/// Runs a `Store` call off the async executor. The connection is behind a
-/// blocking mutex, so every one of these has to leave the reactor thread.
-/// Which conversation this message belongs to.
-///
-/// After a long gap the old thread is set aside and a quick LLM check
-/// decides whether the new message continues it — the same rule the
-/// in-memory session used, now applied to stored conversations so it
-/// survives a restart.
-async fn resolve_conversation(
-    app: &App,
-    user_id: i64,
-    scope: &str,
-    text: &str,
-) -> anyhow::Result<i64> {
-    let account_id = account_of(app, user_id).await?;
-    let ttl = SESSION_TTL.as_secs() as i64;
-    let store = app.core.deps.store.clone();
-    let (scope_owned, latest) = {
-        let scope_owned = scope.to_string();
-        let s = scope_owned.clone();
-        let store = store.clone();
-        (
-            scope_owned,
-            blocking(move || store.latest_conversation(account_id, &s, ttl)).await?,
-        )
-    };
 
-    let Some((id, aged_out)) = latest else {
-        let store = app.core.deps.store.clone();
-        return blocking(move || store.start_conversation(account_id, &scope_owned)).await;
-    };
-    if !aged_out {
-        return Ok(id);
-    }
 
-    let excerpt = {
-        let store = app.core.deps.store.clone();
-        let history = blocking(move || load_history(&store, id, HISTORY_CAP)).await?;
-        last_messages_text(&history, 6)
-    };
-    if excerpt.trim().is_empty() {
-        let store = app.core.deps.store.clone();
-        return blocking(move || store.start_conversation(account_id, &scope_owned)).await;
-    }
-    match crate::agent::continues_previous(&app.core.deps.llm, &excerpt, text).await {
-        Ok(true) => {
-            tracing::info!(user_id, id, "session expired but topic continues; keeping context");
-            let store = app.core.deps.store.clone();
-            blocking(move || store.touch_conversation(id)).await?;
-            Ok(id)
-        }
-        Ok(false) => {
-            tracing::info!(user_id, "session expired; starting fresh");
-            let store = app.core.deps.store.clone();
-            blocking(move || store.start_conversation(account_id, &scope_owned)).await
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, user_id, "continuation check failed; starting fresh");
-            let store = app.core.deps.store.clone();
-            blocking(move || store.start_conversation(account_id, &scope_owned)).await
-        }
-    }
-}
 
-/// Rewrites a conversation's stored messages to match `history`.
-///
-/// A whole rewrite rather than an append: `trim_history` drops messages
-/// from the front, so what is stored has to be what the agent will actually
-/// be sent next time, not a growing log that disagrees with it.
-fn save_history(store: &Store, conversation_id: i64, history: &[LlmMessage]) -> anyhow::Result<()> {
-    let bodies = history
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    store.replace_messages(conversation_id, &bodies)
-}
 
-/// Stored messages, oldest first. A row that no longer deserializes —
-/// because rig changed shape under us — is dropped rather than fatal:
-/// losing some context is survivable, refusing to answer at all is not.
-fn load_history(store: &Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
-    let bodies = store.conversation_messages(conversation_id, cap)?;
-    let mut out = Vec::with_capacity(bodies.len());
-    for body in bodies {
-        match serde_json::from_str::<LlmMessage>(&body) {
-            Ok(m) => out.push(m),
-            Err(e) => tracing::warn!(error = %e, "dropping an unreadable stored message"),
-        }
-    }
-    Ok(out)
-}
-
-/// In a 1:1 chat Telegram makes the chat id equal the user id, and that is
-/// the thread the web app will share. Anywhere else is a room with other
-/// people in it and keeps its own history.
-fn conversation_scope(chat_id: i64, user_id: i64) -> String {
-    if chat_id == user_id {
-        "direct".to_string()
-    } else {
-        format!("telegram:{chat_id}")
-    }
-}
-
-/// The account behind a Telegram user, created on first sight.
-///
-/// Everything below the adapter is keyed by account id; `sender_id` is a
-/// Telegram id. This is the single place the two meet, so a caller that
-/// forgets to convert gets a type that is still an `i64` but a name that
-/// says which one it is.
-async fn account_of(app: &App, telegram_id: i64) -> anyhow::Result<i64> {
-    let store = app.core.deps.store.clone();
-    blocking(move || store.account_for_telegram(telegram_id)).await
-}
 
 async fn blocking<T, F>(f: F) -> anyhow::Result<T>
 where
@@ -1384,36 +1243,6 @@ async fn handle_kick(
     Ok(())
 }
 
-/// `Some(reply)` when this person has spent today's allowance.
-///
-/// Founders are exempt: they are the people paying for the bot.
-///
-/// A failed count lets the message through. The cap is a cost guard, not an
-/// access control — the gate above it already decided this person is
-/// allowed here — and a database blip should not silence everyone at once.
-async fn over_daily_cap(app: &Arc<App>, user_id: i64) -> Option<String> {
-    if app.core.cfg.allowed_user_ids.contains(&user_id) {
-        return None;
-    }
-    let cap = app.core.cfg.invite_daily_requests;
-    let store = app.core.deps.store.clone();
-    let used = match blocking(move || {
-        let account_id = store.account_for_telegram(user_id)?;
-        store.requests_today(account_id)
-    })
-    .await
-    {
-        Ok(used) => used,
-        Err(e) => {
-            tracing::warn!(error = %e, user_id, "daily cap check failed; letting it through");
-            return None;
-        }
-    };
-    (used >= cap).then(|| {
-        tracing::info!(user_id, used, cap, "daily cap reached");
-        format!("You've used today's {cap} requests. It resets at midnight UTC.")
-    })
-}
 
 async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let text = msg.text().unwrap_or_default().to_string();
@@ -1422,7 +1251,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     // Checked before the request is logged: otherwise somebody over their
     // cap would push their own count up by being told they are over it, and
     // /stat would report refusals as work.
-    if let Some(refusal) = over_daily_cap(&app, user_id).await {
+    if let Some(refusal) = crate::session::over_daily_cap(&app.core, user_id).await {
         bot.send_message(chat_id, refusal).await?;
         return Ok(());
     }
@@ -1440,8 +1269,8 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         let mut chat = app.chats.entry(key).or_default();
         take_expired_session(&mut chat, std::time::Instant::now());
     }
-    let scope = conversation_scope(chat_id.0, user_id);
-    let conversation_id = match resolve_conversation(&app, user_id, &scope, &text).await {
+    let scope = crate::session::conversation_scope(chat_id.0, user_id);
+    let conversation_id = match crate::session::resolve_conversation(&app.core, user_id, &scope, &text).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not open a conversation");
@@ -1582,7 +1411,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     // Before the session is touched as well as before the request is
     // logged: a refused photo should leave the conversation exactly as it
     // was, not clear a history and disarm a draft on its way out.
-    if let Some(refusal) = over_daily_cap(&app, user_id).await {
+    if let Some(refusal) = crate::session::over_daily_cap(&app.core, user_id).await {
         bot.send_message(chat_id, refusal).await?;
         return Ok(());
     }
@@ -1696,8 +1525,8 @@ async fn handle_reaction(
     // A reaction continues whatever thread this chat is already in, so it
     // never starts one: an empty excerpt would just make the classifier
     // guess.
-    let scope = conversation_scope(chat_id.0, user_id);
-    let conversation_id = match resolve_conversation(&app, user_id, &scope, &prompt).await {
+    let scope = crate::session::conversation_scope(chat_id.0, user_id);
+    let conversation_id = match crate::session::resolve_conversation(&app.core, user_id, &scope, &prompt).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "could not open a conversation");
@@ -1758,7 +1587,7 @@ async fn run_agent(
     conversation_id: i64,
     prompt: &str,
 ) -> anyhow::Result<String> {
-    let account_id = account_of(app, user_id).await?;
+    let account_id = crate::session::account_of(&app.core, user_id).await?;
     let facts = {
         let store = app.core.deps.store.clone();
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
@@ -1769,7 +1598,7 @@ async fn run_agent(
     // else's — the isolation the (chat, user) map used to provide.
     let mut history = {
         let store = app.core.deps.store.clone();
-        blocking(move || load_history(&store, conversation_id, HISTORY_CAP)).await?
+        blocking(move || crate::session::load_history(&store, conversation_id, HISTORY_CAP)).await?
     };
 
     let mut streamed = String::new();
@@ -1934,7 +1763,7 @@ async fn run_agent(
 
     trim_history(&mut history, HISTORY_CAP);
     let store = app.core.deps.store.clone();
-    if let Err(e) = blocking(move || save_history(&store, conversation_id, &history)).await {
+    if let Err(e) = blocking(move || crate::session::save_history(&store, conversation_id, &history)).await {
         // The answer is already on its way to the user; losing the thread is
         // worse than not saving it, but it is not worth failing the reply.
         tracing::warn!(error = %e, conversation_id, "could not save the conversation");
@@ -2112,8 +1941,8 @@ mod tests {
         let c = s.start_conversation(a, "direct").unwrap();
 
         let original = vec![LlmMessage::user("cheapest beans"), LlmMessage::assistant("here")];
-        save_history(&s, c, &original).unwrap();
-        let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
+        crate::session::save_history(&s, c, &original).unwrap();
+        let loaded = crate::session::load_history(&s, c, HISTORY_CAP).unwrap();
 
         // Not compared struct-for-struct: rig leaves `additional_params`
         // as None when a message is built in code but deserializes it to
@@ -2122,10 +1951,10 @@ mod tests {
         // trip changes nothing further — otherwise history would drift a
         // little every time it was reloaded.
         assert_eq!(loaded.len(), original.len());
-        assert_eq!(last_messages_text(&loaded, 2), last_messages_text(&original, 2));
+        assert_eq!(crate::session::last_messages_text(&loaded, 2), crate::session::last_messages_text(&original, 2));
 
-        save_history(&s, c, &loaded).unwrap();
-        let again = load_history(&s, c, HISTORY_CAP).unwrap();
+        crate::session::save_history(&s, c, &loaded).unwrap();
+        let again = crate::session::load_history(&s, c, HISTORY_CAP).unwrap();
         assert_eq!(again, loaded, "reloading must reach a fixed point");
     }
 
@@ -2135,20 +1964,15 @@ mod tests {
         let a = s.account_for_telegram(11).unwrap();
         let c = s.start_conversation(a, "direct").unwrap();
 
-        save_history(&s, c, &[LlmMessage::user("one"), LlmMessage::assistant("two")]).unwrap();
+        crate::session::save_history(&s, c, &[LlmMessage::user("one"), LlmMessage::assistant("two")]).unwrap();
         // trim_history can drop from the front; the store must follow it
         // down rather than keeping the messages the agent will never see.
-        save_history(&s, c, &[LlmMessage::assistant("two")]).unwrap();
+        crate::session::save_history(&s, c, &[LlmMessage::assistant("two")]).unwrap();
 
-        let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
+        let loaded = crate::session::load_history(&s, c, HISTORY_CAP).unwrap();
         assert_eq!(loaded.len(), 1, "a trimmed history must not grow back");
     }
 
-    #[test]
-    fn a_scope_string_separates_a_group_from_a_private_chat() {
-        assert_eq!(conversation_scope(4242, 4242), "direct");
-        assert_eq!(conversation_scope(-100123, 4242), "telegram:-100123");
-    }
 
     use super::{thumbs_up_added, ChatSession, SENT_REPLY_CAP};
     use dashmap::DashMap;
@@ -2186,29 +2010,18 @@ mod tests {
 
     #[test]
     fn session_expiry_boundary() {
-        use super::{session_expired, SESSION_TTL};
+        use super::session_expired;
+        use crate::session::SESSION_TTL;
         use std::time::Instant;
         let now = Instant::now();
         assert!(!session_expired(None, now), "first contact is never stale");
-        assert!(!session_expired(Some(now - SESSION_TTL / 2), now));
+        assert!(!session_expired(Some(now - crate::session::SESSION_TTL / 2), now));
         assert!(session_expired(
-            Some(now - SESSION_TTL - std::time::Duration::from_secs(1)),
+            Some(now - crate::session::SESSION_TTL - std::time::Duration::from_secs(1)),
             now
         ));
     }
 
-    #[test]
-    fn last_messages_text_renders_roles_and_takes_tail() {
-        use super::last_messages_text;
-        let history = vec![
-            user_text("oldest question"),
-            assistant_text("oldest answer"),
-            user_text("find me a bike"),
-            assistant_text("here are 3 bikes"),
-        ];
-        let excerpt = last_messages_text(&history, 2);
-        assert_eq!(excerpt, "user: find me a bike\nassistant: here are 3 bikes");
-    }
 
     #[test]
     fn chat_key_isolates_session_state_per_user() {
@@ -2255,7 +2068,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let now = Instant::now();
-        let stale = now - SESSION_TTL - Duration::from_secs(1);
+        let stale = now - crate::session::SESSION_TTL - Duration::from_secs(1);
 
         // Aged out with history: hand it back for the continuation check,
         // and drop the draft — a photo drafted before the gap must not be
@@ -2273,7 +2086,7 @@ mod tests {
         // Still inside the TTL: nothing is touched.
         let mut chat = ChatSession {
             pending_draft: Some("USB hub, 4-port, black".to_string()),
-            last_seen: Some(now - SESSION_TTL / 2),
+            last_seen: Some(now - crate::session::SESSION_TTL / 2),
         };
         assert!(!take_expired_session(&mut chat, now));
         assert_eq!(chat.pending_draft.as_deref(), Some("USB hub, 4-port, black"));

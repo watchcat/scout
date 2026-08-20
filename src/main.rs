@@ -7,6 +7,7 @@ mod events;
 mod links;
 mod progress;
 mod scheduler;
+mod session;
 mod stats;
 mod store;
 mod text;

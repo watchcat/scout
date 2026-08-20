@@ -349,6 +349,32 @@ agent or the scheduler.
 plus web login as a second identity kind. Its own design document,
 where the interface questions belong.
 
+> **Amended before starting phase two (2026-08-20): two is split in half.**
+> Reading the code first showed the coupling is far thinner than assumed —
+> `Live`'s whole surface is four methods, and inside `run_agent` there are
+> five calls to it: a tool description, the answer so far, thinking twice,
+> and the wrap-up notice. Everything else in that function is already
+> transport-agnostic.
+>
+> That makes the semantic change separable from the transport one:
+>
+> **2a — the event protocol, one process.** `run_agent` stops holding a
+> `Live` and emits events into an in-process channel; the adapter consumes
+> them and renders. One binary, behaviour unchanged, but the agent no longer
+> owns the renderer — which is the part that could turn out to be wrong.
+>
+> **2b — the workspace and the wire.** Crates, axum, SSE, two containers.
+> The channel becomes a socket and little else changes.
+>
+> The event carries the **cumulative** text rather than a delta, because
+> that is what `Live::show` already takes and `Live` does its own diffing.
+> Sending whole snapshots over a socket is wasteful, so 2b may switch to
+> deltas — but doing it in 2a would change behaviour while claiming not to.
+>
+> One deliberate consequence: with a channel between them, the agent loop no
+> longer blocks on Telegram's rate limiter. That is a change, and a wanted
+> one — it is exactly what a split has to be true for.
+
 Phase one precedes phase two because the API is conversation-scoped:
 `/v1/conversations/current/messages` cannot be specified before
 accounts and conversations exist.

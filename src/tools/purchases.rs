@@ -15,7 +15,7 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> StoreToolError {
 
 pub struct RecordPurchaseTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for RecordPurchaseTool {
@@ -57,8 +57,8 @@ impl Tool for RecordPurchaseTool {
             None => Some(chrono::Local::now().date_naive().to_string()),
         };
         let store = self.store.clone();
-        let user_id = self.user_id;
-        tokio::task::spawn_blocking(move || store.record_purchase(user_id, args))
+        let account_id = self.account_id;
+        tokio::task::spawn_blocking(move || store.record_purchase(account_id, args))
             .await
             .map_err(internal)?
             .map_err(internal)
@@ -73,7 +73,7 @@ pub struct QueryPurchasesArgs {
 
 pub struct QueryPurchasesTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for QueryPurchasesTool {
@@ -101,10 +101,10 @@ impl Tool for QueryPurchasesTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         let limit = args.limit.unwrap_or(10).min(50);
         tokio::task::spawn_blocking(move || {
-            store.query_purchases(user_id, args.search_term.as_deref(), limit)
+            store.query_purchases(account_id, args.search_term.as_deref(), limit)
         })
         .await
         .map_err(internal)?
@@ -126,7 +126,7 @@ mod tests {
     #[tokio::test]
     async fn record_then_query_scoped_to_tool_user() {
         let (store, _d) = setup();
-        let record = RecordPurchaseTool { store: store.clone(), user_id: 7 };
+        let record = RecordPurchaseTool { store: store.clone(), account_id: 7 };
         let recorded = record
             .call(NewPurchase {
                 item: "coffee beans".into(),
@@ -141,7 +141,7 @@ mod tests {
             .unwrap();
         assert_eq!(recorded.item, "coffee beans");
 
-        let query = QueryPurchasesTool { store: store.clone(), user_id: 7 };
+        let query = QueryPurchasesTool { store: store.clone(), account_id: 7 };
         let found = query
             .call(QueryPurchasesArgs { search_term: Some("coffee".into()), limit: None })
             .await
@@ -149,7 +149,7 @@ mod tests {
         assert_eq!(found.len(), 1);
 
         // A different user's tool sees nothing.
-        let other = QueryPurchasesTool { store, user_id: 8 };
+        let other = QueryPurchasesTool { store, account_id: 8 };
         let found = other
             .call(QueryPurchasesArgs { search_term: None, limit: None })
             .await
@@ -160,7 +160,7 @@ mod tests {
     #[tokio::test]
     async fn record_defaults_purchased_at_to_today() {
         let (store, _d) = setup();
-        let record = RecordPurchaseTool { store, user_id: 1 };
+        let record = RecordPurchaseTool { store, account_id: 1 };
         let recorded = record
             .call(NewPurchase {
                 item: "coffee beans".into(),
@@ -181,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn record_rejects_malformed_purchased_at() {
         let (store, _d) = setup();
-        let record = RecordPurchaseTool { store, user_id: 1 };
+        let record = RecordPurchaseTool { store, account_id: 1 };
         let result = record
             .call(NewPurchase {
                 item: "coffee beans".into(),

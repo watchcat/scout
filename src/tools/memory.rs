@@ -23,7 +23,7 @@ pub struct RememberFactArgs {
 
 pub struct RememberFactTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for RememberFactTool {
@@ -63,10 +63,10 @@ impl Tool for RememberFactTool {
             )));
         }
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         {
             let (key, value) = (key.clone(), value.clone());
-            tokio::task::spawn_blocking(move || store.upsert_fact(user_id, &key, &value))
+            tokio::task::spawn_blocking(move || store.upsert_fact(account_id, &key, &value))
                 .await
                 .map_err(internal)?
                 .map_err(internal)?;
@@ -82,7 +82,7 @@ pub struct ForgetFactArgs {
 
 pub struct ForgetFactTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for ForgetFactTool {
@@ -110,10 +110,10 @@ impl Tool for ForgetFactTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let key = normalize_key(&args.key);
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         let removed = {
             let key = key.clone();
-            tokio::task::spawn_blocking(move || store.forget_fact(user_id, &key))
+            tokio::task::spawn_blocking(move || store.forget_fact(account_id, &key))
                 .await
                 .map_err(internal)?
                 .map_err(internal)?
@@ -147,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn remember_upserts_normalized_and_forget_removes() {
         let (store, _d) = setup();
-        let remember = RememberFactTool { store: store.clone(), user_id: 7 };
+        let remember = RememberFactTool { store: store.clone(), account_id: 7 };
         let out = remember
             .call(RememberFactArgs { key: "Delivery Country".into(), value: " NL ".into() })
             .await
@@ -158,7 +158,7 @@ mod tests {
             vec![("delivery_country".to_string(), "NL".to_string())]
         );
 
-        let forget = ForgetFactTool { store: store.clone(), user_id: 7 };
+        let forget = ForgetFactTool { store: store.clone(), account_id: 7 };
         assert_eq!(
             forget.call(ForgetFactArgs { key: "delivery country".into() }).await.unwrap(),
             "forgotten: delivery_country"
@@ -173,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn remember_rejects_empty_and_oversized() {
         let (store, _d) = setup();
-        let tool = RememberFactTool { store, user_id: 7 };
+        let tool = RememberFactTool { store, account_id: 7 };
         assert!(tool
             .call(RememberFactArgs { key: "  ".into(), value: "x".into() })
             .await

@@ -48,7 +48,12 @@ async fn tick(bot: &Bot, store: &Store, today: NaiveDate) -> Result<()> {
             "⏰ Time to reorder {} — want me to search for deals?",
             reminder.item
         );
-        match bot.send_message(ChatId(reminder.chat_id), text).await {
+        let Ok(chat) = reminder.address.parse::<i64>() else {
+            tracing::error!(reminder_id = reminder.id, address = %reminder.address,
+                "unparseable delivery address; skipping reminder");
+            continue;
+        };
+        match bot.send_message(ChatId(chat), text).await {
             Ok(_) => {
                 let Ok(parsed) = NaiveDate::parse_from_str(&reminder.next_due, "%Y-%m-%d") else {
                     tracing::error!(reminder_id = reminder.id, next_due = %reminder.next_due,

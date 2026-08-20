@@ -512,7 +512,7 @@ fn price_option(candidate: &TripCandidate, offers: &[Flight]) -> PricedOption {
 /// fetched fresh, on every call.
 pub struct FinaliseTripTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
     pub duffel: Option<DuffelClient>,
     /// The same per-user market wrapper `FlightSearchTool` uses, not the
     /// bare client `AgentDeps` holds. `merged_search` calls
@@ -555,9 +555,9 @@ impl Tool for FinaliseTripTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         let name = args.trip.clone();
-        let trip = tokio::task::spawn_blocking(move || find_trip_or_list(&store, user_id, &name))
+        let trip = tokio::task::spawn_blocking(move || find_trip_or_list(&store, account_id, &name))
             .await
             .map_err(internal)?
             .map_err(internal)?;
@@ -767,7 +767,7 @@ pub struct AddSegmentArgs {
 
 pub struct AddTripSegmentTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for AddTripSegmentTool {
@@ -815,10 +815,10 @@ impl Tool for AddTripSegmentTool {
         let date = calendar_date(&args.departure_date)?;
 
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
             let trip = store.upsert_trip(
-                user_id,
+                account_id,
                 &args.trip,
                 args.adults,
                 args.cabin_class.as_deref(),
@@ -851,8 +851,8 @@ fn lost_trip_race(e: anyhow::Error) -> anyhow::Error {
 }
 
 /// "none yet", or the traveller's trip names joined for a human to read.
-fn trip_names(store: &Store, user_id: i64) -> anyhow::Result<String> {
-    let names: Vec<String> = store.list_trips(user_id)?.into_iter().map(|t| t.name).collect();
+fn trip_names(store: &Store, account_id: i64) -> anyhow::Result<String> {
+    let names: Vec<String> = store.list_trips(account_id)?.into_iter().map(|t| t.name).collect();
     Ok(match names.is_empty() {
         true => "none yet".to_string(),
         false => names.join(", "),
@@ -864,10 +864,10 @@ fn trip_names(store: &Store, user_id: i64) -> anyhow::Result<String> {
 /// The list is the point: a model that mistypes a name can correct itself
 /// from the reply instead of spending another call finding out, or asking
 /// the traveller a question it could have answered.
-fn find_trip_or_list(store: &Store, user_id: i64, name: &str) -> anyhow::Result<Trip> {
-    match store.find_trip(user_id, name)? {
+fn find_trip_or_list(store: &Store, account_id: i64, name: &str) -> anyhow::Result<Trip> {
+    match store.find_trip(account_id, name)? {
         Some(trip) => Ok(trip),
-        None => anyhow::bail!("no trip called {name:?}. This traveller has: {}", trip_names(store, user_id)?),
+        None => anyhow::bail!("no trip called {name:?}. This traveller has: {}", trip_names(store, account_id)?),
     }
 }
 
@@ -916,7 +916,7 @@ pub struct AddOptionArgs {
 
 pub struct AddTripOptionTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
     /// What this chat was shown, so an invented id costs nothing to refuse.
     pub shown: Arc<ShownFlights>,
     pub chat_id: i64,
@@ -1008,13 +1008,13 @@ impl Tool for AddTripOptionTool {
         let date_unchecked = leg_date.is_none();
 
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         let (leg_origin, leg_destination) = (leg.origin.clone(), leg.destination.clone());
         let position = args.position;
         let trip_name = args.trip;
         let decided = args.decided.unwrap_or(true);
         let trip = tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
-            let trip = find_trip_or_list(&store, user_id, &trip_name)?;
+            let trip = find_trip_or_list(&store, account_id, &trip_name)?;
             let expected = ExpectedSegment {
                 origin: &leg_origin,
                 destination: &leg_destination,
@@ -1081,7 +1081,7 @@ pub struct ChooseOptionArgs {
 
 pub struct ChooseTripOptionTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for ChooseTripOptionTool {
@@ -1112,10 +1112,10 @@ impl Tool for ChooseTripOptionTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         let (chosen_position, chosen_candidate) = (args.position, args.candidate);
         tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
-            let trip = find_trip_or_list(&store, user_id, &args.trip)?;
+            let trip = find_trip_or_list(&store, account_id, &args.trip)?;
             store.choose_candidate(trip.id, args.position, args.candidate).map_err(lost_trip_race)
         })
         .await
@@ -1144,7 +1144,7 @@ pub struct TripList {
 
 pub struct ShowTripTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for ShowTripTool {
@@ -1172,11 +1172,11 @@ impl Tool for ShowTripTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Trip>> {
             match &args.trip {
-                None => store.list_trips(user_id),
-                Some(name) => find_trip_or_list(&store, user_id, name).map(|trip| vec![trip]),
+                None => store.list_trips(account_id),
+                Some(name) => find_trip_or_list(&store, account_id, name).map(|trip| vec![trip]),
             }
         })
         .await
@@ -1209,7 +1209,7 @@ pub struct UpdateSegmentArgs {
 
 pub struct UpdateTripSegmentTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for UpdateTripSegmentTool {
@@ -1257,9 +1257,9 @@ impl Tool for UpdateTripSegmentTool {
         }
 
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         tokio::task::spawn_blocking(move || -> anyhow::Result<(Trip, usize, bool)> {
-            let trip = find_trip_or_list(&store, user_id, &args.trip)?;
+            let trip = find_trip_or_list(&store, account_id, &args.trip)?;
             store
                 .update_segment(
                     trip.id,
@@ -1305,7 +1305,7 @@ impl Tool for UpdateTripSegmentTool {
 
 pub struct DropTripSegmentTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for DropTripSegmentTool {
@@ -1335,9 +1335,9 @@ impl Tool for DropTripSegmentTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
-            let trip = find_trip_or_list(&store, user_id, &args.trip)?;
+            let trip = find_trip_or_list(&store, account_id, &args.trip)?;
             match args.candidate {
                 Some(candidate) => store.drop_candidate(trip.id, args.position, candidate),
                 None => store.drop_segment(trip.id, args.position),
@@ -1369,7 +1369,7 @@ pub struct DeleteTripResult {
 
 pub struct DeleteTripTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for DeleteTripTool {
@@ -1394,10 +1394,10 @@ impl Tool for DeleteTripTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
-        let user_id = self.user_id;
+        let account_id = self.account_id;
         let name = args.trip.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<DeleteTripResult> {
-            let deleted = store.delete_trip(user_id, &args.trip)?;
+            let deleted = store.delete_trip(account_id, &args.trip)?;
             let notes = match deleted {
                 true => Vec::new(),
                 // A mistyped name is indistinguishable here from one
@@ -1406,7 +1406,7 @@ impl Tool for DeleteTripTool {
                 false => vec![format!(
                     "nothing called {:?} to delete. This traveller has: {}",
                     args.trip,
-                    trip_names(&store, user_id)?
+                    trip_names(&store, account_id)?
                 )],
             };
             Ok(DeleteTripResult { deleted, trip: name, notes })
@@ -1440,7 +1440,7 @@ mod tests {
         // editing "Setpember" comes back as an unfamiliar one-segment trip, in
         // the reply, where the traveller sees it.
         let (store, _d) = setup();
-        let tool = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let tool = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         let trip = tool
             .call(AddSegmentArgs {
                 trip: "September".into(),
@@ -1463,7 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn a_bad_airport_code_is_refused_before_anything_is_written() {
         let (store, _d) = setup();
-        let tool = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let tool = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         let err = tool
             .call(AddSegmentArgs {
                 trip: "September".into(),
@@ -1486,7 +1486,7 @@ mod tests {
         // agrees with date order when every date is zero-padded — that
         // invariant is established here, at the tool boundary, or nowhere.
         let (store, _d) = setup();
-        let tool = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let tool = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         let trip = tool
             .call(AddSegmentArgs {
                 trip: "September".into(),
@@ -1692,7 +1692,7 @@ mod tests {
             ],
             Instant::now(),
         );
-        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add_seg
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -1707,7 +1707,7 @@ mod tests {
             .unwrap();
 
         let add_opt =
-            AddTripOptionTool { store: store.clone(), user_id: 7, shown: shown.clone(), chat_id: 99 };
+            AddTripOptionTool { store: store.clone(), account_id: 7, shown: shown.clone(), chat_id: 99 };
         for id in ["nonstop", "via-hkg"] {
             add_opt
                 .call(AddOptionArgs {
@@ -1732,7 +1732,7 @@ mod tests {
         assert_eq!(view.trip.segments[0].candidates[1].flight_numbers, "CX270,CX500");
         assert!(view.trip.segments[0].candidates.iter().all(|c| !c.chosen));
 
-        let choose = ChooseTripOptionTool { store: store.clone(), user_id: 7 };
+        let choose = ChooseTripOptionTool { store: store.clone(), account_id: 7 };
         let view = choose
             .call(ChooseOptionArgs { trip: "Japan".into(), position: 1, candidate: 2 })
             .await
@@ -1745,7 +1745,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("real", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
-        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add_seg
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -1761,7 +1761,7 @@ mod tests {
 
         // Another chat's tool, holding the same store.
         let elsewhere =
-            AddTripOptionTool { store: store.clone(), user_id: 7, shown: shown.clone(), chat_id: 12 };
+            AddTripOptionTool { store: store.clone(), account_id: 7, shown: shown.clone(), chat_id: 12 };
         let err = elsewhere
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1785,7 +1785,7 @@ mod tests {
         round_trip.legs.push(one_way("x", "NRT", "AMS", "2026-09-10", &["KL862"]).legs.remove(0));
         shown.remember(99, vec![round_trip], Instant::now());
 
-        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add_seg
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -1799,7 +1799,7 @@ mod tests {
             .await
             .unwrap();
 
-        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
         let err = add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1817,7 +1817,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("wrong", "AMS", "LIS", "2026-09-03", &["TP675"])], Instant::now());
-        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add_seg
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -1831,7 +1831,7 @@ mod tests {
             .await
             .unwrap();
 
-        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
         let err = add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1854,7 +1854,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("wrong-date", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
-        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add_seg
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -1868,7 +1868,7 @@ mod tests {
             .await
             .unwrap();
 
-        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
         let err = add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1894,7 +1894,7 @@ mod tests {
         let mut flight = one_way("no-time", "AMS", "NRT", "2026-09-03", &["KL861"]);
         flight.legs[0].departing_at_local = String::new();
         shown.remember(99, vec![flight], Instant::now());
-        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add_seg
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -1908,7 +1908,7 @@ mod tests {
             .await
             .unwrap();
 
-        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
         let view = add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1933,7 +1933,7 @@ mod tests {
     #[tokio::test]
     async fn show_lists_every_trip_when_no_name_is_given() {
         let (store, _d) = setup();
-        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         for name in ["Japan via HK", "Japan direct"] {
             add.call(AddSegmentArgs {
                 trip: name.into(),
@@ -1948,7 +1948,7 @@ mod tests {
             .unwrap();
         }
 
-        let show = ShowTripTool { store: store.clone(), user_id: 7 };
+        let show = ShowTripTool { store: store.clone(), account_id: 7 };
         let all = show.call(ShowTripArgs { trip: None }).await.unwrap();
         assert_eq!(all.trips.len(), 2);
 
@@ -1971,7 +1971,7 @@ mod tests {
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("a", "AMS", "HKG", "2026-09-15", &["EY78"])], Instant::now());
 
-        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         let view = add
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -1987,7 +1987,7 @@ mod tests {
         let waiting = view.not_ready.expect("a segment with no flight is not ready");
         assert!(waiting.contains("segment 1"), "and it says which: {waiting}");
 
-        let view = AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+        let view = AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
             .call(AddOptionArgs {
                 trip: "Japan".into(),
                 position: 1,
@@ -2030,8 +2030,8 @@ mod tests {
             ],
             Instant::now(),
         );
-        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
-        let park = AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 };
+        let add = AddTripSegmentTool { store: store.clone(), account_id: 7 };
+        let park = AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 };
         // Both legs decided, so the only thing left wrong is their order.
         for (position, o, d, date, offer) in [
             (1, "AMS", "HKG", "2026-09-19", "out"),
@@ -2057,7 +2057,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let view = ShowTripTool { store, user_id: 7 }
+        let view = ShowTripTool { store, account_id: 7 }
             .call(ShowTripArgs { trip: Some("Japan".into()) })
             .await
             .unwrap();
@@ -2073,7 +2073,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("a", "HND", "AMS", "2026-09-27", &["CZ324"])], Instant::now());
-        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         for (o, d, date) in [("AMS", "HKG", "2026-09-15"), ("HND", "AMS", "2026-09-27")] {
             add.call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -2087,7 +2087,7 @@ mod tests {
             .await
             .unwrap();
         }
-        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
             .call(AddOptionArgs {
                 trip: "Japan".into(),
                 position: 2,
@@ -2097,7 +2097,7 @@ mod tests {
             .await
             .unwrap();
 
-        let update = UpdateTripSegmentTool { store: store.clone(), user_id: 7 };
+        let update = UpdateTripSegmentTool { store: store.clone(), account_id: 7 };
         let view = update
             .call(UpdateSegmentArgs {
                 trip: "Japan".into(),
@@ -2129,7 +2129,7 @@ mod tests {
         // later edit looks lost. A call reporting its own change is never
         // stale about that change.
         let (store, _d) = setup();
-        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         for (o, d, date) in [("OKA", "HND", "2026-09-21"), ("HND", "AMS", "2026-09-25")] {
             add.call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -2143,7 +2143,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let update = UpdateTripSegmentTool { store, user_id: 7 };
+        let update = UpdateTripSegmentTool { store, account_id: 7 };
 
         let first = update
             .call(UpdateSegmentArgs {
@@ -2190,7 +2190,7 @@ mod tests {
     #[tokio::test]
     async fn an_edit_naming_nothing_to_change_is_refused() {
         let (store, _d) = setup();
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -2202,7 +2202,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let err = UpdateTripSegmentTool { store, user_id: 7 }
+        let err = UpdateTripSegmentTool { store, account_id: 7 }
             .call(UpdateSegmentArgs {
                 trip: "Japan".into(),
                 position: 1,
@@ -2220,7 +2220,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
-        let add = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add.call(AddSegmentArgs {
             trip: "Japan".into(),
             origin: "AMS".into(),
@@ -2232,7 +2232,7 @@ mod tests {
         })
         .await
         .unwrap();
-        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
             .call(AddOptionArgs {
                 trip: "Japan".into(),
                 position: 1,
@@ -2242,7 +2242,7 @@ mod tests {
             .await
             .unwrap();
 
-        let drop = DropTripSegmentTool { store: store.clone(), user_id: 7 };
+        let drop = DropTripSegmentTool { store: store.clone(), account_id: 7 };
         let view = drop
             .call(DropSegmentArgs { trip: "Japan".into(), position: 1, candidate: Some(1) })
             .await
@@ -2260,7 +2260,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_a_trip_reports_when_there_was_nothing_to_delete() {
         let (store, _d) = setup();
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Setpember".into(),
                 origin: "AMS".into(),
@@ -2272,7 +2272,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let delete = DeleteTripTool { store: store.clone(), user_id: 7 };
+        let delete = DeleteTripTool { store: store.clone(), account_id: 7 };
         assert!(delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
         assert!(!delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
     }
@@ -2287,7 +2287,7 @@ mod tests {
     #[tokio::test]
     async fn drop_trip_segment_on_an_unknown_name_lists_the_real_ones() {
         let (store, _d) = setup();
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -2300,7 +2300,7 @@ mod tests {
             .await
             .unwrap();
 
-        let drop = DropTripSegmentTool { store, user_id: 7 };
+        let drop = DropTripSegmentTool { store, account_id: 7 };
         let err = drop
             .call(DropSegmentArgs { trip: "Japen".into(), position: 1, candidate: None })
             .await
@@ -2311,7 +2311,7 @@ mod tests {
     #[tokio::test]
     async fn choose_trip_option_on_an_unknown_name_lists_the_real_ones() {
         let (store, _d) = setup();
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -2324,7 +2324,7 @@ mod tests {
             .await
             .unwrap();
 
-        let choose = ChooseTripOptionTool { store, user_id: 7 };
+        let choose = ChooseTripOptionTool { store, account_id: 7 };
         let err = choose
             .call(ChooseOptionArgs { trip: "Japen".into(), position: 1, candidate: 1 })
             .await
@@ -2337,7 +2337,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -2352,7 +2352,7 @@ mod tests {
 
         // The offer must be a real, shown one so the two guards ahead of
         // the trip lookup both pass and it is that lookup being tested.
-        let add_opt = AddTripOptionTool { store, user_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
         let err = add_opt
             .call(AddOptionArgs { trip: "Japen".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
@@ -2671,7 +2671,7 @@ mod tests {
         // Not an error - deleting something already gone is the state the
         // caller wanted - but a mistyped name still needs somewhere to go.
         let (store, _d) = setup();
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -2684,7 +2684,7 @@ mod tests {
             .await
             .unwrap();
 
-        let delete = DeleteTripTool { store, user_id: 7 };
+        let delete = DeleteTripTool { store, account_id: 7 };
         let result = delete.call(DeleteTripArgs { trip: "Japen".into() }).await.unwrap();
         assert!(!result.deleted);
         assert!(
@@ -2745,7 +2745,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -2757,7 +2757,7 @@ mod tests {
             })
             .await
             .unwrap();
-        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
             .call(AddOptionArgs {
                 trip: "Japan".into(),
                 position: 1,
@@ -2774,7 +2774,7 @@ mod tests {
         );
         let tool = FinaliseTripTool {
             store: store.clone(),
-            user_id: 7,
+            account_id: 7,
             duffel: Some(duffel),
             ignav: None,
             budget: Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -2819,7 +2819,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -2831,7 +2831,7 @@ mod tests {
             })
             .await
             .unwrap();
-        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
             .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
             .unwrap();
@@ -2843,7 +2843,7 @@ mod tests {
         );
         let out = FinaliseTripTool {
             store,
-            user_id: 7,
+            account_id: 7,
             duffel: Some(duffel),
             ignav: None,
             budget: Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -2872,7 +2872,7 @@ mod tests {
         // proving the tool never got that far.
         let server = MockServer::start().await;
         let (store, _d) = setup();
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -2892,7 +2892,7 @@ mod tests {
         );
         let err = FinaliseTripTool {
             store,
-            user_id: 7,
+            account_id: 7,
             duffel: Some(duffel),
             ignav: None,
             budget: Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -2926,7 +2926,7 @@ mod tests {
             ],
             Instant::now(),
         );
-        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add_seg
             .call(AddSegmentArgs {
                 trip: "Lisbon".into(),
@@ -2951,7 +2951,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let add_opt = AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 };
         add_opt
             .call(AddOptionArgs { trip: "Lisbon".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
@@ -2968,7 +2968,7 @@ mod tests {
         );
         let out = FinaliseTripTool {
             store,
-            user_id: 7,
+            account_id: 7,
             duffel: Some(duffel),
             ignav: None,
             budget: Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -3006,7 +3006,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -3018,7 +3018,7 @@ mod tests {
             })
             .await
             .unwrap();
-        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
             .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
             .unwrap();
@@ -3030,7 +3030,7 @@ mod tests {
         );
         let tool = FinaliseTripTool {
             store: store.clone(),
-            user_id: 7,
+            account_id: 7,
             duffel: Some(duffel),
             ignav: None,
             budget: Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -3108,7 +3108,7 @@ mod tests {
             ],
             Instant::now(),
         );
-        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add_seg
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
@@ -3122,7 +3122,7 @@ mod tests {
             .await
             .unwrap();
         let add_opt =
-            AddTripOptionTool { store: store.clone(), user_id: 7, shown: shown.clone(), chat_id: 99 };
+            AddTripOptionTool { store: store.clone(), account_id: 7, shown: shown.clone(), chat_id: 99 };
         add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -3149,7 +3149,7 @@ mod tests {
         );
         let out = FinaliseTripTool {
             store,
-            user_id: 7,
+            account_id: 7,
             duffel: Some(duffel),
             ignav: None,
             budget: Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -3242,7 +3242,7 @@ mod tests {
             ],
             Instant::now(),
         );
-        let add_seg = AddTripSegmentTool { store: store.clone(), user_id: 7 };
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7 };
         add_seg
             .call(AddSegmentArgs {
                 trip: "Lisbon".into(),
@@ -3267,7 +3267,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let add_opt = AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 };
         add_opt
             .call(AddOptionArgs { trip: "Lisbon".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
@@ -3312,7 +3312,7 @@ mod tests {
         );
         let out = FinaliseTripTool {
             store,
-            user_id: 7,
+            account_id: 7,
             duffel: Some(duffel),
             ignav: None,
             budget: Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -3369,7 +3369,7 @@ mod tests {
         );
         let out = FinaliseTripTool {
             store,
-            user_id: 7,
+            account_id: 7,
             duffel: Some(duffel),
             ignav: None,
             budget: Arc::new(crate::tools::budget::FlightBudget::default()),
@@ -3404,7 +3404,7 @@ mod tests {
         let (store, _d) = setup();
         let shown = Arc::new(ShownFlights::default());
         shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
-        AddTripSegmentTool { store: store.clone(), user_id: 7 }
+        AddTripSegmentTool { store: store.clone(), account_id: 7 }
             .call(AddSegmentArgs {
                 trip: "Japan".into(),
                 origin: "AMS".into(),
@@ -3416,7 +3416,7 @@ mod tests {
             })
             .await
             .unwrap();
-        AddTripOptionTool { store: store.clone(), user_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
             .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
             .unwrap();
@@ -3428,7 +3428,7 @@ mod tests {
         );
         let out = FinaliseTripTool {
             store,
-            user_id: 7,
+            account_id: 7,
             duffel: Some(duffel),
             // No Ignav configured at all, so nothing could invent a link
             // even by mistake — the same result as an Ignav-less deploy.

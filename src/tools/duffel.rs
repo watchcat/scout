@@ -24,7 +24,7 @@ pub struct FlightSearchTool {
     /// Every search is billed, so each one is recorded against the user who
     /// caused it and shown in `/stat`.
     pub store: crate::store::Store,
-    pub user_id: i64,
+    pub account_id: i64,
     /// Shared across one user request: caps how many searches it can buy,
     /// and remembers what each one returned so a repeat costs nothing.
     pub budget: std::sync::Arc<crate::tools::budget::FlightBudget>,
@@ -171,7 +171,7 @@ impl rig::tool::Tool for FlightSearchTool {
 /// `search_flights` whenever flights are configured.
 pub struct BookingLinkTool {
     pub client: DuffelClient,
-    pub user_id: i64,
+    pub account_id: i64,
     /// Where Duffel sends the traveller when they are done — the bot's own
     /// Telegram address, so they land back in the conversation.
     pub return_url: String,
@@ -201,7 +201,7 @@ impl rig::tool::Tool for BookingLinkTool {
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(BookingLink {
-            url: self.client.booking_link(self.user_id, &self.return_url).await?,
+            url: self.client.booking_link(self.account_id, &self.return_url).await?,
             expires_in: "24 hours if unopened, 20 minutes once opened",
             note: "the checkout opens on its own search box — it cannot be \
                    pre-filled, so repeat the route, date and price for the \
@@ -254,9 +254,9 @@ impl FlightSearchTool {
     /// the search has already been paid for, and losing the answer as well
     /// would make a bookkeeping problem into a user-facing one.
     async fn note_search(&self) {
-        let (store, user_id) = (self.store.clone(), self.user_id);
+        let (store, account_id) = (self.store.clone(), self.account_id);
         let logged = tokio::task::spawn_blocking(move || {
-            store.log_request(user_id, crate::store::Store::FLIGHT_SEARCH)
+            store.log_request(account_id, crate::store::Store::FLIGHT_SEARCH)
         })
         .await;
         if let Err(e) = logged.map_err(anyhow::Error::from).and_then(|r| r) {
@@ -968,11 +968,11 @@ impl DuffelClient {
     /// Single-use and short-lived: unused sessions die after 24 hours, and
     /// a used one after 20 minutes. So this is called when someone asks to
     /// book, never in advance.
-    pub async fn booking_link(&self, user_id: i64, return_url: &str) -> Result<String, DuffelError> {
+    pub async fn booking_link(&self, account_id: i64, return_url: &str) -> Result<String, DuffelError> {
         let mut data = serde_json::json!({
             // Comes back on the order, so a booking can be traced to
             // whoever asked for the link.
-            "reference": user_id.to_string(),
+            "reference": account_id.to_string(),
             "success_url": return_url,
             "failure_url": return_url,
             "abandonment_url": return_url,
@@ -2890,7 +2890,7 @@ mod client_tests {
             FlightSearchTool {
                 duffel: Some(client(server)),
                 store,
-                user_id: 7,
+                account_id: 7,
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
                 ignav: None,
                 shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
@@ -2965,7 +2965,7 @@ mod client_tests {
         let tool = FlightSearchTool {
             duffel: None,
             store: crate::store::Store::open(dir.path().join("t.duckdb")).unwrap(),
-            user_id: 7,
+            account_id: 7,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
             chat_id: 1,
@@ -3530,7 +3530,7 @@ mod links_tests {
         let tool = FlightSearchTool {
             duffel: Some(client(&server, 0.03)),
             store: crate::store::Store::open(dir.path().join("t.duckdb")).unwrap(),
-            user_id: 1,
+            account_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             ignav: None,
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
@@ -3547,7 +3547,7 @@ mod links_tests {
         let plain = FlightSearchTool {
             duffel: Some(client(&server, 0.0)),
             store: crate::store::Store::open(dir.path().join("u.duckdb")).unwrap(),
-            user_id: 1,
+            account_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             ignav: None,
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
@@ -3638,7 +3638,7 @@ mod live {
             let tool = FlightSearchTool {
                 duffel: Some(client.clone()),
                 store: crate::store::Store::open(dir.path().join("probe.duckdb")).unwrap(),
-                user_id: 1,
+                account_id: 1,
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
                 ignav: None,
                 shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),

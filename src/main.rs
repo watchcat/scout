@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
         founders = cfg.allowed_user_ids.len(),
         members = members.len(),
         daily_cap = cfg.invite_daily_requests,
+        schema = store.schema_version()?,
         "who may talk to this bot"
     );
 

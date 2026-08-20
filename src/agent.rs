@@ -644,7 +644,7 @@ fn markup_rate(d: &AgentDeps) -> f64 {
 /// so the LLM never sees or chooses user ids.
 pub fn build_agent(
     d: &AgentDeps,
-    user_id: i64,
+    account_id: i64,
     chat_id: i64,
     facts: &[(String, String)],
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
@@ -672,27 +672,27 @@ pub fn build_agent(
             budget,
         })
         .tool(ComparePricesTool)
-        .tool(RecordPurchaseTool { store: d.store.clone(), user_id })
-        .tool(QueryPurchasesTool { store: d.store.clone(), user_id })
-        .tool(CreateReminderTool { store: d.store.clone(), user_id, chat_id })
-        .tool(ListRemindersTool { store: d.store.clone(), user_id })
-        .tool(CancelReminderTool { store: d.store.clone(), user_id })
-        .tool(RememberFactTool { store: d.store.clone(), user_id })
-        .tool(ForgetFactTool { store: d.store.clone(), user_id })
+        .tool(RecordPurchaseTool { store: d.store.clone(), account_id })
+        .tool(QueryPurchasesTool { store: d.store.clone(), account_id })
+        .tool(CreateReminderTool { store: d.store.clone(), account_id, chat_id })
+        .tool(ListRemindersTool { store: d.store.clone(), account_id })
+        .tool(CancelReminderTool { store: d.store.clone(), account_id })
+        .tool(RememberFactTool { store: d.store.clone(), account_id })
+        .tool(ForgetFactTool { store: d.store.clone(), account_id })
         // Trip planning. Registered unconditionally: a trip is a plan, and
         // planning one needs no provider at all. Only finalising does.
-        .tool(AddTripSegmentTool { store: d.store.clone(), user_id })
+        .tool(AddTripSegmentTool { store: d.store.clone(), account_id })
         .tool(AddTripOptionTool {
             store: d.store.clone(),
-            user_id,
+            account_id,
             shown: d.shown.clone(),
             chat_id,
         })
-        .tool(ChooseTripOptionTool { store: d.store.clone(), user_id })
-        .tool(ShowTripTool { store: d.store.clone(), user_id })
-        .tool(UpdateTripSegmentTool { store: d.store.clone(), user_id })
-        .tool(DropTripSegmentTool { store: d.store.clone(), user_id })
-        .tool(DeleteTripTool { store: d.store.clone(), user_id });
+        .tool(ChooseTripOptionTool { store: d.store.clone(), account_id })
+        .tool(ShowTripTool { store: d.store.clone(), account_id })
+        .tool(UpdateTripSegmentTool { store: d.store.clone(), account_id })
+        .tool(DropTripSegmentTool { store: d.store.clone(), account_id })
+        .tool(DeleteTripTool { store: d.store.clone(), account_id });
     // Offered only when configured, so the model never sees a tool that
     // cannot work.
     if let Some(bol) = &d.bol {
@@ -705,7 +705,7 @@ pub fn build_agent(
         builder = builder.tool(crate::tools::duffel::FlightSearchTool {
             duffel: d.duffel.clone(),
             store: d.store.clone(),
-            user_id,
+            account_id,
             // One allowance and one memo per user request, like the search
             // budget above. Cloned, not moved: finalise_trip below shares
             // this same allowance, so a request that searches and then
@@ -739,7 +739,7 @@ pub fn build_agent(
         }
         builder = builder.tool(crate::tools::trips::FinaliseTripTool {
             store: d.store.clone(),
-            user_id,
+            account_id,
             duffel: d.duffel.clone(),
             // Same wrapper as FlightSearchTool above, and for the same
             // reason: finalising re-prices every segment through
@@ -769,7 +769,7 @@ pub fn build_agent(
     ) {
         builder = builder.tool(crate::tools::duffel::BookingLinkTool {
             client: duffel.clone(),
-            user_id,
+            account_id,
             return_url: return_url.clone(),
         });
     }

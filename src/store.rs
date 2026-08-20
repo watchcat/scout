@@ -283,7 +283,6 @@ enum Step {
     Sql(&'static str),
     /// For work that needs a loop or a returned id — plain SQL cannot ask
     /// DuckDB for `nextval` per row and keep the mapping.
-    #[allow(dead_code)]
     Code(fn(&Connection) -> Result<()>),
 }
 
@@ -340,8 +339,52 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 "#;
 
+/// Every Telegram id that appears anywhere in the pre-phase-one schema.
+/// `user_chats` is included even though it is about to be replaced: someone
+/// might appear there and nowhere else.
+const LEGACY_USER_IDS: &str = "
+SELECT user_id FROM purchases
+UNION SELECT user_id FROM reminders
+UNION SELECT user_id FROM user_facts
+UNION SELECT user_id FROM request_log
+UNION SELECT user_id FROM users
+UNION SELECT user_id FROM user_chats
+UNION SELECT user_id FROM members
+UNION SELECT user_id FROM waitlist
+UNION SELECT user_id FROM trips
+";
+
+/// One account per pre-existing Telegram id.
+///
+/// Written in Rust rather than SQL because each row needs `nextval` and the
+/// id it produced, and DuckDB has no `setval` to fix a sequence up
+/// afterwards.
+fn step_2_backfill_accounts(conn: &Connection) -> Result<()> {
+    let sql = format!("SELECT DISTINCT user_id FROM ({LEGACY_USER_IDS}) ORDER BY user_id");
+    let mut stmt = conn.prepare(&sql)?;
+    let ids: Vec<i64> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+    for user_id in ids {
+        let account_id: i64 = conn.query_row(
+            "INSERT INTO accounts (id) VALUES (nextval('accounts_id_seq')) RETURNING id",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO identities (account_id, kind, external_id) VALUES (?, 'telegram', ?)",
+            params![account_id, user_id.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
 fn steps() -> Vec<(i64, Step)> {
-    vec![(1, Step::Sql(STEP_1_NEW_TABLES))]
+    vec![
+        (1, Step::Sql(STEP_1_NEW_TABLES)),
+        (2, Step::Code(step_2_backfill_accounts)),
+    ]
 }
 
 fn apply_steps(conn: &Connection) -> Result<()> {
@@ -1544,6 +1587,36 @@ CREATE TABLE segment_candidates (
         .unwrap();
         drop(conn);
         (dir, path)
+    }
+
+    #[test]
+    fn every_legacy_user_gets_exactly_one_account() {
+        let (_d, path) = legacy_db();
+        let s = Store::open(&path).unwrap();
+        let conn = s.conn.lock().unwrap();
+
+        // 11, 22 and 33 — 33 exists only on the waitlist.
+        let accounts: i64 = conn.query_row("SELECT count(*) FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(accounts, 3);
+
+        let ids: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM identities WHERE kind = 'telegram' \
+                 AND external_id IN ('11','22','33')",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ids, 3);
+
+        // No Telegram id claimed twice.
+        let dupes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM (SELECT external_id FROM identities \
+                 WHERE kind='telegram' GROUP BY external_id HAVING count(*) > 1)",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dupes, 0);
     }
 
     #[test]

@@ -1445,6 +1445,120 @@ mod tests {
         (store, dir)
     }
 
+    /// The schema exactly as it stood before phase one, frozen. Do not
+    /// update this when `MIGRATIONS` changes — its whole value is being an
+    /// honest picture of the database the migration will actually meet.
+    const LEGACY_SCHEMA: &str = r#"
+CREATE SEQUENCE purchases_id_seq;
+CREATE TABLE purchases (
+    id BIGINT PRIMARY KEY DEFAULT nextval('purchases_id_seq'),
+    user_id BIGINT NOT NULL, item TEXT NOT NULL, store TEXT NOT NULL,
+    url TEXT, price DOUBLE, currency TEXT, notes TEXT, purchased_at TEXT,
+    recorded_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE SEQUENCE reminders_id_seq;
+CREATE TABLE reminders (
+    id BIGINT PRIMARY KEY DEFAULT nextval('reminders_id_seq'),
+    user_id BIGINT NOT NULL, chat_id BIGINT NOT NULL, item TEXT NOT NULL,
+    interval_days BIGINT NOT NULL, next_due TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE TABLE user_facts (
+    user_id BIGINT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (user_id, key)
+);
+CREATE TABLE request_log (
+    user_id BIGINT NOT NULL, kind TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE TABLE users (
+    user_id BIGINT PRIMARY KEY, display_name TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE TABLE user_chats (
+    user_id BIGINT PRIMARY KEY, chat_id BIGINT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE TABLE invite_rounds (
+    code TEXT PRIMARY KEY, capacity BIGINT NOT NULL,
+    open BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE TABLE members (
+    user_id BIGINT PRIMARY KEY, code TEXT NOT NULL,
+    joined_at TIMESTAMP NOT NULL DEFAULT current_timestamp, revoked_at TIMESTAMP
+);
+CREATE TABLE waitlist (
+    user_id BIGINT PRIMARY KEY, chat_id BIGINT NOT NULL, code TEXT NOT NULL,
+    seen_at TIMESTAMP NOT NULL DEFAULT current_timestamp, invited_at TIMESTAMP
+);
+CREATE SEQUENCE trips_id_seq;
+CREATE TABLE trips (
+    id BIGINT PRIMARY KEY DEFAULT nextval('trips_id_seq'),
+    user_id BIGINT NOT NULL, name TEXT NOT NULL, name_key TEXT NOT NULL,
+    adults BIGINT NOT NULL DEFAULT 1, cabin_class TEXT,
+    status TEXT NOT NULL DEFAULT 'planning',
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (user_id, name_key)
+);
+CREATE TABLE trip_segments (
+    trip_id BIGINT NOT NULL, position BIGINT NOT NULL, origin TEXT NOT NULL,
+    destination TEXT NOT NULL, departure_date TEXT NOT NULL,
+    next_candidate BIGINT NOT NULL DEFAULT 1, PRIMARY KEY (trip_id, position)
+);
+CREATE TABLE segment_candidates (
+    trip_id BIGINT NOT NULL, position BIGINT NOT NULL, candidate BIGINT NOT NULL,
+    chosen BOOLEAN NOT NULL DEFAULT false, airline TEXT NOT NULL,
+    flight_numbers TEXT NOT NULL, itinerary TEXT NOT NULL,
+    departing_at_local TEXT, arriving_at_local TEXT, duration_minutes BIGINT,
+    quoted_price DOUBLE, quoted_currency TEXT, quoted_at TIMESTAMP, source TEXT,
+    PRIMARY KEY (trip_id, position, candidate)
+);
+"#;
+
+    /// Two Telegram users with data spread across every table, written into
+    /// a database that has never seen a migration step. User 33 appears only
+    /// on the waitlist, which is what catches a backfill that reads accounts
+    /// from the wrong set of tables.
+    pub(crate) fn legacy_db() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO purchases (user_id, item, store) VALUES (11,'beans','Amazon'),(22,'mouse','eBay');
+             INSERT INTO reminders (user_id, chat_id, item, interval_days, next_due)
+                 VALUES (11, 555, 'beans', 30, '2026-09-01');
+             INSERT INTO user_facts VALUES (11,'currency','EUR',current_timestamp);
+             INSERT INTO request_log (user_id, kind) VALUES (11,'text'),(11,'photo'),(22,'text');
+             INSERT INTO users (user_id, display_name) VALUES (11,'Ann'),(22,'Bo');
+             INSERT INTO user_chats (user_id, chat_id) VALUES (11,555),(22,666);
+             INSERT INTO invite_rounds (code, capacity) VALUES ('spring', 5);
+             INSERT INTO members (user_id, code) VALUES (22,'spring');
+             INSERT INTO waitlist (user_id, chat_id, code) VALUES (33,777,'spring');
+             INSERT INTO trips (user_id, name, name_key) VALUES (11,'Lisbon','lisbon');",
+        )
+        .unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    #[test]
+    fn the_legacy_fixture_has_no_accounts_yet() {
+        let (_d, path) = legacy_db();
+        let conn = Connection::open(&path).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = 'accounts'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
     fn new_purchase(item: &str, store: &str, purchased_at: Option<&str>) -> NewPurchase {
         NewPurchase {
             item: item.to_string(),

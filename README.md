@@ -130,6 +130,13 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   booking separately
 
 **Remembers things**
+- **A conversation survives a restart.** History lives in DuckDB, not in
+  memory, so a deploy or a crash no longer costs you the thread. Scout was
+  restarted 24 times in 20 minutes once when Telegram's API went quiet, and
+  every conversation in flight went with it. That no longer costs anything
+- **You are an account, not a Telegram id.** A Telegram login is one identity
+  pointing at an account, which is what will let the same purchase history,
+  trips and profile answer to a web login later without a second copy of you
 - Purchase history: *"where did I buy this last time?"* — react 👍 to a
   suggestion and Scout offers to save it
 - Your profile: delivery country, sizes, preferred marketplaces, languages.
@@ -167,7 +174,10 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   as it's written, all in one edited message, with the typing indicator held
   up throughout so a slow step never looks like a crash
 - Sessions reset after 10 idle minutes, with an LLM check that restores
-  context when you're clearly continuing the same topic
+  context when you're clearly continuing the same topic — and because the
+  thread is on disk, that check still works after a restart
+- A group chat keeps its own thread. Your private chat and, later, the web
+  app share one; a room with other people in it never merges into it
 - Hard caps on searches, page opens and turns per request, so no single
   question can run away with your API budget. Asking the same route twice in
   one request is answered from memory rather than bought twice
@@ -261,11 +271,13 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 23 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **412 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **425 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
-flakiness.
+flakiness. The schema migration that moved every table onto account ids was
+rehearsed against a copy of the live database before it ran on the real one,
+and the row counts were compared either side.
 
-Roughly 19,500 lines of Rust across a dozen focused modules.
+Roughly 23,200 lines of Rust across 30 focused modules.
 
 ---
 
@@ -312,7 +324,7 @@ Roughly 19,500 lines of Rust across a dozen focused modules.
   rather than a link, and why a dead round's link stays dead: codes do not
   carry between rounds.
 - **Invited, not isolated.** Conversation state, purchase memory and `/stat`
-  are scoped per user — but everyone admitted shares one process, one
+  are scoped per account — but everyone admitted shares one process, one
   database file and one API budget. Rounds bound how many people there are
   and the daily cap bounds each of them; neither bounds what a single
   question can cost.
@@ -331,7 +343,7 @@ Roughly 19,500 lines of Rust across a dozen focused modules.
 ## Development
 
 ```bash
-cargo test                  # 412 tests, no network needed
+cargo test                  # 425 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

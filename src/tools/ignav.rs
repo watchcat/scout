@@ -852,7 +852,7 @@ mod live {
         let tool = crate::tools::duffel::FlightSearchTool {
             duffel: None,
             store: crate::store::Store::open(dir.path().join("probe.duckdb")).unwrap(),
-            user_id: 1,
+            account_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
             chat_id: 1,

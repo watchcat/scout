@@ -9,7 +9,7 @@ const MIGRATIONS: &str = r#"
 CREATE SEQUENCE IF NOT EXISTS purchases_id_seq;
 CREATE TABLE IF NOT EXISTS purchases (
     id BIGINT PRIMARY KEY DEFAULT nextval('purchases_id_seq'),
-    user_id BIGINT NOT NULL,
+    account_id BIGINT NOT NULL,
     item TEXT NOT NULL,
     store TEXT NOT NULL,
     url TEXT,
@@ -22,8 +22,9 @@ CREATE TABLE IF NOT EXISTS purchases (
 CREATE SEQUENCE IF NOT EXISTS reminders_id_seq;
 CREATE TABLE IF NOT EXISTS reminders (
     id BIGINT PRIMARY KEY DEFAULT nextval('reminders_id_seq'),
-    user_id BIGINT NOT NULL,
-    chat_id BIGINT NOT NULL,
+    account_id BIGINT NOT NULL,
+    channel TEXT NOT NULL DEFAULT 'telegram',
+    address TEXT NOT NULL,
     item TEXT NOT NULL,
     interval_days BIGINT NOT NULL,
     next_due TEXT NOT NULL,
@@ -31,30 +32,22 @@ CREATE TABLE IF NOT EXISTS reminders (
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
 CREATE TABLE IF NOT EXISTS user_facts (
-    user_id BIGINT NOT NULL,
+    account_id BIGINT NOT NULL,
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
-    PRIMARY KEY (user_id, key)
+    PRIMARY KEY (account_id, key)
 );
 CREATE TABLE IF NOT EXISTS request_log (
-    user_id BIGINT NOT NULL,
+    account_id BIGINT NOT NULL,
     kind TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
 -- Telegram display names, refreshed on every request so /stat can label a
 -- user id with something readable. Names change; the id is the identity.
 CREATE TABLE IF NOT EXISTS users (
-    user_id BIGINT PRIMARY KEY,
+    account_id BIGINT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
-);
--- Where each person last spoke to the bot, so an announcement can reach
--- them. A separate table rather than a column on `users`: that one already
--- holds live data, and adding to it means altering it in place.
-CREATE TABLE IF NOT EXISTS user_chats (
-    user_id BIGINT PRIMARY KEY,
-    chat_id BIGINT NOT NULL,
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
 -- Admission. `ALLOWED_TELEGRAM_USER_IDS` stays the founder list; these three
@@ -67,21 +60,19 @@ CREATE TABLE IF NOT EXISTS invite_rounds (
     open       BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
--- One row per person admitted, ever. `user_id` is the key, so a person
+-- One row per person admitted, ever. `account_id` is the key, so a person
 -- belongs to one round; `revoked_at` set means removed, and the row stays
 -- put so the seat is not handed back.
 CREATE TABLE IF NOT EXISTS members (
-    user_id    BIGINT PRIMARY KEY,
+    account_id    BIGINT PRIMARY KEY,
     code       TEXT NOT NULL,
     joined_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
     revoked_at TIMESTAMP
 );
--- People a full or unknown round turned away. `chat_id` is stored because
--- reaching them later is the whole point, and the START they pressed is the
--- permission to do it.
+-- People a full or unknown round turned away. Where to reach them lives in
+-- `deliveries`, because the START they pressed is the permission to do it.
 CREATE TABLE IF NOT EXISTS waitlist (
-    user_id    BIGINT PRIMARY KEY,
-    chat_id    BIGINT NOT NULL,
+    account_id BIGINT PRIMARY KEY,
     code       TEXT NOT NULL,
     seen_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
     invited_at TIMESTAMP
@@ -91,7 +82,7 @@ CREATE TABLE IF NOT EXISTS waitlist (
 CREATE SEQUENCE IF NOT EXISTS trips_id_seq;
 CREATE TABLE IF NOT EXISTS trips (
     id          BIGINT PRIMARY KEY DEFAULT nextval('trips_id_seq'),
-    user_id     BIGINT NOT NULL,
+    account_id     BIGINT NOT NULL,
     name        TEXT NOT NULL,
     -- lowercased `name`: the trip is addressed by what the traveller calls
     -- it, and "September" and "september" are the same trip.
@@ -101,7 +92,7 @@ CREATE TABLE IF NOT EXISTS trips (
     status      TEXT NOT NULL DEFAULT 'planning',
     created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
     updated_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
-    UNIQUE (user_id, name_key)
+    UNIQUE (account_id, name_key)
 );
 -- Where and when. This is all that gets re-searched.
 CREATE TABLE IF NOT EXISTS trip_segments (
@@ -136,6 +127,56 @@ CREATE TABLE IF NOT EXISTS segment_candidates (
     source             TEXT,
     PRIMARY KEY (trip_id, position, candidate)
 );
+CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
+-- A person, independent of how they reach Scout. Deliberately almost empty:
+-- everything knowable about someone belongs to one of their identities or to
+-- their data, not here.
+CREATE TABLE IF NOT EXISTS accounts (
+    id         BIGINT PRIMARY KEY DEFAULT nextval('accounts_id_seq'),
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+-- One row per way of proving you are that account. `kind` is 'telegram'
+-- today; a web login is a second kind. The primary key is what stops one
+-- Telegram id from being claimed by two accounts.
+CREATE TABLE IF NOT EXISTS identities (
+    account_id  BIGINT NOT NULL,
+    kind        TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (kind, external_id)
+);
+-- Where to reach an account on a channel, when nothing more specific says
+-- otherwise. Replaces `user_chats`.
+CREATE TABLE IF NOT EXISTS deliveries (
+    account_id BIGINT NOT NULL,
+    channel    TEXT NOT NULL,
+    address    TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (account_id, channel)
+);
+CREATE SEQUENCE IF NOT EXISTS conversations_id_seq;
+-- A rolling thread. `scope` keeps a group chat's history out of the
+-- account's private thread: 'direct' is the 1:1 chat and the web app, which
+-- share; a group is 'telegram:<chat_id>'.
+CREATE TABLE IF NOT EXISTS conversations (
+    id            BIGINT PRIMARY KEY DEFAULT nextval('conversations_id_seq'),
+    account_id    BIGINT NOT NULL,
+    scope         TEXT NOT NULL,
+    pending_draft TEXT,
+    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE SEQUENCE IF NOT EXISTS messages_id_seq;
+-- `body` is a serde_json `rig::completion::Message`. Storing the whole
+-- message rather than plain text keeps tool calls and their results paired,
+-- which `trim_history` depends on.
+CREATE TABLE IF NOT EXISTS messages (
+    id              BIGINT PRIMARY KEY DEFAULT nextval('messages_id_seq'),
+    conversation_id BIGINT NOT NULL,
+    position        BIGINT NOT NULL,
+    body            TEXT NOT NULL,
+    created_at      TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
 "#;
 
 /// A purchase as the agent sees it. `purchased_at` is an ISO `YYYY-MM-DD`
@@ -168,9 +209,11 @@ pub struct NewPurchase {
 pub struct Reminder {
     pub id: i64,
     #[serde(skip)]
-    pub user_id: i64,
+    pub account_id: i64,
     #[serde(skip)]
-    pub chat_id: i64,
+    pub channel: String,
+    #[serde(skip)]
+    pub address: String,
     pub item: String,
     pub interval_days: i64,
     pub next_due: String, // YYYY-MM-DD
@@ -286,6 +329,9 @@ enum Step {
     Code(fn(&Connection) -> Result<()>),
 }
 
+/// The tables phase one introduced. Included in `MIGRATIONS` as well, so a
+/// brand-new database is created in the finished shape; kept as a step so an
+/// existing one still gets them.
 const STEP_1_NEW_TABLES: &str = r#"
 CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
 -- A person, independent of how they reach Scout. Deliberately almost empty:
@@ -380,11 +426,197 @@ fn step_2_backfill_accounts(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Every table is rebuilt rather than altered in place, even where the
+/// column is unconstrained and `ALTER` would have worked.
+///
+/// Measured: DuckDB refuses to `ALTER` and then `UPDATE` the same table
+/// inside one transaction — "Attempting to modify table purchases but
+/// another transaction has altered this table". Doing it in autocommit
+/// works but gives up atomicity, and this migration is one-way over live
+/// purchase history. A rebuild touches the new table and the old one
+/// separately, so it commits as a unit.
+///
+/// `reminders` gains its `channel` and `address` here rather than in a later
+/// step; the table is being rewritten anyway and two rebuilds would be waste.
+const STEP_3_UNCONSTRAINED: &str = r#"
+CREATE TABLE purchases_new (
+    id BIGINT PRIMARY KEY DEFAULT nextval('purchases_id_seq'),
+    account_id BIGINT NOT NULL,
+    item TEXT NOT NULL,
+    store TEXT NOT NULL,
+    url TEXT,
+    price DOUBLE,
+    currency TEXT,
+    notes TEXT,
+    purchased_at TEXT,
+    recorded_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+INSERT INTO purchases_new
+    (id, account_id, item, store, url, price, currency, notes, purchased_at, recorded_at)
+SELECT p.id, i.account_id, p.item, p.store, p.url, p.price, p.currency, p.notes,
+       p.purchased_at, p.recorded_at
+FROM purchases p
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(p.user_id AS TEXT);
+DROP TABLE purchases;
+ALTER TABLE purchases_new RENAME TO purchases;
+
+CREATE TABLE reminders_new (
+    id BIGINT PRIMARY KEY DEFAULT nextval('reminders_id_seq'),
+    account_id BIGINT NOT NULL,
+    channel TEXT NOT NULL DEFAULT 'telegram',
+    address TEXT NOT NULL,
+    item TEXT NOT NULL,
+    interval_days BIGINT NOT NULL,
+    next_due TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+INSERT INTO reminders_new
+    (id, account_id, channel, address, item, interval_days, next_due, active, created_at)
+SELECT r.id, i.account_id, 'telegram', CAST(r.chat_id AS TEXT), r.item,
+       r.interval_days, r.next_due, r.active, r.created_at
+FROM reminders r
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(r.user_id AS TEXT);
+DROP TABLE reminders;
+ALTER TABLE reminders_new RENAME TO reminders;
+
+CREATE TABLE request_log_new (
+    account_id BIGINT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+INSERT INTO request_log_new (account_id, kind, created_at)
+SELECT i.account_id, l.kind, l.created_at
+FROM request_log l
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(l.user_id AS TEXT);
+DROP TABLE request_log;
+ALTER TABLE request_log_new RENAME TO request_log;
+"#;
+
+/// The five tables whose `account_id` sits inside a PK or UNIQUE constraint.
+/// DuckDB will not drop such a column at all, so a rebuild is the only
+/// route — and it is the same route step 3 takes, for atomicity.
+const STEP_4_REBUILDS: &str = r#"
+-- Do this FIRST, before waitlist is rebuilt without its chat_id. Someone on
+-- the waitlist may never have had a user_chats row, and the START they
+-- pressed is the only permission we have to message them. Dropping the
+-- column before reading it would lose that silently, and the next announce
+-- would simply skip them.
+INSERT INTO deliveries (account_id, channel, address)
+SELECT i.account_id, 'telegram', CAST(w.chat_id AS TEXT)
+FROM waitlist w
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(w.user_id AS TEXT)
+ON CONFLICT (account_id, channel) DO NOTHING;
+
+CREATE TABLE user_facts_new (
+    account_id BIGINT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (account_id, key)
+);
+INSERT INTO user_facts_new (account_id, key, value, updated_at)
+SELECT i.account_id, f.key, f.value, f.updated_at FROM user_facts f
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(f.user_id AS TEXT);
+DROP TABLE user_facts;
+ALTER TABLE user_facts_new RENAME TO user_facts;
+
+CREATE TABLE users_new (
+    account_id   BIGINT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    updated_at   TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+INSERT INTO users_new (account_id, display_name, updated_at)
+SELECT i.account_id, u.display_name, u.updated_at FROM users u
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(u.user_id AS TEXT);
+DROP TABLE users;
+ALTER TABLE users_new RENAME TO users;
+
+CREATE TABLE members_new (
+    account_id BIGINT PRIMARY KEY,
+    code       TEXT NOT NULL,
+    joined_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    revoked_at TIMESTAMP
+);
+INSERT INTO members_new (account_id, code, joined_at, revoked_at)
+SELECT i.account_id, m.code, m.joined_at, m.revoked_at FROM members m
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(m.user_id AS TEXT);
+DROP TABLE members;
+ALTER TABLE members_new RENAME TO members;
+
+CREATE TABLE waitlist_new (
+    account_id BIGINT PRIMARY KEY,
+    code       TEXT NOT NULL,
+    seen_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    invited_at TIMESTAMP
+);
+INSERT INTO waitlist_new (account_id, code, seen_at, invited_at)
+SELECT i.account_id, w.code, w.seen_at, w.invited_at FROM waitlist w
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(w.user_id AS TEXT);
+DROP TABLE waitlist;
+ALTER TABLE waitlist_new RENAME TO waitlist;
+
+CREATE TABLE trips_new (
+    id          BIGINT PRIMARY KEY DEFAULT nextval('trips_id_seq'),
+    account_id  BIGINT NOT NULL,
+    name        TEXT NOT NULL,
+    name_key    TEXT NOT NULL,
+    adults      BIGINT NOT NULL DEFAULT 1,
+    cabin_class TEXT,
+    status      TEXT NOT NULL DEFAULT 'planning',
+    created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (account_id, name_key)
+);
+INSERT INTO trips_new
+    (id, account_id, name, name_key, adults, cabin_class, status, created_at, updated_at)
+SELECT t.id, i.account_id, t.name, t.name_key, t.adults, t.cabin_class, t.status,
+       t.created_at, t.updated_at
+FROM trips t
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(t.user_id AS TEXT);
+DROP TABLE trips;
+ALTER TABLE trips_new RENAME TO trips;
+"#;
+
+/// `user_chats` was already "where to reach this person", which is what
+/// `deliveries` is. The waitlist rescue happened at the top of step 4,
+/// before that column was dropped; this is the richer record and overwrites
+/// it where both exist, because user_chats is the more recent sighting.
+const STEP_5_DELIVERIES: &str = r#"
+-- `updated_at` is carried from the source row rather than set to now:
+-- bare `current_timestamp` inside DO UPDATE SET is parsed as a column
+-- reference by DuckDB, and the real last-seen time is the truer value.
+INSERT INTO deliveries (account_id, channel, address, updated_at)
+SELECT i.account_id, 'telegram', CAST(c.chat_id AS TEXT), c.updated_at
+FROM user_chats c
+JOIN identities i ON i.kind='telegram' AND i.external_id = CAST(c.user_id AS TEXT)
+ON CONFLICT (account_id, channel)
+DO UPDATE SET address = excluded.address, updated_at = excluded.updated_at;
+
+DROP TABLE user_chats;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
         (2, Step::Code(step_2_backfill_accounts)),
+        (3, Step::Sql(STEP_3_UNCONSTRAINED)),
+        (4, Step::Sql(STEP_4_REBUILDS)),
+        (5, Step::Sql(STEP_5_DELIVERIES)),
     ]
+}
+
+/// True when this database predates phase one. `purchases.user_id` is the
+/// marker: `MIGRATIONS` has created that table with `account_id` since, so
+/// the old column name can only survive on a file that already existed.
+fn legacy_shape(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_name = 'purchases' AND column_name = 'user_id'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 fn apply_steps(conn: &Connection) -> Result<()> {
@@ -395,8 +627,18 @@ fn apply_steps(conn: &Connection) -> Result<()> {
     let mut current = match current {
         Some(v) => v,
         None => {
-            conn.execute("INSERT INTO schema_version (version) VALUES (0)", [])?;
-            0
+            // No recorded version yet, which is true of two very different
+            // databases: one created before phase one, and one created just
+            // now by `MIGRATIONS` in the finished shape. Telling them apart
+            // matters — the upgrade steps read `purchases.user_id`, which
+            // only the older one has, and would fail on a fresh file.
+            let start = if legacy_shape(conn)? {
+                0
+            } else {
+                steps().last().map(|(n, _)| *n).unwrap_or(0)
+            };
+            conn.execute("INSERT INTO schema_version (version) VALUES (?)", params![start])?;
+            start
         }
     };
     for (n, step) in steps() {
@@ -443,12 +685,12 @@ impl Store {
         Ok(conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?)
     }
 
-    pub fn record_purchase(&self, user_id: i64, p: NewPurchase) -> Result<Purchase> {
+    pub fn record_purchase(&self, account_id: i64, p: NewPurchase) -> Result<Purchase> {
         let conn = self.conn.lock().unwrap();
         let id: i64 = conn.query_row(
-            "INSERT INTO purchases (user_id, item, store, url, price, currency, notes, purchased_at)
+            "INSERT INTO purchases (account_id, item, store, url, price, currency, notes, purchased_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-            params![user_id, p.item, p.store, p.url, p.price, p.currency, p.notes, p.purchased_at],
+            params![account_id, p.item, p.store, p.url, p.price, p.currency, p.notes, p.purchased_at],
             |row| row.get(0),
         )?;
         Ok(Purchase {
@@ -466,7 +708,7 @@ impl Store {
     /// Case-insensitive substring match on item/store/notes, newest first.
     pub fn query_purchases(
         &self,
-        user_id: i64,
+        account_id: i64,
         term: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Purchase>> {
@@ -479,20 +721,20 @@ impl Store {
             Some(t) => {
                 let like = format!("%{}%", t.to_lowercase());
                 let sql = format!(
-                    "{SELECT} WHERE user_id = ? AND (lower(item) LIKE ? \
+                    "{SELECT} WHERE account_id = ? AND (lower(item) LIKE ? \
                      OR lower(store) LIKE ? OR lower(coalesce(notes, '')) LIKE ?) {ORDER}"
                 );
                 let mut stmt = conn.prepare(&sql)?;
                 let rows =
-                    stmt.query_map(params![user_id, like, like, like, limit as i64], row_to_purchase)?;
+                    stmt.query_map(params![account_id, like, like, like, limit as i64], row_to_purchase)?;
                 for row in rows {
                     out.push(row?);
                 }
             }
             None => {
-                let sql = format!("{SELECT} WHERE user_id = ? {ORDER}");
+                let sql = format!("{SELECT} WHERE account_id = ? {ORDER}");
                 let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map(params![user_id, limit as i64], row_to_purchase)?;
+                let rows = stmt.query_map(params![account_id, limit as i64], row_to_purchase)?;
                 for row in rows {
                     out.push(row?);
                 }
@@ -501,25 +743,30 @@ impl Store {
         Ok(out)
     }
 
+    /// `address` is where this reminder should be delivered — the chat it
+    /// was created in, not wherever the account was last seen. A reminder
+    /// set in a group belongs to that group.
     pub fn create_reminder(
         &self,
-        user_id: i64,
-        chat_id: i64,
+        account_id: i64,
+        channel: &str,
+        address: &str,
         item: &str,
         interval_days: i64,
         next_due: &str,
     ) -> Result<Reminder> {
         let conn = self.conn.lock().unwrap();
         let id: i64 = conn.query_row(
-            "INSERT INTO reminders (user_id, chat_id, item, interval_days, next_due)
-             VALUES (?, ?, ?, ?, ?) RETURNING id",
-            params![user_id, chat_id, item, interval_days, next_due],
+            "INSERT INTO reminders (account_id, channel, address, item, interval_days, next_due)
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            params![account_id, channel, address, item, interval_days, next_due],
             |row| row.get(0),
         )?;
         Ok(Reminder {
             id,
-            user_id,
-            chat_id,
+            account_id,
+            channel: channel.to_string(),
+            address: address.to_string(),
             item: item.to_string(),
             interval_days,
             next_due: next_due.to_string(),
@@ -527,22 +774,22 @@ impl Store {
     }
 
     /// Active reminders for one user, soonest first.
-    pub fn list_reminders(&self, user_id: i64) -> Result<Vec<Reminder>> {
+    pub fn list_reminders(&self, account_id: i64) -> Result<Vec<Reminder>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, user_id, chat_id, item, interval_days, next_due FROM reminders
-             WHERE user_id = ? AND active ORDER BY next_due ASC, id ASC",
+            "SELECT id, account_id, channel, address, item, interval_days, next_due FROM reminders
+             WHERE account_id = ? AND active ORDER BY next_due ASC, id ASC",
         )?;
-        let rows = stmt.query_map(params![user_id], row_to_reminder)?;
+        let rows = stmt.query_map(params![account_id], row_to_reminder)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     /// Returns true if an active reminder belonging to this user was cancelled.
-    pub fn cancel_reminder(&self, user_id: i64, id: i64) -> Result<bool> {
+    pub fn cancel_reminder(&self, account_id: i64, id: i64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE reminders SET active = false WHERE id = ? AND user_id = ? AND active",
-            params![id, user_id],
+            "UPDATE reminders SET active = false WHERE id = ? AND account_id = ? AND active",
+            params![id, account_id],
         )?;
         Ok(n > 0)
     }
@@ -551,7 +798,7 @@ impl Store {
     pub fn due_reminders(&self, today: &str) -> Result<Vec<Reminder>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, user_id, chat_id, item, interval_days, next_due FROM reminders
+            "SELECT id, account_id, channel, address, item, interval_days, next_due FROM reminders
              WHERE active AND next_due <= ? ORDER BY next_due ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![today], row_to_reminder)?;
@@ -569,32 +816,32 @@ impl Store {
     }
 
     /// Insert or overwrite one user-profile fact.
-    pub fn upsert_fact(&self, user_id: i64, key: &str, value: &str) -> Result<()> {
+    pub fn upsert_fact(&self, account_id: i64, key: &str, value: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO user_facts (user_id, key, value) VALUES (?, ?, ?)
-             ON CONFLICT (user_id, key)
+            "INSERT INTO user_facts (account_id, key, value) VALUES (?, ?, ?)
+             ON CONFLICT (account_id, key)
              DO UPDATE SET value = excluded.value, updated_at = now()",
-            params![user_id, key, value],
+            params![account_id, key, value],
         )?;
         Ok(())
     }
 
     /// One user's profile facts as (key, value), sorted by key.
-    pub fn list_facts(&self, user_id: i64) -> Result<Vec<(String, String)>> {
+    pub fn list_facts(&self, account_id: i64) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT key, value FROM user_facts WHERE user_id = ? ORDER BY key ASC")?;
-        let rows = stmt.query_map(params![user_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            .prepare("SELECT key, value FROM user_facts WHERE account_id = ? ORDER BY key ASC")?;
+        let rows = stmt.query_map(params![account_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     /// Returns true if the fact existed and was removed.
-    pub fn forget_fact(&self, user_id: i64, key: &str) -> Result<bool> {
+    pub fn forget_fact(&self, account_id: i64, key: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "DELETE FROM user_facts WHERE user_id = ? AND key = ?",
-            params![user_id, key],
+            "DELETE FROM user_facts WHERE account_id = ? AND key = ?",
+            params![account_id, key],
         )?;
         Ok(n > 0)
     }
@@ -605,11 +852,11 @@ impl Store {
     /// and a typo on either side would silently report zero.
     pub const FLIGHT_SEARCH: &'static str = "flight_search";
 
-    pub fn log_request(&self, user_id: i64, kind: &str) -> Result<()> {
+    pub fn log_request(&self, account_id: i64, kind: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO request_log (user_id, kind) VALUES (?, ?)",
-            params![user_id, kind],
+            "INSERT INTO request_log (account_id, kind) VALUES (?, ?)",
+            params![account_id, kind],
         )?;
         Ok(())
     }
@@ -617,44 +864,44 @@ impl Store {
     /// Remember what to call a user id in `/stat`. Deliberately separate
     /// from `log_request`: commands should teach the bot your name without
     /// also counting as requests. A blank name is not a name.
-    pub fn remember_user(&self, user_id: i64, display_name: &str) -> Result<()> {
+    pub fn remember_user(&self, account_id: i64, display_name: &str) -> Result<()> {
         let name = display_name.trim();
         if name.is_empty() {
             return Ok(());
         }
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO users (user_id, display_name) VALUES (?, ?)
-             ON CONFLICT (user_id)
+            "INSERT INTO users (account_id, display_name) VALUES (?, ?)
+             ON CONFLICT (account_id)
              DO UPDATE SET display_name = excluded.display_name, updated_at = now()",
-            params![user_id, name],
+            params![account_id, name],
         )?;
         Ok(())
     }
 
     #[cfg(test)]
-    fn log_request_at(&self, user_id: i64, kind: &str, at: &str) -> Result<()> {
+    fn log_request_at(&self, account_id: i64, kind: &str, at: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO request_log (user_id, kind, created_at) VALUES (?, ?, CAST(? AS TIMESTAMP))",
-            params![user_id, kind, at],
+            "INSERT INTO request_log (account_id, kind, created_at) VALUES (?, ?, CAST(? AS TIMESTAMP))",
+            params![account_id, kind, at],
         )?;
         Ok(())
     }
 
     /// Per-day request counts scoped to a single user, as
-    /// (user_id, day "YYYY-MM-DD", count) at or after `cutoff`
+    /// (account_id, day "YYYY-MM-DD", count) at or after `cutoff`
     /// ("YYYY-MM-DD 00:00:00"). This is what non-admin `/stat` callers get,
     /// so they only ever see their own volume however many users share the
     /// bot.
-    pub fn usage_stats_for(&self, cutoff: &str, user_id: i64) -> Result<Vec<(i64, String, i64)>> {
+    pub fn usage_stats_for(&self, cutoff: &str, account_id: i64) -> Result<Vec<(i64, String, i64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT user_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
-             FROM request_log WHERE user_id = ? AND created_at >= CAST(? AS TIMESTAMP)
-             GROUP BY user_id, day ORDER BY day ASC, user_id ASC",
+            "SELECT account_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
+             FROM request_log WHERE account_id = ? AND created_at >= CAST(? AS TIMESTAMP)
+             GROUP BY account_id, day ORDER BY day ASC, account_id ASC",
         )?;
-        let rows = stmt.query_map(params![user_id, cutoff], |row| {
+        let rows = stmt.query_map(params![account_id, cutoff], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         rows.map(|r| r.map_err(Into::into)).collect()
@@ -666,9 +913,9 @@ impl Store {
     pub fn usage_stats_all(&self, cutoff: &str) -> Result<Vec<(i64, String, i64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT user_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
+            "SELECT account_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
              FROM request_log WHERE created_at >= CAST(? AS TIMESTAMP)
-             GROUP BY user_id, day ORDER BY day ASC, user_id ASC",
+             GROUP BY account_id, day ORDER BY day ASC, account_id ASC",
         )?;
         let rows = stmt.query_map(params![cutoff], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -676,57 +923,95 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// The account behind a Telegram user, creating one the first time.
+    ///
+    /// Both branches run under the same lock, so two updates arriving from
+    /// the same person cannot mint two accounts for them.
+    pub fn account_for_telegram(&self, telegram_id: i64) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let key = telegram_id.to_string();
+        let mut stmt = conn.prepare(
+            "SELECT account_id FROM identities WHERE kind = 'telegram' AND external_id = ?",
+        )?;
+        let found: Option<i64> = stmt.query_map(params![&key], |r| r.get(0))?.next().transpose()?;
+        drop(stmt);
+        if let Some(id) = found {
+            return Ok(id);
+        }
+        let account_id: i64 = conn.query_row(
+            "INSERT INTO accounts (id) VALUES (nextval('accounts_id_seq')) RETURNING id",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO identities (account_id, kind, external_id) VALUES (?, 'telegram', ?)",
+            params![account_id, key],
+        )?;
+        Ok(account_id)
+    }
+
     /// Records where this person last spoke, for announcements.
     ///
     /// A user id and a chat id are the same number in a private chat and
     /// different in a group, so the chat is stored rather than derived.
-    pub fn remember_chat(&self, user_id: i64, chat_id: i64) -> Result<()> {
+    pub fn note_delivery(&self, account_id: i64, channel: &str, address: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO user_chats (user_id, chat_id) VALUES (?, ?)
-             ON CONFLICT (user_id)
-             DO UPDATE SET chat_id = excluded.chat_id, updated_at = now()",
-            params![user_id, chat_id],
+            "INSERT INTO deliveries (account_id, channel, address) VALUES (?, ?, ?)
+             ON CONFLICT (account_id, channel)
+             DO UPDATE SET address = excluded.address, updated_at = now()",
+            params![account_id, channel, address],
         )?;
         Ok(())
     }
 
-    /// Everyone the bot could announce something to, as (user, chat).
+    /// Everyone the bot could announce something to on a channel, as
+    /// (account, address).
     pub fn broadcast_targets(&self) -> Result<Vec<(i64, i64)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT user_id, chat_id FROM user_chats ORDER BY user_id ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT account_id, CAST(address AS BIGINT) FROM deliveries
+             WHERE channel = 'telegram' ORDER BY account_id ASC",
+        )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
-    /// Everyone admitted and not since revoked. Read once at startup to
-    /// build the membership set the gate actually consults; the table is
-    /// the durable record, the set is the hot path.
+    /// Everyone admitted and not since revoked, as **Telegram ids**. Read
+    /// once at startup to build the membership set the gate consults.
+    ///
+    /// Telegram ids rather than account ids because the gate runs on every
+    /// update and all it has is `sender_id`. Resolving an account there
+    /// would put a database read in front of every message from every
+    /// stranger, which is the cost this set exists to avoid.
     pub fn active_members(&self) -> Result<Vec<i64>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT user_id FROM members WHERE revoked_at IS NULL ORDER BY user_id ASC",
+            "SELECT CAST(i.external_id AS BIGINT)
+             FROM members m
+             JOIN identities i ON i.account_id = m.account_id AND i.kind = 'telegram'
+             WHERE m.revoked_at IS NULL
+             ORDER BY 1 ASC",
         )?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
-    /// Try to take a seat in `code` for `user_id`.
+    /// Try to take a seat in `code` for `account_id`.
     ///
     /// One method, one lock acquisition, so check-and-insert is atomic by
     /// construction: a round of 100 admits exactly 100 however many people
     /// press START at the same moment. There is no counter to drift from
     /// the rows — seats used *is* `count(*)` over them.
-    pub fn claim_seat(&self, user_id: i64, chat_id: i64, code: &str) -> Result<Claim> {
+    pub fn claim_seat(&self, account_id: i64, chat_id: i64, code: &str) -> Result<Claim> {
         let conn = self.conn.lock().unwrap();
 
         // Membership decides before the round does. Checking the round
         // first would let a revoked person be told "that round is full",
         // and a member re-clicking a link consume a second seat.
-        let mut stmt = conn.prepare("SELECT revoked_at IS NULL FROM members WHERE user_id = ?")?;
+        let mut stmt = conn.prepare("SELECT revoked_at IS NULL FROM members WHERE account_id = ?")?;
         let standing: Option<bool> = stmt
-            .query_map(params![user_id], |row| row.get(0))?
+            .query_map(params![account_id], |row| row.get(0))?
             .next()
             .transpose()?;
         match standing {
@@ -751,25 +1036,32 @@ impl Store {
         // guessed exists, and that is information with no use.
         if !matches!(round, Some((true, capacity, used)) if used < capacity) {
             conn.execute(
-                "INSERT INTO waitlist (user_id, chat_id, code) VALUES (?, ?, ?)
-                 ON CONFLICT (user_id) DO UPDATE SET
-                     chat_id = excluded.chat_id,
+                "INSERT INTO waitlist (account_id, code) VALUES (?, ?)
+                 ON CONFLICT (account_id) DO UPDATE SET
                      code = excluded.code,
                      -- They tried again and were turned away again, so they
                      -- are waiting again — but `seen_at` is untouched, so a
                      -- second attempt does not cost them their place.
                      invited_at = NULL",
-                params![user_id, chat_id, code],
+                params![account_id, code],
+            )?;
+            // Where to reach them is not the waitlist's business — it is
+            // every channel's. The START they just pressed is the permission.
+            conn.execute(
+                "INSERT INTO deliveries (account_id, channel, address) VALUES (?, 'telegram', ?)
+                 ON CONFLICT (account_id, channel)
+                 DO UPDATE SET address = excluded.address, updated_at = now()",
+                params![account_id, chat_id.to_string()],
             )?;
             return Ok(Claim::NoRoom);
         }
 
         conn.execute(
-            "INSERT INTO members (user_id, code) VALUES (?, ?)",
-            params![user_id, code],
+            "INSERT INTO members (account_id, code) VALUES (?, ?)",
+            params![account_id, code],
         )?;
         // Nobody who is inside should be chased by a later announce.
-        conn.execute("DELETE FROM waitlist WHERE user_id = ?", params![user_id])?;
+        conn.execute("DELETE FROM waitlist WHERE account_id = ?", params![account_id])?;
         Ok(Claim::Admitted)
     }
 
@@ -826,23 +1118,23 @@ impl Store {
     /// Removes a member. False when they were not one (or already were
     /// removed). The row stays: the seat is spent, and moderation must not
     /// quietly reopen a round.
-    pub fn revoke(&self, user_id: i64) -> Result<bool> {
+    pub fn revoke(&self, account_id: i64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
             "UPDATE members SET revoked_at = current_timestamp
-             WHERE user_id = ? AND revoked_at IS NULL",
-            params![user_id],
+             WHERE account_id = ? AND revoked_at IS NULL",
+            params![account_id],
         )?;
         Ok(changed > 0)
     }
 
     /// Undoes a revoke. False when they were not revoked. Consumes no seat,
     /// for the same reason revoking returned none.
-    pub fn restore(&self, user_id: i64) -> Result<bool> {
+    pub fn restore(&self, account_id: i64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
-            "UPDATE members SET revoked_at = NULL WHERE user_id = ? AND revoked_at IS NOT NULL",
-            params![user_id],
+            "UPDATE members SET revoked_at = NULL WHERE account_id = ? AND revoked_at IS NOT NULL",
+            params![account_id],
         )?;
         Ok(changed > 0)
     }
@@ -852,9 +1144,15 @@ impl Store {
     /// longest hear first.
     pub fn waitlist_to_invite(&self) -> Result<Vec<(i64, i64)>> {
         let conn = self.conn.lock().unwrap();
+        // An inner join, deliberately: someone with no recorded address
+        // cannot be reached, and silently announcing to nobody would look
+        // like a delivered invitation.
         let mut stmt = conn.prepare(
-            "SELECT user_id, chat_id FROM waitlist WHERE invited_at IS NULL
-             ORDER BY seen_at ASC, user_id ASC",
+            "SELECT w.account_id, CAST(d.address AS BIGINT)
+             FROM waitlist w
+             JOIN deliveries d ON d.account_id = w.account_id AND d.channel = 'telegram'
+             WHERE w.invited_at IS NULL
+             ORDER BY w.seen_at ASC, w.account_id ASC",
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
@@ -862,11 +1160,11 @@ impl Store {
 
     /// Stamped per successful send, so re-running an announce reaches only
     /// the people the first run missed.
-    pub fn mark_invited(&self, user_id: i64) -> Result<()> {
+    pub fn mark_invited(&self, account_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE waitlist SET invited_at = current_timestamp WHERE user_id = ?",
-            params![user_id],
+            "UPDATE waitlist SET invited_at = current_timestamp WHERE account_id = ?",
+            params![account_id],
         )?;
         Ok(())
     }
@@ -875,9 +1173,9 @@ impl Store {
     /// be reached at all — they blocked the bot or deleted the chat, which
     /// is an opt-out, and carrying them forward would mean retrying that
     /// same failure at every future round.
-    pub fn forget_waitlist(&self, user_id: i64) -> Result<()> {
+    pub fn forget_waitlist(&self, account_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM waitlist WHERE user_id = ?", params![user_id])?;
+        conn.execute("DELETE FROM waitlist WHERE account_id = ?", params![account_id])?;
         Ok(())
     }
 
@@ -889,14 +1187,14 @@ impl Store {
     ///
     /// `current_date` is the container clock, which runs UTC — the same
     /// midnight the reply tells the user about.
-    pub fn requests_today(&self, user_id: i64) -> Result<i64> {
+    pub fn requests_today(&self, account_id: i64) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT count(*) FROM request_log
-             WHERE user_id = ? AND kind IN ('text', 'photo') AND created_at >= current_date",
+             WHERE account_id = ? AND kind IN ('text', 'photo') AND created_at >= current_date",
         )?;
         let n: i64 = stmt
-            .query_map(params![user_id], |row| row.get(0))?
+            .query_map(params![account_id], |row| row.get(0))?
             .next()
             .transpose()?
             .unwrap_or(0);
@@ -905,8 +1203,8 @@ impl Store {
 
     /// Flight searches per user since `cutoff`, scoped to one user. See
     /// [`FLIGHT_SEARCH`].
-    pub fn flight_searches_for(&self, cutoff: &str, user_id: i64) -> Result<BTreeMap<i64, i64>> {
-        self.kind_counts(cutoff, Self::FLIGHT_SEARCH, Some(user_id))
+    pub fn flight_searches_for(&self, cutoff: &str, account_id: i64) -> Result<BTreeMap<i64, i64>> {
+        self.kind_counts(cutoff, Self::FLIGHT_SEARCH, Some(account_id))
     }
 
     /// The same across every user. Reachable from `/stat` only when the
@@ -923,16 +1221,16 @@ impl Store {
         &self,
         cutoff: &str,
         kind: &str,
-        user_id: Option<i64>,
+        account_id: Option<i64>,
     ) -> Result<BTreeMap<i64, i64>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT user_id, count(*) FROM request_log
+            "SELECT account_id, count(*) FROM request_log
              WHERE kind = ? AND created_at >= CAST(? AS TIMESTAMP)
-               AND (? IS NULL OR user_id = ?)
-             GROUP BY user_id ORDER BY user_id ASC",
+               AND (? IS NULL OR account_id = ?)
+             GROUP BY account_id ORDER BY account_id ASC",
         )?;
-        let rows = stmt.query_map(params![kind, cutoff, user_id, user_id], |row| {
+        let rows = stmt.query_map(params![kind, cutoff, account_id, account_id], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?;
         rows.map(|r| r.map_err(Into::into)).collect()
@@ -942,7 +1240,7 @@ impl Store {
     /// one row per person who has ever messaged the bot.
     pub fn display_names(&self) -> Result<BTreeMap<i64, String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT user_id, display_name FROM users")?;
+        let mut stmt = conn.prepare("SELECT account_id, display_name FROM users")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
@@ -953,7 +1251,7 @@ impl Store {
     /// overwrite a value already set.
     pub fn upsert_trip(
         &self,
-        user_id: i64,
+        account_id: i64,
         name: &str,
         adults: Option<i64>,
         cabin_class: Option<&str>,
@@ -965,9 +1263,9 @@ impl Store {
         let key = name.to_lowercase();
         let conn = self.conn.lock().unwrap();
         let inserted = conn.execute(
-            "INSERT INTO trips (user_id, name, name_key) VALUES (?, ?, ?)
-             ON CONFLICT (user_id, name_key) DO NOTHING",
-            params![user_id, name, key],
+            "INSERT INTO trips (account_id, name, name_key) VALUES (?, ?, ?)
+             ON CONFLICT (account_id, name_key) DO NOTHING",
+            params![account_id, name, key],
         )?;
         // A freshly created trip already starts in `planning`, and a call
         // that supplies neither field is how find-or-create works — it must
@@ -977,27 +1275,27 @@ impl Store {
         if let Some(adults) = adults {
             conn.execute(
                 "UPDATE trips SET adults = ?, updated_at = current_timestamp
-                 WHERE user_id = ? AND name_key = ?",
-                params![adults, user_id, key],
+                 WHERE account_id = ? AND name_key = ?",
+                params![adults, account_id, key],
             )?;
         }
         if let Some(cabin) = cabin_class {
             conn.execute(
                 "UPDATE trips SET cabin_class = ?, updated_at = current_timestamp
-                 WHERE user_id = ? AND name_key = ?",
-                params![cabin, user_id, key],
+                 WHERE account_id = ? AND name_key = ?",
+                params![cabin, account_id, key],
             )?;
         }
         if invalidates_prices {
             conn.execute(
                 "UPDATE trips SET status = 'planning', updated_at = current_timestamp
-                 WHERE user_id = ? AND name_key = ?",
-                params![user_id, key],
+                 WHERE account_id = ? AND name_key = ?",
+                params![account_id, key],
             )?;
         }
         let id: i64 = conn.query_row(
-            "SELECT id FROM trips WHERE user_id = ? AND name_key = ?",
-            params![user_id, key],
+            "SELECT id FROM trips WHERE account_id = ? AND name_key = ?",
+            params![account_id, key],
             |row| row.get(0),
         )?;
         load_trip(&conn, id)
@@ -1013,13 +1311,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn find_trip(&self, user_id: i64, name: &str) -> Result<Option<Trip>> {
+    pub fn find_trip(&self, account_id: i64, name: &str) -> Result<Option<Trip>> {
         let key = name.trim().to_lowercase();
         let conn = self.conn.lock().unwrap();
         let mut stmt =
-            conn.prepare("SELECT id FROM trips WHERE user_id = ? AND name_key = ?")?;
+            conn.prepare("SELECT id FROM trips WHERE account_id = ? AND name_key = ?")?;
         let id: Option<i64> = stmt
-            .query_map(params![user_id, key], |row| row.get(0))?
+            .query_map(params![account_id, key], |row| row.get(0))?
             .next()
             .transpose()?;
         match id {
@@ -1029,12 +1327,12 @@ impl Store {
     }
 
     /// Every trip this user has, newest activity first.
-    pub fn list_trips(&self, user_id: i64) -> Result<Vec<Trip>> {
+    pub fn list_trips(&self, account_id: i64) -> Result<Vec<Trip>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id FROM trips WHERE user_id = ? ORDER BY updated_at DESC, id DESC")?;
+            .prepare("SELECT id FROM trips WHERE account_id = ? ORDER BY updated_at DESC, id DESC")?;
         let ids: Vec<i64> = stmt
-            .query_map(params![user_id], |row| row.get(0))?
+            .query_map(params![account_id], |row| row.get(0))?
             .collect::<duckdb::Result<_>>()?;
         ids.into_iter().map(|id| load_trip(&conn, id)).collect()
     }
@@ -1329,12 +1627,12 @@ impl Store {
 
     /// False when there was no such trip. Deleting something already gone is
     /// the state the caller wanted, not a failure.
-    pub fn delete_trip(&self, user_id: i64, name: &str) -> Result<bool> {
+    pub fn delete_trip(&self, account_id: i64, name: &str) -> Result<bool> {
         let key = name.trim().to_lowercase();
         let conn = self.conn.lock().unwrap();
         let mut stmt =
-            conn.prepare("SELECT id FROM trips WHERE user_id = ? AND name_key = ?")?;
-        let mut ids = stmt.query_map(params![user_id, key], |row| row.get::<_, i64>(0))?;
+            conn.prepare("SELECT id FROM trips WHERE account_id = ? AND name_key = ?")?;
+        let mut ids = stmt.query_map(params![account_id, key], |row| row.get::<_, i64>(0))?;
         let Some(id) = ids.next().transpose()? else {
             return Ok(false);
         };
@@ -1469,11 +1767,12 @@ fn row_to_purchase(row: &Row) -> duckdb::Result<Purchase> {
 fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
     Ok(Reminder {
         id: row.get(0)?,
-        user_id: row.get(1)?,
-        chat_id: row.get(2)?,
-        item: row.get(3)?,
-        interval_days: row.get(4)?,
-        next_due: row.get(5)?,
+        account_id: row.get(1)?,
+        channel: row.get(2)?,
+        address: row.get(3)?,
+        item: row.get(4)?,
+        interval_days: row.get(5)?,
+        next_due: row.get(6)?,
     })
 }
 
@@ -1587,6 +1886,134 @@ CREATE TABLE segment_candidates (
         .unwrap();
         drop(conn);
         (dir, path)
+    }
+
+    #[test]
+    fn where_to_reach_someone_moves_into_deliveries() {
+        let (_d, path) = legacy_db();
+        let s = Store::open(&path).unwrap();
+        let conn = s.conn.lock().unwrap();
+
+        let account_of = |tg: &str| -> i64 {
+            conn.query_row(
+                "SELECT account_id FROM identities WHERE kind='telegram' AND external_id = ?",
+                params![tg], |r| r.get(0),
+            ).unwrap()
+        };
+
+        let addr: String = conn
+            .query_row("SELECT address FROM deliveries WHERE account_id = ? AND channel='telegram'",
+                params![account_of("11")], |r| r.get(0)).unwrap();
+        assert_eq!(addr, "555");
+
+        // The waitlisted person had a chat_id but no user_chats row; the
+        // waitlist was the only record of where to reach them, and losing it
+        // would silently break the next announce.
+        let addr: String = conn
+            .query_row("SELECT address FROM deliveries WHERE account_id = ? AND channel='telegram'",
+                params![account_of("33")], |r| r.get(0)).unwrap();
+        assert_eq!(addr, "777");
+
+        let gone: i64 = conn
+            .query_row("SELECT count(*) FROM information_schema.tables WHERE table_name='user_chats'",
+                [], |r| r.get(0)).unwrap();
+        assert_eq!(gone, 0, "user_chats should be gone");
+    }
+
+    #[test]
+    fn constrained_tables_are_rebuilt_around_accounts() {
+        let (_d, path) = legacy_db();
+        let s = Store::open(&path).unwrap();
+        let conn = s.conn.lock().unwrap();
+
+        let account_of = |tg: &str| -> i64 {
+            conn.query_row(
+                "SELECT account_id FROM identities WHERE kind='telegram' AND external_id = ?",
+                params![tg], |r| r.get(0),
+            ).unwrap()
+        };
+        let (ann, bo, cy) = (account_of("11"), account_of("22"), account_of("33"));
+
+        let fact: String = conn
+            .query_row("SELECT value FROM user_facts WHERE account_id = ? AND key='currency'",
+                params![ann], |r| r.get(0)).unwrap();
+        assert_eq!(fact, "EUR");
+
+        let name: String = conn
+            .query_row("SELECT display_name FROM users WHERE account_id = ?", params![bo], |r| r.get(0)).unwrap();
+        assert_eq!(name, "Bo");
+
+        let code: String = conn
+            .query_row("SELECT code FROM members WHERE account_id = ?", params![bo], |r| r.get(0)).unwrap();
+        assert_eq!(code, "spring");
+
+        let waiting: i64 = conn
+            .query_row("SELECT count(*) FROM waitlist WHERE account_id = ?", params![cy], |r| r.get(0)).unwrap();
+        assert_eq!(waiting, 1);
+
+        let trip: String = conn
+            .query_row("SELECT name FROM trips WHERE account_id = ?", params![ann], |r| r.get(0)).unwrap();
+        assert_eq!(trip, "Lisbon");
+
+        // The waitlisted person's chat id had to be rescued into deliveries
+        // before the rebuild dropped the column.
+        let addr: String = conn
+            .query_row("SELECT address FROM deliveries WHERE account_id = ? AND channel='telegram'",
+                params![cy], |r| r.get(0)).unwrap();
+        assert_eq!(addr, "777");
+
+        // The trips sequence still hands out fresh ids after the rebuild.
+        conn.execute("INSERT INTO trips (account_id, name, name_key) VALUES (?, 'Porto', 'porto')",
+            params![ann]).unwrap();
+        let ids: i64 = conn.query_row("SELECT count(DISTINCT id) FROM trips", [], |r| r.get(0)).unwrap();
+        assert_eq!(ids, 2, "a rebuilt table must not reuse an id");
+    }
+
+    #[test]
+    fn unconstrained_tables_carry_account_ids_and_keep_their_rows() {
+        let (_d, path) = legacy_db();
+        let s = Store::open(&path).unwrap();
+        let conn = s.conn.lock().unwrap();
+
+        let ann: i64 = conn
+            .query_row(
+                "SELECT account_id FROM identities WHERE kind='telegram' AND external_id='11'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+
+        let purchases: i64 = conn
+            .query_row("SELECT count(*) FROM purchases WHERE account_id = ?", params![ann], |r| r.get(0))
+            .unwrap();
+        assert_eq!(purchases, 1, "Ann's beans should have moved across");
+
+        let logged: i64 = conn
+            .query_row("SELECT count(*) FROM request_log WHERE account_id = ?", params![ann], |r| r.get(0))
+            .unwrap();
+        assert_eq!(logged, 2);
+
+        // A reminder is delivered where it was created, so it carries its
+        // own address rather than inheriting the account default.
+        let addr: String = conn
+            .query_row("SELECT address FROM reminders WHERE item = 'beans'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(addr, "555");
+
+        // Ids and their sequences survive the rebuild.
+        conn.execute("INSERT INTO purchases (account_id, item, store) VALUES (?, 'cable', 'eBay')",
+            params![ann]).unwrap();
+        let distinct: i64 = conn
+            .query_row("SELECT count(DISTINCT id) FROM purchases", [], |r| r.get(0)).unwrap();
+        let total: i64 = conn.query_row("SELECT count(*) FROM purchases", [], |r| r.get(0)).unwrap();
+        assert_eq!(distinct, total, "a rebuilt table must not reuse an id");
+
+        // Nothing orphaned anywhere.
+        for table in ["purchases", "reminders", "request_log"] {
+            let orphans: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table} WHERE account_id IS NULL"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(orphans, 0, "{table} has rows with no account");
+        }
     }
 
     #[test]
@@ -1729,7 +2156,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn create_list_cancel_reminder() {
         let (s, _d) = test_store();
-        let r = s.create_reminder(1, 10, "coffee", 30, "2026-08-01").unwrap();
+        let r = s.create_reminder(1, "telegram", "10", "coffee", 30, "2026-08-01").unwrap();
         assert_eq!(r.id, 1);
 
         let listed = s.list_reminders(1).unwrap();
@@ -1745,7 +2172,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn cancel_is_scoped_to_owner() {
         let (s, _d) = test_store();
-        let r = s.create_reminder(1, 10, "coffee", 30, "2026-08-01").unwrap();
+        let r = s.create_reminder(1, "telegram", "10", "coffee", 30, "2026-08-01").unwrap();
         assert!(!s.cancel_reminder(2, r.id).unwrap());
         assert_eq!(s.list_reminders(1).unwrap().len(), 1);
     }
@@ -1753,12 +2180,12 @@ CREATE TABLE segment_candidates (
     #[test]
     fn due_reminders_selects_past_and_today_only() {
         let (s, _d) = test_store();
-        s.create_reminder(1, 10, "overdue", 30, "2026-07-01").unwrap();
-        s.create_reminder(1, 10, "today", 30, "2026-07-22").unwrap();
-        s.create_reminder(1, 10, "future", 30, "2026-09-01").unwrap();
-        let cancelled = s.create_reminder(1, 10, "cancelled", 30, "2026-07-01").unwrap();
+        s.create_reminder(1, "telegram", "10", "overdue", 30, "2026-07-01").unwrap();
+        s.create_reminder(1, "telegram", "10", "today", 30, "2026-07-22").unwrap();
+        s.create_reminder(1, "telegram", "10", "future", 30, "2026-09-01").unwrap();
+        let cancelled = s.create_reminder(1, "telegram", "10", "cancelled", 30, "2026-07-01").unwrap();
         s.cancel_reminder(1, cancelled.id).unwrap();
-        s.create_reminder(2, 20, "other-user", 30, "2026-07-02").unwrap();
+        s.create_reminder(2, "telegram", "20", "other-user", 30, "2026-07-02").unwrap();
 
         let due = s.due_reminders("2026-07-22").unwrap();
         let items: Vec<_> = due.iter().map(|r| r.item.as_str()).collect();
@@ -1768,7 +2195,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn set_next_due_updates() {
         let (s, _d) = test_store();
-        let r = s.create_reminder(1, 10, "coffee", 30, "2026-07-01").unwrap();
+        let r = s.create_reminder(1, "telegram", "10", "coffee", 30, "2026-07-01").unwrap();
         s.set_next_due(r.id, "2026-08-01").unwrap();
         assert!(s.due_reminders("2026-07-22").unwrap().is_empty());
         assert_eq!(s.list_reminders(1).unwrap()[0].next_due, "2026-08-01");
@@ -1834,13 +2261,13 @@ CREATE TABLE segment_candidates (
         // conversation happened, so the chat is recorded rather than
         // assumed.
         let (s, _d) = test_store();
-        s.remember_chat(1, 1).unwrap();
-        s.remember_chat(2, -100200300).unwrap();
+        s.note_delivery(1, "telegram", "1").unwrap();
+        s.note_delivery(2, "telegram", "-100200300").unwrap();
         assert_eq!(s.broadcast_targets().unwrap(), vec![(1, 1), (2, -100200300)]);
 
         // Moving chats replaces the old one: an announcement should follow
         // the person, not accumulate copies.
-        s.remember_chat(1, -999).unwrap();
+        s.note_delivery(1, "telegram", "-999").unwrap();
         assert_eq!(s.broadcast_targets().unwrap(), vec![(1, -999), (2, -100200300)]);
     }
 
@@ -2531,10 +2958,14 @@ CREATE TABLE segment_candidates (
     fn a_round_admits_its_capacity_and_not_one_more() {
         let (s, _d) = test_store();
         assert!(s.create_round("autumn", 3).unwrap());
-        for user in 1..=3 {
-            assert_eq!(s.claim_seat(user, user, "autumn").unwrap(), Claim::Admitted);
+        // Through the resolver, so each member has a telegram identity —
+        // which is what `active_members` reports back to the gate.
+        for tg in 1..=3 {
+            let account = s.account_for_telegram(tg).unwrap();
+            assert_eq!(s.claim_seat(account, tg, "autumn").unwrap(), Claim::Admitted);
         }
-        assert_eq!(s.claim_seat(4, 4, "autumn").unwrap(), Claim::NoRoom);
+        let fourth = s.account_for_telegram(4).unwrap();
+        assert_eq!(s.claim_seat(fourth, 4, "autumn").unwrap(), Claim::NoRoom);
         assert_eq!(s.active_members().unwrap(), vec![1, 2, 3]);
 
         let rounds = s.rounds().unwrap();
@@ -2551,9 +2982,12 @@ CREATE TABLE segment_candidates (
 
         let admitted: usize = std::thread::scope(|scope| {
             let handles: Vec<_> = (1..=40)
-                .map(|user| {
+                .map(|tg| {
                     let s = s.clone();
-                    scope.spawn(move || s.claim_seat(user, user, "rush").unwrap())
+                    scope.spawn(move || {
+                        let account = s.account_for_telegram(tg).unwrap();
+                        s.claim_seat(account, tg, "rush").unwrap()
+                    })
                 })
                 .collect();
             handles
@@ -2604,8 +3038,9 @@ CREATE TABLE segment_candidates (
     fn revoking_returns_no_seat_and_restoring_takes_none() {
         let (s, _d) = test_store();
         s.create_round("autumn", 2).unwrap();
-        s.claim_seat(1, 1, "autumn").unwrap();
-        s.claim_seat(2, 2, "autumn").unwrap();
+        let (a1, a2) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
+        s.claim_seat(a1, 1, "autumn").unwrap();
+        s.claim_seat(a2, 2, "autumn").unwrap();
 
         assert!(s.revoke(1).unwrap());
         assert_eq!(s.rounds().unwrap()[0].used, 2, "a round of 2 admitted 2 people, once");

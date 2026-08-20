@@ -389,7 +389,10 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     let claim = {
         let store = app.deps.store.clone();
         let code = code.clone();
-        tokio::task::spawn_blocking(move || store.claim_seat(user_id, chat_id.0, &code))
+        tokio::task::spawn_blocking(move || {
+            let account_id = store.account_for_telegram(user_id)?;
+            store.claim_seat(account_id, chat_id.0, &code)
+        })
             .await
             .map_err(anyhow::Error::from)
             .and_then(|r| r)
@@ -641,7 +644,12 @@ fn chat_display_name(chat: &teloxide::types::ChatFullInfo) -> Option<String> {
 fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
     let store = app.deps.store.clone();
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || store.log_request(user_id, kind)).await {
+        let logged = tokio::task::spawn_blocking(move || {
+            let account_id = store.account_for_telegram(user_id)?;
+            store.log_request(account_id, kind)
+        })
+        .await;
+        match logged {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "request logging failed"),
             Err(e) => tracing::warn!(error = %e, "request logging join failed"),
@@ -690,7 +698,12 @@ impl Drop for Typing {
 fn note_user(app: &Arc<App>, user_id: i64, name: String) {
     let store = app.deps.store.clone();
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || store.remember_user(user_id, &name)).await {
+        let noted = tokio::task::spawn_blocking(move || {
+            let account_id = store.account_for_telegram(user_id)?;
+            store.remember_user(account_id, &name)
+        })
+        .await;
+        match noted {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "display name update failed"),
             Err(e) => tracing::warn!(error = %e, "display name join failed"),
@@ -710,7 +723,12 @@ fn note_sender(app: &Arc<App>, msg: &Message) {
 fn note_chat(app: &Arc<App>, user_id: i64, chat_id: i64) {
     let store = app.deps.store.clone();
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || store.remember_chat(user_id, chat_id)).await {
+        let recorded = tokio::task::spawn_blocking(move || {
+            let account_id = store.account_for_telegram(user_id)?;
+            store.note_delivery(account_id, "telegram", &chat_id.to_string())
+        })
+        .await;
+        match recorded {
             Ok(Err(e)) => tracing::warn!(error = %e, "could not record the user's chat"),
             Err(e) => tracing::warn!(error = %e, "chat recording task failed"),
             Ok(Ok(())) => {}
@@ -1051,6 +1069,17 @@ async fn handle_invite(
 
 /// Runs a `Store` call off the async executor. The connection is behind a
 /// blocking mutex, so every one of these has to leave the reactor thread.
+/// The account behind a Telegram user, created on first sight.
+///
+/// Everything below the adapter is keyed by account id; `sender_id` is a
+/// Telegram id. This is the single place the two meet, so a caller that
+/// forgets to convert gets a type that is still an `i64` but a name that
+/// says which one it is.
+async fn account_of(app: &App, telegram_id: i64) -> anyhow::Result<i64> {
+    let store = app.deps.store.clone();
+    blocking(move || store.account_for_telegram(telegram_id)).await
+}
+
 async fn blocking<T, F>(f: F) -> anyhow::Result<T>
 where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
@@ -1209,8 +1238,8 @@ async fn handle_kick(
         Ok(target) => {
             let store = app.deps.store.clone();
             let changed = blocking(move || match kicking {
-                true => store.revoke(target),
-                false => store.restore(target),
+                true => store.revoke(store.account_for_telegram(target)?),
+                false => store.restore(store.account_for_telegram(target)?),
             })
             .await;
             match changed {
@@ -1256,7 +1285,12 @@ async fn over_daily_cap(app: &Arc<App>, user_id: i64) -> Option<String> {
     }
     let cap = app.cfg.invite_daily_requests;
     let store = app.deps.store.clone();
-    let used = match blocking(move || store.requests_today(user_id)).await {
+    let used = match blocking(move || {
+        let account_id = store.account_for_telegram(user_id)?;
+        store.requests_today(account_id)
+    })
+    .await
+    {
         Ok(used) => used,
         Err(e) => {
             tracing::warn!(error = %e, user_id, "daily cap check failed; letting it through");
@@ -1594,11 +1628,12 @@ async fn run_agent(
     chat_id: i64,
     prompt: &str,
 ) -> anyhow::Result<String> {
+    let account_id = account_of(app, user_id).await?;
     let facts = {
         let store = app.deps.store.clone();
-        tokio::task::spawn_blocking(move || store.list_facts(user_id)).await??
+        tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
-    let agent = build_agent(&app.deps, user_id, chat_id, &facts);
+    let agent = build_agent(&app.deps, account_id, chat_id, &facts);
     // Per-(chat,user) history. Reading here; the matching writeback at the
     // end of this function uses the same key, so an in-flight run always
     // populates the caller's own session, never anyone else's.

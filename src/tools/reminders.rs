@@ -36,7 +36,7 @@ pub struct CreateReminderArgs {
 
 pub struct CreateReminderTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
     pub chat_id: i64,
 }
 
@@ -76,10 +76,10 @@ impl Tool for CreateReminderTool {
             }
             None => {
                 let store = self.store.clone();
-                let user_id = self.user_id;
+                let account_id = self.account_id;
                 let item = args.item.clone();
                 let last = tokio::task::spawn_blocking(move || {
-                    store.query_purchases(user_id, Some(&item), 1)
+                    store.query_purchases(account_id, Some(&item), 1)
                 })
                 .await
                 .map_err(internal)?
@@ -93,9 +93,16 @@ impl Tool for CreateReminderTool {
             }
         };
         let store = self.store.clone();
-        let (user_id, chat_id) = (self.user_id, self.chat_id);
+        let (account_id, chat_id) = (self.account_id, self.chat_id);
         tokio::task::spawn_blocking(move || {
-            store.create_reminder(user_id, chat_id, &args.item, args.interval_days, &next_due)
+            store.create_reminder(
+                account_id,
+                "telegram",
+                &chat_id.to_string(),
+                &args.item,
+                args.interval_days,
+                &next_due,
+            )
         })
         .await
         .map_err(internal)?
@@ -105,7 +112,7 @@ impl Tool for CreateReminderTool {
 
 pub struct ListRemindersTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -127,8 +134,8 @@ impl Tool for ListRemindersTool {
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
-        let user_id = self.user_id;
-        tokio::task::spawn_blocking(move || store.list_reminders(user_id))
+        let account_id = self.account_id;
+        tokio::task::spawn_blocking(move || store.list_reminders(account_id))
             .await
             .map_err(internal)?
             .map_err(internal)
@@ -142,7 +149,7 @@ pub struct CancelReminderArgs {
 
 pub struct CancelReminderTool {
     pub store: Store,
-    pub user_id: i64,
+    pub account_id: i64,
 }
 
 impl Tool for CancelReminderTool {
@@ -165,8 +172,8 @@ impl Tool for CancelReminderTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
-        let user_id = self.user_id;
-        let cancelled = tokio::task::spawn_blocking(move || store.cancel_reminder(user_id, args.id))
+        let account_id = self.account_id;
+        let cancelled = tokio::task::spawn_blocking(move || store.cancel_reminder(account_id, args.id))
             .await
             .map_err(internal)?
             .map_err(internal)?;
@@ -219,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn create_list_cancel_via_tools() {
         let (store, _d) = setup();
-        let create = CreateReminderTool { store: store.clone(), user_id: 1, chat_id: 99 };
+        let create = CreateReminderTool { store: store.clone(), account_id: 1, chat_id: 99 };
         let r = create
             .call(CreateReminderArgs {
                 item: "coffee".into(),
@@ -228,20 +235,20 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(r.chat_id, 99);
+        assert_eq!(r.address, "99");
         assert_eq!(r.next_due, "2026-08-01");
 
-        let list = ListRemindersTool { store: store.clone(), user_id: 1 };
+        let list = ListRemindersTool { store: store.clone(), account_id: 1 };
         assert_eq!(list.call(NoArgs {}).await.unwrap().len(), 1);
 
-        let cancel = CancelReminderTool { store, user_id: 1 };
+        let cancel = CancelReminderTool { store, account_id: 1 };
         assert_eq!(cancel.call(CancelReminderArgs { id: r.id }).await.unwrap(), "reminder cancelled");
     }
 
     #[tokio::test]
     async fn create_rejects_bad_interval_and_bad_date() {
         let (store, _d) = setup();
-        let create = CreateReminderTool { store, user_id: 1, chat_id: 99 };
+        let create = CreateReminderTool { store, account_id: 1, chat_id: 99 };
         assert!(create
             .call(CreateReminderArgs { item: "x".into(), interval_days: 0, next_due: None })
             .await

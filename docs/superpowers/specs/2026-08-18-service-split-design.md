@@ -106,6 +106,23 @@ and `messages` instead of a `DashMap` entry. Named, revisitable threads
 are a superset we can add later without another schema change, and are
 not built now.
 
+> **Amended while planning phase one (2026-08-18): a conversation carries a
+> scope, and a reminder keeps its own address.** Two places where the
+> decision above, applied literally, would have changed behaviour nobody
+> asked to change.
+>
+> Today `chats: DashMap<(chat_id, sender_id), ChatSession>` gives each group
+> chat its own history. "One conversation per account" would merge a group's
+> thread into the owner's private one. So `conversations` has a `scope`:
+> `'direct'` covers the 1:1 Telegram chat and the web app — those two do
+> share, which is the whole point — and a group is `'telegram:<chat_id>'`.
+>
+> Likewise, "`reminders.chat_id` becomes a row in `deliveries`" would send a
+> reminder created in a group to the owner's DM, because `deliveries` holds
+> one default address per channel. A reminder therefore keeps its own
+> `channel` and `address`; `deliveries` holds the account default, used for
+> announces.
+
 **One protocol: HTTP with server-sent events.** A message is a POST;
 the answer is an event stream. Browsers speak SSE natively, axum serves
 it in a few lines, and it survives any proxy. Both adapters use the
@@ -349,10 +366,14 @@ Two cautions belong in the implementation plan:
 - **Copy the `.duckdb` file before running it.** The backfill cannot be
   undone.
 - **Copy it from inside the container, never from the host.** The
-  container runs DuckDB 1.1.x; the local Python DuckDB is 1.4.5, and
-  opening the file with the newer library can upgrade the format in
-  place and leave the container unable to read its own database. That
-  file holds the real purchase history and the live reminders.
+  `duckdb` crate bundles its engine, and the locked `duckdb 1.10501.0`
+  is **DuckDB v1.5.1** — verified by running `SELECT version()` through
+  the crate, and the deployed image was built from this same lockfile.
+  The Python DuckDB on the development machine is **1.4.5, which is
+  older**. It cannot be relied on to open the file at all and must
+  never write to it. Take the copy with `docker compose exec`, or with
+  core stopped. That file holds the real purchase history and the live
+  reminders.
 
 ## Deferred to phase three
 

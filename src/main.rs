@@ -1,6 +1,7 @@
 mod agent;
 mod bot;
 mod config;
+mod core;
 mod draft;
 mod events;
 mod links;
@@ -149,9 +150,10 @@ async fn main() -> Result<()> {
 
     tokio::spawn(scheduler::run(telegram.clone(), store));
 
+    let core = Arc::new(core::Core { cfg, deps });
+
     let app = Arc::new(bot::App {
-        cfg,
-        deps,
+        core,
         chats: DashMap::new(),
         replies: DashMap::new(),
         streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

@@ -1,5 +1,4 @@
-use crate::agent::{build_agent, wrap_up_agent, AgentDeps, HISTORY_CAP, WRAP_UP_NOTE};
-use crate::config::Config;
+use crate::agent::{build_agent, wrap_up_agent, HISTORY_CAP, WRAP_UP_NOTE};
 use crate::draft::{resolve_draft, DraftResolution};
 use crate::progress::Live;
 use crate::store::Store;
@@ -20,8 +19,9 @@ use teloxide::types::{
 use teloxide::utils::command::BotCommands;
 
 pub struct App {
-    pub cfg: Config,
-    pub deps: AgentDeps,
+    /// Everything that is Scout rather than Telegram. Shared, never owned:
+    /// in 2b-2 it lives in another process entirely.
+    pub core: Arc<crate::core::Core>,
     /// One entry per (chat_id, sender_id). In a 1:1 chat a single user always
     /// hits the same slot; in a group/supergroup, each allowed user has
     /// their own history, draft and last_seen, isolating conversation
@@ -300,7 +300,7 @@ fn is_member(app: &App, msg: &Message) -> bool {
 /// The gate: founders from `ALLOWED_TELEGRAM_USER_IDS`, plus everyone
 /// admitted through an invite round and not since revoked.
 fn is_member_id(app: &App, user_id: i64) -> bool {
-    app.cfg.allowed_user_ids.contains(&user_id) || app.members.contains(&user_id)
+    app.core.cfg.allowed_user_ids.contains(&user_id) || app.members.contains(&user_id)
 }
 
 /// True for `/start`, with or without an `@bot` suffix and with or without
@@ -348,7 +348,7 @@ fn display_name(user: &teloxide::types::User) -> String {
 
 /// `/help`'s text for one person: admins get their own commands appended.
 fn help_for(app: &App, user_id: i64) -> String {
-    match app.cfg.admin_user_ids.contains(&user_id) {
+    match app.core.cfg.admin_user_ids.contains(&user_id) {
         true => format!("{HELP}{ADMIN_HELP}"),
         false => HELP.to_string(),
     }
@@ -383,7 +383,7 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     };
 
     let claim = {
-        let store = app.deps.store.clone();
+        let store = app.core.deps.store.clone();
         let code = code.clone();
         tokio::task::spawn_blocking(move || {
             let account_id = store.account_for_telegram(user_id)?;
@@ -467,7 +467,7 @@ async fn handle_command(
             // would leave the thread intact and /reset would do nothing.
             // A fresh conversation is what "cleared" has to mean.
             let scope = conversation_scope(msg.chat.id.0, user_id);
-            let store = app.deps.store.clone();
+            let store = app.core.deps.store.clone();
             let started = blocking(move || {
                 let account_id = store.account_for_telegram(user_id)?;
                 store.start_conversation(account_id, &scope)
@@ -497,7 +497,7 @@ async fn handle_command(
                 }
             };
 
-            let store = app.deps.store.clone();
+            let store = app.core.deps.store.clone();
             let targets = tokio::task::spawn_blocking(move || store.broadcast_targets())
                 .await
                 .map_err(anyhow::Error::from)
@@ -550,14 +550,14 @@ async fn handle_command(
             };
             // Admins see the whole bot; everyone else sees only themselves.
             // This branch is the only place cross-user counts are reachable.
-            let admin = app.cfg.admin_user_ids.contains(&user_id);
+            let admin = app.core.cfg.admin_user_ids.contains(&user_id);
             let today = chrono::Local::now().date_naive();
             let cutoff = format!(
                 "{} 00:00:00",
                 today - chrono::Duration::days(i64::from(days) - 1)
             );
             let data = {
-                let store = app.deps.store.clone();
+                let store = app.core.deps.store.clone();
                 tokio::task::spawn_blocking(move || {
                     // Both reads take the same admin branch, so a
                     // non-admin can never see another user's flight
@@ -653,7 +653,7 @@ fn chat_display_name(chat: &teloxide::types::ChatFullInfo) -> Option<String> {
 
 /// Fire-and-forget usage logging; never delays request handling.
 fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
-    let store = app.deps.store.clone();
+    let store = app.core.deps.store.clone();
     tokio::spawn(async move {
         let logged = tokio::task::spawn_blocking(move || {
             let account_id = store.account_for_telegram(user_id)?;
@@ -707,7 +707,7 @@ impl Drop for Typing {
 /// an id. Separate from `log_request` on purpose: running a command should
 /// teach the bot your name without inflating your request count.
 fn note_user(app: &Arc<App>, user_id: i64, name: String) {
-    let store = app.deps.store.clone();
+    let store = app.core.deps.store.clone();
     tokio::spawn(async move {
         let noted = tokio::task::spawn_blocking(move || {
             let account_id = store.account_for_telegram(user_id)?;
@@ -732,7 +732,7 @@ fn note_sender(app: &Arc<App>, msg: &Message) {
 /// Records where this person is talking, so `/advert` can reach them. A
 /// user id is only the same as a chat id in a private chat.
 fn note_chat(app: &Arc<App>, user_id: i64, chat_id: i64) {
-    let store = app.deps.store.clone();
+    let store = app.core.deps.store.clone();
     tokio::spawn(async move {
         let recorded = tokio::task::spawn_blocking(move || {
             let account_id = store.account_for_telegram(user_id)?;
@@ -779,7 +779,7 @@ pub fn check_advert(body: &str) -> Result<&str, String> {
 const NOT_ADMIN: &str = "That command is for the bot's admin.";
 
 fn is_admin(app: &App, user_id: i64) -> bool {
-    app.cfg.admin_user_ids.contains(&user_id)
+    app.core.cfg.admin_user_ids.contains(&user_id)
 }
 
 /// Capacity when `/invite new` is given a name and no number.
@@ -1011,7 +1011,7 @@ async fn handle_invite(
             return Ok(());
         }
     };
-    let store = app.deps.store.clone();
+    let store = app.core.deps.store.clone();
     match cmd {
         InviteCmd::New { code, capacity } => {
             let created = {
@@ -1094,7 +1094,7 @@ async fn resolve_conversation(
 ) -> anyhow::Result<i64> {
     let account_id = account_of(app, user_id).await?;
     let ttl = SESSION_TTL.as_secs() as i64;
-    let store = app.deps.store.clone();
+    let store = app.core.deps.store.clone();
     let (scope_owned, latest) = {
         let scope_owned = scope.to_string();
         let s = scope_owned.clone();
@@ -1106,7 +1106,7 @@ async fn resolve_conversation(
     };
 
     let Some((id, aged_out)) = latest else {
-        let store = app.deps.store.clone();
+        let store = app.core.deps.store.clone();
         return blocking(move || store.start_conversation(account_id, &scope_owned)).await;
     };
     if !aged_out {
@@ -1114,29 +1114,29 @@ async fn resolve_conversation(
     }
 
     let excerpt = {
-        let store = app.deps.store.clone();
+        let store = app.core.deps.store.clone();
         let history = blocking(move || load_history(&store, id, HISTORY_CAP)).await?;
         last_messages_text(&history, 6)
     };
     if excerpt.trim().is_empty() {
-        let store = app.deps.store.clone();
+        let store = app.core.deps.store.clone();
         return blocking(move || store.start_conversation(account_id, &scope_owned)).await;
     }
-    match crate::agent::continues_previous(&app.deps.llm, &excerpt, text).await {
+    match crate::agent::continues_previous(&app.core.deps.llm, &excerpt, text).await {
         Ok(true) => {
             tracing::info!(user_id, id, "session expired but topic continues; keeping context");
-            let store = app.deps.store.clone();
+            let store = app.core.deps.store.clone();
             blocking(move || store.touch_conversation(id)).await?;
             Ok(id)
         }
         Ok(false) => {
             tracing::info!(user_id, "session expired; starting fresh");
-            let store = app.deps.store.clone();
+            let store = app.core.deps.store.clone();
             blocking(move || store.start_conversation(account_id, &scope_owned)).await
         }
         Err(e) => {
             tracing::warn!(error = %e, user_id, "continuation check failed; starting fresh");
-            let store = app.deps.store.clone();
+            let store = app.core.deps.store.clone();
             blocking(move || store.start_conversation(account_id, &scope_owned)).await
         }
     }
@@ -1188,7 +1188,7 @@ fn conversation_scope(chat_id: i64, user_id: i64) -> String {
 /// forgets to convert gets a type that is still an `i64` but a name that
 /// says which one it is.
 async fn account_of(app: &App, telegram_id: i64) -> anyhow::Result<i64> {
-    let store = app.deps.store.clone();
+    let store = app.core.deps.store.clone();
     blocking(move || store.account_for_telegram(telegram_id)).await
 }
 
@@ -1247,7 +1247,7 @@ async fn announce_round(
     app: &Arc<App>,
     code: &str,
 ) -> ResponseResult<()> {
-    let store = app.deps.store.clone();
+    let store = app.core.deps.store.clone();
     let rounds = match blocking(move || store.rounds()).await {
         Ok(rounds) => rounds,
         Err(e) => {
@@ -1277,7 +1277,7 @@ async fn announce_round(
         return Ok(());
     }
 
-    let store = app.deps.store.clone();
+    let store = app.core.deps.store.clone();
     let targets = match blocking(move || store.waitlist_to_invite()).await {
         Ok(targets) => targets,
         Err(e) => {
@@ -1296,7 +1296,7 @@ async fn announce_round(
 
     let (mut sent, mut dropped, mut retryable) = (0usize, 0usize, 0usize);
     for (recipient, outcome) in results {
-        let store = app.deps.store.clone();
+        let store = app.core.deps.store.clone();
         match outcome {
             Delivered::Ok => {
                 sent += 1;
@@ -1348,7 +1348,7 @@ async fn handle_kick(
     let reply = match parse_user_id(arg) {
         Err(problem) => problem,
         Ok(target) => {
-            let store = app.deps.store.clone();
+            let store = app.core.deps.store.clone();
             let changed = blocking(move || match kicking {
                 true => store.revoke(store.account_for_telegram(target)?),
                 false => store.restore(store.account_for_telegram(target)?),
@@ -1392,11 +1392,11 @@ async fn handle_kick(
 /// access control — the gate above it already decided this person is
 /// allowed here — and a database blip should not silence everyone at once.
 async fn over_daily_cap(app: &Arc<App>, user_id: i64) -> Option<String> {
-    if app.cfg.allowed_user_ids.contains(&user_id) {
+    if app.core.cfg.allowed_user_ids.contains(&user_id) {
         return None;
     }
-    let cap = app.cfg.invite_daily_requests;
-    let store = app.deps.store.clone();
+    let cap = app.core.cfg.invite_daily_requests;
+    let store = app.core.deps.store.clone();
     let used = match blocking(move || {
         let account_id = store.account_for_telegram(user_id)?;
         store.requests_today(account_id)
@@ -1618,7 +1618,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         }
     };
 
-    match describe_photo(&app.deps.llm, &bytes, msg.caption()).await {
+    match describe_photo(&app.core.deps.llm, &bytes, msg.caption()).await {
         Ok(draft) => {
             app.chats.entry(key).or_default().pending_draft = Some(draft.clone());
             bot.send_message(
@@ -1760,15 +1760,15 @@ async fn run_agent(
 ) -> anyhow::Result<String> {
     let account_id = account_of(app, user_id).await?;
     let facts = {
-        let store = app.deps.store.clone();
+        let store = app.core.deps.store.clone();
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
-    let agent = build_agent(&app.deps, account_id, chat_id, &facts);
+    let agent = build_agent(&app.core.deps, account_id, chat_id, &facts);
     // History comes from the conversation the caller opened, so an
     // in-flight run always reads and writes that thread and never anyone
     // else's — the isolation the (chat, user) map used to provide.
     let mut history = {
-        let store = app.deps.store.clone();
+        let store = app.core.deps.store.clone();
         blocking(move || load_history(&store, conversation_id, HISTORY_CAP)).await?
     };
 
@@ -1895,7 +1895,7 @@ async fn run_agent(
         // model's own notes are the material: its reasoning already lists
         // the prices it confirmed.
         let notes = tail_chars(&format!("{thinking}\n\n{streamed}"), WRAP_UP_CONTEXT);
-        let wrap_up = wrap_up_agent(&app.deps, &facts);
+        let wrap_up = wrap_up_agent(&app.core.deps, &facts);
         let asked = format!(
             "{WRAP_UP_NOTE}\nTell the user briefly that {reason}, then give the answer.\n\n\
              Your research notes so far:\n{notes}"
@@ -1920,12 +1920,12 @@ async fn run_agent(
     // Guard against links the model wrote but never saw: an invented Amazon
     // /dp/<ASIN> URL reads as a real product page and answers 404. One repair
     // turn, then scrub whatever is still dead.
-    let dead = crate::links::dead_links_in(&app.deps.http, &reply).await;
+    let dead = crate::links::dead_links_in(&app.core.deps.http, &reply).await;
     if !dead.is_empty() {
         tracing::warn!(?dead, chat_id, "dead links in reply; asking the agent to correct it");
         let note = crate::links::repair_prompt(&dead);
         reply = strip_thinking(&agent.chat(note, &mut history).await?);
-        let still_dead = crate::links::dead_links_in(&app.deps.http, &reply).await;
+        let still_dead = crate::links::dead_links_in(&app.core.deps.http, &reply).await;
         if !still_dead.is_empty() {
             tracing::warn!(?still_dead, chat_id, "dead links survived the correction; stripping");
             reply = crate::links::strike_dead(&reply, &still_dead);
@@ -1933,7 +1933,7 @@ async fn run_agent(
     }
 
     trim_history(&mut history, HISTORY_CAP);
-    let store = app.deps.store.clone();
+    let store = app.core.deps.store.clone();
     if let Err(e) = blocking(move || save_history(&store, conversation_id, &history)).await {
         // The answer is already on its way to the user; losing the thread is
         // worse than not saving it, but it is not worth failing the reply.

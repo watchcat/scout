@@ -182,6 +182,20 @@ pub fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
     lines.join("\n")
 }
 
+/// Starts a fresh conversation, discarding whatever thread was live.
+///
+/// History lives in the store now, so clearing an in-memory slot would clear
+/// nothing — /reset has to mean a new thread or it means nothing.
+pub async fn reset(core: &Core, telegram_id: i64, scope: &str) -> anyhow::Result<i64> {
+    let store = core.store();
+    let scope = scope.to_string();
+    crate::core::blocking(move || {
+        let account_id = store.account_for_telegram(telegram_id)?;
+        store.start_conversation(account_id, &scope)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

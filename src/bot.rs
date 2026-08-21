@@ -340,18 +340,7 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         return Ok(());
     };
 
-    let claim = {
-        let store = app.core.store();
-        let code = code.clone();
-        tokio::task::spawn_blocking(move || {
-            let account_id = store.account_for_telegram(user_id)?;
-            store.claim_seat(account_id, chat_id.0, &code)
-        })
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|r| r)
-    };
-    let claim = match claim {
+    let claim = match crate::invites::claim(&app.core, user_id, chat_id.0, &code).await {
         Ok(claim) => claim,
         Err(e) => {
             tracing::error!(error = %e, user_id, code, "could not record an invite claim");
@@ -425,13 +414,7 @@ async fn handle_command(
             // would leave the thread intact and /reset would do nothing.
             // A fresh conversation is what "cleared" has to mean.
             let scope = crate::session::conversation_scope(msg.chat.id.0, user_id);
-            let store = app.core.store();
-            let started = blocking(move || {
-                let account_id = store.account_for_telegram(user_id)?;
-                store.start_conversation(account_id, &scope)
-            })
-            .await;
-            if let Err(e) = started {
+            if let Err(e) = crate::session::reset(&app.core, user_id, &scope).await {
                 tracing::error!(error = %e, user_id, "could not clear the conversation");
                 bot.send_message(msg.chat.id, CLAIM_FAILED).await?;
                 return Ok(());
@@ -455,8 +438,7 @@ async fn handle_command(
                 }
             };
 
-            let store = app.core.store();
-            let targets = blocking(move || crate::invites::advert_targets(&store)).await;
+            let targets = crate::invites::advert_targets(&app.core).await;
             let targets = match targets {
                 Ok(targets) => targets,
                 Err(e) => {
@@ -519,9 +501,7 @@ const NAME_BACKFILL_LIMIT: usize = 25;
 /// one to file under. Deriving one from the other is what previously turned a
 /// stats report into `get_chat(ChatId(3))`.
 async fn backfill_names(bot: &Bot, app: &Arc<App>) {
-    let store = app.core.store();
-    let missing = match blocking(move || store.accounts_missing_display_names(NAME_BACKFILL_LIMIT)).await
-    {
+    let missing = match app.core.accounts_missing_names(NAME_BACKFILL_LIMIT).await {
         Ok(missing) => missing,
         Err(e) => {
             tracing::debug!(error = %e, "could not list accounts missing a name");
@@ -539,8 +519,7 @@ async fn backfill_names(bot: &Bot, app: &Arc<App>) {
             }
         };
         let Some(name) = chat_display_name(&chat) else { continue };
-        let store = app.core.store();
-        if let Err(e) = blocking(move || store.remember_user(account_id, &name)).await {
+        if let Err(e) = app.core.record_name(account_id, name).await {
             tracing::debug!(error = %e, account_id, "could not record a display name");
         }
     }
@@ -561,17 +540,10 @@ fn chat_display_name(chat: &teloxide::types::ChatFullInfo) -> Option<String> {
 
 /// Fire-and-forget usage logging; never delays request handling.
 fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
-    let store = app.core.store();
+    let core = app.core.clone();
     tokio::spawn(async move {
-        let logged = tokio::task::spawn_blocking(move || {
-            let account_id = store.account_for_telegram(user_id)?;
-            store.log_request(account_id, kind)
-        })
-        .await;
-        match logged {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "request logging failed"),
-            Err(e) => tracing::warn!(error = %e, "request logging join failed"),
+        if let Err(e) = core.log_request(user_id, kind).await {
+            tracing::warn!(error = %e, "request logging failed");
         }
     });
 }
@@ -615,17 +587,10 @@ impl Drop for Typing {
 /// an id. Separate from `log_request` on purpose: running a command should
 /// teach the bot your name without inflating your request count.
 fn note_user(app: &Arc<App>, user_id: i64, name: String) {
-    let store = app.core.store();
+    let core = app.core.clone();
     tokio::spawn(async move {
-        let noted = tokio::task::spawn_blocking(move || {
-            let account_id = store.account_for_telegram(user_id)?;
-            store.remember_user(account_id, &name)
-        })
-        .await;
-        match noted {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "display name update failed"),
-            Err(e) => tracing::warn!(error = %e, "display name join failed"),
+        if let Err(e) = core.note_display_name(user_id, name).await {
+            tracing::warn!(error = %e, "display name update failed");
         }
     });
 }
@@ -640,17 +605,10 @@ fn note_sender(app: &Arc<App>, msg: &Message) {
 /// Records where this person is talking, so `/advert` can reach them. A
 /// user id is only the same as a chat id in a private chat.
 fn note_chat(app: &Arc<App>, user_id: i64, chat_id: i64) {
-    let store = app.core.store();
+    let core = app.core.clone();
     tokio::spawn(async move {
-        let recorded = tokio::task::spawn_blocking(move || {
-            let account_id = store.account_for_telegram(user_id)?;
-            store.note_delivery(account_id, "telegram", &chat_id.to_string())
-        })
-        .await;
-        match recorded {
-            Ok(Err(e)) => tracing::warn!(error = %e, "could not record the user's chat"),
-            Err(e) => tracing::warn!(error = %e, "chat recording task failed"),
-            Ok(Ok(())) => {}
+        if let Err(e) = core.note_address(user_id, "telegram", chat_id.to_string()).await {
+            tracing::warn!(error = %e, "could not record the user's chat");
         }
     });
 }
@@ -793,16 +751,6 @@ fn classify_send(e: &teloxide::RequestError) -> Delivered {
 
 
 
-async fn blocking<T, F>(f: F) -> anyhow::Result<T>
-where
-    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|r| r)
-}
 
 
 
@@ -817,9 +765,7 @@ async fn announce_round(
     app: &Arc<App>,
     code: &str,
 ) -> ResponseResult<()> {
-    let store = app.core.store();
-    let code_owned = code.to_string();
-    let planned = match blocking(move || crate::invites::plan_announcement(&store, &code_owned)).await {
+    let planned = match crate::invites::plan_announcement(&app.core, code).await {
         Ok(planned) => planned,
         Err(e) => {
             tracing::error!(error = %e, "could not plan the announcement");
@@ -853,8 +799,7 @@ async fn announce_round(
     let dropped = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::Gone).count();
     let retryable = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::No).count();
 
-    let store = app.core.store();
-    if let Err(e) = blocking(move || crate::invites::record_announcement(&store, &outcomes)).await {
+    if let Err(e) = crate::invites::record_announcement(&app.core, outcomes).await {
         tracing::warn!(error = %e, "could not record what the announcement reached");
     }
 

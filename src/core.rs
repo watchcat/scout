@@ -37,6 +37,58 @@ impl Core {
         self.deps.store.clone()
     }
 
+    /// Records a request against the caller's account.
+    ///
+    /// Takes a Telegram id and resolves it, so the caller never has to know
+    /// that the two are different numbers — the mistake that made /stat
+    /// report an empty week.
+    pub async fn log_request(&self, telegram_id: i64, kind: &'static str) -> anyhow::Result<()> {
+        let store = self.store();
+        blocking(move || {
+            let account_id = store.account_for_telegram(telegram_id)?;
+            store.log_request(account_id, kind)
+        })
+        .await
+    }
+
+    /// Remembers what to call someone, under their account.
+    pub async fn note_display_name(&self, telegram_id: i64, name: String) -> anyhow::Result<()> {
+        let store = self.store();
+        blocking(move || {
+            let account_id = store.account_for_telegram(telegram_id)?;
+            store.remember_user(account_id, &name)
+        })
+        .await
+    }
+
+    /// Records where someone last spoke, so an announcement can reach them.
+    pub async fn note_address(
+        &self,
+        telegram_id: i64,
+        channel: &'static str,
+        address: String,
+    ) -> anyhow::Result<()> {
+        let store = self.store();
+        blocking(move || {
+            let account_id = store.account_for_telegram(telegram_id)?;
+            store.note_delivery(account_id, channel, &address)
+        })
+        .await
+    }
+
+    /// Accounts with no recorded name, as (account, telegram id), for a
+    /// channel that can go and ask.
+    pub async fn accounts_missing_names(&self, limit: usize) -> anyhow::Result<Vec<(i64, i64)>> {
+        let store = self.store();
+        blocking(move || store.accounts_missing_display_names(limit)).await
+    }
+
+    /// Files a name a channel looked up, under the account it belongs to.
+    pub async fn record_name(&self, account_id: i64, name: String) -> anyhow::Result<()> {
+        let store = self.store();
+        blocking(move || store.remember_user(account_id, &name)).await
+    }
+
     /// Turns a photo into a search description.
     ///
     /// Wrapped so the adapter never reaches for the model itself: which

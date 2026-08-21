@@ -188,7 +188,13 @@ pub enum Reached {
 /// halfway through a broadcast: announcing a round nobody can join spends
 /// the whole waitlist's one notification on a dead end, and stamps them as
 /// told about something real.
-pub fn plan_announcement(store: &Store, code: &str) -> anyhow::Result<Announcement> {
+pub async fn plan_announcement(core: &Core, code: &str) -> anyhow::Result<Announcement> {
+    let store = core.store();
+    let code = code.to_string();
+    crate::core::blocking(move || plan_announcement_blocking(&store, &code)).await
+}
+
+fn plan_announcement_blocking(store: &Store, code: &str) -> anyhow::Result<Announcement> {
     let rounds = store.rounds()?;
     let refusal = match rounds.iter().find(|r| r.code == code) {
         None => Some(format!("There's no round called \"{code}\".")),
@@ -218,7 +224,12 @@ pub fn plan_announcement(store: &Store, code: &str) -> anyhow::Result<Announceme
 /// Stamped per success, so a re-run reaches only who was missed. A recipient
 /// who has blocked Scout is dropped from the waitlist entirely — chasing them
 /// forever would make every later announcement slower for everyone else.
-pub fn record_announcement(store: &Store, outcomes: &[(i64, Reached)]) -> anyhow::Result<()> {
+pub async fn record_announcement(core: &Core, outcomes: Vec<(i64, Reached)>) -> anyhow::Result<()> {
+    let store = core.store();
+    crate::core::blocking(move || record_announcement_blocking(&store, &outcomes)).await
+}
+
+fn record_announcement_blocking(store: &Store, outcomes: &[(i64, Reached)]) -> anyhow::Result<()> {
     for (account_id, reached) in outcomes {
         match reached {
             Reached::Yes => store.mark_invited(*account_id)?,
@@ -235,8 +246,9 @@ pub fn record_announcement(store: &Store, outcomes: &[(i64, Reached)]) -> anyhow
 /// 2b-2 it becomes an endpoint rather than a store call. Someone with an
 /// account but no recorded address is absent, because there is nowhere to
 /// send — silently reaching nobody would read as a delivered announcement.
-pub fn advert_targets(store: &Store) -> anyhow::Result<Vec<(i64, i64)>> {
-    store.broadcast_targets()
+pub async fn advert_targets(core: &Core) -> anyhow::Result<Vec<(i64, i64)>> {
+    let store = core.store();
+    crate::core::blocking(move || store.broadcast_targets()).await
 }
 
 
@@ -379,6 +391,26 @@ pub async fn kick(
 }
 
 
+/// Claims a seat on a round for whoever pressed START.
+///
+/// Resolves the account first: admission is recorded against a person, not
+/// against a Telegram id, so the same person arriving later by another route
+/// is already in.
+pub async fn claim(
+    core: &Core,
+    telegram_id: i64,
+    chat_id: i64,
+    code: &str,
+) -> anyhow::Result<crate::store::Claim> {
+    let store = core.store();
+    let code = code.to_string();
+    crate::core::blocking(move || {
+        let account_id = store.account_for_telegram(telegram_id)?;
+        store.claim_seat(account_id, chat_id, &code)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,7 +425,7 @@ mod tests {
         // Has an account but has never spoken, so there is nowhere to send.
         s.account_for_telegram(33).unwrap();
 
-        assert_eq!(advert_targets(&s).unwrap(), vec![(a, 555), (b, 666)]);
+        assert_eq!(s.broadcast_targets().unwrap(), vec![(a, 555), (b, 666)]);
     }
 
     #[test]
@@ -404,11 +436,11 @@ mod tests {
         s.claim_seat(a, 11, "autumn").unwrap();
 
         // Full. Announcing it would invite people to a door that is shut.
-        match plan_announcement(&s, "autumn").unwrap() {
+        match plan_announcement_blocking(&s, "autumn").unwrap() {
             Announcement::Refused(reason) => assert!(reason.contains("full"), "{reason}"),
             Announcement::Ready { .. } => panic!("a full round must not be announced"),
         }
-        match plan_announcement(&s, "no-such-round").unwrap() {
+        match plan_announcement_blocking(&s, "no-such-round").unwrap() {
             Announcement::Refused(reason) => assert!(reason.contains("no round"), "{reason}"),
             Announcement::Ready { .. } => panic!("an unknown round must not be announced"),
         }
@@ -427,7 +459,7 @@ mod tests {
         s.claim_seat(third, 33, "autumn").unwrap();
 
         s.create_round("winter", 5).unwrap();
-        let Announcement::Ready { targets, text } = plan_announcement(&s, "winter").unwrap() else {
+        let Announcement::Ready { targets, text } = plan_announcement_blocking(&s, "winter").unwrap() else {
             panic!("an open round with room should be announceable");
         };
         assert_eq!(
@@ -439,8 +471,8 @@ mod tests {
         assert!(!text.contains("t.me/"), "a link only works on an empty chat");
 
         // Only the one that landed is stamped; the other must be retried.
-        record_announcement(&s, &[(second, Reached::Yes), (third, Reached::No)]).unwrap();
-        let Announcement::Ready { targets, .. } = plan_announcement(&s, "winter").unwrap() else {
+        record_announcement_blocking(&s, &[(second, Reached::Yes), (third, Reached::No)]).unwrap();
+        let Announcement::Ready { targets, .. } = plan_announcement_blocking(&s, "winter").unwrap() else {
             panic!("still announceable");
         };
         assert_eq!(
@@ -450,8 +482,8 @@ mod tests {
         );
 
         // Someone gone for good is dropped rather than chased forever.
-        record_announcement(&s, &[(third, Reached::Gone)]).unwrap();
-        match plan_announcement(&s, "winter").unwrap() {
+        record_announcement_blocking(&s, &[(third, Reached::Gone)]).unwrap();
+        match plan_announcement_blocking(&s, "winter").unwrap() {
             Announcement::Refused(r) => assert!(r.contains("Nobody is waiting"), "{r}"),
             Announcement::Ready { targets, .. } => panic!("still targeting {targets:?}"),
         }

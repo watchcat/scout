@@ -28,6 +28,12 @@ pub(crate) fn advance_from(next_due: NaiveDate, interval_days: i64, today: Naive
 /// does not parse has nothing to advance from. Both are logged here, so a
 /// row that is skipped says so once whether it was found while listing
 /// deliveries or while acknowledging one.
+///
+/// The date check deliberately runs earlier than it used to. In the single
+/// process it happened after the send had already succeeded, so a row whose
+/// `next_due` would not parse was delivered, failed to advance, and was
+/// delivered again fifteen minutes later — forever. Refusing before the send
+/// is what the guard was for; the old order sent first and asked afterwards.
 pub(crate) fn next_date(reminder: &Reminder, today: NaiveDate) -> Option<NaiveDate> {
     if reminder.interval_days < 1 {
         tracing::error!(reminder_id = reminder.id, interval_days = reminder.interval_days,

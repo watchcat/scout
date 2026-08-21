@@ -220,6 +220,17 @@ impl Core {
     /// the row already held rather than from today keeps the cadence
     /// anchored to the original date, and makes a second acknowledgement
     /// harmless: once the row is no longer due there is nothing to find.
+    ///
+    /// Two costs come from taking nothing but an id, and both are deliberate
+    /// because that is all `POST /v1/deliveries/{id}/ack` will carry. It
+    /// re-reads the due rows to find the one being acknowledged, so a tick
+    /// delivering n reminders runs n+1 queries where one process ran one;
+    /// that is cheap at this table's size and would not be over a network.
+    /// And it works out today for itself, so a tick that spans local midnight
+    /// and lands exactly on an interval boundary can push a reminder one
+    /// interval further than intended — a single skipped reorder prompt, at
+    /// most once a night, in exchange for an acknowledgement that needs no
+    /// clock agreement between the two sides.
     pub async fn delivery_done(&self, id: i64) -> anyhow::Result<()> {
         let store = self.store();
         let today = chrono::Local::now().date_naive();

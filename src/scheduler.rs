@@ -26,7 +26,16 @@ async fn tick(bot: &Bot, core: &Core) -> Result<()> {
             continue;
         };
         match bot.send_message(ChatId(chat), &delivery.text).await {
-            Ok(_) => core.delivery_done(delivery.id).await?,
+            // Never `?` here. An acknowledgement that fails has already cost
+            // someone a delivered message, and abandoning the tick would
+            // leave everyone behind them unreminded while re-sending this one
+            // every quarter of an hour until the write succeeds.
+            Ok(_) => {
+                if let Err(e) = core.delivery_done("telegram", delivery.id).await {
+                    tracing::error!(id = delivery.id, error = %e,
+                        "delivered but not acked; it will be sent again");
+                }
+            }
             Err(e) => tracing::warn!(id = delivery.id, error = %e,
                 "reminder send failed; it stays due"),
         }

@@ -17,13 +17,27 @@ pub struct Core {
 
 /// One thing to deliver, to one address, on one channel.
 ///
-/// Everything a channel needs and nothing more. `text` is written here so
-/// that a browser and a chat say the same sentence.
+/// `text` is written here so that a browser and a chat say the same
+/// sentence. `channel` is what the caller asked for and is echoed back
+/// rather than needed — the Telegram adapter never reads it — because on a
+/// wire a row that names its own channel can be logged, batched or
+/// forwarded without carrying the query along beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueDelivery {
     pub id: i64,
     pub channel: String,
     pub address: String,
     pub text: String,
+}
+
+/// What a reorder reminder says, wherever it is delivered.
+///
+/// Named rather than written inline at the one call site, because "every
+/// channel says the same sentence" is the claim the whole payload design
+/// rests on, and an anonymous literal is one careless edit from breaking it
+/// quietly.
+pub fn reminder_text(item: &str) -> String {
+    format!("⏰ Time to reorder {item} — want me to search for deals?")
 }
 
 /// Who may talk to this bot, for the start-up log.
@@ -206,7 +220,7 @@ impl Core {
                     id: r.id,
                     channel: r.channel,
                     address: r.address,
-                    text: format!("⏰ Time to reorder {} — want me to search for deals?", r.item),
+                    text: reminder_text(&r.item),
                 })
                 .collect())
         })
@@ -221,24 +235,33 @@ impl Core {
     /// anchored to the original date, and makes a second acknowledgement
     /// harmless: once the row is no longer due there is nothing to find.
     ///
-    /// Two costs come from taking nothing but an id, and both are deliberate
-    /// because that is all `POST /v1/deliveries/{id}/ack` will carry. It
-    /// re-reads the due rows to find the one being acknowledged, so a tick
-    /// delivering n reminders runs n+1 queries where one process ran one;
-    /// that is cheap at this table's size and would not be over a network.
+    /// Takes the channel as well as the id because ids are sequential and
+    /// mean nothing on their own: without it, one channel could acknowledge
+    /// another's reminder, the row would advance, and the person who was
+    /// actually waiting would simply not be reminded — with no error
+    /// anywhere, because a successful advance looks the same either way.
+    /// Over HTTP that is an id no one has to guess.
+    ///
+    /// Two costs come from an acknowledgement that carries nothing else, and
+    /// both are deliberate, because a channel that has sent a message knows
+    /// its own name and the id it was given and nothing more. It re-reads
+    /// the due rows to find the one being acknowledged, so a tick delivering
+    /// n reminders runs 2n+1 queries where one process ran n+1; that is
+    /// cheap at this table's size and would not be over a network.
     /// And it works out today for itself, so a tick that spans local midnight
     /// and lands exactly on an interval boundary can push a reminder one
     /// interval further than intended — a single skipped reorder prompt, at
     /// most once a night, in exchange for an acknowledgement that needs no
     /// clock agreement between the two sides.
-    pub async fn delivery_done(&self, id: i64) -> anyhow::Result<()> {
+    pub async fn delivery_done(&self, channel: &str, id: i64) -> anyhow::Result<()> {
         let store = self.store();
+        let channel = channel.to_string();
         let today = chrono::Local::now().date_naive();
         blocking(move || {
             let Some(reminder) = store
                 .due_reminders(&today.to_string())?
                 .into_iter()
-                .find(|r| r.id == id)
+                .find(|r| r.id == id && r.channel == channel)
             else {
                 return Ok(());
             };
@@ -404,7 +427,46 @@ mod tests {
         assert_eq!(due[0].address, "4242");
         assert!(due[0].text.contains("detergent"), "got: {}", due[0].text);
 
-        core.delivery_done(due[0].id).await.unwrap();
+        core.delivery_done("telegram", due[0].id).await.unwrap();
         assert!(core.due_deliveries("telegram").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_channel_cannot_acknowledge_another_channels_reminder() {
+        // Ids are sequential, so an acknowledgement carrying only an id is a
+        // number anyone can guess. Acking the wrong one would advance a row
+        // nobody delivered, and the person waiting would just never hear —
+        // silently, since an advance looks identical whoever asked for it.
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(
+            Config::for_test(dir.path().join("cross.duckdb").to_str().unwrap()),
+            None,
+        )
+        .unwrap();
+
+        let store = core.store();
+        let account = store.account_for_telegram(4242).unwrap();
+        store
+            .create_reminder(account, "telegram", "4242", "detergent", 30, "2020-01-01")
+            .unwrap();
+
+        let due = core.due_deliveries("telegram").await.unwrap();
+        assert_eq!(due.len(), 1);
+
+        core.delivery_done("web", due[0].id).await.unwrap();
+
+        assert_eq!(
+            core.due_deliveries("telegram").await.unwrap(),
+            due,
+            "a web acknowledgement moved a telegram reminder"
+        );
+    }
+
+    #[test]
+    fn every_channel_is_handed_the_same_sentence() {
+        assert_eq!(
+            reminder_text("detergent"),
+            "⏰ Time to reorder detergent — want me to search for deals?"
+        );
     }
 }

@@ -848,6 +848,14 @@ to `crates/scout-telegram/src/text.rs`. Move each item's tests with it.
 If anything else in `text.rs` does not fall cleanly on one side, stop and
 report it rather than guessing.
 
+Third, **`DueDelivery` belongs in `scout-api`**, not in `core.rs`. The
+architecture line at the top of this plan says `scout-api` holds what both
+sides speak, and this is the payload of `GET /v1/deliveries`. It is the same
+"cheap now, expensive once it is a wire format" argument that moves the other
+two. Move the struct, derive `serde::Serialize` and `serde::Deserialize` on
+it there alongside the `Debug, Clone, PartialEq, Eq` it already has, and
+re-export or import it in `core.rs`.
+
 - [ ] **Step 3: Split the manifest in two**
 
 `crates/scout-telegram/Cargo.toml` takes the current root package's
@@ -997,7 +1005,23 @@ local, synchronous, free database call, and every one of them is behind an
 HTTP handler afterwards. Report it so the next plan starts from a measured
 number rather than an impression.
 
-- [ ] **Step 2: Prove the boundary is enforced, not just observed**
+- [ ] **Step 2: Sweep the surface that is now unreachable**
+
+Making `store` private left `pub` functions that nobody outside the crate can
+call, because they take arguments nobody outside can name — `save_history`,
+`load_history` and `last_messages_text` in `session.rs` all take a
+`&Store`. Rust does not warn about this (`unnameable_types` is allow by
+default), so it has to be looked for.
+
+```bash
+grep -rn "pub fn" crates/scout-core/src/session.rs
+```
+
+Narrow anything taking or returning a private type to `pub(crate)`. If the
+compiler was already going to complain it would have; this is tidying a
+surface that reads as public API and is not.
+
+- [ ] **Step 3: Prove the boundary is enforced, not just observed**
 
 Temporarily add to `crates/scout-telegram/src/main.rs`:
 
@@ -1011,7 +1035,7 @@ Expected: `error[E0603]: module 'store' is private`.
 **Remove the line again.** This is a mutation check, not a change — the same
 discipline as breaking a guard to watch a test go red.
 
-- [ ] **Step 3: Full verification**
+- [ ] **Step 4: Full verification**
 
 ```bash
 cargo test --workspace       # 441 passed, 3 ignored
@@ -1039,7 +1063,7 @@ artifacts that happened to already exist. Expect one warning that is not
 ours: `proc-macro-error2 v2.0.1` is future-incompatible, via a transitive
 dependency.
 
-- [ ] **Step 4: Back up the database from inside the container**
+- [ ] **Step 5: Back up the database from inside the container**
 
 ```bash
 docker compose exec scout cp /data/scout.duckdb /data/scout.duckdb.pre-2b2a
@@ -1051,13 +1075,13 @@ Older, and it must not write to that file.
 This phase runs no migration, so the backup is precaution rather than
 necessity — take it anyway.
 
-- [ ] **Step 5: Deploy**
+- [ ] **Step 6: Deploy**
 
 Run: `scripts/deploy.sh`
 Expected: `scout is up`, the `who may talk to this bot` line reporting
 `schema=5` and the same founder and member counts as before.
 
-- [ ] **Step 6: Verify against production**
+- [ ] **Step 7: Verify against production**
 
 ```bash
 docker compose ps                       # restarts should be 0
@@ -1068,7 +1092,7 @@ Then exercise it in the chat: an ordinary question, `/stat`, `/invite status`,
 a photo, and `/reset` followed by a follow-up. Nothing about the phase should
 be visible from a chat window — that is the success condition.
 
-- [ ] **Step 7: Commit anything the deploy corrected, then finish the branch**
+- [ ] **Step 8: Commit anything the deploy corrected, then finish the branch**
 
 REQUIRED SUB-SKILL: superpowers:finishing-a-development-branch
 
@@ -1152,4 +1176,34 @@ architecture one:
 - **`anyhow::Result` on every public `Core` method** is right for a binary
   and wrong for something that becomes HTTP: it erases "the database is
   down" (503) from "no such account" (404). Worth naming now because every
-  method Task 5 adds inherits the choice.
+  method Task 5 adds inherits the choice. The concrete first case is
+  `delivery_done`, which returns `Ok(())` for a row that does not exist, a
+  row that is not due, and a row it refuses to advance — a 200 for "I
+  acknowledged something that was never sent", with the one case that
+  indicates a real bug being the only one that logs nothing.
+
+The Task 5 review added four more:
+
+- **Nothing claims a delivery between listing and acknowledging.** The
+  protocol is at-least-once with an unbounded duplicate window, which is
+  correct today only because one process runs one serial loop. Two adapter
+  replicas would both list and both send. Same character as the stale member
+  set: fine until co-location stops being true. Reorder prompts can tolerate
+  at-least-once, so this may stay a documented property rather than becoming
+  a lease — but it should be a decision, not an accident.
+
+- **A permanently undeliverable reminder is retried forever.** Every teloxide
+  send error is treated as transient, so a user who blocks the bot leaves a
+  row that is offered every fifteen minutes and warns every time. The request
+  side needs vocabulary for "do not try again" before that can be fixed,
+  which is the same enum as the ack outcomes above.
+
+- **A permanently malformed row logs at error level every tick.** `next_date`
+  refuses it and `due_deliveries` filters it out, but nothing ever
+  deactivates it: 96 error lines a day until someone edits the database. The
+  redelivery loop is gone; the logging loop replaced it.
+
+- **`chrono::Local` decides "today" for everyone.** Two containers in
+  different zones would disagree, and a user is reminded on the server's day
+  rather than their own. The reminder cadence should follow the account, not
+  the host.

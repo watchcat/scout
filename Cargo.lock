@@ -6653,7 +6653,6 @@ dependencies = [
  "chrono",
  "dashmap",
  "dotenvy",
- "reqwest 0.12.28",
  "scout-api",
  "scout-core",
  "serde",

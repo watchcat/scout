@@ -4,14 +4,18 @@ mod scheduler;
 
 use anyhow::Result;
 use dashmap::DashMap;
-use scout_core::agent::AgentDeps;
 use scout_core::config::Config;
-use scout_core::store::Store;
-use scout_core::tools::kagi::{KagiClient, KAGI_API_BASE};
 use std::sync::Arc;
-use std::time::Duration;
 use teloxide::Bot;
 use tracing_subscriber::EnvFilter;
+
+/// The adapter's own credential, read straight from the environment.
+///
+/// 2b-2b divides `Config` in two and this is the first piece to move.
+fn telegram_token() -> Result<String> {
+    std::env::var("TELEGRAM_BOT_TOKEN")
+        .map_err(|_| anyhow::anyhow!("TELEGRAM_BOT_TOKEN is not set"))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,98 +25,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    let store = Store::open(&cfg.db_path)?;
-
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-    let kagi = KagiClient::new(http.clone(), cfg.kagi_api_key.clone(), KAGI_API_BASE.to_string());
-    let llm = scout_core::agent::llm_client(&cfg.minimax_api_key)?;
-    let ebay = cfg.ebay_credentials.clone().map(|(id, secret)| {
-        scout_core::tools::ebay::EbayClient::new(
-            http.clone(),
-            id,
-            secret,
-            cfg.ebay_marketplace.clone(),
-            scout_core::tools::ebay::EBAY_API_BASE.to_string(),
-        )
-    });
-    tracing::info!(ebay_api = ebay.is_some(), "eBay Browse API verification");
-    let marktplaats = scout_core::tools::marktplaats::MarktplaatsClient::new(
-        http.clone(),
-        scout_core::tools::marktplaats::MARKTPLAATS_BASE.to_string(),
-    );
-
-    let renderer = scout_core::tools::browser::find_chrome().map(scout_core::tools::browser::Renderer::new);
-    tracing::info!(headless_browser = renderer.is_some(), "fallback renderer");
-
-    let bol = cfg.bol_credentials.clone().map(|(id, secret)| {
-        scout_core::tools::bol::BolClient::new(
-            http.clone(),
-            id,
-            secret,
-            cfg.bol_country.clone(),
-            scout_core::tools::bol::BOL_API_BASE.to_string(),
-            scout_core::tools::bol::BOL_LOGIN_BASE.to_string(),
-        )
-    });
-    tracing::info!(bol_api = bol.is_some(), "bol.com Catalog API");
-
-    let perplexity = cfg.perplexity_api_key.clone().map(|key| {
-        scout_core::tools::perplexity::PerplexityClient::new(
-            http.clone(),
-            key,
-            scout_core::tools::perplexity::PERPLEXITY_API_BASE.to_string(),
-        )
-    });
-    tracing::info!(
-        perplexity = perplexity.is_some(),
-        "second search engine (Kagi always on)"
-    );
-
-    let duffel = cfg.duffel_api_key.clone().map(|key| {
-        scout_core::tools::duffel::DuffelClient::new(
-            http.clone(),
-            key,
-            scout_core::tools::duffel::DUFFEL_API_BASE.to_string(),
-        )
-        .with_markup(cfg.duffel_markup_rate)
-    });
-    tracing::info!(
-        duffel_api = duffel.is_some(),
-        markup_rate = cfg.duffel_markup_rate,
-        links = cfg.duffel_links_enabled,
-        ignav = cfg.ignav_api_key.is_some(),
-        "flight search"
-    );
-
-    let http_for_ignav = http.clone();
-    let mut deps = AgentDeps {
-        llm,
-        kagi,
-        renderer,
-        bol,
-        perplexity,
-        http,
-        ebay,
-        duffel,
-        marktplaats,
-        store: store.clone(),
-        secondhand_sites: cfg.secondhand_sites.clone(),
-        // Filled in below, once the bot has told us its username.
-        return_url: None,
-        links_enabled: cfg.duffel_links_enabled,
-        shown: std::sync::Arc::new(scout_core::tools::shown::ShownFlights::default()),
-        ignav: cfg.ignav_api_key.clone().map(|key| {
-            scout_core::tools::ignav::IgnavClient::new(
-                http_for_ignav,
-                key,
-                scout_core::tools::ignav::IGNAV_API_BASE.to_string(),
-            )
-        }),
-    };
-
-    let telegram = Bot::new(cfg.telegram_bot_token.clone());
+    let telegram = Bot::new(telegram_token()?);
 
     // Duffel Links needs somewhere to send the traveller afterwards, and
     // the bot's own chat is the only address Scout owns. Asked for at
@@ -124,22 +37,23 @@ async fn main() -> Result<()> {
             None
         }
     };
-    deps.return_url = return_url;
+
+    let core = Arc::new(scout_core::core::Core::start(cfg, return_url)?);
 
     // The gate reads this set on every update, so it is built once here
     // from the table that survives restarts.
-    let members: dashmap::DashSet<i64> = store.active_members()?.into_iter().collect();
+    let members: dashmap::DashSet<i64> = core.members()?.into_iter().collect();
+    let (founders, admins, daily_cap) = core.population();
     tracing::info!(
-        founders = cfg.allowed_user_ids.len(),
+        founders,
+        admins,
         members = members.len(),
-        daily_cap = cfg.invite_daily_requests,
-        schema = store.schema_version()?,
+        daily_cap,
+        schema = core.schema_version()?,
         "who may talk to this bot"
     );
 
-    tokio::spawn(scheduler::run(telegram.clone(), store));
-
-    let core = Arc::new(scout_core::core::Core { cfg, deps });
+    tokio::spawn(scheduler::run(telegram.clone(), core.store()));
 
     let app = Arc::new(bot::App {
         core,

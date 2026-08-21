@@ -8,7 +8,7 @@ description = "Everything that answers a question, with no idea who asked"
 [dependencies]
 scout-api = { path = "../scout-api" }
 rig = "0.40"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 duckdb = { version = "1", features = ["bundled"] }
 dashmap = "6"
 reqwest = { version = "0.12", features = ["json"] }

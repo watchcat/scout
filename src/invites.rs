@@ -1,4 +1,5 @@
 use crate::core::Core;
+use crate::store::Store;
 
 /// Capacity when `/invite new` is given a name and no number.
 pub(crate) const DEFAULT_CAPACITY: i64 = 100;
@@ -160,9 +161,138 @@ pub(crate) fn status_report(rounds: &[crate::store::RoundStatus], waiting: i64) 
     out
 }
 
+/// What an announcement would do, decided without sending anything.
+pub enum Announcement {
+    /// Nobody should be told, and why.
+    Refused(String),
+    /// Who to reach, as (account, address), and what to say.
+    Ready { targets: Vec<(i64, i64)>, text: String },
+}
+
+/// Whether a recipient was reached.
+///
+/// Three states rather than a bool because "did not arrive" and "will never
+/// arrive" call for opposite responses: retry the first, stop chasing the
+/// second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reached {
+    Yes,
+    No,
+    Gone,
+}
+
+/// Chooses who hears that a round is open, oldest first.
+///
+/// Decides and does not send, so the same decision serves any channel. A
+/// closed, unknown or full round is refused here rather than discovered
+/// halfway through a broadcast: announcing a round nobody can join spends
+/// the whole waitlist's one notification on a dead end, and stamps them as
+/// told about something real.
+pub fn plan_announcement(store: &Store, code: &str) -> anyhow::Result<Announcement> {
+    let rounds = store.rounds()?;
+    let refusal = match rounds.iter().find(|r| r.code == code) {
+        None => Some(format!("There's no round called \"{code}\".")),
+        Some(r) if !r.open => Some(format!(
+            "Round \"{code}\" is closed, so nobody could join through it. \
+             /invite open {code} first."
+        )),
+        Some(r) if r.used >= r.capacity => Some(format!(
+            "Round \"{code}\" is full ({}/{}), so nobody could join through it. \
+             Open a bigger round instead.",
+            r.used, r.capacity
+        )),
+        Some(_) => None,
+    };
+    if let Some(refusal) = refusal {
+        return Ok(Announcement::Refused(refusal));
+    }
+    let targets = store.waitlist_to_invite()?;
+    if targets.is_empty() {
+        return Ok(Announcement::Refused("Nobody is waiting to be told.".to_string()));
+    }
+    Ok(Announcement::Ready { targets, text: announce_message(code) })
+}
+
+/// Records what actually happened, one entry per recipient.
+///
+/// Stamped per success, so a re-run reaches only who was missed. A recipient
+/// who has blocked Scout is dropped from the waitlist entirely — chasing them
+/// forever would make every later announcement slower for everyone else.
+pub fn record_announcement(store: &Store, outcomes: &[(i64, Reached)]) -> anyhow::Result<()> {
+    for (account_id, reached) in outcomes {
+        match reached {
+            Reached::Yes => store.mark_invited(*account_id)?,
+            Reached::No => {}
+            Reached::Gone => store.forget_waitlist(*account_id)?,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_announcement_refuses_a_round_that_cannot_take_anyone() {
+        let (s, _d) = crate::store::tests::test_store();
+        s.create_round("autumn", 1).unwrap();
+        let a = s.account_for_telegram(11).unwrap();
+        s.claim_seat(a, 11, "autumn").unwrap();
+
+        // Full. Announcing it would invite people to a door that is shut.
+        match plan_announcement(&s, "autumn").unwrap() {
+            Announcement::Refused(reason) => assert!(reason.contains("full"), "{reason}"),
+            Announcement::Ready { .. } => panic!("a full round must not be announced"),
+        }
+        match plan_announcement(&s, "no-such-round").unwrap() {
+            Announcement::Refused(reason) => assert!(reason.contains("no round"), "{reason}"),
+            Announcement::Ready { .. } => panic!("an unknown round must not be announced"),
+        }
+    }
+
+    #[test]
+    fn an_announcement_reaches_the_longest_waiting_first_and_records_only_what_landed() {
+        let (s, _d) = crate::store::tests::test_store();
+        s.create_round("autumn", 1).unwrap();
+        let first = s.account_for_telegram(11).unwrap();
+        s.claim_seat(first, 11, "autumn").unwrap();
+        // Both turned away, in order, so both land on the waitlist.
+        let second = s.account_for_telegram(22).unwrap();
+        s.claim_seat(second, 22, "autumn").unwrap();
+        let third = s.account_for_telegram(33).unwrap();
+        s.claim_seat(third, 33, "autumn").unwrap();
+
+        s.create_round("winter", 5).unwrap();
+        let Announcement::Ready { targets, text } = plan_announcement(&s, "winter").unwrap() else {
+            panic!("an open round with room should be announceable");
+        };
+        assert_eq!(
+            targets.iter().map(|t| t.0).collect::<Vec<_>>(),
+            vec![second, third],
+            "oldest first, so a round smaller than the queue reaches those who waited longest"
+        );
+        assert!(text.contains("/start winter"), "the command, because a link cannot reach them");
+        assert!(!text.contains("t.me/"), "a link only works on an empty chat");
+
+        // Only the one that landed is stamped; the other must be retried.
+        record_announcement(&s, &[(second, Reached::Yes), (third, Reached::No)]).unwrap();
+        let Announcement::Ready { targets, .. } = plan_announcement(&s, "winter").unwrap() else {
+            panic!("still announceable");
+        };
+        assert_eq!(
+            targets.iter().map(|t| t.0).collect::<Vec<_>>(),
+            vec![third],
+            "a delivery that failed is tried again"
+        );
+
+        // Someone gone for good is dropped rather than chased forever.
+        record_announcement(&s, &[(third, Reached::Gone)]).unwrap();
+        match plan_announcement(&s, "winter").unwrap() {
+            Announcement::Refused(r) => assert!(r.contains("Nobody is waiting"), "{r}"),
+            Announcement::Ready { targets, .. } => panic!("still targeting {targets:?}"),
+        }
+    }
 
     #[test]
     fn round_names_are_held_to_what_an_invite_link_can_carry() {

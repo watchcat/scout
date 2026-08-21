@@ -869,78 +869,56 @@ where
 
 
 
+/// Delivers an announcement core has planned, then tells core what landed.
+///
+/// Three steps on purpose: core decides who and what, the adapter sends, core
+/// records. That is the shape a network forces, and it is the reason a failed
+/// send is retried while a blocked recipient is dropped.
 async fn announce_round(
     bot: &Bot,
     msg: &Message,
     app: &Arc<App>,
     code: &str,
 ) -> ResponseResult<()> {
-    let store = app.core.deps.store.clone();
-    let rounds = match blocking(move || store.rounds()).await {
-        Ok(rounds) => rounds,
+    let store = app.core.store();
+    let code_owned = code.to_string();
+    let planned = match blocking(move || crate::invites::plan_announcement(&store, &code_owned)).await {
+        Ok(planned) => planned,
         Err(e) => {
-            tracing::error!(error = %e, "could not read the rounds to announce");
+            tracing::error!(error = %e, "could not plan the announcement");
             bot.send_message(msg.chat.id, "Sorry, I couldn't read the rounds.").await?;
             return Ok(());
         }
     };
-    // Announcing a round that cannot admit anybody spends the whole
-    // waitlist's one notification on a dead end, and `invited_at` would be
-    // stamped as though they had been told about something real.
-    let refusal = match rounds.iter().find(|r| r.code == code) {
-        None => Some(format!("There's no round called \"{code}\".")),
-        Some(r) if !r.open => Some(format!(
-            "Round \"{code}\" is closed, so nobody could join through it. \
-             /invite open {code} first."
-        )),
-        Some(r) if r.used >= r.capacity => Some(format!(
-            "Round \"{code}\" is full ({}/{}), so nobody could join through it. \
-             Open a bigger round instead.",
-            r.used, r.capacity
-        )),
-        Some(_) => None,
-    };
-    if let Some(refusal) = refusal {
-        bot.send_message(msg.chat.id, refusal).await?;
-        return Ok(());
-    }
-
-    let store = app.core.deps.store.clone();
-    let targets = match blocking(move || store.waitlist_to_invite()).await {
-        Ok(targets) => targets,
-        Err(e) => {
-            tracing::error!(error = %e, "could not read the waitlist");
-            bot.send_message(msg.chat.id, "Sorry, I couldn't read the waitlist.").await?;
+    let (targets, text) = match planned {
+        crate::invites::Announcement::Refused(reason) => {
+            bot.send_message(msg.chat.id, reason).await?;
             return Ok(());
         }
+        crate::invites::Announcement::Ready { targets, text } => (targets, text),
     };
-    if targets.is_empty() {
-        bot.send_message(msg.chat.id, "Nobody is waiting to be told.").await?;
-        return Ok(());
-    }
 
-    let text = crate::invites::announce_message(code);
     let results = broadcast(bot, &targets, &text, Some(ParseMode::Html)).await;
 
-    let (mut sent, mut dropped, mut retryable) = (0usize, 0usize, 0usize);
-    for (recipient, outcome) in results {
-        let store = app.core.deps.store.clone();
-        match outcome {
-            Delivered::Ok => {
-                sent += 1;
-                // Per success, so a re-run reaches only who was missed.
-                if let Err(e) = blocking(move || store.mark_invited(recipient)).await {
-                    tracing::warn!(error = %e, recipient, "could not stamp an invite as sent");
-                }
-            }
-            Delivered::Gone => {
-                dropped += 1;
-                if let Err(e) = blocking(move || store.forget_waitlist(recipient)).await {
-                    tracing::warn!(error = %e, recipient, "could not drop a waitlist row");
-                }
-            }
-            Delivered::Failed => retryable += 1,
-        }
+    let outcomes: Vec<(i64, crate::invites::Reached)> = results
+        .iter()
+        .map(|(recipient, outcome)| {
+            let reached = match outcome {
+                Delivered::Ok => crate::invites::Reached::Yes,
+                Delivered::Gone => crate::invites::Reached::Gone,
+                Delivered::Failed => crate::invites::Reached::No,
+            };
+            (*recipient, reached)
+        })
+        .collect();
+
+    let sent = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::Yes).count();
+    let dropped = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::Gone).count();
+    let retryable = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::No).count();
+
+    let store = app.core.store();
+    if let Err(e) = blocking(move || crate::invites::record_announcement(&store, &outcomes)).await {
+        tracing::warn!(error = %e, "could not record what the announcement reached");
     }
 
     let mut report = format!("Told {sent} of {} people about \"{code}\".", targets.len());

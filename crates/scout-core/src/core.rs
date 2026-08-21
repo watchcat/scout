@@ -6,9 +6,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 // The payload of `GET /v1/deliveries` once there is one, so it lives with
-// the rest of what both sides speak. Re-exported rather than merely used,
-// so a channel can keep naming it where it has always been.
-pub use scout_api::DueDelivery;
+// the rest of what both sides speak rather than here.
+use scout_api::DueDelivery;
 
 /// Everything answering a question needs, and nothing about how the question
 /// arrived.

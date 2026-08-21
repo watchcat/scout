@@ -1040,28 +1040,25 @@ discipline as breaking a guard to watch a test go red.
 ```bash
 cargo test --workspace       # 441 passed, 3 ignored
 
-RUSTC=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc \
-CARGO_TARGET_DIR=target/clippy \
-~/.cargo/bin/cargo +stable clippy --workspace --all-targets
+# clippy has to be the one that matches the compiler cargo is using
+PATH="$(dirname "$(ls -d /nix/store/*clippy-1.96.1/bin/cargo-clippy)")":$PATH \
+cargo clippy --workspace --all-targets
 ```
 
-Clippy needs all three of those, and the reason is worth knowing before it
-looks like a regression. `cargo` on this machine is nix's (1.96.1) while
-`cargo-clippy` is rustup's (0.1.97, a 1.97 rustc). Mixing them gives
+`cargo` on this machine is nix's 1.96.1, and `~/.cargo/bin/cargo-clippy` is
+rustup's 1.97 — first on `PATH` and quietly wrong. Mixing them gives
 `error[E0514]: found crate 'serde' compiled by an incompatible version of
-rustc`.
+rustc`, which reads like a broken branch and is not.
 
-A separate target directory alone is not enough: cargo still picks `rustc`
-off `PATH`, where nix's wrapper comes first, so the fresh directory fills up
-with 1.96 artifacts and fails the same way. `RUSTC` has to be pinned to the
-toolchain clippy belongs to. Expect one slow first run — it compiles DuckDB
-from scratch in the new directory — and roughly two minutes after that.
+Pinning `RUSTC` at rustup's toolchain and giving clippy its own target
+directory also works, but it is the wrong fix: it rebuilds every dependency
+under a second compiler, takes minutes, and leaves two target directories to
+keep straight. The nix devshell already ships a matching clippy. Putting it
+ahead of rustup's on `PATH` runs against the artifacts `cargo build` already
+produced and finishes in seconds.
 
-Nothing here is caused by this branch. It surfaced only because the new
-crates forced dependencies to be re-checked; before that, clippy was reading
-artifacts that happened to already exist. Expect one warning that is not
-ours: `proc-macro-error2 v2.0.1` is future-incompatible, via a transitive
-dependency.
+Expect one warning that is not ours: `proc-macro-error2 v2.0.1` is
+future-incompatible, via a transitive dependency.
 
 - [ ] **Step 5: Back up the database from inside the container**
 

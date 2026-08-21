@@ -1333,6 +1333,20 @@ async fn handle_kick(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gate_answers_from_memory_alone() {
+        // Not a style point. The gate runs on every update, including from
+        // people who were never invited, so a store read here means anyone
+        // who finds the bot can make it do disk work by typing at it. That
+        // is why the member set is cached in the first place.
+        let src = include_str!("bot.rs");
+        let start = src.find("fn is_member_id").expect("the gate must exist");
+        let end = src[start..].find("\n}").expect("the gate must end") + start;
+        let body = &src[start..end];
+        assert!(!body.contains("store"), "the gate must not touch the store");
+        assert!(!body.contains(".await"), "the gate must not await anything");
+    }
+
 
 
 

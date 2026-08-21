@@ -5,7 +5,7 @@
 /// what `Live::show` already takes and `Live` diffs it against what is on
 /// screen. A socket would rather have deltas; that is a phase-2b question,
 /// and changing it here would alter behaviour while claiming not to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentEvent {
     /// A tool started, already rendered as a human sentence.
     Tool(String),
@@ -64,5 +64,22 @@ mod tests {
                 AgentEvent::Answer("The cheapest".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn an_event_survives_the_json_round_trip_both_sides_will_use() {
+        // In 2b-2b this crosses a socket. The point of one shared crate is
+        // that the two ends cannot disagree about what an event is.
+        let each_kind = vec![
+            AgentEvent::Tool("🔎 searching: wasmiddel".to_string()),
+            AgentEvent::Answer("The cheapest is".to_string()),
+            AgentEvent::Thinking("comparing fares".to_string()),
+            AgentEvent::Notice("wrapped up early".to_string()),
+        ];
+        for event in each_kind {
+            let wire = serde_json::to_string(&event).unwrap();
+            let back: AgentEvent = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, event, "round trip changed the event: {wire}");
+        }
     }
 }

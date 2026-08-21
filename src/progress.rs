@@ -429,9 +429,9 @@ impl Renderer for Live {
 /// drops its sink — so the loop needs no shutdown signal of its own.
 pub async fn render_events<R: Renderer>(
     mut renderer: R,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<crate::events::AgentEvent>,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<scout_api::AgentEvent>,
 ) -> R {
-    use crate::events::AgentEvent;
+    use scout_api::AgentEvent;
     while let Some(event) = events.recv().await {
         match event {
             AgentEvent::Tool(text) | AgentEvent::Answer(text) | AgentEvent::Notice(text) => {
@@ -448,7 +448,7 @@ pub async fn render_events<R: Renderer>(
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use crate::events::AgentEvent;
+    use scout_api::AgentEvent;
 
     /// A renderer that writes to a list instead of to Telegram. This is the
     /// thing phase two was for: progress rendering can now be tested with no
@@ -472,10 +472,10 @@ mod render_tests {
     #[tokio::test]
     async fn every_event_reaches_the_renderer_in_order_and_in_the_right_mode() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::events::emit(&tx, AgentEvent::Tool("searching Kagi".into()));
-        crate::events::emit(&tx, AgentEvent::Thinking("comparing fares".into()));
-        crate::events::emit(&tx, AgentEvent::Answer("The cheapest".into()));
-        crate::events::emit(&tx, AgentEvent::Notice("wrapping up".into()));
+        scout_api::emit(&tx, AgentEvent::Tool("searching Kagi".into()));
+        scout_api::emit(&tx, AgentEvent::Thinking("comparing fares".into()));
+        scout_api::emit(&tx, AgentEvent::Answer("The cheapest".into()));
+        scout_api::emit(&tx, AgentEvent::Notice("wrapping up".into()));
         drop(tx);
 
         let rec = render_events(Recorder::default(), rx).await;
@@ -496,7 +496,7 @@ mod render_tests {
         // The caller needs it afterwards to send the final answer, so the
         // loop must return it rather than consume it.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::events::emit(&tx, AgentEvent::Answer("done".into()));
+        scout_api::emit(&tx, AgentEvent::Answer("done".into()));
         drop(tx);
         let rec = render_events(Recorder::default(), rx).await;
         assert_eq!(rec.frames.len(), 1);

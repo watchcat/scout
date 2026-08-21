@@ -1,0 +1,13 @@
+[package]
+name = "scout-api"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The events Scout's core emits and its channels render"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+serde_json = "1"

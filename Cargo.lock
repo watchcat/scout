@@ -6658,6 +6658,7 @@ dependencies = [
  "futures",
  "reqwest 0.12.28",
  "rig",
+ "scout-api",
  "serde",
  "serde_json",
  "teloxide",
@@ -6667,6 +6668,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+]
+
+[[package]]
+name = "scout-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

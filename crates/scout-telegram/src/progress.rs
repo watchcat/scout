@@ -176,7 +176,7 @@ impl Live {
         }
         // Long answers are chunked by the caller; a frame that overflows is
         // clipped rather than dropped.
-        let text: String = text.chars().take(scout_core::text::TELEGRAM_LIMIT).collect();
+        let text: String = text.chars().take(crate::text::TELEGRAM_LIMIT).collect();
         let body = html.clone().unwrap_or_else(|| text.clone());
         let parse_mode = html.is_some().then_some(ParseMode::Html);
         let sent = match self.message {

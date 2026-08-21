@@ -5,6 +5,11 @@ use crate::tools::kagi::{KagiClient, KAGI_API_BASE};
 use std::collections::HashSet;
 use std::time::Duration;
 
+// The payload of `GET /v1/deliveries` once there is one, so it lives with
+// the rest of what both sides speak. Re-exported rather than merely used,
+// so a channel can keep naming it where it has always been.
+pub use scout_api::DueDelivery;
+
 /// Everything answering a question needs, and nothing about how the question
 /// arrived.
 ///
@@ -13,21 +18,6 @@ use std::time::Duration;
 pub struct Core {
     pub(crate) cfg: Config,
     pub(crate) deps: AgentDeps,
-}
-
-/// One thing to deliver, to one address, on one channel.
-///
-/// `text` is written here so that a browser and a chat say the same
-/// sentence. `channel` is what the caller asked for and is echoed back
-/// rather than needed — the Telegram adapter never reads it — because on a
-/// wire a row that names its own channel can be logged, batched or
-/// forwarded without carrying the query along beside it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DueDelivery {
-    pub id: i64,
-    pub channel: String,
-    pub address: String,
-    pub text: String,
 }
 
 /// What a reorder reminder says, wherever it is delivered.

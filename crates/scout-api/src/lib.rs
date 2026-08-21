@@ -31,6 +31,21 @@ pub fn emit(sink: &EventSink, event: AgentEvent) {
     let _ = sink.send(event);
 }
 
+/// One thing to deliver, to one address, on one channel.
+///
+/// `text` is written here so that a browser and a chat say the same
+/// sentence. `channel` is what the caller asked for and is echoed back
+/// rather than needed — the Telegram adapter never reads it — because on a
+/// wire a row that names its own channel can be logged, batched or
+/// forwarded without carrying the query along beside it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DueDelivery {
+    pub id: i64,
+    pub channel: String,
+    pub address: String,
+    pub text: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

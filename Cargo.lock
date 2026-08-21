@@ -6646,26 +6646,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "scout"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dashmap",
- "dotenvy",
- "scout-api",
- "scout-core",
- "serde",
- "serde_json",
- "teloxide",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wiremock",
-]
-
-[[package]]
 name = "scout-api"
 version = "0.1.0"
 dependencies = [
@@ -6694,6 +6674,22 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "scout-telegram"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dashmap",
+ "dotenvy",
+ "scout-api",
+ "scout-core",
+ "serde_json",
+ "teloxide",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

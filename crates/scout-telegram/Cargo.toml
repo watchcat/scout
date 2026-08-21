@@ -1,0 +1,24 @@
+[package]
+name = "scout-telegram"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Scout's Telegram channel"
+repository = "https://github.com/watchcat/scout"
+
+[dependencies]
+teloxide = { version = "0.17", features = ["macros"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+dashmap = "6"
+dotenvy = "0.15"
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+scout-api = { path = "../scout-api" }
+scout-core = { path = "../scout-core" }
+
+[dev-dependencies]
+# Paused time, so a test for the render queue's 45-second deadline finishes
+# instantly instead of waiting it out.
+tokio = { version = "1", features = ["test-util"] }

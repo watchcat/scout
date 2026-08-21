@@ -1,6 +1,8 @@
 mod bot;
+mod draft;
 mod progress;
 mod scheduler;
+mod text;
 
 use anyhow::Result;
 use dashmap::DashMap;

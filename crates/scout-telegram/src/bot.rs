@@ -1,7 +1,7 @@
+use crate::draft::{resolve_draft, DraftResolution};
 use crate::progress::Live;
+use crate::text::{split_message, TELEGRAM_LIMIT};
 use dashmap::DashMap;
-use scout_core::draft::{resolve_draft, DraftResolution};
-use scout_core::text::{split_message, TELEGRAM_LIMIT};
 use std::sync::Arc;
 use teloxide::net::Download;
 use teloxide::prelude::*;

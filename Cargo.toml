@@ -1,32 +1,3 @@
-[package]
-name = "scout"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-description = "A Telegram shopping researcher that verifies prices and links instead of inventing them"
-repository = "https://github.com/watchcat/scout"
-
 [workspace]
 resolver = "2"
-members = ["crates/scout-api", "crates/scout-core"]
-
-[dependencies]
-teloxide = { version = "0.17", features = ["macros"] }
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
-dashmap = "6"
-dotenvy = "0.15"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-chrono = "0.4"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-scout-api = { path = "crates/scout-api" }
-scout-core = { path = "crates/scout-core" }
-
-[dev-dependencies]
-wiremock = "0.6"
-tempfile = "3"
-# Paused time, so a test for the render queue's 45-second deadline finishes
-# instantly instead of waiting it out.
-tokio = { version = "1", features = ["test-util"] }
+members = ["crates/scout-api", "crates/scout-core", "crates/scout-telegram"]

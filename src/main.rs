@@ -4,6 +4,7 @@ mod config;
 mod core;
 mod draft;
 mod events;
+mod invites;
 mod links;
 mod progress;
 mod scheduler;

@@ -671,7 +671,33 @@ on the next tick — the behaviour `src/scheduler.rs` has today.
 Run: `cargo test -p scout-core a_due_reminder_arrives_addressed`
 Expected: PASS
 
-- [ ] **Step 5: Reduce the adapter's scheduler to a loop and a send**
+- [ ] **Step 5: Replace `population()`'s tuple with something that cannot be transposed**
+
+Task 4 added `population() -> (usize, usize, i64)`. Two of the three are
+`usize`, and founders versus admins is an authorization distinction — the
+sets genuinely differ, since `admin_user_ids` defaults to the first founder
+and `SCOUT_ADMIN_USER_IDS` can name a subset. Swap them in the constructor
+and everything still compiles, with a wrong log line as the only symptom.
+It is also the wrong name for what it holds: `invite_daily_requests` is a
+policy knob, not a census figure, and `session.rs:106` already reads it
+separately.
+
+While this file is open anyway:
+
+```rust
+/// Who may talk to this bot, for the start-up log.
+pub struct Population {
+    pub founders: usize,
+    pub admins: usize,
+    pub daily_cap: i64,
+}
+```
+
+Named fields flow straight into `tracing::info!` and a fourth one can be
+added without re-reading every call site. The adapter keeps the log line,
+because it is the half that knows how many members are in the gate's set.
+
+- [ ] **Step 6: Reduce the adapter's scheduler to a loop and a send**
 
 `src/scheduler.rs` keeps `TICK`, `run` and `tick`. `tick` becomes:
 
@@ -698,7 +724,7 @@ file. Update `src/main.rs:154` to
 `tokio::spawn(scheduler::run(telegram.clone(), core.clone()))`, which also
 removes `main.rs`'s last mention of `store`.
 
-- [ ] **Step 6: Give the adapter a name for a claim that is not the store's**
+- [ ] **Step 7: Give the adapter a name for a claim that is not the store's**
 
 `src/bot.rs:354-379` matches on `scout_core::store::Claim` — the outcome of
 someone pressing START with an invite code. `invites::claim` returns it, so
@@ -718,7 +744,7 @@ Then `src/bot.rs` names `scout_core::invites::Claim`. Four lines change.
 
 This is not tidying — Step 7 does not compile without it.
 
-- [ ] **Step 7: Shut the door**
+- [ ] **Step 8: Shut the door**
 
 Nothing outside `scout-core` names `Store`, `AgentDeps` or any `tools::`
 client any more. In `crates/scout-core/src/lib.rs`:
@@ -744,7 +770,7 @@ If `mod tools;` does not compile, do not force it — report which caller
 still needs it and leave `pub mod tools;`. Being wrong about that costs
 nothing; guessing at a fix costs the phase its meaning.
 
-- [ ] **Step 8: Verify the adapter is clean**
+- [ ] **Step 9: Verify the adapter is clean**
 
 ```bash
 grep -rn "scout_core::store\|scout_core::agent\|scout_core::tools" src/
@@ -753,7 +779,7 @@ grep -rn "AgentDeps\|duckdb\|chrono" src/
 
 Expected: no output from either.
 
-- [ ] **Step 8: Run the tests and commit**
+- [ ] **Step 10: Run the tests and commit**
 
 Run: `cargo test`
 Expected: 441 passed, 3 ignored.
@@ -950,6 +976,18 @@ version of this check looked for the type name and would have reported clean
 while `bot.rs` was matching on `store::Claim` — a real reach into a module
 about to become private, invisible to the grep meant to catch exactly that.
 
+Then measure the number that is actually load-bearing for the next phase:
+
+```bash
+echo "core-side store calls: $(grep -rn 'deps.store' crates/scout-core/src/*.rs | wc -l)"
+```
+
+Zero on the adapter side is this phase's result and will stay zero. The
+core-side count is 2b-2b's workload: every one of those sites assumes a
+local, synchronous, free database call, and every one of them is behind an
+HTTP handler afterwards. Report it so the next plan starts from a measured
+number rather than an impression.
+
 - [ ] **Step 2: Prove the boundary is enforced, not just observed**
 
 Temporarily add to `crates/scout-telegram/src/main.rs`:
@@ -968,18 +1006,29 @@ discipline as breaking a guard to watch a test go red.
 
 ```bash
 cargo test --workspace       # 441 passed, 3 ignored
-CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets
+
+RUSTC=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc \
+CARGO_TARGET_DIR=target/clippy \
+~/.cargo/bin/cargo +stable clippy --workspace --all-targets
 ```
 
-Clippy needs its own target directory on this machine, and the reason is
-worth knowing before it looks like a regression. `cargo` here is nix's
-(1.96.1) while `cargo-clippy` is rustup's (0.1.97, a 1.97 rustc). They
-disagree about the artifacts in `target/`, so clippy fails with
+Clippy needs all three of those, and the reason is worth knowing before it
+looks like a regression. `cargo` on this machine is nix's (1.96.1) while
+`cargo-clippy` is rustup's (0.1.97, a 1.97 rustc). Mixing them gives
 `error[E0514]: found crate 'serde' compiled by an incompatible version of
-rustc`. Nothing to do with this branch — it surfaced only because the new
-crates forced dependencies to be re-checked. A separate target directory
-keeps the two toolchains out of each other's way at the cost of one slow
-first run.
+rustc`.
+
+A separate target directory alone is not enough: cargo still picks `rustc`
+off `PATH`, where nix's wrapper comes first, so the fresh directory fills up
+with 1.96 artifacts and fails the same way. `RUSTC` has to be pinned to the
+toolchain clippy belongs to. Expect one slow first run — it compiles DuckDB
+from scratch in the new directory — and roughly two minutes after that.
+
+Nothing here is caused by this branch. It surfaced only because the new
+crates forced dependencies to be re-checked; before that, clippy was reading
+artifacts that happened to already exist. Expect one warning that is not
+ours: `proc-macro-error2 v2.0.1` is future-incompatible, via a transitive
+dependency.
 
 - [ ] **Step 4: Back up the database from inside the container**
 
@@ -1062,3 +1111,36 @@ rediscoveries:
   shapes** — `Vec<(i64, i64)>` versus `DueDelivery { id, channel, address,
   text }`. The second is right. Unify when 2b-2b designs both endpoints,
   where the cost of two disagreeing shapes actually lands.
+
+The review after Task 4 added four more, and the first is the one that will
+bite hardest because it presents as a permissions bug rather than an
+architecture one:
+
+- **The gate's member set goes stale the day the processes split.** The
+  adapter builds a `DashSet` at start-up and the gate reads it on every
+  update. That is correct today only because the same process that admits
+  someone also inserts into the set. Once core is separate, an admit in core
+  never reaches the adapter, and the newly-admitted person keeps being
+  refused until the adapter restarts. The most recent commit on `main` is
+  *"feat: the bot can let people in without a redeploy"* — this is exactly
+  the property that commit bought, and 2b-2b would silently give it back.
+  The spec already prescribes the fix (`GET /v1/members`, ETag, 60-second
+  re-poll); what was missing is that it is load-bearing rather than an
+  optimisation.
+
+- **`return_url` is per-channel, not per-process.** It is a `Core::start`
+  argument today, which holds exactly one. `build_agent` is already built
+  per incoming message and reads the field there, so the per-request path
+  exists — it wants moving onto the call, not into the constructor.
+
+- **`members()` returns `Vec<i64>` of Telegram ids** from a crate that is
+  supposed to be channel-agnostic, while `due_deliveries(channel)` two
+  methods away speaks `(channel, address)`. They should match. Deferred
+  rather than half-changed here: doing one and not the other leaves the
+  surface less consistent than it is now, and the adapter would have to
+  parse addresses back into ids for the gate, which fails silently.
+
+- **`anyhow::Result` on every public `Core` method** is right for a binary
+  and wrong for something that becomes HTTP: it erases "the database is
+  down" (503) from "no such account" (404). Worth naming now because every
+  method Task 5 adds inherits the choice.

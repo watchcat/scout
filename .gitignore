@@ -4,3 +4,4 @@
 *.duckdb.wal
 .DS_Store
 /.idea
+/.mcp.json

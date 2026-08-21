@@ -74,7 +74,7 @@ pub async fn run_agent(
                     let args = &tool_call.function.arguments;
                     scout_api::emit(
                         &events,
-                        scout_api::AgentEvent::Tool(crate::progress::describe(
+                        scout_api::AgentEvent::Tool(crate::describe::describe(
                             &tool_call.function.name,
                             args,
                         )),

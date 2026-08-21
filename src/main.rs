@@ -2,6 +2,7 @@ mod agent;
 mod bot;
 mod config;
 mod core;
+mod describe;
 mod draft;
 mod invites;
 mod links;

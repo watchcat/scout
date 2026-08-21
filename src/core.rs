@@ -36,6 +36,19 @@ impl Core {
     pub fn store(&self) -> crate::store::Store {
         self.deps.store.clone()
     }
+
+    /// Turns a photo into a search description.
+    ///
+    /// Wrapped so the adapter never reaches for the model itself: which
+    /// model, and how it is asked, is core's business. The adapter's job
+    /// stops at getting the bytes.
+    pub async fn describe_photo(
+        &self,
+        bytes: &[u8],
+        caption: Option<&str>,
+    ) -> anyhow::Result<String> {
+        crate::vision::describe_photo(&self.deps.llm, bytes, caption).await
+    }
 }
 
 /// Runs a blocking store call off the async runtime.

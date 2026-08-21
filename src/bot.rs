@@ -1,7 +1,6 @@
 use crate::draft::{resolve_draft, DraftResolution};
 use crate::progress::Live;
 use crate::text::{split_message, TELEGRAM_LIMIT};
-use crate::vision::describe_photo;
 use dashmap::DashMap;
 use std::sync::Arc;
 use teloxide::net::Download;
@@ -259,7 +258,7 @@ fn is_member(app: &App, msg: &Message) -> bool {
 /// The gate: founders from `ALLOWED_TELEGRAM_USER_IDS`, plus everyone
 /// admitted through an invite round and not since revoked.
 fn is_member_id(app: &App, user_id: i64) -> bool {
-    app.core.cfg.allowed_user_ids.contains(&user_id) || app.members.contains(&user_id)
+    app.core.is_founder(user_id) || app.members.contains(&user_id)
 }
 
 /// True for `/start`, with or without an `@bot` suffix and with or without
@@ -307,7 +306,7 @@ fn display_name(user: &teloxide::types::User) -> String {
 
 /// `/help`'s text for one person: admins get their own commands appended.
 fn help_for(app: &App, user_id: i64) -> String {
-    match app.core.cfg.admin_user_ids.contains(&user_id) {
+    match app.core.is_admin(user_id) {
         true => format!("{HELP}{ADMIN_HELP}"),
         false => HELP.to_string(),
     }
@@ -342,7 +341,7 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     };
 
     let claim = {
-        let store = app.core.deps.store.clone();
+        let store = app.core.store();
         let code = code.clone();
         tokio::task::spawn_blocking(move || {
             let account_id = store.account_for_telegram(user_id)?;
@@ -426,7 +425,7 @@ async fn handle_command(
             // would leave the thread intact and /reset would do nothing.
             // A fresh conversation is what "cleared" has to mean.
             let scope = crate::session::conversation_scope(msg.chat.id.0, user_id);
-            let store = app.core.deps.store.clone();
+            let store = app.core.store();
             let started = blocking(move || {
                 let account_id = store.account_for_telegram(user_id)?;
                 store.start_conversation(account_id, &scope)
@@ -562,7 +561,7 @@ fn chat_display_name(chat: &teloxide::types::ChatFullInfo) -> Option<String> {
 
 /// Fire-and-forget usage logging; never delays request handling.
 fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
-    let store = app.core.deps.store.clone();
+    let store = app.core.store();
     tokio::spawn(async move {
         let logged = tokio::task::spawn_blocking(move || {
             let account_id = store.account_for_telegram(user_id)?;
@@ -616,7 +615,7 @@ impl Drop for Typing {
 /// an id. Separate from `log_request` on purpose: running a command should
 /// teach the bot your name without inflating your request count.
 fn note_user(app: &Arc<App>, user_id: i64, name: String) {
-    let store = app.core.deps.store.clone();
+    let store = app.core.store();
     tokio::spawn(async move {
         let noted = tokio::task::spawn_blocking(move || {
             let account_id = store.account_for_telegram(user_id)?;
@@ -641,7 +640,7 @@ fn note_sender(app: &Arc<App>, msg: &Message) {
 /// Records where this person is talking, so `/advert` can reach them. A
 /// user id is only the same as a chat id in a private chat.
 fn note_chat(app: &Arc<App>, user_id: i64, chat_id: i64) {
-    let store = app.core.deps.store.clone();
+    let store = app.core.store();
     tokio::spawn(async move {
         let recorded = tokio::task::spawn_blocking(move || {
             let account_id = store.account_for_telegram(user_id)?;
@@ -1046,7 +1045,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         }
     };
 
-    match describe_photo(&app.core.deps.llm, &bytes, msg.caption()).await {
+    match app.core.describe_photo(&bytes, msg.caption()).await {
         Ok(draft) => {
             app.chats.entry(key).or_default().pending_draft = Some(draft.clone());
             bot.send_message(

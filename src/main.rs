@@ -11,10 +11,15 @@ use tracing_subscriber::EnvFilter;
 
 /// The adapter's own credential, read straight from the environment.
 ///
-/// 2b-2b divides `Config` in two and this is the first piece to move.
+/// 2b-2b divides `Config` in two and this is the first piece to move. Blank
+/// counts as unset, exactly as `Config`'s own `required()` has it, so that
+/// deletion can be a pure deletion: otherwise a whitespace token would stop
+/// failing at start-up and start failing at the first API call instead.
 fn telegram_token() -> Result<String> {
     std::env::var("TELEGRAM_BOT_TOKEN")
-        .map_err(|_| anyhow::anyhow!("TELEGRAM_BOT_TOKEN is not set"))
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN is not set"))
 }
 
 #[tokio::main]

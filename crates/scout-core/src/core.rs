@@ -30,10 +30,14 @@ pub fn is_admin_id(admins: &HashSet<i64>, telegram_id: i64) -> bool {
 impl Core {
     /// Opens the database and builds every client the agent can use.
     ///
-    /// `return_url` is where Duffel Links sends a traveller back to, and it
-    /// is the one thing core cannot work out for itself: today it comes from
-    /// the bot's own `getMe`. When core moves into its own process it will
-    /// have to be configured or asserted at start-up — see the spec.
+    /// `return_url` is where Duffel Links sends a traveller back to — today
+    /// the bot's own address, from `getMe`. Taking it here is a deliberate
+    /// simplification while there is one channel: it is really a property of
+    /// the channel, not of the process, and a core serving two channels has
+    /// two return addresses where a constructor argument holds one. The path
+    /// out is already there — `build_agent` is built per incoming message
+    /// and reads the field at that point — so this moves to the request when
+    /// a second channel arrives.
     pub fn start(cfg: Config, return_url: Option<String>) -> anyhow::Result<Self> {
         let store = Store::open(&cfg.db_path)?;
 
@@ -158,6 +162,8 @@ impl Core {
         is_admin_id(&self.cfg.admin_user_ids, telegram_id)
     }
 
+    /// Public only until the scheduler moves inside core in Task 5; it is
+    /// the one remaining way a channel can get a handle on the database.
     pub fn store(&self) -> crate::store::Store {
         self.deps.store.clone()
     }
@@ -265,13 +271,9 @@ mod tests {
     }
 
     #[test]
-    fn a_core_opens_its_own_database_and_never_hands_it_out() {
-        // The whole point of the crate split: a channel can start a core
-        // but cannot reach past it. If `Store` ever becomes nameable from
-        // outside, this test still passes — but `cargo build -p
-        // scout-telegram` is what actually enforces it, and Task 8 measures
-        // it. This test pins the constructor's contract: it opens the file
-        // itself, from config, with no handle passed in.
+    fn a_core_opens_its_own_database_from_config_alone() {
+        // This pins the constructor's contract: it opens the file itself,
+        // from config, with no handle passed in.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("start.duckdb");
         let cfg = Config::for_test(path.to_str().unwrap());
@@ -280,5 +282,17 @@ mod tests {
 
         assert_eq!(core.members().unwrap(), Vec::<i64>::new());
         assert!(core.schema_version().unwrap() >= 5);
+
+        // The rest of what `start` does is wire clients from config, and the
+        // way that breaks is a field read from the wrong key. With none of
+        // the optional keys set, every optional integration must come out as
+        // nothing rather than as a client holding an empty credential — a
+        // state production runs in too. Reaching into `deps` is a privilege
+        // only a test inside this crate has.
+        assert!(core.deps.duffel.is_none());
+        assert!(core.deps.perplexity.is_none());
+        assert!(!core.deps.links_enabled);
+        // Not from config at all: whatever the caller passed, unchanged.
+        assert!(core.deps.return_url.is_none());
     }
 }

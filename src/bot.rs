@@ -1,15 +1,7 @@
-use crate::agent::{build_agent, wrap_up_agent, AgentDeps, HISTORY_CAP, WRAP_UP_NOTE};
-use crate::config::Config;
 use crate::draft::{resolve_draft, DraftResolution};
 use crate::progress::Live;
-use crate::store::Store;
-use crate::text::{split_message, strip_thinking, TELEGRAM_LIMIT};
-use crate::vision::describe_photo;
+use crate::text::{split_message, TELEGRAM_LIMIT};
 use dashmap::DashMap;
-use futures::StreamExt;
-use rig::agent::MultiTurnStreamItem;
-use rig::completion::{Chat, Message as LlmMessage};
-use rig::streaming::{StreamedAssistantContent, StreamingChat};
 use std::sync::Arc;
 use teloxide::net::Download;
 use teloxide::prelude::*;
@@ -20,8 +12,9 @@ use teloxide::types::{
 use teloxide::utils::command::BotCommands;
 
 pub struct App {
-    pub cfg: Config,
-    pub deps: AgentDeps,
+    /// Everything that is Scout rather than Telegram. Shared, never owned:
+    /// in 2b-2 it lives in another process entirely.
+    pub core: Arc<crate::core::Core>,
     /// One entry per (chat_id, sender_id). In a 1:1 chat a single user always
     /// hits the same slot; in a group/supergroup, each allowed user has
     /// their own history, draft and last_seen, isolating conversation
@@ -52,11 +45,6 @@ pub struct App {
 /// (which carry only a message id) can be resolved back to their text.
 const SENT_REPLY_CAP: usize = 30;
 
-/// A chat quiet for longer than this starts a fresh session on the next
-/// message; for text messages an LLM check may restore the old context if
-/// the new message continues the same topic.
-const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
 /// Key for the per-(chat,user) session map. Extracted here so the same
 /// tuple is built everywhere; in 1:1 chats the same value is reused.
 fn chat_key(chat_id: i64, user_id: i64) -> (i64, i64) {
@@ -72,7 +60,7 @@ pub struct ChatSession {
 
 /// True when the gap since `last_seen` exceeds the session TTL.
 fn session_expired(last_seen: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    last_seen.is_some_and(|t| now.duration_since(t) > SESSION_TTL)
+    last_seen.is_some_and(|t| now.duration_since(t) > crate::session::SESSION_TTL)
 }
 
 /// Apply session expiry to one slot and hand back the aged-out history, if
@@ -91,36 +79,6 @@ fn take_expired_session(chat: &mut ChatSession, now: std::time::Instant) -> bool
     expired
 }
 
-/// The last `n` plain-text messages of a history, rendered as
-/// "user:/assistant:" lines for the continuation classifier.
-fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
-    let mut lines: Vec<String> = history
-        .iter()
-        .rev()
-        .filter_map(|m| match m {
-            LlmMessage::User { content } => content
-                .iter()
-                .filter_map(|c| match c {
-                    rig::message::UserContent::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .reduce(|a, b| format!("{a}\n{b}"))
-                .map(|t| format!("user: {t}")),
-            LlmMessage::Assistant { content, .. } => content
-                .iter()
-                .filter_map(|c| match c {
-                    rig::message::AssistantContent::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .reduce(|a, b| format!("{a}\n{b}"))
-                .map(|t| format!("assistant: {t}")),
-            _ => None,
-        })
-        .take(n)
-        .collect();
-    lines.reverse();
-    lines.join("\n")
-}
 
 /// Stash a sent reply against the per-chat ring buffer. Every bot reply in
 /// `chat_id` is appended, with FIFO eviction past `SENT_REPLY_CAP`. Used by
@@ -300,7 +258,7 @@ fn is_member(app: &App, msg: &Message) -> bool {
 /// The gate: founders from `ALLOWED_TELEGRAM_USER_IDS`, plus everyone
 /// admitted through an invite round and not since revoked.
 fn is_member_id(app: &App, user_id: i64) -> bool {
-    app.cfg.allowed_user_ids.contains(&user_id) || app.members.contains(&user_id)
+    app.core.is_founder(user_id) || app.members.contains(&user_id)
 }
 
 /// True for `/start`, with or without an `@bot` suffix and with or without
@@ -348,7 +306,7 @@ fn display_name(user: &teloxide::types::User) -> String {
 
 /// `/help`'s text for one person: admins get their own commands appended.
 fn help_for(app: &App, user_id: i64) -> String {
-    match app.cfg.admin_user_ids.contains(&user_id) {
+    match app.core.is_admin(user_id) {
         true => format!("{HELP}{ADMIN_HELP}"),
         false => HELP.to_string(),
     }
@@ -382,18 +340,7 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         return Ok(());
     };
 
-    let claim = {
-        let store = app.deps.store.clone();
-        let code = code.clone();
-        tokio::task::spawn_blocking(move || {
-            let account_id = store.account_for_telegram(user_id)?;
-            store.claim_seat(account_id, chat_id.0, &code)
-        })
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|r| r)
-    };
-    let claim = match claim {
+    let claim = match crate::invites::claim(&app.core, user_id, chat_id.0, &code).await {
         Ok(claim) => claim,
         Err(e) => {
             tracing::error!(error = %e, user_id, code, "could not record an invite claim");
@@ -466,14 +413,8 @@ async fn handle_command(
             // History lives in the store now, so clearing the slot alone
             // would leave the thread intact and /reset would do nothing.
             // A fresh conversation is what "cleared" has to mean.
-            let scope = conversation_scope(msg.chat.id.0, user_id);
-            let store = app.deps.store.clone();
-            let started = blocking(move || {
-                let account_id = store.account_for_telegram(user_id)?;
-                store.start_conversation(account_id, &scope)
-            })
-            .await;
-            if let Err(e) = started {
+            let scope = crate::session::conversation_scope(msg.chat.id.0, user_id);
+            if let Err(e) = crate::session::reset(&app.core, user_id, &scope).await {
                 tracing::error!(error = %e, user_id, "could not clear the conversation");
                 bot.send_message(msg.chat.id, CLAIM_FAILED).await?;
                 return Ok(());
@@ -485,8 +426,8 @@ async fn handle_command(
             // Same gate as the cross-user /stat view: the admin list is
             // the whole access-control surface for anything that reaches
             // beyond the caller.
-            if !is_admin(&app, user_id) {
-                bot.send_message(msg.chat.id, NOT_ADMIN).await?;
+            if !app.core.is_admin(user_id) {
+                bot.send_message(msg.chat.id, crate::invites::NOT_ADMIN).await?;
                 return Ok(());
             }
             let body = match check_advert(&body) {
@@ -497,11 +438,7 @@ async fn handle_command(
                 }
             };
 
-            let store = app.deps.store.clone();
-            let targets = tokio::task::spawn_blocking(move || store.broadcast_targets())
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|r| r);
+            let targets = crate::invites::advert_targets(&app.core).await;
             let targets = match targets {
                 Ok(targets) => targets,
                 Err(e) => {
@@ -537,59 +474,17 @@ async fn handle_command(
             bot.send_message(msg.chat.id, report).await?;
         }
         Command::Stat(arg) => {
-            let days = match crate::stats::parse_days(&arg) {
-                Ok(days) => days,
-                Err(e) => {
-                    bot.send_message(msg.chat.id, format!("{e} — usage: /stat [1-90]")).await?;
-                    return Ok(());
-                }
-            };
             let Some(user_id) = sender_id(&msg) else {
                 tracing::debug!("/stat from a message with no sender; ignoring");
                 return Ok(());
             };
-            // Admins see the whole bot; everyone else sees only themselves.
-            // This branch is the only place cross-user counts are reachable.
-            let admin = app.cfg.admin_user_ids.contains(&user_id);
-            let today = chrono::Local::now().date_naive();
-            let cutoff = format!(
-                "{} 00:00:00",
-                today - chrono::Duration::days(i64::from(days) - 1)
-            );
-            let data = {
-                let store = app.deps.store.clone();
-                tokio::task::spawn_blocking(move || {
-                    // Both reads take the same admin branch, so a
-                    // non-admin can never see another user's flight
-                    // spending either.
-                    let (rows, flights) = if admin {
-                        (store.usage_stats_all(&cutoff)?, store.flight_searches_all(&cutoff)?)
-                    } else {
-                        (
-                            store.usage_stats_for(&cutoff, user_id)?,
-                            store.flight_searches_for(&cutoff, user_id)?,
-                        )
-                    };
-                    Ok::<_, anyhow::Error>((rows, store.display_names()?, flights))
-                })
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|r| r)
-            };
-            match data {
-                Ok((rows, mut names, flights)) => {
-                    backfill_names(&bot, &app, &rows, &mut names).await;
-                    let report =
-                        crate::stats::format_stats(&rows, days, today, user_id, &names, &flights);
-                    bot.send_message(msg.chat.id, format!("<pre>{report}</pre>"))
-                        .parse_mode(ParseMode::Html)
-                        .await?;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "usage stats query failed");
-                    bot.send_message(msg.chat.id, "Sorry, couldn't compute stats.").await?;
-                }
-            }
+            // Ask Telegram for any display names we are missing before
+            // reporting, so the table reads as people rather than numbers.
+            backfill_names(&bot, &app).await;
+            let report = crate::stats::report(&app.core, user_id, &arg).await;
+            bot.send_message(msg.chat.id, format!("<pre>{report}</pre>"))
+                .parse_mode(ParseMode::Html)
+                .await?;
         }
     }
     Ok(())
@@ -600,41 +495,33 @@ async fn handle_command(
 /// picks up where this one stopped.
 const NAME_BACKFILL_LIMIT: usize = 25;
 
-/// Learn the names of users who appear in the stats but predate the names
-/// table — otherwise every historical id reads `—` until its owner happens
-/// to message again.
+/// Fills in display names Scout has never recorded, by asking Telegram.
 ///
-/// `getChat` answers for anyone who has talked to the bot, which is exactly
-/// who lands in `request_log`. Results are persisted, so this is one call
-/// per user ever, not per `/stat`.
-async fn backfill_names(
-    bot: &Bot,
-    app: &Arc<App>,
-    rows: &[(i64, String, i64)],
-    names: &mut std::collections::BTreeMap<i64, String>,
-) {
-    let missing: Vec<i64> = rows
-        .iter()
-        .map(|(user, _, _)| *user)
-        .filter(|user| !names.contains_key(user))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .take(NAME_BACKFILL_LIMIT)
-        .collect();
-
-    for user_id in missing {
-        let chat = match bot.get_chat(ChatId(user_id)).await {
+/// Takes both ids from the store: the Telegram one to ask with, the account
+/// one to file under. Deriving one from the other is what previously turned a
+/// stats report into `get_chat(ChatId(3))`.
+async fn backfill_names(bot: &Bot, app: &Arc<App>) {
+    let missing = match app.core.accounts_missing_names(NAME_BACKFILL_LIMIT).await {
+        Ok(missing) => missing,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not list accounts missing a name");
+            return;
+        }
+    };
+    for (account_id, telegram_id) in missing {
+        let chat = match bot.get_chat(ChatId(telegram_id)).await {
             Ok(chat) => chat,
             // Blocked the bot, deleted account, never a private chat —
             // none of it is worth failing /stat over.
             Err(e) => {
-                tracing::debug!(error = %e, user_id, "could not look up a display name");
+                tracing::debug!(error = %e, telegram_id, "could not look up a display name");
                 continue;
             }
         };
         let Some(name) = chat_display_name(&chat) else { continue };
-        note_user(app, user_id, name.clone());
-        names.insert(user_id, name);
+        if let Err(e) = app.core.record_name(account_id, name).await {
+            tracing::debug!(error = %e, account_id, "could not record a display name");
+        }
     }
 }
 
@@ -653,17 +540,10 @@ fn chat_display_name(chat: &teloxide::types::ChatFullInfo) -> Option<String> {
 
 /// Fire-and-forget usage logging; never delays request handling.
 fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
-    let store = app.deps.store.clone();
+    let core = app.core.clone();
     tokio::spawn(async move {
-        let logged = tokio::task::spawn_blocking(move || {
-            let account_id = store.account_for_telegram(user_id)?;
-            store.log_request(account_id, kind)
-        })
-        .await;
-        match logged {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "request logging failed"),
-            Err(e) => tracing::warn!(error = %e, "request logging join failed"),
+        if let Err(e) = core.log_request(user_id, kind).await {
+            tracing::warn!(error = %e, "request logging failed");
         }
     });
 }
@@ -707,17 +587,10 @@ impl Drop for Typing {
 /// an id. Separate from `log_request` on purpose: running a command should
 /// teach the bot your name without inflating your request count.
 fn note_user(app: &Arc<App>, user_id: i64, name: String) {
-    let store = app.deps.store.clone();
+    let core = app.core.clone();
     tokio::spawn(async move {
-        let noted = tokio::task::spawn_blocking(move || {
-            let account_id = store.account_for_telegram(user_id)?;
-            store.remember_user(account_id, &name)
-        })
-        .await;
-        match noted {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "display name update failed"),
-            Err(e) => tracing::warn!(error = %e, "display name join failed"),
+        if let Err(e) = core.note_display_name(user_id, name).await {
+            tracing::warn!(error = %e, "display name update failed");
         }
     });
 }
@@ -732,17 +605,10 @@ fn note_sender(app: &Arc<App>, msg: &Message) {
 /// Records where this person is talking, so `/advert` can reach them. A
 /// user id is only the same as a chat id in a private chat.
 fn note_chat(app: &Arc<App>, user_id: i64, chat_id: i64) {
-    let store = app.deps.store.clone();
+    let core = app.core.clone();
     tokio::spawn(async move {
-        let recorded = tokio::task::spawn_blocking(move || {
-            let account_id = store.account_for_telegram(user_id)?;
-            store.note_delivery(account_id, "telegram", &chat_id.to_string())
-        })
-        .await;
-        match recorded {
-            Ok(Err(e)) => tracing::warn!(error = %e, "could not record the user's chat"),
-            Err(e) => tracing::warn!(error = %e, "chat recording task failed"),
-            Ok(Ok(())) => {}
+        if let Err(e) = core.note_address(user_id, "telegram", chat_id.to_string()).await {
+            tracing::warn!(error = %e, "could not record the user's chat");
         }
     });
 }
@@ -776,132 +642,18 @@ pub fn check_advert(body: &str) -> Result<&str, String> {
     Ok(body)
 }
 
-const NOT_ADMIN: &str = "That command is for the bot's admin.";
 
-fn is_admin(app: &App, user_id: i64) -> bool {
-    app.cfg.admin_user_ids.contains(&user_id)
-}
 
-/// Capacity when `/invite new` is given a name and no number.
-const DEFAULT_CAPACITY: i64 = 100;
 
-/// A Telegram start parameter is 1-64 characters long.
-const MAX_ROUND_NAME: usize = 64;
 
-const INVITE_USAGE: &str = "usage:\n\
-/invite new <name> [capacity] - open a round (capacity defaults to 100)\n\
-/invite status - rounds, seats used, and who is waiting\n\
-/invite open <name> | /invite close <name>\n\
-/invite announce <name> - tell the waitlist a round is open";
 
-#[derive(Debug, PartialEq, Eq)]
-enum InviteCmd {
-    New { code: String, capacity: i64 },
-    Status,
-    SetOpen { code: String, open: bool },
-    Announce(String),
-}
 
-fn parse_invite(arg: &str) -> Result<InviteCmd, String> {
-    let mut words = arg.split_whitespace();
-    let Some(verb) = words.next() else {
-        return Err(INVITE_USAGE.to_string());
-    };
-    let cmd = match verb.to_ascii_lowercase().as_str() {
-        "status" => InviteCmd::Status,
-        "new" => {
-            let code = check_round_name(words.next())?;
-            let capacity = match words.next() {
-                Some(raw) => check_capacity(raw)?,
-                None => DEFAULT_CAPACITY,
-            };
-            InviteCmd::New { code, capacity }
-        }
-        "open" => InviteCmd::SetOpen { code: check_round_name(words.next())?, open: true },
-        "close" => InviteCmd::SetOpen { code: check_round_name(words.next())?, open: false },
-        "announce" => InviteCmd::Announce(check_round_name(words.next())?),
-        other => return Err(format!("I don't know \"{other}\".\n\n{INVITE_USAGE}")),
-    };
-    // A trailing word is a typo, not something to ignore: silently dropping
-    // it is how "/invite new autumn 100 seats" opens a round nobody meant.
-    if let Some(extra) = words.next() {
-        return Err(format!("I didn't expect \"{extra}\".\n\n{INVITE_USAGE}"));
-    }
-    Ok(cmd)
-}
 
-/// A round name is also a Telegram start parameter, so it is checked
-/// against exactly what one may contain — 1-64 characters of `A-Za-z0-9_-`.
-/// Refusing at the point the admin types it beats discovering it when
-/// nobody can join.
-fn check_round_name(name: Option<&str>) -> Result<String, String> {
-    let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
-        return Err(format!("that needs a round name.\n\n{INVITE_USAGE}"));
-    };
-    if name.chars().count() > MAX_ROUND_NAME {
-        return Err(format!(
-            "\"{name}\" is {} characters; an invite link carries at most {MAX_ROUND_NAME}.",
-            name.chars().count()
-        ));
-    }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(format!(
-            "\"{name}\" has characters an invite link can't carry. \
-             Use letters, digits, - and _ only."
-        ));
-    }
-    Ok(name.to_string())
-}
 
-fn check_capacity(raw: &str) -> Result<i64, String> {
-    let n: i64 = raw
-        .parse()
-        .map_err(|_| format!("\"{raw}\" is not a number of seats."))?;
-    if n < 1 {
-        return Err("a round needs at least one seat.".to_string());
-    }
-    Ok(n)
-}
 
-fn parse_user_id(arg: &str) -> Result<i64, String> {
-    let arg = arg.trim();
-    if arg.is_empty() {
-        return Err("that needs a numeric user id — /stat lists them.".to_string());
-    }
-    match arg.parse::<i64>() {
-        Ok(id) if id > 0 => Ok(id),
-        _ => Err(format!("\"{arg}\" is not a Telegram user id. /stat lists them.")),
-    }
-}
 
-/// How someone already in a chat with Scout joins a round.
-///
-/// The link is not that route. Telegram only shows the START button — and
-/// only START delivers the payload — in a chat with no history, so anyone
-/// who has ever messaged the bot (which is everyone on the waitlist, since
-/// being turned away is itself a message) opens a link to nothing. Sending
-/// the command by hand delivers the same payload and always works.
-fn join_instruction(code: &str) -> String {
-    format!("/start {code}")
-}
 
-/// The invite link itself, for posting somewhere public where the people
-/// reading it have never messaged Scout — which is where it does work.
-fn join_link(username: &str, code: &str) -> String {
-    format!("https://t.me/{username}?start={code}")
-}
 
-/// What the waitlist is sent when a round opens. HTML so the command sits
-/// in a `<code>` span, which Telegram makes tap-to-copy — the code is
-/// validated to `A-Za-z0-9_-`, so there is nothing in it to escape.
-pub fn announce_message(code: &str) -> String {
-    format!(
-        "A new round of Scout invites just opened — you asked to be told.\n\n\
-         Send me this to claim a seat:\n<code>{}</code>\n\n\
-         (Tap it to copy.) Seats are first come, first served.",
-        join_instruction(code)
-    )
-}
 
 /// One recipient's outcome in a broadcast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -993,326 +745,62 @@ fn classify_send(e: &teloxide::RequestError) -> Delivered {
     }
 }
 
-async fn handle_invite(
-    bot: &Bot,
-    msg: &Message,
-    app: &Arc<App>,
-    arg: &str,
-) -> ResponseResult<()> {
-    let Some(user_id) = sender_id(msg) else { return Ok(()) };
-    if !is_admin(app, user_id) {
-        bot.send_message(msg.chat.id, NOT_ADMIN).await?;
-        return Ok(());
-    }
-    let cmd = match parse_invite(arg) {
-        Ok(cmd) => cmd,
-        Err(problem) => {
-            bot.send_message(msg.chat.id, problem).await?;
-            return Ok(());
-        }
-    };
-    let store = app.deps.store.clone();
-    match cmd {
-        InviteCmd::New { code, capacity } => {
-            let created = {
-                let (store, code) = (store.clone(), code.clone());
-                blocking(move || store.create_round(&code, capacity)).await
-            };
-            let reply = match created {
-                Err(e) => {
-                    tracing::error!(error = %e, code, "could not open a round");
-                    "Sorry, I couldn't open that round.".to_string()
-                }
-                Ok(false) => format!(
-                    "There is already a round called \"{code}\". \
-                     Pick another name — reusing one would pool two rounds' \
-                     seats under a single capacity."
-                ),
-                Ok(true) => {
-                    // Losing the round because a username lookup blipped
-                    // would be worse than a reply without a link.
-                    let username = match teloxide::prelude::Requester::get_me(bot).await {
-                        Ok(me) => me.username.clone(),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "could not read the bot's username");
-                            None
-                        }
-                    };
-                    new_round_reply(&code, capacity, username.as_deref())
-                }
-            };
-            bot.send_message(msg.chat.id, reply).await?;
-        }
-        InviteCmd::Status => {
-            let status = blocking(move || Ok((store.rounds()?, store.waiting_count()?))).await;
-            let reply = match status {
-                Ok((rounds, waiting)) => status_report(&rounds, waiting),
-                Err(e) => {
-                    tracing::error!(error = %e, "could not read invite status");
-                    "Sorry, I couldn't read the rounds.".to_string()
-                }
-            };
-            bot.send_message(msg.chat.id, reply).await?;
-        }
-        InviteCmd::SetOpen { code, open } => {
-            let changed = {
-                let code = code.clone();
-                blocking(move || store.set_round_open(&code, open)).await
-            };
-            let reply = match changed {
-                Err(e) => {
-                    tracing::error!(error = %e, code, "could not change a round");
-                    "Sorry, I couldn't change that round.".to_string()
-                }
-                Ok(false) => format!("There's no round called \"{code}\"."),
-                Ok(true) if open => format!("Round \"{code}\" is admitting again."),
-                Ok(true) => format!(
-                    "Round \"{code}\" is closed. Its seats stay spent; \
-                     /invite open {code} resumes it."
-                ),
-            };
-            bot.send_message(msg.chat.id, reply).await?;
-        }
-        InviteCmd::Announce(code) => announce_round(bot, msg, app, &code).await?,
-    }
-    Ok(())
-}
 
-/// Runs a `Store` call off the async executor. The connection is behind a
-/// blocking mutex, so every one of these has to leave the reactor thread.
-/// Which conversation this message belongs to.
+
+
+
+
+
+
+
+
+/// Delivers an announcement core has planned, then tells core what landed.
 ///
-/// After a long gap the old thread is set aside and a quick LLM check
-/// decides whether the new message continues it — the same rule the
-/// in-memory session used, now applied to stored conversations so it
-/// survives a restart.
-async fn resolve_conversation(
-    app: &App,
-    user_id: i64,
-    scope: &str,
-    text: &str,
-) -> anyhow::Result<i64> {
-    let account_id = account_of(app, user_id).await?;
-    let ttl = SESSION_TTL.as_secs() as i64;
-    let store = app.deps.store.clone();
-    let (scope_owned, latest) = {
-        let scope_owned = scope.to_string();
-        let s = scope_owned.clone();
-        let store = store.clone();
-        (
-            scope_owned,
-            blocking(move || store.latest_conversation(account_id, &s, ttl)).await?,
-        )
-    };
-
-    let Some((id, aged_out)) = latest else {
-        let store = app.deps.store.clone();
-        return blocking(move || store.start_conversation(account_id, &scope_owned)).await;
-    };
-    if !aged_out {
-        return Ok(id);
-    }
-
-    let excerpt = {
-        let store = app.deps.store.clone();
-        let history = blocking(move || load_history(&store, id, HISTORY_CAP)).await?;
-        last_messages_text(&history, 6)
-    };
-    if excerpt.trim().is_empty() {
-        let store = app.deps.store.clone();
-        return blocking(move || store.start_conversation(account_id, &scope_owned)).await;
-    }
-    match crate::agent::continues_previous(&app.deps.llm, &excerpt, text).await {
-        Ok(true) => {
-            tracing::info!(user_id, id, "session expired but topic continues; keeping context");
-            let store = app.deps.store.clone();
-            blocking(move || store.touch_conversation(id)).await?;
-            Ok(id)
-        }
-        Ok(false) => {
-            tracing::info!(user_id, "session expired; starting fresh");
-            let store = app.deps.store.clone();
-            blocking(move || store.start_conversation(account_id, &scope_owned)).await
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, user_id, "continuation check failed; starting fresh");
-            let store = app.deps.store.clone();
-            blocking(move || store.start_conversation(account_id, &scope_owned)).await
-        }
-    }
-}
-
-/// Rewrites a conversation's stored messages to match `history`.
-///
-/// A whole rewrite rather than an append: `trim_history` drops messages
-/// from the front, so what is stored has to be what the agent will actually
-/// be sent next time, not a growing log that disagrees with it.
-fn save_history(store: &Store, conversation_id: i64, history: &[LlmMessage]) -> anyhow::Result<()> {
-    let bodies = history
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    store.replace_messages(conversation_id, &bodies)
-}
-
-/// Stored messages, oldest first. A row that no longer deserializes —
-/// because rig changed shape under us — is dropped rather than fatal:
-/// losing some context is survivable, refusing to answer at all is not.
-fn load_history(store: &Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
-    let bodies = store.conversation_messages(conversation_id, cap)?;
-    let mut out = Vec::with_capacity(bodies.len());
-    for body in bodies {
-        match serde_json::from_str::<LlmMessage>(&body) {
-            Ok(m) => out.push(m),
-            Err(e) => tracing::warn!(error = %e, "dropping an unreadable stored message"),
-        }
-    }
-    Ok(out)
-}
-
-/// In a 1:1 chat Telegram makes the chat id equal the user id, and that is
-/// the thread the web app will share. Anywhere else is a room with other
-/// people in it and keeps its own history.
-fn conversation_scope(chat_id: i64, user_id: i64) -> String {
-    if chat_id == user_id {
-        "direct".to_string()
-    } else {
-        format!("telegram:{chat_id}")
-    }
-}
-
-/// The account behind a Telegram user, created on first sight.
-///
-/// Everything below the adapter is keyed by account id; `sender_id` is a
-/// Telegram id. This is the single place the two meet, so a caller that
-/// forgets to convert gets a type that is still an `i64` but a name that
-/// says which one it is.
-async fn account_of(app: &App, telegram_id: i64) -> anyhow::Result<i64> {
-    let store = app.deps.store.clone();
-    blocking(move || store.account_for_telegram(telegram_id)).await
-}
-
-async fn blocking<T, F>(f: F) -> anyhow::Result<T>
-where
-    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|r| r)
-}
-
-fn new_round_reply(code: &str, capacity: i64, username: Option<&str>) -> String {
-    let mut reply = format!("Round \"{code}\" is open for {capacity}.\n\n");
-    match username {
-        Some(username) => reply.push_str(&format!("{}\n\n", join_link(username, code))),
-        None => reply.push_str(
-            "I couldn't read my own username just now, so I can't build the \
-             link — it is https://t.me/<botname>?start= followed by the name.\n\n",
-        ),
-    }
-    reply.push_str(&format!(
-        "The link only works for people who have never messaged Scout: \
-         Telegram shows the START button only in an empty chat, and only \
-         START carries the code. Anyone who has already talked to Scout \
-         joins by sending\n{}\n\n\
-         /invite announce {code} tells the waitlist, using that same command.",
-        join_instruction(code)
-    ));
-    reply
-}
-
-fn status_report(rounds: &[crate::store::RoundStatus], waiting: i64) -> String {
-    if rounds.is_empty() {
-        return "No rounds yet. /invite new <name> [capacity] opens one.".to_string();
-    }
-    let mut out = String::new();
-    for r in rounds {
-        out.push_str(&format!(
-            "{} — {}/{} seats, {}\n",
-            r.code,
-            r.used,
-            r.capacity,
-            if r.open { "open" } else { "closed" }
-        ));
-    }
-    out.push_str(&format!("\n{waiting} waiting."));
-    out
-}
-
+/// Three steps on purpose: core decides who and what, the adapter sends, core
+/// records. That is the shape a network forces, and it is the reason a failed
+/// send is retried while a blocked recipient is dropped.
 async fn announce_round(
     bot: &Bot,
     msg: &Message,
     app: &Arc<App>,
     code: &str,
 ) -> ResponseResult<()> {
-    let store = app.deps.store.clone();
-    let rounds = match blocking(move || store.rounds()).await {
-        Ok(rounds) => rounds,
+    let planned = match crate::invites::plan_announcement(&app.core, code).await {
+        Ok(planned) => planned,
         Err(e) => {
-            tracing::error!(error = %e, "could not read the rounds to announce");
+            tracing::error!(error = %e, "could not plan the announcement");
             bot.send_message(msg.chat.id, "Sorry, I couldn't read the rounds.").await?;
             return Ok(());
         }
     };
-    // Announcing a round that cannot admit anybody spends the whole
-    // waitlist's one notification on a dead end, and `invited_at` would be
-    // stamped as though they had been told about something real.
-    let refusal = match rounds.iter().find(|r| r.code == code) {
-        None => Some(format!("There's no round called \"{code}\".")),
-        Some(r) if !r.open => Some(format!(
-            "Round \"{code}\" is closed, so nobody could join through it. \
-             /invite open {code} first."
-        )),
-        Some(r) if r.used >= r.capacity => Some(format!(
-            "Round \"{code}\" is full ({}/{}), so nobody could join through it. \
-             Open a bigger round instead.",
-            r.used, r.capacity
-        )),
-        Some(_) => None,
-    };
-    if let Some(refusal) = refusal {
-        bot.send_message(msg.chat.id, refusal).await?;
-        return Ok(());
-    }
-
-    let store = app.deps.store.clone();
-    let targets = match blocking(move || store.waitlist_to_invite()).await {
-        Ok(targets) => targets,
-        Err(e) => {
-            tracing::error!(error = %e, "could not read the waitlist");
-            bot.send_message(msg.chat.id, "Sorry, I couldn't read the waitlist.").await?;
+    let (targets, text) = match planned {
+        crate::invites::Announcement::Refused(reason) => {
+            bot.send_message(msg.chat.id, reason).await?;
             return Ok(());
         }
+        crate::invites::Announcement::Ready { targets, text } => (targets, text),
     };
-    if targets.is_empty() {
-        bot.send_message(msg.chat.id, "Nobody is waiting to be told.").await?;
-        return Ok(());
-    }
 
-    let text = announce_message(code);
     let results = broadcast(bot, &targets, &text, Some(ParseMode::Html)).await;
 
-    let (mut sent, mut dropped, mut retryable) = (0usize, 0usize, 0usize);
-    for (recipient, outcome) in results {
-        let store = app.deps.store.clone();
-        match outcome {
-            Delivered::Ok => {
-                sent += 1;
-                // Per success, so a re-run reaches only who was missed.
-                if let Err(e) = blocking(move || store.mark_invited(recipient)).await {
-                    tracing::warn!(error = %e, recipient, "could not stamp an invite as sent");
-                }
-            }
-            Delivered::Gone => {
-                dropped += 1;
-                if let Err(e) = blocking(move || store.forget_waitlist(recipient)).await {
-                    tracing::warn!(error = %e, recipient, "could not drop a waitlist row");
-                }
-            }
-            Delivered::Failed => retryable += 1,
-        }
+    let outcomes: Vec<(i64, crate::invites::Reached)> = results
+        .iter()
+        .map(|(recipient, outcome)| {
+            let reached = match outcome {
+                Delivered::Ok => crate::invites::Reached::Yes,
+                Delivered::Gone => crate::invites::Reached::Gone,
+                Delivered::Failed => crate::invites::Reached::No,
+            };
+            (*recipient, reached)
+        })
+        .collect();
+
+    let sent = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::Yes).count();
+    let dropped = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::Gone).count();
+    let retryable = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::No).count();
+
+    if let Err(e) = crate::invites::record_announcement(&app.core, outcomes).await {
+        tracing::warn!(error = %e, "could not record what the announcement reached");
     }
 
     let mut report = format!("Told {sent} of {} people about \"{code}\".", targets.len());
@@ -1333,87 +821,7 @@ async fn announce_round(
     Ok(())
 }
 
-async fn handle_kick(
-    bot: &Bot,
-    msg: &Message,
-    app: &Arc<App>,
-    arg: &str,
-    kicking: bool,
-) -> ResponseResult<()> {
-    let Some(user_id) = sender_id(msg) else { return Ok(()) };
-    if !is_admin(app, user_id) {
-        bot.send_message(msg.chat.id, NOT_ADMIN).await?;
-        return Ok(());
-    }
-    let reply = match parse_user_id(arg) {
-        Err(problem) => problem,
-        Ok(target) => {
-            let store = app.deps.store.clone();
-            let changed = blocking(move || match kicking {
-                true => store.revoke(store.account_for_telegram(target)?),
-                false => store.restore(store.account_for_telegram(target)?),
-            })
-            .await;
-            match changed {
-                Err(e) => {
-                    tracing::error!(error = %e, target, kicking, "membership change failed");
-                    "Sorry, I couldn't write that down, so nothing changed.".to_string()
-                }
-                // The table is the record; the set follows it.
-                Ok(true) if kicking => {
-                    app.members.remove(&target);
-                    format!(
-                        "{target} is out. Their seat stays spent, so the round \
-                         does not quietly reopen."
-                    )
-                }
-                Ok(true) => {
-                    app.members.insert(target);
-                    format!("{target} is back in. That consumed no seat.")
-                }
-                Ok(false) if kicking => format!(
-                    "{target} isn't a member, so there's nothing to remove. \
-                     Founders listed in ALLOWED_TELEGRAM_USER_IDS aren't \
-                     members — remove those from .env instead."
-                ),
-                Ok(false) => format!("{target} isn't a revoked member, so there's nothing to undo."),
-            }
-        }
-    };
-    bot.send_message(msg.chat.id, reply).await?;
-    Ok(())
-}
 
-/// `Some(reply)` when this person has spent today's allowance.
-///
-/// Founders are exempt: they are the people paying for the bot.
-///
-/// A failed count lets the message through. The cap is a cost guard, not an
-/// access control — the gate above it already decided this person is
-/// allowed here — and a database blip should not silence everyone at once.
-async fn over_daily_cap(app: &Arc<App>, user_id: i64) -> Option<String> {
-    if app.cfg.allowed_user_ids.contains(&user_id) {
-        return None;
-    }
-    let cap = app.cfg.invite_daily_requests;
-    let store = app.deps.store.clone();
-    let used = match blocking(move || {
-        let account_id = store.account_for_telegram(user_id)?;
-        store.requests_today(account_id)
-    })
-    .await
-    {
-        Ok(used) => used,
-        Err(e) => {
-            tracing::warn!(error = %e, user_id, "daily cap check failed; letting it through");
-            return None;
-        }
-    };
-    (used >= cap).then(|| {
-        tracing::info!(user_id, used, cap, "daily cap reached");
-        format!("You've used today's {cap} requests. It resets at midnight UTC.")
-    })
-}
 
 async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let text = msg.text().unwrap_or_default().to_string();
@@ -1422,7 +830,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     // Checked before the request is logged: otherwise somebody over their
     // cap would push their own count up by being told they are over it, and
     // /stat would report refusals as work.
-    if let Some(refusal) = over_daily_cap(&app, user_id).await {
+    if let Some(refusal) = crate::session::over_daily_cap(&app.core, user_id).await {
         bot.send_message(chat_id, refusal).await?;
         return Ok(());
     }
@@ -1440,8 +848,8 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         let mut chat = app.chats.entry(key).or_default();
         take_expired_session(&mut chat, std::time::Instant::now());
     }
-    let scope = conversation_scope(chat_id.0, user_id);
-    let conversation_id = match resolve_conversation(&app, user_id, &scope, &text).await {
+    let scope = crate::session::conversation_scope(chat_id.0, user_id);
+    let conversation_id = match crate::session::resolve_conversation(&app.core, user_id, &scope, &text).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not open a conversation");
@@ -1486,7 +894,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     // renderer's futures need no Send bound. `events` moves into the run and
     // drops when it returns, which is what ends the renderer.
     let (result, mut live) = tokio::join!(
-        run_agent(&app, events, user_id, chat_id.0, conversation_id, &prompt),
+        crate::run::run_agent(&app.core, events, user_id, chat_id.0, conversation_id, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {
@@ -1496,7 +904,8 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
             // Replace the progress message rather than sending a second one:
             // otherwise the user is left with a half-written thought frozen
             // above the apology.
-            live.show(agent_error_message(&e), true).await;
+            live.show(crate::run::agent_error_message(&e), true).await;
+
         }
     }
     Ok(())
@@ -1535,46 +944,9 @@ fn looks_like_price_request(text: &str) -> bool {
     PRICE_MARKERS.iter().any(|m| text.contains(m))
 }
 
-/// How much of the model's own notes to hand the wrap-up agent.
-const WRAP_UP_CONTEXT: usize = 6000;
-/// No stream item for this long means the run is stuck. Generous, because a
-/// tool call (three site searches, a page fetch and its dead-link probes)
-/// runs between items — but all of those carry their own timeouts well
-/// under this. rig's client has no timeout of its own, so this is the only
-/// thing standing between a stalled connection and a chat that waits
-/// forever.
-const STREAM_STALL: std::time::Duration = std::time::Duration::from_secs(90);
-/// Hard ceiling on one request. A thorough price comparison takes ~60-90s;
-/// past this the user is better served by an answer built from the notes.
-const RUN_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
-/// The salvage write-up is one tool-less call.
-const WRAP_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// The last `max` characters — the newest notes are the ones carrying
-/// confirmed prices.
-fn tail_chars(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    text.chars().skip(count.saturating_sub(max)).collect()
-}
 
-/// rig wraps the turn-limit failure in its own error types; the message is
-/// the stable part across them.
-fn is_max_turns(e: &impl std::fmt::Display) -> bool {
-    let text = e.to_string();
-    text.contains("MaxTurnsError") || text.contains("max turns")
-}
 
-/// Turn an agent failure into a user-facing message; the max-turns budget
-/// gets an actionable explanation instead of the generic apology.
-fn agent_error_message(e: &anyhow::Error) -> &'static str {
-    if e.to_string().contains("max turns") {
-        "That request needed more research steps than I allow per message. \
-         Try narrowing it (a more specific product, or fewer platforms), or \
-         ask me to continue from where I stopped."
-    } else {
-        "Sorry, something went wrong on my side. Please try again."
-    }
-}
 
 async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
@@ -1582,7 +954,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     // Before the session is touched as well as before the request is
     // logged: a refused photo should leave the conversation exactly as it
     // was, not clear a history and disarm a draft on its way out.
-    if let Some(refusal) = over_daily_cap(&app, user_id).await {
+    if let Some(refusal) = crate::session::over_daily_cap(&app.core, user_id).await {
         bot.send_message(chat_id, refusal).await?;
         return Ok(());
     }
@@ -1618,7 +990,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         }
     };
 
-    match describe_photo(&app.deps.llm, &bytes, msg.caption()).await {
+    match app.core.describe_photo(&bytes, msg.caption()).await {
         Ok(draft) => {
             app.chats.entry(key).or_default().pending_draft = Some(draft.clone());
             bot.send_message(
@@ -1696,8 +1068,8 @@ async fn handle_reaction(
     // A reaction continues whatever thread this chat is already in, so it
     // never starts one: an empty excerpt would just make the classifier
     // guess.
-    let scope = conversation_scope(chat_id.0, user_id);
-    let conversation_id = match resolve_conversation(&app, user_id, &scope, &prompt).await {
+    let scope = crate::session::conversation_scope(chat_id.0, user_id);
+    let conversation_id = match crate::session::resolve_conversation(&app.core, user_id, &scope, &prompt).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "could not open a conversation");
@@ -1707,14 +1079,14 @@ async fn handle_reaction(
     let (events, incoming) = tokio::sync::mpsc::unbounded_channel();
     let live = Live::new(bot.clone(), chat_id, app.streams.clone());
     let (result, mut live) = tokio::join!(
-        run_agent(&app, events, user_id, chat_id.0, conversation_id, &prompt),
+        crate::run::run_agent(&app.core, events, user_id, chat_id.0, conversation_id, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "reaction follow-up failed");
-            live.show(agent_error_message(&e), true).await;
+            live.show(crate::run::agent_error_message(&e), true).await;
         }
     }
     Ok(())
@@ -1739,273 +1111,9 @@ async fn download_photo(
     Ok(bytes)
 }
 
-/// Runs the agent against a snapshot of this chat's history, then writes the
-/// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
-/// from being held across awaits.
-///
-/// The run reports progress as events rather than drawing them, because the
-/// tool calls alone take most of a minute and an idle chat looks broken —
-/// but who draws them is not this function's business.
-///
-/// `events` is taken by value: returning drops it, which closes the channel
-/// and ends whoever is rendering. That is the only shutdown signal the
-/// renderer gets, so it must not be held anywhere else.
-async fn run_agent(
-    app: &App,
-    events: crate::events::EventSink,
-    user_id: i64,
-    chat_id: i64,
-    conversation_id: i64,
-    prompt: &str,
-) -> anyhow::Result<String> {
-    let account_id = account_of(app, user_id).await?;
-    let facts = {
-        let store = app.deps.store.clone();
-        tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
-    };
-    let agent = build_agent(&app.deps, account_id, chat_id, &facts);
-    // History comes from the conversation the caller opened, so an
-    // in-flight run always reads and writes that thread and never anyone
-    // else's — the isolation the (chat, user) map used to provide.
-    let mut history = {
-        let store = app.deps.store.clone();
-        blocking(move || load_history(&store, conversation_id, HISTORY_CAP)).await?
-    };
 
-    let mut streamed = String::new();
-    // Reasoning arrives on its own channel, separate from the answer text.
-    let mut thinking = String::new();
-    let mut final_response = None;
-    // The whole streamed run sits inside one deadline. A guard on
-    // stream.next() alone is not enough: it leaves every await in the loop
-    // body uncovered, and the budget check below it can only fire when an
-    // item arrives — so a run that stops receiving anything is bounded by
-    // nothing. Observed once at fifteen minutes before the provider finally
-    // errored, with the user watching a frozen progress message.
-    let outcome: Result<Result<Option<&'static str>, anyhow::Error>, _> =
-        tokio::time::timeout(RUN_BUDGET, async {
-            let mut stream = agent.stream_chat(prompt, history.clone()).await;
-            loop {
-                // A silent stream is a stall even while the run as a whole
-                // still has time left.
-                let next = match tokio::time::timeout(STREAM_STALL, stream.next()).await {
-                    Ok(Some(item)) => item,
-                    Ok(None) => return Ok(None),
-                    Err(_) => return Ok(Some("the model stopped responding")),
-                };
-                let item = match next {
-                    Ok(item) => item,
-                    // Not fatal: by this point the research is usually done
-                    // and only the write-up is missing. Salvaged below.
-                    Err(e) if is_max_turns(&e) => {
-                        return Ok(Some("I ran out of research steps"))
-                    }
-                    Err(e) => return Err(anyhow::Error::from(e)),
-                };
-                match item {
-                MultiTurnStreamItem::ToolExecutionStart { tool_call, .. } => {
-                    let args = &tool_call.function.arguments;
-                    crate::events::emit(
-                        &events,
-                        crate::events::AgentEvent::Tool(crate::progress::describe(
-                            &tool_call.function.name,
-                            args,
-                        )),
-                    );
-                }
-                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
-                    streamed.push_str(&t.text);
-                    // Unclosed <think> blocks render as nothing, so inline
-                    // reasoning never reaches the chat as answer text.
-                    let answer = strip_thinking(&streamed);
-                    if !answer.is_empty() {
-                        crate::events::emit(&events, crate::events::AgentEvent::Answer(answer));
-                    }
-                }
-                // MiniMax streams its reasoning on a separate channel. Shown
-                // in italics while it works, replaced by the answer after.
-                MultiTurnStreamItem::StreamAssistantItem(
-                    StreamedAssistantContent::ReasoningDelta { reasoning, .. },
-                ) => {
-                    thinking.push_str(&reasoning);
-                    if strip_thinking(&streamed).is_empty() {
-                        crate::events::emit(
-                            &events,
-                            crate::events::AgentEvent::Thinking(thinking.clone()),
-                        );
-                    }
-                }
-                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
-                    r,
-                )) => {
-                    for block in &r.content {
-                        if let rig::completion::message::ReasoningContent::Text { text, .. } = block
-                        {
-                            thinking.push_str(text);
-                        }
-                    }
-                    if strip_thinking(&streamed).is_empty() {
-                        crate::events::emit(
-                            &events,
-                            crate::events::AgentEvent::Thinking(thinking.clone()),
-                        );
-                    }
-                }
-                MultiTurnStreamItem::FinalResponse(res) => {
-                    final_response = Some(res);
-                    return Ok(None);
-                }
-                _ => {}
-            }
-            }
-        })
-        .await;
 
-    // Partial text survives a dropped future: whatever the run wrote before
-    // the deadline is still in `streamed`/`thinking` for the wrap-up.
-    let salvage = match outcome {
-        Ok(Ok(reason)) => reason,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => Some("this took too long"),
-    };
 
-    // The streamed deltas are the answer; the final response is the
-    // authority on both the text and the history to keep.
-    let (text, new_history) = match final_response {
-        Some(res) => (res.output().to_string(), res.messages().map(|m| m.to_vec())),
-        None => (streamed.clone(), None),
-    };
-    if let Some(h) = new_history {
-        history = h;
-    }
-    let mut reply = strip_thinking(&text);
-    if reply.is_empty() {
-        reply = strip_thinking(&streamed);
-    }
-
-    if let Some(reason) = salvage {
-        tracing::warn!(chat_id, reason, "run interrupted; writing up from notes");
-        crate::events::emit(
-            &events,
-            crate::events::AgentEvent::Notice(
-                "✍️ wrapping up with what I found so far".to_string(),
-            ),
-        );
-        // The history of an interrupted run is never returned, so the
-        // model's own notes are the material: its reasoning already lists
-        // the prices it confirmed.
-        let notes = tail_chars(&format!("{thinking}\n\n{streamed}"), WRAP_UP_CONTEXT);
-        let wrap_up = wrap_up_agent(&app.deps, &facts);
-        let asked = format!(
-            "{WRAP_UP_NOTE}\nTell the user briefly that {reason}, then give the answer.\n\n\
-             Your research notes so far:\n{notes}"
-        );
-        // The salvage attempt gets its own deadline: it must never become a
-        // second way to hang.
-        reply = match tokio::time::timeout(
-            WRAP_UP_BUDGET,
-            rig::completion::Prompt::prompt(&wrap_up, asked),
-        )
-        .await
-        {
-            Ok(Ok(text)) => strip_thinking(&text),
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => anyhow::bail!("wrap-up timed out after the run was interrupted"),
-        };
-        // Keep the exchange in context; the interrupted turns are lost.
-        history.push(LlmMessage::user(prompt));
-        history.push(LlmMessage::assistant(&reply));
-    }
-
-    // Guard against links the model wrote but never saw: an invented Amazon
-    // /dp/<ASIN> URL reads as a real product page and answers 404. One repair
-    // turn, then scrub whatever is still dead.
-    let dead = crate::links::dead_links_in(&app.deps.http, &reply).await;
-    if !dead.is_empty() {
-        tracing::warn!(?dead, chat_id, "dead links in reply; asking the agent to correct it");
-        let note = crate::links::repair_prompt(&dead);
-        reply = strip_thinking(&agent.chat(note, &mut history).await?);
-        let still_dead = crate::links::dead_links_in(&app.deps.http, &reply).await;
-        if !still_dead.is_empty() {
-            tracing::warn!(?still_dead, chat_id, "dead links survived the correction; stripping");
-            reply = crate::links::strike_dead(&reply, &still_dead);
-        }
-    }
-
-    trim_history(&mut history, HISTORY_CAP);
-    let store = app.deps.store.clone();
-    if let Err(e) = blocking(move || save_history(&store, conversation_id, &history)).await {
-        // The answer is already on its way to the user; losing the thread is
-        // worse than not saving it, but it is not worth failing the reply.
-        tracing::warn!(error = %e, conversation_id, "could not save the conversation");
-    }
-    Ok(reply)
-}
-
-/// Caps `history` at `cap` messages, then trims further so it never starts
-/// mid tool-call/tool-result exchange. Providers serialize history as-is, and
-/// a leading orphaned tool-result message (a user-role message whose content
-/// is a `ToolResult` left behind when its assistant tool-call got cut) is
-/// rejected by strict OpenAI-compatible backends. We only trust a history
-/// that begins with a plain user text message.
-pub(crate) fn trim_history(history: &mut Vec<LlmMessage>, cap: usize) {
-    if history.len() <= cap {
-        return;
-    }
-    let full = std::mem::take(history);
-    let mut window = full[full.len() - cap..].to_vec();
-    match window.iter().position(is_plain_user_text) {
-        Some(0) => *history = window,
-        Some(i) => {
-            window.drain(..i);
-            *history = window;
-        }
-        // One turn produced more tool traffic than the whole cap, so the
-        // window is tool calls all the way up and there is no safe head in
-        // it. Clearing here is what turned a four-leg trip search into "I
-        // don't have a recent flight search in our conversation", with the
-        // search still on screen above the reply.
-        //
-        // Keep the prose instead. Text carries no call/result pairing, so
-        // it cannot be orphaned however it is cut, and it is the part worth
-        // remembering — what was asked and what was answered.
-        None => {
-            let mut text: Vec<LlmMessage> = full.into_iter().filter(is_text_only).collect();
-            if text.len() > cap {
-                text.drain(..text.len() - cap);
-            }
-            *history = text;
-        }
-    }
-}
-
-/// A message that is prose and nothing else.
-///
-/// Providers reject a tool result whose call was trimmed away; text has no
-/// such pairing to break, so a history of text alone is safe to send no
-/// matter where it was cut.
-fn is_text_only(msg: &LlmMessage) -> bool {
-    match msg {
-        LlmMessage::User { content } => {
-            content.iter().all(|c| matches!(c, rig::message::UserContent::Text(_)))
-        }
-        LlmMessage::Assistant { content, .. } => {
-            content.iter().all(|c| matches!(c, rig::message::AssistantContent::Text(_)))
-        }
-        // Instruction text, and never part of a call/result pair.
-        LlmMessage::System { .. } => true,
-    }
-}
-
-/// A `Message::User` whose content is entirely plain text - no tool-result,
-/// image, or other part that only makes sense following a tool call.
-fn is_plain_user_text(msg: &LlmMessage) -> bool {
-    matches!(
-        msg,
-        LlmMessage::User { content }
-            if content.iter().all(|c| !matches!(c, rig::message::UserContent::ToolResult(_)))
-    )
-}
 
 /// Inline button under a photo draft: tapping copies the draft into the
 /// clipboard so the user can paste, edit and send it. Bot API caps
@@ -2103,52 +1211,89 @@ async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> Resp
     Ok(())
 }
 
+/// Parses a Telegram invite command and hands the request to core.
+///
+/// Parsing the wire format is the adapter's job; deciding what the request
+/// means is not. Announce is routed separately because it has to *send*
+/// things, which core cannot do.
+async fn handle_invite(bot: &Bot, msg: &Message, app: &Arc<App>, arg: &str) -> ResponseResult<()> {
+    let Some(user_id) = sender_id(msg) else { return Ok(()) };
+    // Checked here as well as inside core: announce does not go through
+    // `invite`, so relying on core's check alone would leave it open.
+    if !app.core.is_admin(user_id) {
+        bot.send_message(msg.chat.id, crate::invites::NOT_ADMIN).await?;
+        return Ok(());
+    }
+    let cmd = match crate::invites::parse_invite(arg) {
+        Ok(cmd) => cmd,
+        Err(problem) => {
+            bot.send_message(msg.chat.id, problem).await?;
+            return Ok(());
+        }
+    };
+    if let crate::invites::InviteCmd::Announce(code) = &cmd {
+        return announce_round(bot, msg, app, code).await;
+    }
+    // Only a new round needs the link, and losing the round because a
+    // username lookup blipped would be worse than a reply without one.
+    let username = match cmd {
+        crate::invites::InviteCmd::New { .. } => {
+            match teloxide::prelude::Requester::get_me(bot).await {
+                Ok(me) => me.username.clone(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not read the bot's username");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let reply = crate::invites::invite(&app.core, user_id, cmd, username.as_deref()).await;
+    bot.send_message(msg.chat.id, reply).await?;
+    Ok(())
+}
+
+/// Hands a moderation request to core, then follows the answer with the
+/// gate's cache.
+async fn handle_kick(
+    bot: &Bot,
+    msg: &Message,
+    app: &Arc<App>,
+    arg: &str,
+    kicking: bool,
+) -> ResponseResult<()> {
+    let Some(user_id) = sender_id(msg) else { return Ok(()) };
+    let outcome = crate::invites::kick(&app.core, user_id, arg, kicking).await;
+    // The table is the record; the set follows it.
+    if let (Some(now_member), Ok(target)) = (outcome.membership, arg.trim().parse::<i64>()) {
+        if now_member {
+            app.members.insert(target);
+        } else {
+            app.members.remove(&target);
+        }
+    }
+    bot.send_message(msg.chat.id, outcome.reply).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
-    fn history_survives_being_dropped_and_reloaded() {
-        let (s, _d) = crate::store::tests::test_store();
-        let a = s.account_for_telegram(11).unwrap();
-        let c = s.start_conversation(a, "direct").unwrap();
-
-        let original = vec![LlmMessage::user("cheapest beans"), LlmMessage::assistant("here")];
-        save_history(&s, c, &original).unwrap();
-        let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
-
-        // Not compared struct-for-struct: rig leaves `additional_params`
-        // as None when a message is built in code but deserializes it to
-        // Some({}), so a round trip is never byte-identical. What has to
-        // hold is that the words and their roles survive, and that a second
-        // trip changes nothing further — otherwise history would drift a
-        // little every time it was reloaded.
-        assert_eq!(loaded.len(), original.len());
-        assert_eq!(last_messages_text(&loaded, 2), last_messages_text(&original, 2));
-
-        save_history(&s, c, &loaded).unwrap();
-        let again = load_history(&s, c, HISTORY_CAP).unwrap();
-        assert_eq!(again, loaded, "reloading must reach a fixed point");
+    fn the_gate_answers_from_memory_alone() {
+        // Not a style point. The gate runs on every update, including from
+        // people who were never invited, so a store read here means anyone
+        // who finds the bot can make it do disk work by typing at it. That
+        // is why the member set is cached in the first place.
+        let src = include_str!("bot.rs");
+        let start = src.find("fn is_member_id").expect("the gate must exist");
+        let end = src[start..].find("\n}").expect("the gate must end") + start;
+        let body = &src[start..end];
+        assert!(!body.contains("store"), "the gate must not touch the store");
+        assert!(!body.contains(".await"), "the gate must not await anything");
     }
 
-    #[test]
-    fn saving_replaces_rather_than_appends() {
-        let (s, _d) = crate::store::tests::test_store();
-        let a = s.account_for_telegram(11).unwrap();
-        let c = s.start_conversation(a, "direct").unwrap();
 
-        save_history(&s, c, &[LlmMessage::user("one"), LlmMessage::assistant("two")]).unwrap();
-        // trim_history can drop from the front; the store must follow it
-        // down rather than keeping the messages the agent will never see.
-        save_history(&s, c, &[LlmMessage::assistant("two")]).unwrap();
 
-        let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
-        assert_eq!(loaded.len(), 1, "a trimmed history must not grow back");
-    }
-
-    #[test]
-    fn a_scope_string_separates_a_group_from_a_private_chat() {
-        assert_eq!(conversation_scope(4242, 4242), "direct");
-        assert_eq!(conversation_scope(-100123, 4242), "telegram:-100123");
-    }
 
     use super::{thumbs_up_added, ChatSession, SENT_REPLY_CAP};
     use dashmap::DashMap;
@@ -2186,29 +1331,17 @@ mod tests {
 
     #[test]
     fn session_expiry_boundary() {
-        use super::{session_expired, SESSION_TTL};
+        use super::session_expired;
         use std::time::Instant;
         let now = Instant::now();
         assert!(!session_expired(None, now), "first contact is never stale");
-        assert!(!session_expired(Some(now - SESSION_TTL / 2), now));
+        assert!(!session_expired(Some(now - crate::session::SESSION_TTL / 2), now));
         assert!(session_expired(
-            Some(now - SESSION_TTL - std::time::Duration::from_secs(1)),
+            Some(now - crate::session::SESSION_TTL - std::time::Duration::from_secs(1)),
             now
         ));
     }
 
-    #[test]
-    fn last_messages_text_renders_roles_and_takes_tail() {
-        use super::last_messages_text;
-        let history = vec![
-            user_text("oldest question"),
-            assistant_text("oldest answer"),
-            user_text("find me a bike"),
-            assistant_text("here are 3 bikes"),
-        ];
-        let excerpt = last_messages_text(&history, 2);
-        assert_eq!(excerpt, "user: find me a bike\nassistant: here are 3 bikes");
-    }
 
     #[test]
     fn chat_key_isolates_session_state_per_user() {
@@ -2255,7 +1388,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let now = Instant::now();
-        let stale = now - SESSION_TTL - Duration::from_secs(1);
+        let stale = now - crate::session::SESSION_TTL - Duration::from_secs(1);
 
         // Aged out with history: hand it back for the continuation check,
         // and drop the draft — a photo drafted before the gap must not be
@@ -2273,7 +1406,7 @@ mod tests {
         // Still inside the TTL: nothing is touched.
         let mut chat = ChatSession {
             pending_draft: Some("USB hub, 4-port, black".to_string()),
-            last_seen: Some(now - SESSION_TTL / 2),
+            last_seen: Some(now - crate::session::SESSION_TTL / 2),
         };
         assert!(!take_expired_session(&mut chat, now));
         assert_eq!(chat.pending_draft.as_deref(), Some("USB hub, 4-port, black"));
@@ -2341,110 +1474,16 @@ mod tests {
         assert!(problem.contains("3500"), "got: {problem}");
         assert!(check_advert(&"x".repeat(3500)).is_ok());
     }
-    use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
-    use rig::message::ToolCall;
-    use rig::one_or_many::OneOrMany;
 
-    fn user_text(s: &str) -> LlmMessage {
-        LlmMessage::user(s)
-    }
 
-    fn assistant_text(s: &str) -> LlmMessage {
-        LlmMessage::assistant(s)
-    }
 
-    fn assistant_tool_call(id: &str, name: &str) -> LlmMessage {
-        LlmMessage::Assistant {
-            id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
-                id.to_string(),
-                rig::message::ToolFunction {
-                    name: name.to_string(),
-                    arguments: serde_json::json!({}),
-                },
-            ))),
-        }
-    }
 
-    fn tool_result(id: &str) -> LlmMessage {
-        LlmMessage::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: id.to_string(),
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::text("result")),
-            })),
-        }
-    }
 
-    #[test]
-    fn under_cap_is_untouched() {
-        let mut history = vec![user_text("hi"), assistant_text("hello")];
-        let original = history.clone();
-        trim_history(&mut history, 10);
-        assert_eq!(history, original);
-    }
 
-    #[test]
-    fn at_cap_is_untouched() {
-        let mut history = vec![user_text("hi"), assistant_text("hello")];
-        let original = history.clone();
-        trim_history(&mut history, 2);
-        assert_eq!(history, original);
-    }
 
-    #[test]
-    fn over_cap_trims_to_cap_and_starts_on_plain_user_text() {
-        // Clean exchanges only, so the cap boundary itself lands on a user
-        // text message - no further trimming needed.
-        let mut history = vec![
-            user_text("q1"),
-            assistant_text("a1"),
-            user_text("q2"),
-            assistant_text("a2"),
-            user_text("q3"),
-            assistant_text("a3"),
-        ];
-        trim_history(&mut history, 4);
-        assert!(history.len() <= 4);
-        assert!(is_plain_user_text(&history[0]), "got: {:?}", history[0]);
-        assert_eq!(history.last(), Some(&assistant_text("a3")));
-    }
 
-    #[test]
-    fn drain_landing_on_tool_result_trims_forward_to_next_user_text() {
-        // Cap of 4 lands the drain boundary right on the tool-result message
-        // (index 2), which must not be kept as the new head.
-        let mut history = vec![
-            user_text("q1"),                        // 0 - dropped by cap
-            assistant_tool_call("call-1", "search"), // 1 - dropped by cap
-            tool_result("call-1"),                   // 2 - would be new head; orphaned, must drop
-            assistant_text("a1"),                    // 3 - also orphaned (no leading user turn)
-            user_text("q2"),                         // 4 - first safe head
-            assistant_text("a2"),                    // 5
-        ];
-        trim_history(&mut history, 4);
-        assert_eq!(history, vec![user_text("q2"), assistant_text("a2")]);
-        assert!(is_plain_user_text(&history[0]));
-    }
 
-    #[test]
-    fn the_turn_limit_is_recognised_however_rig_wraps_it() {
-        // Exactly what production logged when a user was left hanging.
-        assert!(is_max_turns(&"PromptError: MaxTurnsError: reached max turns limit: 12"));
-        assert!(is_max_turns(&"reached max turns limit: 16"));
-        assert!(!is_max_turns(&"kagi api error (status 401): bad key"));
-        assert!(!is_max_turns(&"perplexity request failed: timed out"));
-    }
 
-    #[test]
-    fn wrap_up_notes_keep_the_newest_findings() {
-        let notes = format!("{}\nconfirmed: 44.99 EUR for 9 kg", "old chatter ".repeat(500));
-        let kept = tail_chars(&notes, 60);
-        assert_eq!(kept.chars().count(), 60);
-        assert!(kept.ends_with("confirmed: 44.99 EUR for 9 kg"), "got: {kept}");
-        // shorter than the cap: untouched
-        assert_eq!(tail_chars("short", 60), "short");
-    }
 
     #[test]
     fn price_requests_are_recognised_across_languages() {
@@ -2495,54 +1534,7 @@ mod tests {
         assert_eq!(retry_delay(&other), Some(RETRY_PAUSE));
     }
 
-    #[test]
-    fn no_safe_head_after_drain_falls_back_to_the_text_of_the_conversation() {
-        // Not empty: an answer with nothing to anchor it is still worth
-        // keeping, and dropping it is how a reply becomes "I don't have a
-        // recent search in our conversation".
-        let mut history = vec![
-            assistant_tool_call("call-1", "search"),
-            tool_result("call-1"),
-            assistant_text("final answer"),
-        ];
-        trim_history(&mut history, 1);
-        assert_eq!(history.len(), 1);
-        assert!(matches!(&history[0], LlmMessage::Assistant { .. }));
-    }
 
-    #[test]
-    fn one_turn_of_heavy_tool_use_does_not_erase_the_conversation() {
-        // Measured in production: a four-leg trip search ran twelve searches
-        // in one turn. Twenty-five messages of tool traffic pushed the
-        // user's own message out of the capped window, no plain user text
-        // was left to start from, and the whole history was cleared. The
-        // next reply was "I don't have a recent flight search in our
-        // conversation" — with the search still on screen above it.
-        let mut history = vec![
-            user_text("flights to Japan via Hong Kong"),
-            assistant_text("let me look"),
-            user_text("around 15 September"),
-        ];
-        for i in 0..12 {
-            history.push(assistant_tool_call(&format!("call-{i}"), "search_flights"));
-            history.push(tool_result(&format!("call-{i}")));
-        }
-        history.push(assistant_text("AMS to HKG on Etihad, EUR 369.94"));
-
-        trim_history(&mut history, HISTORY_CAP);
-
-        assert!(!history.is_empty(), "a turn must not be able to erase the conversation");
-        assert!(
-            is_plain_user_text(&history[0]),
-            "whatever survives still has to start somewhere a provider accepts"
-        );
-        // The substance survives even though the tool traffic does not.
-        let text = format!("{history:?}");
-        assert!(text.contains("Hong Kong"), "the question is still there: {text}");
-        assert!(text.contains("369.94"), "and so is the answer: {text}");
-        assert!(!text.contains("ToolCall"), "but the tool calls are gone");
-        assert!(!text.contains("ToolResult"), "and so are their results");
-    }
 
     #[test]
     fn start_is_recognised_across_every_form_telegram_sends() {
@@ -2574,88 +1566,10 @@ mod tests {
         assert_eq!(join_code("find me a bike"), None);
     }
 
-    #[test]
-    fn round_names_are_held_to_what_an_invite_link_can_carry() {
-        // Telegram start parameters are 1-64 of A-Za-z0-9_-. Refused where
-        // it is typed, rather than discovered when nobody can join.
-        assert_eq!(check_round_name(Some("autumn-drop_2")).unwrap(), "autumn-drop_2");
-        assert_eq!(check_round_name(Some(&"a".repeat(64))).unwrap().len(), 64);
 
-        assert!(check_round_name(None).is_err());
-        assert!(check_round_name(Some("")).is_err());
-        assert!(check_round_name(Some("   ")).is_err());
-        assert!(check_round_name(Some(&"a".repeat(65))).is_err());
-        for bad in ["autumn drop", "autumn.drop", "осень", "autumn/drop", "autumn?x=1"] {
-            assert!(check_round_name(Some(bad)).is_err(), "accepted: {bad}");
-        }
-    }
 
-    #[test]
-    fn capacity_defaults_to_a_hundred_and_refuses_nonsense() {
-        assert_eq!(
-            parse_invite("new autumn").unwrap(),
-            InviteCmd::New { code: "autumn".to_string(), capacity: 100 }
-        );
-        assert_eq!(
-            parse_invite("new autumn 250").unwrap(),
-            InviteCmd::New { code: "autumn".to_string(), capacity: 250 }
-        );
-        assert!(parse_invite("new autumn lots").is_err());
-        assert!(parse_invite("new autumn 0").is_err(), "a round with no seats admits nobody");
-        assert!(parse_invite("new autumn -5").is_err());
-    }
 
-    #[test]
-    fn invite_subcommands_parse_and_a_stray_word_is_refused() {
-        assert_eq!(parse_invite("status").unwrap(), InviteCmd::Status);
-        assert_eq!(parse_invite("  STATUS ").unwrap(), InviteCmd::Status);
-        assert_eq!(
-            parse_invite("open autumn").unwrap(),
-            InviteCmd::SetOpen { code: "autumn".to_string(), open: true }
-        );
-        assert_eq!(
-            parse_invite("close autumn").unwrap(),
-            InviteCmd::SetOpen { code: "autumn".to_string(), open: false }
-        );
-        assert_eq!(
-            parse_invite("announce autumn").unwrap(),
-            InviteCmd::Announce("autumn".to_string())
-        );
 
-        // Nothing at all, an unknown verb, and a missing name all say how
-        // to use it rather than doing something surprising.
-        for bad in ["", "   ", "delete autumn", "open", "announce", "new"] {
-            assert!(parse_invite(bad).is_err(), "accepted: {bad:?}");
-        }
-        // A trailing word is a typo. Ignoring it is how "/invite new autumn
-        // 100 seats" opens a round nobody meant.
-        assert!(parse_invite("new autumn 100 seats").is_err());
-        assert!(parse_invite("status now").is_err());
-    }
-
-    #[test]
-    fn a_kick_needs_a_real_user_id() {
-        assert_eq!(parse_user_id(" 123456 ").unwrap(), 123456);
-        for bad in ["", "  ", "@watchcat", "0", "-1", "12.5"] {
-            assert!(parse_user_id(bad).is_err(), "accepted: {bad:?}");
-        }
-    }
-
-    #[test]
-    fn the_announce_asks_for_the_command_because_a_link_would_not_work() {
-        // Everyone on the waitlist has chat history with Scout — being
-        // turned away is itself a message — and Telegram only delivers a
-        // start payload through the START button, which only appears in an
-        // empty chat. A link here would open a chat and carry nothing.
-        let out = announce_message("autumn-drop");
-        assert!(out.contains("/start autumn-drop"), "got: {out}");
-        assert!(
-            !out.contains("t.me/"),
-            "a link is the one route this audience cannot use: {out}"
-        );
-        // Tap-to-copy, so nobody has to retype a code by hand.
-        assert!(out.contains("<code>/start autumn-drop</code>"), "got: {out}");
-    }
 
     #[test]
     fn a_stranger_is_told_the_route_that_still_works_for_them() {
@@ -2670,36 +1584,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn opening_a_round_gives_the_link_and_the_command_it_falls_back_to() {
-        let reply = new_round_reply("autumn", 100, Some("scout_bot"));
-        assert!(reply.contains("https://t.me/scout_bot?start=autumn"), "got: {reply}");
-        assert!(reply.contains("/start autumn"), "got: {reply}");
-        assert!(reply.contains("100"));
 
-        // get_me can blip. Losing the round over it would be worse than a
-        // reply without a link, so the round is still open and the code is
-        // still in the message.
-        let reply = new_round_reply("autumn", 100, None);
-        assert!(reply.contains("autumn"), "got: {reply}");
-        assert!(reply.contains("/start autumn"), "got: {reply}");
-    }
-
-    #[test]
-    fn status_shows_seats_capacity_and_the_queue() {
-        use crate::store::RoundStatus;
-        let rounds = vec![
-            RoundStatus { code: "autumn".into(), capacity: 100, used: 100, open: true },
-            RoundStatus { code: "winter".into(), capacity: 50, used: 3, open: false },
-        ];
-        let out = status_report(&rounds, 12);
-        assert!(out.contains("autumn — 100/100 seats, open"), "got: {out}");
-        assert!(out.contains("winter — 3/50 seats, closed"), "got: {out}");
-        assert!(out.contains("12 waiting"), "got: {out}");
-
-        let empty = status_report(&[], 0);
-        assert!(empty.contains("/invite new"), "got: {empty}");
-    }
 
     #[test]
     fn broadcast_pacing_stays_under_telegrams_bulk_limit() {

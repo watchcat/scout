@@ -346,3 +346,60 @@ mod tests {
     }
 }
 
+
+/// The `/stat` answer as text.
+///
+/// Resolves the caller's Telegram id to an account before querying anything.
+/// Everything the store counts is keyed by account, and passing a Telegram id
+/// where an account id belongs matches nothing at all — which is exactly what
+/// happened between the accounts migration and this function existing.
+///
+/// `everyone` is refused for a non-admin here rather than in the adapter,
+/// because the web app must not be able to ask for it either. Both reads take
+/// the same branch, so a non-admin cannot see another person's flight
+/// spending either.
+pub async fn report(core: &crate::core::Core, telegram_id: i64, arg: &str) -> String {
+    let days = match parse_days(arg) {
+        Ok(days) => days,
+        Err(e) => return format!("{e} — usage: /stat [1-90]"),
+    };
+    let store = core.store();
+    let account_id = match crate::core::blocking(move || store.account_for_telegram(telegram_id)).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, telegram_id, "could not resolve an account for /stat");
+            return "Sorry, couldn't compute stats.".to_string();
+        }
+    };
+
+    let admin = core.is_admin(telegram_id);
+    let today = chrono::Local::now().date_naive();
+    let cutoff = format!(
+        "{} 00:00:00",
+        today - chrono::Duration::days(i64::from(days) - 1)
+    );
+
+    let store = core.store();
+    let data = crate::core::blocking(move || {
+        let (rows, flights) = if admin {
+            (store.usage_stats_all(&cutoff)?, store.flight_searches_all(&cutoff)?)
+        } else {
+            (
+                store.usage_stats_for(&cutoff, account_id)?,
+                store.flight_searches_for(&cutoff, account_id)?,
+            )
+        };
+        Ok((rows, store.display_names()?, flights))
+    })
+    .await;
+
+    match data {
+        Ok((rows, names, flights)) => {
+            format_stats(&rows, days, today, account_id, &names, &flights)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "usage stats query failed");
+            "Sorry, couldn't compute stats.".to_string()
+        }
+    }
+}

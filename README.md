@@ -239,7 +239,7 @@ lives in the `scout-data` volume and survives rebuilds.
 ## How it works
 
 ```
-Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 23 tools
+Telegram ──► bot.rs ──► core ──► rig agent ──────► 23 tools
                 │                                    │
                 │  streams progress + answer         ├─ search_web        Kagi + Perplexity, merged
                 │  back into one edited message      ├─ search_secondhand eBay / Marktplaats / Vinted
@@ -271,13 +271,20 @@ Telegram ──► bot.rs ──► rig agent (MiniMax M3) ──► 23 tools
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **430 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **438 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,
 and the row counts were compared either side.
 
-Roughly 23,400 lines of Rust across 31 focused modules.
+`bot.rs` is now only the Telegram adapter: it parses commands, streams the
+answer into one edited message, and delivers. It holds no database handle and
+calls no store method. Everything that answers a question sits behind `core`,
+which knows nothing about chats or `ChatId`s and asks MiniMax M3 through
+`rig`. That arrow is where a second front end goes — a web app can talk to the
+same core without either side learning about the other.
+
+Roughly 23,900 lines of Rust across 35 focused modules.
 
 ---
 
@@ -343,7 +350,7 @@ Roughly 23,400 lines of Rust across 31 focused modules.
 ## Development
 
 ```bash
-cargo test                  # 430 tests, no network needed
+cargo test                  # 438 tests, no network needed
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

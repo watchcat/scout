@@ -239,6 +239,146 @@ pub fn advert_targets(store: &Store) -> anyhow::Result<Vec<(i64, i64)>> {
     store.broadcast_targets()
 }
 
+
+/// Runs an invite command and returns what to say about it.
+///
+/// Returns text rather than sending it: core has no channel, and the web app
+/// will want this same answer rendered differently.
+///
+/// `bot_username` is supplied by the caller because it is a fact about a
+/// channel, not about Scout. Only `New` uses it, and a reply without a link
+/// is better than losing a round because a username lookup blipped.
+///
+/// The admin check is here as well as in the adapter. The adapter's is a
+/// courtesy that saves a round trip; this one is the actual gate, because in
+/// 2b-2 the caller is across a network and may be the web app.
+pub async fn invite(
+    core: &Core,
+    admin_telegram_id: i64,
+    cmd: InviteCmd,
+    bot_username: Option<&str>,
+) -> String {
+    if !core.is_admin(admin_telegram_id) {
+        return NOT_ADMIN.to_string();
+    }
+    let store = core.store();
+    match cmd {
+        InviteCmd::New { code, capacity } => {
+            let created = {
+                let (store, code) = (store.clone(), code.clone());
+                crate::core::blocking(move || store.create_round(&code, capacity)).await
+            };
+            match created {
+                Err(e) => {
+                    tracing::error!(error = %e, code, "could not open a round");
+                    "Sorry, I couldn't open that round.".to_string()
+                }
+                Ok(false) => format!(
+                    "There is already a round called \"{code}\". \
+                     Pick another name — reusing one would pool two rounds' \
+                     seats under a single capacity."
+                ),
+                Ok(true) => new_round_reply(&code, capacity, bot_username),
+            }
+        }
+        InviteCmd::Status => {
+            let status =
+                crate::core::blocking(move || Ok((store.rounds()?, store.waiting_count()?))).await;
+            match status {
+                Ok((rounds, waiting)) => status_report(&rounds, waiting),
+                Err(e) => {
+                    tracing::error!(error = %e, "could not read invite status");
+                    "Sorry, I couldn't read the rounds.".to_string()
+                }
+            }
+        }
+        InviteCmd::SetOpen { code, open } => {
+            let changed = {
+                let code = code.clone();
+                crate::core::blocking(move || store.set_round_open(&code, open)).await
+            };
+            match changed {
+                Err(e) => {
+                    tracing::error!(error = %e, code, "could not change a round");
+                    "Sorry, I couldn't change that round.".to_string()
+                }
+                Ok(false) => format!("There's no round called \"{code}\"."),
+                Ok(true) if open => format!("Round \"{code}\" is admitting again."),
+                Ok(true) => format!(
+                    "Round \"{code}\" is closed. Its seats stay spent; \
+                     /invite open {code} resumes it."
+                ),
+            }
+        }
+        // Announcing needs a channel to send on, so the adapter handles it
+        // through plan_announcement instead. Reaching here means a caller
+        // routed it wrongly.
+        InviteCmd::Announce(_) => {
+            "Announcing needs a channel to send on.".to_string()
+        }
+    }
+}
+
+/// What a `/kick` or `/unkick` did.
+///
+/// `membership` is what the caller's cache should now say about this
+/// Telegram id: `Some(true)` in, `Some(false)` out, `None` unchanged. Core
+/// keeps no cache — the table is the record — but the adapter's gate does,
+/// and it has to follow.
+pub struct KickOutcome {
+    pub reply: String,
+    pub membership: Option<bool>,
+}
+
+/// Revokes (`kicking`) or restores a member named by Telegram id.
+pub async fn kick(
+    core: &Core,
+    admin_telegram_id: i64,
+    arg: &str,
+    kicking: bool,
+) -> KickOutcome {
+    let no_change = |reply: String| KickOutcome { reply, membership: None };
+    if !core.is_admin(admin_telegram_id) {
+        return no_change(NOT_ADMIN.to_string());
+    }
+    let target = match parse_user_id(arg) {
+        Ok(t) => t,
+        Err(problem) => return no_change(problem),
+    };
+    let store = core.store();
+    let changed = crate::core::blocking(move || match kicking {
+        true => store.revoke(store.account_for_telegram(target)?),
+        false => store.restore(store.account_for_telegram(target)?),
+    })
+    .await;
+    match changed {
+        Err(e) => {
+            tracing::error!(error = %e, target, kicking, "membership change failed");
+            no_change("Sorry, I couldn't write that down, so nothing changed.".to_string())
+        }
+        Ok(true) if kicking => KickOutcome {
+            reply: format!(
+                "{target} is out. Their seat stays spent, so the round \
+                 does not quietly reopen."
+            ),
+            membership: Some(false),
+        },
+        Ok(true) => KickOutcome {
+            reply: format!("{target} is back in. That consumed no seat."),
+            membership: Some(true),
+        },
+        Ok(false) if kicking => no_change(format!(
+            "{target} isn't a member, so there's nothing to remove. \
+             Founders listed in ALLOWED_TELEGRAM_USER_IDS aren't \
+             members — remove those from .env instead."
+        )),
+        Ok(false) => no_change(format!(
+            "{target} isn't a revoked member, so there's nothing to undo."
+        )),
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,143 +569,5 @@ mod tests {
 
         let empty = status_report(&[], 0);
         assert!(empty.contains("/invite new"), "got: {empty}");
-    }
-}
-
-/// Runs an invite command and returns what to say about it.
-///
-/// Returns text rather than sending it: core has no channel, and the web app
-/// will want this same answer rendered differently.
-///
-/// `bot_username` is supplied by the caller because it is a fact about a
-/// channel, not about Scout. Only `New` uses it, and a reply without a link
-/// is better than losing a round because a username lookup blipped.
-///
-/// The admin check is here as well as in the adapter. The adapter's is a
-/// courtesy that saves a round trip; this one is the actual gate, because in
-/// 2b-2 the caller is across a network and may be the web app.
-pub async fn invite(
-    core: &Core,
-    admin_telegram_id: i64,
-    cmd: InviteCmd,
-    bot_username: Option<&str>,
-) -> String {
-    if !core.is_admin(admin_telegram_id) {
-        return NOT_ADMIN.to_string();
-    }
-    let store = core.store();
-    match cmd {
-        InviteCmd::New { code, capacity } => {
-            let created = {
-                let (store, code) = (store.clone(), code.clone());
-                crate::core::blocking(move || store.create_round(&code, capacity)).await
-            };
-            match created {
-                Err(e) => {
-                    tracing::error!(error = %e, code, "could not open a round");
-                    "Sorry, I couldn't open that round.".to_string()
-                }
-                Ok(false) => format!(
-                    "There is already a round called \"{code}\". \
-                     Pick another name — reusing one would pool two rounds' \
-                     seats under a single capacity."
-                ),
-                Ok(true) => new_round_reply(&code, capacity, bot_username),
-            }
-        }
-        InviteCmd::Status => {
-            let status =
-                crate::core::blocking(move || Ok((store.rounds()?, store.waiting_count()?))).await;
-            match status {
-                Ok((rounds, waiting)) => status_report(&rounds, waiting),
-                Err(e) => {
-                    tracing::error!(error = %e, "could not read invite status");
-                    "Sorry, I couldn't read the rounds.".to_string()
-                }
-            }
-        }
-        InviteCmd::SetOpen { code, open } => {
-            let changed = {
-                let code = code.clone();
-                crate::core::blocking(move || store.set_round_open(&code, open)).await
-            };
-            match changed {
-                Err(e) => {
-                    tracing::error!(error = %e, code, "could not change a round");
-                    "Sorry, I couldn't change that round.".to_string()
-                }
-                Ok(false) => format!("There's no round called \"{code}\"."),
-                Ok(true) if open => format!("Round \"{code}\" is admitting again."),
-                Ok(true) => format!(
-                    "Round \"{code}\" is closed. Its seats stay spent; \
-                     /invite open {code} resumes it."
-                ),
-            }
-        }
-        // Announcing needs a channel to send on, so the adapter handles it
-        // through plan_announcement instead. Reaching here means a caller
-        // routed it wrongly.
-        InviteCmd::Announce(_) => {
-            "Announcing needs a channel to send on.".to_string()
-        }
-    }
-}
-
-/// What a `/kick` or `/unkick` did.
-///
-/// `membership` is what the caller's cache should now say about this
-/// Telegram id: `Some(true)` in, `Some(false)` out, `None` unchanged. Core
-/// keeps no cache — the table is the record — but the adapter's gate does,
-/// and it has to follow.
-pub struct KickOutcome {
-    pub reply: String,
-    pub membership: Option<bool>,
-}
-
-/// Revokes (`kicking`) or restores a member named by Telegram id.
-pub async fn kick(
-    core: &Core,
-    admin_telegram_id: i64,
-    arg: &str,
-    kicking: bool,
-) -> KickOutcome {
-    let no_change = |reply: String| KickOutcome { reply, membership: None };
-    if !core.is_admin(admin_telegram_id) {
-        return no_change(NOT_ADMIN.to_string());
-    }
-    let target = match parse_user_id(arg) {
-        Ok(t) => t,
-        Err(problem) => return no_change(problem),
-    };
-    let store = core.store();
-    let changed = crate::core::blocking(move || match kicking {
-        true => store.revoke(store.account_for_telegram(target)?),
-        false => store.restore(store.account_for_telegram(target)?),
-    })
-    .await;
-    match changed {
-        Err(e) => {
-            tracing::error!(error = %e, target, kicking, "membership change failed");
-            no_change("Sorry, I couldn't write that down, so nothing changed.".to_string())
-        }
-        Ok(true) if kicking => KickOutcome {
-            reply: format!(
-                "{target} is out. Their seat stays spent, so the round \
-                 does not quietly reopen."
-            ),
-            membership: Some(false),
-        },
-        Ok(true) => KickOutcome {
-            reply: format!("{target} is back in. That consumed no seat."),
-            membership: Some(true),
-        },
-        Ok(false) if kicking => no_change(format!(
-            "{target} isn't a member, so there's nothing to remove. \
-             Founders listed in ALLOWED_TELEGRAM_USER_IDS aren't \
-             members — remove those from .env instead."
-        )),
-        Ok(false) => no_change(format!(
-            "{target} isn't a revoked member, so there's nothing to undo."
-        )),
     }
 }

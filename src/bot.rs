@@ -46,10 +46,6 @@ pub struct App {
 /// (which carry only a message id) can be resolved back to their text.
 const SENT_REPLY_CAP: usize = 30;
 
-/// A chat quiet for longer than this starts a fresh session on the next
-/// message; for text messages an LLM check may restore the old context if
-/// the new message continues the same topic.
-
 /// Key for the per-(chat,user) session map. Extracted here so the same
 /// tuple is built everywhere; in 1:1 chats the same value is reused.
 fn chat_key(chat_id: i64, user_id: i64) -> (i64, i64) {
@@ -1378,7 +1374,6 @@ mod tests {
     #[test]
     fn session_expiry_boundary() {
         use super::session_expired;
-        use crate::session::SESSION_TTL;
         use std::time::Instant;
         let now = Instant::now();
         assert!(!session_expired(None, now), "first contact is never stale");
@@ -1521,9 +1516,6 @@ mod tests {
         assert!(problem.contains("3500"), "got: {problem}");
         assert!(check_advert(&"x".repeat(3500)).is_ok());
     }
-    use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
-    use rig::message::ToolCall;
-    use rig::one_or_many::OneOrMany;
 
 
 

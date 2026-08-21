@@ -562,15 +562,18 @@ Use the variable name `config.rs` actually reads — check
 Run: `cargo test`
 Expected: 440 passed, 3 ignored, split across three test binaries.
 
-Then confirm the boundary holds where it counts:
+Then confirm the boundary holds where it counts. Ask about the *modules*, not
+about type names — a capitalised `Store` misses `store::Claim`, which is
+exactly what `bot.rs` reaches for:
 
 ```bash
-grep -n "Store\|AgentDeps\|duckdb\|kagi\|rig::" src/*.rs
+grep -rn "scout_core::store\|scout_core::agent\|scout_core::tools" src/
 ```
 
-Expected: `src/scheduler.rs` and nothing else. It legitimately still holds a
-`Store` — Task 5 is what removes that, and Task 5 is what then makes the
-module private.
+Expected after this task: `src/scheduler.rs:3` (`use scout_core::store::Store`)
+and `src/bot.rs:354,367,376,379` (`scout_core::store::Claim`). Both are
+legitimate today and both are gone by the end of Task 5. Anything else
+listed means `main.rs` did not give up something it should have.
 
 - [ ] **Step 8: Commit**
 
@@ -695,30 +698,60 @@ file. Update `src/main.rs:154` to
 `tokio::spawn(scheduler::run(telegram.clone(), core.clone()))`, which also
 removes `main.rs`'s last mention of `store`.
 
-- [ ] **Step 6: Shut the door**
+- [ ] **Step 6: Give the adapter a name for a claim that is not the store's**
 
-Nothing outside `scout-core` names `Store` or `AgentDeps` any more, so in
-`crates/scout-core/src/lib.rs`:
+`src/bot.rs:354-379` matches on `scout_core::store::Claim` — the outcome of
+someone pressing START with an invite code. `invites::claim` returns it, so
+the adapter is naming a type it gets from `invites` through a module that is
+about to be private.
+
+Re-export it from where the adapter actually gets it, in
+`crates/scout-core/src/invites.rs`:
+
+```rust
+/// What claiming a seat did. Defined next to the table it is read from,
+/// re-exported here because this is where a channel meets it.
+pub use crate::store::Claim;
+```
+
+Then `src/bot.rs` names `scout_core::invites::Claim`. Four lines change.
+
+This is not tidying — Step 7 does not compile without it.
+
+- [ ] **Step 7: Shut the door**
+
+Nothing outside `scout-core` names `Store`, `AgentDeps` or any `tools::`
+client any more. In `crates/scout-core/src/lib.rs`:
 
 ```rust
 mod agent;
 mod store;
+mod tools;
 ```
+
+`tools` joins them because Task 4 moved the last outside caller — every
+client constructor `main.rs` used now lives in `Core::start`. That is about
+330 public items becoming crate-internal in one line.
 
 `Core::store()` becomes `pub(crate)` in the same edit, or the private module
 leaks straight back out through the return type — the compiler says so
 plainly, `private type in public interface`.
 
 This is the commit the whole phase exists for. Everything before it moved
-code; this line is what makes the boundary hold.
+code; these three lines are what make the boundary hold.
 
-- [ ] **Step 7: Verify the adapter is clean**
+If `mod tools;` does not compile, do not force it — report which caller
+still needs it and leave `pub mod tools;`. Being wrong about that costs
+nothing; guessing at a fix costs the phase its meaning.
+
+- [ ] **Step 8: Verify the adapter is clean**
 
 ```bash
-grep -rn "Store\|AgentDeps\|duckdb\|chrono" src/
+grep -rn "scout_core::store\|scout_core::agent\|scout_core::tools" src/
+grep -rn "AgentDeps\|duckdb\|chrono" src/
 ```
 
-Expected: no output.
+Expected: no output from either.
 
 - [ ] **Step 8: Run the tests and commit**
 
@@ -746,10 +779,55 @@ mkdir -p crates/scout-telegram
 git mv src crates/scout-telegram/src
 ```
 
-- [ ] **Step 2: Split the manifest in two**
+- [ ] **Step 2: Move the two modules that landed on the wrong side**
+
+Two things went into `scout-core` with the rest of the move and do not
+belong there. Both are cheap now and expensive after 2b-2b, when moving them
+means changing a wire format:
+
+**`draft.rs`** has exactly one consumer in the workspace — `src/bot.rs` —
+and nothing in `scout-core` touches it. Its own constants say why:
+`CONFIRM_WORDS` and `CANCEL_WORDS` exist to match the Go and Cancel buttons
+on a Telegram reply keyboard. That is chat-UI grammar.
+
+```bash
+git mv crates/scout-core/src/draft.rs crates/scout-telegram/src/draft.rs
+```
+
+Drop `pub mod draft;` from `scout-core`'s `lib.rs`, add `mod draft;` to the
+adapter's `main.rs`, and rewrite `scout_core::draft::` back to `crate::draft::`
+in `bot.rs`.
+
+**`text.rs`** is two unrelated modules sharing a file, and the crate boundary
+runs through the middle of it:
+
+| Item | Used by |
+|---|---|
+| `strip_thinking` | `agent.rs`, `run.rs`, `vision.rs` — core only |
+| `TELEGRAM_LIMIT`, `split_message` | `bot.rs`, `progress.rs` — adapter only |
+
+`strip_thinking` is model-output hygiene and stays in core. The other two are
+Telegram message chunking — the constant is named after Telegram — and move
+to `crates/scout-telegram/src/text.rs`. Move each item's tests with it.
+
+If anything else in `text.rs` does not fall cleanly on one side, stop and
+report it rather than guessing.
+
+- [ ] **Step 3: Split the manifest in two**
 
 `crates/scout-telegram/Cargo.toml` takes the current root package's
-`[dependencies]` and `[dev-dependencies]` verbatim, with:
+`[dependencies]` and `[dev-dependencies]`, **minus the three that no longer
+have a single reference in the adapter's source**: `serde`, and the
+dev-dependencies `wiremock` and `tempfile`. All three followed the core
+modules into `scout-core`. Verify before deleting:
+
+```bash
+grep -rw "serde\|wiremock\|tempfile" crates/scout-telegram/src/
+```
+
+Expected: no output. Keep `serde_json`, which is still used.
+
+With:
 
 ```toml
 [package]
@@ -769,13 +847,17 @@ resolver = "2"
 members = ["crates/scout-api", "crates/scout-core", "crates/scout-telegram"]
 ```
 
-- [ ] **Step 3: Run the tests**
+- [ ] **Step 4: Run the tests**
 
-Run: `cargo test`
+Run: `cargo test --workspace`
 Expected: 441 passed, 3 ignored. `Cargo.lock` changes — the package renamed —
 and stays at the repository root.
 
-- [ ] **Step 4: Commit**
+From this task onward plain `cargo test` also covers everything, because the
+root manifest is finally virtual: a workspace with no root package tests all
+its members by default. Task 7 relies on that.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -821,6 +903,12 @@ Replace `src` with `crates` in each:
 if [ -n "$(git status --porcelain -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile)" ]; then
 ```
 
+Also make `scripts/deploy.sh:50` explicit — `cargo test --quiet` becomes
+`cargo test --workspace --quiet`. It is already equivalent once the root
+manifest is virtual, but a deploy gate should say what it means rather than
+depend on a manifest property one edit away from changing. Between Tasks 1
+and 6 that command was silently testing one crate out of three.
+
 - [ ] **Step 3: Dry-run the deploy**
 
 Run: `scripts/deploy.sh --dry-run`
@@ -851,11 +939,16 @@ git commit -m "build: the image builds a workspace"
 echo "adapter lines:      $(cat crates/scout-telegram/src/*.rs | wc -l)"
 echo "adapter deps:       $(cargo tree -p scout-telegram --depth 1 | tail -n +2 | wc -l)"
 echo "duckdb in adapter:  $(grep -rc duckdb crates/scout-telegram/src/ | grep -v ':0' | wc -l)"
-echo "store in adapter:   $(grep -rn 'Store' crates/scout-telegram/src/ | wc -l)"
+echo "core internals:     $(grep -rn 'scout_core::store\|scout_core::agent\|scout_core::tools' crates/scout-telegram/src/ | wc -l)"
 ```
 
-Expected: `duckdb in adapter` and `store in adapter` both `0`. Record the
+Expected: `duckdb in adapter` and `core internals` both `0`. Record the
 numbers in the completion report; they are the evidence the phase worked.
+
+Ask about module paths, not about `Store` with a capital S. The earlier
+version of this check looked for the type name and would have reported clean
+while `bot.rs` was matching on `store::Claim` — a real reach into a module
+about to become private, invisible to the grep meant to catch exactly that.
 
 - [ ] **Step 2: Prove the boundary is enforced, not just observed**
 
@@ -874,9 +967,19 @@ discipline as breaking a guard to watch a test go red.
 - [ ] **Step 3: Full verification**
 
 ```bash
-cargo test              # 441 passed, 3 ignored
-cargo clippy --all-targets   # silent
+cargo test --workspace       # 441 passed, 3 ignored
+CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets
 ```
+
+Clippy needs its own target directory on this machine, and the reason is
+worth knowing before it looks like a regression. `cargo` here is nix's
+(1.96.1) while `cargo-clippy` is rustup's (0.1.97, a 1.97 rustc). They
+disagree about the artifacts in `target/`, so clippy fails with
+`error[E0514]: found crate 'serde' compiled by an incompatible version of
+rustc`. Nothing to do with this branch — it surfaced only because the new
+crates forced dependencies to be re-checked. A separate target directory
+keeps the two toolchains out of each other's way at the cost of one slow
+first run.
 
 - [ ] **Step 4: Back up the database from inside the container**
 
@@ -925,3 +1028,37 @@ REQUIRED SUB-SKILL: superpowers:finishing-a-development-branch
   needs solving before core moves out.
 - **No delta events.** The protocol keeps cumulative text until there is a
   socket to justify changing it.
+
+## Found during the phase, deliberately not fixed here
+
+The code review after Task 3 turned up four things that are real and are not
+this plan's business. Recorded so they are known deferrals rather than
+rediscoveries:
+
+- **Core owns Telegram's `/invite` grammar.** `invites.rs` holds
+  `INVITE_USAGE` (literal slash-command help), `parse_invite` returning
+  user-facing English, `join_link` building a `t.me` URL, `announce_message`
+  emitting the `<code>` tag Telegram makes tap-to-copy, and `MAX_ROUND_NAME =
+  64` because that is Telegram's start-parameter limit. `bot.rs:1211` says
+  "parsing the wire format is the adapter's job"; the code does the opposite.
+  Core should own round lifecycle and hand back typed outcomes. **This wants
+  fixing before 2b-2b designs an endpoint**, because the easy endpoint is
+  `POST /v1/invite` taking a serialised `InviteCmd`, and that would freeze
+  one chat client's command grammar as the inter-service protocol.
+
+- **Every core entry point takes a `telegram_id`.** `log_request`,
+  `note_display_name`, `note_address`, `describe_photo`, `session::reset`,
+  `stats::report` and all of `invites` take a Telegram id and resolve it
+  internally. With one channel that is invisible. With two it is the `/stat`
+  id-space bug again — the exact bug this phase exists to make impossible.
+  Core should take `(channel, address)`. Belongs in 2b-2b, and belongs in
+  the spec's deferred list, which is where it now is.
+
+- **`stats.rs` returns Telegram-shaped text.** `NAME_WIDTH = 16` is sized for
+  a phone rendering `<pre>`. Over HTTP, core would ship pre-formatted chat
+  text to a browser that wanted numbers. 2b-2b, alongside the read endpoints.
+
+- **`plan_announcement` and `due_deliveries` are the same idea in two
+  shapes** — `Vec<(i64, i64)>` versus `DueDelivery { id, channel, address,
+  text }`. The second is right. Unify when 2b-2b designs both endpoints,
+  where the cost of two disagreeing shapes actually lands.

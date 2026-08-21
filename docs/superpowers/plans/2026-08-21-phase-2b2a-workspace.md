@@ -315,13 +315,12 @@ tokio = { version = "1", features = ["test-util"] }
 ```rust
 //! Everything that answers a question, and nothing about who asked it.
 //!
-//! `store` and `agent` are deliberately private. A channel that could name
-//! `Store` could query it, and the boundary would be back to being a
-//! convention. Everything a channel legitimately needs is a method on
-//! `Core`.
+//! `store` and `agent` become private in Task 5, once nothing outside this
+//! crate names them. A channel that can name `Store` can query it, and the
+//! boundary goes back to being a convention.
 
-mod agent;
-mod store;
+pub mod agent;
+pub mod store;
 
 pub mod config;
 pub mod core;
@@ -360,26 +359,29 @@ agent::AgentDeps;`, `use config::Config;` and `use store::Store;` become
 `scout_core::` paths, and the `mod` declarations for the moved modules are
 deleted, leaving only `mod bot; mod progress; mod scheduler;`.
 
-- [ ] **Step 6: Build and fix what falls out**
+- [ ] **Step 6: Build**
 
-Run: `cargo build 2>&1 | head -40`
+Run: `cargo build --workspace 2>&1 | head -40`
 
-Expected failures, all of them privacy errors from Step 3 rather than
-mistakes: `main.rs` names `Store`, `AgentDeps` and the `tools::*` client
-constructors, which is exactly the wiring Task 4 moves into `Core::start`. If
-the only errors are in `src/main.rs`, that is the expected state — go to
-Task 4 rather than trying to fix them here. Errors anywhere else mean a path
-was rewritten wrongly; fix those before continuing.
+This must succeed. Every module is `pub` for now, so the move is the only
+change and nothing has been taken away yet — `main.rs` still constructs
+`Store` and `AgentDeps` exactly as it does today, just through
+`scout_core::` paths. An error here means a path was rewritten wrongly.
 
-- [ ] **Step 7: Commit the state that does not build yet**
+The tightening comes later on purpose: Task 4 removes `main.rs`'s reasons to
+name those types, Task 5 removes the scheduler's, and only then does Task 5
+make the modules private. Privacy applied before the last caller is gone
+would mean two commits that do not build, which is a bad way to bisect.
 
-Committing a red tree is normally wrong. It is right here: Task 3 and Task 4
-are one change split for reviewability, and squashing them would hide which
-line of `main.rs` moved where.
+- [ ] **Step 7: Run the tests and commit**
+
+Run: `cargo test --workspace`
+Expected: 439 passed, 3 ignored — the same tests, now spread across three
+crates.
 
 ```bash
 git add -A
-git commit -m "refactor: core becomes a crate (main.rs does not compile yet)"
+git commit -m "refactor: core becomes a crate"
 ```
 
 ---
@@ -502,11 +504,6 @@ impl Core {
 
 `invite_daily_requests` is an `i64` (`src/config.rs:5-46`), not a `u32`.
 
-`Core::store()` also changes here: it is `pub` today and must become
-`pub(crate)`, or the private `store` module leaks straight back out through
-its return type. The compiler will say so — `private type in public
-interface` — if this is forgotten.
-
 - [ ] **Step 5: Make the fields private**
 
 In `crates/scout-core/src/core.rs`, `pub cfg` and `pub deps` become plain
@@ -566,8 +563,9 @@ Then confirm the boundary holds where it counts:
 grep -n "Store\|AgentDeps\|duckdb\|kagi\|rig::" src/*.rs
 ```
 
-Expected: no output. The scheduler is the exception and Task 5 removes it —
-if `src/scheduler.rs` is the only file listed, that is the expected state.
+Expected: `src/scheduler.rs` and nothing else. It legitimately still holds a
+`Store` — Task 5 is what removes that, and Task 5 is what then makes the
+module private.
 
 - [ ] **Step 8: Commit**
 
@@ -692,7 +690,24 @@ file. Update `src/main.rs:154` to
 `tokio::spawn(scheduler::run(telegram.clone(), core.clone()))`, which also
 removes `main.rs`'s last mention of `store`.
 
-- [ ] **Step 6: Verify the adapter is clean**
+- [ ] **Step 6: Shut the door**
+
+Nothing outside `scout-core` names `Store` or `AgentDeps` any more, so in
+`crates/scout-core/src/lib.rs`:
+
+```rust
+mod agent;
+mod store;
+```
+
+`Core::store()` becomes `pub(crate)` in the same edit, or the private module
+leaks straight back out through the return type — the compiler says so
+plainly, `private type in public interface`.
+
+This is the commit the whole phase exists for. Everything before it moved
+code; this line is what makes the boundary hold.
+
+- [ ] **Step 7: Verify the adapter is clean**
 
 ```bash
 grep -rn "Store\|AgentDeps\|duckdb\|chrono" src/
@@ -700,7 +715,7 @@ grep -rn "Store\|AgentDeps\|duckdb\|chrono" src/
 
 Expected: no output.
 
-- [ ] **Step 7: Run the tests and commit**
+- [ ] **Step 8: Run the tests and commit**
 
 Run: `cargo test`
 Expected: 441 passed, 3 ignored.

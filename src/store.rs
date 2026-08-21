@@ -1334,6 +1334,26 @@ impl Store {
 
     /// Last-seen display name per user id. Small enough to read whole —
     /// one row per person who has ever messaged the bot.
+    /// Accounts with a Telegram identity but no recorded display name, as
+    /// (account, telegram id).
+    ///
+    /// Both ids, because the caller needs the Telegram one to ask Telegram
+    /// and the account one to file the answer. Handing back only the account
+    /// id is what let a display-name backfill call `get_chat` on an account
+    /// id and mint a bogus identity from the result.
+    pub fn accounts_missing_display_names(&self, limit: usize) -> Result<Vec<(i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT i.account_id, CAST(i.external_id AS BIGINT)
+             FROM identities i
+             WHERE i.kind = 'telegram'
+               AND NOT EXISTS (SELECT 1 FROM users u WHERE u.account_id = i.account_id)
+             ORDER BY i.account_id ASC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     pub fn display_names(&self) -> Result<BTreeMap<i64, String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT account_id, display_name FROM users")?;
@@ -1982,6 +2002,38 @@ CREATE TABLE segment_candidates (
         .unwrap();
         drop(conn);
         (dir, path)
+    }
+
+    #[test]
+    fn missing_names_come_back_with_both_ids_because_they_are_different_numbers() {
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(8849043058).unwrap();
+        let b = s.account_for_telegram(1980797790).unwrap();
+        s.remember_user(a, "Ann").unwrap();
+
+        // Only b is missing, and it comes back as (account, telegram) — two
+        // very different numbers. An account id is a small counter; a
+        // Telegram id is ten digits. Using one where the other belongs
+        // matches nothing, silently.
+        let missing = s.accounts_missing_display_names(10).unwrap();
+        assert_eq!(missing, vec![(b, 1980797790)]);
+        assert_ne!(b, 1980797790, "the two id spaces must not be confused");
+
+        s.remember_user(b, "Bo").unwrap();
+        assert!(s.accounts_missing_display_names(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn usage_is_counted_by_account_not_by_telegram_id() {
+        let (s, _d) = test_store();
+        let account = s.account_for_telegram(8849043058).unwrap();
+        s.log_request(account, "text").unwrap();
+
+        let cutoff = "1970-01-01 00:00:00";
+        assert_eq!(s.usage_stats_for(cutoff, account).unwrap().len(), 1);
+        // The trap: a Telegram id here is a valid i64 and matches nothing,
+        // so /stat quietly reported an empty week instead of failing.
+        assert!(s.usage_stats_for(cutoff, 8849043058).unwrap().is_empty());
     }
 
     #[test]

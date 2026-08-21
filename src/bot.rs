@@ -505,59 +505,17 @@ async fn handle_command(
             bot.send_message(msg.chat.id, report).await?;
         }
         Command::Stat(arg) => {
-            let days = match crate::stats::parse_days(&arg) {
-                Ok(days) => days,
-                Err(e) => {
-                    bot.send_message(msg.chat.id, format!("{e} — usage: /stat [1-90]")).await?;
-                    return Ok(());
-                }
-            };
             let Some(user_id) = sender_id(&msg) else {
                 tracing::debug!("/stat from a message with no sender; ignoring");
                 return Ok(());
             };
-            // Admins see the whole bot; everyone else sees only themselves.
-            // This branch is the only place cross-user counts are reachable.
-            let admin = app.core.cfg.admin_user_ids.contains(&user_id);
-            let today = chrono::Local::now().date_naive();
-            let cutoff = format!(
-                "{} 00:00:00",
-                today - chrono::Duration::days(i64::from(days) - 1)
-            );
-            let data = {
-                let store = app.core.deps.store.clone();
-                tokio::task::spawn_blocking(move || {
-                    // Both reads take the same admin branch, so a
-                    // non-admin can never see another user's flight
-                    // spending either.
-                    let (rows, flights) = if admin {
-                        (store.usage_stats_all(&cutoff)?, store.flight_searches_all(&cutoff)?)
-                    } else {
-                        (
-                            store.usage_stats_for(&cutoff, user_id)?,
-                            store.flight_searches_for(&cutoff, user_id)?,
-                        )
-                    };
-                    Ok::<_, anyhow::Error>((rows, store.display_names()?, flights))
-                })
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|r| r)
-            };
-            match data {
-                Ok((rows, mut names, flights)) => {
-                    backfill_names(&bot, &app, &rows, &mut names).await;
-                    let report =
-                        crate::stats::format_stats(&rows, days, today, user_id, &names, &flights);
-                    bot.send_message(msg.chat.id, format!("<pre>{report}</pre>"))
-                        .parse_mode(ParseMode::Html)
-                        .await?;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "usage stats query failed");
-                    bot.send_message(msg.chat.id, "Sorry, couldn't compute stats.").await?;
-                }
-            }
+            // Ask Telegram for any display names we are missing before
+            // reporting, so the table reads as people rather than numbers.
+            backfill_names(&bot, &app).await;
+            let report = crate::stats::report(&app.core, user_id, &arg).await;
+            bot.send_message(msg.chat.id, format!("<pre>{report}</pre>"))
+                .parse_mode(ParseMode::Html)
+                .await?;
         }
     }
     Ok(())
@@ -568,41 +526,36 @@ async fn handle_command(
 /// picks up where this one stopped.
 const NAME_BACKFILL_LIMIT: usize = 25;
 
-/// Learn the names of users who appear in the stats but predate the names
-/// table — otherwise every historical id reads `—` until its owner happens
-/// to message again.
+/// Fills in display names Scout has never recorded, by asking Telegram.
 ///
-/// `getChat` answers for anyone who has talked to the bot, which is exactly
-/// who lands in `request_log`. Results are persisted, so this is one call
-/// per user ever, not per `/stat`.
-async fn backfill_names(
-    bot: &Bot,
-    app: &Arc<App>,
-    rows: &[(i64, String, i64)],
-    names: &mut std::collections::BTreeMap<i64, String>,
-) {
-    let missing: Vec<i64> = rows
-        .iter()
-        .map(|(user, _, _)| *user)
-        .filter(|user| !names.contains_key(user))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .take(NAME_BACKFILL_LIMIT)
-        .collect();
-
-    for user_id in missing {
-        let chat = match bot.get_chat(ChatId(user_id)).await {
+/// Takes both ids from the store: the Telegram one to ask with, the account
+/// one to file under. Deriving one from the other is what previously turned a
+/// stats report into `get_chat(ChatId(3))`.
+async fn backfill_names(bot: &Bot, app: &Arc<App>) {
+    let store = app.core.store();
+    let missing = match blocking(move || store.accounts_missing_display_names(NAME_BACKFILL_LIMIT)).await
+    {
+        Ok(missing) => missing,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not list accounts missing a name");
+            return;
+        }
+    };
+    for (account_id, telegram_id) in missing {
+        let chat = match bot.get_chat(ChatId(telegram_id)).await {
             Ok(chat) => chat,
             // Blocked the bot, deleted account, never a private chat —
             // none of it is worth failing /stat over.
             Err(e) => {
-                tracing::debug!(error = %e, user_id, "could not look up a display name");
+                tracing::debug!(error = %e, telegram_id, "could not look up a display name");
                 continue;
             }
         };
         let Some(name) = chat_display_name(&chat) else { continue };
-        note_user(app, user_id, name.clone());
-        names.insert(user_id, name);
+        let store = app.core.store();
+        if let Err(e) = blocking(move || store.remember_user(account_id, &name)).await {
+            tracing::debug!(error = %e, account_id, "could not record a display name");
+        }
     }
 }
 

@@ -15,6 +15,24 @@ pub struct Core {
     pub(crate) deps: AgentDeps,
 }
 
+/// One thing to deliver, to one address, on one channel.
+///
+/// Everything a channel needs and nothing more. `text` is written here so
+/// that a browser and a chat say the same sentence.
+pub struct DueDelivery {
+    pub id: i64,
+    pub channel: String,
+    pub address: String,
+    pub text: String,
+}
+
+/// Who may talk to this bot, for the start-up log.
+pub struct Population {
+    pub founders: usize,
+    pub admins: usize,
+    pub daily_cap: i64,
+}
+
 /// Founders are the people paying for the bot, named in the environment by
 /// Telegram id because that is the only name they had when the list was
 /// written. Exempt from the daily cap.
@@ -146,12 +164,12 @@ impl Core {
     }
 
     /// Founders, admins and the cap, for the same log line.
-    pub fn population(&self) -> (usize, usize, i64) {
-        (
-            self.cfg.allowed_user_ids.len(),
-            self.cfg.admin_user_ids.len(),
-            self.cfg.invite_daily_requests,
-        )
+    pub fn population(&self) -> Population {
+        Population {
+            founders: self.cfg.allowed_user_ids.len(),
+            admins: self.cfg.admin_user_ids.len(),
+            daily_cap: self.cfg.invite_daily_requests,
+        }
     }
 
     pub fn is_founder(&self, telegram_id: i64) -> bool {
@@ -162,10 +180,63 @@ impl Core {
         is_admin_id(&self.cfg.admin_user_ids, telegram_id)
     }
 
-    /// Public only until the scheduler moves inside core in Task 5; it is
-    /// the one remaining way a channel can get a handle on the database.
-    pub fn store(&self) -> crate::store::Store {
+    /// A handle on the database, for this crate only. `store` is private, so
+    /// a return type of `Store` is itself what keeps this in here.
+    pub(crate) fn store(&self) -> crate::store::Store {
         self.deps.store.clone()
+    }
+
+    /// Everything due to be delivered on one channel today.
+    ///
+    /// Which day it is is decided here rather than passed in, because a
+    /// channel that chose the date could quietly shift everyone's cadence.
+    /// Rows core would refuse to act on are logged and left where they are:
+    /// skipping one is not an error worth abandoning the tick for.
+    pub async fn due_deliveries(&self, channel: &str) -> anyhow::Result<Vec<DueDelivery>> {
+        let store = self.store();
+        let channel = channel.to_string();
+        let today = chrono::Local::now().date_naive();
+        blocking(move || {
+            let due = store.due_reminders(&today.to_string())?;
+            Ok(due
+                .into_iter()
+                .filter(|r| r.channel == channel)
+                .filter(|r| crate::schedule::next_date(r, today).is_some())
+                .map(|r| DueDelivery {
+                    id: r.id,
+                    channel: r.channel,
+                    address: r.address,
+                    text: format!("⏰ Time to reorder {} — want me to search for deals?", r.item),
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// The delivery arrived: move the reminder on to its next date.
+    ///
+    /// A channel that does not call this leaves the row untouched, which is
+    /// how a failed send retries on the next tick. Advancing from the date
+    /// the row already held rather than from today keeps the cadence
+    /// anchored to the original date, and makes a second acknowledgement
+    /// harmless: once the row is no longer due there is nothing to find.
+    pub async fn delivery_done(&self, id: i64) -> anyhow::Result<()> {
+        let store = self.store();
+        let today = chrono::Local::now().date_naive();
+        blocking(move || {
+            let Some(reminder) = store
+                .due_reminders(&today.to_string())?
+                .into_iter()
+                .find(|r| r.id == id)
+            else {
+                return Ok(());
+            };
+            let Some(next_due) = crate::schedule::next_date(&reminder, today) else {
+                return Ok(());
+            };
+            store.set_next_due(id, &next_due.to_string())
+        })
+        .await
     }
 
     /// Records a request against the caller's account.
@@ -294,5 +365,35 @@ mod tests {
         assert!(!core.deps.links_enabled);
         // Not from config at all: whatever the caller passed, unchanged.
         assert!(core.deps.return_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_due_reminder_arrives_addressed_and_worded_ready_to_send() {
+        // The channel is told where to send and what to say. It is not told
+        // the interval, the next date, or anything else it would have to do
+        // arithmetic on — that stays here, so a second channel cannot get
+        // the cadence subtly wrong.
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(
+            Config::for_test(dir.path().join("due.duckdb").to_str().unwrap()),
+            None,
+        )
+        .unwrap();
+
+        // The test is inside scout-core, so it may use the store directly —
+        // that is precisely the privilege the adapter no longer has.
+        let store = core.store();
+        let account = store.account_for_telegram(4242).unwrap();
+        store
+            .create_reminder(account, "telegram", "4242", "detergent", 30, "2020-01-01")
+            .unwrap();
+
+        let due = core.due_deliveries("telegram").await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].address, "4242");
+        assert!(due[0].text.contains("detergent"), "got: {}", due[0].text);
+
+        core.delivery_done(due[0].id).await.unwrap();
+        assert!(core.due_deliveries("telegram").await.unwrap().is_empty());
     }
 }

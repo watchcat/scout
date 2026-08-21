@@ -1,6 +1,10 @@
 use crate::core::Core;
 use crate::store::Store;
 
+/// What claiming a seat did. Defined next to the table it is read from,
+/// re-exported here because this is where a channel meets it.
+pub use crate::store::Claim;
+
 /// Capacity when `/invite new` is given a name and no number.
 pub(crate) const DEFAULT_CAPACITY: i64 = 100;
 pub(crate) const INVITE_USAGE: &str = "usage:\n\

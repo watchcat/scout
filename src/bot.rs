@@ -351,7 +351,7 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     tracing::info!(user_id, code, outcome = ?claim, "invite claim");
 
     match claim {
-        scout_core::store::Claim::Admitted => {
+        scout_core::invites::Claim::Admitted => {
             app.members.insert(user_id);
             // Only now: `user_chats` is /advert's address book, and a
             // person turned away at the door has not used this bot.
@@ -364,7 +364,7 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         }
         // The table is the authority when it and the set disagree, so a
         // claim that says they are in puts them in.
-        scout_core::store::Claim::AlreadyIn => {
+        scout_core::invites::Claim::AlreadyIn => {
             app.members.insert(user_id);
             note_sender(&app, &msg);
             bot.send_message(
@@ -373,10 +373,10 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
             )
             .await?;
         }
-        scout_core::store::Claim::Revoked => {
+        scout_core::invites::Claim::Revoked => {
             bot.send_message(chat_id, ACCESS_REMOVED).await?;
         }
-        scout_core::store::Claim::NoRoom => {
+        scout_core::invites::Claim::NoRoom => {
             bot.send_message(chat_id, ROUND_FULL).await?;
         }
     }

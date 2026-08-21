@@ -1,11 +1,12 @@
 //! Everything that answers a question, and nothing about who asked it.
 //!
-//! `store` and `agent` become private in Task 5, once nothing outside this
-//! crate names them. A channel that can name `Store` can query it, and the
-//! boundary goes back to being a convention.
+//! `agent`, `store` and `tools` are private because a channel that can name
+//! `Store` can query it, and the boundary goes back to being a convention.
+//! What a channel may reach is what `Core` hands it.
 
-pub mod agent;
-pub mod store;
+mod agent;
+mod store;
+mod tools;
 
 pub mod config;
 pub mod core;
@@ -14,8 +15,8 @@ pub mod draft;
 pub mod invites;
 pub mod links;
 pub mod run;
+mod schedule;
 pub mod session;
 pub mod stats;
 pub mod text;
-pub mod tools;
 pub mod vision;

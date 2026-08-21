@@ -48,17 +48,17 @@ async fn main() -> Result<()> {
     // The gate reads this set on every update, so it is built once here
     // from the table that survives restarts.
     let members: dashmap::DashSet<i64> = core.members()?.into_iter().collect();
-    let (founders, admins, daily_cap) = core.population();
+    let population = core.population();
     tracing::info!(
-        founders,
-        admins,
+        founders = population.founders,
+        admins = population.admins,
         members = members.len(),
-        daily_cap,
+        daily_cap = population.daily_cap,
         schema = core.schema_version()?,
         "who may talk to this bot"
     );
 
-    tokio::spawn(scheduler::run(telegram.clone(), core.store()));
+    tokio::spawn(scheduler::run(telegram.clone(), core.clone()));
 
     let app = Arc::new(bot::App {
         core,

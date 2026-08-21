@@ -199,6 +199,45 @@ mod tests {
     }
 
     #[test]
+    fn history_survives_being_dropped_and_reloaded() {
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
+
+        let original = vec![LlmMessage::user("cheapest beans"), LlmMessage::assistant("here")];
+        save_history(&s, c, &original).unwrap();
+        let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
+
+        // Not compared struct-for-struct: rig leaves `additional_params`
+        // as None when a message is built in code but deserializes it to
+        // Some({}), so a round trip is never byte-identical. What has to
+        // hold is that the words and their roles survive, and that a second
+        // trip changes nothing further — otherwise history would drift a
+        // little every time it was reloaded.
+        assert_eq!(loaded.len(), original.len());
+        assert_eq!(last_messages_text(&loaded, 2), last_messages_text(&original, 2));
+
+        save_history(&s, c, &loaded).unwrap();
+        let again = load_history(&s, c, HISTORY_CAP).unwrap();
+        assert_eq!(again, loaded, "reloading must reach a fixed point");
+    }
+
+    #[test]
+    fn saving_replaces_rather_than_appends() {
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
+
+        save_history(&s, c, &[LlmMessage::user("one"), LlmMessage::assistant("two")]).unwrap();
+        // trim_history can drop from the front; the store must follow it
+        // down rather than keeping the messages the agent will never see.
+        save_history(&s, c, &[LlmMessage::assistant("two")]).unwrap();
+
+        let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
+        assert_eq!(loaded.len(), 1, "a trimmed history must not grow back");
+    }
+
+    #[test]
     fn the_scope_of_a_private_chat_is_shared_and_a_group_is_not() {
         // Telegram makes chat id equal user id in a 1:1 chat, and that
         // thread is the one the web app will share. A group is a room with

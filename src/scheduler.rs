@@ -1,6 +1,6 @@
-use crate::store::Store;
 use anyhow::Result;
 use chrono::{Duration as ChronoDuration, NaiveDate};
+use scout_core::store::Store;
 use std::time::Duration;
 use teloxide::prelude::*;
 

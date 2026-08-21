@@ -343,9 +343,14 @@ and 2b-2b divides it properly.
 
 Root `Cargo.toml`: add `scout-core = { path = "crates/scout-core" }`, extend
 `members` to `["crates/scout-api", "crates/scout-core"]`, and delete the
-dependencies that moved: `rig`, `duckdb`, `reqwest`, `thiserror`, `futures`,
-`base64`. Keep `teloxide`, `tokio`, `dashmap`, `dotenvy`, `serde`,
-`serde_json`, `anyhow`, `chrono`, `tracing`, `tracing-subscriber`.
+dependencies that moved: `rig`, `duckdb`, `thiserror`, `futures`, `base64`.
+
+Keep `reqwest` for now. `main.rs:40` still builds the shared HTTP client
+itself, and that construction does not move until Task 4 — deleting the
+dependency here would break the build for no reason. Task 4 removes it.
+
+Also keep `teloxide`, `tokio`, `dashmap`, `dotenvy`, `serde`, `serde_json`,
+`anyhow`, `chrono`, `tracing`, `tracing-subscriber`.
 
 - [ ] **Step 5: Point the adapter at the crate**
 

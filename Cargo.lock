@@ -6650,20 +6650,16 @@ name = "scout"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "chrono",
  "dashmap",
  "dotenvy",
- "duckdb",
- "futures",
  "reqwest 0.12.28",
- "rig",
  "scout-api",
+ "scout-core",
  "serde",
  "serde_json",
  "teloxide",
  "tempfile",
- "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6677,6 +6673,28 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "scout-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "dashmap",
+ "duckdb",
+ "futures",
+ "reqwest 0.12.28",
+ "rig",
+ "scout-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

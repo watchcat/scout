@@ -1,30 +1,16 @@
-mod agent;
 mod bot;
-mod config;
-mod core;
-mod describe;
-mod draft;
-mod invites;
-mod links;
 mod progress;
-mod run;
 mod scheduler;
-mod session;
-mod stats;
-mod store;
-mod text;
-mod tools;
-mod vision;
 
-use agent::AgentDeps;
 use anyhow::Result;
-use config::Config;
 use dashmap::DashMap;
+use scout_core::agent::AgentDeps;
+use scout_core::config::Config;
+use scout_core::store::Store;
+use scout_core::tools::kagi::{KagiClient, KAGI_API_BASE};
 use std::sync::Arc;
 use std::time::Duration;
-use store::Store;
 use teloxide::Bot;
-use tools::kagi::{KagiClient, KAGI_API_BASE};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -41,42 +27,42 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(30))
         .build()?;
     let kagi = KagiClient::new(http.clone(), cfg.kagi_api_key.clone(), KAGI_API_BASE.to_string());
-    let llm = agent::llm_client(&cfg.minimax_api_key)?;
+    let llm = scout_core::agent::llm_client(&cfg.minimax_api_key)?;
     let ebay = cfg.ebay_credentials.clone().map(|(id, secret)| {
-        tools::ebay::EbayClient::new(
+        scout_core::tools::ebay::EbayClient::new(
             http.clone(),
             id,
             secret,
             cfg.ebay_marketplace.clone(),
-            tools::ebay::EBAY_API_BASE.to_string(),
+            scout_core::tools::ebay::EBAY_API_BASE.to_string(),
         )
     });
     tracing::info!(ebay_api = ebay.is_some(), "eBay Browse API verification");
-    let marktplaats = tools::marktplaats::MarktplaatsClient::new(
+    let marktplaats = scout_core::tools::marktplaats::MarktplaatsClient::new(
         http.clone(),
-        tools::marktplaats::MARKTPLAATS_BASE.to_string(),
+        scout_core::tools::marktplaats::MARKTPLAATS_BASE.to_string(),
     );
 
-    let renderer = tools::browser::find_chrome().map(tools::browser::Renderer::new);
+    let renderer = scout_core::tools::browser::find_chrome().map(scout_core::tools::browser::Renderer::new);
     tracing::info!(headless_browser = renderer.is_some(), "fallback renderer");
 
     let bol = cfg.bol_credentials.clone().map(|(id, secret)| {
-        tools::bol::BolClient::new(
+        scout_core::tools::bol::BolClient::new(
             http.clone(),
             id,
             secret,
             cfg.bol_country.clone(),
-            tools::bol::BOL_API_BASE.to_string(),
-            tools::bol::BOL_LOGIN_BASE.to_string(),
+            scout_core::tools::bol::BOL_API_BASE.to_string(),
+            scout_core::tools::bol::BOL_LOGIN_BASE.to_string(),
         )
     });
     tracing::info!(bol_api = bol.is_some(), "bol.com Catalog API");
 
     let perplexity = cfg.perplexity_api_key.clone().map(|key| {
-        tools::perplexity::PerplexityClient::new(
+        scout_core::tools::perplexity::PerplexityClient::new(
             http.clone(),
             key,
-            tools::perplexity::PERPLEXITY_API_BASE.to_string(),
+            scout_core::tools::perplexity::PERPLEXITY_API_BASE.to_string(),
         )
     });
     tracing::info!(
@@ -85,10 +71,10 @@ async fn main() -> Result<()> {
     );
 
     let duffel = cfg.duffel_api_key.clone().map(|key| {
-        tools::duffel::DuffelClient::new(
+        scout_core::tools::duffel::DuffelClient::new(
             http.clone(),
             key,
-            tools::duffel::DUFFEL_API_BASE.to_string(),
+            scout_core::tools::duffel::DUFFEL_API_BASE.to_string(),
         )
         .with_markup(cfg.duffel_markup_rate)
     });
@@ -116,12 +102,12 @@ async fn main() -> Result<()> {
         // Filled in below, once the bot has told us its username.
         return_url: None,
         links_enabled: cfg.duffel_links_enabled,
-        shown: std::sync::Arc::new(tools::shown::ShownFlights::default()),
+        shown: std::sync::Arc::new(scout_core::tools::shown::ShownFlights::default()),
         ignav: cfg.ignav_api_key.clone().map(|key| {
-            tools::ignav::IgnavClient::new(
+            scout_core::tools::ignav::IgnavClient::new(
                 http_for_ignav,
                 key,
-                tools::ignav::IGNAV_API_BASE.to_string(),
+                scout_core::tools::ignav::IGNAV_API_BASE.to_string(),
             )
         }),
     };
@@ -153,7 +139,7 @@ async fn main() -> Result<()> {
 
     tokio::spawn(scheduler::run(telegram.clone(), store));
 
-    let core = Arc::new(core::Core { cfg, deps });
+    let core = Arc::new(scout_core::core::Core { cfg, deps });
 
     let app = Arc::new(bot::App {
         core,

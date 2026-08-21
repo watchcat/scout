@@ -1,0 +1,27 @@
+[package]
+name = "scout-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Everything that answers a question, with no idea who asked"
+
+[dependencies]
+scout-api = { path = "../scout-api" }
+rig = "0.40"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+duckdb = { version = "1", features = ["bundled"] }
+dashmap = "6"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+chrono = "0.4"
+futures = "0.3"
+base64 = "0.22"
+tracing = "0.1"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

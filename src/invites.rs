@@ -229,9 +229,32 @@ pub fn record_announcement(store: &Store, outcomes: &[(i64, Reached)]) -> anyhow
     Ok(())
 }
 
+/// Everyone an announcement could reach on Telegram, as (account, chat).
+///
+/// A thin wrapper today, but it is the door `/advert` goes through, and in
+/// 2b-2 it becomes an endpoint rather than a store call. Someone with an
+/// account but no recorded address is absent, because there is nowhere to
+/// send — silently reaching nobody would read as a delivered announcement.
+pub fn advert_targets(store: &Store) -> anyhow::Result<Vec<(i64, i64)>> {
+    store.broadcast_targets()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_advert_reaches_everyone_with_a_known_address() {
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let b = s.account_for_telegram(22).unwrap();
+        s.note_delivery(a, "telegram", "555").unwrap();
+        s.note_delivery(b, "telegram", "666").unwrap();
+        // Has an account but has never spoken, so there is nowhere to send.
+        s.account_for_telegram(33).unwrap();
+
+        assert_eq!(advert_targets(&s).unwrap(), vec![(a, 555), (b, 666)]);
+    }
 
     #[test]
     fn an_announcement_refuses_a_round_that_cannot_take_anyone() {

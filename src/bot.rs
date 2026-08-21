@@ -453,7 +453,7 @@ async fn handle_command(
             // Same gate as the cross-user /stat view: the admin list is
             // the whole access-control surface for anything that reaches
             // beyond the caller.
-            if !is_admin(&app, user_id) {
+            if !app.core.is_admin(user_id) {
                 bot.send_message(msg.chat.id, crate::invites::NOT_ADMIN).await?;
                 return Ok(());
             }
@@ -465,11 +465,8 @@ async fn handle_command(
                 }
             };
 
-            let store = app.core.deps.store.clone();
-            let targets = tokio::task::spawn_blocking(move || store.broadcast_targets())
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|r| r);
+            let store = app.core.store();
+            let targets = blocking(move || crate::invites::advert_targets(&store)).await;
             let targets = match targets {
                 Ok(targets) => targets,
                 Err(e) => {
@@ -698,9 +695,6 @@ pub fn check_advert(body: &str) -> Result<&str, String> {
 }
 
 
-fn is_admin(app: &App, user_id: i64) -> bool {
-    app.core.cfg.admin_user_ids.contains(&user_id)
-}
 
 
 

@@ -66,8 +66,12 @@ pub fn is_admin_id(admins: &HashSet<i64>, telegram_id: i64) -> bool {
 impl Core {
     /// Opens the database and builds every client the agent can use.
     ///
-    /// `return_url` is where Duffel Links sends a traveller back to — today
-    /// the bot's own address, from `getMe`. Taking it here is a deliberate
+    /// `return_url` is the bot's own address, from `getMe`. Two things read
+    /// it: Duffel Links, as where to send a traveller after checkout, and
+    /// `admission`, as the base of the join link a stranger is offered. They
+    /// agree today only because the bot's own chat is the one address Scout
+    /// owns — that is a coincidence the type does not enforce, and it is why
+    /// this wants to become a named concept rather than a borrowed field. Taking it here is a deliberate
     /// simplification while there is one channel: it is really a property of
     /// the channel, not of the process, and a core serving two channels has
     /// two return addresses where a constructor argument holds one. The path
@@ -347,6 +351,10 @@ impl Core {
     /// Reads the database. Callers on a request path must cache it — see
     /// `scout-web`, where a public endpoint that took the store's mutex
     /// would be a way for a stranger to slow the agent down.
+    ///
+    /// "Room" here is the same count `claim_seat` uses, revoked members
+    /// included. That is what stops the page from lying: it can never say
+    /// open where a real attempt to join would be turned away.
     pub async fn admission(&self) -> anyhow::Result<Admission> {
         let store = self.store();
         let return_url = self.deps.return_url.clone();
@@ -508,6 +516,11 @@ mod tests {
         assert_eq!(core.admission().await.unwrap(), Admission::Full,
             "no rounds at all is not an invitation");
 
+        // Created back to back. `rounds()` orders by created_at then code,
+        // so if these ever landed in the same microsecond the tiebreak would
+        // put `autumn` first and "newest" would resolve to `spring` — which
+        // is the wrong answer and fails this test rather than passing it
+        // quietly. The safe direction, but worth knowing it rests on that.
         store.create_round("spring", 1).unwrap();
         store.create_round("autumn", 1).unwrap();
         assert_eq!(

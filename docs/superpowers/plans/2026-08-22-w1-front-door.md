@@ -214,7 +214,8 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 ```
 
-Then add axum, letting cargo pick the version rather than guessing one:
+Then add axum, letting cargo pick the version rather than guessing one. Write
+Step 2's `src/lib.rs` first — `cargo add` refuses a manifest with no targets:
 
 ```bash
 cargo add axum -p scout-web

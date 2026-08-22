@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scout — landing page v2</title>
+<style>
+  :root{
+    --base03:#002b36; --base02:#073642; --base01:#586e75; --base00:#657b83;
+    --base0:#839496; --base1:#93a1a1; --base2:#eee8d5; --base3:#fdf6e3;
+    --yellow:#b58900; --orange:#cb4b16; --red:#dc322f; --magenta:#d33682;
+    --violet:#6c71c4; --blue:#268bd2; --cyan:#2aa198; --green:#859900;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--base03); color:var(--base0);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .note{background:var(--base02); border-bottom:1px solid #0d4a5a; padding:10px 20px;
+    font-size:13px; color:var(--base01); text-align:center}
+  .note b{color:var(--base1); font-weight:600}
+  .wrap{max-width:880px; margin:0 auto; padding:0 24px}
+  a{color:var(--blue); text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.92em;
+    background:var(--base02); padding:1px 5px; border-radius:3px; color:var(--cyan)}
+
+  header{padding:70px 0 42px}
+  .mark{font-size:13px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--cyan); margin-bottom:18px; font-weight:600}
+  h1{font-size:44px; line-height:1.15; margin:0 0 20px; color:var(--base2);
+    font-weight:700; letter-spacing:-.02em}
+  h1 em{font-style:normal; color:var(--base01)}
+  .lede{font-size:19px; max-width:37em; margin:0 0 32px; color:var(--base0)}
+
+  .board{
+    background:var(--base02); border-radius:6px; padding:18px 20px; margin:0 0 12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13.5px;
+    overflow-x:auto; line-height:1.9;
+  }
+  .board .row{white-space:pre; color:var(--base1)}
+  .board .row.win{color:var(--base2)}
+  .board .unit{color:var(--green); font-weight:600}
+  .board .ship{color:var(--orange)}
+  .board .shop{color:var(--base01)}
+  .board .hdr{color:var(--base01); border-bottom:1px solid #0d4a5a;
+    padding-bottom:6px; margin-bottom:6px; display:block}
+  .caption{font-size:13.5px; color:var(--base01); margin:0 0 34px; max-width:44em}
+
+  .gate{background:var(--base02); border:1px solid #0d4a5a; border-radius:6px;
+    padding:22px 24px; display:flex; align-items:center; gap:20px; flex-wrap:wrap}
+  .pill{display:inline-flex; align-items:center; gap:8px; font-size:13px; font-weight:600;
+    padding:5px 12px; border-radius:999px; white-space:nowrap}
+  .pill.open{background:rgba(133,153,0,.14); color:var(--green); border:1px solid rgba(133,153,0,.35)}
+  .pill.full{background:rgba(203,75,22,.14); color:var(--orange); border:1px solid rgba(203,75,22,.35)}
+  .dot{width:7px; height:7px; border-radius:50%; background:currentColor}
+  .gate p{margin:0; flex:1; min-width:220px; font-size:15px}
+  .btn{background:var(--blue); color:var(--base03); font-weight:650; font-size:15px;
+    padding:11px 22px; border-radius:5px; border:0; white-space:nowrap}
+  .btn:hover{text-decoration:none; background:#3196d8}
+  .btn.ghost{background:transparent; color:var(--base1); border:1px solid var(--base01)}
+
+  section{padding:30px 0}
+  h2{font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:var(--base01);
+    margin:0 0 20px; font-weight:600}
+  h3{margin:0 0 7px; font-size:16.5px; color:var(--base1); font-weight:650}
+  .cols{display:grid; grid-template-columns:repeat(3,1fr); gap:26px}
+  .cols p{margin:0; font-size:14.5px; color:var(--base00)}
+
+  .chat{background:var(--base02); border-left:3px solid var(--violet);
+    padding:14px 18px; border-radius:0 4px 4px 0; margin:0 0 14px; font-size:15px;
+    color:var(--base1); font-style:italic}
+
+  .src{border-top:1px solid var(--base02); padding:16px 0; display:grid;
+    grid-template-columns:170px 1fr; gap:20px; align-items:start}
+  .src .who{font-weight:650; color:var(--base1); font-size:15px}
+  .src .tag{display:block; font-size:11.5px; font-weight:600; letter-spacing:.08em;
+    text-transform:uppercase; margin-top:5px}
+  .tag.official{color:var(--green)}
+  .tag.unofficial{color:var(--yellow)}
+  .tag.read{color:var(--cyan)}
+  .src p{margin:0; font-size:14.5px; color:var(--base00)}
+
+  table{width:100%; border-collapse:collapse; font-size:14.5px}
+  td{padding:13px 0; vertical-align:top; border-top:1px solid var(--base02)}
+  td.bad{color:var(--base01); width:50%; padding-right:26px}
+  td.good{color:var(--base0)}
+  .bad b{color:var(--red); font-weight:600}
+  .good b{color:var(--green); font-weight:600}
+
+  .aside{background:var(--base02); border-radius:6px; padding:18px 22px; font-size:14.5px}
+  .aside h3{margin-bottom:6px}
+  .aside p{margin:0; color:var(--base00)}
+
+  footer{margin-top:36px; padding:26px 0 60px; border-top:1px solid var(--base02);
+    font-size:14px; color:var(--base01); display:flex; gap:22px; flex-wrap:wrap}
+  .variants{background:var(--base02); border-radius:6px; padding:18px 22px; margin:30px 0 0}
+  .variants h4{margin:0 0 14px; font-size:12px; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--base01); font-weight:600}
+  .variants .gate{margin-bottom:12px; background:var(--base03)}
+  @media(max-width:680px){
+    .cols{grid-template-columns:1fr; gap:20px}
+    .src{grid-template-columns:1fr; gap:6px}
+    h1{font-size:33px}
+    td.bad,td.good{display:block; width:auto; padding-right:0}
+    td.bad{border-top:1px solid var(--base02); padding-bottom:4px}
+    td.good{border-top:0; padding-top:0}
+  }
+</style>
+</head>
+<body>
+
+<div class="note">
+  <b>W1 landing page, v2</b> — shopping leads, flights demoted to what they are.
+  eBay and Marktplaats now described separately, because they are not the same kind of thing.
+</div>
+
+<div class="wrap">
+
+<header>
+  <div class="mark">Scout</div>
+  <h1>Finds the actual cheapest —<br><em>and shows you the arithmetic.</em></h1>
+  <p class="lede">
+    Ask any chat model for the cheapest detergent and it will answer confidently, invent
+    a product link, and compare a three-pack against a single bottle. Scout opens the
+    pages, reads the real prices, and does the maths in Rust.
+  </p>
+
+  <div class="board">
+    <span class="row hdr">  price      shipping        per wash      shop</span>
+<span class="row win">  €18.49   + €0.00    →    <span class="unit">€0.31</span>       <span class="shop">bol.com          60 washes</span></span>
+<span class="row">  €12.95   + <span class="ship">€4.95</span>    →    €0.45       <span class="shop">123schoon.nl     40 washes</span></span>
+<span class="row">  €15.17   + <span class="ship">€16.98</span>   →    €0.53       <span class="shop">marktplaats.nl   60 washes</span></span>
+  </div>
+  <p class="caption">
+    The cheapest sticker price is the worst deal of the three. Scout compares
+    <b>landed cost</b> — item plus shipping — and then the price per wash, because a
+    bigger bottle is only cheaper if it is actually cheaper per wash.
+  </p>
+
+  <div class="gate">
+    <span class="pill open"><span class="dot"></span>Invites open</span>
+    <p>There is room in the current round.</p>
+    <a class="btn" href="#">Start on Telegram</a>
+  </div>
+</header>
+
+<section>
+  <h2>How it finds the cheapest</h2>
+  <div class="cols">
+    <div>
+      <h3>Landed cost, not sticker</h3>
+      <p>€15.17 with €16.98 shipping loses to €35.25 delivered. Offers that don't state
+         shipping still compete, but their prices are labelled item-only.</p>
+    </div>
+    <div>
+      <h3>Price per unit</h3>
+      <p>Per wash, per litre, per 100g. A three-pack and a single bottle are only
+         comparable once they're in the same units, and that division happens in Rust.</p>
+    </div>
+    <div>
+      <h3>Numbers off the page</h3>
+      <p>Prices come from the page's structured data for the exact URL opened — never
+         from page text, where a “related items” strip becomes your quote.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Your shops, not just the ones that rank</h2>
+  <p class="chat">“always check 123schoon.nl for cleaning products”</p>
+  <p style="margin:0 0 18px; max-width:44em">
+    Small shops never rank organically, even under their product's exact name. Tell Scout
+    once which shops you trust and for what, and it queries them directly with a
+    <code>site:</code> search on every relevant question — scoped by category, so a
+    cleaning-products shop isn't consulted about a laptop.
+  </p>
+  <p style="margin:0; max-width:44em">
+    The same goes for the rest of your profile: delivery country, sizes, languages. Scout
+    searches in your languages as well as English in one call, because
+    <em>“laundry detergent”</em> finds nothing on a Dutch shop and <em>“wasmiddel”</em> does.
+  </p>
+</section>
+
+<section>
+  <h2>Where the listings come from</h2>
+
+  <div class="src">
+    <div class="who">eBay<span class="tag official">Official API</span></div>
+    <p>The eBay Browse API, with developer credentials and OAuth. Current prices and
+       stock straight from eBay, no page reading involved. Needs your own key —
+       without one, eBay results still arrive through ordinary search.</p>
+  </div>
+
+  <div class="src">
+    <div class="who">Marktplaats<span class="tag unofficial">Unofficial feed</span></div>
+    <p>The same JSON endpoint marktplaats.nl's own front end calls to fill its results
+       page. Not scraping rendered HTML, but not a public API either: it can change
+       shape without warning, and when it does Scout falls back to normal search rather
+       than reporting nothing. Sold and deleted listings are filtered out.</p>
+  </div>
+
+  <div class="src">
+    <div class="who">bol.com<span class="tag official">Official API</span></div>
+    <p>The Catalog API, if you have an approved affiliate account — and they do reject
+       applications. Optional, like the rest.</p>
+  </div>
+
+  <div class="src">
+    <div class="who">Everywhere else<span class="tag read">Read and verified</span></div>
+    <p>Found by search, then opened and read. Pages that block a plain HTTP client get
+       re-opened in headless Chrome, which clears the challenge shops put in front of
+       them. When a page can't be verified, Scout says so rather than guessing.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Every row here was a real bug</h2>
+  <table>
+    <tr>
+      <td class="bad"><b>Four Amazon links, all fabricated.</b> An invented product URL
+        looks perfectly real and always 404s.</td>
+      <td class="good"><b>Every link is probed before sending.</b> Dead ones trigger a
+        correction turn, then get struck from the text.</td>
+    </tr>
+    <tr>
+      <td class="bad"><b>€640 for a €6.48 bottle of cola.</b> The shop published the price
+        twice — once in euros, once in cents — and we picked the wrong one.</td>
+      <td class="good"><b>A price with decimals beats a bare integer</b>, and anything
+        exactly 100× the page's other price is corrected.</td>
+    </tr>
+    <tr>
+      <td class="bad"><b>Recommended something marked “out of stock”.</b> The page returns
+        HTTP 200, so nothing looked wrong.</td>
+      <td class="good"><b>Stock comes from the page's markup, not its prose</b> — that
+        page said “unavailable” once and “add to basket” seven times.</td>
+    </tr>
+  </table>
+</section>
+
+<section>
+  <div class="aside">
+    <h3>Flights, honestly: a prototype</h3>
+    <p>
+      Scout can search live fares and draw a multi-city trip on one line
+      (<code>AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09</code>), with every price
+      labelled by whether you can actually book it. It works, and it is early — thinner
+      and less proven than the shopping side, which is what Scout is really for today.
+    </p>
+  </div>
+</section>
+
+<div class="variants">
+  <h4>The status strip, in both states</h4>
+  <div class="gate">
+    <span class="pill open"><span class="dot"></span>Invites open</span>
+    <p>There is room in the current round.</p>
+    <a class="btn" href="#">Start on Telegram</a>
+  </div>
+  <div class="gate">
+    <span class="pill full"><span class="dot"></span>Currently full</span>
+    <p>This round is closed. Joining the queue arrives with sign-in, in W2.</p>
+    <a class="btn ghost" href="#">Read the source</a>
+  </div>
+</div>
+
+<footer>
+  <a href="#">Source on GitHub</a>
+  <a href="#">Honest limitations</a>
+  <span>Built in Rust with teloxide, rig and DuckDB.</span>
+</footer>
+
+</div>
+</body>
+</html>

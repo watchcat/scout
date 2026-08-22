@@ -1,0 +1,17 @@
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    # Where Let's Encrypt writes if a certificate stops renewing. Certificates
+    # last 90 days and cert-manager renews at 60, so this is the 30-day warning
+    # — and the only one there is.
+    email: "${SCOUT_ACME_EMAIL}"
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik

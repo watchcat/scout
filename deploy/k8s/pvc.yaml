@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scout-data
+  namespace: scout
+spec:
+  accessModes: [ReadWriteOnce]
+  # k3s's bundled provisioner: a directory on this node's disk. That is honest
+  # about what it is — there is one node, so there is no network volume to be
+  # had, and pretending otherwise with a distributed store on a single machine
+  # would guard against a failure that also takes the cluster. Backups are
+  # Hetzner's snapshots plus the dump before each migration, not a storage layer.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi

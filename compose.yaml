@@ -18,6 +18,45 @@ services:
     # Reached only when something is actually running; an idle bot exits at
     # once. See the SIGTERM handler in bot::run.
     stop_grace_period: 330s
+    networks: [internal]
+    # No `ports:` — the web server listens on 8080 inside the container and
+    # only caddy can reach it. Publishing it here would put the app on the
+    # host as well, which is the one thing this whole arrangement exists to
+    # prevent.
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # 443 serves the site; 80 is not optional either, because ACME's HTTP
+    # challenge and the redirect to HTTPS both live there.
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SCOUT_DOMAIN: ${SCOUT_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [internal]
+    # Ordering only: this does not wait for scout to be listening. A request
+    # arriving in the second between caddy accepting and scout binding gets
+    # the 503 from handle_errors, which is the same answer a deploy gives
+    # and needs no machinery to produce.
+    depends_on: [scout]
+
+networks:
+  # A plain user-defined bridge. The name says what it is for; it is
+  # deliberately NOT `internal: true`, which would cut the container off
+  # from the internet and take Telegram, Kagi and MiniMax with it.
+  internal:
 
 volumes:
+  # The production database lives here. The name is load-bearing: change it
+  # and a new, empty volume appears while the real one sits unreferenced.
   scout-data:
+  # The issued certificates. Losing this means re-issuing on the next start,
+  # which Let's Encrypt rate-limits — hence a named volume rather than a
+  # bind mount, and not something to prune casually.
+  caddy-data:
+  caddy-config:

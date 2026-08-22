@@ -38,9 +38,9 @@ say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 running=$(docker compose ps --status running --quiet 2>/dev/null | wc -l | tr -d ' ')
 
 say "Checking the working tree"
-if [ -n "$(git status --porcelain -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile)" ]; then
+if [ -n "$(git status --porcelain -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile Caddyfile)" ]; then
     echo "  uncommitted changes — deploying code that is not in git:"
-    git status --short -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile | sed 's/^/    /'
+    git status --short -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile Caddyfile | sed 's/^/    /'
 else
     echo "  clean: $(git log --oneline -1)"
 fi

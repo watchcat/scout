@@ -1,0 +1,32 @@
+{$SCOUT_DOMAIN} {
+	encode gzip
+	reverse_proxy scout:8080
+
+	header {
+		# The page loads nothing from anywhere else and runs no script, so
+		# the policy can be as tight as a policy gets.
+		Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Only fires when the proxy cannot reach scout at all — a response the
+	# app itself produced, 404 included, is passed through untouched. That
+	# happens during every deploy: the web server stops accepting the moment
+	# SIGTERM lands, while the bot keeps draining for up to 330 seconds. A
+	# bare 502 would tell a visitor the site is broken; 503 says it is
+	# temporarily away, which is both true and what a crawler needs to hear
+	# in order not to treat the outage as permanent.
+	#
+	# There is deliberately no `health_uri` on the proxy above. Active health
+	# checks earn their keep when there is a second upstream to fail over to;
+	# with one, an unhealthy verdict produces the same 502 as a failed dial,
+	# and it lingers — Caddy would keep routing away from scout until the
+	# next probe interval, making recovery slower than doing nothing.
+	handle_errors {
+		respond "Scout is restarting. Try again in a minute." 503
+	}
+}

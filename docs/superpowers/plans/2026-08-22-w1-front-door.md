@@ -619,10 +619,18 @@ async fn index(State(cache): State<AdmissionCache>) -> Html<String> {
 /// Serves until the process ends.
 ///
 /// Takes the first reading before binding, so the page is never briefly
-/// wrong on start-up, and so a database that will not open is a start-up
-/// failure rather than a page that lies for thirty seconds.
+/// wrong on start-up. A failed first reading is not fatal, though: by this
+/// point `Core::start` has already opened the database, so a failure here is
+/// a transient query error rather than an unreachable store — and refusing
+/// to open the front door over one would contradict the policy every later
+/// refresh follows. It starts at `Full`, which is the safe thing to be wrong
+/// about, and corrects itself within `REFRESH`.
 pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
-    let cache = AdmissionCache::new(core.admission().await?);
+    let first = core.admission().await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "could not read admission at start-up; opening as full");
+        scout_core::core::Admission::Full
+    });
+    let cache = AdmissionCache::new(first);
     tokio::spawn(refresh_forever(core, cache.clone()));
 
     let listener = tokio::net::TcpListener::bind(bind).await?;

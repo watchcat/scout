@@ -7,10 +7,14 @@
 
 use scout_core::core::{Admission, Core};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// How stale the page may be. Opening a round takes this long to show up,
-/// which nobody notices, and it makes every request free.
+/// How stale the page may be, in both directions. Opening a round takes this
+/// long to show up, and so does one filling — but those cost differently.
+/// A page that still says full has cost a round some sign-ups. A page that
+/// still says open sends someone to a gate that turns them away, which is
+/// cheap precisely because the gate reads the database itself and is the one
+/// thing here that cannot be fooled.
 pub const REFRESH: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -47,12 +51,43 @@ impl AdmissionCache {
 ///
 /// Separate from the loop below so that this decision — the only judgement
 /// in the refresher — can be tested without waiting on a timer.
-fn store_or_keep(reading: anyhow::Result<Admission>, cache: &AdmissionCache) {
+fn store_or_keep(
+    reading: anyhow::Result<Admission>,
+    cache: &AdmissionCache,
+    failing_since: &mut Option<Instant>,
+    now: Instant,
+) {
     match reading {
-        Ok(next) => cache.put(next),
-        Err(e) => tracing::warn!(error = %e, "could not refresh admission; keeping the last value"),
+        Ok(next) => {
+            *failing_since = None;
+            cache.put(next);
+        }
+        Err(e) => {
+            let since = *failing_since.get_or_insert(now);
+            let stale_for = now.saturating_duration_since(since);
+            if stale_for >= TRUST_LAST_ANSWER_FOR {
+                // Long enough that this is no longer a blip. The page stops
+                // repeating an answer nobody has confirmed and says the
+                // thing that is safe to be wrong about.
+                tracing::error!(error = %e, stale_secs = stale_for.as_secs(),
+                    "admission unreadable for too long; the page will say full until it is not");
+                cache.put(Admission::Full);
+            } else {
+                tracing::warn!(error = %e, stale_secs = stale_for.as_secs(),
+                    "could not refresh admission; keeping the last value");
+            }
+        }
     }
 }
+
+/// How long a page may go on repeating an answer nobody has confirmed.
+///
+/// Keeping the last value through a blip is the point of this module. Doing
+/// it for an hour is a different thing: the page would be asserting a state
+/// no one has checked since before lunch. Past this, it falls back to the
+/// safe lie — `Full` costs a round some sign-ups, `Open` sends people to a
+/// door that will not open.
+pub const TRUST_LAST_ANSWER_FOR: Duration = Duration::from_secs(10 * 60);
 
 /// Refreshes forever.
 ///
@@ -62,6 +97,9 @@ fn store_or_keep(reading: anyhow::Result<Admission>, cache: &AdmissionCache) {
 /// off the request path, writing the same answer.
 pub async fn refresh_forever(core: Arc<Core>, cache: AdmissionCache) {
     let mut ticker = tokio::time::interval(REFRESH);
+    // When the reads started failing, so a long outage can stop being
+    // treated as a blip. `None` means the last read succeeded.
+    let mut failing_since: Option<Instant> = None;
     // A tokio interval defaults to catching up on ticks it missed, firing
     // them back to back with no gap. If a read ever took longer than
     // REFRESH — which happens exactly when the store is already contended —
@@ -74,7 +112,7 @@ pub async fn refresh_forever(core: Arc<Core>, cache: AdmissionCache) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        store_or_keep(core.admission().await, &cache);
+        store_or_keep(core.admission().await, &cache, &mut failing_since, Instant::now());
     }
 }
 
@@ -111,11 +149,53 @@ mod tests {
         // every reader the moment DuckDB hiccups, and would pass the test
         // above without complaint.
         let cache = AdmissionCache::new(Admission::Open { join_url: None });
+        let mut failing_since = None;
+        let start = Instant::now();
 
-        store_or_keep(Err(anyhow::anyhow!("the store is busy")), &cache);
+        store_or_keep(Err(anyhow::anyhow!("the store is busy")), &cache, &mut failing_since, start);
         assert_eq!(cache.get(), Admission::Open { join_url: None });
 
-        store_or_keep(Ok(Admission::Full), &cache);
+        store_or_keep(Ok(Admission::Full), &cache, &mut failing_since, start);
+        assert_eq!(cache.get(), Admission::Full);
+        assert!(failing_since.is_none(), "a success has to clear the outage, or the next blip inherits its age");
+    }
+
+    #[test]
+    fn an_outage_long_enough_to_stop_being_a_blip_falls_back_to_full() {
+        // Keeping the last answer through a hiccup is this module's job.
+        // Repeating it for an hour is a different thing: the page would be
+        // asserting a state nobody has checked since before lunch. Past the
+        // budget it says the thing that is safe to be wrong about.
+        let cache = AdmissionCache::new(Admission::Open { join_url: None });
+        let mut failing_since = None;
+        let start = Instant::now();
+
+        store_or_keep(Err(anyhow::anyhow!("busy")), &cache, &mut failing_since, start);
+        assert_eq!(cache.get(), Admission::Open { join_url: None }, "one failure is a blip");
+
+        let later = start + TRUST_LAST_ANSWER_FOR;
+        store_or_keep(Err(anyhow::anyhow!("still busy")), &cache, &mut failing_since, later);
+        assert_eq!(cache.get(), Admission::Full, "an outage is not a blip");
+    }
+
+    #[test]
+    fn the_clock_starts_at_the_first_failure_not_the_first_success() {
+        // The age that matters is how long it has been since anyone
+        // confirmed the answer, so a run of failures must not keep resetting
+        // it — that would let the page stay stale indefinitely, one blip at
+        // a time.
+        let cache = AdmissionCache::new(Admission::Open { join_url: None });
+        let mut failing_since = None;
+        let start = Instant::now();
+
+        for minute in 0..12 {
+            store_or_keep(
+                Err(anyhow::anyhow!("busy")),
+                &cache,
+                &mut failing_since,
+                start + Duration::from_secs(minute * 60),
+            );
+        }
         assert_eq!(cache.get(), Admission::Full);
     }
 

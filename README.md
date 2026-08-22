@@ -271,20 +271,41 @@ Telegram ──► bot.rs ──► core ──► rig agent ──────�
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **438 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **446 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,
 and the row counts were compared either side.
 
-`bot.rs` is now only the Telegram adapter: it parses commands, streams the
-answer into one edited message, and delivers. It holds no database handle and
-calls no store method. Everything that answers a question sits behind `core`,
-which knows nothing about chats or `ChatId`s and asks MiniMax M3 through
-`rig`. That arrow is where a second front end goes — a web app can talk to the
-same core without either side learning about the other.
+That middle arrow is a crate boundary, not a convention. Scout is a cargo
+workspace of three:
 
-Roughly 23,900 lines of Rust across 35 focused modules.
+```
+scout-core       21,800 lines  the agent, the tools, the database — everything
+                               that answers a question, and nothing that knows
+                               who asked
+scout-telegram    2,400 lines  teloxide, streaming into one edited message,
+                               chunking, flood control, delivery
+scout-api           100 lines  the events core emits and a channel renders,
+                               so the two cannot disagree about what one is
+```
+
+`scout-core` does not export its store. The adapter cannot open a database,
+run a query, or name the type that would let it — writing
+`scout_core::store::Store` in the Telegram crate is `error[E0603]`, checked by
+the compiler on every build rather than by whoever reviews the diff.
+
+Drawing that line found a bug the old shape was hiding: acknowledging a
+delivered reminder took only its id, and ids are sequential — so once a
+second channel exists, one channel could advance another's reminder, and the
+person waiting would simply never be reminded, with nothing logged anywhere,
+because an advance looks the same whoever asked for it.
+
+That is what makes the second front end cheap. A web app talks to the same
+core, and neither side can reach around the other, because the crate graph
+will not compile it.
+
+Roughly 24,300 lines of Rust across 39 focused modules.
 
 ---
 
@@ -350,7 +371,7 @@ Roughly 23,900 lines of Rust across 35 focused modules.
 ## Development
 
 ```bash
-cargo test                  # 438 tests, no network needed
+cargo test                  # 446 tests across three crates, no network
 cargo clippy --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

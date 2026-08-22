@@ -36,6 +36,21 @@ pub struct Population {
     pub daily_cap: i64,
 }
 
+/// Whether someone arriving right now can get in.
+///
+/// Deliberately not a count. How many seats are left is nobody's business
+/// outside this process; whether it is worth turning up is everybody's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// A round is open and has room. `join_url` is `None` only when the bot
+    /// could not read its own address at start-up, which disables the link
+    /// rather than sending anyone somewhere that is not ours.
+    Open { join_url: Option<String> },
+    /// Full, closed, or no round at all. One answer on purpose: which it is
+    /// tells a stranger about rounds they were not invited to.
+    Full,
+}
+
 /// Founders are the people paying for the bot, named in the environment by
 /// Telegram id because that is the only name they had when the list was
 /// written. Exempt from the daily cap.
@@ -326,6 +341,31 @@ impl Core {
     ) -> anyhow::Result<String> {
         crate::vision::describe_photo(&self.deps.llm, bytes, caption).await
     }
+
+    /// Who may walk in, as the public page reports it.
+    ///
+    /// Reads the database. Callers on a request path must cache it — see
+    /// `scout-web`, where a public endpoint that took the store's mutex
+    /// would be a way for a stranger to slow the agent down.
+    pub async fn admission(&self) -> anyhow::Result<Admission> {
+        let store = self.store();
+        let return_url = self.deps.return_url.clone();
+        blocking(move || {
+            // `rounds()` comes back oldest first, so searching from the back
+            // finds the newest round that will still take someone.
+            let newest_with_room = store
+                .rounds()?
+                .into_iter()
+                .rfind(|r| r.open && r.used < r.capacity);
+            Ok(match newest_with_room {
+                Some(r) => Admission::Open {
+                    join_url: return_url.map(|u| format!("{u}?start={}", r.code)),
+                },
+                None => Admission::Full,
+            })
+        })
+        .await
+    }
 }
 
 /// Runs a blocking store call off the async runtime.
@@ -347,6 +387,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Claim;
 
     #[test]
     fn a_founder_is_exempt_from_the_daily_cap_and_a_member_is_not() {
@@ -449,6 +490,43 @@ mod tests {
             due,
             "a web acknowledgement moved a telegram reminder"
         );
+    }
+
+    #[tokio::test]
+    async fn the_newest_round_with_room_is_the_one_a_stranger_can_join() {
+        // Several rounds can be open at once — nothing closes the old one
+        // when a new one opens. The page has room for one answer, so core
+        // picks: the newest round that is open and not yet full.
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(
+            Config::for_test(dir.path().join("doors.duckdb").to_str().unwrap()),
+            Some("https://t.me/scoutbot".to_string()),
+        )
+        .unwrap();
+        let store = core.store();
+
+        assert_eq!(core.admission().await.unwrap(), Admission::Full,
+            "no rounds at all is not an invitation");
+
+        store.create_round("spring", 1).unwrap();
+        store.create_round("autumn", 1).unwrap();
+        assert_eq!(
+            core.admission().await.unwrap(),
+            Admission::Open { join_url: Some("https://t.me/scoutbot?start=autumn".to_string()) },
+            "the newer round supersedes the older one without anyone closing it"
+        );
+
+        // Fill autumn. Spring is still open with room, so the door is not shut.
+        let joiner = store.account_for_telegram(7).unwrap();
+        assert_eq!(store.claim_seat(joiner, 7, "autumn").unwrap(), Claim::Admitted);
+        assert_eq!(
+            core.admission().await.unwrap(),
+            Admission::Open { join_url: Some("https://t.me/scoutbot?start=spring".to_string()) }
+        );
+
+        store.set_round_open("spring", false).unwrap();
+        assert_eq!(core.admission().await.unwrap(), Admission::Full,
+            "a closed round and a full round look the same from outside");
     }
 
     #[test]

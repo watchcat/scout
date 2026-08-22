@@ -63,11 +63,14 @@ fn store_or_keep(reading: anyhow::Result<Admission>, cache: &AdmissionCache) {
 pub async fn refresh_forever(core: Arc<Core>, cache: AdmissionCache) {
     let mut ticker = tokio::time::interval(REFRESH);
     // A tokio interval defaults to catching up on ticks it missed, firing
-    // them back to back. If a read ever took longer than REFRESH — which
-    // happens exactly when the store is already contended — the catch-up
-    // would answer a busy database with several more queries at once. This
-    // refresher has nothing to catch up on: it wants a recent answer, not
-    // every answer, so it waits REFRESH after each read instead.
+    // them back to back with no gap. If a read ever took longer than
+    // REFRESH — which happens exactly when the store is already contended —
+    // the catch-up would answer a busy database by querying it again
+    // immediately. Sequentially, not concurrently, and only past twice
+    // REFRESH does more than one tick queue up; still the wrong direction to
+    // push a database that is already struggling. This refresher has nothing
+    // to catch up on: it wants a recent answer, not every answer, so it
+    // waits REFRESH after each read finishes instead.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;

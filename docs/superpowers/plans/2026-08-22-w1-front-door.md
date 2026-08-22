@@ -588,6 +588,11 @@ Expected: FAIL — `cannot find function 'router'`.
 Replace `health_router` with:
 
 ```rust
+// Narrow this back from the `pub mod` Task 3 needed. That was to stop
+// dead-code warnings while nothing called into it — `pub(crate)` does not
+// silence those, since dead-code analysis is about reachability. Now that
+// `serve` calls it, `mod` is enough, and leaving it public would give the
+// same items two paths in from outside.
 mod cache;
 mod page;
 

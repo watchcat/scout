@@ -27,6 +27,17 @@
 	# and it lingers — Caddy would keep routing away from scout until the
 	# next probe interval, making recovery slower than doing nothing.
 	handle_errors {
+		# The header block above does not reach here: it compiles into the
+		# site's route tree and this is a sibling error route, so a 503 goes
+		# out bare unless it is told otherwise. Mostly that costs nothing —
+		# a fixed line of plain text needs no content policy — but HSTS is
+		# different. A first-time visitor arriving during a deploy would
+		# leave unpinned to HTTPS, which is exactly the visitor it protects.
+		header {
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+			X-Content-Type-Options "nosniff"
+			-Server
+		}
 		respond "Scout is restarting. Try again in a minute." 503
 	}
 }

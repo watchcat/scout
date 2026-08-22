@@ -109,8 +109,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()["content-type"], "text/html; charset=utf-8");
 
-        // Deleting Task 2's test would otherwise leave /healthz uncovered,
-        // and it is the route the proxy depends on.
+        // Nothing consumes /healthz today — the proxy dials per request
+        // rather than probing, deliberately. It stays because a container
+        // wants a way to be asked whether it is alive that does not involve
+        // rendering a page, and because W2 or an uptime check will want it.
         let health = app.clone()
             .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
             .await.unwrap();

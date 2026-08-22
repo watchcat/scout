@@ -1,6 +1,10 @@
 use crate::core::Core;
 use crate::store::Store;
 
+/// What claiming a seat did. Defined next to the table it is read from,
+/// re-exported here because this is where a channel meets it.
+pub use crate::store::Claim;
+
 /// Capacity when `/invite new` is given a name and no number.
 pub(crate) const DEFAULT_CAPACITY: i64 = 100;
 pub(crate) const INVITE_USAGE: &str = "usage:\n\
@@ -29,17 +33,17 @@ pub(crate) fn join_link(username: &str, code: &str) -> String {
     format!("https://t.me/{username}?start={code}")
 }
 
-pub(crate) const NOT_ADMIN: &str = "That command is for the bot's admin.";
+pub const NOT_ADMIN: &str = "That command is for the bot's admin.";
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum InviteCmd {
+pub enum InviteCmd {
     New { code: String, capacity: i64 },
     Status,
     SetOpen { code: String, open: bool },
     Announce(String),
 }
 
-pub(crate) fn parse_invite(arg: &str) -> Result<InviteCmd, String> {
+pub fn parse_invite(arg: &str) -> Result<InviteCmd, String> {
     let mut words = arg.split_whitespace();
     let Some(verb) = words.next() else {
         return Err(INVITE_USAGE.to_string());

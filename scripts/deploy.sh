@@ -38,16 +38,16 @@ say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 running=$(docker compose ps --status running --quiet 2>/dev/null | wc -l | tr -d ' ')
 
 say "Checking the working tree"
-if [ -n "$(git status --porcelain -- src Cargo.toml Cargo.lock compose.yaml Dockerfile)" ]; then
+if [ -n "$(git status --porcelain -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile)" ]; then
     echo "  uncommitted changes — deploying code that is not in git:"
-    git status --short -- src Cargo.toml Cargo.lock compose.yaml Dockerfile | sed 's/^/    /'
+    git status --short -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile | sed 's/^/    /'
 else
     echo "  clean: $(git log --oneline -1)"
 fi
 
 if [ "$RUN_TESTS" -eq 1 ]; then
     say "Running tests"
-    if [ "$DRY_RUN" -eq 1 ]; then echo "  (dry run) cargo test"; else cargo test --quiet; fi
+    if [ "$DRY_RUN" -eq 1 ]; then echo "  (dry run) cargo test --workspace"; else cargo test --workspace --quiet; fi
 fi
 
 # Built before anything is stopped, so a compile error costs no downtime at

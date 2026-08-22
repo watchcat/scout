@@ -375,6 +375,58 @@ where the interface questions belong.
 > longer blocks on Telegram's rate limiter. That is a change, and a wanted
 > one — it is exactly what a split has to be true for.
 
+> **Amended again (2026-08-21), after 2a and the first half of 2b shipped.**
+> 2b split once more on the way in — moving the logic and moving the process
+> turned out to be separable too — and the same thing has now happened to what
+> was left. The delivered names, so the plans and this document agree:
+>
+> - **2a** — the event protocol. Shipped.
+> - **2b-1** — everything that answers a question moves behind a core that has
+>   never heard of Telegram. Shipped: the adapter went from 28 store calls to
+>   zero and `bot.rs` from 2740 lines to 1625. Still one process.
+> - **2b-2a** — the cargo workspace. Three crates, still one binary. The
+>   boundary 2b-1 drew by hand becomes one the compiler checks.
+> - **2b-2b** — the wire. axum, SSE, the adapter as an HTTP client, two
+>   containers.
+>
+> 2b-2a exists because the boundary is currently only a convention. Nothing
+> stops a future edit from reaching into the store from `bot.rs`, and the
+> compiler would not object. Making `Store` unnameable outside `scout-core`
+> is a day's work that removes an entire class of regression before the
+> transport change starts leaning on it.
+>
+> Four decisions taken before planning 2b-2a:
+>
+> **Deltas on the wire, cumulative on the screen.** 2a deliberately kept
+> cumulative text because `Live` diffs it. Over a socket that re-sends the
+> whole answer per token — roughly 200KB for a 2,000-character answer. So the
+> wire carries deltas and the adapter accumulates before handing `Live` the
+> snapshot it already expects. Telegram behaviour is unchanged; only the
+> bandwidth is. This lands in 2b-2b, where it costs nothing extra.
+>
+> **`seq` from the start, replay later.** Every event carries `seq` as the SSE
+> `id:` field from the first version, so adding replay never changes the
+> protocol. But no server-side buffer is built yet. A dropped stream means the
+> run still finishes and still writes its answer to `messages`; what is lost
+> is watching it live, not the answer. The buffer gets built when a real drop
+> is observed rather than in anticipation of one.
+>
+> **One image, two services.** Both binaries are built by the existing
+> Dockerfile and run as two compose services with different `command:`. The
+> DuckDB C++ compile is the expensive part of a cold build, and paying it
+> twice to save the adapter some unused megabytes of Chromium is a bad trade.
+>
+> **The scheduler splits in 2b-2a, not 2b-2b.** It has to: the adapter cannot
+> keep a `Store` handle once `Store` is private, and the reminder loop needs
+> both a database and a bot token. Deciding what is due becomes two `Core`
+> methods now, which is exactly what `GET /v1/deliveries` wraps later. The
+> expensive part of the split therefore happens without a network involved.
+>
+> One thing 2b-2a leaves open for 2b-2b: `return_url` is read from `getMe` at
+> start-up so it cannot drift from the token, and in two processes core has no
+> way to ask. It becomes a constructor argument in 2b-2a and needs an answer —
+> configured, or asserted by the adapter at start-up — before core moves out.
+
 Phase one precedes phase two because the API is conversation-scoped:
 `/v1/conversations/current/messages` cannot be specified before
 accounts and conversations exist.

@@ -14,7 +14,7 @@ use teloxide::utils::command::BotCommands;
 pub struct App {
     /// Everything that is Scout rather than Telegram. Shared, never owned:
     /// in 2b-2 it lives in another process entirely.
-    pub core: Arc<crate::core::Core>,
+    pub core: Arc<scout_core::core::Core>,
     /// One entry per (chat_id, sender_id). In a 1:1 chat a single user always
     /// hits the same slot; in a group/supergroup, each allowed user has
     /// their own history, draft and last_seen, isolating conversation
@@ -60,7 +60,7 @@ pub struct ChatSession {
 
 /// True when the gap since `last_seen` exceeds the session TTL.
 fn session_expired(last_seen: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    last_seen.is_some_and(|t| now.duration_since(t) > crate::session::SESSION_TTL)
+    last_seen.is_some_and(|t| now.duration_since(t) > scout_core::session::SESSION_TTL)
 }
 
 /// Apply session expiry to one slot and hand back the aged-out history, if
@@ -340,7 +340,7 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         return Ok(());
     };
 
-    let claim = match crate::invites::claim(&app.core, user_id, chat_id.0, &code).await {
+    let claim = match scout_core::invites::claim(&app.core, user_id, chat_id.0, &code).await {
         Ok(claim) => claim,
         Err(e) => {
             tracing::error!(error = %e, user_id, code, "could not record an invite claim");
@@ -351,7 +351,7 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     tracing::info!(user_id, code, outcome = ?claim, "invite claim");
 
     match claim {
-        crate::store::Claim::Admitted => {
+        scout_core::invites::Claim::Admitted => {
             app.members.insert(user_id);
             // Only now: `user_chats` is /advert's address book, and a
             // person turned away at the door has not used this bot.
@@ -364,7 +364,7 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         }
         // The table is the authority when it and the set disagree, so a
         // claim that says they are in puts them in.
-        crate::store::Claim::AlreadyIn => {
+        scout_core::invites::Claim::AlreadyIn => {
             app.members.insert(user_id);
             note_sender(&app, &msg);
             bot.send_message(
@@ -373,10 +373,10 @@ async fn handle_start(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
             )
             .await?;
         }
-        crate::store::Claim::Revoked => {
+        scout_core::invites::Claim::Revoked => {
             bot.send_message(chat_id, ACCESS_REMOVED).await?;
         }
-        crate::store::Claim::NoRoom => {
+        scout_core::invites::Claim::NoRoom => {
             bot.send_message(chat_id, ROUND_FULL).await?;
         }
     }
@@ -413,8 +413,8 @@ async fn handle_command(
             // History lives in the store now, so clearing the slot alone
             // would leave the thread intact and /reset would do nothing.
             // A fresh conversation is what "cleared" has to mean.
-            let scope = crate::session::conversation_scope(msg.chat.id.0, user_id);
-            if let Err(e) = crate::session::reset(&app.core, user_id, &scope).await {
+            let scope = scout_core::session::conversation_scope(msg.chat.id.0, user_id);
+            if let Err(e) = scout_core::session::reset(&app.core, user_id, &scope).await {
                 tracing::error!(error = %e, user_id, "could not clear the conversation");
                 bot.send_message(msg.chat.id, CLAIM_FAILED).await?;
                 return Ok(());
@@ -427,7 +427,7 @@ async fn handle_command(
             // the whole access-control surface for anything that reaches
             // beyond the caller.
             if !app.core.is_admin(user_id) {
-                bot.send_message(msg.chat.id, crate::invites::NOT_ADMIN).await?;
+                bot.send_message(msg.chat.id, scout_core::invites::NOT_ADMIN).await?;
                 return Ok(());
             }
             let body = match check_advert(&body) {
@@ -438,7 +438,7 @@ async fn handle_command(
                 }
             };
 
-            let targets = crate::invites::advert_targets(&app.core).await;
+            let targets = scout_core::invites::advert_targets(&app.core).await;
             let targets = match targets {
                 Ok(targets) => targets,
                 Err(e) => {
@@ -481,7 +481,7 @@ async fn handle_command(
             // Ask Telegram for any display names we are missing before
             // reporting, so the table reads as people rather than numbers.
             backfill_names(&bot, &app).await;
-            let report = crate::stats::report(&app.core, user_id, &arg).await;
+            let report = scout_core::stats::report(&app.core, user_id, &arg).await;
             bot.send_message(msg.chat.id, format!("<pre>{report}</pre>"))
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -765,7 +765,7 @@ async fn announce_round(
     app: &Arc<App>,
     code: &str,
 ) -> ResponseResult<()> {
-    let planned = match crate::invites::plan_announcement(&app.core, code).await {
+    let planned = match scout_core::invites::plan_announcement(&app.core, code).await {
         Ok(planned) => planned,
         Err(e) => {
             tracing::error!(error = %e, "could not plan the announcement");
@@ -774,32 +774,32 @@ async fn announce_round(
         }
     };
     let (targets, text) = match planned {
-        crate::invites::Announcement::Refused(reason) => {
+        scout_core::invites::Announcement::Refused(reason) => {
             bot.send_message(msg.chat.id, reason).await?;
             return Ok(());
         }
-        crate::invites::Announcement::Ready { targets, text } => (targets, text),
+        scout_core::invites::Announcement::Ready { targets, text } => (targets, text),
     };
 
     let results = broadcast(bot, &targets, &text, Some(ParseMode::Html)).await;
 
-    let outcomes: Vec<(i64, crate::invites::Reached)> = results
+    let outcomes: Vec<(i64, scout_core::invites::Reached)> = results
         .iter()
         .map(|(recipient, outcome)| {
             let reached = match outcome {
-                Delivered::Ok => crate::invites::Reached::Yes,
-                Delivered::Gone => crate::invites::Reached::Gone,
-                Delivered::Failed => crate::invites::Reached::No,
+                Delivered::Ok => scout_core::invites::Reached::Yes,
+                Delivered::Gone => scout_core::invites::Reached::Gone,
+                Delivered::Failed => scout_core::invites::Reached::No,
             };
             (*recipient, reached)
         })
         .collect();
 
-    let sent = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::Yes).count();
-    let dropped = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::Gone).count();
-    let retryable = outcomes.iter().filter(|(_, r)| *r == crate::invites::Reached::No).count();
+    let sent = outcomes.iter().filter(|(_, r)| *r == scout_core::invites::Reached::Yes).count();
+    let dropped = outcomes.iter().filter(|(_, r)| *r == scout_core::invites::Reached::Gone).count();
+    let retryable = outcomes.iter().filter(|(_, r)| *r == scout_core::invites::Reached::No).count();
 
-    if let Err(e) = crate::invites::record_announcement(&app.core, outcomes).await {
+    if let Err(e) = scout_core::invites::record_announcement(&app.core, outcomes).await {
         tracing::warn!(error = %e, "could not record what the announcement reached");
     }
 
@@ -830,7 +830,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     // Checked before the request is logged: otherwise somebody over their
     // cap would push their own count up by being told they are over it, and
     // /stat would report refusals as work.
-    if let Some(refusal) = crate::session::over_daily_cap(&app.core, user_id).await {
+    if let Some(refusal) = scout_core::session::over_daily_cap(&app.core, user_id).await {
         bot.send_message(chat_id, refusal).await?;
         return Ok(());
     }
@@ -848,8 +848,8 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         let mut chat = app.chats.entry(key).or_default();
         take_expired_session(&mut chat, std::time::Instant::now());
     }
-    let scope = crate::session::conversation_scope(chat_id.0, user_id);
-    let conversation_id = match crate::session::resolve_conversation(&app.core, user_id, &scope, &text).await {
+    let scope = scout_core::session::conversation_scope(chat_id.0, user_id);
+    let conversation_id = match scout_core::session::resolve_conversation(&app.core, user_id, &scope, &text).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not open a conversation");
@@ -894,7 +894,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     // renderer's futures need no Send bound. `events` moves into the run and
     // drops when it returns, which is what ends the renderer.
     let (result, mut live) = tokio::join!(
-        crate::run::run_agent(&app.core, events, user_id, chat_id.0, conversation_id, &prompt),
+        scout_core::run::run_agent(&app.core, events, user_id, chat_id.0, conversation_id, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {
@@ -904,7 +904,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
             // Replace the progress message rather than sending a second one:
             // otherwise the user is left with a half-written thought frozen
             // above the apology.
-            live.show(crate::run::agent_error_message(&e), true).await;
+            live.show(scout_core::run::agent_error_message(&e), true).await;
 
         }
     }
@@ -954,7 +954,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     // Before the session is touched as well as before the request is
     // logged: a refused photo should leave the conversation exactly as it
     // was, not clear a history and disarm a draft on its way out.
-    if let Some(refusal) = crate::session::over_daily_cap(&app.core, user_id).await {
+    if let Some(refusal) = scout_core::session::over_daily_cap(&app.core, user_id).await {
         bot.send_message(chat_id, refusal).await?;
         return Ok(());
     }
@@ -1068,8 +1068,8 @@ async fn handle_reaction(
     // A reaction continues whatever thread this chat is already in, so it
     // never starts one: an empty excerpt would just make the classifier
     // guess.
-    let scope = crate::session::conversation_scope(chat_id.0, user_id);
-    let conversation_id = match crate::session::resolve_conversation(&app.core, user_id, &scope, &prompt).await {
+    let scope = scout_core::session::conversation_scope(chat_id.0, user_id);
+    let conversation_id = match scout_core::session::resolve_conversation(&app.core, user_id, &scope, &prompt).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "could not open a conversation");
@@ -1079,14 +1079,14 @@ async fn handle_reaction(
     let (events, incoming) = tokio::sync::mpsc::unbounded_channel();
     let live = Live::new(bot.clone(), chat_id, app.streams.clone());
     let (result, mut live) = tokio::join!(
-        crate::run::run_agent(&app.core, events, user_id, chat_id.0, conversation_id, &prompt),
+        scout_core::run::run_agent(&app.core, events, user_id, chat_id.0, conversation_id, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {
         Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "reaction follow-up failed");
-            live.show(crate::run::agent_error_message(&e), true).await;
+            live.show(scout_core::run::agent_error_message(&e), true).await;
         }
     }
     Ok(())
@@ -1221,23 +1221,23 @@ async fn handle_invite(bot: &Bot, msg: &Message, app: &Arc<App>, arg: &str) -> R
     // Checked here as well as inside core: announce does not go through
     // `invite`, so relying on core's check alone would leave it open.
     if !app.core.is_admin(user_id) {
-        bot.send_message(msg.chat.id, crate::invites::NOT_ADMIN).await?;
+        bot.send_message(msg.chat.id, scout_core::invites::NOT_ADMIN).await?;
         return Ok(());
     }
-    let cmd = match crate::invites::parse_invite(arg) {
+    let cmd = match scout_core::invites::parse_invite(arg) {
         Ok(cmd) => cmd,
         Err(problem) => {
             bot.send_message(msg.chat.id, problem).await?;
             return Ok(());
         }
     };
-    if let crate::invites::InviteCmd::Announce(code) = &cmd {
+    if let scout_core::invites::InviteCmd::Announce(code) = &cmd {
         return announce_round(bot, msg, app, code).await;
     }
     // Only a new round needs the link, and losing the round because a
     // username lookup blipped would be worse than a reply without one.
     let username = match cmd {
-        crate::invites::InviteCmd::New { .. } => {
+        scout_core::invites::InviteCmd::New { .. } => {
             match teloxide::prelude::Requester::get_me(bot).await {
                 Ok(me) => me.username.clone(),
                 Err(e) => {
@@ -1248,7 +1248,7 @@ async fn handle_invite(bot: &Bot, msg: &Message, app: &Arc<App>, arg: &str) -> R
         }
         _ => None,
     };
-    let reply = crate::invites::invite(&app.core, user_id, cmd, username.as_deref()).await;
+    let reply = scout_core::invites::invite(&app.core, user_id, cmd, username.as_deref()).await;
     bot.send_message(msg.chat.id, reply).await?;
     Ok(())
 }
@@ -1263,7 +1263,7 @@ async fn handle_kick(
     kicking: bool,
 ) -> ResponseResult<()> {
     let Some(user_id) = sender_id(msg) else { return Ok(()) };
-    let outcome = crate::invites::kick(&app.core, user_id, arg, kicking).await;
+    let outcome = scout_core::invites::kick(&app.core, user_id, arg, kicking).await;
     // The table is the record; the set follows it.
     if let (Some(now_member), Ok(target)) = (outcome.membership, arg.trim().parse::<i64>()) {
         if now_member {
@@ -1335,9 +1335,9 @@ mod tests {
         use std::time::Instant;
         let now = Instant::now();
         assert!(!session_expired(None, now), "first contact is never stale");
-        assert!(!session_expired(Some(now - crate::session::SESSION_TTL / 2), now));
+        assert!(!session_expired(Some(now - scout_core::session::SESSION_TTL / 2), now));
         assert!(session_expired(
-            Some(now - crate::session::SESSION_TTL - std::time::Duration::from_secs(1)),
+            Some(now - scout_core::session::SESSION_TTL - std::time::Duration::from_secs(1)),
             now
         ));
     }
@@ -1388,7 +1388,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let now = Instant::now();
-        let stale = now - crate::session::SESSION_TTL - Duration::from_secs(1);
+        let stale = now - scout_core::session::SESSION_TTL - Duration::from_secs(1);
 
         // Aged out with history: hand it back for the continuation check,
         // and drop the draft — a photo drafted before the gap must not be
@@ -1406,7 +1406,7 @@ mod tests {
         // Still inside the TTL: nothing is touched.
         let mut chat = ChatSession {
             pending_draft: Some("USB hub, 4-port, black".to_string()),
-            last_seen: Some(now - crate::session::SESSION_TTL / 2),
+            last_seen: Some(now - scout_core::session::SESSION_TTL / 2),
         };
         assert!(!take_expired_session(&mut chat, now));
         assert_eq!(chat.pending_draft.as_deref(), Some("USB hub, 4-port, black"));

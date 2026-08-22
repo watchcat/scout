@@ -16,12 +16,10 @@ pub fn default_next_due(
 ) -> NaiveDate {
     assert!(interval_days >= 1, "interval_days must be >= 1");
     match last_purchase {
-        Some(mut d) => {
-            while d <= today {
-                d += Duration::days(interval_days);
-            }
-            d
-        }
+        // Stepping from the purchase is the same arithmetic the scheduler
+        // does every fifteen minutes, so it is asked for rather than
+        // repeated: two copies of a cadence eventually disagree.
+        Some(d) => crate::schedule::advance_from(d, interval_days, today),
         None => today + Duration::days(interval_days),
     }
 }

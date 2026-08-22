@@ -2,7 +2,7 @@
 
 # Build stage. Cargo's registry and target directory live in BuildKit caches
 # instead of image layers, which is what keeps rebuilds cheap:
-#   * a source change recompiles this crate alone (~20s)
+#   * a source change recompiles the touched crate(s) alone (~20s)
 #   * a Cargo.toml change recompiles the changed dependency alone, instead of
 #     DuckDB's C++ from scratch — that is the ~10 minute build, and touching
 #     dependencies three times in an afternoon paid it three times.
@@ -13,13 +13,13 @@ FROM rust:bookworm AS builder
 ENV CARGO_BUILD_JOBS=4
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY crates ./crates
 # The binary has to be copied out within this step: a cache mount is not part
 # of the layer that results from it.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     cargo build --release \
-    && cp target/release/scout /scout
+    && cp target/release/scout-telegram /scout-telegram
 
 # Runtime stage: TLS deps plus Chromium, used only to re-open pages that
 # refuse a plain HTTP client (a shop behind a challenge answers 403 to
@@ -33,9 +33,9 @@ RUN apt-get update \
     && useradd -m scout \
     && mkdir -p /data \
     && chown scout:scout /data
-COPY --from=builder /scout /usr/local/bin/scout
+COPY --from=builder /scout-telegram /usr/local/bin/scout-telegram
 USER scout
 WORKDIR /data
 ENV SCOUT_DB_PATH=/data/scout.duckdb
 ENV SCOUT_CHROME=/usr/bin/chromium
-CMD ["scout"]
+CMD ["scout-telegram"]

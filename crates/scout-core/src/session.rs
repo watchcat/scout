@@ -128,7 +128,7 @@ pub async fn over_daily_cap(core: &Core, user_id: i64) -> Option<String> {
 /// A whole rewrite rather than an append: `trim_history` drops messages
 /// from the front, so what is stored has to be what the agent will actually
 /// be sent next time, not a growing log that disagrees with it.
-pub fn save_history(store: &crate::store::Store, conversation_id: i64, history: &[LlmMessage]) -> anyhow::Result<()> {
+pub(crate) fn save_history(store: &crate::store::Store, conversation_id: i64, history: &[LlmMessage]) -> anyhow::Result<()> {
     let bodies = history
         .iter()
         .map(serde_json::to_string)
@@ -139,7 +139,7 @@ pub fn save_history(store: &crate::store::Store, conversation_id: i64, history: 
 /// Stored messages, oldest first. A row that no longer deserializes —
 /// because rig changed shape under us — is dropped rather than fatal:
 /// losing some context is survivable, refusing to answer at all is not.
-pub fn load_history(store: &crate::store::Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
+pub(crate) fn load_history(store: &crate::store::Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
     let bodies = store.conversation_messages(conversation_id, cap)?;
     let mut out = Vec::with_capacity(bodies.len());
     for body in bodies {
@@ -153,7 +153,7 @@ pub fn load_history(store: &crate::store::Store, conversation_id: i64, cap: usiz
 
 /// The last `n` plain-text messages of a history, rendered as
 /// "user:/assistant:" lines for the continuation classifier.
-pub fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
+pub(crate) fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
     let mut lines: Vec<String> = history
         .iter()
         .rev()

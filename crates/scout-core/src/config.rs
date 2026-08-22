@@ -51,6 +51,21 @@ impl Config {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
 
+    /// A Config with only the four required variables set and the database
+    /// somewhere temporary. Mirrors `base_env()` in this module's tests.
+    #[cfg(test)]
+    pub fn for_test(db_path: &str) -> Self {
+        Self::from_lookup(|k| match k {
+            "TELEGRAM_BOT_TOKEN" => Some("tok".to_string()),
+            "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
+            "MINIMAX_API_KEY" => Some("mk".to_string()),
+            "KAGI_API_KEY" => Some("kk".to_string()),
+            "SCOUT_DB_PATH" => Some(db_path.to_string()),
+            _ => None,
+        })
+        .expect("the four required variables are all set")
+    }
+
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let required = |k: &str| -> Result<String> {
             get(k)

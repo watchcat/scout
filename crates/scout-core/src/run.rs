@@ -19,7 +19,7 @@ use rig::streaming::{StreamedAssistantContent, StreamingChat};
 /// renderer gets, so it must not be held anywhere else.
 pub async fn run_agent(
     core: &Core,
-    events: crate::events::EventSink,
+    events: scout_api::EventSink,
     user_id: i64,
     chat_id: i64,
     conversation_id: i64,
@@ -72,9 +72,9 @@ pub async fn run_agent(
                 match item {
                 MultiTurnStreamItem::ToolExecutionStart { tool_call, .. } => {
                     let args = &tool_call.function.arguments;
-                    crate::events::emit(
+                    scout_api::emit(
                         &events,
-                        crate::events::AgentEvent::Tool(crate::progress::describe(
+                        scout_api::AgentEvent::Tool(crate::describe::describe(
                             &tool_call.function.name,
                             args,
                         )),
@@ -86,7 +86,7 @@ pub async fn run_agent(
                     // reasoning never reaches the chat as answer text.
                     let answer = strip_thinking(&streamed);
                     if !answer.is_empty() {
-                        crate::events::emit(&events, crate::events::AgentEvent::Answer(answer));
+                        scout_api::emit(&events, scout_api::AgentEvent::Answer(answer));
                     }
                 }
                 // MiniMax streams its reasoning on a separate channel. Shown
@@ -96,9 +96,9 @@ pub async fn run_agent(
                 ) => {
                     thinking.push_str(&reasoning);
                     if strip_thinking(&streamed).is_empty() {
-                        crate::events::emit(
+                        scout_api::emit(
                             &events,
-                            crate::events::AgentEvent::Thinking(thinking.clone()),
+                            scout_api::AgentEvent::Thinking(thinking.clone()),
                         );
                     }
                 }
@@ -112,9 +112,9 @@ pub async fn run_agent(
                         }
                     }
                     if strip_thinking(&streamed).is_empty() {
-                        crate::events::emit(
+                        scout_api::emit(
                             &events,
-                            crate::events::AgentEvent::Thinking(thinking.clone()),
+                            scout_api::AgentEvent::Thinking(thinking.clone()),
                         );
                     }
                 }
@@ -152,9 +152,9 @@ pub async fn run_agent(
 
     if let Some(reason) = salvage {
         tracing::warn!(chat_id, reason, "run interrupted; writing up from notes");
-        crate::events::emit(
+        scout_api::emit(
             &events,
-            crate::events::AgentEvent::Notice(
+            scout_api::AgentEvent::Notice(
                 "✍️ wrapping up with what I found so far".to_string(),
             ),
         );

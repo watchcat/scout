@@ -4,6 +4,12 @@
 //! a second process cannot open the file. In W4 the same crate is spawned by
 //! the core binary instead; nothing here changes when it moves.
 
+/// Public because the binary that serves the page has to spawn the refresher
+/// and hand the cache to the router. A private module would also mean every
+/// item in it is dead code until that binary exists, which is a warning about
+/// the wrong thing.
+pub mod cache;
+
 #[cfg(test)]
 use axum::routing::get;
 #[cfg(test)]

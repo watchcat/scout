@@ -564,6 +564,13 @@ In `crates/scout-web/src/lib.rs`'s test module:
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()["content-type"], "text/html; charset=utf-8");
 
+        // Deleting Task 2's test would otherwise leave /healthz uncovered,
+        // and it is the route the proxy depends on.
+        let health = app.clone()
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
         let missing = app
             .oneshot(Request::builder().uri("/wp-login.php").body(Body::empty()).unwrap())
             .await.unwrap();
@@ -620,9 +627,15 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
 }
 ```
 
-Keep the `health_router` test passing by pointing it at `router(...)` with a
-cache, or delete that test now that Step 1's covers `/healthz` through the real
-router. Deleting is right — two tests for one route is one too many.
+Delete Task 2's `the_proxy_can_tell_whether_we_are_alive` and its
+`#[cfg(test)] fn health_router` — Step 1's test now covers `/healthz` through
+the real router, and two tests for one route is one too many. Check the
+`#[cfg(test)]` attributes on the imports come off with it.
+
+While here: drop `tempfile` from `crates/scout-web/Cargo.toml`'s
+dev-dependencies if nothing in the crate uses it by now. It was added in
+anticipation of a test that reaches for a real `Core`, and no task in this
+plan turned out to need one.
 
 - [ ] **Step 4: Spawn it from main**
 

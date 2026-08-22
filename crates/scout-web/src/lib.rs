@@ -10,6 +10,11 @@
 /// the wrong thing.
 pub mod cache;
 
+/// Public for the same reason as `cache`: the binary that serves the page
+/// calls `render` directly, and there is no router here yet to make it look
+/// used from the inside.
+pub mod page;
+
 #[cfg(test)]
 use axum::routing::get;
 #[cfg(test)]

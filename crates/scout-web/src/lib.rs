@@ -50,12 +50,45 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
         scout_core::core::Admission::Full
     });
     let cache = AdmissionCache::new(first);
+
+    // Bind before spawning the refresher. The other order leaves a task
+    // querying a single-writer database every thirty seconds, forever, for
+    // a cache no reader will ever consult, on the one path where nobody is
+    // reading: a bind that failed.
+    let listener = tokio::net::TcpListener::bind(bind).await?;
     tokio::spawn(refresh_forever(core, cache.clone()));
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(bind, "the front door is open");
-    axum::serve(listener, router(cache)).await?;
+    axum::serve(listener, router(cache))
+        .with_graceful_shutdown(closing_time())
+        .await?;
     Ok(())
+}
+
+/// Resolves when the container is being replaced.
+///
+/// Without this the server accepts connections for the whole of the bot's
+/// drain window — up to 330 seconds — answering `/healthz` with 200 while
+/// the container is on its way out, and then cuts whatever is in flight the
+/// moment the runtime drops. Stopping when the signal arrives means a
+/// request either completes or was never accepted.
+///
+/// This listens for itself rather than sharing the bot's handler: two
+/// listeners for one signal is what tokio's signal handling is for, and the
+/// alternative is a channel threaded through two crates for the sake of one
+/// bool.
+async fn closing_time() {
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            // Nothing to do but keep serving, which is the behaviour this
+            // function replaced.
+            tracing::warn!(error = %e, "cannot listen for SIGTERM; the page will serve until the process dies");
+            return std::future::pending().await;
+        }
+    };
+    term.recv().await;
+    tracing::info!("the front door is closing");
 }
 
 #[cfg(test)]

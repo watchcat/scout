@@ -29,9 +29,17 @@ fn status_strip(admission: &Admission) -> String {
     <a class="btn" href="{url}">Start on Telegram</a>
   </div>"#
         ),
+        // No link to give, so no instruction either. `return_url` is read
+        // once from `getMe` when the process starts and never retried, so
+        // this is not a blink — a bot that could not read its own name keeps
+        // this state until someone restarts it. Telling a visitor to go and
+        // message a bot we cannot name would be an instruction they have no
+        // way to follow, for hours. Say the true thing and offer the link
+        // that always works, which is what the full state already does.
         Admission::Open { join_url: None } => r#"<div class="gate">
     <span class="pill open"><span class="dot"></span>Invites open</span>
-    <p>There is room in the current round. Message the bot on Telegram to start.</p>
+    <p>There is room in the current round.</p>
+    <a class="btn ghost" href="https://github.com/watchcat/scout">Read the source</a>
   </div>"#
             .to_string(),
         Admission::Full => r#"<div class="gate">
@@ -68,6 +76,33 @@ mod tests {
         let page = render(&Admission::Open { join_url: None });
         assert!(page.contains("Invites open"));
         assert!(!page.contains("t.me"));
+        assert!(
+            !page.contains("Message the bot"),
+            "an instruction nobody can follow is worse than no instruction"
+        );
+    }
+
+    #[test]
+    fn the_template_still_has_somewhere_to_put_the_status() {
+        // `replace` on a token that is not there does nothing and says
+        // nothing: the page would ship with no status strip at all, no
+        // error, no log line. The token is an HTML comment, which reads as
+        // inert to anyone editing index.html who has not read this file.
+        assert!(TEMPLATE.contains(TOKEN), "index.html has lost its {TOKEN}");
+    }
+
+    #[test]
+    fn every_class_the_strip_emits_is_one_the_page_can_style() {
+        // The strip's markup lives in Rust and the CSS that styles it lives
+        // in index.html, with nothing joining them. Renaming a class in the
+        // stylesheet would leave the strip unstyled and every other test
+        // passing, because they all assert on text and links.
+        for class in ["gate", "pill", "open", "full", "dot", "btn", "ghost"] {
+            assert!(
+                TEMPLATE.contains(&format!(".{class}")),
+                "the strip emits class `{class}` and the page has no rule for it"
+            );
+        }
     }
 
     #[test]

@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # Deploy scout to the k3s node.
 #
-# Runs HERE, not on the node. The image is built locally and shipped over SSH
-# into k3s's containerd; the manifests are piped through SSH to kubectl. The
-# server therefore needs no Docker, no build toolchain, and no copy of this
-# repository — it runs k3s and Scout and nothing else, which is both cheaper
-# and less to attack.
+# Runs HERE and builds THERE. The build has to happen on the node because this
+# repository is developed on arm64 and the server is x86_64 — buildx can target
+# amd64 locally, but only by emulating the whole DuckDB C++ compile, which
+# takes hours rather than minutes.
 #
-# The other half of that trade: a deploy needs a machine with Docker, and the
-# first image push is a slow upload.
+# The source crosses as `git archive HEAD`, so what is built is exactly the
+# commit this deploy claims to be: no clone, no credentials on the node, and
+# nothing untracked or gitignored can sneak into the image. `.env` is not in
+# that archive and never lands on the node's disk — it is piped into `kubectl
+# create secret` and forgotten.
 #
-#   scripts/deploy-k3s.sh            build, ship, apply, wait
+#   scripts/deploy-k3s.sh            build, apply, wait
 #   scripts/deploy-k3s.sh --dry-run  print the plan, change nothing
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -26,6 +28,7 @@ step() { if [ "$DRY_RUN" -eq 1 ]; then echo "  (dry run) $1"; return 1; fi; retu
 : "${SCOUT_SSH:?set SCOUT_SSH to the node, e.g. root@203.0.113.4}"
 
 SSH=(ssh -o BatchMode=yes "$SCOUT_SSH")
+REMOTE_SRC=/opt/scout
 
 # A deploy is named by what is in git, so a rollback is a tag that still exists
 # in containerd rather than a rebuild that might not reproduce.
@@ -36,24 +39,24 @@ if [ -n "$(git status --porcelain -- crates Cargo.toml Cargo.lock Dockerfile dep
     exit 1
 fi
 
-say "Building scout:$SHA here"
-step "docker build -t scout:$SHA ." && docker build -t "scout:$SHA" .
+say "Sending $SHA to $SCOUT_SSH"
+step "git archive HEAD | ssh | tar -x -C $REMOTE_SRC" \
+    && git archive HEAD | "${SSH[@]}" "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC && tar -x -C $REMOTE_SRC"
 
-say "Shipping it to $SCOUT_SSH"
-# gzip -1 rather than the default: the layers that matter are already
-# compressed, so the cheap setting gets most of the saving for a fraction of
-# the CPU. Expect minutes on the first push and seconds afterwards, since only
-# the top layer changes.
-step "docker save | gzip | ssh | k3s ctr images import" \
-    && docker save "scout:$SHA" | gzip -1 | "${SSH[@]}" 'gunzip | k3s ctr images import -'
+say "Building scout:$SHA there"
+# The first build compiles DuckDB's C++ and takes about ten minutes; later ones
+# reuse the cache mounts and take about twenty seconds.
+step "docker build -t scout:$SHA" \
+    && "${SSH[@]}" "cd $REMOTE_SRC && docker build -t scout:$SHA ."
+step "docker save | k3s ctr images import" \
+    && "${SSH[@]}" "docker save scout:$SHA | k3s ctr images import -"
 
 say "Applying"
 step "kubectl apply namespace" \
     && "${SSH[@]}" 'kubectl apply -f -' < deploy/k8s/namespace.yaml
-# .env never lands on the node: it is piped in, used, and gone. The values do
-# end up in the cluster's datastore, which is the same trust boundary they
-# already have on this machine.
-step "kubectl create secret from .env (piped, not copied)" \
+# .env is piped in, used, and gone. The values do end up in the cluster's
+# datastore, which is the same trust boundary they already have here.
+step "kubectl create secret from .env (piped, never written)" \
     && "${SSH[@]}" 'kubectl -n scout create secret generic scout \
          --from-env-file=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -' < .env
 for f in pvc service deployment ingress issuer; do

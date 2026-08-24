@@ -39,15 +39,61 @@ if [ -n "$(git status --porcelain -- crates Cargo.toml Cargo.lock Dockerfile dep
     exit 1
 fi
 
-say "Sending $SHA to $SCOUT_SSH"
-step "git archive HEAD | ssh | tar -x -C $REMOTE_SRC" \
-    && git archive HEAD | "${SSH[@]}" "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC && tar -x -C $REMOTE_SRC"
+# The build runs detached on the node and this script watches it. That is not
+# tidiness: a synchronous `ssh ... docker build` dies with the connection, and
+# ten minutes of DuckDB compilation is long enough for a laptop to sleep or a
+# network to blink. Detaching also makes this script resumable — re-run it after
+# a dropped connection and it attaches to the build already in flight rather
+# than starting a second one on top of it.
+BUILD_LOG="/var/log/scout-build-$SHA.log"
 
-say "Building scout:$SHA there"
-# The first build compiles DuckDB's C++ and takes about ten minutes; later ones
-# reuse the cache mounts and take about twenty seconds.
-step "docker build -t scout:$SHA" \
-    && "${SSH[@]}" "cd $REMOTE_SRC && docker build -t scout:$SHA ."
+remote_state() {
+    "${SSH[@]}" "
+        if docker image inspect scout:$SHA >/dev/null 2>&1; then echo built
+        elif pgrep -f 'docker build -t scout:$SHA' >/dev/null 2>&1; then echo building
+        else echo absent; fi"
+}
+
+say "Checking $SCOUT_SSH for scout:$SHA"
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  (dry run) would check, send, build, and watch"
+    STATE=absent
+else
+    STATE=$(remote_state)
+    echo "  $STATE"
+fi
+
+if [ "$DRY_RUN" -eq 0 ] && [ "$STATE" = absent ]; then
+    say "Sending $SHA"
+    # git archive, so what is built is exactly this commit: nothing untracked,
+    # nothing gitignored, and no .env.
+    git archive HEAD | "${SSH[@]}" "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC && tar -x -C $REMOTE_SRC"
+
+    say "Starting the build (detached; first one compiles DuckDB, ~10 min)"
+    "${SSH[@]}" "cd $REMOTE_SRC && setsid nohup docker build -t scout:$SHA . > $BUILD_LOG 2>&1 < /dev/null & echo '  pid' \$!"
+    STATE=building
+fi
+
+if [ "$DRY_RUN" -eq 0 ] && [ "$STATE" = building ]; then
+    say "Watching the build"
+    while :; do
+        case "$(remote_state)" in
+            built) echo "  done"; break ;;
+            building)
+                "${SSH[@]}" "tail -n 20 $BUILD_LOG 2>/dev/null | grep -vE '^\\s*$' | tail -1 | cut -c1-100" \
+                    | sed 's/^/  /'
+                sleep 15 ;;
+            absent)
+                echo >&2
+                echo "  the build stopped without producing an image" >&2
+                "${SSH[@]}" "tail -n 30 $BUILD_LOG 2>/dev/null" >&2
+                exit 1 ;;
+        esac
+    done
+fi
+
+say "Importing into containerd"
+# k3s does not see docker's images; they live in different stores.
 step "docker save | k3s ctr images import" \
     && "${SSH[@]}" "docker save scout:$SHA | k3s ctr images import -"
 

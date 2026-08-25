@@ -69,16 +69,17 @@ In `store.rs`'s `mod tests`:
         store.remember_user(account, "after the backup").unwrap();
 
         let restored = Store::open(&backup).unwrap();
-        let names = restored.display_name(account).unwrap();
-        assert_eq!(names.as_deref(), Some("before the backup"),
-            "the backup should hold what was committed when it was taken");
+        assert_eq!(
+            restored.display_names().unwrap().get(&account).map(String::as_str),
+            Some("before the backup"),
+            "the backup should hold what was committed when it was taken"
+        );
         assert_eq!(restored.schema_version().unwrap(), store.schema_version().unwrap());
     }
 ```
 
-Check `display_name`'s real name and signature in `store.rs` before using it; if
-there is no such reader, assert on `active_members()` or a purchase row instead.
-The point is that a row written before the backup is present in it.
+`display_names()` returns a `BTreeMap<i64, String>` (`store.rs:1357`); there is
+no single-account reader.
 
 - [ ] **Step 2: Run it to watch it fail**
 

@@ -669,6 +669,35 @@ pub struct Store {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// Writes a consistent copy of `conn`'s database to `path`.
+///
+/// DuckDB is single-writer, so this is the only way to get a copy that is not
+/// merely crash-consistent: it runs on the connection that already holds the
+/// database open, folding in whatever is still sitting in the write-ahead log.
+/// A copy taken from outside — `cp`, a volume snapshot, a provider's block
+/// backup — captures whatever was on disk mid-flight and relies on WAL replay,
+/// exactly like recovering from a power cut.
+///
+/// Written to a `.partial` and renamed, so an interrupted backup leaves
+/// something obviously unfinished rather than something that looks restorable.
+fn backup_connection(conn: &Connection, path: &Path) -> Result<()> {
+    // The source's identifier is derived from its filename — `scout` in
+    // production, a random temp name under test — so it is asked for rather
+    // than assumed. Hardcoding it would pass no test and quietly couple
+    // production to a filename.
+    let source: String = conn.query_row("SELECT current_database()", [], |r| r.get(0))?;
+    let partial = path.with_extension("partial");
+    let _ = std::fs::remove_file(&partial);
+
+    conn.execute_batch(&format!(
+        "ATTACH '{}' AS scout_backup; COPY FROM DATABASE \"{}\" TO scout_backup; DETACH scout_backup;",
+        partial.display(),
+        source,
+    ))?;
+    std::fs::rename(&partial, path)?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path.as_ref())?;
@@ -677,6 +706,16 @@ impl Store {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// A consistent copy of this database, taken without stopping anything.
+    ///
+    /// Holds the store's mutex for the duration, which blocks the agent. At
+    /// this database's size that is imperceptible; it is worth knowing because
+    /// it scales with the file.
+    pub(crate) fn backup_to(&self, path: &Path) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        backup_connection(&conn, path)
     }
 
     /// Highest migration step applied to this database.
@@ -3395,4 +3434,29 @@ CREATE TABLE segment_candidates (
         assert_eq!(s.requests_today(2).unwrap(), 1);
         assert_eq!(s.requests_today(999).unwrap(), 0);
     }
+    #[test]
+    fn a_backup_is_a_whole_database_that_opens_on_its_own() {
+        // Taken from the connection that holds the source open, with no
+        // checkpoint and nothing stopped. That is the entire point: no
+        // outside process can open this file while Scout runs, so a copy
+        // made from outside is crash-consistent at best.
+        let (store, dir) = test_store();
+        let account = store.account_for_telegram(99).unwrap();
+        store.remember_user(account, "before the backup").unwrap();
+
+        let backup = dir.path().join("backup.duckdb");
+        store.backup_to(&backup).unwrap();
+
+        // The source is undisturbed and still writable.
+        store.remember_user(account, "after the backup").unwrap();
+
+        let restored = Store::open(&backup).unwrap();
+        assert_eq!(
+            restored.display_names().unwrap().get(&account).map(String::as_str),
+            Some("before the backup"),
+            "the backup should hold what was committed when it was taken"
+        );
+        assert_eq!(restored.schema_version().unwrap(), store.schema_version().unwrap());
+    }
+
 }

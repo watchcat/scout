@@ -46,11 +46,17 @@ fi
 # a dropped connection and it attaches to the build already in flight rather
 # than starting a second one on top of it.
 BUILD_LOG="/var/log/scout-build-$SHA.log"
+BUILD_PID="/run/scout-build-$SHA.pid"
 
+# Liveness comes from a pidfile, not from pgrep. `pgrep -f "docker build -t
+# scout:$SHA"` matches the ssh wrapper running the check, because that
+# wrapper's own command line contains the pattern — so it reports "building"
+# forever, the script never starts a build, and it watches one that does not
+# exist. That is not hypothetical; it is what the first version did.
 remote_state() {
     "${SSH[@]}" "
         if docker image inspect scout:$SHA >/dev/null 2>&1; then echo built
-        elif pgrep -f 'docker build -t scout:$SHA' >/dev/null 2>&1; then echo building
+        elif [ -f $BUILD_PID ] && kill -0 \$(cat $BUILD_PID) 2>/dev/null; then echo building
         else echo absent; fi"
 }
 
@@ -70,7 +76,7 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$STATE" = absent ]; then
     git archive HEAD | "${SSH[@]}" "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC && tar -x -C $REMOTE_SRC"
 
     say "Starting the build (detached; first one compiles DuckDB, ~10 min)"
-    "${SSH[@]}" "cd $REMOTE_SRC && setsid nohup docker build -t scout:$SHA . > $BUILD_LOG 2>&1 < /dev/null & echo '  pid' \$!"
+    "${SSH[@]}" "cd $REMOTE_SRC && { setsid nohup docker build -t scout:$SHA . > $BUILD_LOG 2>&1 < /dev/null & echo \$! > $BUILD_PID; } && echo '  pid' \$(cat $BUILD_PID)"
     STATE=building
 fi
 
@@ -87,6 +93,9 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$STATE" = building ]; then
                 echo >&2
                 echo "  the build stopped without producing an image" >&2
                 "${SSH[@]}" "tail -n 30 $BUILD_LOG 2>/dev/null" >&2
+                exit 1 ;;
+            *)
+                echo "  could not read the node's state" >&2
                 exit 1 ;;
         esac
     done

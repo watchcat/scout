@@ -109,15 +109,43 @@ step "docker save | k3s ctr images import" \
 say "Applying"
 step "kubectl apply namespace" \
     && "${SSH[@]}" 'kubectl apply -f -' < deploy/k8s/namespace.yaml
-# .env is piped in, used, and gone. The values do end up in the cluster's
-# datastore, which is the same trust boundary they already have here.
-step "kubectl create secret from .env (piped, never written)" \
-    && "${SSH[@]}" 'kubectl -n scout create secret generic scout \
-         --from-env-file=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -' < .env
+# .env is the single source of truth for secrets, but it is split in two on
+# the way in, and the split is the point.
+#
+# The bot's Secret is mounted into its process with envFrom. That process
+# fetches arbitrary web pages, runs headless Chromium on them and feeds the
+# result to a language model — so it must not carry credentials that can
+# delete every backup. Anything AWS_* or RESTIC_* goes to a separate Secret
+# that only the backup CronJob reads.
+#
+# Both are piped in and never written to the node's disk.
+step "kubectl create secret scout (bot keys only)" \
+    && grep -vE '^(AWS_|RESTIC_)' .env | "${SSH[@]}" 'kubectl -n scout create secret generic scout \
+         --from-env-file=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -'
+
+# Only if there are any: the cluster is usable before R2 is set up.
+if [ "$DRY_RUN" -eq 0 ] && grep -qE '^(AWS_|RESTIC_)' .env; then
+    echo "  creating secret scout-offsite (backup keys only)"
+    grep -E '^(AWS_|RESTIC_)' .env | "${SSH[@]}" 'kubectl -n scout create secret generic scout-offsite \
+         --from-env-file=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -'
+elif [ "$DRY_RUN" -eq 1 ]; then
+    echo "  (dry run) kubectl create secret scout-offsite (backup keys only, if present)"
+fi
 for f in pvc service deployment ingress issuer; do
     step "apply deploy/k8s/$f.yaml" \
         && envsubst < "deploy/k8s/$f.yaml" | "${SSH[@]}" 'kubectl apply -f -'
 done
+
+# The backup job only exists once its credentials do. Applying it earlier
+# would schedule something that fails every night with a missing secret,
+# which is worse than not having it: a failing job nobody expects to work
+# teaches everyone to ignore failing jobs.
+if [ "$DRY_RUN" -eq 0 ] && grep -qE '^(AWS_|RESTIC_)' .env; then
+    echo "  applying the off-site backup job"
+    "${SSH[@]}" 'kubectl apply -f -' < deploy/k8s/backup-cronjob.yaml
+elif [ "$DRY_RUN" -eq 1 ]; then
+    echo "  (dry run) apply deploy/k8s/backup-cronjob.yaml, if its keys are set"
+fi
 step "set image scout:$SHA" \
     && "${SSH[@]}" "kubectl -n scout set image deployment/scout scout=scout:$SHA"
 

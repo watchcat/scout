@@ -128,6 +128,8 @@ enum Command {
     Kick(String),
     #[command(description = "admin only: undo a kick: /unkick <user_id>")]
     Unkick(String),
+    #[command(description = "admin only: take a database backup now")]
+    Backup,
 }
 
 const HELP: &str = "\
@@ -156,7 +158,8 @@ const ADMIN_HELP: &str = "\n\
 /invite open|close <name> - resume or stop admitting (admin)\n\
 /invite announce <name> - tell the waitlist a round is open (admin)\n\
 /kick <user_id> - remove a member (admin)\n\
-/unkick <user_id> - undo a kick (admin)";
+/unkick <user_id> - undo a kick (admin)\n\
+/backup - copy the database now, before doing something risky (admin)";
 
 /// What a stranger who sends a bare `/start` is told. The one message a
 /// non-member gets unprompted: silence here reads as broken rather than as
@@ -420,6 +423,25 @@ async fn handle_command(
                 return Ok(());
             }
             bot.send_message(msg.chat.id, "Conversation cleared.").await?;
+        }
+        Command::Backup => {
+            let Some(user_id) = msg.from.as_ref().map(|u| u.id.0 as i64) else {
+                return Ok(());
+            };
+            if !app.core.is_admin(user_id) {
+                bot.send_message(msg.chat.id, scout_core::invites::NOT_ADMIN).await?;
+                return Ok(());
+            }
+            let reply = match app.core.backup(scout_core::backup::Reason::Manual).await {
+                Ok(to) => {
+                    let kb = std::fs::metadata(&to).map(|m| m.len() / 1024).unwrap_or(0);
+                    format!("Backed up to {} ({kb} KB)", to.display())
+                }
+                // Said out loud rather than only logged: a backup nobody knows
+                // failed is the same as no backup.
+                Err(e) => format!("Backup failed: {e}"),
+            };
+            bot.send_message(msg.chat.id, reply).await?;
         }
         Command::Advert(body) => {
             let Some(user_id) = sender_id(&msg) else { return Ok(()) };

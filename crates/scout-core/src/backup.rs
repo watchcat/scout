@@ -101,6 +101,37 @@ pub fn is_due(dir: &Path) -> anyhow::Result<bool> {
         .unwrap_or(true))
 }
 
+/// Touched by whatever ships backups off the box, only after it has actually
+/// succeeded. Its age is how stale the off-site copy is.
+///
+/// A file rather than core asking the destination: core does not know what an
+/// object store is and should not have to, in order to say when something last
+/// worked. Whoever uploads asserts the fact; core only reports it.
+pub const UPLOADED_MARKER: &str = ".uploaded";
+
+/// How old each copy is. `None` is not a long duration — it means there is no
+/// such copy at all, which needs a different reaction and must never be
+/// collapsed into "old".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Freshness {
+    pub newest_local: Option<Duration>,
+    pub newest_uploaded: Option<Duration>,
+}
+
+fn age_of(path: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
+/// Cannot fail. A report about backups must not be the thing that breaks an
+/// admin's view of everything else.
+pub fn freshness(dir: &Path) -> Freshness {
+    Freshness {
+        newest_local: existing(dir).ok().and_then(|mut v| v.pop()).and_then(|p| age_of(&p)),
+        newest_uploaded: age_of(&dir.join(UPLOADED_MARKER)),
+    }
+}
+
 /// Where backups live: beside the database, on the same volume.
 ///
 /// That covers corruption, a bad migration and a mistaken delete. It does not
@@ -162,4 +193,23 @@ mod tests {
         std::fs::write(dir.path().join("scout-2026-08-05T000000Z-nightly.duckdb"), b"x").unwrap();
         assert!(!is_due(dir.path()).unwrap(), "one taken just now is not due again");
     }
+    #[test]
+    fn freshness_reports_both_copies_and_says_when_there_are_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = freshness(dir.path());
+        assert_eq!(none.newest_local, None, "no local backups yet");
+        assert_eq!(none.newest_uploaded, None, "nothing has been uploaded");
+
+        std::fs::write(dir.path().join("scout-2026-08-05T000000Z-nightly.duckdb"), b"x").unwrap();
+        let local_only = freshness(dir.path());
+        assert!(local_only.newest_local.is_some());
+        assert_eq!(
+            local_only.newest_uploaded, None,
+            "a local backup is not an uploaded one, and that difference is the whole point"
+        );
+
+        std::fs::write(dir.path().join(UPLOADED_MARKER), b"").unwrap();
+        assert!(freshness(dir.path()).newest_uploaded.is_some());
+    }
+
 }

@@ -2,6 +2,18 @@
 
 **A Telegram shopping and flight researcher that doesn't make things up.**
 
+### 🟢 [goodscout.fyi](https://goodscout.fyi) — invites are open
+
+Scout admits people in rounds, and there is room in the current one. The site
+reports the live state and hands you the link to start; if a round fills while
+you are reading this, it will say so rather than send you to a door that does
+not open.
+
+You do not need to host anything to use it. The rest of this page is for
+running your own.
+
+---
+
 Scout finds products and flights, compares real prices, and remembers what you
 bought. It never buys anything — you get verified links, arithmetic done in
 Rust rather than guessed at, and the purchase stays in your hands.
@@ -188,6 +200,9 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 ---
 
 ## Quick start
+
+This is for running your own instance. To use the hosted one, go to
+[goodscout.fyi](https://goodscout.fyi) — there is nothing to install.
 
 ```bash
 git clone https://github.com/watchcat/scout && cd scout

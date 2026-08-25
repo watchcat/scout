@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: scout
+  namespace: scout
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: ["${SCOUT_DOMAIN}"]
+      secretName: scout-tls
+  rules:
+    # Substituted by scripts/deploy-k3s.sh. A hostname cannot be templated by
+    # kubectl alone, and hardcoding it would put the domain in git for no gain.
+    - host: "${SCOUT_DOMAIN}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: scout
+                port: { name: http }

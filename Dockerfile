@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 chromium fonts-liberation \
+        ca-certificates libssl3 chromium fonts-liberation tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m scout \
     && mkdir -p /data \
@@ -38,4 +38,10 @@ USER scout
 WORKDIR /data
 ENV SCOUT_DB_PATH=/data/scout.duckdb
 ENV SCOUT_CHROME=/usr/bin/chromium
+# Chromium's helper processes (renderer, zygote, crashpad) outlive the process
+# that spawned them and are reparented to PID 1. Without an init there they are
+# never reaped: one render left 35 zombies, which ends in an exhausted PID
+# table. Compose can supply one with `init: true`; Kubernetes has no equivalent,
+# so it belongs in the image, where every runtime gets it for free.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["scout-telegram"]

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: scout
+  namespace: scout
+spec:
+  selector: { app: scout }
+  ports:
+    - { name: http, port: 80, targetPort: http }

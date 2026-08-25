@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scout
+  namespace: scout
+spec:
+  # Not a knob. DuckDB is single-writer, so a second process cannot open the
+  # database at all — and two clients long-polling one Telegram bot token both
+  # get 409 Conflict. Scaling this up breaks the bot in two ways at once, and
+  # neither failure mentions the replica count.
+  replicas: 1
+  strategy:
+    # For the same reason. The default rolling update starts the new pod before
+    # stopping the old one, which is precisely the collision above — on every
+    # deploy, not just when someone edits the replica count.
+    type: Recreate
+  selector:
+    matchLabels: { app: scout }
+  template:
+    metadata:
+      labels: { app: scout }
+    spec:
+      # One request is bounded by RUN_BUDGET (300s) plus link verification and
+      # wrap-up, so anything shorter kills the slowest answers mid-sentence.
+      # Reached only when something is actually running; an idle bot exits at
+      # once. See the SIGTERM handlers in bot::run and scout_web::serve.
+      terminationGracePeriodSeconds: 330
+      containers:
+        - name: scout
+          # The deploy script replaces this with the git SHA it just built.
+          # IfNotPresent rather than Never: there is no registry, so a missing
+          # image should fail loudly instead of quietly running whatever
+          # `latest` happens to point at.
+          image: scout:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: scout
+          env:
+            - { name: SCOUT_DB_PATH, value: /data/scout.duckdb }
+            - { name: SCOUT_WEB_BIND, value: "0.0.0.0:8080" }
+          ports:
+            - { name: http, containerPort: 8080 }
+          # /healthz reports process liveness and deliberately says nothing
+          # about the database: a check that failed while DuckDB was busy would
+          # restart a pod that was still serving the page correctly from cache.
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            # Memory only. A CPU limit would throttle the agent mid-answer for
+            # no benefit on a box running one workload.
+            limits: { memory: 3Gi }
+          securityContext:
+            # Nothing here needs privileges: the image already runs as `scout`,
+            # and Chromium is invoked with --no-sandbox, which is why it works
+            # unprivileged today. Adding SYS_ADMIN to "fix" a browser problem
+            # would be undoing that.
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: scout-data }

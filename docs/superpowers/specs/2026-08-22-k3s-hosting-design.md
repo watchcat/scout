@@ -8,7 +8,7 @@ back. W1 makes Scout reachable from the internet, which turns the laptop into a
 published host with a residential IP, an uptime bounded by the lid, and an
 address the ISP may rotate.
 
-This document designs the move: a single Hetzner Cloud server running k3s, with
+This document designs the move: a single Contabo VPS running k3s, with
 Scout as its first workload and room for others.
 
 ## Why Kubernetes, given that Scout cannot use it
@@ -54,22 +54,39 @@ than load-bearing.
 
 ## The server
 
-One Hetzner Cloud **CX32** — 4 vCPU, 8 GB, 80 GB — Ubuntu 24.04, in Nuremberg
-or Falkenstein.
+One **Contabo VPS**, Ubuntu 24.04 — 8 GB and 100 GB, which is more than this
+needs and is what the cheap tier happens to come with.
 
-8 GB is not padding. The Dockerfile records that DuckDB's C++ compile hangs the
-build at 10 jobs against ~8 GB and that `CARGO_BUILD_JOBS=4` fits; a 4 GB box
-saves €3 a month and buys an out-of-memory kill in a ten-minute compile. k3s
-itself wants roughly 500 MB, Chromium peaks around 1 GB during a render, and
-the rest is headroom for the services this exists to make room for.
+That is smaller than it would need to be if it built its own images. The 8 GB
+figure that appears in the Dockerfile — "10 jobs against ~8 GiB hangs the build,
+4 jobs fits" — is about compiling DuckDB's C++, and this server never compiles
+anything. Running Scout is modest: k3s is roughly 500 MB, Chromium peaks around
+1 GB while rendering a page, and the rest is headroom for the services this
+exists to make room for.
 
-**Hetzner's automatic backups should be enabled** — 20% of the server price, and
-the only thing standing between a disk failure and the purchase history.
+**Images are built elsewhere and shipped in.** The box has the memory to build, but should not: a compiler and a Docker
+daemon on an internet-facing host are attack surface bought for nothing, when
+the build can happen where the developer already is. `docker save | ssh | k3s ctr images import` puts the image on
+the node without Docker, a toolchain, or a checkout ever existing on it. The
+box runs k3s and Scout and nothing else, which is both cheaper and less to
+attack.
+
+The cost of that: a deploy needs a machine with Docker, and the first image
+push is a slow upload. Both are acceptable for a one-person project; neither
+would be for a team without a CI runner, which is the point at which this
+should become a registry.
+
+**Contabo has no free snapshots and no cloud firewall**, which are the two
+things this design was quietly relying on a provider for. The firewall becomes
+`ufw` on the host, configured to allow k3s's own pod and service networks or
+the cluster loses its DNS. The backup becomes a dump the operator takes, since
+Contabo's Auto Backup is a paid add-on — and until one exists, the purchase
+history lives on exactly one disk.
 
 ## Architecture
 
 ```
-internet ──► Hetzner firewall (22, 80, 443 only)
+internet ──► ufw on the host (22, 80, 443 only; 6443 never)
                 └─► k3s node
                       ├─ traefik        ingress, bundled with k3s
                       ├─ cert-manager   Let's Encrypt HTTP-01
@@ -98,8 +115,8 @@ its `Certificate` resources make expiry visible to `kubectl`.
 on the node's disk. This is honest about what it is — there is one node, so
 there is no such thing as a network volume here, and pretending otherwise with
 Longhorn on a single machine would add a distributed storage system to protect
-against a failure mode (node loss) that also loses the cluster. Backups are
-Hetzner's snapshot plus the manual dump procedure below, not a storage layer.
+against a failure mode (node loss) that also loses the cluster. Backups are the manual dump procedure below, and — on this provider — nothing
+else unless the Auto Backup add-on is bought.
 
 **Secrets: a Kubernetes Secret created from `.env`.** `kubectl create secret
 generic scout --from-env-file=.env` keeps `.env` the source of truth, keeps it
@@ -112,11 +129,12 @@ The twelve keys: `TELEGRAM_BOT_TOKEN`, `ALLOWED_TELEGRAM_USER_IDS`,
 `PERPLEXITY_API_KEY`, `DUFFEL_API_KEY`, `IGNAV_API_KEY`, `EBAY_CLIENT_ID`,
 `EBAY_CLIENT_SECRET`, `EBAY_MARKETPLACE`, `SCOUT_DOMAIN`.
 
-**The image is built on the box and imported into containerd.** No registry, no
-credentials, no second service — and the box is sized for the build anyway.
-`docker build`, then `docker save | k3s ctr images import -`, tagged with the
-git SHA so a rollback is a tag change rather than a rebuild. The alternative,
-pushing to ghcr.io, is cleaner for multi-node and pointless for one.
+**The image is built where the developer is and shipped in.** No registry, no
+credentials, no second service. `docker build` locally, then `docker save |
+gzip | ssh | k3s ctr images import -`, tagged with the git SHA so a rollback is
+a tag change rather than a rebuild. Pushing to ghcr.io would be cleaner for
+multi-node or for a team, and is not worth its credentials for one machine and
+one person.
 
 ## What W1's work becomes
 
@@ -164,9 +182,12 @@ exists for.
 
 Order matters, and one step is unforgiving.
 
-1. Create the server, enable backups, apply a Hetzner firewall allowing only
-   22, 80 and 443. **k3s serves its API on 6443 and binds it to all
-   interfaces** — leaving that reachable would publish cluster admin.
+1. Create the server, then install k3s, then firewall it with `ufw` — in that
+   order, because the rules have to allow the pod and service networks k3s
+   creates, and those should be read from the running cluster rather than
+   assumed. **k3s serves its API on 6443 and binds it to all interfaces**;
+   leaving that reachable would publish cluster admin. Contabo provides no
+   cloud firewall, so there is nothing catching this if the host does not.
 2. Install k3s, cert-manager, and the Scout manifests, with the Deployment
    scaled to zero. Nothing is running yet, so nothing conflicts.
 3. **Stop the laptop's container.** Two processes long-polling one bot token
@@ -203,9 +224,10 @@ the real thing, and it is written as one in the plan:
 
 - **Anything for the second service.** The ingress and cert-manager are set up
   to be shared, but no second workload is designed here.
-- **Off-box backups.** Hetzner's snapshots protect against disk failure, not
-  against deleting the wrong namespace. A periodic dump to somewhere else is
-  wanted and is not in this scope.
+- **Backups.** Contabo's Auto Backup is a paid add-on, so unless it is bought
+  there is no snapshot behind this at all and the database lives on one disk.
+  The dump procedure exists; a schedule does not. This is the largest gap the
+  move leaves and it should be closed soon after.
 - **Monitoring.** No Prometheus, no alerting. `kubectl` and `docker compose
   logs`' successor are the whole story for now.
 - **GitOps.** Manifests are applied by the deploy script from a checkout, not

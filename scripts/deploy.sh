@@ -38,9 +38,9 @@ say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 running=$(docker compose ps --status running --quiet 2>/dev/null | wc -l | tr -d ' ')
 
 say "Checking the working tree"
-if [ -n "$(git status --porcelain -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile)" ]; then
+if [ -n "$(git status --porcelain -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile Caddyfile)" ]; then
     echo "  uncommitted changes — deploying code that is not in git:"
-    git status --short -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile | sed 's/^/    /'
+    git status --short -- crates Cargo.toml Cargo.lock compose.yaml Dockerfile Caddyfile | sed 's/^/    /'
 else
     echo "  clean: $(git log --oneline -1)"
 fi
@@ -81,6 +81,22 @@ for _ in $(seq 1 60); do
             sed -E 's/\x1b\[[0-9;]*m//g; s/^scout-1 *\| *//' |
             tail -5 |
             sed 's/^/  /'
+
+        # "scout is up" only speaks for scout. Since the proxy joined the
+        # project, a caddy that cannot start — an unset SCOUT_DOMAIN, a
+        # certificate it could not get — would crash-loop quietly while this
+        # script reported success and exited 0. The deploy would be a lie:
+        # the bot fine, the site down, and nothing saying so.
+        not_running=$(docker compose ps --format '{{.Service}} {{.State}}' 2>/dev/null |
+            awk '$2 != "running" { print $1 }')
+        if [ -n "$not_running" ]; then
+            echo >&2
+            echo "  scout is up, but these are not: $not_running" >&2
+            echo "  the bot is fine; something else in the project is not." >&2
+            docker compose ps >&2
+            exit 1
+        fi
+
         say "Deployed: $(git log --oneline -1)"
         exit 0
     fi

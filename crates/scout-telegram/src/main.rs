@@ -62,6 +62,18 @@ async fn main() -> Result<()> {
 
     tokio::spawn(scheduler::run(telegram.clone(), core.clone()));
 
+    // The web front door. Same process as the bot because DuckDB is
+    // single-writer; W4 is where it moves out. A failure here must not stop
+    // the bot: the page going dark is worse than nothing, but a bot that
+    // will not start because a port is taken is worse than that.
+    let web_core = core.clone();
+    let bind = std::env::var("SCOUT_WEB_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    tokio::spawn(async move {
+        if let Err(e) = scout_web::serve(web_core, &bind).await {
+            tracing::error!(error = %e, "the front door did not open");
+        }
+    });
+
     let app = Arc::new(bot::App {
         core,
         chats: DashMap::new(),

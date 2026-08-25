@@ -1,0 +1,16 @@
+[package]
+name = "scout-web"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Scout's public face"
+
+[dependencies]
+scout-core = { path = "../scout-core" }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+anyhow = "1"
+tracing = "0.1"
+axum = "0.8.9"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

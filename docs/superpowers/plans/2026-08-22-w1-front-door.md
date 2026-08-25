@@ -214,7 +214,8 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 ```
 
-Then add axum, letting cargo pick the version rather than guessing one:
+Then add axum, letting cargo pick the version rather than guessing one. Write
+Step 2's `src/lib.rs` first — `cargo add` refuses a manifest with no targets:
 
 ```bash
 cargo add axum -p scout-web
@@ -563,6 +564,13 @@ In `crates/scout-web/src/lib.rs`'s test module:
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()["content-type"], "text/html; charset=utf-8");
 
+        // Deleting Task 2's test would otherwise leave /healthz uncovered,
+        // and it is the route the proxy depends on.
+        let health = app.clone()
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
         let missing = app
             .oneshot(Request::builder().uri("/wp-login.php").body(Body::empty()).unwrap())
             .await.unwrap();
@@ -580,6 +588,11 @@ Expected: FAIL — `cannot find function 'router'`.
 Replace `health_router` with:
 
 ```rust
+// Narrow this back from the `pub mod` Task 3 needed. That was to stop
+// dead-code warnings while nothing called into it — `pub(crate)` does not
+// silence those, since dead-code analysis is about reachability. Now that
+// `serve` calls it, `mod` is enough, and leaving it public would give the
+// same items two paths in from outside.
 mod cache;
 mod page;
 
@@ -606,10 +619,18 @@ async fn index(State(cache): State<AdmissionCache>) -> Html<String> {
 /// Serves until the process ends.
 ///
 /// Takes the first reading before binding, so the page is never briefly
-/// wrong on start-up, and so a database that will not open is a start-up
-/// failure rather than a page that lies for thirty seconds.
+/// wrong on start-up. A failed first reading is not fatal, though: by this
+/// point `Core::start` has already opened the database, so a failure here is
+/// a transient query error rather than an unreachable store — and refusing
+/// to open the front door over one would contradict the policy every later
+/// refresh follows. It starts at `Full`, which is the safe thing to be wrong
+/// about, and corrects itself within `REFRESH`.
 pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
-    let cache = AdmissionCache::new(core.admission().await?);
+    let first = core.admission().await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "could not read admission at start-up; opening as full");
+        scout_core::core::Admission::Full
+    });
+    let cache = AdmissionCache::new(first);
     tokio::spawn(refresh_forever(core, cache.clone()));
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -619,9 +640,15 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
 }
 ```
 
-Keep the `health_router` test passing by pointing it at `router(...)` with a
-cache, or delete that test now that Step 1's covers `/healthz` through the real
-router. Deleting is right — two tests for one route is one too many.
+Delete Task 2's `the_proxy_can_tell_whether_we_are_alive` and its
+`#[cfg(test)] fn health_router` — Step 1's test now covers `/healthz` through
+the real router, and two tests for one route is one too many. Check the
+`#[cfg(test)]` attributes on the imports come off with it.
+
+While here: drop `tempfile` from `crates/scout-web/Cargo.toml`'s
+dev-dependencies if nothing in the crate uses it by now. It was added in
+anticipation of a test that reaches for a real `Core`, and no task in this
+plan turned out to need one.
 
 - [ ] **Step 4: Spawn it from main**
 

@@ -17,6 +17,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 scout-api = { path = "../scout-api" }
 scout-core = { path = "../scout-core" }
+scout-web = { path = "../scout-web" }
 
 [dev-dependencies]
 # Paused time, so a test for the render queue's 45-second deadline finishes

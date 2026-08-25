@@ -36,6 +36,21 @@ pub struct Population {
     pub daily_cap: i64,
 }
 
+/// Whether someone arriving right now can get in.
+///
+/// Deliberately not a count. How many seats are left is nobody's business
+/// outside this process; whether it is worth turning up is everybody's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// A round is open and has room. `join_url` is `None` only when the bot
+    /// could not read its own address at start-up, which disables the link
+    /// rather than sending anyone somewhere that is not ours.
+    Open { join_url: Option<String> },
+    /// Full, closed, or no round at all. One answer on purpose: which it is
+    /// tells a stranger about rounds they were not invited to.
+    Full,
+}
+
 /// Founders are the people paying for the bot, named in the environment by
 /// Telegram id because that is the only name they had when the list was
 /// written. Exempt from the daily cap.
@@ -51,8 +66,12 @@ pub fn is_admin_id(admins: &HashSet<i64>, telegram_id: i64) -> bool {
 impl Core {
     /// Opens the database and builds every client the agent can use.
     ///
-    /// `return_url` is where Duffel Links sends a traveller back to — today
-    /// the bot's own address, from `getMe`. Taking it here is a deliberate
+    /// `return_url` is the bot's own address, from `getMe`. Two things read
+    /// it: Duffel Links, as where to send a traveller after checkout, and
+    /// `admission`, as the base of the join link a stranger is offered. They
+    /// agree today only because the bot's own chat is the one address Scout
+    /// owns — that is a coincidence the type does not enforce, and it is why
+    /// this wants to become a named concept rather than a borrowed field. Taking it here is a deliberate
     /// simplification while there is one channel: it is really a property of
     /// the channel, not of the process, and a core serving two channels has
     /// two return addresses where a constructor argument holds one. The path
@@ -326,6 +345,35 @@ impl Core {
     ) -> anyhow::Result<String> {
         crate::vision::describe_photo(&self.deps.llm, bytes, caption).await
     }
+
+    /// Who may walk in, as the public page reports it.
+    ///
+    /// Reads the database. Callers on a request path must cache it — see
+    /// `scout-web`, where a public endpoint that took the store's mutex
+    /// would be a way for a stranger to slow the agent down.
+    ///
+    /// "Room" here is the same count `claim_seat` uses, revoked members
+    /// included. That is what stops the page from lying: it can never say
+    /// open where a real attempt to join would be turned away.
+    pub async fn admission(&self) -> anyhow::Result<Admission> {
+        let store = self.store();
+        let return_url = self.deps.return_url.clone();
+        blocking(move || {
+            // `rounds()` comes back oldest first, so searching from the back
+            // finds the newest round that will still take someone.
+            let newest_with_room = store
+                .rounds()?
+                .into_iter()
+                .rfind(|r| r.open && r.used < r.capacity);
+            Ok(match newest_with_room {
+                Some(r) => Admission::Open {
+                    join_url: return_url.map(|u| format!("{u}?start={}", r.code)),
+                },
+                None => Admission::Full,
+            })
+        })
+        .await
+    }
 }
 
 /// Runs a blocking store call off the async runtime.
@@ -347,6 +395,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Claim;
 
     #[test]
     fn a_founder_is_exempt_from_the_daily_cap_and_a_member_is_not() {
@@ -449,6 +498,48 @@ mod tests {
             due,
             "a web acknowledgement moved a telegram reminder"
         );
+    }
+
+    #[tokio::test]
+    async fn the_newest_round_with_room_is_the_one_a_stranger_can_join() {
+        // Several rounds can be open at once — nothing closes the old one
+        // when a new one opens. The page has room for one answer, so core
+        // picks: the newest round that is open and not yet full.
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(
+            Config::for_test(dir.path().join("doors.duckdb").to_str().unwrap()),
+            Some("https://t.me/scoutbot".to_string()),
+        )
+        .unwrap();
+        let store = core.store();
+
+        assert_eq!(core.admission().await.unwrap(), Admission::Full,
+            "no rounds at all is not an invitation");
+
+        // Created back to back. `rounds()` orders by created_at then code,
+        // so if these ever landed in the same microsecond the tiebreak would
+        // put `autumn` first and "newest" would resolve to `spring` — which
+        // is the wrong answer and fails this test rather than passing it
+        // quietly. The safe direction, but worth knowing it rests on that.
+        store.create_round("spring", 1).unwrap();
+        store.create_round("autumn", 1).unwrap();
+        assert_eq!(
+            core.admission().await.unwrap(),
+            Admission::Open { join_url: Some("https://t.me/scoutbot?start=autumn".to_string()) },
+            "the newer round supersedes the older one without anyone closing it"
+        );
+
+        // Fill autumn. Spring is still open with room, so the door is not shut.
+        let joiner = store.account_for_telegram(7).unwrap();
+        assert_eq!(store.claim_seat(joiner, 7, "autumn").unwrap(), Claim::Admitted);
+        assert_eq!(
+            core.admission().await.unwrap(),
+            Admission::Open { join_url: Some("https://t.me/scoutbot?start=spring".to_string()) }
+        );
+
+        store.set_round_open("spring", false).unwrap();
+        assert_eq!(core.admission().await.unwrap(), Admission::Full,
+            "a closed round and a full round look the same from outside");
     }
 
     #[test]

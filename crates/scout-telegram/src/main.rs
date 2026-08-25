@@ -61,6 +61,9 @@ async fn main() -> Result<()> {
     );
 
     tokio::spawn(scheduler::run(telegram.clone(), core.clone()));
+    // Backups belong to core, not to this channel: they must keep happening
+    // whether or not Telegram is running.
+    tokio::spawn(core.clone().run_maintenance());
 
     // The web front door. Same process as the bot because DuckDB is
     // single-writer; W4 is where it moves out. A failure here must not stop

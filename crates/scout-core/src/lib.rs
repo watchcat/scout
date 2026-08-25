@@ -8,6 +8,7 @@ mod agent;
 mod store;
 mod tools;
 
+pub mod backup;
 pub mod config;
 pub mod core;
 pub mod describe;

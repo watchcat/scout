@@ -619,7 +619,7 @@ fn legacy_shape(conn: &Connection) -> Result<bool> {
     Ok(n > 0)
 }
 
-fn apply_steps(conn: &Connection) -> Result<()> {
+fn apply_steps(conn: &Connection, db_path: &Path) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL)")?;
     let mut stmt = conn.prepare("SELECT version FROM schema_version")?;
     let current: Option<i64> = stmt.query_map([], |r| r.get(0))?.next().transpose()?;
@@ -641,6 +641,33 @@ fn apply_steps(conn: &Connection) -> Result<()> {
             start
         }
     };
+    // Before the first step, not after: a migration cannot be undone, so this
+    // is the last moment the old shape still exists.
+    //
+    // A failure here is logged and the migration proceeds anyway. That is
+    // deliberate and it is sharp — it means an irreversible change can run
+    // unprotected. The alternative, refusing to start, turns a full disk into
+    // a bot that will not boot, at the worst possible moment. Reversing this
+    // choice is one `?`; see the design doc.
+    let target = steps().last().map(|(n, _)| *n).unwrap_or(0);
+    if target > current {
+        let dir = crate::backup::dir_for(db_path);
+        let taken = std::fs::create_dir_all(&dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                let to = dir.join(crate::backup::file_name_now(
+                    crate::backup::Reason::Migration { to: target },
+                ));
+                backup_connection(conn, &to).map(|()| to)
+            });
+        match taken {
+            Ok(to) => tracing::info!(path = %to.display(), from = current, to = target,
+                "backed up before migrating"),
+            Err(e) => tracing::error!(error = %e, from = current, to = target,
+                "COULD NOT BACK UP BEFORE MIGRATING; proceeding anyway"),
+        }
+    }
+
     for (n, step) in steps() {
         if n <= current {
             continue;
@@ -669,14 +696,53 @@ pub struct Store {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// Writes a consistent copy of `conn`'s database to `path`.
+///
+/// DuckDB is single-writer, so this is the only way to get a copy that is not
+/// merely crash-consistent: it runs on the connection that already holds the
+/// database open, folding in whatever is still sitting in the write-ahead log.
+/// A copy taken from outside — `cp`, a volume snapshot, a provider's block
+/// backup — captures whatever was on disk mid-flight and relies on WAL replay,
+/// exactly like recovering from a power cut.
+///
+/// Written to a `.partial` and renamed, so an interrupted backup leaves
+/// something obviously unfinished rather than something that looks restorable.
+fn backup_connection(conn: &Connection, path: &Path) -> Result<()> {
+    // The source's identifier is derived from its filename — `scout` in
+    // production, a random temp name under test — so it is asked for rather
+    // than assumed. Hardcoding it would pass no test and quietly couple
+    // production to a filename.
+    let source: String = conn.query_row("SELECT current_database()", [], |r| r.get(0))?;
+    let partial = path.with_extension("partial");
+    let _ = std::fs::remove_file(&partial);
+
+    conn.execute_batch(&format!(
+        "ATTACH '{}' AS scout_backup; COPY FROM DATABASE \"{}\" TO scout_backup; DETACH scout_backup;",
+        partial.display(),
+        source,
+    ))?;
+    std::fs::rename(&partial, path)?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path.as_ref())?;
         conn.execute_batch(MIGRATIONS)?;
-        apply_steps(&conn)?;
+        apply_steps(&conn, path.as_ref())?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// A consistent copy of this database, taken without stopping anything.
+    ///
+    /// Holds the store's mutex for the duration, which blocks the agent. At
+    /// this database's size that is imperceptible; it is worth knowing because
+    /// it scales with the file.
+    pub(crate) fn backup_to(&self, path: &Path) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        backup_connection(&conn, path)
     }
 
     /// Highest migration step applied to this database.
@@ -3395,4 +3461,85 @@ CREATE TABLE segment_candidates (
         assert_eq!(s.requests_today(2).unwrap(), 1);
         assert_eq!(s.requests_today(999).unwrap(), 0);
     }
+    #[test]
+    fn a_backup_is_a_whole_database_that_opens_on_its_own() {
+        // Taken from the connection that holds the source open, with no
+        // checkpoint and nothing stopped. That is the entire point: no
+        // outside process can open this file while Scout runs, so a copy
+        // made from outside is crash-consistent at best.
+        let (store, dir) = test_store();
+        let account = store.account_for_telegram(99).unwrap();
+        store.remember_user(account, "before the backup").unwrap();
+
+        let backup = dir.path().join("backup.duckdb");
+        store.backup_to(&backup).unwrap();
+
+        // The source is undisturbed and still writable.
+        store.remember_user(account, "after the backup").unwrap();
+
+        let restored = Store::open(&backup).unwrap();
+        assert_eq!(
+            restored.display_names().unwrap().get(&account).map(String::as_str),
+            Some("before the backup"),
+            "the backup should hold what was committed when it was taken"
+        );
+        assert_eq!(restored.schema_version().unwrap(), store.schema_version().unwrap());
+    }
+
+    #[test]
+    fn a_pending_migration_backs_the_database_up_before_changing_it() {
+        // The failure with no second chance. A migration cannot be undone, so
+        // if this copy is missing — or is taken after the fact — a bad schema
+        // step is unrecoverable. We took this by hand four times before
+        // automating it, and remembering was the only protection.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("legacy.duckdb");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(LEGACY_SCHEMA).unwrap();
+            conn.execute_batch(
+                "INSERT INTO purchases (user_id, item, store) VALUES (7, 'detergent', 'bol.com')",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db).unwrap();
+        assert!(store.schema_version().unwrap() >= 5, "the migration ran");
+
+        let backups = crate::backup::dir_for(&db);
+        let taken: Vec<_> = std::fs::read_dir(&backups)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(taken.len(), 1, "exactly one backup, taken before the steps");
+        assert!(taken[0].file_name().unwrap().to_str().unwrap().contains("migration-v"));
+
+        // The proof it was taken BEFORE rather than after: the copy still has
+        // the column the migration replaces.
+        let before = Connection::open(&taken[0]).unwrap();
+        let legacy: i64 = before
+            .query_row(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_name = 'purchases' AND column_name = 'user_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 1, "the backup should predate the column being replaced");
+    }
+
+    #[test]
+    fn a_database_with_nothing_to_migrate_is_not_backed_up() {
+        // Otherwise every restart writes one and the retention window stops
+        // meaning two weeks.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("fresh.duckdb");
+        drop(Store::open(&db).unwrap());
+        drop(Store::open(&db).unwrap());
+
+        let backups = crate::backup::dir_for(&db);
+        let n = std::fs::read_dir(&backups).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(n, 0, "a fresh database has no pending steps and needs no copy");
+    }
+
 }

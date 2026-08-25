@@ -333,6 +333,55 @@ impl Core {
         blocking(move || store.remember_user(account_id, &name)).await
     }
 
+    /// Takes a backup now and prunes old ones. Returns where it went.
+    ///
+    /// Runs off the async runtime: the copy holds the store's mutex for its
+    /// duration, and that mutex is shared with the agent.
+    pub async fn backup(&self, reason: crate::backup::Reason) -> anyhow::Result<std::path::PathBuf> {
+        let store = self.store();
+        let db = std::path::PathBuf::from(&self.cfg.db_path);
+        blocking(move || {
+            let dir = crate::backup::dir_for(&db);
+            std::fs::create_dir_all(&dir)?;
+            let to = dir.join(crate::backup::file_name_now(reason));
+            store.backup_to(&to)?;
+            crate::backup::prune(&dir, crate::backup::KEEP)?;
+            Ok(to)
+        })
+        .await
+    }
+
+    /// Housekeeping that has to happen whether or not a channel is running.
+    ///
+    /// Spawned by whoever owns the process — `main` today, the core binary
+    /// once core has one of its own. Deliberately not part of the Telegram
+    /// scheduler: a backup should not depend on a chat client existing.
+    pub async fn run_maintenance(self: std::sync::Arc<Self>) {
+        // Hourly checks against a daily threshold, so a restart cannot skip a
+        // day and the check itself costs a stat call.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let dir = crate::backup::dir_for(std::path::Path::new(&self.cfg.db_path));
+        loop {
+            ticker.tick().await;
+            match crate::backup::is_due(&dir) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not tell whether a backup is due");
+                    continue;
+                }
+            }
+            // A failed backup must never stop the bot answering. The weakness
+            // of that choice is that nobody reads logs, which is how backups
+            // usually fail — hence the shouting.
+            match self.backup(crate::backup::Reason::Nightly).await {
+                Ok(to) => tracing::info!(path = %to.display(), "nightly backup"),
+                Err(e) => tracing::error!(error = %e, "NIGHTLY BACKUP FAILED"),
+            }
+        }
+    }
+
     /// Turns a photo into a search description.
     ///
     /// Wrapped so the adapter never reaches for the model itself: which
@@ -549,4 +598,27 @@ mod tests {
             "⏰ Time to reorder detergent — want me to search for deals?"
         );
     }
+    #[tokio::test]
+    async fn an_on_demand_backup_lands_beside_the_database_and_prunes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("maint.duckdb");
+        let core = Core::start(Config::for_test(db.to_str().unwrap()), None).unwrap();
+
+        let first = core.backup(crate::backup::Reason::Manual).await.unwrap();
+        assert!(first.exists(), "the backup file should be where it says");
+        assert!(first.starts_with(crate::backup::dir_for(&db)));
+        assert!(first.to_str().unwrap().contains("manual"));
+
+        // It is a database, not just bytes.
+        let restored = Core::start(Config::for_test(first.to_str().unwrap()), None).unwrap();
+        assert!(restored.schema_version().unwrap() >= 5);
+
+        // No `.partial` survives a successful run.
+        let leftovers = std::fs::read_dir(crate::backup::dir_for(&db))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "partial"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
 }

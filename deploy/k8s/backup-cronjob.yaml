@@ -1,0 +1,58 @@
+# Ships the consistent copies Scout takes of itself to Cloudflare R2.
+#
+# A CronJob rather than another loop inside the bot, deliberately: uploading is
+# not something only the database's owner can do — unlike taking the copy,
+# which is, because DuckDB is single-writer. Keeping it out here means restic's
+# credentials never enter the bot's process, a stuck upload cannot block the
+# agent, and the schedule is visible to kubectl instead of buried in a loop.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scout-offsite-backup
+  namespace: scout
+spec:
+  # After the bot's own nightly copy has had time to land.
+  schedule: "30 3 * * *"
+  concurrencyPolicy: Forbid
+  # The evidence of failure is the point of this job, so keep more failures
+  # than successes.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: restic
+              image: restic/restic:0.17.3
+              envFrom:
+                - secretRef:
+                    name: scout-offsite
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  # First run only. `init` against an existing repository
+                  # fails, and that particular failure is uninteresting — which
+                  # is why it is the one command allowed to fail, and why
+                  # `set -e` is on for everything after it.
+                  restic init || true
+                  # /data/backups, never /data/scout.duckdb. The live file is
+                  # open and being written; these were produced by COPY FROM
+                  # DATABASE with the write-ahead log folded in, which is the
+                  # whole reason they exist.
+                  restic backup --host scout /data/backups
+                  restic forget --keep-daily 14 --prune
+                  # Only after everything above succeeded. /stat reads this
+                  # file's age as "how stale is the off-site copy", so touching
+                  # it early would be reporting a success that did not happen.
+                  touch /data/backups/.uploaded
+              volumeMounts:
+                # Read-write solely so the marker can be written. Pruning local
+                # backups stays with the process that created them.
+                - { name: data, mountPath: /data }
+          volumes:
+            - name: data
+              persistentVolumeClaim: { claimName: scout-data }

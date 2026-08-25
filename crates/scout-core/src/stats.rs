@@ -203,6 +203,14 @@ mod flight_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_age_that_has_never_happened_does_not_read_as_a_long_time() {
+        use std::time::Duration;
+        assert_eq!(describe_age(None), "never");
+        assert_eq!(describe_age(Some(Duration::from_secs(120))), "2m ago");
+        assert_eq!(describe_age(Some(Duration::from_secs(7200))), "2h ago");
+        assert_eq!(describe_age(Some(Duration::from_secs(3 * 86400))), "3d ago");
+    }
     use super::*;
 
     fn date(s: &str) -> NaiveDate {
@@ -358,6 +366,33 @@ mod tests {
 /// because the web app must not be able to ask for it either. Both reads take
 /// the same branch, so a non-admin cannot see another person's flight
 /// spending either.
+/// "never" is not "a long time ago". A backup that has never been taken and
+/// one that is a month stale call for different reactions, and a duration
+/// cannot express the first.
+fn describe_age(age: Option<std::time::Duration>) -> String {
+    match age {
+        None => "never".to_string(),
+        Some(d) if d.as_secs() < 3600 => format!("{}m ago", d.as_secs() / 60),
+        Some(d) if d.as_secs() < 86400 => format!("{}h ago", d.as_secs() / 3600),
+        Some(d) => format!("{}d ago", d.as_secs() / 86400),
+    }
+}
+
+/// Appended to `/stat` for admins, because a backup that quietly stopped is
+/// only dangerous while nobody notices — and this is where somebody already
+/// looks. The off-site age comes from a marker on disk, so asking for it
+/// cannot hang on a network call.
+fn backup_line(core: &crate::core::Core) -> String {
+    let f = crate::backup::freshness(&crate::backup::dir_for(std::path::Path::new(
+        &core.cfg.db_path,
+    )));
+    format!(
+        "\nbackups: local {}, off-site {}",
+        describe_age(f.newest_local),
+        describe_age(f.newest_uploaded),
+    )
+}
+
 pub async fn report(core: &crate::core::Core, telegram_id: i64, arg: &str) -> String {
     let days = match parse_days(arg) {
         Ok(days) => days,
@@ -395,7 +430,11 @@ pub async fn report(core: &crate::core::Core, telegram_id: i64, arg: &str) -> St
 
     match data {
         Ok((rows, names, flights)) => {
-            format_stats(&rows, days, today, account_id, &names, &flights)
+            let mut out = format_stats(&rows, days, today, account_id, &names, &flights);
+            if admin {
+                out.push_str(&backup_line(core));
+            }
+            out
         }
         Err(e) => {
             tracing::error!(error = %e, "usage stats query failed");

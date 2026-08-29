@@ -1400,13 +1400,22 @@ impl Store {
     /// request, and a flight search is a sub-event of a message already
     /// counted, so counting it would charge one message twice.
     ///
-    /// `current_date` is the container clock, which runs UTC — the same
-    /// midnight the reply tells the user about.
+    /// Midnight is UTC because that is how the rows are stored, not because
+    /// UTC is nicer. `created_at` is a naive TIMESTAMP defaulting to
+    /// `current_timestamp`, and DuckDB writes that as the UTC instant with
+    /// the zone stripped, while `current_date` stays local. Measured on a
+    /// CEST machine: stored `2026-08-29 22:35`, `current_date`
+    /// `2026-08-30`. This used to compare against `current_date`, which
+    /// therefore excluded every row written since local midnight and
+    /// counted zero — the cap switching itself off for as many hours as the
+    /// offset. The container runs UTC, so the two agreed and production
+    /// never saw it. The test suite did, nightly.
     pub fn requests_today(&self, account_id: i64) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT count(*) FROM request_log
-             WHERE account_id = ? AND kind IN ('text', 'photo') AND created_at >= current_date",
+             WHERE account_id = ? AND kind IN ('text', 'photo')
+               AND created_at >= CAST(current_timestamp AT TIME ZONE 'UTC' AS DATE)",
         )?;
         let n: i64 = stmt
             .query_map(params![account_id], |row| row.get(0))?

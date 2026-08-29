@@ -304,6 +304,17 @@ pub enum Claim {
     NoRoom,
 }
 
+/// What linking a second way of signing in did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkOutcome {
+    Linked,
+    AlreadyYours,
+    /// Somebody else proved this identity first. Never resolved by moving
+    /// it: two sign-ups stay two accounts until a human decides otherwise,
+    /// and a wrong merge cannot be undone.
+    TakenByAnother,
+}
+
 /// One round as `/invite status` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundStatus {
@@ -1085,17 +1096,22 @@ impl Store {
         Ok(())
     }
 
-    /// The account behind a Telegram user, creating one the first time.
+    /// The account proving control of this identity, creating one if the
+    /// identity is new.
+    ///
+    /// `kind` is `&'static str` rather than `&str` on purpose. It is half of
+    /// a primary key, and a kind read off the wire — a typo, or a value an
+    /// attacker chose — would silently open a parallel identity space that
+    /// nothing else can see.
     ///
     /// Both branches run under the same lock, so two updates arriving from
     /// the same person cannot mint two accounts for them.
-    pub fn account_for_telegram(&self, telegram_id: i64) -> Result<i64> {
+    pub fn account_for_identity(&self, kind: &'static str, external_id: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        let key = telegram_id.to_string();
-        let mut stmt = conn.prepare(
-            "SELECT account_id FROM identities WHERE kind = 'telegram' AND external_id = ?",
-        )?;
-        let found: Option<i64> = stmt.query_map(params![&key], |r| r.get(0))?.next().transpose()?;
+        let mut stmt = conn
+            .prepare("SELECT account_id FROM identities WHERE kind = ? AND external_id = ?")?;
+        let found: Option<i64> =
+            stmt.query_map(params![kind, external_id], |r| r.get(0))?.next().transpose()?;
         drop(stmt);
         if let Some(id) = found {
             return Ok(id);
@@ -1106,10 +1122,47 @@ impl Store {
             |r| r.get(0),
         )?;
         conn.execute(
-            "INSERT INTO identities (account_id, kind, external_id) VALUES (?, 'telegram', ?)",
-            params![account_id, key],
+            "INSERT INTO identities (account_id, kind, external_id) VALUES (?, ?, ?)",
+            params![account_id, kind, external_id],
         )?;
         Ok(account_id)
+    }
+
+    /// Attaches a second identity to an account that already exists.
+    ///
+    /// The `PRIMARY KEY (kind, external_id)` is what actually prevents two
+    /// owners under a race; this read exists to produce a sentence a person
+    /// can act on instead of a constraint violation.
+    pub fn link_identity(
+        &self,
+        account_id: i64,
+        kind: &'static str,
+        external_id: &str,
+    ) -> Result<LinkOutcome> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT account_id FROM identities WHERE kind = ? AND external_id = ?")?;
+        let owner: Option<i64> =
+            stmt.query_map(params![kind, external_id], |r| r.get(0))?.next().transpose()?;
+        drop(stmt);
+        match owner {
+            Some(id) if id == account_id => return Ok(LinkOutcome::AlreadyYours),
+            Some(_) => return Ok(LinkOutcome::TakenByAnother),
+            None => {}
+        }
+        conn.execute(
+            "INSERT INTO identities (account_id, kind, external_id) VALUES (?, ?, ?)",
+            params![account_id, kind, external_id],
+        )?;
+        Ok(LinkOutcome::Linked)
+    }
+
+    /// The account behind a Telegram user, creating one the first time.
+    ///
+    /// Delegates to `account_for_identity` so there is one lookup-or-create
+    /// implementation rather than two that can drift.
+    pub fn account_for_telegram(&self, telegram_id: i64) -> Result<i64> {
+        self.account_for_identity("telegram", &telegram_id.to_string())
     }
 
     /// Records where this person last spoke, for announcements.
@@ -2087,6 +2140,43 @@ CREATE TABLE segment_candidates (
 
         s.remember_user(b, "Bo").unwrap();
         assert!(s.accounts_missing_display_names(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_identity_is_looked_up_or_created_whatever_its_kind() {
+        let (s, _d) = test_store();
+        let first = s.account_for_identity("email", "a@example.com").unwrap();
+        let again = s.account_for_identity("email", "a@example.com").unwrap();
+        assert_eq!(first, again, "the same identity produced two accounts");
+
+        // The generalisation must not have changed what Telegram does.
+        let tg = s.account_for_identity("telegram", "11").unwrap();
+        assert_eq!(tg, s.account_for_telegram(11).unwrap());
+        assert_ne!(tg, first, "two kinds collided into one account");
+    }
+
+    #[test]
+    fn an_identity_owned_by_someone_else_is_never_moved() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_identity("telegram", "11").unwrap();
+        let other = s.account_for_identity("email", "b@example.com").unwrap();
+
+        assert_eq!(
+            s.link_identity(other, "telegram", "11").unwrap(),
+            LinkOutcome::TakenByAnother
+        );
+        // The point of the test: the refusal left ownership alone.
+        assert_eq!(s.account_for_identity("telegram", "11").unwrap(), owner);
+
+        assert_eq!(
+            s.link_identity(owner, "telegram", "11").unwrap(),
+            LinkOutcome::AlreadyYours
+        );
+        assert_eq!(
+            s.link_identity(owner, "email", "c@example.com").unwrap(),
+            LinkOutcome::Linked
+        );
+        assert_eq!(s.account_for_identity("email", "c@example.com").unwrap(), owner);
     }
 
     #[test]

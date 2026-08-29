@@ -106,6 +106,20 @@ mod tests {
     }
 
     #[test]
+    fn the_page_carries_the_mark_and_asks_for_the_icon_that_is_served() {
+        // The header's glyph is a copy of icon.svg with the tile dropped and
+        // the colour inherited, so the two can drift. These assert the parts
+        // that must not: that the page still draws a mark at all, and that
+        // the icon path it asks the browser for is the path lib.rs routes.
+        let page = render(&Admission::Full);
+        assert!(page.contains(r#"href="/icon.svg""#), "the page asks for no icon");
+        assert!(page.contains(r#"class="logo""#), "the header lost its mark");
+        // The two lenses and the bridge between them. If a redraw changes
+        // the geometry this fails, which is the point: someone should look.
+        assert_eq!(page.matches("<circle").count(), 4, "the mark is not the mark");
+    }
+
+    #[test]
     fn the_page_never_says_how_many_seats_are_left() {
         // The design says state, not numbers. This is the test that keeps
         // someone from "helpfully" adding a count later.

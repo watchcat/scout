@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72" width="72" height="72" role="img" aria-label="goodscout">
+  <title>goodscout</title>
+  <rect width="72" height="72" rx="16" fill="#17211E"/>
+  <g fill="none" stroke="#9FE1CB">
+    <circle cx="23.5" cy="36" r="11.5" stroke-width="3.2"/>
+    <circle cx="48.5" cy="36" r="11.5" stroke-width="3.2"/>
+    <circle cx="23.5" cy="36" r="4" stroke-width="2.6"/>
+    <circle cx="48.5" cy="36" r="4" stroke-width="2.6"/>
+  </g>
+  <rect x="34" y="33.4" width="4" height="5.2" fill="#9FE1CB"/>
+</svg>

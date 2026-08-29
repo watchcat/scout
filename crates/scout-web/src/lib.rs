@@ -15,7 +15,8 @@ mod page;
 pub use cache::{refresh_forever, AdmissionCache, REFRESH};
 
 use axum::extract::State;
-use axum::response::Html;
+use axum::http::header;
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
 use scout_core::core::Core;
@@ -28,11 +29,24 @@ fn router(cache: AdmissionCache) -> Router {
         // health check that fails when DuckDB is busy would take the site
         // down for a reason the site does not have.
         .route("/healthz", get(|| async { "ok" }))
+        .route("/icon.svg", get(icon))
         .with_state(cache)
 }
 
 async fn index(State(cache): State<AdmissionCache>) -> Html<String> {
     Html(page::render(&cache.get()))
+}
+
+/// The mark, as the browser tab's icon.
+///
+/// Served rather than inlined as a `data:` URI so it is fetched once and
+/// cached, and so the header's copy of the glyph and the tab's icon can
+/// differ: the tab needs the tile behind it to be legible against whatever
+/// colour the browser paints, and the page does not.
+async fn icon() -> impl IntoResponse {
+    const ICON: &str = include_str!("icon.svg");
+    ([(header::CONTENT_TYPE, "image/svg+xml"),
+      (header::CACHE_CONTROL, "public, max-age=86400")], ICON)
 }
 
 /// Serves until the process ends.
@@ -117,6 +131,15 @@ mod tests {
             .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+
+        // The page's <link rel="icon"> points here. A 404 costs nothing
+        // visible — the tab just falls back to a blank page glyph — which
+        // is exactly why it would go unnoticed.
+        let icon = app.clone()
+            .oneshot(Request::builder().uri("/icon.svg").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(icon.status(), StatusCode::OK);
+        assert_eq!(icon.headers()["content-type"], "image/svg+xml");
 
         let missing = app
             .oneshot(Request::builder().uri("/wp-login.php").body(Body::empty()).unwrap())

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Scout — a shopping researcher that doesn't make things up</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
 <style>
   :root{
     --base03:#002b36; --base02:#073642; --base01:#586e75; --base00:#657b83;
@@ -24,8 +25,18 @@
     background:var(--base02); padding:1px 5px; border-radius:3px; color:var(--cyan)}
 
   header{padding:70px 0 42px}
-  .mark{font-size:13px; letter-spacing:.14em; text-transform:uppercase;
-    color:var(--cyan); margin-bottom:18px; font-weight:600}
+  /* The lockup: the mark at display size, wordmark beside it. Two things
+     it deliberately does not do. It does not carry the tile the .svg ships
+     with — that tile is a near-black green, and against the solarized
+     background it reads as a rendering seam rather than a choice. And it
+     does not thin its strokes for the larger size: lightening them looked
+     delicate next to a 700-weight wordmark, and a mark that changes shape
+     with its size is two marks. The geometry here is icon.svg's, untouched. */
+  .mark{display:flex; align-items:center; gap:18px; margin-bottom:26px;
+    color:var(--cyan)}
+  .mark .logo{width:96px; height:96px; flex:none}
+  .mark .word{font-size:32px; font-weight:700; letter-spacing:-.01em;
+    color:var(--base2)}
   h1{font-size:44px; line-height:1.15; margin:0 0 20px; color:var(--base2);
     font-weight:700; letter-spacing:-.02em}
   h1 em{font-style:normal; color:var(--base01)}
@@ -93,6 +104,9 @@
   footer{margin-top:36px; padding:26px 0 60px; border-top:1px solid var(--base02);
     font-size:14px; color:var(--base01); display:flex; gap:22px; flex-wrap:wrap}
   @media(max-width:680px){
+    .mark{gap:14px; margin-bottom:20px}
+    .mark .logo{width:66px; height:66px}
+    .mark .word{font-size:26px}
     .cols{grid-template-columns:1fr; gap:20px}
     .src{grid-template-columns:1fr; gap:6px}
     h1{font-size:33px}
@@ -107,7 +121,18 @@
 <div class="wrap">
 
 <header>
-  <div class="mark">Scout</div>
+  <div class="mark">
+    <svg class="logo" viewBox="0 0 72 72" aria-hidden="true">
+      <g fill="none" stroke="currentColor">
+        <circle cx="23.5" cy="36" r="11.5" stroke-width="3.2"/>
+        <circle cx="48.5" cy="36" r="11.5" stroke-width="3.2"/>
+        <circle cx="23.5" cy="36" r="4" stroke-width="2.6"/>
+        <circle cx="48.5" cy="36" r="4" stroke-width="2.6"/>
+      </g>
+      <rect x="34" y="33.4" width="4" height="5.2" fill="currentColor"/>
+    </svg>
+    <span class="word">Scout</span>
+  </div>
   <h1>Finds the actual cheapest —<br><em>and shows you the arithmetic.</em></h1>
   <p class="lede">
     Ask any chat model for the cheapest detergent and it will answer confidently, invent

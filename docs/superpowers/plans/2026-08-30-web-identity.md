@@ -68,8 +68,8 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 anyhow = "1"
 tracing = "0.1"
 axum = "0.8.9"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 base64 = "0.22"
 rand = "0.8"
 chrono = "0.4"
@@ -88,6 +88,19 @@ Run: `cargo tree -p scout-web 2>/dev/null | grep -c hyper` then
 Expected: the `Cargo.lock` count is still `2`. If it became 3, a
 dependency dragged in an incompatible hyper — stop and report rather than
 proceeding.
+
+Also check you did not add a *second* copy of a crate the workspace already
+resolves:
+
+```bash
+for c in hmac sha2 digest; do
+  echo -n "$c: "; grep -A1 "^name = \"$c\"" Cargo.lock | grep -c version
+done
+```
+
+`hmac` must be `1`. `sha2` and `digest` are `2` for reasons that predate this
+work. The versions above are chosen to match what the workspace already
+resolved — pinning the older 0.12/0.10 line adds a duplicate of all three.
 
 - [ ] **Step 3: Build**
 
@@ -796,7 +809,8 @@ Above those tests in the same file:
 //! at once. That is recorded in the design and is not an oversight.
 
 use base64::Engine;
-use hmac::{Hmac, Mac};
+// `new_from_slice` lives on `KeyInit`, not on `Mac`.
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 pub const COOKIE: &str = "scout_session";
@@ -910,7 +924,7 @@ mod tests {
     /// Builds a payload signed the way Telegram signs one, so the test
     /// exercises the real algorithm rather than our own idea of it.
     fn signed(fields: &[(&str, &str)]) -> Vec<(String, String)> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::{Digest, Sha256};
         let mut pairs: Vec<(String, String)> =
             fields.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -982,7 +996,7 @@ Expected: FAIL — module missing.
 //! no dependency on the Telegram adapter, which the design requires, and
 //! it is testable against a fixture with no network.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 /// How stale a signed payload may be. It stays validly signed forever, so

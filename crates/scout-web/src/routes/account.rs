@@ -245,6 +245,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_telegram_identities_read_as_one_way_in() {
+        // An account can hold two Telegram accounts — a row is
+        // `(kind, external_id)` — and the review found the same shape at
+        // the end of the cross-site link path. The page writes the list of
+        // kinds out in order, so undeduplicated it says "Signed in with
+        // Telegram, Telegram." Asserted through the page rather than on
+        // `identity_kinds` alone, because the sentence is the thing that
+        // was wrong.
+        let (app, core, _dir) = test_app().await;
+        let SignIn::Queued { account_id } =
+            identity::sign_in(&core, "telegram", "777").await.unwrap()
+        else {
+            panic!("no round is open, so this should have queued");
+        };
+        assert_eq!(
+            identity::link(&core, account_id, "telegram", "888").await.unwrap(),
+            scout_core::identity::LinkOutcome::Linked
+        );
+
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let page = body_of(get_with_cookie(&app, "/account", &cookie).await).await;
+        assert!(page.contains("Signed in with Telegram."), "the sentence changed shape: {page}");
+        assert_eq!(page.matches("Telegram, Telegram").count(), 0, "a kind was named twice");
+    }
+
+    #[tokio::test]
     async fn a_form_token_from_one_session_does_nothing_to_another() {
         // The attack the binding closes: `/sign-in` is public, so anybody
         // can fetch a form token from it. Unbound, that token would pass

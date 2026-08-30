@@ -67,7 +67,9 @@ pub async fn sign_in(core: &Core, kind: &'static str, external_id: &str) -> anyh
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Standing {
     pub member: bool,
-    /// `'email'`, `'telegram'` — sorted, so a page renders the same way twice.
+    /// `'email'`, `'telegram'` — sorted, so a page renders the same way
+    /// twice, and each named once however many identities of that kind the
+    /// account holds. See `Store::identity_kinds`.
     pub kinds: Vec<String>,
 }
 

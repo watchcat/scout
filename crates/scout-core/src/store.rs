@@ -1199,10 +1199,18 @@ impl Store {
     /// method exists, not what it is. Handing back the address as well
     /// would put a value somebody chose into a page, and then escaping it
     /// correctly would be everyone's problem forever.
+    ///
+    /// `DISTINCT` because the row is `(kind, external_id)` and one account
+    /// may hold two of a kind — two Telegram accounts linked to one Scout
+    /// account is a row per identity and a legitimate shape. The caller
+    /// asks which *methods* exist, so it wants one answer per method: the
+    /// page that renders this list writes it out in order, and without
+    /// this it reads "Signed in with Telegram, Telegram."
     pub fn identity_kinds(&self, account_id: i64) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT kind FROM identities WHERE account_id = ? ORDER BY kind ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT kind FROM identities WHERE account_id = ? ORDER BY kind ASC",
+        )?;
         let rows = stmt.query_map(params![account_id], |row| row.get(0))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
@@ -2349,6 +2357,26 @@ CREATE TABLE segment_candidates (
             LinkOutcome::Linked
         );
         assert_eq!(s.account_for_identity("email", "c@example.com").unwrap(), owner);
+    }
+
+    #[test]
+    fn two_identities_of_one_kind_are_one_way_in_not_two() {
+        // A row is `(kind, external_id)`, so an account holding two
+        // Telegram accounts holds two `telegram` rows — a legitimate
+        // shape, and the shape the takeover path in the W2 review also
+        // produced. What asks for this list asks which *methods* exist,
+        // and writes the answer out in order: undeduplicated, the account
+        // page reads "Signed in with Telegram, Telegram."
+        let (s, _d) = test_store();
+        let account = s.account_for_identity("telegram", "11").unwrap();
+        assert_eq!(s.link_identity(account, "telegram", "22").unwrap(), LinkOutcome::Linked);
+        assert_eq!(s.link_identity(account, "email", "a@example.com").unwrap(), LinkOutcome::Linked);
+
+        assert_eq!(
+            s.identity_kinds(account).unwrap(),
+            vec!["email".to_string(), "telegram".to_string()],
+            "a kind was named once per identity rather than once"
+        );
     }
 
     #[test]

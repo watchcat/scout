@@ -214,11 +214,21 @@ async fn confirm(State(auth): State<AuthState>, Form(form): Form<Confirmed>) -> 
         // Task 13's `/account` shows how it went; a refusal here must not
         // move the identity, which `link_identity` is what guarantees.
         TokenOutcome::Valid { email, account_id: Some(id) } => {
+            // Every outcome says which it was. The token is spent either
+            // way, so an unannounced refusal is a link that looks like it
+            // worked and cannot be tried again — and the page it lands on
+            // would show no email identity with no explanation for it.
             match identity::link(&auth.core, id, "email", &email).await {
-                Ok(outcome) => tracing::info!(?outcome, "an address was linked"),
-                Err(e) => tracing::error!(error = %e, "could not link an address"),
+                Ok(LinkOutcome::Linked) => see_other("/account?linked=email"),
+                Ok(LinkOutcome::AlreadyYours) => see_other("/account?linked=email-already"),
+                // Refused, and the identity has not moved: `link_identity`
+                // is what guarantees that two sign-ups stay two accounts.
+                Ok(LinkOutcome::TakenByAnother) => see_other("/account?linked=email-taken"),
+                Err(e) => {
+                    tracing::error!(error = %e, "could not link an address");
+                    sorry()
+                }
             }
-            see_other("/account")
         }
         TokenOutcome::AlreadyUsed => Html(pages::link_already_used()).into_response(),
         // One page for both. Answering "we have never seen that token"

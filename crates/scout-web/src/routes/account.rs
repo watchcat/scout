@@ -66,7 +66,8 @@ async fn account(
     .into_response()
 }
 
-/// The sentence for an outcome carried back from `/auth/telegram`.
+/// The sentence for an outcome carried back from `/auth/telegram` or from
+/// the button on an emailed link.
 ///
 /// Matched against a fixed set and never echoed. The value arrives in a
 /// query string, which is to say from whoever wrote the link — rendering
@@ -79,6 +80,16 @@ fn note(linked: &str) -> Option<&'static str> {
         "already" => Some("That Telegram account was already this one."),
         "taken" => Some(
             "That Telegram account belongs to a different Scout account, \
+             so nothing was changed.",
+        ),
+        // The same three, for an address attached by spending a link. Told
+        // apart from the Telegram three by name rather than by a second
+        // parameter, because the value has to survive a redirect either
+        // way and one query string is easier to read than two.
+        "email" => Some("That address is linked. You can sign in either way now."),
+        "email-already" => Some("That address was already this one."),
+        "email-taken" => Some(
+            "That address belongs to a different Scout account, \
              so nothing was changed.",
         ),
         _ => None,
@@ -297,11 +308,57 @@ mod tests {
         // No new session: they had one. And the address is now theirs,
         // lower-cased on the way in so `Ada@` and `ada@` are one identity.
         assert_eq!(spent.status(), StatusCode::SEE_OTHER);
-        assert_eq!(spent.headers()["location"], "/account");
+        assert_eq!(spent.headers()["location"], "/account?linked=email");
         assert!(spent.headers().get("set-cookie").is_none(), "linking minted a session");
         assert_eq!(
             identity::standing(&core, account_id).await.unwrap().kinds,
             vec!["email".to_string(), "telegram".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_that_is_somebody_else_s_says_so_instead_of_looking_like_a_success() {
+        // The button spends the token whatever the answer, so a silent
+        // redirect leaves a member on a page with no address on it, no
+        // sentence saying why, and a link that will not work twice.
+        let (app, core, _dir, sent) = test_app_keeping_mail().await;
+        // The address already proves somebody else's account.
+        identity::sign_in(&core, "email", "taken@example.com").await.unwrap();
+        let SignIn::Queued { account_id } =
+            identity::sign_in(&core, "telegram", "777").await.unwrap()
+        else {
+            panic!("no round is open, so this should have queued");
+        };
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+
+        let csrf = form_token(&app, &cookie).await;
+        post_with_cookie(
+            &app,
+            "/account/link/email",
+            &cookie,
+            &format!("csrf={csrf}&email=taken%40example.com"),
+        )
+        .await;
+
+        let link = mailed_link(&sent).await;
+        let token = link.split_once("?t=").expect("the mail carries no token").1.to_string();
+        let page = body_of(get(&app, &format!("/auth/email?t={token}")).await).await;
+        let (_, rest) = page.split_once(r#"name="csrf" value=""#).unwrap();
+        let confirm_csrf = rest.split_once('"').unwrap().0.to_string();
+        let spent =
+            post_form(&app, "/auth/email", &format!("csrf={confirm_csrf}&t={token}")).await;
+
+        assert_eq!(spent.status(), StatusCode::SEE_OTHER);
+        assert_eq!(spent.headers()["location"], "/account?linked=email-taken");
+        // And the page it lands on actually says it, rather than the note
+        // being a value nothing renders.
+        let landed = body_of(get_with_cookie(&app, "/account?linked=email-taken", &cookie).await).await;
+        assert!(landed.contains("different Scout account"), "the refusal was not shown");
+
+        // The identity has not moved: two sign-ups stay two accounts.
+        assert_eq!(
+            identity::standing(&core, account_id).await.unwrap().kinds,
+            vec!["telegram".to_string()]
         );
     }
 

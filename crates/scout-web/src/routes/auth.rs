@@ -7,8 +7,9 @@
 //! one page with one wording, whoever asked and whatever they typed. The
 //! `GET` on the emailed link changes nothing. An expired token and one
 //! that never existed are told apart nowhere a visitor can see. And a
-//! widget payload that does not verify is refused without saying which of
-//! the three checks it failed.
+//! widget payload that does not check out is refused without saying which
+//! of the four checks — hash, fields, age, and the `state` that says this
+//! browser asked for it — it failed.
 
 use super::{see_other, signed_in_as, sorry, stale_form};
 use crate::{pages, session, telegram_login, AuthState};

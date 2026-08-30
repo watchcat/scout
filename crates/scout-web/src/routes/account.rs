@@ -360,7 +360,8 @@ mod tests {
         assert_eq!(spent.headers()["location"], "/account?linked=email-taken");
         // And the page it lands on actually says it, rather than the note
         // being a value nothing renders.
-        let landed = body_of(get_with_cookie(&app, "/account?linked=email-taken", &cookie).await).await;
+        let landed =
+            body_of(get_with_cookie(&app, "/account?linked=email-taken", &cookie).await).await;
         assert!(landed.contains("different Scout account"), "the refusal was not shown");
 
         // The identity has not moved: two sign-ups stay two accounts.

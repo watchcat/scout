@@ -410,7 +410,13 @@ pub async fn claim(
     let code = code.to_string();
     crate::core::blocking(move || {
         let account_id = store.account_for_telegram(telegram_id)?;
-        store.claim_seat(account_id, chat_id, &code)
+        let outcome = store.claim_seat(account_id, &code)?;
+        // Where to reach them is the channel's business, not the seat's.
+        // Recorded whatever the outcome was: the START they just pressed is
+        // the permission, and an admitted person who has not spoken yet
+        // still needs to be reachable by an announcement.
+        store.note_delivery(account_id, "telegram", &chat_id.to_string())?;
+        Ok(outcome)
     })
     .await
 }
@@ -432,12 +438,36 @@ mod tests {
         assert_eq!(s.broadcast_targets().unwrap(), vec![(a, 555), (b, 666)]);
     }
 
+    #[tokio::test]
+    async fn an_admitted_telegram_user_is_reachable_without_speaking_first() {
+        // The gap this closes: the delivery row used to be written only on
+        // the waitlist branch, so someone admitted straight away had no
+        // recorded address until their first message, and an announcement
+        // could not reach them.
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::core::Core::start(
+            crate::config::Config::for_test(dir.path().join("claim.duckdb").to_str().unwrap()),
+            None,
+        )
+        .unwrap();
+        core.store().create_round("autumn", 5).unwrap();
+
+        assert_eq!(claim(&core, 42, 4242, "autumn").await.unwrap(), Claim::Admitted);
+
+        let account = core.store().account_for_telegram(42).unwrap();
+        assert_eq!(
+            core.store().broadcast_targets().unwrap(),
+            vec![(account, 4242)],
+            "admitted straight away, but still reachable — no message required first"
+        );
+    }
+
     #[test]
     fn an_announcement_refuses_a_round_that_cannot_take_anyone() {
         let (s, _d) = crate::store::tests::test_store();
         s.create_round("autumn", 1).unwrap();
         let a = s.account_for_telegram(11).unwrap();
-        s.claim_seat(a, 11, "autumn").unwrap();
+        s.claim_seat(a, "autumn").unwrap();
 
         // Full. Announcing it would invite people to a door that is shut.
         match plan_announcement_blocking(&s, "autumn").unwrap() {
@@ -455,12 +485,16 @@ mod tests {
         let (s, _d) = crate::store::tests::test_store();
         s.create_round("autumn", 1).unwrap();
         let first = s.account_for_telegram(11).unwrap();
-        s.claim_seat(first, 11, "autumn").unwrap();
+        s.claim_seat(first, "autumn").unwrap();
         // Both turned away, in order, so both land on the waitlist.
         let second = s.account_for_telegram(22).unwrap();
-        s.claim_seat(second, 22, "autumn").unwrap();
+        s.claim_seat(second, "autumn").unwrap();
+        // claim_seat no longer records where to reach them — the channel
+        // does — so give the waitlist the addresses it needs to find them.
+        s.note_delivery(second, "telegram", "22").unwrap();
         let third = s.account_for_telegram(33).unwrap();
-        s.claim_seat(third, 33, "autumn").unwrap();
+        s.claim_seat(third, "autumn").unwrap();
+        s.note_delivery(third, "telegram", "33").unwrap();
 
         s.create_round("winter", 5).unwrap();
         let Announcement::Ready { targets, text } = plan_announcement_blocking(&s, "winter").unwrap() else {

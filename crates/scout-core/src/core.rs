@@ -580,7 +580,7 @@ mod tests {
 
         // Fill autumn. Spring is still open with room, so the door is not shut.
         let joiner = store.account_for_telegram(7).unwrap();
-        assert_eq!(store.claim_seat(joiner, 7, "autumn").unwrap(), Claim::Admitted);
+        assert_eq!(store.claim_seat(joiner, "autumn").unwrap(), Claim::Admitted);
         assert_eq!(
             core.admission().await.unwrap(),
             Admission::Open { join_url: Some("https://t.me/scoutbot?start=spring".to_string()) }

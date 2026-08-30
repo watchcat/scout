@@ -1325,7 +1325,7 @@ impl Store {
     /// construction: a round of 100 admits exactly 100 however many people
     /// press START at the same moment. There is no counter to drift from
     /// the rows — seats used *is* `count(*)` over them.
-    pub fn claim_seat(&self, account_id: i64, chat_id: i64, code: &str) -> Result<Claim> {
+    pub fn claim_seat(&self, account_id: i64, code: &str) -> Result<Claim> {
         let conn = self.conn.lock().unwrap();
 
         // Membership decides before the round does. Checking the round
@@ -1366,14 +1366,6 @@ impl Store {
                      -- second attempt does not cost them their place.
                      invited_at = NULL",
                 params![account_id, code],
-            )?;
-            // Where to reach them is not the waitlist's business — it is
-            // every channel's. The START they just pressed is the permission.
-            conn.execute(
-                "INSERT INTO deliveries (account_id, channel, address) VALUES (?, 'telegram', ?)
-                 ON CONFLICT (account_id, channel)
-                 DO UPDATE SET address = excluded.address, updated_at = now()",
-                params![account_id, chat_id.to_string()],
             )?;
             return Ok(Claim::NoRoom);
         }
@@ -3526,15 +3518,37 @@ CREATE TABLE segment_candidates (
         // which is what `active_members` reports back to the gate.
         for tg in 1..=3 {
             let account = s.account_for_telegram(tg).unwrap();
-            assert_eq!(s.claim_seat(account, tg, "autumn").unwrap(), Claim::Admitted);
+            assert_eq!(s.claim_seat(account, "autumn").unwrap(), Claim::Admitted);
         }
         let fourth = s.account_for_telegram(4).unwrap();
-        assert_eq!(s.claim_seat(fourth, 4, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.claim_seat(fourth, "autumn").unwrap(), Claim::NoRoom);
         assert_eq!(s.active_members().unwrap(), vec![1, 2, 3]);
 
         let rounds = s.rounds().unwrap();
         assert_eq!(rounds.len(), 1);
         assert_eq!((rounds[0].used, rounds[0].capacity, rounds[0].open), (3, 3, true));
+    }
+
+    #[test]
+    fn claiming_a_seat_records_no_address_of_its_own() {
+        let (s, _d) = test_store();
+        s.create_round("autumn", 5).unwrap();
+        let account = s.account_for_identity("email", "web@example.com").unwrap();
+
+        assert_eq!(s.claim_seat(account, "autumn").unwrap(), Claim::Admitted);
+
+        // The point of the split: a web visitor has no chat, and claiming a
+        // seat must not invent one. If this fails, the delivery write has
+        // crept back into claim_seat and the web path writes a lie.
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM deliveries WHERE account_id = ?",
+                params![account],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "claim_seat wrote a delivery row");
     }
 
     #[test]
@@ -3550,7 +3564,7 @@ CREATE TABLE segment_candidates (
                     let s = s.clone();
                     scope.spawn(move || {
                         let account = s.account_for_telegram(tg).unwrap();
-                        s.claim_seat(account, tg, "rush").unwrap()
+                        s.claim_seat(account, "rush").unwrap()
                     })
                 })
                 .collect();
@@ -3570,14 +3584,14 @@ CREATE TABLE segment_candidates (
     fn a_second_claim_by_the_same_person_spends_no_seat() {
         let (s, _d) = test_store();
         s.create_round("autumn", 2).unwrap();
-        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::Admitted);
-        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::AlreadyIn);
+        assert_eq!(s.claim_seat(1, "autumn").unwrap(), Claim::Admitted);
+        assert_eq!(s.claim_seat(1, "autumn").unwrap(), Claim::AlreadyIn);
         // A member opening a *later* round's link is also already in.
         s.create_round("winter", 5).unwrap();
-        assert_eq!(s.claim_seat(1, 1, "winter").unwrap(), Claim::AlreadyIn);
+        assert_eq!(s.claim_seat(1, "winter").unwrap(), Claim::AlreadyIn);
 
         assert_eq!(s.rounds().unwrap()[0].used, 1, "one person, one seat");
-        assert_eq!(s.claim_seat(2, 2, "autumn").unwrap(), Claim::Admitted);
+        assert_eq!(s.claim_seat(2, "autumn").unwrap(), Claim::Admitted);
     }
 
     #[test]
@@ -3585,13 +3599,13 @@ CREATE TABLE segment_candidates (
         // Without this, revoking is theatre.
         let (s, _d) = test_store();
         s.create_round("autumn", 10).unwrap();
-        s.claim_seat(1, 1, "autumn").unwrap();
+        s.claim_seat(1, "autumn").unwrap();
         assert!(s.revoke(1).unwrap());
         assert!(s.active_members().unwrap().is_empty());
 
-        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::Revoked);
+        assert_eq!(s.claim_seat(1, "autumn").unwrap(), Claim::Revoked);
         s.create_round("winter", 10).unwrap();
-        assert_eq!(s.claim_seat(1, 1, "winter").unwrap(), Claim::Revoked);
+        assert_eq!(s.claim_seat(1, "winter").unwrap(), Claim::Revoked);
 
         // And being refused does not put them on the waitlist to be
         // announced back in later.
@@ -3603,12 +3617,12 @@ CREATE TABLE segment_candidates (
         let (s, _d) = test_store();
         s.create_round("autumn", 2).unwrap();
         let (a1, a2) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
-        s.claim_seat(a1, 1, "autumn").unwrap();
-        s.claim_seat(a2, 2, "autumn").unwrap();
+        s.claim_seat(a1, "autumn").unwrap();
+        s.claim_seat(a2, "autumn").unwrap();
 
         assert!(s.revoke(1).unwrap());
         assert_eq!(s.rounds().unwrap()[0].used, 2, "a round of 2 admitted 2 people, once");
-        assert_eq!(s.claim_seat(3, 3, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.claim_seat(3, "autumn").unwrap(), Claim::NoRoom);
 
         assert!(s.restore(1).unwrap());
         assert_eq!(s.rounds().unwrap()[0].used, 2, "restoring consumes nothing either");
@@ -3626,8 +3640,8 @@ CREATE TABLE segment_candidates (
         s.create_round("autumn", 10).unwrap();
         assert!(s.set_round_open("autumn", false).unwrap());
 
-        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::NoRoom);
-        assert_eq!(s.claim_seat(2, 2, "no-such-round").unwrap(), Claim::NoRoom);
+        assert_eq!(s.claim_seat(1, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.claim_seat(2, "no-such-round").unwrap(), Claim::NoRoom);
         assert!(s.active_members().unwrap().is_empty());
         // Both are people who tried to reach us, so both are queued.
         assert_eq!(s.waiting_count().unwrap(), 2);
@@ -3640,10 +3654,10 @@ CREATE TABLE segment_candidates (
         let (s, _d) = test_store();
         s.create_round("autumn", 10).unwrap();
         s.set_round_open("autumn", false).unwrap();
-        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.claim_seat(1, "autumn").unwrap(), Claim::NoRoom);
 
         assert!(s.set_round_open("autumn", true).unwrap());
-        assert_eq!(s.claim_seat(1, 1, "autumn").unwrap(), Claim::Admitted);
+        assert_eq!(s.claim_seat(1, "autumn").unwrap(), Claim::Admitted);
     }
 
     #[test]
@@ -3659,19 +3673,22 @@ CREATE TABLE segment_candidates (
     fn being_turned_away_queues_you_and_getting_in_clears_it() {
         let (s, _d) = test_store();
         s.create_round("autumn", 1).unwrap();
-        s.claim_seat(1, 1, "autumn").unwrap();
+        s.claim_seat(1, "autumn").unwrap();
 
-        assert_eq!(s.claim_seat(2, 8002, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.claim_seat(2, "autumn").unwrap(), Claim::NoRoom);
+        // claim_seat no longer records where to reach them — that is the
+        // channel's job now — so give the waitlist the address it needs.
+        s.note_delivery(2, "telegram", "8002").unwrap();
         assert_eq!(s.waitlist_to_invite().unwrap(), vec![(2, 8002)]);
 
         // A second attempt keeps their place rather than costing it.
-        assert_eq!(s.claim_seat(2, 8002, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.claim_seat(2, "autumn").unwrap(), Claim::NoRoom);
         assert_eq!(s.waiting_count().unwrap(), 1);
 
         // Getting in through a later round takes them off the queue, so a
         // future announce does not chase somebody already inside.
         s.create_round("winter", 5).unwrap();
-        assert_eq!(s.claim_seat(2, 8002, "winter").unwrap(), Claim::Admitted);
+        assert_eq!(s.claim_seat(2, "winter").unwrap(), Claim::Admitted);
         assert_eq!(s.waiting_count().unwrap(), 0);
         assert!(s.waitlist_to_invite().unwrap().is_empty());
     }
@@ -3681,7 +3698,9 @@ CREATE TABLE segment_candidates (
         let (s, _d) = test_store();
         s.create_round("autumn", 0).unwrap();
         for user in [1, 2, 3] {
-            s.claim_seat(user, 9000 + user, "autumn").unwrap();
+            s.claim_seat(user, "autumn").unwrap();
+            // claim_seat no longer records the address — the channel does.
+            s.note_delivery(user, "telegram", &(9000 + user).to_string()).unwrap();
         }
         assert_eq!(
             s.waitlist_to_invite().unwrap(),
@@ -3708,12 +3727,13 @@ CREATE TABLE segment_candidates (
         // still waiting, so the next announce has to reach them.
         let (s, _d) = test_store();
         s.create_round("autumn", 0).unwrap();
-        s.claim_seat(1, 9001, "autumn").unwrap();
+        s.claim_seat(1, "autumn").unwrap();
+        s.note_delivery(1, "telegram", "9001").unwrap();
         s.mark_invited(1).unwrap();
         assert!(s.waitlist_to_invite().unwrap().is_empty());
 
         s.create_round("winter", 0).unwrap();
-        assert_eq!(s.claim_seat(1, 9001, "winter").unwrap(), Claim::NoRoom);
+        assert_eq!(s.claim_seat(1, "winter").unwrap(), Claim::NoRoom);
         assert_eq!(s.waitlist_to_invite().unwrap(), vec![(1, 9001)]);
     }
 

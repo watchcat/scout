@@ -17,15 +17,24 @@
 **Run tests with `--workspace`.** The root manifest is not virtual, so a bare
 `cargo test` tests only the root package: `cargo test --workspace`.
 
-**Clippy needs the nix toolchain.** `cargo` is nix 1.96.1 while
-`~/.cargo/bin/cargo-clippy` is rustup 1.97, and mixing them fails with
-`E0514`. If `cargo clippy` errors that way:
+**Clippy needs the nix toolchain, and it keeps vanishing.** `cargo` is nix
+1.96.1 while `~/.cargo/bin/cargo-clippy` is rustup 1.97; mixing them fails
+with `E0514`. Build it once with a GC root so the nix garbage collector stops
+eating it — `--no-link` leaves no root and it disappeared twice in one day:
 
 ```bash
-OUT=$(nix build --no-link --print-out-paths '/nix/store/z75w481isp7d6mbmlif92sabnszzrnmv-clippy-1.96.1.drv^*')
-export PATH="$OUT/bin:$PATH"
+nix build --out-link ~/.cache/scout/clippy \
+  '/nix/store/z75w481isp7d6mbmlif92sabnszzrnmv-clippy-1.96.1.drv^*'
+export PATH="$HOME/.cache/scout/clippy/bin:$PATH"
 cargo clippy --workspace --all-targets
 ```
+
+**Expect `dead_code` warnings between Tasks 2 and 6.** `LinkOutcome`,
+`TokenOutcome`, `link_identity`, `issue_login_token` and `consume_login_token`
+are `pub` on `Store`, but `store` is a private module, so nothing outside the
+crate can reach them until `identity.rs` re-exports them in Task 6. Do not
+silence these — `#[allow(dead_code)]` here would still be there long after it
+stopped being true.
 
 **Every task must end on a tree that builds and passes.** If a task changes a
 function's signature, it updates every caller in the same task.

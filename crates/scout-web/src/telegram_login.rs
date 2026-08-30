@@ -14,6 +14,21 @@ use sha2::{Digest, Sha256};
 /// history is a permanent key to that account.
 const MAX_AGE_SECS: i64 = 60;
 
+/// How far ahead of our clock a payload may claim to be.
+///
+/// The window has to be bounded in both directions or it is not a window.
+/// `auth_date` is inside what Telegram signs, so nobody can move it — but
+/// Telegram stamps it from Telegram's clock, and a payload stamped a minute
+/// into our future used to be under the age limit forever, which is exactly
+/// the permanent key the limit exists to prevent. It needs no attacker
+/// either: a host whose clock is a few minutes slow would accept every
+/// payload it ever saw, for as long as it stayed slow.
+///
+/// Thirty seconds rather than zero because the two clocks are not the same
+/// clock and a sign-in that fails on a second of NTP drift is a worse
+/// outcome than a replay window half the length of the one above.
+const MAX_SKEW_SECS: i64 = 30;
+
 /// The Telegram user id this payload proves, or `None`.
 pub fn verify(bot_token: &str, fields: &[(String, String)]) -> Option<i64> {
     let given = fields.iter().find(|(k, _)| k == "hash")?.1.clone();
@@ -33,7 +48,8 @@ pub fn verify(bot_token: &str, fields: &[(String, String)]) -> Option<i64> {
     }
 
     let auth_date: i64 = rest.iter().find(|(k, _)| k == "auth_date")?.1.parse().ok()?;
-    if chrono::Utc::now().timestamp() - auth_date > MAX_AGE_SECS {
+    let age = chrono::Utc::now().timestamp() - auth_date;
+    if age > MAX_AGE_SECS || age < -MAX_SKEW_SECS {
         return None;
     }
     rest.iter().find(|(k, _)| k == "id")?.1.parse().ok()
@@ -100,6 +116,25 @@ mod tests {
         let old = (now() - 3600).to_string();
         let p = signed(&[("id", "777"), ("first_name", "Ada"), ("auth_date", &old)]);
         assert_eq!(verify(TOKEN, &p), None, "an hour-old sign-in was replayed");
+    }
+
+    #[test]
+    fn a_payload_dated_in_the_future_is_refused_too() {
+        // The window used to be open on one side: `now - auth_date > 60`
+        // is false for every future date, so a payload stamped ahead of us
+        // was accepted forever — the permanent key the age limit exists to
+        // prevent, arrived at from the other direction. It needs no
+        // attacker: a host whose clock runs slow accepts every payload it
+        // has ever seen until somebody fixes the clock.
+        let ahead = (now() + 3600).to_string();
+        let p = signed(&[("id", "777"), ("first_name", "Ada"), ("auth_date", &ahead)]);
+        assert_eq!(verify(TOKEN, &p), None, "an hour-ahead sign-in was accepted");
+
+        // And the reason the allowance is not zero: two clocks, one of
+        // them Telegram's. A few seconds ahead is drift, not a replay.
+        let barely = (now() + 5).to_string();
+        let p = signed(&[("id", "777"), ("first_name", "Ada"), ("auth_date", &barely)]);
+        assert_eq!(verify(TOKEN, &p), Some(777), "a few seconds of clock drift refused a sign-in");
     }
 
     #[test]

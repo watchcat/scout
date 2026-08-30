@@ -969,6 +969,12 @@ mod tests {
                 "{what} went out with no policy"
             );
             assert_eq!(res.headers()["x-frame-options"], "DENY", "{what}");
+            // `/account` shows standing and a live form token, and the
+            // `/auth/email` page's own URL carries a login token. A stored
+            // copy of either is a credential someone else can press Back
+            // to. Nothing this half serves wants caching, so it is asserted
+            // on all of them rather than on the two that would hurt most.
+            assert_eq!(res.headers()["cache-control"], "no-store", "{what}");
         }
 
         // And not on the public page, which has no script, no form and

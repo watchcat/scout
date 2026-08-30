@@ -179,9 +179,9 @@ frame-src https://oauth.telegram.org; \
 img-src 'self' data:; \
 style-src 'self' 'unsafe-inline'";
 
-/// Puts the four headers on every response the signed-in half makes.
+/// Puts the five headers on every response the signed-in half makes.
 ///
-/// A layer rather than four tuples repeated in nine handlers, because the
+/// A layer rather than five tuples repeated in nine handlers, because the
 /// handler that forgot them would be the one that mattered.
 async fn security_headers(
     request: axum::extract::Request,
@@ -209,6 +209,19 @@ async fn security_headers(
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin"));
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    // Nothing this half serves is worth keeping a copy of. `/account`
+    // renders whether you hold a seat and a form token that is live for
+    // fifteen minutes, and `/auth/email` renders a page whose own URL
+    // carries a login token — so a cached copy is a credential sitting in
+    // a shared browser's back button or in an intermediary that decided
+    // the response looked static. `no-store` rather than `no-cache`:
+    // `no-cache` permits storing it and only requires revalidation, which
+    // is the wrong half of the promise.
+    //
+    // On the whole half rather than on the two pages that need it, for the
+    // reason the layer exists at all — and nothing here is worth caching
+    // anyway. `/icon.svg` is on the public router and keeps its day.
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

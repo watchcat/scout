@@ -12,6 +12,7 @@
 mod cache;
 mod page;
 mod session;
+mod telegram_login;
 
 pub use cache::{refresh_forever, AdmissionCache, REFRESH};
 

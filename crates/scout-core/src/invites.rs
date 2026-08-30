@@ -268,6 +268,23 @@ pub async fn advert_targets(core: &Core) -> anyhow::Result<Vec<(i64, i64)>> {
 /// The admin check is here as well as in the adapter. The adapter's is a
 /// courtesy that saves a round trip; this one is the actual gate, because in
 /// 2b-2 the caller is across a network and may be the web app.
+/// Opens a round, for callers that are not answering a chat message.
+///
+/// `invite` exists to reply to a Telegram command: it takes `InviteCmd`,
+/// which is that command's grammar, and returns prose to send back. Anything
+/// that is not a chat — the web app, a test — wants the operation without the
+/// sentence, and should not have to construct a chat command or read English
+/// to find out what happened. `invite` delegates here so there is one
+/// implementation of what opening a round means.
+///
+/// False when the name is taken, which `create_round` refuses rather than
+/// pooling two rounds' seats under one capacity.
+pub async fn open_round(core: &Core, code: &str, capacity: i64) -> anyhow::Result<bool> {
+    let store = core.store();
+    let code = code.to_string();
+    crate::core::blocking(move || store.create_round(&code, capacity)).await
+}
+
 pub async fn invite(
     core: &Core,
     admin_telegram_id: i64,
@@ -280,10 +297,7 @@ pub async fn invite(
     let store = core.store();
     match cmd {
         InviteCmd::New { code, capacity } => {
-            let created = {
-                let (store, code) = (store.clone(), code.clone());
-                crate::core::blocking(move || store.create_round(&code, capacity)).await
-            };
+            let created = open_round(core, &code, capacity).await;
             match created {
                 Err(e) => {
                     tracing::error!(error = %e, code, "could not open a round");
@@ -424,6 +438,20 @@ pub async fn claim(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_round_can_be_opened_without_speaking_telegram() {
+        // The web app has no chat command to send and no reply to read.
+        // If this ever needs an InviteCmd again, one client's command
+        // grammar has become the protocol between services.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("t.duckdb");
+        let core = Core::start(crate::config::Config::for_test(db.to_str().unwrap()), None).unwrap();
+
+        assert!(open_round(&core, "autumn", 5).await.unwrap());
+        // Refused rather than pooling two rounds' seats under one capacity.
+        assert!(!open_round(&core, "autumn", 99).await.unwrap());
+    }
 
     #[test]
     fn an_advert_reaches_everyone_with_a_known_address() {

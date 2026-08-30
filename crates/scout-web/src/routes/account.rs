@@ -22,6 +22,12 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/account", get(account))
         .route("/account/link/email", post(link_email))
         .route("/sign-out", post(sign_out))
+        // The same layer the other half carries: a `POST` from somebody
+        // else's page is refused before the handler sees it.
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            super::only_from_our_own_pages,
+        ))
         .with_state(auth)
 }
 
@@ -362,6 +368,44 @@ mod tests {
             identity::standing(&core, account_id).await.unwrap().kinds,
             vec!["telegram".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_post_from_another_site_does_not_reach_this_half_either() {
+        // The layer is on both routers, and this is what says so. Being
+        // signed out by somebody else's page is a nuisance; having a link
+        // mailed from your account to an address you did not type is not.
+        let (app, core, _dir) = test_app().await;
+        identity::sign_in(&core, "email", "mine@example.com").await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, 1, DAY);
+        let csrf = form_token(&app, &cookie).await;
+        let jar = format!("{}={cookie}", crate::session::COOKIE);
+        let elsewhere = [("cookie", jar.as_str()), ("origin", "https://evil.example")];
+
+        let out = post_with_headers(&app, "/sign-out", &format!("csrf={csrf}"), &elsewhere).await;
+        assert_eq!(out.status(), StatusCode::BAD_REQUEST);
+        assert!(out.headers().get("set-cookie").is_none(), "a cross-site post cleared the cookie");
+
+        let linked = post_with_headers(
+            &app,
+            "/account/link/email",
+            &format!("csrf={csrf}&email=mallory%40example.com"),
+            &elsewhere,
+        )
+        .await;
+        assert_eq!(linked.status(), StatusCode::BAD_REQUEST);
+
+        // From our own page, with the same token, both still work — so the
+        // refusals above are about where the post came from.
+        let ours = [("cookie", jar.as_str()), ("origin", "https://example.com")];
+        let asked = post_with_headers(
+            &app,
+            "/account/link/email",
+            &format!("csrf={csrf}&email=ada%40example.com"),
+            &ours,
+        )
+        .await;
+        assert_eq!(asked.status(), StatusCode::OK);
     }
 
     #[tokio::test]

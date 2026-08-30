@@ -38,6 +38,13 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/sign-in/email", post(request_link))
         .route("/auth/email", get(confirm_page).post(confirm))
         .route("/auth/telegram", get(telegram_callback))
+        // Every `POST` below has to have come from a page of ours. See
+        // `routes::from_our_own_pages` for what that can and cannot
+        // establish, and why the form tokens stay as well.
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            super::only_from_our_own_pages,
+        ))
         .with_state(auth)
 }
 
@@ -487,6 +494,132 @@ mod tests {
             scout_core::identity::consume_token(&core, &hash("tok-forged")).await.unwrap(),
             scout_core::identity::TokenOutcome::Valid { .. }
         ));
+    }
+
+    /// Somebody else's site.
+    const ELSEWHERE: &str = "https://evil.example";
+
+    #[tokio::test]
+    async fn a_post_from_somebody_else_s_page_is_refused_however_good_its_form_token() {
+        // Login CSRF. The pre-session form token is minted by a `GET` that
+        // is served to strangers, is good for fifteen minutes and is not
+        // one-time — so an attacker holds a valid one by asking for it. It
+        // proves that Scout exists, not that the `POST` came from Scout.
+        //
+        // With one harvested, the attacker asks for a link to their own
+        // address and auto-submits the confirm form from a page the victim
+        // visits. The victim's browser is handed a session cookie for the
+        // *attacker's* account, and everything the victim attaches
+        // afterwards — their address, their Telegram — lands there.
+        let (app, core, _dir) = test_app().await;
+        issue(&core, "tok-mallory").await;
+        let harvested = form_token(&app, "/sign-in").await;
+
+        let spent = post_with_headers(
+            &app,
+            "/auth/email",
+            &format!("csrf={harvested}&t=tok-mallory"),
+            &[("origin", ELSEWHERE)],
+        )
+        .await;
+        assert_eq!(spent.status(), StatusCode::BAD_REQUEST, "a cross-site post was acted on");
+        assert!(
+            spent.headers().get("set-cookie").is_none(),
+            "a cross-site post planted a session in the victim's browser"
+        );
+        // Refused *before acting*: the token is still there to spend.
+        assert!(matches!(
+            scout_core::identity::consume_token(&core, &hash("tok-mallory")).await.unwrap(),
+            scout_core::identity::TokenOutcome::Valid { .. }
+        ));
+
+        // The other half of the same attack: a link mailed to whoever the
+        // attacker names, from a form the visitor never saw.
+        let asked = post_with_headers(
+            &app,
+            "/sign-in/email",
+            &format!("csrf={harvested}&email=mallory%40example.com"),
+            &[("origin", ELSEWHERE)],
+        )
+        .await;
+        assert_eq!(asked.status(), StatusCode::BAD_REQUEST);
+
+        // `Referer` when there is no `Origin`: less to go on, and enough.
+        let by_referer = post_with_headers(
+            &app,
+            "/sign-in/email",
+            &format!("csrf={harvested}&email=mallory%40example.com"),
+            &[("referer", "https://evil.example/a-page-of-theirs")],
+        )
+        .await;
+        assert_eq!(by_referer.status(), StatusCode::BAD_REQUEST);
+
+        // A host that merely starts the same way is a different site.
+        let lookalike = post_with_headers(
+            &app,
+            "/sign-in/email",
+            &format!("csrf={harvested}&email=mallory%40example.com"),
+            &[("origin", "https://example.com.evil.example")],
+        )
+        .await;
+        assert_eq!(lookalike.status(), StatusCode::BAD_REQUEST);
+
+        // Our own page still posts. Without this the four refusals above
+        // would pass against a route that refused everything.
+        let ours = post_with_headers(
+            &app,
+            "/sign-in/email",
+            &format!("csrf={harvested}&email=ada%40example.com"),
+            &[("origin", "https://example.com")],
+        )
+        .await;
+        assert_eq!(ours.status(), StatusCode::OK);
+
+        // A host is compared case-insensitively, which is how origins are
+        // equal. Refusing this would refuse a real visitor.
+        let shouting = post_with_headers(
+            &app,
+            "/sign-in/email",
+            &format!("csrf={harvested}&email=ada%40example.com"),
+            &[("origin", "https://EXAMPLE.com")],
+        )
+        .await;
+        assert_eq!(shouting.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_post_that_names_no_origin_at_all_is_left_to_the_form_token() {
+        // Deliberate, and the reason is written out in
+        // `routes::from_our_own_pages`: `security_headers` puts
+        // `Referrer-Policy: no-referrer` on every page of this half, which
+        // suppresses `Referer` and — per Fetch — makes the browser send
+        // `Origin: null` on a form post from such a page. A request with
+        // nothing to go on is therefore what our *own* forms look like,
+        // and refusing it would refuse every real sign-in.
+        //
+        // `null` and absent have to read the same way, so both are here:
+        // changing one without the other is a failing test.
+        let (app, core, _dir) = test_app().await;
+        issue(&core, "tok-quiet").await;
+        let csrf = form_token(&app, "/auth/email?t=tok-quiet").await;
+
+        let opaque = post_with_headers(
+            &app,
+            "/sign-in/email",
+            &format!("csrf={csrf}&email=ada%40example.com"),
+            &[("origin", "null")],
+        )
+        .await;
+        assert_eq!(opaque.status(), StatusCode::OK, "`Origin: null` was refused");
+
+        let silent =
+            post_form(&app, "/auth/email", &format!("csrf={csrf}&t=tok-quiet")).await;
+        assert_eq!(silent.status(), StatusCode::SEE_OTHER);
+
+        // And the form token is still the thing deciding, rather than
+        // nothing at all deciding.
+        let no_token = post_form(&app, "/sign-in/email", "email=ada%40example.com").await;
+        assert_eq!(no_token.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

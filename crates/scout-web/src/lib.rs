@@ -409,6 +409,26 @@ mod tests {
         ).await.unwrap()
     }
 
+    /// A `POST` carrying headers a browser would have set — `Origin` on a
+    /// form submission, `Referer` when the page's referrer policy allows
+    /// one. Sent as real headers rather than handed to the handler, so
+    /// whatever reads them is on the path these tests exercise.
+    pub(crate) async fn post_with_headers(
+        app: &axum::Router,
+        uri: &str,
+        form: &str,
+        extra: &[(&str, &str)],
+    ) -> Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded");
+        for (name, value) in extra {
+            req = req.header(*name, *value);
+        }
+        app.clone().oneshot(req.body(Body::from(form.to_string())).unwrap()).await.unwrap()
+    }
+
     /// The same `GET`, carrying a session cookie.
     ///
     /// Sent as a real `Cookie:` header rather than by handing the handler

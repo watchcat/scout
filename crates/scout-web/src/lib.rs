@@ -10,6 +10,7 @@
 // `serve` calls it, `mod` is enough, and leaving it public would give the
 // same items two paths in from outside.
 mod cache;
+mod email;
 mod page;
 mod ratelimit;
 mod session;

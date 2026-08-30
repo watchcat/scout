@@ -6764,6 +6764,7 @@ dependencies = [
  "reqwest 0.12.28",
  "scout-core",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tokio",
  "tower",

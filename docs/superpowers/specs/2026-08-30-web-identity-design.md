@@ -64,6 +64,11 @@ everyone, no exploit required, only traffic. Authenticating against a
 the cookie carries `account_id`, an expiry and a nonce, HMAC-signed;
 verification is pure computation.
 
+This keeps the lever off *session verification*, and nothing more: sign-in
+itself still writes to the database from an unauthenticated route. See the
+security posture below, which says what that costs and what is and is not
+done about it.
+
 The cost is real and accepted: **there is no per-session revocation.**
 Sessions expire rather than being killed, and rotating the key signs everyone
 out at once. For a product whose entire userbase currently fits in one invite
@@ -223,6 +228,17 @@ ends that, so the posture is restated rather than inherited.
   minutes, 10 per IP per hour**. In memory rather than in the database, for
   the same reason sessions are stateless — and a counter whose worst case is
   being reset by a deploy is the right shape for this.
+
+  A limit is only worth what its *key* is worth, which the W2 security
+  review found out the hard way. Both keys are normalised before counting:
+  an address is lower-cased, its `+tag` stripped, and its dots stripped at
+  the providers known to ignore them, so that forty spellings of one inbox
+  are one bucket; a client address is keyed by its /64 when it is IPv6,
+  since the smallest allocation an IPv6 client gets is a /64 and keying on
+  the /128 gave one ordinary client one bucket per request. The forwarded
+  address is read from the *last* `X-Forwarded-For` entry — the one our own
+  proxy appended — and a request arriving with no usable forwarded address
+  falls into a single shared bucket rather than being exempt.
 - **Tokens** hashed at rest, 15-minute expiry, single-use, consumed by `POST`.
 - **CSRF**: state-changing routes are `POST` carrying a signed double-submit
   token. `SameSite=Lax` does not cover cross-site `POST` and is not treated as
@@ -233,8 +249,25 @@ ends that, so the posture is restated rather than inherited.
   than 60 seconds is refused even with a valid HMAC.
 - **CSP** gains exactly one external origin, `telegram.org`, for the widget
   script — the only resource the site loads from anywhere but itself.
-- **The database stays off the per-request path**, as in W1. Sign-in touches
-  it; reading a page does not.
+- **The database stays off the per-request path**, as in W1. Reading a page
+  does not touch it. Sign-in does — and this is where the claim above, that
+  keeping sessions stateless means "a stranger cannot make the site take the
+  store mutex", is **not true**. It is true of session *verification*, which
+  is what that decision was about. It is false of `POST /sign-in/email`,
+  which is unauthenticated, reachable by anybody, and writes a
+  `login_tokens` row through the same `Arc<Mutex<Connection>>` the agent
+  uses. A flood of sign-in requests degrades the bot for real users, with no
+  exploit involved.
+
+  **This is not closed, and closing it needs a queue** — a writer task the
+  web layer hands work to, so that a request can be dropped instead of
+  waiting on the mutex. That is not built. What *is* done is bounding the
+  reachable rate: with the keys above actually binding, the writes a
+  stranger can cause are 3 per inbox per 15 minutes and 10 per client per
+  hour, and `login_tokens` is pruned a day past expiry in the maintenance
+  loop rather than kept forever, so the table is no longer a size a stranger
+  chooses either. The residual is that an attacker with many client
+  addresses still gets one write each, at 10 an hour apiece.
 
 ## Failure handling
 

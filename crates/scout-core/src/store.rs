@@ -1233,15 +1233,26 @@ impl Store {
     /// bare `current_timestamp`, which is local. See `requests_today` for
     /// the bug that pattern caused.
     ///
-    /// The addition happens here rather than as `TIMESTAMP + INTERVAL` in
-    /// SQL on purpose: on a freshly opened, file-backed connection (unlike
-    /// an in-memory one, and unlike an ad-hoc `query_row` probe run after
-    /// other queries have already primed the process) DuckDB's binder can
-    /// fail that expression with "No function matches ... (TIMESTAMP,
-    /// INTERVAL)" — a startup race in this build, not a real type error.
-    /// Binding an already-computed timestamp sidesteps it; the plain `<`
-    /// comparison below over two TIMESTAMP values needs no such arithmetic
-    /// and does not carry the same risk.
+    /// The addition happens in Rust rather than as `TIMESTAMP + INTERVAL`
+    /// in SQL because of a DuckDB behaviour that is reproducible and
+    /// unexplained. Measured on this build, five runs, identical every
+    /// time: `(current_timestamp AT TIME ZONE 'UTC') +
+    /// to_seconds(CAST(? AS INTEGER))`, executed as the *first* statement
+    /// on a freshly opened connection, fails to bind with "No function
+    /// matches ... (TIMESTAMP, INTERVAL)". The same statement, executed
+    /// after any four other queries on the same connection, succeeds. It is
+    /// not prepare-versus-execute — both were executed — and it is not
+    /// flaky. Literal intervals, `to_seconds(900)` and `CAST(? AS INTERVAL)`
+    /// all bind from cold.
+    ///
+    /// Why the first statement differs is not known. An earlier version of
+    /// this comment called it a "startup race", which is wrong twice over:
+    /// nothing here is racing, and no mechanism was ever established. The
+    /// honest statement is that the shape is avoided, not understood.
+    ///
+    /// Computing the value here sidesteps it entirely, and the `<`
+    /// comparison in `consume_login_token` is between two TIMESTAMPs with
+    /// no arithmetic, so it never meets the same wall.
     pub fn issue_login_token(
         &self,
         token_hash: &str,

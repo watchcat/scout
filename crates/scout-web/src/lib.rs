@@ -11,6 +11,7 @@
 // same items two paths in from outside.
 mod cache;
 mod page;
+mod session;
 
 pub use cache::{refresh_forever, AdmissionCache, REFRESH};
 

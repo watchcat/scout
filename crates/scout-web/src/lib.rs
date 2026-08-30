@@ -188,9 +188,22 @@ async fn security_headers(
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
-    // Sign-in URLs carry tokens. `no-referrer` keeps them out of the logs
-    // of every site a page here happens to link to.
-    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    // Sign-in URLs carry tokens, so the path must never leave this site.
+    // `strict-origin` sends `https://goodscout.fyi/` and never the path or
+    // query, which keeps the token out of other people's logs just as
+    // `no-referrer` did.
+    //
+    // It is `strict-origin` rather than `no-referrer` because of a second
+    // effect that is easy to miss: per Fetch, a page served with
+    // `no-referrer` makes the browser send `Origin: null` on form
+    // submissions — the rule covers requests that are neither GET nor HEAD
+    // and not in `cors` mode, which is every form here. Our own posts
+    // therefore arrived naming nobody, `from_our_own_pages` had to allow
+    // that case, and an attacker who set `no-referrer` on their own page
+    // looked identical to us. Under `strict-origin` our forms carry a real
+    // `Origin` and theirs carries theirs, so the check can refuse the
+    // nameless request instead of waving it through.
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin"));
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     response
@@ -405,6 +418,10 @@ mod tests {
         app.clone().oneshot(
             Request::builder().method("POST").uri(uri)
                 .header("content-type", "application/x-www-form-urlencoded")
+                // A browser sets this on every form submission, and under
+                // `strict-origin` it is a real origin rather than `null`.
+                // Omitting it here would test a request no browser sends.
+                .header("origin", "https://example.com")
                 .body(Body::from(form.to_string())).unwrap()
         ).await.unwrap()
     }
@@ -464,6 +481,7 @@ mod tests {
                     .method("POST")
                     .uri(uri)
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "https://example.com")
                     .header("cookie", format!("{}={session}", crate::session::COOKIE))
                     .body(Body::from(form.to_string()))
                     .unwrap(),

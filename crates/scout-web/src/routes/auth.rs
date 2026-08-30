@@ -438,7 +438,7 @@ mod tests {
         let res = get(&app, &format!("/auth/email?t={token}")).await;
         assert_eq!(res.status(), StatusCode::OK);
         // The token is in this page's URL; `Referer` must not carry it on.
-        assert_eq!(res.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(res.headers()["referrer-policy"], "strict-origin");
 
         // Still spendable afterwards.
         assert!(matches!(
@@ -589,17 +589,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_post_that_names_no_origin_at_all_is_left_to_the_form_token() {
-        // Deliberate, and the reason is written out in
-        // `routes::from_our_own_pages`: `security_headers` puts
-        // `Referrer-Policy: no-referrer` on every page of this half, which
-        // suppresses `Referer` and — per Fetch — makes the browser send
-        // `Origin: null` on a form post from such a page. A request with
-        // nothing to go on is therefore what our *own* forms look like,
-        // and refusing it would refuse every real sign-in.
+    async fn a_post_that_names_no_origin_at_all_is_refused() {
+        // This is only correct because `security_headers` sends
+        // `strict-origin` rather than `no-referrer`. Under `no-referrer`,
+        // Fetch has the browser send `Origin: null` on a form post from our
+        // own page — the rule covers requests that are neither GET nor HEAD
+        // and not in `cors` mode, which is every form here — so a nameless
+        // request was indistinguishable from our own and had to be allowed.
+        // An attacker who set `no-referrer` on their page then looked
+        // exactly like us, which is login CSRF for anyone who read the
+        // spec.
         //
-        // `null` and absent have to read the same way, so both are here:
-        // changing one without the other is a failing test.
+        // `null` and absent must read the same way, so both are here.
+        // Changing the header back without changing `from_our_own_pages`
+        // makes this test fail, which is the point of it.
         let (app, core, _dir) = test_app().await;
         issue(&core, "tok-quiet").await;
         let csrf = form_token(&app, "/auth/email?t=tok-quiet").await;
@@ -611,16 +614,21 @@ mod tests {
             &[("origin", "null")],
         )
         .await;
-        assert_eq!(opaque.status(), StatusCode::OK, "`Origin: null` was refused");
+        assert_eq!(opaque.status(), StatusCode::BAD_REQUEST, "`Origin: null` was allowed");
 
-        let silent =
-            post_form(&app, "/auth/email", &format!("csrf={csrf}&t=tok-quiet")).await;
-        assert_eq!(silent.status(), StatusCode::SEE_OTHER);
+        let silent = post_with_headers(
+            &app,
+            "/auth/email",
+            &format!("csrf={csrf}&t=tok-quiet"),
+            &[],
+        )
+        .await;
+        assert_eq!(silent.status(), StatusCode::BAD_REQUEST, "a nameless POST was allowed");
 
-        // And the form token is still the thing deciding, rather than
-        // nothing at all deciding.
-        let no_token = post_form(&app, "/sign-in/email", "email=ada%40example.com").await;
-        assert_eq!(no_token.status(), StatusCode::BAD_REQUEST);
+        // Not vacuous: the same request naming our own origin succeeds, and
+        // the token is still unspent for it to succeed with.
+        let ours = post_form(&app, "/auth/email", &format!("csrf={csrf}&t=tok-quiet")).await;
+        assert_eq!(ours.status(), StatusCode::SEE_OTHER);
     }
 
     #[tokio::test]
@@ -900,7 +908,7 @@ mod tests {
             ["https://oauth.telegram.org", "https://telegram.org"].into_iter().collect()
         );
 
-        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert_eq!(headers["referrer-policy"], "strict-origin");
         assert_eq!(headers["x-content-type-options"], "nosniff");
         assert_eq!(headers["x-frame-options"], "DENY");
     }

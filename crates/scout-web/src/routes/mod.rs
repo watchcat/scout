@@ -76,29 +76,17 @@ pub(crate) fn from_our_own_pages(auth: &AuthState, headers: &HeaderMap) -> bool 
 
     match claimed {
         Some(theirs) => theirs == ours,
-        // Neither header names a site. Allowed — and this is the one
-        // decision here that costs something, so, plainly:
+        // Neither header names a site. Refused.
         //
-        // `security_headers` puts `Referrer-Policy: no-referrer` on every
-        // page of this half. That suppresses `Referer` outright, and per
-        // Fetch it also makes the browser send `Origin: null` on a form
-        // submission from such a page — the rule covers requests that are
-        // neither `GET` nor `HEAD` and are not in `cors` mode, which is
-        // every form on this site. So a request with nothing to go on is
-        // what our *own* forms look like, not a suspicious one, and
-        // refusing it would refuse every real sign-in on the live site.
-        //
-        // What that leaves standing: an attacker posting from an ordinary
-        // page of their own is refused, because their page sends a real
-        // `Origin`. An attacker who puts `no-referrer` on their own page
-        // is not, because they then look exactly like us. Closing that
-        // needs `Referrer-Policy` on this half to become `strict-origin`
-        // — which still keeps the mailed token out of anybody else's logs,
-        // the reason `no-referrer` was chosen, while leaving our own posts
-        // a real `Origin` — after which this arm becomes `false`. That is
-        // a change to the security headers and is recorded in the review
-        // rather than made here.
-        None => true,
+        // This is only safe to refuse because `security_headers` sends
+        // `strict-origin` rather than `no-referrer`. Under `no-referrer`
+        // the browser sends `Origin: null` on a form post from our own
+        // page, so a nameless request was what we looked like ourselves
+        // and refusing it would have refused every real sign-in. The two
+        // decisions are one decision; changing that header back without
+        // changing this arm reopens login CSRF to anyone who reads the
+        // same spec.
+        None => false,
     }
 }
 

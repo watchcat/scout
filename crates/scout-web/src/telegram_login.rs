@@ -48,8 +48,10 @@ pub fn verify(bot_token: &str, fields: &[(String, String)]) -> Option<i64> {
     }
 
     let auth_date: i64 = rest.iter().find(|(k, _)| k == "auth_date")?.1.parse().ok()?;
+    // A window with both ends closed. Negative age is a payload dated
+    // ahead of us; see `MAX_SKEW_SECS` for why that is not simply refused.
     let age = chrono::Utc::now().timestamp() - auth_date;
-    if age > MAX_AGE_SECS || age < -MAX_SKEW_SECS {
+    if !(-MAX_SKEW_SECS..=MAX_AGE_SECS).contains(&age) {
         return None;
     }
     rest.iter().find(|(k, _)| k == "id")?.1.parse().ok()

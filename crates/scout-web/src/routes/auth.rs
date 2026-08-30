@@ -12,7 +12,7 @@
 //! browser asked for it — it failed.
 
 use super::{see_other, signed_in_as, sorry, stale_form};
-use crate::{pages, session, telegram_login, AuthState};
+use crate::{pages, ratelimit, session, telegram_login, AuthState};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -143,10 +143,13 @@ pub(crate) async fn offer_a_link(
     // reason to be trusted with somebody else's inbox: `link` will refuse
     // an address that is not theirs, but the mail has already gone out by
     // then, and that mail is the thing being rationed.
-    let ip = client_ip(headers);
+    //
+    // Counted on `ratelimit`'s keys rather than on what was typed and what
+    // the header said: `victim+1@` and `victim+2@` are one inbox, and a
+    // /128 out of an IPv6 client's own /64 is one client.
     let send = deliverable(&address)
-        && auth.by_address.allow(&address)
-        && ip.as_deref().is_none_or(|ip| auth.by_ip.allow(ip));
+        && auth.by_address.allow(&ratelimit::address_key(&address))
+        && auth.by_ip.allow(&client_bucket(headers));
     if send {
         mail_a_link(auth, address, account_id).await;
     }
@@ -383,23 +386,58 @@ fn deliverable(address: &str) -> bool {
                 && !domain.ends_with('.'))
 }
 
-/// The visitor's address, as the proxy in front of us reports it.
+/// The bucket every request with no usable forwarded address shares.
+///
+/// One bucket for all of them, rather than no bucket at all. The previous
+/// answer was "no IP limit", on the reasoning that a shared bucket would
+/// take sign-in away from everyone the first time a proxy stopped setting
+/// the header — but that reasoning only weighs one of the two failures.
+/// Behind the ingress every request carries `X-Forwarded-For`, so a
+/// request without one means the deployment is misconfigured or is being
+/// reached past the proxy; and "misconfigured" must not be the state in
+/// which the mail limit switches off. Of the two costs, sign-in throttled
+/// to the per-IP quota until someone fixes the ingress is loud, bounded
+/// and recoverable, and an unmetered path to sending mail is neither.
+///
+/// It cannot collide with a real key: `ratelimit::ip_key` only ever
+/// returns something that parsed as an address.
+const NO_CLIENT_ADDRESS: &str = "no-forwarded-for";
+
+/// Which per-IP bucket this request counts against.
 ///
 /// The socket address is the ingress controller's and is the same for
 /// everybody, so a forwarded header is the only thing that tells callers
-/// apart. With no such header there is no IP bucket at all, rather than
-/// one bucket shared by the whole internet: a shared bucket would silently
-/// take sign-in away from everyone the first time a proxy stopped setting
-/// the header, and the per-address limit still stands either way.
+/// apart.
+///
+/// **The last entry, not the first.** `X-Forwarded-For` is appended to:
+/// each proxy adds the address it received the connection from. So the
+/// first entry is whatever the original client claimed — which a client
+/// writes itself, and can make a fresh one of per request — and the last
+/// is the only entry written by something we trust, the proxy directly in
+/// front of us. Taking the first is right only for an edge that *replaces*
+/// the header rather than appending to it, which is not a property this
+/// code can check from here. Reading the last means the value we count on
+/// is the one our own ingress put there, and a client prepending anything
+/// it likes buys nothing.
+///
+/// If it is repeated as several header lines, the last line's last entry
+/// is the one the nearest proxy wrote, for the same reason.
+///
+/// Anything that does not parse as an address — including a header a
+/// client got to write with nothing in front of it — falls through to the
+/// shared bucket rather than becoming a key of its own, or junk would buy
+/// one bucket per junk string.
+fn client_bucket(headers: &HeaderMap) -> String {
+    client_ip(headers).unwrap_or_else(|| NO_CLIENT_ADDRESS.to_string())
+}
+
 fn client_ip(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        // The first entry is the client; the rest are the proxies it came
-        // through, and a client can put whatever it likes in front of it.
-        .map(|v| v.split(',').next().unwrap_or_default().trim().to_string())
-        .filter(|ip| !ip.is_empty())
+    let mut lines = headers.get_all("x-forwarded-for").iter();
+    let raw = match lines.next_back() {
+        Some(v) => v,
+        None => headers.get("x-real-ip")?,
+    };
+    ratelimit::ip_key(raw.to_str().ok()?.rsplit(',').next()?)
 }
 
 #[cfg(test)]
@@ -937,6 +975,190 @@ mod tests {
         // nothing to steal. A policy it does not need is one that gets
         // loosened for a reason that was never about it.
         assert!(get(&app, "/").await.headers().get("content-security-policy").is_none());
+    }
+
+    /// An address, as a form body carries it.
+    ///
+    /// `+` means a space in a form encoding, so a tagged address written
+    /// raw would arrive as `victim 1@gmail.com` and be refused as
+    /// undeliverable — the test would pass for the wrong reason.
+    fn encoded(email: &str) -> String {
+        email.replace('+', "%2B").replace('@', "%40")
+    }
+
+    /// Asks for a link the way a browser would, from a named address.
+    ///
+    /// The answer is deliberately the same page whatever happens, so these
+    /// tests count what went out rather than reading statuses.
+    async fn ask(app: &axum::Router, csrf: &str, email: &str, forwarded: &[(&str, &str)]) {
+        let mut headers = vec![("origin", "https://example.com")];
+        headers.extend_from_slice(forwarded);
+        let res = post_with_headers(
+            app,
+            "/sign-in/email",
+            &format!("csrf={csrf}&email={}", encoded(email)),
+            &headers,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK, "the form itself was refused");
+    }
+
+    /// How many messages actually went out.
+    ///
+    /// `mail_a_link` spawns, so the response comes back before the message
+    /// does. Yielding rather than sleeping, for the reason `mailed_link`
+    /// gives: on a current-thread runtime a spawned task runs at the next
+    /// yield, and `Mailer::Kept` has no await inside it.
+    async fn mail_sent(sent: &Sent) -> usize {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        let n = sent.lock().unwrap().len();
+        n
+    }
+
+    #[tokio::test]
+    async fn a_mail_bomb_cannot_buy_more_buckets_by_respelling_one_address() {
+        // The per-address limit was per *string*. `victim+1@gmail.com` and
+        // `v.i.c.t.i.m@gmail.com` are one inbox and were three buckets, so
+        // "3 per 15 minutes" bounded nothing a targeted mail bomb cared
+        // about: forty requests meant forty messages, capped only by the
+        // per-IP limit that the next test is about.
+        let (app, _core, _dir, sent) = test_app_keeping_mail().await;
+        let csrf = form_token(&app, "/sign-in").await;
+        let from = |ip| [("x-forwarded-for", ip)];
+
+        for i in 0..40 {
+            ask(&app, &csrf, &format!("victim+{i}@gmail.com"), &from("198.51.100.1")).await;
+        }
+        assert_eq!(mail_sent(&sent).await, 3, "the documented per-address cap did not hold");
+
+        // A second IP, so what refuses these is the address and not the
+        // address it came from. Dots are the other spelling of the same
+        // inbox at this provider.
+        for local in ["v.ictim", "vi.ctim", "vic.tim", "v.i.c.t.i.m"] {
+            ask(&app, &csrf, &format!("{local}@gmail.com"), &from("198.51.100.2")).await;
+        }
+        assert_eq!(mail_sent(&sent).await, 3, "a dotted spelling bought a fresh bucket");
+
+        // Not vacuous, twice over. A different person at the same provider
+        // still gets their mail...
+        ask(&app, &csrf, "ada@gmail.com", &from("198.51.100.3")).await;
+        assert_eq!(mail_sent(&sent).await, 4);
+        // ...and dots are only ignored where the provider ignores them:
+        // these are two different people at a company that takes them
+        // literally, and both are served.
+        ask(&app, &csrf, "ada@example.com", &from("198.51.100.4")).await;
+        ask(&app, &csrf, "a.da@example.com", &from("198.51.100.5")).await;
+        assert_eq!(mail_sent(&sent).await, 6, "dots were stripped where they mean something");
+    }
+
+    #[tokio::test]
+    async fn an_honest_visitor_is_still_allowed_exactly_what_is_documented() {
+        // The positive control for all of the above: every refusal in this
+        // file would pass against a sign-in form that mailed nothing at
+        // all. Three per address per fifteen minutes, ten per IP per hour,
+        // as the design says.
+        let (app, _core, _dir, sent) = test_app_keeping_mail().await;
+        let csrf = form_token(&app, "/sign-in").await;
+        let home = [("x-forwarded-for", "203.0.113.4")];
+
+        for _ in 0..10 {
+            ask(&app, &csrf, "ada@example.com", &home).await;
+        }
+        assert_eq!(mail_sent(&sent).await, 3, "an honest visitor got the wrong number of links");
+
+        // Ten per hour from one address, over distinct inboxes — a family
+        // or an office behind one NAT, which is what the IP limit is for.
+        for i in 0..20 {
+            ask(&app, &csrf, &format!("person{i}@example.com"), &home).await;
+        }
+        assert_eq!(mail_sent(&sent).await, 10, "the documented per-IP cap did not hold");
+    }
+
+    #[tokio::test]
+    async fn one_ipv6_client_is_one_bucket_and_not_a_sixty_four_of_them() {
+        // Any IPv6 client is handed at least a /64 — 18 quintillion
+        // addresses — so keying on the full /128 gave one ordinary client
+        // one bucket per request. Forty distinct addresses out of one /64
+        // meant forty messages against a cap of ten.
+        let (app, _core, _dir, sent) = test_app_keeping_mail().await;
+        let csrf = form_token(&app, "/sign-in").await;
+
+        for i in 0..40 {
+            let ip = format!("2001:db8:1::{i:x}");
+            ask(&app, &csrf, &format!("v{i}@example.com"), &[("x-forwarded-for", &ip)]).await;
+        }
+        assert_eq!(mail_sent(&sent).await, 10, "a /64 was worth more than one client");
+
+        // A different /64 is a different client, and is served.
+        ask(&app, &csrf, "ada@example.com", &[("x-forwarded-for", "2001:db8:2::1")]).await;
+        assert_eq!(mail_sent(&sent).await, 11);
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_header_the_client_wrote_does_not_buy_a_bucket() {
+        // `X-Forwarded-For` is appended to, so the *first* entry is
+        // whatever the client claimed and the last is what our own proxy
+        // saw. Reading the first meant a client could mint a new bucket per
+        // request by writing a new address in front of it — the ten-an-hour
+        // cap, with an unlimited supply of hours.
+        let (app, _core, _dir, sent) = test_app_keeping_mail().await;
+        let csrf = form_token(&app, "/sign-in").await;
+
+        for i in 0..40 {
+            let spoofed = format!("192.0.2.{i}, 203.0.113.9");
+            ask(&app, &csrf, &format!("v{i}@example.com"), &[("x-forwarded-for", &spoofed)]).await;
+        }
+        assert_eq!(mail_sent(&sent).await, 10, "a client-written entry was counted on");
+
+        // A second header line is the same trick with more layers: the
+        // nearest proxy wrote the last one.
+        for i in 40..60 {
+            let ip = format!("192.0.2.{i}");
+            ask(
+                &app,
+                &csrf,
+                &format!("v{i}@example.com"),
+                &[("x-forwarded-for", &ip), ("x-forwarded-for", "203.0.113.9")],
+            )
+            .await;
+        }
+        assert_eq!(mail_sent(&sent).await, 10, "a second header line bought a fresh bucket");
+
+        // Not vacuous: a request the proxy really did forward from
+        // somewhere else is served.
+        ask(&app, &csrf, "ada@example.com", &[("x-forwarded-for", "203.0.113.10")]).await;
+        assert_eq!(mail_sent(&sent).await, 11);
+    }
+
+    #[tokio::test]
+    async fn requests_with_no_forwarded_address_share_one_bucket() {
+        // `is_none_or` used to make a missing header mean "allowed", so a
+        // path that reached us without one had no IP limit at all. Behind
+        // the ingress every request carries the header; a request without
+        // one means something is misconfigured, and misconfigured must not
+        // be the state in which the mail limit switches off.
+        let (app, _core, _dir, sent) = test_app_keeping_mail().await;
+        let csrf = form_token(&app, "/sign-in").await;
+
+        for i in 0..40 {
+            ask(&app, &csrf, &format!("v{i}@example.com"), &[]).await;
+        }
+        assert_eq!(mail_sent(&sent).await, 10, "a missing header meant no limit");
+
+        // Junk falls in the same bucket rather than becoming one of its
+        // own, or a header full of nonsense buys a bucket per nonsense.
+        for i in 40..60 {
+            let junk = format!("not-an-address-{i}");
+            ask(&app, &csrf, &format!("v{i}@example.com"), &[("x-forwarded-for", &junk)]).await;
+        }
+        assert_eq!(mail_sent(&sent).await, 10, "an unparseable header bought a bucket");
+
+        // Not vacuous: a real forwarded address is a different bucket and
+        // is served.
+        ask(&app, &csrf, "ada@example.com", &[("x-forwarded-for", "203.0.113.11")]).await;
+        assert_eq!(mail_sent(&sent).await, 11);
     }
 
     #[tokio::test]

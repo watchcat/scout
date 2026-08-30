@@ -886,7 +886,6 @@ fn move_rows(conn: &Connection, absorbed: i64, survivor: i64) -> Result<()> {
     Ok(())
 }
 
-
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path.as_ref())?;

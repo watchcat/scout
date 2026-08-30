@@ -1349,6 +1349,28 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// The Telegram ids this account can prove, as numbers.
+    ///
+    /// `external_id` is TEXT because an identity's id is opaque to the
+    /// store; Telegram's happen to be integers and the founder list is
+    /// integers, so this is where the two meet. A row that will not parse
+    /// is skipped rather than failing the call — one unreadable identity
+    /// must not make an account impossible to ask about.
+    pub fn telegram_ids(&self, account_id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT external_id FROM identities WHERE account_id = ? AND kind = 'telegram'",
+        )?;
+        let rows = stmt.query_map(params![account_id], |r| r.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            if let Ok(id) = row?.parse::<i64>() {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// Whether this account holds a seat that has not been revoked.
     ///
     /// The same question `claim_seat` asks first, as a read. A page that
@@ -1660,6 +1682,22 @@ impl Store {
              WHERE account_id = ? AND revoked_at IS NULL",
             params![account_id],
         )?;
+        Ok(changed > 0)
+    }
+
+    /// Hands a seat back to its round by removing the row, rather than
+    /// marking it.
+    ///
+    /// The opposite choice from `revoke`, deliberately. Revoking keeps the
+    /// row so that moderation cannot quietly reopen a round. This deletes
+    /// it, because it is only ever called for a seat nobody is sitting in:
+    /// a founder is admitted by `ALLOWED_TELEGRAM_USER_IDS` and never
+    /// consults `members` at all, so a seat that lands on one is a seat the
+    /// round has lost for no reason. False when there was none to hand back.
+    pub fn release_seat(&self, account_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed =
+            conn.execute("DELETE FROM members WHERE account_id = ?", params![account_id])?;
         Ok(changed > 0)
     }
 
@@ -2638,6 +2676,38 @@ CREATE TABLE segment_candidates (
             LinkOutcome::Merged { account_id: member }
         );
         assert_eq!(s.waiting_count().unwrap(), 0, "a member was left queued");
+    }
+
+    #[test]
+    fn releasing_a_seat_hands_it_back_where_revoking_deliberately_does_not() {
+        let (s, _d) = test_store();
+        s.create_round("autumn", 1).unwrap();
+        let a = s.account_for_identity("telegram", "11").unwrap();
+        s.claim_seat(a, "autumn").unwrap();
+        assert_eq!(s.rounds().unwrap()[0].used, 1);
+
+        // Revoking keeps the row, so the seat stays spent. That is the
+        // existing promise and this must not change it.
+        assert!(s.revoke(a).unwrap());
+        assert_eq!(s.rounds().unwrap()[0].used, 1, "revoking handed a seat back");
+
+        assert!(s.release_seat(a).unwrap());
+        assert_eq!(s.rounds().unwrap()[0].used, 0);
+        assert!(!s.release_seat(a).unwrap(), "a seat nobody held was released anyway");
+    }
+
+    #[test]
+    fn telegram_ids_come_back_as_numbers_and_skip_what_will_not_parse() {
+        let (s, _d) = test_store();
+        let a = s.account_for_identity("telegram", "11").unwrap();
+        s.link_identity(a, "telegram", "22").unwrap();
+        s.link_identity(a, "email", "x@example.com").unwrap();
+        // `external_id` is TEXT, so nothing stops a row like this existing.
+        s.link_identity(a, "telegram", "not-a-number").unwrap();
+
+        let mut ids = s.telegram_ids(a).unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![11, 22], "an address or an unparseable row leaked in");
     }
 
     #[test]

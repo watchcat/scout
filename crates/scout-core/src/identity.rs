@@ -93,8 +93,28 @@ pub async fn link(
     external_id: &str,
 ) -> anyhow::Result<LinkOutcome> {
     let store = core.store();
-    let external_id = external_id.to_string();
-    blocking(move || store.link_identity(account_id, kind, &external_id)).await
+    let owned = external_id.to_string();
+    let outcome = blocking(move || store.link_identity(account_id, kind, &owned)).await?;
+
+    // A merge moves the absorbed account's seat onto the survivor whenever
+    // the survivor has none. That is right for an ordinary account, whose
+    // only admission may have arrived that way — and wrong for a founder,
+    // who is admitted by `ALLOWED_TELEGRAM_USER_IDS` and has no `members`
+    // row on purpose. Left alone it makes a round report a seat spent that
+    // nobody is sitting in, which is the number admissions are decided on.
+    //
+    // Here rather than in `link_identity` because the founder list is
+    // configuration the store has never been told about, and telling it
+    // would make admission a second thing the database has an opinion on.
+    if let LinkOutcome::Merged { account_id: survivor } = outcome {
+        let store = core.store();
+        let ids = blocking(move || store.telegram_ids(survivor)).await?;
+        if ids.iter().any(|id| core.is_founder(*id)) {
+            let store = core.store();
+            blocking(move || store.release_seat(survivor)).await?;
+        }
+    }
+    Ok(outcome)
 }
 
 /// Files a login token, ready to be emailed.
@@ -205,6 +225,62 @@ mod tests {
             core.store().account_for_identity("telegram", "12345").unwrap(),
             account_id
         );
+    }
+
+    #[tokio::test]
+    async fn a_founder_absorbing_an_empty_account_does_not_inherit_its_seat() {
+        // `Config::for_test` makes telegram 111 the founder. A founder is
+        // admitted by the allow-list and holds no `members` row, so a seat
+        // that lands on one is a seat the round has lost for nobody.
+        let (core, _dir) = test_core().await;
+        core.store().create_round("autumn", 5).unwrap();
+        let founder = core.store().account_for_identity("telegram", "111").unwrap();
+        core.store().log_request(founder, "text").unwrap();
+        assert!(!core.store().is_member(founder).unwrap(), "a founder started with a seat");
+
+        // Signing in on the web mints an empty account, which takes a seat.
+        let SignIn::In { account_id: web } =
+            sign_in(&core, "email", "f@example.com").await.unwrap()
+        else {
+            panic!("the round had room");
+        };
+        assert_eq!(core.store().rounds().unwrap()[0].used, 1);
+
+        assert_eq!(
+            link(&core, web, "telegram", "111").await.unwrap(),
+            LinkOutcome::Merged { account_id: founder }
+        );
+        assert_eq!(
+            core.store().rounds().unwrap()[0].used,
+            0,
+            "the founder inherited a seat instead of handing it back"
+        );
+        assert!(!core.store().is_member(founder).unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_account_does_inherit_the_seat_it_was_merged_with() {
+        // The other side of the same rule. Handing this seat back would
+        // sign somebody in and then throw them out, because unlike a
+        // founder their admission is the seat.
+        let (core, _dir) = test_core().await;
+        core.store().create_round("autumn", 5).unwrap();
+        let user = core.store().account_for_identity("telegram", "222").unwrap();
+        core.store().log_request(user, "text").unwrap();
+
+        let SignIn::In { account_id: web } =
+            sign_in(&core, "email", "g@example.com").await.unwrap()
+        else {
+            panic!("the round had room");
+        };
+        assert!(core.store().is_member(web).unwrap());
+
+        assert_eq!(
+            link(&core, web, "telegram", "222").await.unwrap(),
+            LinkOutcome::Merged { account_id: user }
+        );
+        assert!(core.store().is_member(user).unwrap(), "the seat vanished with the account");
+        assert_eq!(core.store().rounds().unwrap()[0].used, 1);
     }
 
     #[tokio::test]

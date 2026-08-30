@@ -75,17 +75,33 @@ impl AuthConfig {
     /// a sign-in form and then cannot mail anything is worse than one that
     /// does not offer sign-in at all.
     pub fn from_env() -> Option<Self> {
-        let key = std::env::var("SCOUT_SESSION_KEY").ok()?;
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// The half of `from_env` that does not read the process environment,
+    /// so it can be tested without one. `Config::from_lookup` is split the
+    /// same way, for the same reason.
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        // An empty variable is not a configured one. `env::var` hands back
+        // `Ok("")` for `X=`, which is what a compose file with a blank
+        // value or a Kubernetes secret missing a key produces — so four of
+        // these five keys used to pass while empty, which is exactly the
+        // half-configured deployment the all-or-nothing rule exists to
+        // prevent. `Config::from_lookup` has always filtered this way; the
+        // two disagreeing was the bug.
+        let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+
+        let key = set("SCOUT_SESSION_KEY")?;
         if key.len() < 32 {
             tracing::warn!("SCOUT_SESSION_KEY is shorter than 32 bytes; sign-in stays off");
             return None;
         }
         Some(Self {
             session_key: key.into_bytes(),
-            bot_token: std::env::var("TELEGRAM_BOT_TOKEN").ok()?,
-            resend_api_key: std::env::var("RESEND_API_KEY").ok()?,
-            mail_from: std::env::var("SCOUT_MAIL_FROM").ok()?,
-            base_url: std::env::var("SCOUT_BASE_URL").ok()?,
+            bot_token: set("TELEGRAM_BOT_TOKEN")?,
+            resend_api_key: set("RESEND_API_KEY")?,
+            mail_from: set("SCOUT_MAIL_FROM")?,
+            base_url: set("SCOUT_BASE_URL")?,
         })
     }
 }
@@ -481,6 +497,38 @@ mod tests {
             .oneshot(Request::builder().uri("/wp-login.php").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn an_empty_variable_does_not_count_as_a_configured_one() {
+        // `X=` in a compose file is a variable somebody meant to fill in
+        // and did not. Taken as set, it mounts a sign-in page that mails
+        // through Resend with no API key and signs cookies with a key
+        // nobody chose — the half-configured deployment `from_env` exists
+        // to refuse.
+        let full = |k: &str| {
+            Some(match k {
+                // Long enough to clear the 32-byte floor.
+                "SCOUT_SESSION_KEY" => "a session key of at least 32 bytes".to_string(),
+                _ => "value".to_string(),
+            })
+        };
+        assert!(AuthConfig::from_lookup(full).is_some(), "a full environment was refused");
+
+        for blank in ["", "   ", "\n"] {
+            for name in [
+                "SCOUT_SESSION_KEY",
+                "TELEGRAM_BOT_TOKEN",
+                "RESEND_API_KEY",
+                "SCOUT_MAIL_FROM",
+                "SCOUT_BASE_URL",
+            ] {
+                let cfg = AuthConfig::from_lookup(|k: &str| {
+                    if k == name { Some(blank.to_string()) } else { full(k) }
+                });
+                assert!(cfg.is_none(), "{name}={blank:?} counted as configured");
+            }
+        }
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 // same items two paths in from outside.
 mod cache;
 mod page;
+mod ratelimit;
 mod session;
 mod telegram_login;
 

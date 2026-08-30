@@ -7,15 +7,31 @@ const TOKEN: &str = "<!--STATUS-->";
 
 /// The page with its status strip filled in.
 ///
-/// Substitution rather than a template engine: there is exactly one variable
-/// on this page, and a dependency to interpolate one string would be a
+/// Substitution rather than a template engine: there are two variables on
+/// this page, and a dependency to interpolate two strings would be a
 /// dependency to keep patched forever.
-pub fn render(admission: &Admission) -> String {
-    TEMPLATE.replace(TOKEN, &status_strip(admission))
+///
+/// `sign_in` is whether the deployment has been given the keys for the
+/// signed-in half. It is a parameter rather than a link written into
+/// `index.html` because the page is embedded with `include_str!` and
+/// served identically everywhere: a hardcoded `/sign-in` would advertise a
+/// door that 404s wherever `AuthConfig::from_env` came back `None`.
+pub fn render(admission: &Admission, sign_in: bool) -> String {
+    TEMPLATE.replace(TOKEN, &status_strip(admission, sign_in))
 }
 
-fn status_strip(admission: &Admission) -> String {
-    match admission {
+fn status_strip(admission: &Admission, sign_in: bool) -> String {
+    // Appended after whichever strip follows rather than written into each
+    // of them, so the three branches keep saying only what they are about,
+    // and outside the `.gate` box because that box is a flex row and a
+    // fourth item in it would land beside the button.
+    let door = if sign_in {
+        r#"
+  <p class="caption"><a href="/sign-in">Already have an account? Sign in</a></p>"#
+    } else {
+        ""
+    };
+    let strip = match admission {
         // The join URL needs no escaping: it is the bot's own address from
         // `getMe` plus a round code, and `check_round_name` in
         // `scout-core/src/invites.rs` allows only ASCII letters, digits, `-`
@@ -48,7 +64,8 @@ fn status_strip(admission: &Admission) -> String {
     <a class="btn ghost" href="https://github.com/watchcat/scout">Read the source</a>
   </div>"#
             .to_string(),
-    }
+    };
+    format!("{strip}{door}")
 }
 
 #[cfg(test)]
@@ -57,14 +74,15 @@ mod tests {
 
     #[test]
     fn an_open_round_offers_a_way_in_and_a_full_one_offers_none() {
-        let open = render(&Admission::Open {
-            join_url: Some("https://t.me/scoutbot?start=autumn".to_string()),
-        });
+        let open = render(
+            &Admission::Open { join_url: Some("https://t.me/scoutbot?start=autumn".to_string()) },
+            false,
+        );
         assert!(open.contains("https://t.me/scoutbot?start=autumn"));
         assert!(open.contains("Invites open"));
         assert!(!open.contains("<!--STATUS-->"), "the token survived into the page");
 
-        let full = render(&Admission::Full);
+        let full = render(&Admission::Full, false);
         assert!(full.contains("Currently full"));
         assert!(!full.contains("t.me"), "a full round must not hand out a join link");
     }
@@ -73,13 +91,31 @@ mod tests {
     fn a_round_with_no_known_join_link_still_says_it_is_open() {
         // return_url is None when getMe failed at start-up. Saying "open"
         // with no button is honest; inventing a link is not.
-        let page = render(&Admission::Open { join_url: None });
+        let page = render(&Admission::Open { join_url: None }, false);
         assert!(page.contains("Invites open"));
         assert!(!page.contains("t.me"));
         assert!(
             !page.contains("Message the bot"),
             "an instruction nobody can follow is worse than no instruction"
         );
+    }
+
+    #[test]
+    fn the_page_offers_sign_in_only_where_there_is_a_sign_in() {
+        // Nothing linked to `/sign-in` before this, so a visitor could only
+        // reach it by knowing the path. The link cannot live in index.html:
+        // that file is embedded and served identically everywhere, and on a
+        // deployment with no keys the route does not exist — so the link
+        // would be an invitation to a 404.
+        let configured = render(&Admission::Full, true);
+        assert!(configured.contains(r#"href="/sign-in""#), "no way in from the front page");
+
+        let bare = render(&Admission::Full, false);
+        assert!(!bare.contains("/sign-in"), "advertised a door that is not there");
+
+        // The strip itself is otherwise untouched, so the two differ by the
+        // link and nothing else.
+        assert!(bare.contains("Currently full") && configured.contains("Currently full"));
     }
 
     #[test]
@@ -97,7 +133,7 @@ mod tests {
         // in index.html, with nothing joining them. Renaming a class in the
         // stylesheet would leave the strip unstyled and every other test
         // passing, because they all assert on text and links.
-        for class in ["gate", "pill", "open", "full", "dot", "btn", "ghost"] {
+        for class in ["gate", "pill", "open", "full", "dot", "btn", "ghost", "caption"] {
             assert!(
                 TEMPLATE.contains(&format!(".{class}")),
                 "the strip emits class `{class}` and the page has no rule for it"
@@ -111,7 +147,7 @@ mod tests {
         // the colour inherited, so the two can drift. These assert the parts
         // that must not: that the page still draws a mark at all, and that
         // the icon path it asks the browser for is the path lib.rs routes.
-        let page = render(&Admission::Full);
+        let page = render(&Admission::Full, false);
         assert!(page.contains(r#"href="/icon.svg""#), "the page asks for no icon");
         assert!(page.contains(r#"class="logo""#), "the header lost its mark");
         // The two lenses and the bridge between them. If a redraw changes
@@ -124,7 +160,7 @@ mod tests {
         // The design says state, not numbers. This is the test that keeps
         // someone from "helpfully" adding a count later.
         for a in [Admission::Full, Admission::Open { join_url: None }] {
-            let page = render(&a);
+            let page = render(&a, false);
             assert!(!page.contains("seats"), "{a:?} leaked capacity");
             assert!(!page.contains("remaining"), "{a:?} leaked capacity");
         }

@@ -106,18 +106,78 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         // down for a reason the site does not have.
         .route("/healthz", get(|| async { "ok" }))
         .route("/icon.svg", get(icon))
-        .with_state(cache);
+        .with_state(Public { cache, sign_in: auth.is_some() });
 
     match auth {
-        Some(auth) => public
-            .merge(routes::auth::routes(auth.clone()))
-            .merge(routes::account::routes(auth)),
+        // The headers go on here rather than on the whole site because
+        // this is the half that renders forms, sets cookies and embeds
+        // somebody else's script. The public page has no script tag, no
+        // input and nothing to steal, and a policy it does not need is a
+        // policy that gets loosened for a reason that was never about it.
+        Some(auth) => public.merge(
+            routes::auth::routes(auth.clone())
+                .merge(routes::account::routes(auth))
+                .layer(axum::middleware::from_fn(security_headers)),
+        ),
         None => public,
     }
 }
 
-async fn index(State(cache): State<AdmissionCache>) -> Html<String> {
-    Html(page::render(&cache.get()))
+/// What the public page needs: the cached admission, and whether there is
+/// anywhere to sign in.
+///
+/// The second is a fact about the deployment, fixed at start-up, not
+/// something that changes per request — but it has to reach `render`
+/// somehow, and threading it through the one state the public routes
+/// already share beats a second extractor or a global.
+#[derive(Clone)]
+struct Public {
+    cache: AdmissionCache,
+    sign_in: bool,
+}
+
+async fn index(State(public): State<Public>) -> Html<String> {
+    Html(page::render(&public.cache.get(), public.sign_in))
+}
+
+/// What the browser may load, and what it may tell others about us.
+///
+/// `script-src` names `telegram.org` because the login widget is served
+/// from there, and `frame-src` names `oauth.telegram.org` because that is
+/// where the button the script draws actually lives —
+/// `telegram-widget.js` builds its iframe as `widgetsOrigin + '/embed/'`,
+/// and `widgetsOrigin` is `https://oauth.telegram.org`. A CSP host source
+/// matches one host exactly, so naming only `telegram.org` would allow the
+/// script and then blank the button it draws. Two hosts, one external
+/// party, and the test below asserts that set rather than counting them:
+/// anyone else's origin has to be added on this line, with a reason.
+///
+/// `frame-ancestors` is not here because `X-Frame-Options` says the same
+/// thing and is understood by more of what sits in front of us.
+const CSP: &str = "default-src 'self'; \
+script-src 'self' https://telegram.org; \
+frame-src https://oauth.telegram.org; \
+img-src 'self' data:; \
+style-src 'self' 'unsafe-inline'";
+
+/// Puts the four headers on every response the signed-in half makes.
+///
+/// A layer rather than four tuples repeated in nine handlers, because the
+/// handler that forgot them would be the one that mattered.
+async fn security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::HeaderValue;
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    // Sign-in URLs carry tokens. `no-referrer` keeps them out of the logs
+    // of every site a page here happens to link to.
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
 }
 
 /// The mark, as the browser tab's icon.

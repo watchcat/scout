@@ -548,6 +548,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_sign_in_page_allows_telegram_and_nothing_else() {
+        let (app, _core, _dir) = test_app().await;
+        let res = get(&app, "/sign-in").await;
+        let headers = res.headers();
+        let csp = headers["content-security-policy"].to_str().unwrap();
+
+        // Every external source the policy names, as a set.
+        //
+        // The plan asked for a count of `https://` occurrences instead,
+        // and said it had to be one. It cannot be: the widget's script is
+        // served from `telegram.org` and the button it draws is an iframe
+        // from `oauth.telegram.org`, and a CSP host source matches one
+        // host exactly. Asserting the set keeps what the count was for —
+        // an origin belonging to anyone but Telegram has to be added on
+        // this line, by somebody who can say why.
+        let external: std::collections::BTreeSet<&str> = csp
+            .split([' ', ';'])
+            .filter(|token| token.starts_with("https://"))
+            .collect();
+        assert_eq!(
+            external,
+            ["https://oauth.telegram.org", "https://telegram.org"].into_iter().collect()
+        );
+
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["x-frame-options"], "DENY");
+    }
+
+    #[tokio::test]
+    async fn every_page_of_the_signed_in_half_carries_the_headers() {
+        // One layer over the whole half rather than four tuples in nine
+        // handlers, because the handler that forgot them would be the one
+        // that mattered. This is what says the layer is actually on.
+        let (app, _core, _dir) = test_app().await;
+        let cookie = crate::session::mint(TEST_KEY, 1, 86_400);
+        for (res, what) in [
+            (get(&app, "/sign-in").await, "/sign-in"),
+            (get(&app, "/auth/email?t=nope").await, "/auth/email"),
+            (get_with_cookie(&app, "/account", &cookie).await, "/account"),
+            (post_form(&app, "/sign-in/email", "email=a%40b.com").await, "a refused POST"),
+        ] {
+            assert!(
+                res.headers().contains_key("content-security-policy"),
+                "{what} went out with no policy"
+            );
+            assert_eq!(res.headers()["x-frame-options"], "DENY", "{what}");
+        }
+
+        // And not on the public page, which has no script, no form and
+        // nothing to steal. A policy it does not need is one that gets
+        // loosened for a reason that was never about it.
+        assert!(get(&app, "/").await.headers().get("content-security-policy").is_none());
+    }
+
+    #[tokio::test]
     async fn an_expired_link_and_one_that_never_existed_read_alike() {
         let (app, core, _dir) = test_app().await;
         // Issued already dead, which is what `ttl_secs` being signed is for.

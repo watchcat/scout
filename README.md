@@ -249,6 +249,43 @@ compiles from source.
 Keys are read from `.env` at runtime and never baked into the image. Memory
 lives in the `scout-data` volume and survives rebuilds.
 
+### Deploying
+
+Three more variables live in `.env` but are read by `scripts/deploy-k3s.sh`
+rather than by the bot:
+
+| Variable | Purpose |
+|---|---|
+| `SCOUT_DOMAIN` | the hostname the ingress and its certificate are issued for |
+| `SCOUT_ACME_EMAIL` | where Let's Encrypt sends expiry warnings |
+| `SCOUT_SSH` | the node to build on and ship to, e.g. `root@203.0.113.4` |
+
+The script runs here and **builds there**, because this repository is
+developed on arm64 and the server is x86_64 — emulating the DuckDB C++
+compile locally takes hours rather than minutes. The source crosses as
+`git archive HEAD`, so a deploy refuses to run with uncommitted changes and
+nothing untracked can reach the image.
+
+**`.env` cannot be `source`d.** Values are unquoted, so a line like
+`SCOUT_MAIL_FROM=Scout <scout@example.com>` is a redirect to bash. The
+script never sources it — it pipes it to `kubectl create secret
+--from-env-file` — but a shell that wants these three should extract them,
+not source the file:
+
+```bash
+export SCOUT_DOMAIN="$(grep -m1 '^SCOUT_DOMAIN=' .env | cut -d= -f2-)"
+```
+
+Everything in `.env` except `AWS_*` and `RESTIC_*` reaches the bot's own
+environment through that Secret, these three included. That is harmless —
+none of them is a credential — but it is worth knowing before adding
+anything else to the file.
+
+`scripts/deploy-k3s.sh` takes **no database backup**. DuckDB is
+single-writer, so the only consistent copy comes from `/backup`, an admin
+command inside the running bot. Take one before anything that changes
+data.
+
 ---
 
 ## How it works
@@ -386,12 +423,13 @@ Roughly 24,300 lines of Rust across 39 focused modules.
 ## Development
 
 ```bash
-cargo test                  # 446 tests across three crates, no network
-cargo clippy --all-targets  # clean
+cargo test --workspace      # 559 tests across four crates, no network
+cargo clippy --workspace --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now
-scripts/deploy.sh           # test, build, drain, hand over
-scripts/deploy.sh --dry-run # show the plan, change nothing
+scripts/deploy.sh           # compose: test, build, drain, hand over
+scripts/deploy-k3s.sh       # production: build on the node, apply, wait
+scripts/deploy-k3s.sh --dry-run # show the plan, change nothing
 ```
 
 A handful of tests are `#[ignore]`d because they call the real APIs. They are

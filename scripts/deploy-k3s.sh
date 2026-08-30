@@ -23,9 +23,26 @@ DRY_RUN=0
 say() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 step() { if [ "$DRY_RUN" -eq 1 ]; then echo "  (dry run) $1"; return 1; fi; return 0; }
 
-: "${SCOUT_DOMAIN:?set SCOUT_DOMAIN — it is in .env}"
-: "${SCOUT_ACME_EMAIL:?set SCOUT_ACME_EMAIL — it is in .env}"
-: "${SCOUT_SSH:?set SCOUT_SSH to the node, e.g. root@203.0.113.4}"
+# These three configure the deploy rather than the bot, but they live in the
+# same .env as everything else. Read from there when the environment does not
+# already carry them — which is the normal case, because .env cannot be
+# `source`d: its values are unquoted, so a line like
+# `SCOUT_MAIL_FROM=Scout <scout@example.com>` is a redirect as far as bash is
+# concerned. An exported value still wins, so a one-off deploy elsewhere is
+# `SCOUT_SSH=root@other scripts/deploy-k3s.sh`.
+env_file_value() {
+    [ -f .env ] || return 0
+    sed -n "s/^$1=//p" .env | head -1
+}
+for key in SCOUT_DOMAIN SCOUT_ACME_EMAIL SCOUT_SSH; do
+    if [ -z "${!key:-}" ]; then
+        export "$key=$(env_file_value "$key")"
+    fi
+done
+
+: "${SCOUT_DOMAIN:?set SCOUT_DOMAIN — in .env or the environment}"
+: "${SCOUT_ACME_EMAIL:?set SCOUT_ACME_EMAIL — in .env or the environment}"
+: "${SCOUT_SSH:?set SCOUT_SSH to the node, e.g. root@203.0.113.4 — in .env or the environment}"
 
 SSH=(ssh -o BatchMode=yes "$SCOUT_SSH")
 REMOTE_SRC=/opt/scout

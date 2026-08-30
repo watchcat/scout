@@ -163,3 +163,49 @@ directions; `GET` on a link consuming nothing; `Expired` and `Unknown`
 rendering identically; the link form not being a membership oracle; the
 60-second Telegram replay bound; `link_identity` never moving an identity;
 HTML escaping on every interpolation traced; open redirect.
+
+---
+
+# Resolution
+
+All findings closed on branch `w2-security-fixes`, 20 commits. 547 tests,
+clippy clean.
+
+| # | What closed it |
+|---|---|
+| 1 | A signed `state` on the widget's `data-auth-url`, bound to the session when there is one. The attack was written as a test, confirmed to succeed against the old code, and now returns 400 with nothing linked. |
+| 2 | An `Origin`/`Referer` check on every state-changing POST — plus `Referrer-Policy: strict-origin`, without which the check was toothless. See below. |
+| 3 | Not closed; cannot be without a queue, which was not built. The design document now states the residual instead of claiming otherwise. |
+| 4 | Address keys normalised, IPv6 keyed by /64, the map swept on a size threshold rather than per call, one shared `reqwest::Client`, and `login_tokens` pruned hourly in `run_maintenance`. |
+| 5 | `client_ip` takes the last `X-Forwarded-For` entry. A request with no forwarded header now shares one bucket rather than being exempt. |
+| 6 | The vacuous test rewritten to tamper with each payload field in turn. The reviewer's mutation was reapplied to confirm the suite passed under it before, and that the new test fails under it now. |
+| 9 | `__Host-` cookie prefix, `Cache-Control: no-store`, HSTS on the whole router, a two-sided `auth_date` window, `SELECT DISTINCT kind`, and `consumed_at` on the same clock as `expires_at`. |
+
+## Two things worth carrying forward
+
+**Finding 2 was nearly fixed in name only.** The `Origin` check had to allow
+requests naming nobody, because `Referrer-Policy: no-referrer` makes browsers
+send `Origin: null` on form posts — so our own forms looked nameless and an
+attacker who set the same policy looked identical to us. The header and the
+check are one decision. `strict-origin` keeps the mailed token out of other
+people's logs, which is the only thing `no-referrer` was for, while leaving
+our own posts a real `Origin`. A test fails if either is changed without the
+other.
+
+**The agent that fixed it said so itself**, rather than reporting the finding
+closed. That is the only reason it was caught.
+
+## Still open
+
+- **Finding 3's root cause.** `POST /sign-in/email` still writes to DuckDB
+  through the bot's own mutex. Bounded now, not removed.
+- **Signed-out login CSRF on `/auth/telegram`.** A state for a signed-out
+  browser is fetchable from the public `/sign-in` by construction, so an
+  attacker can still push a *signed-out* visitor into signing in as the
+  attacker's Telegram identity. The signed-in takeover is closed.
+- **A signed-in user can link a second Telegram identity.** `/account` hides
+  the widget once you have one; `/sign-in` does not. Possibly intended —
+  someone with two Telegram accounts — but the two pages disagree, and that
+  disagreement is what made the duplicate render reachable.
+- **The widget's `data-auth-url` now carries a query string** and nobody has
+  confirmed Telegram honours that. It fails visibly if not.

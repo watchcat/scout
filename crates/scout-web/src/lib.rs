@@ -140,6 +140,38 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         ),
         None => public,
     }
+    // HSTS goes on everything, unlike the headers above. It is a statement
+    // about the host rather than about a page: a visitor who only ever
+    // reads the landing page must still come away knowing never to try
+    // this domain over HTTP, or the one request that matters — the first
+    // one, before any redirect — stays interceptable. The Caddyfile set
+    // this and the k3s ingress that replaced it does not, so the site has
+    // been running without it; serving it from here means it does not
+    // depend on which proxy is in front.
+    .layer(axum::middleware::from_fn(hsts))
+}
+
+/// Tells the browser never to speak to this host over plain HTTP.
+///
+/// A year, with subdomains, matching what the Caddyfile asserted before the
+/// move to k3s. `includeSubDomains` is safe here because nothing under this
+/// domain serves HTTP at all — `send.goodscout.fyi` exists only as MX and
+/// TXT records for mail.
+///
+/// Worth knowing that this is close to irreversible: a browser that has
+/// seen it refuses plain HTTP for a year regardless of what is served
+/// later, so shortening it does not take effect until each visitor comes
+/// back.
+async fn hsts(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        axum::http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    response
 }
 
 /// What the public page needs: the cached admission, and whether there is
@@ -583,6 +615,36 @@ mod tests {
                 assert!(cfg.is_none(), "{name}={blank:?} counted as configured");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn every_response_tells_the_browser_to_stay_on_https() {
+        // On the public page too, not only the signed-in half. Somebody who
+        // reads the landing page and comes back tomorrow must already know
+        // not to try http:// — otherwise the first request of the next
+        // visit, the one before any redirect, is still interceptable.
+        let (app, _core, _dir) = test_app().await;
+        for path in ["/", "/healthz", "/sign-in"] {
+            let res = get(&app, path).await;
+            assert_eq!(
+                res.headers()["strict-transport-security"],
+                "max-age=31536000; includeSubDomains",
+                "{path} did not assert HSTS"
+            );
+        }
+
+        // And when sign-in is not configured at all, so the whole
+        // signed-in half is absent along with its header layer.
+        let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
+        let bare = crate::router(cache, None);
+        let res = bare
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            res.headers().contains_key("strict-transport-security"),
+            "an unconfigured deployment served no HSTS"
+        );
     }
 
     #[tokio::test]

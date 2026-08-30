@@ -1500,10 +1500,11 @@ later task can use it:
     }
 ```
 
-**`open_round` assumes `scout_core::invites::open(core, code, capacity)`.**
-Confirm the real name first — `grep -n "pub async fn" crates/scout-core/src/invites.rs`
-— and if the crate only exposes round creation through `InviteCmd`, call
-`core.store().create_round(code, capacity)` from a `blocking` closure instead.
+**`open_round` calls `scout_core::invites::open_round(core, code, capacity)`.**
+That function was added during execution: `Core::store()` is `pub(crate)` and
+the only public route to creating a round was `invite()`, which speaks
+`InviteCmd` and answers in prose. It returns `Ok(false)` when the name is
+already taken.
 
 Every test that calls `test_app()` binds three values, the third being the
 TempDir: `let (app, core, _dir) = test_app().await;`

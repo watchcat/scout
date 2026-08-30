@@ -194,7 +194,79 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::response::Response;
     use tower::ServiceExt;
+
+    pub(crate) const TEST_KEY: &[u8] = b"a test session key of at least 32 bytes";
+
+    /// A router over a real Core on a throwaway database.
+    ///
+    /// A real Core rather than a fake because what these tests are for is
+    /// the join between HTTP and the store — a fake would agree with
+    /// whatever the handler believes about it.
+    ///
+    /// The TempDir is returned and must be held: dropping it deletes the
+    /// database out from under the still-open connection.
+    pub(crate) async fn test_app()
+        -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir)
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("test.duckdb");
+        // Not `Config::for_test`: that is `#[cfg(test)]`, which means it
+        // exists while scout-core tests itself and not from here.
+        // `from_lookup` is the door it goes through anyway. The cost of
+        // spelling it out is that a new required variable breaks this
+        // line — loudly, in one place, which is the right way round.
+        let cfg = scout_core::config::Config::from_lookup(|k| match k {
+            "TELEGRAM_BOT_TOKEN" => Some("123456:test-bot-token".to_string()),
+            "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
+            "MINIMAX_API_KEY" => Some("mk".to_string()),
+            "KAGI_API_KEY" => Some("kk".to_string()),
+            "SCOUT_DB_PATH" => Some(db.to_str().unwrap().to_string()),
+            _ => None,
+        })
+        .expect("the required variables are all set");
+        let core = std::sync::Arc::new(scout_core::core::Core::start(cfg, None).unwrap());
+
+        let auth = crate::AuthConfig {
+            session_key: TEST_KEY.to_vec(),
+            bot_token: "123456:test-bot-token".to_string(),
+            resend_api_key: "test-key".to_string(),
+            mail_from: "Scout <hello@example.com>".to_string(),
+            base_url: "https://example.com".to_string(),
+        };
+        let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
+        let app = crate::router(cache, Some(crate::AuthState::new(auth, core.clone())));
+        (app, core, dir)
+    }
+
+    pub(crate) fn hash(token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    pub(crate) async fn issue(core: &scout_core::core::Core, token: &str) {
+        scout_core::identity::issue_token(core, &hash(token), "a@example.com", None, 900)
+            .await.unwrap();
+    }
+
+    pub(crate) async fn get(app: &axum::Router, uri: &str) -> Response {
+        app.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await.unwrap()
+    }
+
+    pub(crate) async fn post_form(app: &axum::Router, uri: &str, form: &str) -> Response {
+        app.clone().oneshot(
+            Request::builder().method("POST").uri(uri)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_string())).unwrap()
+        ).await.unwrap()
+    }
+
+    pub(crate) async fn body_of(res: Response) -> String {
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
 
     #[tokio::test]
     async fn the_root_serves_the_page_and_an_unknown_path_does_not() {

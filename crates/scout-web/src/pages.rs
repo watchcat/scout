@@ -2,7 +2,9 @@
 //!
 //! Strings and `replace`, like `page.rs`, and for the same reason: a
 //! template engine to interpolate three values is a dependency to keep
-//! patched forever.
+//! patched forever. The cost is that escaping is a thing this file has to
+//! remember rather than a thing the engine does, so anything that came in
+//! over HTTP goes through `escape` on its way out — see `confirm`.
 
 const SHELL: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -69,6 +71,26 @@ fn shell(title: &str, body: &str) -> String {
     SHELL.replace("__TITLE__", title).replace("__BODY__", body)
 }
 
+/// The five characters that can turn text into markup.
+///
+/// Only ever applied to values that arrived over HTTP. The `t` parameter is
+/// the one that matters: anyone can put anything in it and mail the link to
+/// somebody else, and it is rendered back into an attribute.
+pub fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Ask for an address, and say what will happen to it.
 ///
 /// `csrf` is not escaped, here or in `confirm`: it is `session::mint`'s
@@ -94,18 +116,143 @@ pub fn sign_in(csrf: &str) -> String {
     )
 }
 
+/// The answer to every request for a link, whoever asked.
+///
+/// One page, one wording, no branch. Saying "we don't know that address"
+/// would answer a question the form is not supposed to answer: whether
+/// somebody has an account here.
+pub fn check_your_inbox() -> String {
+    shell(
+        "Check your inbox",
+        r#"  <h1>Check your inbox</h1>
+  <div class="card">
+    <p>If that address can sign in, a link is on its way. It works once and
+       expires in 15 minutes.</p>
+    <p class="muted">Nothing arrived? Check spam, then
+       <a href="/sign-in">try again</a>.</p>
+  </div>"#,
+    )
+}
+
+/// The page the emailed link lands on.
+///
+/// A button rather than an automatic sign-in, because a `GET` here is not
+/// necessarily a human: corporate mail scanners open every link in a
+/// message before it is delivered. Signing in on `GET` would let the
+/// scanner spend the token and leave the recipient reading "that link has
+/// expired" — a failure that happens only to people at organisations that
+/// scan, which is to say never on our own machines.
+pub fn confirm(token: &str, csrf: &str) -> String {
+    shell(
+        "Confirm sign-in",
+        &format!(
+            r#"  <h1>Confirm sign-in</h1>
+  <div class="card">
+    <p>You asked to sign in to Scout. Confirm it was you.</p>
+    <form method="post" action="/auth/email">
+      <input type="hidden" name="csrf" value="{csrf}">
+      <input type="hidden" name="t" value="{token}">
+      <button class="btn" type="submit">Confirm sign-in</button>
+    </form>
+    <p class="muted">If you did not ask for this, close the page — nothing
+       has happened to any account.</p>
+  </div>"#,
+            token = escape(token)
+        ),
+    )
+}
+
+/// Expired, unknown, or nonsense — all the same page.
+///
+/// Telling an unknown token apart from an expired one would confirm which
+/// tokens have existed, which is a slow way of asking who has signed in.
+pub fn link_dead() -> String {
+    shell(
+        "That link has expired",
+        r#"  <h1>That link has expired</h1>
+  <div class="card">
+    <p>Sign-in links last 15 minutes and work once.</p>
+    <p><a class="btn" href="/sign-in">Get a new link</a></p>
+  </div>"#,
+    )
+}
+
+/// Spent already — which usually means it worked.
+pub fn link_already_used() -> String {
+    shell(
+        "That link has been used",
+        r#"  <h1>That link has already been used</h1>
+  <div class="card">
+    <p>You may already be signed in.</p>
+    <p><a class="btn" href="/account">Go to your account</a></p>
+  </div>"#,
+    )
+}
+
+/// A form whose token we did not mint, or minted too long ago.
+///
+/// One page for a forged `POST` and for a sign-in tab left open over
+/// lunch, because they arrive identically and the honest instruction is
+/// the same: start again.
+pub fn stale_form() -> String {
+    shell(
+        "Start again",
+        r#"  <h1>That form is out of date</h1>
+  <div class="card">
+    <p>Forms expire after 15 minutes.</p>
+    <p><a class="btn" href="/sign-in">Start again</a></p>
+  </div>"#,
+    )
+}
+
+/// Something on our side broke. Says so, and says nothing else: what
+/// failed is in the log, and the log is not a page.
+pub fn sorry() -> String {
+    shell(
+        "Something went wrong",
+        r#"  <h1>Something went wrong</h1>
+  <div class="card">
+    <p>That is on us, and it has been logged.</p>
+    <p><a class="btn" href="/sign-in">Try again</a></p>
+  </div>"#,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_that_is_markup_cannot_close_the_attribute_it_sits_in() {
+        // The attack: mail somebody a link whose `t` is
+        // `"><script>…</script>`, and the confirm page runs it.
+        let page = confirm(r#""><script>alert(1)</script>"#, "c");
+        assert!(!page.contains("<script>"), "a token escaped its attribute");
+        assert!(page.contains("&quot;&gt;&lt;script&gt;"));
+    }
 
     #[test]
     fn every_page_is_whole() {
         // `replace` on a token that is not there does nothing and says
         // nothing, so a shell that lost `__BODY__` would ship as an empty
         // page with no error anywhere.
-        let page = sign_in("c");
-        assert!(!page.contains("__BODY__"), "a page rendered with no body");
-        assert!(!page.contains("__TITLE__"), "a page rendered with no title");
-        assert!(page.contains("</html>"));
+        for page in [sign_in("c"), check_your_inbox(), confirm("t", "c"), link_dead(),
+                     link_already_used(), stale_form(), sorry()] {
+            assert!(!page.contains("__BODY__"), "a page rendered with no body");
+            assert!(!page.contains("__TITLE__"), "a page rendered with no title");
+            assert!(page.contains("</html>"));
+        }
     }
+
+    #[test]
+    fn the_dead_link_page_names_neither_expiry_nor_ignorance() {
+        // Both an expired token and one that never existed render this, so
+        // the wording must not commit to either. If someone "improves" it
+        // to say "we have no record of that link", they have built the
+        // oracle this page exists to avoid.
+        let page = link_dead();
+        assert!(!page.to_lowercase().contains("no record"));
+        assert!(!page.to_lowercase().contains("unknown"));
+    }
+
 }

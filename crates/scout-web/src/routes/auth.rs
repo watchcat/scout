@@ -41,8 +41,12 @@ pub fn routes(auth: AuthState) -> Router {
         .with_state(auth)
 }
 
-async fn sign_in_page(State(auth): State<AuthState>) -> Html<String> {
-    Html(pages::sign_in(&session::csrf(&auth.cfg.session_key), widget(&auth).as_deref()))
+async fn sign_in_page(State(auth): State<AuthState>, headers: HeaderMap) -> Html<String> {
+    // Signed in and looking at `/sign-in` is unusual but allowed, and the
+    // widget's state has to name whoever is actually holding the browser
+    // or their own press of the button would be refused.
+    let widget = widget(&auth, signed_in_as(&auth, &headers));
+    Html(pages::sign_in(&session::csrf(&auth.cfg.session_key), widget.as_deref()))
 }
 
 /// Telegram's login button, when the bot could name itself at start-up.
@@ -52,13 +56,33 @@ async fn sign_in_page(State(auth): State<AuthState>) -> Html<String> {
 /// of a fact the token already decides, and the two would drift the first
 /// time a bot was renamed. `None` when `getMe` failed — a widget naming no
 /// bot draws nothing, and one naming the wrong bot signs people into it.
-pub(crate) fn widget(auth: &AuthState) -> Option<String> {
+///
+/// `account_id` is whoever is looking at the page this button is drawn on,
+/// and `None` when that is nobody.
+pub(crate) fn widget(auth: &AuthState, account_id: Option<i64>) -> Option<String> {
     let username = auth.core.return_url()?.rsplit('/').next()?;
     if username.is_empty() {
         return None;
     }
     let base = auth.cfg.base_url.trim_end_matches('/');
-    Some(pages::telegram_widget(username, &format!("{base}/auth/telegram")))
+    // `data-auth-url` is where Telegram sends the browser back to, and
+    // Telegram appends its own fields to whatever is already there — so a
+    // query parameter put here comes back on the callback, and is the only
+    // part of that request neither Telegram nor a stranger can produce.
+    //
+    // Bound to the browser this page is being drawn for. Signed out is
+    // account 0, which is what `csrf` already means by "nobody": that a
+    // state fetched from the public `/sign-in` cannot be replayed onto a
+    // request carrying somebody's session is the whole of the defence,
+    // since `/sign-in` hands one to anybody who asks.
+    //
+    // Over the `.csrf` key rather than the session key, so this can never
+    // itself be presented as a session cookie — the same reason form
+    // tokens use it. It is in fact indistinguishable from a form token for
+    // the same account, and that costs nothing: only that account's own
+    // browser ever holds either.
+    let state = session::csrf_for(&auth.cfg.session_key, account_id.unwrap_or(0));
+    Some(pages::telegram_widget(username, &format!("{base}/auth/telegram?state={state}")))
 }
 
 #[derive(Deserialize)]
@@ -254,11 +278,33 @@ async fn telegram_callback(
     headers: HeaderMap,
     Query(fields): Query<Vec<(String, String)>>,
 ) -> Response {
-    // One refusal for a forged hash, a missing field and an hour-old
-    // replay. Saying which would tell someone assembling a payload how
-    // far they had got.
-    let Some(telegram_id) = telegram_login::verify(&auth.cfg.bot_token, &fields) else {
-        return (StatusCode::BAD_REQUEST, Html(pages::telegram_refused())).into_response();
+    // Ours out of Telegram's before anything is checked. The HMAC covers
+    // every field Telegram put in the URL and none that we did, so feeding
+    // `state` to `verify` would break every genuine signature.
+    let (ours, theirs): (Vec<_>, Vec<_>) =
+        fields.into_iter().partition(|(k, _)| k == "state");
+
+    // Whose browser this is, decided before anything this request carries
+    // gets to act. A `GET` that changes something needs a token minted by
+    // us for this browser, or `SameSite=Lax` — which sends the session
+    // cookie on a top-level cross-site navigation — lets a stranger hand a
+    // signed-in visitor a payload of their own and have it attached to the
+    // visitor's account.
+    let account_id = signed_in_as(&auth, &headers);
+    let state_ok = ours
+        .iter()
+        .any(|(_, v)| session::csrf_ok_for(&auth.cfg.session_key, v, account_id.unwrap_or(0)));
+
+    // One refusal for a forged hash, a missing field, an hour-old replay
+    // and a state that is not ours. Saying which would tell someone
+    // assembling a payload how far they had got.
+    let refused =
+        || (StatusCode::BAD_REQUEST, Html(pages::telegram_refused())).into_response();
+    if !state_ok {
+        return refused();
+    }
+    let Some(telegram_id) = telegram_login::verify(&auth.cfg.bot_token, &theirs) else {
+        return refused();
     };
     let telegram_id = telegram_id.to_string();
 
@@ -267,7 +313,7 @@ async fn telegram_callback(
     // account under someone who had just asked to attach one — and if the
     // Telegram id belonged to a second account of theirs, it would strand
     // whatever was in the first.
-    let Some(account_id) = signed_in_as(&auth, &headers) else {
+    let Some(account_id) = account_id else {
         return match identity::sign_in(&auth.core, "telegram", &telegram_id).await {
             // Queued is signed in too, for the reason `confirm` gives.
             Ok(SignIn::In { account_id } | SignIn::Queued { account_id }) => {
@@ -475,38 +521,159 @@ mod tests {
             .join("&")
     }
 
+    /// The `state` out of the widget's `data-auth-url` on a rendered page.
+    ///
+    /// Read back out of the real markup, like the form tokens above, so a
+    /// page that stopped carrying one fails these tests rather than
+    /// quietly stopping being checked. This is exactly the round trip the
+    /// widget makes: Telegram appends its own fields to this URL.
+    fn widget_state(html: &str) -> String {
+        let (_, rest) = html.split_once(r#"data-auth-url=""#).unwrap_or_else(|| {
+            panic!("the page draws no widget");
+        });
+        let url = rest.split_once('"').unwrap().0;
+        url.split_once("state=")
+            .unwrap_or_else(|| panic!("the widget's auth url carries no state: {url}"))
+            .1
+            .to_string()
+    }
+
+    /// The app with a bot name, so the widget — and its state — exists.
+    async fn app_with_a_widget()
+        -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        test_app_named(Some("https://t.me/goodscoutbot")).await
+    }
+
     #[tokio::test]
     async fn a_widget_payload_that_does_not_verify_says_only_that() {
-        let (app, _core, _dir) = test_app().await;
+        let (app, _core, _dir) = app_with_a_widget().await;
         let now = chrono::Utc::now().timestamp().to_string();
+        // A real state off the real page, so what these cases exercise is
+        // the payload's own checks and not the state.
+        let state = widget_state(&body_of(get(&app, "/sign-in").await).await);
 
         // Edited after signing: the id is the field worth editing, since
         // it is the whole of who you are claiming to be.
         let forged = widget_query(&[("id", "777"), ("auth_date", &now)])
             .replace("id=777", "id=1");
-        let res = get(&app, &format!("/auth/telegram?{forged}")).await;
+        let res = get(&app, &format!("/auth/telegram?{forged}&state={state}")).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(res.headers().get("set-cookie").is_none(), "a forged payload set a cookie");
 
         // An hour-old payload is genuinely signed and still refused.
         let old = (chrono::Utc::now().timestamp() - 3600).to_string();
         let replayed = widget_query(&[("id", "777"), ("auth_date", &old)]);
-        let stale = get(&app, &format!("/auth/telegram?{replayed}")).await;
+        let stale = get(&app, &format!("/auth/telegram?{replayed}&state={state}")).await;
         assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
 
-        // Byte for byte the same page: which check failed is not a thing
-        // somebody assembling a payload gets to learn.
-        assert_eq!(body_of(res).await, body_of(stale).await);
+        // And a payload that is beyond reproach, arriving with no state at
+        // all. Which of the four checks failed is not a thing somebody
+        // assembling a request gets to learn, so this reads the same as the
+        // other two — byte for byte.
+        let genuine = widget_query(&[("id", "777"), ("auth_date", &now)]);
+        let stateless = get(&app, &format!("/auth/telegram?{genuine}")).await;
+        assert_eq!(stateless.status(), StatusCode::BAD_REQUEST);
+
+        let (a, b, c) =
+            (body_of(res).await, body_of(stale).await, body_of(stateless).await);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    /// The account behind a sign-in, admitted or queued.
+    async fn account_for(
+        core: &scout_core::core::Core,
+        kind: &'static str,
+        id: &'static str,
+    ) -> i64 {
+        match scout_core::identity::sign_in(core, kind, id).await.unwrap() {
+            scout_core::identity::SignIn::In { account_id }
+            | scout_core::identity::SignIn::Queued { account_id } => account_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_widget_payload_the_victim_never_asked_for_does_not_attach_to_them() {
+        // The takeover. `SameSite=Lax` sends the session cookie on a
+        // top-level cross-site navigation, so an attacker who has just
+        // pressed the real widget and copied their own freshly signed
+        // payload out of the address bar can — inside the sixty seconds it
+        // stays good — navigate a signed-in victim to
+        // `/auth/telegram?<that payload>`. Every check the handler had to
+        // make passed: the HMAC is Telegram's own and the session is the
+        // victim's. The attacker's Telegram id ended up attached to the
+        // victim's account, and pressing the widget again put the attacker
+        // inside it.
+        //
+        // What was missing is the only thing neither party could forge: a
+        // token minted by us, for this browser, on a page of ours.
+        let (app, core, _dir) = test_app().await;
+        let victim = account_for(&core, "email", "victim@example.com").await;
+        let cookie = crate::session::mint(TEST_KEY, victim, 86_400);
+
+        let now = chrono::Utc::now().timestamp().to_string();
+        let attacker = widget_query(&[("id", "999"), ("first_name", "Mallory"), ("auth_date", &now)]);
+
+        let res = get_with_cookie(&app, &format!("/auth/telegram?{attacker}"), &cookie).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "a payload carrying no state of ours was acted on"
+        );
+        assert!(
+            !scout_core::identity::standing(&core, victim).await.unwrap()
+                .kinds.contains(&"telegram".to_string()),
+            "a Telegram identity the victim never asked for was attached to their account"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_state_minted_for_a_signed_out_browser_is_no_use_on_a_session() {
+        // The state has to be bound to the session or it is a hoop the
+        // attacker walks through on the way to the same takeover: anybody
+        // may fetch `/sign-in`, so anybody may have a valid state.
+        let (app, core, _dir) = app_with_a_widget().await;
+        let harvested = widget_state(&body_of(get(&app, "/sign-in").await).await);
+
+        let victim = account_for(&core, "email", "victim@example.com").await;
+        let cookie = crate::session::mint(TEST_KEY, victim, 86_400);
+        let now = chrono::Utc::now().timestamp().to_string();
+        let attacker =
+            widget_query(&[("id", "999"), ("first_name", "Mallory"), ("auth_date", &now)]);
+
+        let res =
+            get_with_cookie(&app, &format!("/auth/telegram?{attacker}&state={harvested}"), &cookie)
+                .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "a state for nobody worked on a session");
+        assert!(
+            !scout_core::identity::standing(&core, victim).await.unwrap()
+                .kinds.contains(&"telegram".to_string()),
+            "a Telegram identity the victim never asked for was attached to their account"
+        );
+
+        // Not vacuous: the state off the victim's *own* account page, on
+        // the victim's own session, links. The refusal above is about
+        // which browser the state was minted for and nothing else.
+        let theirs =
+            widget_state(&body_of(get_with_cookie(&app, "/account", &cookie).await).await);
+        let asked =
+            get_with_cookie(&app, &format!("/auth/telegram?{attacker}&state={theirs}"), &cookie)
+                .await;
+        assert_eq!(asked.status(), StatusCode::SEE_OTHER);
+        assert_eq!(asked.headers()["location"], "/account?linked=yes");
     }
 
     #[tokio::test]
     async fn the_widget_signs_you_in_when_you_are_out_and_links_when_you_are_in() {
-        let (app, core, _dir) = test_app().await;
+        let (app, core, _dir) = app_with_a_widget().await;
         let now = chrono::Utc::now().timestamp().to_string();
         let payload = widget_query(&[("id", "777"), ("first_name", "Ada"), ("auth_date", &now)]);
 
-        // Signed out: a session, and the account page.
-        let res = get(&app, &format!("/auth/telegram?{payload}")).await;
+        // Signed out: a session, and the account page. The state is the
+        // one the sign-in page's own button carries, which is the whole
+        // journey a real press makes.
+        let state = widget_state(&body_of(get(&app, "/sign-in").await).await);
+        let res = get(&app, &format!("/auth/telegram?{payload}&state={state}")).await;
         assert_eq!(res.status(), StatusCode::SEE_OTHER);
         assert_eq!(res.headers()["location"], "/account");
         let set = res.headers()["set-cookie"].to_str().unwrap().to_string();
@@ -525,7 +692,12 @@ mod tests {
         assert_ne!(other, telegram_account);
         let cookie = crate::session::mint(TEST_KEY, other, 86_400);
 
-        let linked = get_with_cookie(&app, &format!("/auth/telegram?{payload}"), &cookie).await;
+        // Their own account page's button, pressed by them.
+        let state =
+            widget_state(&body_of(get_with_cookie(&app, "/account", &cookie).await).await);
+        let linked =
+            get_with_cookie(&app, &format!("/auth/telegram?{payload}&state={state}"), &cookie)
+                .await;
         assert_eq!(linked.status(), StatusCode::SEE_OTHER);
         // Taken, not linked: 777 already belongs to the account the first
         // request made. Two sign-ups stay two accounts.
@@ -547,14 +719,26 @@ mod tests {
         let page = body_of(get(&nameless, "/sign-in").await).await;
         assert!(!page.contains("telegram-widget.js"));
 
-        let (app, _core, _dir) = test_app_named(Some("https://t.me/goodscoutbot")).await;
+        let (app, _core, _dir) = app_with_a_widget().await;
         let page = body_of(get(&app, "/sign-in").await).await;
         assert!(page.contains("telegram-widget.js"), "the sign-in page has no widget");
         assert!(page.contains(r#"data-telegram-login="goodscoutbot""#));
         // Absolute, and pointing at the route that receives it: Telegram
         // refuses a relative one, and refuses it in its own popup where
         // our logs never see it.
-        assert!(page.contains(r#"data-auth-url="https://example.com/auth/telegram""#));
+        assert!(page.contains(r#"data-auth-url="https://example.com/auth/telegram?state="#));
+
+        // And the state on it names nobody, because nobody is signed in.
+        // Nothing here needs escaping — it is `mint`'s output, which is
+        // digits, dots and base64url — but a state that did would arrive
+        // back mangled, so this also says it survives the round trip.
+        let state = widget_state(&page);
+        assert!(crate::session::csrf_ok(TEST_KEY, &state), "the widget's state is not ours");
+        assert!(
+            !crate::session::csrf_ok_for(TEST_KEY, &state, 1),
+            "a signed-out state named an account"
+        );
+        assert_eq!(crate::pages::escape(&state), state, "the state needed escaping");
     }
 
     #[tokio::test]

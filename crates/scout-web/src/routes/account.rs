@@ -53,7 +53,9 @@ async fn account(
 
     // Bound to this account, so it is no use on anyone else's session.
     let csrf = session::csrf_for(&auth.cfg.session_key, account_id);
-    let widget = super::auth::widget(&auth);
+    // The button on this page is drawn for this account, and the state in
+    // its `data-auth-url` names it — see `auth::widget`.
+    let widget = super::auth::widget(&auth, Some(account_id));
 
     Html(pages::account(&pages::Account {
         member: standing.member,

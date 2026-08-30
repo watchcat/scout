@@ -30,6 +30,31 @@ TC=$(ls -d ~/.rustup/toolchains/*/bin | head -1)
 PATH="$TC:$PATH" CARGO_TARGET_DIR=/tmp/clippy-check "$TC/cargo" clippy --workspace --all-targets
 ```
 
+**Measured again on 2026-08-31, and the ground has moved.** Both `cargo`s are
+now 1.97.1 — nix's and rustup's — so the flip no longer produces mixed rlibs.
+What was left was a `target/` still holding 1.96.1 artifacts from before, which
+is not self-healing: `cargo clean` removed 220,515 files and 103.8 GB, and a
+plain `cargo build --workspace --tests` then succeeded with no toolchain
+pinning at all.
+
+The `PATH` advice above has **inverted**, so do not follow it blindly. It is
+now `cargo-clippy` that splits, and the stale one is the one the devshell puts
+first:
+
+| on `PATH` first | `/nix/store/…clippy-1.96.1/bin/cargo-clippy` | `clippy 0.1.96` — stale, gives `E0514` |
+| the working one | `/run/current-system/sw/bin/cargo-clippy` | `clippy 0.1.97 (8bab26f4f6)` — matches `rustc` |
+
+```bash
+PATH="/run/current-system/sw/bin:$PATH" cargo clippy --workspace --all-targets
+```
+
+No second target dir, no rebuild: it runs against what `cargo build` already
+produced. The lasting lesson is not any one of these three commands, all of
+which have now been wrong in turn — it is that **nothing in the repo pins a
+toolchain**, so every one of them is a snapshot of one machine on one day.
+Check `cargo-clippy --version` against `rustc --version` before believing any
+of them.
+
 A future-incompat note about `proc-macro-error2` is pre-existing and comes
 from a transitive dependency.
 

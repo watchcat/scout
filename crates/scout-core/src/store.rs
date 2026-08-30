@@ -2305,6 +2305,32 @@ CREATE TABLE segment_candidates (
     }
 
     #[test]
+    fn a_migrated_database_gets_login_tokens_too_not_just_a_fresh_one() {
+        // `test_store` opens a fresh file; production opens one at schema
+        // 5. This covers the second, which nothing else did.
+        //
+        // What it does NOT cover, established by breaking each in turn:
+        // STEP_6 does not create this table. `Store::open` runs MIGRATIONS
+        // unconditionally before applying any step, and MIGRATIONS is all
+        // CREATE TABLE IF NOT EXISTS, so the table appears on every
+        // database either way — renaming the table inside STEP_6 leaves
+        // both tests green. What STEP_6 earns is the version bump, which
+        // these tests do pin: dropping it from steps() fails both on
+        // `schema_version`. That bump is not bookkeeping either. A pending
+        // step is what makes the migration runner take a backup first, so
+        // it is the reason this deploy copies the database before touching
+        // it.
+        let (_dir, path) = legacy_db();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 6);
+        store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
+        assert_eq!(
+            store.consume_login_token("hash-migrated").unwrap(),
+            TokenOutcome::Valid { email: "m@example.com".to_string(), account_id: None }
+        );
+    }
+
+    #[test]
     fn a_token_works_once_and_says_so_afterwards() {
         let (s, _d) = test_store();
         s.issue_login_token("hash-a", "a@example.com", None, 900).unwrap();

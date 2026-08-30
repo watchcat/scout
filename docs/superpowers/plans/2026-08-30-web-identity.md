@@ -275,8 +275,15 @@ git commit -m "feat: an identity is an identity, whatever kind it is"
 ## Task 3: Migration 6 — `login_tokens`
 
 The schema exists twice: `MIGRATIONS` builds a fresh database in its finished
-shape, and `steps()` upgrades an existing one. **Both must gain the table**,
-or a fresh database and a migrated one disagree.
+shape, and `steps()` upgrades an existing one. Add the table to both — but not
+for the reason it first appears.
+
+`Store::open` runs `MIGRATIONS` unconditionally on every open, before applying
+any step, and `MIGRATIONS` is all `CREATE TABLE IF NOT EXISTS`. So the table
+lands on every database from `MIGRATIONS` alone; **`STEP_6` never creates it**.
+What the step earns is the version bump, and that is not bookkeeping: a pending
+step is what makes the migration runner copy the database before touching it.
+Without it, this change reaches production with no pre-migration backup.
 
 **Files:** Modify `crates/scout-core/src/store.rs`
 
@@ -287,8 +294,6 @@ or a fresh database and a migrated one disagree.
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
         assert_eq!(s.schema_version().unwrap(), 6);
-        // A fresh database is built by MIGRATIONS and a migrated one by
-        // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
     }
 ```

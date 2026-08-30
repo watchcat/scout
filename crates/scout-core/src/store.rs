@@ -1282,6 +1282,20 @@ impl Store {
     ///
     /// Marking consumed and reading the row happen under one mutex, so two
     /// simultaneous clicks cannot both come back `Valid`.
+    ///
+    /// `consumed_at` is computed here from `Utc::now()`, matching
+    /// `issue_login_token` and `prune_login_tokens`. It used to be written
+    /// by bare `current_timestamp`, which DuckDB resolves in the session's
+    /// local zone, while every other timestamp this table holds — and the
+    /// expiry comparison right above — is UTC-naive. Nothing reads the
+    /// value yet, only whether it is null, so the two clocks cost nothing
+    /// today; that is the whole reason to fix it now rather than after
+    /// something reads it. See `requests_today` for what this mismatch
+    /// costs once something does.
+    ///
+    /// Rust rather than `current_timestamp AT TIME ZONE 'UTC'`, which would
+    /// also be correct, because then all three writers of a timestamp in
+    /// this table are the same line and there is nothing to compare.
     pub fn consume_login_token(&self, token_hash: &str) -> Result<TokenOutcome> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1305,9 +1319,10 @@ impl Store {
         if expired {
             return Ok(TokenOutcome::Expired);
         }
+        let consumed_at = chrono::Utc::now().naive_utc();
         conn.execute(
-            "UPDATE login_tokens SET consumed_at = current_timestamp WHERE token_hash = ?",
-            params![token_hash],
+            "UPDATE login_tokens SET consumed_at = ? WHERE token_hash = ?",
+            params![consumed_at.to_string(), token_hash],
         )?;
         Ok(TokenOutcome::Valid { email, account_id })
     }
@@ -2467,6 +2482,52 @@ CREATE TABLE segment_candidates (
         // gets advice ("you may already be signed in"), not "expired".
         assert_eq!(s.consume_login_token("hash-a").unwrap(), TokenOutcome::AlreadyUsed);
         assert_eq!(s.consume_login_token("hash-never").unwrap(), TokenOutcome::Unknown);
+    }
+
+    #[test]
+    fn a_spent_token_is_stamped_on_the_clock_that_expires_it() {
+        // Every timestamp this table holds is UTC-naive, and the expiry
+        // check compares against `current_timestamp AT TIME ZONE 'UTC'`.
+        // `consumed_at` used to be written by bare `current_timestamp`,
+        // which DuckDB resolves in the session's local zone — two clocks in
+        // one table. Nothing reads the value today, only whether it is
+        // null, which is exactly why this needs a test rather than a
+        // reader to notice it.
+        let (s, _d) = test_store();
+
+        // Pinned to a zone that is not UTC, so this fails on a UTC machine
+        // as well as on a laptop. The `requests_today` version of this bug
+        // survived in production precisely because the container runs UTC
+        // and the two clocks agreed there; a test that only bites off-UTC
+        // would be a test that agrees with the machine it runs on.
+        s.conn
+            .lock()
+            .unwrap()
+            .execute("SET TimeZone = 'America/New_York'", [])
+            .expect("the session's zone can be set");
+
+        s.issue_login_token("hash-clock", "a@example.com", None, 900).unwrap();
+        assert!(matches!(
+            s.consume_login_token("hash-clock").unwrap(),
+            TokenOutcome::Valid { .. }
+        ));
+
+        let written: String = {
+            let conn = s.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT consumed_at::TEXT FROM login_tokens WHERE token_hash = ?",
+                params!["hash-clock"],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let stamped = chrono::NaiveDateTime::parse_from_str(&written, "%Y-%m-%d %H:%M:%S%.f")
+            .unwrap_or_else(|e| panic!("consumed_at reads {written:?}, which does not parse: {e}"));
+        let skew = (chrono::Utc::now().naive_utc() - stamped).num_seconds().abs();
+        assert!(
+            skew < 60,
+            "consumed_at was written {skew}s from UTC now ({written:?}) — another clock wrote it"
+        );
     }
 
     #[test]

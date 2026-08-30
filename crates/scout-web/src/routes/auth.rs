@@ -8,7 +8,7 @@
 //! `GET` on the emailed link changes nothing. And an expired token and one
 //! that never existed are told apart nowhere a visitor can see.
 
-use crate::{email, pages, session, AuthState};
+use crate::{pages, session, AuthState};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -101,7 +101,7 @@ async fn mail_a_link(auth: &AuthState, address: String) {
     }
 
     let link = format!("{}/auth/email?t={token}", auth.cfg.base_url.trim_end_matches('/'));
-    let cfg = auth.cfg.clone();
+    let mailer = auth.mailer.clone();
 
     // Sent from a task of its own, so the response does not wait on a
     // third party and does not report what it said. `email.rs` offers the
@@ -110,7 +110,7 @@ async fn mail_a_link(auth: &AuthState, address: String) {
     // "we could not send that" would answer, out loud, whether an address
     // is real. It goes to the log, where it is the operator's problem.
     tokio::spawn(async move {
-        if let Err(e) = email::send(&cfg.resend_api_key, &cfg.mail_from, &address, &link).await {
+        if let Err(e) = mailer.send(&address, &link).await {
             tracing::error!(error = %e, "could not mail a sign-in link");
         }
     });

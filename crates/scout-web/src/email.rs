@@ -14,7 +14,37 @@ pub fn body(link: &str) -> String {
 
 /// Sends the link. `Err` when Resend would not take it, so the caller can
 /// tell the visitor the truth rather than claim success into a void.
-pub async fn send(api_key: &str, from: &str, to: &str, link: &str) -> anyhow::Result<()> {
+/// Where sign-in mail goes.
+///
+/// An enum rather than a trait object because there are two cases and there
+/// is no prospect of a third: it either goes to Resend or it does not go.
+#[derive(Clone)]
+pub enum Mailer {
+    Resend { api_key: String, from: String },
+    /// Writes the link to the log instead of sending it.
+    ///
+    /// The tests use this. Without it, exercising the sign-in form fires a
+    /// real HTTPS request at api.resend.com from `cargo test` — which makes
+    /// the suite fail on a train, leak an address to a third party from a
+    /// unit test, and depend on someone else's uptime. The rest of this
+    /// repository's tests bind no socket and reach no network, and this is
+    /// how that stays true here.
+    Discard,
+}
+
+impl Mailer {
+    pub async fn send(&self, to: &str, link: &str) -> anyhow::Result<()> {
+        match self {
+            Mailer::Resend { api_key, from } => send(api_key, from, to, link).await,
+            Mailer::Discard => {
+                tracing::info!(link, "sign-in link not sent: no mailer configured");
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn send(api_key: &str, from: &str, to: &str, link: &str) -> anyhow::Result<()> {
     let res = reqwest::Client::new()
         .post("https://api.resend.com/emails")
         .bearer_auth(api_key)

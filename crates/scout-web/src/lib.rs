@@ -48,14 +48,20 @@ pub struct AuthState {
     pub core: Arc<Core>,
     pub by_address: Arc<ratelimit::Limiter>,
     pub by_ip: Arc<ratelimit::Limiter>,
+    pub mailer: email::Mailer,
 }
 
 impl AuthState {
     pub fn new(cfg: AuthConfig, core: Arc<Core>) -> Self {
         use std::time::Duration;
+        let mailer = email::Mailer::Resend {
+            api_key: cfg.resend_api_key.clone(),
+            from: cfg.mail_from.clone(),
+        };
         Self {
             cfg: Arc::new(cfg),
             core,
+            mailer,
             by_address: Arc::new(ratelimit::Limiter::new(3, Duration::from_secs(900))),
             by_ip: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(3600))),
         }
@@ -236,7 +242,14 @@ mod tests {
             base_url: "https://example.com".to_string(),
         };
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let app = crate::router(cache, Some(crate::AuthState::new(auth, core.clone())));
+        // Discard rather than Resend: with the real mailer the sign-in
+        // tests fire an HTTPS request at api.resend.com, which makes the
+        // suite depend on someone else's uptime and hands a test address
+        // to a third party. Nothing else in this repository's tests binds
+        // a socket or reaches the network.
+        let mut state = crate::AuthState::new(auth, core.clone());
+        state.mailer = crate::email::Mailer::Discard;
+        let app = crate::router(cache, Some(state));
         (app, core, dir)
     }
 

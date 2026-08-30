@@ -1293,6 +1293,30 @@ impl Store {
         Ok(TokenOutcome::Valid { email, account_id })
     }
 
+    /// Drops login tokens that stopped being worth keeping, returning how
+    /// many went. `keep_secs` is measured from a row's own expiry.
+    ///
+    /// The table is written once per sign-in *attempt*, by anyone who can
+    /// reach the form, and nothing ever deleted from it — so it grew with
+    /// every request forever, which is a table a stranger controls the size
+    /// of. Consumed rows are kept past their expiry on purpose, so that
+    /// "already used" and "expired" stay distinguishable, but that only has
+    /// to hold for as long as the advice is worth giving: someone clicking
+    /// a link from a week-old email is told it is dead either way.
+    ///
+    /// The cutoff is computed here from `Utc::now()` rather than in SQL,
+    /// matching `issue_login_token`: `expires_at` is UTC-naive and bare
+    /// `current_timestamp` is local, and mixing the two is the mismatch
+    /// documented on `requests_today` as having caused a real bug.
+    pub fn prune_login_tokens(&self, keep_secs: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(keep_secs);
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM login_tokens WHERE expires_at < ?",
+            params![cutoff.to_string()],
+        )?)
+    }
+
     /// The account behind a Telegram user, creating one the first time.
     ///
     /// Delegates to `account_for_identity` so there is one lookup-or-create
@@ -2323,6 +2347,46 @@ CREATE TABLE segment_candidates (
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
+    }
+
+    #[test]
+    fn old_login_tokens_are_pruned_and_recent_ones_are_not() {
+        // The table used to be append-only: one row per sign-in *attempt*,
+        // kept forever, written by anybody who can reach the form. That is
+        // a table whose size a stranger decides.
+        let (s, _d) = test_store();
+        const DAY: i64 = 86_400;
+
+        // Expired a day and a bit ago — past what any advice is worth.
+        s.issue_login_token("hash-ancient", "a@example.com", None, -(DAY + 900)).unwrap();
+        // Expired an hour ago. Still inside the window on purpose: this is
+        // the row that keeps "already used" and "expired" apart, and
+        // pruning it would turn a stale link into "we have never seen that
+        // token".
+        s.issue_login_token("hash-recent", "b@example.com", None, -3600).unwrap();
+        // Alive.
+        s.issue_login_token("hash-live", "c@example.com", None, 900).unwrap();
+
+        assert_eq!(s.prune_login_tokens(DAY).unwrap(), 1, "the wrong number of rows went");
+
+        assert_eq!(s.consume_login_token("hash-ancient").unwrap(), TokenOutcome::Unknown);
+        assert_eq!(s.consume_login_token("hash-recent").unwrap(), TokenOutcome::Expired);
+        assert_eq!(
+            s.consume_login_token("hash-live").unwrap(),
+            TokenOutcome::Valid { email: "c@example.com".to_string(), account_id: None }
+        );
+
+        // And the thing the window exists to protect: a row that has been
+        // spent recently survives a prune, so the second press of the same
+        // button still reads as "already used" rather than as a token that
+        // never existed.
+        s.issue_login_token("hash-spent", "d@example.com", None, 900).unwrap();
+        assert!(matches!(
+            s.consume_login_token("hash-spent").unwrap(),
+            TokenOutcome::Valid { .. }
+        ));
+        assert_eq!(s.prune_login_tokens(DAY).unwrap(), 0, "a live row was pruned");
+        assert_eq!(s.consume_login_token("hash-spent").unwrap(), TokenOutcome::AlreadyUsed);
     }
 
     #[test]

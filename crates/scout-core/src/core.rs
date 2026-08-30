@@ -366,6 +366,16 @@ impl Core {
         .await
     }
 
+    /// How long a login token is kept past its own expiry.
+    ///
+    /// Consumed rows outlive their expiry so that "already used" and
+    /// "expired" stay distinguishable, which is advice worth giving to
+    /// somebody who pressed the button twice this morning and not to
+    /// somebody opening a week-old email. A day covers the first and ends
+    /// the table's growth, which was one row per sign-in attempt, kept
+    /// forever, written by anyone who can reach the form.
+    const LOGIN_TOKEN_KEEP_SECS: i64 = 86_400;
+
     /// Housekeeping that has to happen whether or not a channel is running.
     ///
     /// Spawned by whoever owns the process — `main` today, the core binary
@@ -379,6 +389,18 @@ impl Core {
         let dir = crate::backup::dir_for(std::path::Path::new(&self.cfg.db_path));
         loop {
             ticker.tick().await;
+
+            // Every hour rather than with the nightly backup: this is the
+            // one table whose size a stranger decides, so it should not
+            // wait behind a check about something else. One DELETE over a
+            // small table, and a failure is not a reason to skip the
+            // backup below.
+            match self.prune_login_tokens().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(pruned = n, "expired login tokens dropped"),
+                Err(e) => tracing::warn!(error = %e, "could not prune login tokens"),
+            }
+
             match crate::backup::is_due(&dir) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -395,6 +417,16 @@ impl Core {
                 Err(e) => tracing::error!(error = %e, "NIGHTLY BACKUP FAILED"),
             }
         }
+    }
+
+    /// Drops login tokens a day past their expiry. Returns how many went.
+    ///
+    /// Private, and not on `identity`: the only caller is the maintenance
+    /// loop above, which is inside core. Nothing outside needs a way to
+    /// delete sign-in tokens, and a door that exists gets opened.
+    async fn prune_login_tokens(&self) -> anyhow::Result<usize> {
+        let store = self.store();
+        blocking(move || store.prune_login_tokens(Self::LOGIN_TOKEN_KEEP_SECS)).await
     }
 
     /// Turns a photo into a search description.

@@ -80,6 +80,32 @@ pub fn set_cookie(value: &str, max_age: i64) -> String {
     format!("{COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age}")
 }
 
+/// A token for a form, proving the form came from us.
+///
+/// The same construction as a session, over a key that is deliberately
+/// *not* the session key. Signed with the session key, the hidden field in
+/// every form would itself verify as a session cookie, and the page would
+/// be handing out sessions in its own HTML.
+///
+/// This is the whole of the CSRF defence: `SameSite=Lax` withholds the
+/// cookie from cross-site `POST` in current browsers, but that is a
+/// property of the browser, not of the site, and the site is what has to
+/// be right. What the token proves is that we minted it within the last
+/// fifteen minutes — not who holds it, since on the sign-in form there is
+/// no session yet to bind it to.
+pub fn csrf(key: &[u8]) -> String {
+    mint(&csrf_key(key), 0, 900)
+}
+
+/// True when this form token is one of ours and has not expired.
+pub fn csrf_ok(key: &[u8], value: &str) -> bool {
+    verify(&csrf_key(key), value).is_some()
+}
+
+fn csrf_key(key: &[u8]) -> Vec<u8> {
+    [key, b".csrf"].concat()
+}
+
 /// A `Set-Cookie` value that removes the session.
 pub fn clear_cookie() -> String {
     format!("{COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0")
@@ -121,6 +147,20 @@ mod tests {
         let theirs = mint(KEY, 1, 3600);
         assert_ne!(mine, theirs);
         assert_eq!(verify(KEY, &theirs), Some(1));
+    }
+
+    #[test]
+    fn a_form_token_is_not_a_session_and_a_session_is_not_a_form_token() {
+        // The reason the two keys differ. Were they the same, every page
+        // that renders a form would be publishing a working session cookie
+        // in its own HTML — for account 0 here, but the construction is
+        // what matters, and Task 13 mints these for a real account id.
+        let form = csrf(KEY);
+        assert!(csrf_ok(KEY, &form));
+        assert_eq!(verify(KEY, &form), None, "a form token authenticated as a session");
+
+        let cookie = mint(KEY, 42, 3600);
+        assert!(!csrf_ok(KEY, &cookie), "a session cookie passed as a form token");
     }
 
     #[test]

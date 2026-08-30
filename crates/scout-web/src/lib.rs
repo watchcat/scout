@@ -12,7 +12,9 @@
 mod cache;
 mod email;
 mod page;
+mod pages;
 mod ratelimit;
+mod routes;
 mod session;
 mod telegram_login;
 
@@ -26,15 +28,84 @@ use axum::Router;
 use scout_core::core::Core;
 use std::sync::Arc;
 
-fn router(cache: AdmissionCache) -> Router {
-    Router::new()
+/// Everything the signed-in half of the site needs. Absent when the
+/// deployment has not been given the keys for it.
+#[derive(Clone)]
+pub struct AuthConfig {
+    pub session_key: Vec<u8>,
+    pub bot_token: String,
+    pub resend_api_key: String,
+    pub mail_from: String,
+    pub base_url: String,
+}
+
+/// The router's state for the signed-in half. The limiters live here, in
+/// one place, because they are shared across requests by definition — a
+/// per-request limiter counts to one and stops nothing.
+#[derive(Clone)]
+pub struct AuthState {
+    pub cfg: Arc<AuthConfig>,
+    pub core: Arc<Core>,
+    pub by_address: Arc<ratelimit::Limiter>,
+    pub by_ip: Arc<ratelimit::Limiter>,
+}
+
+impl AuthState {
+    pub fn new(cfg: AuthConfig, core: Arc<Core>) -> Self {
+        use std::time::Duration;
+        Self {
+            cfg: Arc::new(cfg),
+            core,
+            by_address: Arc::new(ratelimit::Limiter::new(3, Duration::from_secs(900))),
+            by_ip: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(3600))),
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Reads the environment, returning `None` unless every key is present.
+    ///
+    /// All or nothing on purpose: a half-configured deployment that serves
+    /// a sign-in form and then cannot mail anything is worse than one that
+    /// does not offer sign-in at all.
+    pub fn from_env() -> Option<Self> {
+        let key = std::env::var("SCOUT_SESSION_KEY").ok()?;
+        if key.len() < 32 {
+            tracing::warn!("SCOUT_SESSION_KEY is shorter than 32 bytes; sign-in stays off");
+            return None;
+        }
+        Some(Self {
+            session_key: key.into_bytes(),
+            bot_token: std::env::var("TELEGRAM_BOT_TOKEN").ok()?,
+            resend_api_key: std::env::var("RESEND_API_KEY").ok()?,
+            mail_from: std::env::var("SCOUT_MAIL_FROM").ok()?,
+            base_url: std::env::var("SCOUT_BASE_URL").ok()?,
+        })
+    }
+}
+
+/// The public page always; the signed-in half only when there are keys for
+/// it.
+///
+/// The two halves are separate routers merged together rather than one
+/// router with one state, because they hold different things: the public
+/// page needs a cached admission and nothing else, and giving it a `Core`
+/// it does not use would be an invitation to query the database from the
+/// one path that exists to avoid doing that.
+fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
+    let public = Router::new()
         .route("/", get(index))
         // Liveness only. Deliberately says nothing about the database: a
         // health check that fails when DuckDB is busy would take the site
         // down for a reason the site does not have.
         .route("/healthz", get(|| async { "ok" }))
         .route("/icon.svg", get(icon))
-        .with_state(cache)
+        .with_state(cache);
+
+    match auth {
+        Some(auth) => public.merge(routes::auth::routes(auth)),
+        None => public,
+    }
 }
 
 async fn index(State(cache): State<AdmissionCache>) -> Html<String> {
@@ -69,6 +140,15 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
     });
     let cache = AdmissionCache::new(first);
 
+    // Said out loud at start-up rather than left to be discovered by
+    // probing: "the sign-in page 404s" is a symptom with several causes,
+    // and this line names the one it actually is.
+    let auth = AuthConfig::from_env().map(|cfg| AuthState::new(cfg, core.clone()));
+    match &auth {
+        Some(_) => tracing::info!("sign-in is configured"),
+        None => tracing::info!("sign-in is not configured; serving the public page only"),
+    }
+
     // Bind before spawning the refresher. The other order leaves a task
     // querying a single-writer database every thirty seconds, forever, for
     // a cache no reader will ever consult, on the one path where nobody is
@@ -77,7 +157,7 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
     tokio::spawn(refresh_forever(core, cache.clone()));
 
     tracing::info!(bind, "the front door is open");
-    axum::serve(listener, router(cache))
+    axum::serve(listener, router(cache, auth))
         .with_graceful_shutdown(closing_time())
         .await?;
     Ok(())
@@ -119,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn the_root_serves_the_page_and_an_unknown_path_does_not() {
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let app = router(cache);
+        let app = router(cache, None);
 
         let res = app.clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -149,5 +229,19 @@ mod tests {
             .oneshot(Request::builder().uri("/wp-login.php").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn without_a_session_key_the_auth_routes_do_not_exist() {
+        let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
+        // Unconfigured: no key, so nothing that mints a session is served.
+        // Booting with a generated default would sign sessions that a
+        // restart could not verify, and nobody would notice until someone
+        // forged one.
+        let app = router(cache, None);
+        let res = app
+            .oneshot(Request::builder().uri("/sign-in").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }

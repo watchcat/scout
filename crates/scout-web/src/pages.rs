@@ -39,6 +39,8 @@ const SHELL: &str = r#"<!DOCTYPE html>
   .btn{background:var(--blue); color:var(--base03); font:inherit; font-weight:650;
     padding:11px 22px; border-radius:5px; border:0; cursor:pointer}
   .btn:hover{background:#3196d8}
+  .btn.ghost{background:transparent; color:var(--base1); border:1px solid var(--base01)}
+  .btn.ghost:hover{background:transparent; color:var(--base2)}
   .muted{font-size:14px; color:var(--base01); margin:18px 0 0}
 </style>
 </head>
@@ -97,7 +99,18 @@ pub fn escape(s: &str) -> String {
 /// output, which is decimal digits, base64url and dots, and none of those
 /// can close an attribute. A value from the request would be a different
 /// matter, which is why `t` is escaped and this is not.
-pub fn sign_in(csrf: &str) -> String {
+pub fn sign_in(csrf: &str, widget: Option<&str>) -> String {
+    // No widget when we could not read our own Telegram name at start-up.
+    // The same choice `page.rs` makes about the join link: a login button
+    // naming the wrong bot, or no bot, is worse than one way in.
+    let telegram = match widget {
+        Some(w) => format!(
+            r#"
+  <p class="muted">Or, if you already talk to Scout on Telegram:</p>
+  <div class="card">{w}</div>"#
+        ),
+        None => String::new(),
+    };
     shell(
         "Sign in",
         &format!(
@@ -111,7 +124,138 @@ pub fn sign_in(csrf: &str) -> String {
              autofocus required placeholder="you@example.com">
       <button class="btn" type="submit">Email me a link</button>
     </form>
-  </div>"#
+  </div>{telegram}"#
+        ),
+    )
+}
+
+/// Telegram's login button, as Telegram's own script draws it.
+///
+/// The one thing this site loads from anywhere but itself, which is why
+/// `lib.rs` names `telegram.org` in the Content-Security-Policy and
+/// nothing else. `data-auth-url` has to be an absolute URL on a domain
+/// that has been given to BotFather; Telegram refuses the login otherwise,
+/// and it refuses it in its own popup where our logs never see it.
+pub fn telegram_widget(bot_username: &str, auth_url: &str) -> String {
+    format!(
+        r#"<script async src="https://telegram.org/js/telegram-widget.js?22"
+        data-telegram-login="{bot}" data-size="large"
+        data-auth-url="{auth}" data-radius="5"></script>"#,
+        bot = escape(bot_username),
+        auth = escape(auth_url),
+    )
+}
+
+/// Everything the account page shows.
+///
+/// A struct rather than six positional arguments, because five of them are
+/// `Option<&str>` and `bool` and a caller that swapped two would compile.
+pub struct Account<'a> {
+    /// In a round, as opposed to waiting for one.
+    pub member: bool,
+    /// `'email'`, `'telegram'` — the ways in that already exist.
+    pub kinds: &'a [String],
+    /// Scout's own Telegram chat, when the bot could name itself.
+    pub chat_url: Option<&'a str>,
+    /// Telegram's login button, for an account that has no Telegram
+    /// identity yet. `None` also when we cannot name the bot.
+    pub widget: Option<&'a str>,
+    /// Bound to this account — see `session::csrf_for`.
+    pub csrf: &'a str,
+    /// How the last attempt to attach an identity went. One of this
+    /// module's own sentences, chosen by the handler from a fixed set:
+    /// nothing a visitor sent ever reaches this field, which is why it is
+    /// not escaped.
+    pub note: Option<&'a str>,
+}
+
+/// Where you stand, what proves it, and how to leave.
+pub fn account(a: &Account) -> String {
+    let note = match a.note {
+        Some(n) => format!("  <p class=\"muted\">{n}</p>\n"),
+        None => String::new(),
+    };
+
+    // Membership is the whole of the standing shown. No queue position:
+    // `identity::Standing` cannot produce one — a revoked account has no
+    // waitlist row either — and a number that is sometimes a lie is worse
+    // than no number. See `SignIn::Queued`.
+    let standing = if a.member {
+        let chat = match a.chat_url {
+            Some(url) => format!(
+                "\n    <p><a class=\"btn\" href=\"{url}\">Open Scout on Telegram</a></p>",
+                url = escape(url)
+            ),
+            None => String::new(),
+        };
+        format!(
+            r#"    <p>You're in. Scout lives in Telegram today — that is where you ask it
+       things.</p>{chat}"#
+        )
+    } else {
+        r#"    <p>You're on the list. When a round opens with room in it, you're in —
+       there is nothing else to do.</p>"#
+            .to_string()
+    };
+
+    let has = |kind: &str| a.kinds.iter().any(|k| k == kind);
+    let linked: String = a
+        .kinds
+        .iter()
+        .map(|k| match k.as_str() {
+            "email" => "email".to_string(),
+            "telegram" => "Telegram".to_string(),
+            // Never rendered today, and escaped anyway: the day a third
+            // kind exists this must not be the line that has to be found.
+            other => escape(other),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Only the missing one is offered. Offering both would invite somebody
+    // to "link" the identity they are already signed in with, and be told
+    // it is already theirs — a control whose only outcome is a shrug.
+    let mut add = String::new();
+    if !has("email") {
+        add.push_str(&format!(
+            r#"  <div class="card">
+    <form method="post" action="/account/link/email">
+      <input type="hidden" name="csrf" value="{csrf}">
+      <label for="email">Add an email address</label>
+      <input type="email" id="email" name="email" autocomplete="email"
+             required placeholder="you@example.com">
+      <button class="btn" type="submit">Email me a link</button>
+    </form>
+  </div>
+"#,
+            csrf = a.csrf
+        ));
+    }
+    if !has("telegram") {
+        if let Some(widget) = a.widget {
+            add.push_str(&format!(
+                r#"  <div class="card">
+    <p>Add Telegram, and you can sign in either way.</p>
+    {widget}
+  </div>
+"#
+            ));
+        }
+    }
+
+    shell(
+        "Your account",
+        &format!(
+            r#"  <h1>Your account</h1>
+{note}  <div class="card">
+{standing}
+    <p class="muted">Signed in with {linked}.</p>
+  </div>
+{add}  <form method="post" action="/sign-out">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <button class="btn ghost" type="submit">Sign out</button>
+  </form>"#,
+            csrf = a.csrf
         ),
     )
 }
@@ -189,6 +333,23 @@ pub fn link_already_used() -> String {
     )
 }
 
+/// A widget payload that did not verify.
+///
+/// A bad HMAC, a missing field and a replay of an hour-old sign-in all
+/// render this. Naming which would tell somebody assembling a payload how
+/// far they had got, and there is nothing an honest visitor could do with
+/// the distinction anyway.
+pub fn telegram_refused() -> String {
+    shell(
+        "That sign-in did not check out",
+        r#"  <h1>That sign-in did not check out</h1>
+  <div class="card">
+    <p>Telegram sign-ins are only good for a minute. Try again.</p>
+    <p><a class="btn" href="/sign-in">Back to sign in</a></p>
+  </div>"#,
+    )
+}
+
 /// A form whose token we did not mint, or minted too long ago.
 ///
 /// One page for a forged `POST` and for a sign-in tab left open over
@@ -236,12 +397,117 @@ mod tests {
         // `replace` on a token that is not there does nothing and says
         // nothing, so a shell that lost `__BODY__` would ship as an empty
         // page with no error anywhere.
-        for page in [sign_in("c"), check_your_inbox(), confirm("t", "c"), link_dead(),
-                     link_already_used(), stale_form(), sorry()] {
+        let kinds = ["email".to_string()];
+        for page in [sign_in("c", None), sign_in("c", Some("<i>w</i>")), check_your_inbox(),
+                     confirm("t", "c"), link_dead(), link_already_used(), stale_form(),
+                     telegram_refused(), sorry(),
+                     account(&Account { member: true, kinds: &kinds, chat_url: None,
+                                        widget: None, csrf: "c", note: None })] {
             assert!(!page.contains("__BODY__"), "a page rendered with no body");
             assert!(!page.contains("__TITLE__"), "a page rendered with no title");
             assert!(page.contains("</html>"));
         }
+    }
+
+    const WIDGET: &str = r#"<script src="https://telegram.org/js/telegram-widget.js?22"></script>"#;
+
+    fn kinds(of: &[&str]) -> Vec<String> {
+        of.iter().map(|k| k.to_string()).collect()
+    }
+
+    /// A member who is in, with the bot's name known.
+    fn member(kinds: &[String]) -> Account<'_> {
+        Account {
+            member: true,
+            kinds,
+            chat_url: Some("https://t.me/scoutbot"),
+            widget: Some(WIDGET),
+            csrf: "c",
+            note: None,
+        }
+    }
+
+    #[test]
+    fn the_account_page_offers_only_the_way_in_that_is_missing() {
+        // Offering both would invite somebody to attach the identity they
+        // are signed in with and be told it is already theirs — a control
+        // whose only outcome is a shrug.
+        let email = kinds(&["email"]);
+        let page = account(&member(&email));
+        assert!(page.contains("telegram-widget.js"), "no way to add Telegram");
+        assert!(
+            !page.contains("/account/link/email"),
+            "offered to add the address they signed in with"
+        );
+
+        let both = kinds(&["email", "telegram"]);
+        let page = account(&member(&both));
+        assert!(!page.contains("telegram-widget.js"));
+        assert!(!page.contains("/account/link/email"));
+
+        let telegram = kinds(&["telegram"]);
+        let page = account(&member(&telegram));
+        assert!(page.contains(r#"action="/account/link/email""#), "no way to add an address");
+        assert!(!page.contains("telegram-widget.js"));
+
+        // And no widget at all when the bot could not name itself, rather
+        // than a button that signs people into nothing.
+        let page = account(&Account { widget: None, ..member(&email) });
+        assert!(!page.contains("telegram-widget.js"));
+    }
+
+    #[test]
+    fn a_member_is_shown_the_chat_and_someone_queued_is_not() {
+        // Telegram is where Scout is actually used until there is a web
+        // chat, so a member who is not told that has been signed in to
+        // nothing they can see.
+        let email = kinds(&["email"]);
+        let page = account(&member(&email));
+        assert!(page.contains("https://t.me/scoutbot"), "a member was not shown the chat");
+
+        // Queued: no link, because there is nothing behind it for them
+        // yet. And no queue position, which `Standing` cannot produce.
+        let waiting = account(&Account { member: false, ..member(&email) });
+        assert!(!waiting.contains("t.me"), "someone still queued was pointed at the bot");
+        for leak in ["position", "ahead of you", "seats"] {
+            assert!(!waiting.contains(leak), "the page invented `{leak}`");
+        }
+
+        // And with no bot name — `getMe` failed at start-up — a member is
+        // told where they stand and offered no link at all, rather than a
+        // link to nowhere.
+        let nameless = account(&Account { chat_url: None, ..member(&email) });
+        assert!(!nameless.contains("t.me"));
+        assert!(nameless.contains("You're in"));
+    }
+
+    #[test]
+    fn both_forms_on_the_account_page_carry_the_session_bound_token() {
+        // The token is minted by `session::csrf_for` for this account.
+        // A form that shipped without one would be refused, which someone
+        // would notice; a form that shipped with the *anonymous* token
+        // would work, and that is the hole binding closes.
+        let telegram = kinds(&["telegram"]);
+        let page = account(&Account { csrf: "TOKEN", ..member(&telegram) });
+        assert_eq!(
+            page.matches(r#"name="csrf" value="TOKEN""#).count(),
+            2,
+            "sign out and add-an-address must both carry the form token"
+        );
+    }
+
+    #[test]
+    fn a_link_outcome_is_a_sentence_of_ours_and_the_bot_name_cannot_escape() {
+        // `note` is chosen by the handler from a fixed set, never echoed
+        // from the query string — but the widget's bot name comes from
+        // `getMe`, which is a value someone else controls.
+        let email = kinds(&["email"]);
+        let page = account(&Account { note: Some("Telegram is linked."), ..member(&email) });
+        assert!(page.contains("Telegram is linked."));
+
+        let widget = telegram_widget(r#""><script>alert(1)</script>"#, "https://example.com/a");
+        assert!(!widget.contains("<script>alert"), "a bot name escaped its attribute");
+        assert!(widget.contains("&quot;&gt;&lt;script&gt;"));
     }
 
     #[test]

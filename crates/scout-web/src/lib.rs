@@ -109,7 +109,9 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         .with_state(cache);
 
     match auth {
-        Some(auth) => public.merge(routes::auth::routes(auth)),
+        Some(auth) => public
+            .merge(routes::auth::routes(auth.clone()))
+            .merge(routes::account::routes(auth)),
         None => public,
     }
 }
@@ -216,6 +218,59 @@ mod tests {
     pub(crate) async fn test_app()
         -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir)
     {
+        // `None`, like a deployment whose `getMe` failed: no bot name, so
+        // no login widget and no Telegram link. The tests that need one
+        // ask for it, so that the harness everything else shares does not
+        // quietly assert a fact about Telegram.
+        build_app(None, crate::email::Mailer::Discard).await
+    }
+
+    /// `test_app`, with the bot's own address that `getMe` would have
+    /// returned.
+    pub(crate) async fn test_app_named(
+        return_url: Option<&str>,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        build_app(return_url, crate::email::Mailer::Discard).await
+    }
+
+    /// Every link the app would have mailed, in order.
+    pub(crate) type Sent = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// `test_app`, keeping the mail instead of throwing it away.
+    ///
+    /// For the one thing that cannot be seen from outside: whether the
+    /// token behind a link was filed against an account. The link is the
+    /// only place that token ever appears, so a test that wants to spend
+    /// one has to read the message.
+    pub(crate) async fn test_app_keeping_mail()
+        -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir, Sent)
+    {
+        let sent: Sent = Default::default();
+        let (app, core, dir) = build_app(None, crate::email::Mailer::Kept(sent.clone())).await;
+        (app, core, dir, sent)
+    }
+
+    /// The link that was mailed, once the task that mails it has run.
+    ///
+    /// `mail_a_link` spawns, so the response comes back before the message
+    /// does. Yielding until it appears rather than sleeping: on a
+    /// current-thread runtime the spawned task runs at the next yield, and
+    /// a fixed sleep would be both slower and still a guess.
+    pub(crate) async fn mailed_link(sent: &Sent) -> String {
+        for _ in 0..1000 {
+            let first = sent.lock().unwrap().first().cloned();
+            if let Some(link) = first {
+                return link;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("nothing was mailed");
+    }
+
+    async fn build_app(
+        return_url: Option<&str>,
+        mailer: crate::email::Mailer,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("test.duckdb");
         // Not `Config::for_test`: that is `#[cfg(test)]`, which means it
@@ -232,7 +287,9 @@ mod tests {
             _ => None,
         })
         .expect("the required variables are all set");
-        let core = std::sync::Arc::new(scout_core::core::Core::start(cfg, None).unwrap());
+        let core = std::sync::Arc::new(
+            scout_core::core::Core::start(cfg, return_url.map(str::to_string)).unwrap(),
+        );
 
         let auth = crate::AuthConfig {
             session_key: TEST_KEY.to_vec(),
@@ -242,13 +299,13 @@ mod tests {
             base_url: "https://example.com".to_string(),
         };
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        // Discard rather than Resend: with the real mailer the sign-in
-        // tests fire an HTTPS request at api.resend.com, which makes the
-        // suite depend on someone else's uptime and hands a test address
-        // to a third party. Nothing else in this repository's tests binds
-        // a socket or reaches the network.
+        // Never Resend: with the real mailer the sign-in tests fire an
+        // HTTPS request at api.resend.com, which makes the suite depend on
+        // someone else's uptime and hands a test address to a third party.
+        // Nothing else in this repository's tests binds a socket or
+        // reaches the network.
         let mut state = crate::AuthState::new(auth, core.clone());
-        state.mailer = crate::email::Mailer::Discard;
+        state.mailer = mailer;
         let app = crate::router(cache, Some(state));
         (app, core, dir)
     }
@@ -274,6 +331,56 @@ mod tests {
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(Body::from(form.to_string())).unwrap()
         ).await.unwrap()
+    }
+
+    /// The same `GET`, carrying a session cookie.
+    ///
+    /// Sent as a real `Cookie:` header rather than by handing the handler
+    /// an account id, so `read_cookie` and `verify` are on the path these
+    /// tests exercise — a handler that stopped reading the cookie would
+    /// otherwise still pass them.
+    pub(crate) async fn get_with_cookie(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+    ) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("cookie", format!("{}={session}", crate::session::COOKIE))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn post_with_cookie(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+        form: &str,
+    ) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("cookie", format!("{}={session}", crate::session::COOKIE))
+                    .body(Body::from(form.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn open_round(core: &scout_core::core::Core, code: &str, capacity: i64) {
+        assert!(
+            scout_core::invites::open_round(core, code, capacity).await.unwrap(),
+            "the round `{code}` was already open"
+        );
     }
 
     pub(crate) async fn body_of(res: Response) -> String {

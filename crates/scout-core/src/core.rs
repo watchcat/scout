@@ -180,6 +180,21 @@ impl Core {
         self.deps.store.active_members()
     }
 
+    /// The bot's own address, or `None` when `getMe` could not be read at
+    /// start-up.
+    ///
+    /// Handed out because the web pages need Scout's Telegram name twice:
+    /// the login widget has to say which bot it signs people into, and a
+    /// member's account page offers the chat as the way to actually use
+    /// Scout until there is a web one. Read from here rather than
+    /// configured a second time, so it cannot drift from the token — the
+    /// same reason `start` asks Telegram for it instead of taking it from
+    /// the environment. `None` means no widget and no link, not a guess:
+    /// see `admission`, which makes the same choice about the join link.
+    pub fn return_url(&self) -> Option<&str> {
+        self.deps.return_url.as_deref()
+    }
+
     /// For the start-up log line.
     pub fn schema_version(&self) -> anyhow::Result<i64> {
         self.deps.store.schema_version()

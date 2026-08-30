@@ -39,29 +39,38 @@ pub fn verify(bot_token: &str, fields: &[(String, String)]) -> Option<i64> {
     rest.iter().find(|(k, _)| k == "id")?.1.parse().ok()
 }
 
+/// Builds a payload signed the way Telegram signs one, so a test exercises
+/// the real algorithm rather than our own idea of it.
+///
+/// Outside the test module because the route that receives these payloads
+/// is tested in another file, and a second implementation of the signing
+/// would be a second thing that can be wrong in the same way.
+#[cfg(test)]
+pub(crate) fn signed_like_telegram(
+    bot_token: &str,
+    fields: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> =
+        fields.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let check = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n");
+    let secret = Sha256::digest(bot_token.as_bytes());
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
+    mac.update(check.as_bytes());
+    let hash =
+        mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    pairs.push(("hash".to_string(), hash));
+    pairs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const TOKEN: &str = "123456:test-bot-token";
 
-    /// Builds a payload signed the way Telegram signs one, so the test
-    /// exercises the real algorithm rather than our own idea of it.
     fn signed(fields: &[(&str, &str)]) -> Vec<(String, String)> {
-        use hmac::{Hmac, KeyInit, Mac};
-        use sha2::{Digest, Sha256};
-        let mut pairs: Vec<(String, String)> =
-            fields.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        let check = pairs.iter().map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>().join("\n");
-        let secret = Sha256::digest(TOKEN.as_bytes());
-        let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
-        mac.update(check.as_bytes());
-        let hash = mac.finalize().into_bytes().iter()
-            .map(|b| format!("{b:02x}")).collect::<String>();
-        pairs.push(("hash".to_string(), hash));
-        pairs
+        signed_like_telegram(TOKEN, fields)
     }
 
     fn now() -> i64 { chrono::Utc::now().timestamp() }

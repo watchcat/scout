@@ -90,16 +90,38 @@ pub fn set_cookie(value: &str, max_age: i64) -> String {
 /// This is the whole of the CSRF defence: `SameSite=Lax` withholds the
 /// cookie from cross-site `POST` in current browsers, but that is a
 /// property of the browser, not of the site, and the site is what has to
-/// be right. What the token proves is that we minted it within the last
-/// fifteen minutes — not who holds it, since on the sign-in form there is
-/// no session yet to bind it to.
+/// be right.
+///
+/// For the forms that come before a session there is nobody to bind the
+/// token to, so account 0 stands in and all the token proves is that we
+/// minted it within the last fifteen minutes. That is the most those
+/// forms can be given: `/sign-in` is served to strangers, so a token from
+/// it is by construction obtainable by anyone.
 pub fn csrf(key: &[u8]) -> String {
-    mint(&csrf_key(key), 0, 900)
+    csrf_for(key, 0)
 }
 
-/// True when this form token is one of ours and has not expired.
+/// True when this form token is one of ours, unexpired, and belongs to no
+/// session — an account-bound token is not accepted here.
 pub fn csrf_ok(key: &[u8], value: &str) -> bool {
-    verify(&csrf_key(key), value).is_some()
+    csrf_ok_for(key, value, 0)
+}
+
+/// A form token for a page that a particular account is looking at.
+///
+/// The account id is inside what the signature covers, so the token is
+/// only good for that account. Without this, an attacker who fetched
+/// `/sign-in` — which anyone may do — would hold a token that passes the
+/// check on `/sign-out` and `/account/link/email` for *everybody*, and the
+/// hidden field would be proving only that Scout exists.
+pub fn csrf_for(key: &[u8], account_id: i64) -> String {
+    mint(&csrf_key(key), account_id, 900)
+}
+
+/// True when this form token is ours, unexpired, and was minted for this
+/// account.
+pub fn csrf_ok_for(key: &[u8], value: &str, account_id: i64) -> bool {
+    verify(&csrf_key(key), value) == Some(account_id)
 }
 
 fn csrf_key(key: &[u8]) -> Vec<u8> {
@@ -161,6 +183,27 @@ mod tests {
 
         let cookie = mint(KEY, 42, 3600);
         assert!(!csrf_ok(KEY, &cookie), "a session cookie passed as a form token");
+    }
+
+    #[test]
+    fn a_form_token_for_one_account_is_no_use_on_another() {
+        // The attack: fetch `/sign-in`, which is public, take the hidden
+        // field, and POST it to `/sign-out` or `/account/link/email` on
+        // behalf of whoever follows your link. An unbound token passes
+        // both, so the check has to name the session it was minted for.
+        let mine = csrf_for(KEY, 42);
+        assert!(csrf_ok_for(KEY, &mine, 42));
+        assert!(!csrf_ok_for(KEY, &mine, 7), "one account's form token worked for another");
+
+        // The pre-sign-in token is bound to nobody, and that is as far as
+        // it reaches: it must not stand in for a session's.
+        let anonymous = csrf(KEY);
+        assert!(csrf_ok(KEY, &anonymous));
+        assert!(!csrf_ok_for(KEY, &anonymous, 42), "an anonymous token passed for account 42");
+        assert!(!csrf_ok(KEY, &mine), "a bound token passed where none was expected");
+
+        // And a bound token is still not a session cookie.
+        assert_eq!(verify(KEY, &mine), None, "a form token authenticated as a session");
     }
 
     #[test]

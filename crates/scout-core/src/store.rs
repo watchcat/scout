@@ -1192,6 +1192,35 @@ impl Store {
         Ok(LinkOutcome::Linked)
     }
 
+    /// Which ways of proving this account exist — `'email'`, `'telegram'`.
+    ///
+    /// The kinds and never the external ids. What asks is a page offering
+    /// to attach whichever method is missing, and it needs to know that a
+    /// method exists, not what it is. Handing back the address as well
+    /// would put a value somebody chose into a page, and then escaping it
+    /// correctly would be everyone's problem forever.
+    pub fn identity_kinds(&self, account_id: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT kind FROM identities WHERE account_id = ? ORDER BY kind ASC")?;
+        let rows = stmt.query_map(params![account_id], |row| row.get(0))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Whether this account holds a seat that has not been revoked.
+    ///
+    /// The same question `claim_seat` asks first, as a read. A page that
+    /// reported standing by calling `claim_seat` would seat a queued
+    /// visitor the moment they looked at it, and spend a seat on a `GET`.
+    pub fn is_member(&self, account_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT revoked_at IS NULL FROM members WHERE account_id = ?")?;
+        let standing: Option<bool> =
+            stmt.query_map(params![account_id], |row| row.get(0))?.next().transpose()?;
+        Ok(standing.unwrap_or(false))
+    }
+
     /// Records a token that has been mailed out.
     ///
     /// `token_hash` is a hash of the value in the link, never the value:

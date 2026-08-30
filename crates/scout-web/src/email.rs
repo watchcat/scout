@@ -30,6 +30,15 @@ pub enum Mailer {
     /// repository's tests bind no socket and reach no network, and this is
     /// how that stays true here.
     Discard,
+    /// Keeps the link instead of sending it, so a test can follow it.
+    ///
+    /// `#[cfg(test)]`, so it does not exist in a built binary: a mailer
+    /// that silently kept every message in memory is not something anyone
+    /// should be able to configure by accident. The link is the only place
+    /// a login token ever appears in full, so a test that wants to spend
+    /// one has no other way to read it.
+    #[cfg(test)]
+    Kept(std::sync::Arc<std::sync::Mutex<Vec<String>>>),
 }
 
 impl Mailer {
@@ -38,6 +47,11 @@ impl Mailer {
             Mailer::Resend { api_key, from } => send(api_key, from, to, link).await,
             Mailer::Discard => {
                 tracing::info!(link, "sign-in link not sent: no mailer configured");
+                Ok(())
+            }
+            #[cfg(test)]
+            Mailer::Kept(sent) => {
+                sent.lock().unwrap().push(link.to_string());
                 Ok(())
             }
         }

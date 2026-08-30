@@ -57,6 +57,32 @@ pub async fn sign_in(core: &Core, kind: &'static str, external_id: &str) -> anyh
     .await
 }
 
+/// Where an account stands, and how it can prove itself.
+///
+/// Both facts in one struct because one page wants both and each is a turn
+/// of the store's mutex. `Queued` is the absence of a seat rather than a
+/// waitlist row, for the reason `SignIn::Queued` gives: a revoked account
+/// has no seat and no row either, and neither this type nor a page built
+/// on it may claim a queue position it cannot produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Standing {
+    pub member: bool,
+    /// `'email'`, `'telegram'` — sorted, so a page renders the same way twice.
+    pub kinds: Vec<String>,
+}
+
+/// Reads an account without changing it.
+pub async fn standing(core: &Core, account_id: i64) -> anyhow::Result<Standing> {
+    let store = core.store();
+    blocking(move || {
+        Ok(Standing {
+            member: store.is_member(account_id)?,
+            kinds: store.identity_kinds(account_id)?,
+        })
+    })
+    .await
+}
+
 /// Attaches a second way of proving the same account.
 pub async fn link(
     core: &Core,
@@ -172,6 +198,51 @@ mod tests {
             core.store().account_for_identity("telegram", "12345").unwrap(),
             account_id
         );
+    }
+
+    #[tokio::test]
+    async fn standing_reads_an_account_without_seating_anyone() {
+        let (core, _dir) = test_core().await;
+        core.store().create_round("autumn", 1).unwrap();
+        let queued = core.store().account_for_identity("email", "waiting@example.com").unwrap();
+
+        // Queued: an account with an identity and no seat.
+        let before = standing(&core, queued).await.unwrap();
+        assert!(!before.member);
+        assert_eq!(before.kinds, vec!["email".to_string()]);
+
+        // And reading it did not take the round's one seat — the failure
+        // this is a read rather than a `claim_seat` to avoid.
+        let SignIn::In { account_id } = sign_in(&core, "email", "first@example.com").await.unwrap()
+        else {
+            panic!("the round had a seat and nobody should have spent it");
+        };
+
+        let after = standing(&core, account_id).await.unwrap();
+        assert!(after.member);
+
+        // Two identities come back sorted, so the page does not shuffle.
+        link(&core, account_id, "telegram", "777").await.unwrap();
+        assert_eq!(
+            standing(&core, account_id).await.unwrap().kinds,
+            vec!["email".to_string(), "telegram".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_member_is_not_a_member() {
+        // Revocation that a page still reads as membership would be
+        // theatre, the same way `claim_seat` treats it.
+        let (core, _dir) = test_core().await;
+        core.store().create_round("autumn", 5).unwrap();
+        let SignIn::In { account_id } = sign_in(&core, "email", "gone@example.com").await.unwrap()
+        else {
+            panic!("expected In");
+        };
+        assert!(standing(&core, account_id).await.unwrap().member);
+
+        core.store().revoke(account_id).unwrap();
+        assert!(!standing(&core, account_id).await.unwrap().member);
     }
 
     #[tokio::test]

@@ -1,20 +1,23 @@
-//! Signing in by email: ask for an address, then spend the link it gets.
+//! Two ways in: an emailed link, and Telegram's login widget.
 //!
 //! Mounted only when `AuthConfig::from_env` found every key, so every
 //! handler here can assume it has somewhere to mail a link to.
 //!
-//! Three rules run through all of it. The answer to "email me a link" is
+//! Four rules run through all of it. The answer to "email me a link" is
 //! one page with one wording, whoever asked and whatever they typed. The
-//! `GET` on the emailed link changes nothing. And an expired token and one
-//! that never existed are told apart nowhere a visitor can see.
+//! `GET` on the emailed link changes nothing. An expired token and one
+//! that never existed are told apart nowhere a visitor can see. And a
+//! widget payload that does not verify is refused without saying which of
+//! the three checks it failed.
 
-use crate::{pages, session, AuthState};
+use super::{see_other, signed_in_as, sorry, stale_form};
+use crate::{pages, session, telegram_login, AuthState};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
-use scout_core::identity::{self, SignIn, TokenOutcome};
+use scout_core::identity::{self, LinkOutcome, SignIn, TokenOutcome};
 use serde::Deserialize;
 
 /// How long a mailed link is worth anything. Stated in the mail, so the
@@ -34,11 +37,28 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/sign-in", get(sign_in_page))
         .route("/sign-in/email", post(request_link))
         .route("/auth/email", get(confirm_page).post(confirm))
+        .route("/auth/telegram", get(telegram_callback))
         .with_state(auth)
 }
 
 async fn sign_in_page(State(auth): State<AuthState>) -> Html<String> {
-    Html(pages::sign_in(&session::csrf(&auth.cfg.session_key)))
+    Html(pages::sign_in(&session::csrf(&auth.cfg.session_key), widget(&auth).as_deref()))
+}
+
+/// Telegram's login button, when the bot could name itself at start-up.
+///
+/// The username comes off `return_url`, which is `getMe`'s answer, rather
+/// than from a variable of its own: a configured username is a second copy
+/// of a fact the token already decides, and the two would drift the first
+/// time a bot was renamed. `None` when `getMe` failed — a widget naming no
+/// bot draws nothing, and one naming the wrong bot signs people into it.
+pub(crate) fn widget(auth: &AuthState) -> Option<String> {
+    let username = auth.core.return_url()?.rsplit('/').next()?;
+    if username.is_empty() {
+        return None;
+    }
+    let base = auth.cfg.base_url.trim_end_matches('/');
+    Some(pages::telegram_widget(username, &format!("{base}/auth/telegram")))
 }
 
 #[derive(Deserialize)]
@@ -62,30 +82,48 @@ async fn request_link(
     if !session::csrf_ok(&auth.cfg.session_key, &form.csrf) {
         return stale_form();
     }
+    // `None`: nobody is signed in, so the token this issues is a way in
+    // rather than an address being attached to an account.
+    offer_a_link(&auth, &headers, &form.email, None).await
+}
 
+/// The half of "email me a link" that is the same whether or not there is
+/// a session — shared with `/account/link/email`, which differs only in
+/// passing an account id.
+///
+/// Nothing below the first line branches on whether the address is known:
+/// a token is issued and mailed for a stranger exactly as for a member,
+/// because signing in is also how signing up happens. The only reasons not
+/// to send are the shape of the address and the rate limits, and none of
+/// them changes what the visitor is told.
+pub(crate) async fn offer_a_link(
+    auth: &AuthState,
+    headers: &HeaderMap,
+    typed: &str,
+    account_id: Option<i64>,
+) -> Response {
     // Trimmed and lower-cased before it becomes an identity, so that
     // `Ada@example.com` and `ada@example.com` are one account rather than
     // two that cannot see each other.
-    let address = form.email.trim().to_lowercase();
+    let address = typed.trim().to_lowercase();
 
-    // Nothing below this line branches on whether the address is known: a
-    // token is issued and mailed for a stranger exactly as for a member,
-    // because signing in is also how signing up happens. The only reasons
-    // not to send are the shape of the address and the rate limits, and
-    // neither of them changes what the visitor is told.
-    let ip = client_ip(&headers);
+    // The limits count the signed-in request too. A session is not a
+    // reason to be trusted with somebody else's inbox: `link` will refuse
+    // an address that is not theirs, but the mail has already gone out by
+    // then, and that mail is the thing being rationed.
+    let ip = client_ip(headers);
     let send = deliverable(&address)
         && auth.by_address.allow(&address)
         && ip.as_deref().is_none_or(|ip| auth.by_ip.allow(ip));
     if send {
-        mail_a_link(&auth, address).await;
+        mail_a_link(auth, address, account_id).await;
     }
 
     Html(pages::check_your_inbox()).into_response()
 }
 
 /// Files a token and hands the mail off to a task of its own.
-async fn mail_a_link(auth: &AuthState, address: String) {
+async fn mail_a_link(auth: &AuthState, address: String, account_id: Option<i64>) {
     // 32 random bytes, hex. Stored as its SHA-256 and never otherwise:
     // a leaked `login_tokens` table then holds nothing anyone can spend,
     // for the same reason a password file holds hashes.
@@ -94,7 +132,7 @@ async fn mail_a_link(auth: &AuthState, address: String) {
     let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     if let Err(e) = identity::issue_token(
-        &auth.core, &hashed(&token), &address, None, LINK_TTL_SECS,
+        &auth.core, &hashed(&token), &address, account_id, LINK_TTL_SECS,
     ).await {
         tracing::error!(error = %e, "could not file a login token");
         return;
@@ -192,6 +230,59 @@ async fn confirm(State(auth): State<AuthState>, Form(form): Form<Confirmed>) -> 
     }
 }
 
+/// Where Telegram's widget sends the browser back to.
+///
+/// `Vec<(String, String)>` rather than a struct: the payload's fields
+/// depend on what the person has set on their Telegram profile —
+/// `username`, `last_name` and `photo_url` are each sometimes absent —
+/// and the signature covers every field that *is* there. Naming them in a
+/// struct would mean a new optional field, added by Telegram, silently
+/// dropping out of the string we check the HMAC over, and every sign-in
+/// failing at once.
+async fn telegram_callback(
+    State(auth): State<AuthState>,
+    headers: HeaderMap,
+    Query(fields): Query<Vec<(String, String)>>,
+) -> Response {
+    // One refusal for a forged hash, a missing field and an hour-old
+    // replay. Saying which would tell someone assembling a payload how
+    // far they had got.
+    let Some(telegram_id) = telegram_login::verify(&auth.cfg.bot_token, &fields) else {
+        return (StatusCode::BAD_REQUEST, Html(pages::telegram_refused())).into_response();
+    };
+    let telegram_id = telegram_id.to_string();
+
+    // A session already in hand turns this into "also let me in this way"
+    // rather than "let me in". Signing in instead would quietly swap the
+    // account under someone who had just asked to attach one — and if the
+    // Telegram id belonged to a second account of theirs, it would strand
+    // whatever was in the first.
+    let Some(account_id) = signed_in_as(&auth, &headers) else {
+        return match identity::sign_in(&auth.core, "telegram", &telegram_id).await {
+            // Queued is signed in too, for the reason `confirm` gives.
+            Ok(SignIn::In { account_id } | SignIn::Queued { account_id }) => {
+                signed_in(&auth, account_id)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "could not sign in a Telegram id");
+                sorry()
+            }
+        };
+    };
+
+    match identity::link(&auth.core, account_id, "telegram", &telegram_id).await {
+        Ok(LinkOutcome::Linked) => see_other("/account?linked=yes"),
+        Ok(LinkOutcome::AlreadyYours) => see_other("/account?linked=already"),
+        // Refused, and the identity has not moved: `link_identity` is what
+        // guarantees that two sign-ups stay two accounts.
+        Ok(LinkOutcome::TakenByAnother) => see_other("/account?linked=taken"),
+        Err(e) => {
+            tracing::error!(error = %e, "could not link a Telegram id");
+            sorry()
+        }
+    }
+}
+
 /// Sets the session cookie and sends them on.
 fn signed_in(auth: &AuthState, account_id: i64) -> Response {
     let cookie = session::mint(&auth.cfg.session_key, account_id, SESSION_TTL_SECS);
@@ -203,23 +294,6 @@ fn signed_in(auth: &AuthState, account_id: i64) -> Response {
         ],
     )
         .into_response()
-}
-
-fn see_other(to: &str) -> Response {
-    (StatusCode::SEE_OTHER, [(header::LOCATION, to.to_string())]).into_response()
-}
-
-/// A form token that was never ours, or has expired under a page left open.
-fn stale_form() -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Html(pages::stale_form()),
-    )
-        .into_response()
-}
-
-fn sorry() -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, Html(pages::sorry())).into_response()
 }
 
 /// The hex SHA-256 of a token: what the database sees.
@@ -380,6 +454,97 @@ mod tests {
         let second = post_form(&app, "/auth/email", &format!("csrf={csrf}&t=tok-button")).await;
         assert_eq!(second.status(), StatusCode::OK);
         assert!(body_of(second).await.contains("already been used"));
+    }
+
+    /// A widget payload as a query string, signed with the test bot token.
+    fn widget_query(fields: &[(&str, &str)]) -> String {
+        crate::telegram_login::signed_like_telegram("123456:test-bot-token", fields)
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    #[tokio::test]
+    async fn a_widget_payload_that_does_not_verify_says_only_that() {
+        let (app, _core, _dir) = test_app().await;
+        let now = chrono::Utc::now().timestamp().to_string();
+
+        // Edited after signing: the id is the field worth editing, since
+        // it is the whole of who you are claiming to be.
+        let forged = widget_query(&[("id", "777"), ("auth_date", &now)])
+            .replace("id=777", "id=1");
+        let res = get(&app, &format!("/auth/telegram?{forged}")).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(res.headers().get("set-cookie").is_none(), "a forged payload set a cookie");
+
+        // An hour-old payload is genuinely signed and still refused.
+        let old = (chrono::Utc::now().timestamp() - 3600).to_string();
+        let replayed = widget_query(&[("id", "777"), ("auth_date", &old)]);
+        let stale = get(&app, &format!("/auth/telegram?{replayed}")).await;
+        assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
+
+        // Byte for byte the same page: which check failed is not a thing
+        // somebody assembling a payload gets to learn.
+        assert_eq!(body_of(res).await, body_of(stale).await);
+    }
+
+    #[tokio::test]
+    async fn the_widget_signs_you_in_when_you_are_out_and_links_when_you_are_in() {
+        let (app, core, _dir) = test_app().await;
+        let now = chrono::Utc::now().timestamp().to_string();
+        let payload = widget_query(&[("id", "777"), ("first_name", "Ada"), ("auth_date", &now)]);
+
+        // Signed out: a session, and the account page.
+        let res = get(&app, &format!("/auth/telegram?{payload}")).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(res.headers()["location"], "/account");
+        let set = res.headers()["set-cookie"].to_str().unwrap().to_string();
+        let value = set.split_once('=').unwrap().1.split_once(';').unwrap().0;
+        let telegram_account = crate::session::verify(TEST_KEY, value)
+            .expect("the cookie it set does not verify as a session");
+
+        // Signed in as somebody else: a link, no new session, and the
+        // account under the cookie is the one that changes.
+        let other = scout_core::identity::sign_in(&core, "email", "other@example.com")
+            .await
+            .unwrap();
+        let scout_core::identity::SignIn::Queued { account_id: other } = other else {
+            panic!("no round is open, so this should have queued");
+        };
+        assert_ne!(other, telegram_account);
+        let cookie = crate::session::mint(TEST_KEY, other, 86_400);
+
+        let linked = get_with_cookie(&app, &format!("/auth/telegram?{payload}"), &cookie).await;
+        assert_eq!(linked.status(), StatusCode::SEE_OTHER);
+        // Taken, not linked: 777 already belongs to the account the first
+        // request made. Two sign-ups stay two accounts.
+        assert_eq!(linked.headers()["location"], "/account?linked=taken");
+        assert!(linked.headers().get("set-cookie").is_none(), "linking minted a session");
+        assert!(
+            !scout_core::identity::standing(&core, other).await.unwrap()
+                .kinds.contains(&"telegram".to_string()),
+            "an identity owned by someone else was moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_login_widget_appears_only_when_the_bot_can_name_itself() {
+        // `getMe` failed at start-up: no username, so no widget. A button
+        // naming no bot draws nothing and one naming the wrong bot signs
+        // people into it, so the honest answer is the email form alone.
+        let (nameless, _core, _dir) = test_app().await;
+        let page = body_of(get(&nameless, "/sign-in").await).await;
+        assert!(!page.contains("telegram-widget.js"));
+
+        let (app, _core, _dir) = test_app_named(Some("https://t.me/goodscoutbot")).await;
+        let page = body_of(get(&app, "/sign-in").await).await;
+        assert!(page.contains("telegram-widget.js"), "the sign-in page has no widget");
+        assert!(page.contains(r#"data-telegram-login="goodscoutbot""#));
+        // Absolute, and pointing at the route that receives it: Telegram
+        // refuses a relative one, and refuses it in its own popup where
+        // our logs never see it.
+        assert!(page.contains(r#"data-auth-url="https://example.com/auth/telegram""#));
     }
 
     #[tokio::test]

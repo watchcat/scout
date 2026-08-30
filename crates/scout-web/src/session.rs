@@ -11,7 +11,20 @@ use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
-pub const COOKIE: &str = "scout_session";
+/// The `__Host-` prefix is not decoration. Without it, a foothold on any
+/// sibling or parent domain — a stray subdomain, a takeover of one — can
+/// set `scout_session` for `.goodscout.fyi`, and a host-scoped cookie loses
+/// to a domain-scoped one of the same name in the jar the browser sends.
+/// That is session fixation: the visitor arrives already signed into
+/// somebody else's account and attaches their address to it. The prefix
+/// makes the name unwritable by anyone but this exact host over HTTPS.
+///
+/// The browser enforces what the prefix promises and does so by refusing to
+/// store the cookie at all: it must be `Secure`, it must say `Path=/`, and
+/// it must not name a `Domain`. `set_cookie` and `clear_cookie` satisfy all
+/// three, and a test asserts it, because getting one wrong does not weaken
+/// the session — it silently stops there being one.
+pub const COOKIE: &str = "__Host-scout_session";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -239,10 +252,32 @@ mod tests {
 
     #[test]
     fn a_cookie_header_yields_only_the_named_cookie() {
-        let header = "other=1; scout_session=abc; another=2";
-        assert_eq!(read_cookie(header, "scout_session"), Some("abc".to_string()));
-        assert_eq!(read_cookie(header, "absent"), None);
-        // A prefix must not match: `xscout_session` is not `scout_session`.
-        assert_eq!(read_cookie("xscout_session=abc", "scout_session"), None);
+        let header = format!("other=1; {COOKIE}=abc; another=2");
+        assert_eq!(read_cookie(&header, COOKIE), Some("abc".to_string()));
+        assert_eq!(read_cookie(&header, "absent"), None);
+        // A prefix must not match: `x__Host-scout_session` is not ours.
+        assert_eq!(read_cookie(&format!("x{COOKIE}=abc"), COOKIE), None);
+        // Nor does the unprefixed name we used to answer to. Anyone can
+        // write that one from a neighbouring host, which is the whole
+        // reason for the prefix; reading it would hand the shadowing
+        // cookie back the win the prefix just took away.
+        assert_eq!(read_cookie("scout_session=abc", COOKIE), None);
+    }
+
+    #[test]
+    fn the_cookie_carries_the_host_prefix_and_everything_the_prefix_requires() {
+        // All three conditions, on both headers. The browser's answer to a
+        // `__Host-` cookie that gets one of them wrong is to drop it on the
+        // floor, so the failure this catches looks like "signing in does
+        // nothing" rather than like a weakened session. `clear_cookie` is
+        // checked too: a deletion the browser refuses to store leaves the
+        // old cookie in place, and sign-out stops working.
+        assert!(COOKIE.starts_with("__Host-"), "the cookie lost its prefix");
+        for header in [set_cookie("abc", 3600), clear_cookie()] {
+            assert!(header.starts_with(&format!("{COOKIE}=")), "wrong name: {header}");
+            assert!(header.contains("; Secure"), "__Host- requires Secure: {header}");
+            assert!(header.contains("; Path=/;"), "__Host- requires Path=/: {header}");
+            assert!(!header.contains("Domain"), "__Host- forbids Domain: {header}");
+        }
     }
 }

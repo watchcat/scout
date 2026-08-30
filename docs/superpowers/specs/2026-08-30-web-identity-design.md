@@ -127,8 +127,16 @@ network.
 
 ## Sessions
 
-Cookie `scout_session`: `account_id`, expiry, nonce, HMAC-SHA256 over all
-three. `HttpOnly`, `Secure`, `SameSite=Lax`, 30 days.
+Cookie `__Host-scout_session`: `account_id`, expiry, nonce, HMAC-SHA256 over
+all three. `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain`,
+30 days.
+
+The `__Host-` prefix is what stops a neighbouring host writing this name. It
+was added after the W2 review; the cookie shipped without it, so the rename
+signed out everyone holding an old one — one person, who signed in again.
+The prefix's three conditions are not optional decoration: a browser that
+sees `__Host-` without `Secure`, without `Path=/`, or with a `Domain` refuses
+to store the cookie at all.
 
 `Lax` rather than `Strict` is deliberate: the Telegram widget returns through
 a cross-site navigation, and `Strict` would drop the cookie at exactly that

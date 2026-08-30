@@ -236,6 +236,12 @@ mod tests {
         assert_eq!(out.headers()["location"], "/");
         let set = out.headers()["set-cookie"].to_str().unwrap();
         assert!(set.contains("Max-Age=0"), "sign out did not clear the cookie");
+        // The name on the wire, not just the constant: a browser refuses a
+        // `__Host-` cookie that is missing any of `Secure`, `Path=/` or a
+        // `Domain`, and refusing this one means the session survives sign
+        // out. `session.rs` pins the three attributes; this pins that the
+        // header a real response emits is the prefixed one.
+        assert!(set.starts_with("__Host-scout_session="), "the emitted cookie lost its prefix");
     }
 
     #[tokio::test]

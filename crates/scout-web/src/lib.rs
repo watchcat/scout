@@ -54,9 +54,12 @@ pub struct AuthState {
 impl AuthState {
     pub fn new(cfg: AuthConfig, core: Arc<Core>) -> Self {
         use std::time::Duration;
+        // One HTTP client for the process, not one per message. See
+        // `email::client`.
         let mailer = email::Mailer::Resend {
             api_key: cfg.resend_api_key.clone(),
             from: cfg.mail_from.clone(),
+            http: email::client(),
         };
         Self {
             cfg: Arc::new(cfg),

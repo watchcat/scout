@@ -20,7 +20,14 @@ pub fn body(link: &str) -> String {
 /// is no prospect of a third: it either goes to Resend or it does not go.
 #[derive(Clone)]
 pub enum Mailer {
-    Resend { api_key: String, from: String },
+    /// Carries its own HTTP client, built once at start-up.
+    ///
+    /// Not built per message: a `reqwest::Client` owns a TLS
+    /// configuration and a connection pool, so one per email meant a full
+    /// handshake for every message and a pool that was thrown away before
+    /// it could be reused. Cloning this is cheap — the client is a handle
+    /// to shared state, which is what makes the pool a pool.
+    Resend { api_key: String, from: String, http: reqwest::Client },
     /// Writes the link to the log instead of sending it.
     ///
     /// The tests use this. Without it, exercising the sign-in form fires a
@@ -44,7 +51,7 @@ pub enum Mailer {
 impl Mailer {
     pub async fn send(&self, to: &str, link: &str) -> anyhow::Result<()> {
         match self {
-            Mailer::Resend { api_key, from } => send(api_key, from, to, link).await,
+            Mailer::Resend { api_key, from, http } => send(http, api_key, from, to, link).await,
             Mailer::Discard => {
                 tracing::info!(link, "sign-in link not sent: no mailer configured");
                 Ok(())
@@ -58,8 +65,36 @@ impl Mailer {
     }
 }
 
-async fn send(api_key: &str, from: &str, to: &str, link: &str) -> anyhow::Result<()> {
-    let res = reqwest::Client::new()
+/// How long one message may take before the task carrying it gives up.
+///
+/// Every accepted request spawns a task that lives until this call
+/// returns; with no timeout at all, a Resend that accepts connections and
+/// then says nothing leaves one task and one connection per request
+/// hanging for as long as the process lives. Fifteen seconds is far longer
+/// than a healthy call and short enough to be a bound.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The client the `Resend` mailer holds, built once.
+///
+/// Panics if a TLS backend cannot be initialised, which is what
+/// `reqwest::Client::new` does too. If that fails, nothing this deployment
+/// does with mail can ever work, and saying so at start-up beats every
+/// sign-in failing quietly inside a spawned task.
+pub fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(SEND_TIMEOUT)
+        .build()
+        .expect("a TLS-capable HTTP client")
+}
+
+async fn send(
+    http: &reqwest::Client,
+    api_key: &str,
+    from: &str,
+    to: &str,
+    link: &str,
+) -> anyhow::Result<()> {
+    let res = http
         .post("https://api.resend.com/emails")
         .bearer_auth(api_key)
         .json(&serde_json::json!({

@@ -259,6 +259,12 @@ async fn confirm(State(auth): State<AuthState>, Form(form): Form<Confirmed>) -> 
                 // Refused, and the identity has not moved: `link_identity`
                 // is what guarantees that two sign-ups stay two accounts.
                 Ok(LinkOutcome::TakenByAnother) => see_other("/account?linked=email-taken"),
+                // One of the two held nothing, so they were the same person
+                // twice and are now one account. The session has to follow
+                // the survivor, which may not be the account that asked.
+                Ok(LinkOutcome::Merged { account_id }) => {
+                    signed_in_at(&auth, account_id, "/account?linked=merged")
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "could not link an address");
                     sorry()
@@ -343,6 +349,12 @@ async fn telegram_callback(
         // Refused, and the identity has not moved: `link_identity` is what
         // guarantees that two sign-ups stay two accounts.
         Ok(LinkOutcome::TakenByAnother) => see_other("/account?linked=taken"),
+        // See `confirm`: the survivor is usually the Telegram account,
+        // because the session asking is the empty one the email sign-in
+        // minted. `signed_in_at` is what stops the old cookie outliving it.
+        Ok(LinkOutcome::Merged { account_id: survivor }) => {
+            signed_in_at(&auth, survivor, "/account?linked=merged")
+        }
         Err(e) => {
             tracing::error!(error = %e, "could not link a Telegram id");
             sorry()
@@ -352,11 +364,22 @@ async fn telegram_callback(
 
 /// Sets the session cookie and sends them on.
 fn signed_in(auth: &AuthState, account_id: i64) -> Response {
+    signed_in_at(auth, account_id, "/account")
+}
+
+/// The same, landing somewhere that says what just happened.
+///
+/// A merge is the one path that re-issues a session it did not create. The
+/// account that survives is usually *not* the one the visitor was signed in
+/// as — signing in by email mints an empty account, so the person who then
+/// adds Telegram is the empty side — and leaving the old cookie in place
+/// would leave them holding a session for an account that no longer exists.
+fn signed_in_at(auth: &AuthState, account_id: i64, location: &str) -> Response {
     let cookie = session::mint(&auth.cfg.session_key, account_id, SESSION_TTL_SECS);
     (
         StatusCode::SEE_OTHER,
         [
-            (header::LOCATION, "/account".to_string()),
+            (header::LOCATION, location.to_string()),
             (header::SET_COOKIE, session::set_cookie(&cookie, SESSION_TTL_SECS)),
         ],
     )
@@ -844,7 +867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_widget_signs_you_in_when_you_are_out_and_links_when_you_are_in() {
+    async fn the_widget_signs_you_in_when_you_are_out_and_refuses_an_identity_in_use() {
         let (app, core, _dir) = app_with_a_widget().await;
         let now = chrono::Utc::now().timestamp().to_string();
         let payload = widget_query(&[("id", "777"), ("first_name", "Ada"), ("auth_date", &now)]);
@@ -861,33 +884,89 @@ mod tests {
         let telegram_account = crate::session::verify(TEST_KEY, value)
             .expect("the cookie it set does not verify as a session");
 
-        // Signed in as somebody else: a link, no new session, and the
-        // account under the cookie is the one that changes.
-        let other = scout_core::identity::sign_in(&core, "email", "other@example.com")
-            .await
-            .unwrap();
-        let scout_core::identity::SignIn::Queued { account_id: other } = other else {
-            panic!("no round is open, so this should have queued");
-        };
+        // Both accounts have to have been *used*, or they are two empty
+        // halves of one person and linking merges them instead. That is
+        // the case the next test covers; this one is the genuine clash.
+        core.log_request(777, "text").await.unwrap();
+        core.log_request(888, "text").await.unwrap();
+        let other = scout_core::identity::sign_in(&core, "telegram", "888").await.unwrap();
+        let (scout_core::identity::SignIn::In { account_id: other }
+        | scout_core::identity::SignIn::Queued { account_id: other }) = other;
         assert_ne!(other, telegram_account);
         let cookie = crate::session::mint(TEST_KEY, other, 86_400);
 
-        // Their own account page's button, pressed by them.
-        let state =
-            widget_state(&body_of(get_with_cookie(&app, "/account", &cookie).await).await);
+        // Minted rather than read off the page: `/account` draws no widget
+        // for an account that already has Telegram (see `pages::account`),
+        // so this account has no button to press. The state is the same
+        // value that button would have carried, which is what the callback
+        // actually checks.
+        let state = crate::session::csrf_for(TEST_KEY, other);
         let linked =
             get_with_cookie(&app, &format!("/auth/telegram?{payload}&state={state}"), &cookie)
                 .await;
         assert_eq!(linked.status(), StatusCode::SEE_OTHER);
-        // Taken, not linked: 777 already belongs to the account the first
-        // request made. Two sign-ups stay two accounts.
+        // Taken, not linked: 777 already belongs to an account that has
+        // used Scout. Two real accounts stay two accounts.
         assert_eq!(linked.headers()["location"], "/account?linked=taken");
         assert!(linked.headers().get("set-cookie").is_none(), "linking minted a session");
-        assert!(
-            !scout_core::identity::standing(&core, other).await.unwrap()
-                .kinds.contains(&"telegram".to_string()),
+        // `other` is itself a Telegram account, so "has a telegram kind"
+        // proves nothing here. What must hold is that 777 still answers to
+        // the account it already belonged to.
+        assert_eq!(
+            account_for(&core, "telegram", "777").await,
+            telegram_account,
             "an identity owned by someone else was moved"
         );
+    }
+
+    #[tokio::test]
+    async fn pressing_telegram_from_an_email_account_with_nothing_in_it_merges_the_two() {
+        // The journey every early user takes: they already use Scout on
+        // Telegram, they sign in on the web with an address Scout has never
+        // seen — which mints a second, empty account — and then press the
+        // Telegram button from it.
+        let (app, core, _dir) = app_with_a_widget().await;
+        core.log_request(777, "text").await.unwrap();
+        let telegram_account =
+            account_for(&core, "telegram", "777").await;
+
+        // Signed in by email, as the empty account that sign-in minted.
+        let web = account_for(&core, "email", "ada@example.com").await;
+        assert_ne!(web, telegram_account);
+        let cookie = crate::session::mint(TEST_KEY, web, 86_400);
+
+        let now = chrono::Utc::now().timestamp().to_string();
+        let payload = widget_query(&[("id", "777"), ("first_name", "Ada"), ("auth_date", &now)]);
+        let state =
+            widget_state(&body_of(get_with_cookie(&app, "/account", &cookie).await).await);
+        let merged =
+            get_with_cookie(&app, &format!("/auth/telegram?{payload}&state={state}"), &cookie)
+                .await;
+
+        assert_eq!(merged.status(), StatusCode::SEE_OTHER);
+        assert_eq!(merged.headers()["location"], "/account?linked=merged");
+
+        // The session must have moved to the surviving account. Without
+        // this the visitor walks away holding a cookie for an account that
+        // has just been deleted, and every later page reads as a stranger.
+        let set = merged
+            .headers()
+            .get("set-cookie")
+            .expect("a merge that changed the account did not re-issue the session")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let value = set.split_once('=').unwrap().1.split_once(';').unwrap().0;
+        let now_signed_in_as = crate::session::verify(TEST_KEY, value)
+            .expect("the re-issued cookie does not verify");
+        assert_eq!(
+            now_signed_in_as, telegram_account,
+            "the session followed the empty account rather than the surviving one"
+        );
+
+        // And that one account answers to both.
+        let standing = scout_core::identity::standing(&core, telegram_account).await.unwrap();
+        assert_eq!(standing.kinds, vec!["email".to_string(), "telegram".to_string()]);
     }
 
     #[tokio::test]

@@ -188,6 +188,11 @@ mod tests {
         let (core, _dir) = test_core().await;
         let account_id = core.store().account_for_identity("email", "owner@example.com").unwrap();
         let other_id = core.store().account_for_identity("email", "other@example.com").unwrap();
+        // Both have used Scout, so neither may be absorbed into the other.
+        // Two empty accounts are one person twice and would merge — see
+        // `store`'s tests for that path.
+        core.store().log_request(account_id, "text").unwrap();
+        core.store().log_request(other_id, "text").unwrap();
 
         let outcome = link(&core, account_id, "telegram", "12345").await.unwrap();
         assert_eq!(outcome, LinkOutcome::Linked);

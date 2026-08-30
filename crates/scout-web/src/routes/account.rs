@@ -100,6 +100,13 @@ fn note(linked: &str) -> Option<&'static str> {
             "That address belongs to a different Scout account, \
              so nothing was changed.",
         ),
+        // One sentence for both directions. Which account survived is not
+        // worth explaining — from the outside nothing was lost, and naming
+        // an id would only invite the question of what happened to it.
+        "merged" => Some(
+            "Those were two accounts for the same person, so they are one \
+             account now. Everything is here.",
+        ),
         _ => None,
     }
 }
@@ -362,8 +369,16 @@ mod tests {
         // redirect leaves a member on a page with no address on it, no
         // sentence saying why, and a link that will not work twice.
         let (app, core, _dir, sent) = test_app_keeping_mail().await;
-        // The address already proves somebody else's account.
-        identity::sign_in(&core, "email", "taken@example.com").await.unwrap();
+        // The address already proves somebody else's account, and both
+        // accounts have been used — two accounts that each hold something
+        // stay two. Were either empty this would merge instead, which is
+        // the whole point of the rule and so has to be excluded by name.
+        core.log_request(888, "text").await.unwrap();
+        let (SignIn::In { account_id: stranger } | SignIn::Queued { account_id: stranger }) =
+            identity::sign_in(&core, "telegram", "888").await.unwrap();
+        identity::link(&core, stranger, "email", "taken@example.com").await.unwrap();
+
+        core.log_request(777, "text").await.unwrap();
         let SignIn::Queued { account_id } =
             identity::sign_in(&core, "telegram", "777").await.unwrap()
         else {

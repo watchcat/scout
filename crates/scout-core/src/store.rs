@@ -324,10 +324,21 @@ pub enum Claim {
 pub enum LinkOutcome {
     Linked,
     AlreadyYours,
-    /// Somebody else proved this identity first. Never resolved by moving
-    /// it: two sign-ups stay two accounts until a human decides otherwise,
-    /// and a wrong merge cannot be undone.
+    /// Somebody else proved this identity first, and both accounts have
+    /// been used. Never resolved by moving it: a wrong merge cannot be
+    /// undone, so two accounts that both hold something stay two until a
+    /// human decides otherwise.
     TakenByAnother,
+    /// The identity belonged to another account, but one of the two was
+    /// empty — no purchases, reminders, facts, requests, trips or
+    /// conversations — so the empty one was absorbed and deleted.
+    ///
+    /// Carries the account that survived, which is *not* always the one
+    /// that asked: signing in by email mints a fresh account, so the
+    /// person who then adds Telegram is usually the empty side, and the
+    /// account they end up in is the one their history is already under.
+    /// A caller holding a session must re-issue it for this id.
+    Merged { account_id: i64 },
 }
 
 /// What a magic link turned out to be worth.
@@ -771,6 +782,111 @@ fn backup_connection(conn: &Connection, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether an account holds anything its owner would miss.
+///
+/// Bookkeeping is deliberately not counted. A seat, a waitlist place, a
+/// display name, a delivery address and a pending login token are all things
+/// Scout wrote *about* someone rather than things they made, and an account
+/// can hold every one of them without its owner having asked Scout a single
+/// question. Counting them would make the ordinary case permanently
+/// unmergeable: signing in by email mints a fresh account, which immediately
+/// takes a seat, and that seat would then be the proof it could never be
+/// merged away.
+fn is_empty_account(conn: &Connection, account_id: i64) -> Result<bool> {
+    // Six `?` rather than a repeated `?1`: DuckDB's own placeholder styles
+    // are `?` and `$n`, and mixing them is how this reads wrong later.
+    let held: i64 = conn.query_row(
+        "SELECT (SELECT count(*) FROM purchases     WHERE account_id = ?)
+              + (SELECT count(*) FROM reminders     WHERE account_id = ?)
+              + (SELECT count(*) FROM user_facts    WHERE account_id = ?)
+              + (SELECT count(*) FROM request_log   WHERE account_id = ?)
+              + (SELECT count(*) FROM trips         WHERE account_id = ?)
+              + (SELECT count(*) FROM conversations WHERE account_id = ?)",
+        params![account_id, account_id, account_id, account_id, account_id, account_id],
+        |r| r.get(0),
+    )?;
+    Ok(held == 0)
+}
+
+/// Moves everything `absorbed` can prove or be reached by onto `survivor`,
+/// then deletes it.
+///
+/// This is the only operation in the store that deletes an account, so it
+/// re-checks the precondition its caller has already checked. What that
+/// second check buys is narrow and worth being exact about: it catches a
+/// caller that picked the direction backwards — `link_identity` chooses
+/// which of the two survives across three branches — and it would not catch
+/// `is_empty_account` being wrong, since it asks the same question of the
+/// same tables. The predicate is the thing to change carefully.
+fn merge_accounts(conn: &Connection, absorbed: i64, survivor: i64) -> Result<()> {
+    if absorbed == survivor {
+        return Ok(());
+    }
+    if !is_empty_account(conn, absorbed)? {
+        anyhow::bail!("refusing to merge account {absorbed} away: it holds content");
+    }
+
+    conn.execute_batch("BEGIN")?;
+    match move_rows(conn, absorbed, survivor) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// The body of a merge, split out so the caller can roll back one call.
+fn move_rows(conn: &Connection, absorbed: i64, survivor: i64) -> Result<()> {
+    // `deliveries` is keyed per channel, so only channels the survivor has
+    // no address for can move. Where both have one the survivor's is kept:
+    // it belongs to the account with the history, so it is the address its
+    // owner is actually reachable at.
+    conn.execute(
+        "DELETE FROM deliveries WHERE account_id = ?
+         AND channel IN (SELECT channel FROM deliveries WHERE account_id = ?)",
+        params![absorbed, survivor],
+    )?;
+
+    // One row per account each, so a row can only move where the survivor
+    // has none of its own. Dropping the absorbed `members` row when the
+    // survivor is already inside hands its seat back to the round, because
+    // `rounds` counts member rows — and unlike a revoke, which keeps the row
+    // so moderation cannot quietly reopen a round, that seat was never a
+    // person.
+    for table in ["users", "members", "waitlist"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE account_id = ?
+                 AND EXISTS (SELECT 1 FROM {table} kept WHERE kept.account_id = ?)"
+            ),
+            params![absorbed, survivor],
+        )?;
+    }
+
+    for table in ["deliveries", "users", "members", "waitlist", "login_tokens", "identities"] {
+        conn.execute(
+            &format!("UPDATE {table} SET account_id = ? WHERE account_id = ?"),
+            params![survivor, absorbed],
+        )?;
+    }
+
+    // Somebody inside must not also be queued, or the next announce chases a
+    // member. `claim_seat` keeps the same invariant when it admits.
+    conn.execute(
+        "DELETE FROM waitlist WHERE account_id = ?
+         AND EXISTS (SELECT 1 FROM members m WHERE m.account_id = ? AND m.revoked_at IS NULL)",
+        params![survivor, survivor],
+    )?;
+
+    conn.execute("DELETE FROM accounts WHERE id = ?", params![absorbed])?;
+    Ok(())
+}
+
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path.as_ref())?;
@@ -1180,16 +1296,35 @@ impl Store {
         let owner: Option<i64> =
             stmt.query_map(params![kind, external_id], |r| r.get(0))?.next().transpose()?;
         drop(stmt);
-        match owner {
+        let other = match owner {
             Some(id) if id == account_id => return Ok(LinkOutcome::AlreadyYours),
-            Some(_) => return Ok(LinkOutcome::TakenByAnother),
-            None => {}
-        }
-        conn.execute(
-            "INSERT INTO identities (account_id, kind, external_id) VALUES (?, ?, ?)",
-            params![account_id, kind, external_id],
-        )?;
-        Ok(LinkOutcome::Linked)
+            Some(id) => id,
+            None => {
+                conn.execute(
+                    "INSERT INTO identities (account_id, kind, external_id) VALUES (?, ?, ?)",
+                    params![account_id, kind, external_id],
+                )?;
+                return Ok(LinkOutcome::Linked);
+            }
+        };
+
+        // Two accounts, one identity. The side holding nothing is absorbed
+        // into the side holding something, and if both hold something they
+        // stay apart — a merge cannot be undone, so it is only ever done
+        // where there is provably nothing to lose.
+        let (survivor, absorbed) =
+            match (is_empty_account(&conn, account_id)?, is_empty_account(&conn, other)?) {
+                (false, false) => return Ok(LinkOutcome::TakenByAnother),
+                (false, true) => (account_id, other),
+                (true, false) => (other, account_id),
+                // Both empty, so neither has a claim on the other. Keeping
+                // the older id makes the result the same whichever of the
+                // two asked, rather than a coin toss decided by who clicked.
+                (true, true) => (account_id.min(other), account_id.max(other)),
+            };
+
+        merge_accounts(&conn, absorbed, survivor)?;
+        Ok(LinkOutcome::Merged { account_id: survivor })
     }
 
     /// Which ways of proving this account exist — `'email'`, `'telegram'`.
@@ -2355,6 +2490,12 @@ CREATE TABLE segment_candidates (
         let (s, _d) = test_store();
         let owner = s.account_for_identity("telegram", "11").unwrap();
         let other = s.account_for_identity("email", "b@example.com").unwrap();
+        // Both have asked Scout something, so both are real people and
+        // neither may be absorbed. Without this the two are empty and the
+        // merge rule applies instead — which is the point of the rule, and
+        // the reason this test has to say which case it is testing.
+        s.log_request(owner, "text").unwrap();
+        s.log_request(other, "text").unwrap();
 
         assert_eq!(
             s.link_identity(other, "telegram", "11").unwrap(),
@@ -2372,6 +2513,132 @@ CREATE TABLE segment_candidates (
             LinkOutcome::Linked
         );
         assert_eq!(s.account_for_identity("email", "c@example.com").unwrap(), owner);
+    }
+
+    #[test]
+    fn signing_in_by_email_then_adding_telegram_lands_in_the_account_with_the_history() {
+        // The shape every early user hits: they already talk to Scout on
+        // Telegram, they sign in on the web with an address Scout has never
+        // seen, and that mints a second account which takes a second seat.
+        let (s, _d) = test_store();
+        s.create_round("autumn", 5).unwrap();
+
+        let telegram = s.account_for_identity("telegram", "11").unwrap();
+        s.claim_seat(telegram, "autumn").unwrap();
+        s.log_request(telegram, "text").unwrap();
+
+        let web = s.account_for_identity("email", "a@example.com").unwrap();
+        assert_eq!(s.claim_seat(web, "autumn").unwrap(), Claim::Admitted);
+        assert_eq!(s.rounds().unwrap()[0].used, 2, "the second sign-in did not take a seat");
+
+        // Pressing the Telegram button from that session.
+        assert_eq!(
+            s.link_identity(web, "telegram", "11").unwrap(),
+            LinkOutcome::Merged { account_id: telegram },
+            "the survivor must be the side holding the history, not the side that asked"
+        );
+
+        // Both ways in now reach the one account.
+        assert_eq!(s.account_for_identity("telegram", "11").unwrap(), telegram);
+        assert_eq!(s.account_for_identity("email", "a@example.com").unwrap(), telegram);
+        assert_eq!(
+            s.identity_kinds(telegram).unwrap(),
+            vec!["email".to_string(), "telegram".to_string()]
+        );
+        assert!(s.is_member(telegram).unwrap());
+
+        let survived: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM accounts WHERE id = ?", params![web], |r| r.get(0))
+            .unwrap();
+        assert_eq!(survived, 0, "the absorbed account row outlived the merge");
+
+        // And the seat that phantom account was holding is back in the round.
+        assert_eq!(s.rounds().unwrap()[0].used, 1, "the phantom seat was not returned");
+    }
+
+    #[test]
+    fn an_empty_account_on_the_other_side_is_absorbed_into_mine() {
+        // The mirror direction: I am the one with the history, and the
+        // address I am adding was signed in with once and never used.
+        let (s, _d) = test_store();
+        let mine = s.account_for_identity("telegram", "11").unwrap();
+        s.log_request(mine, "text").unwrap();
+        let stray = s.account_for_identity("email", "a@example.com").unwrap();
+
+        assert_eq!(
+            s.link_identity(mine, "email", "a@example.com").unwrap(),
+            LinkOutcome::Merged { account_id: mine }
+        );
+
+        let survived: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM accounts WHERE id = ?", params![stray], |r| r.get(0))
+            .unwrap();
+        assert_eq!(survived, 0);
+    }
+
+    #[test]
+    fn two_empty_accounts_merge_to_the_older_id_whichever_one_asks() {
+        // Nothing distinguishes them, so the answer must not depend on who
+        // clicked — otherwise the same pair merges two different ways.
+        let (a, _da) = test_store();
+        let older = a.account_for_identity("telegram", "11").unwrap();
+        let newer = a.account_for_identity("email", "x@example.com").unwrap();
+        assert!(older < newer, "test assumes ids are handed out in order");
+        assert_eq!(
+            a.link_identity(newer, "telegram", "11").unwrap(),
+            LinkOutcome::Merged { account_id: older }
+        );
+
+        let (b, _db) = test_store();
+        let older = b.account_for_identity("telegram", "11").unwrap();
+        b.account_for_identity("email", "x@example.com").unwrap();
+        assert_eq!(
+            b.link_identity(older, "email", "x@example.com").unwrap(),
+            LinkOutcome::Merged { account_id: older }
+        );
+    }
+
+    #[test]
+    fn a_merge_refuses_to_absorb_an_account_that_holds_something() {
+        // The guard that stands between a bug in the caller and somebody
+        // losing their purchases. `link_identity` already checks; this is
+        // the second check, tested on its own.
+        let (s, _d) = test_store();
+        let keeper = s.account_for_identity("telegram", "11").unwrap();
+        let busy = s.account_for_identity("email", "a@example.com").unwrap();
+        s.log_request(busy, "text").unwrap();
+
+        let conn = s.conn.lock().unwrap();
+        let err = merge_accounts(&conn, busy, keeper).unwrap_err();
+        assert!(err.to_string().contains("holds content"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_merged_account_that_is_inside_is_not_left_on_the_waitlist() {
+        // The absorbed side was queued and the survivor is a member, so the
+        // waitlist row moves and must then be dropped: an announce that
+        // chases a member is the failure this prevents.
+        let (s, _d) = test_store();
+        s.create_round("autumn", 1).unwrap();
+        let member = s.account_for_identity("telegram", "11").unwrap();
+        s.claim_seat(member, "autumn").unwrap();
+        s.log_request(member, "text").unwrap();
+
+        let web = s.account_for_identity("email", "a@example.com").unwrap();
+        assert_eq!(s.claim_seat(web, "autumn").unwrap(), Claim::NoRoom);
+        assert_eq!(s.waiting_count().unwrap(), 1);
+
+        assert_eq!(
+            s.link_identity(web, "telegram", "11").unwrap(),
+            LinkOutcome::Merged { account_id: member }
+        );
+        assert_eq!(s.waiting_count().unwrap(), 0, "a member was left queued");
     }
 
     #[test]

@@ -17,17 +17,21 @@
 **Run tests with `--workspace`.** The root manifest is not virtual, so a bare
 `cargo test` tests only the root package: `cargo test --workspace`.
 
-**Clippy needs the nix toolchain, and it keeps vanishing.** `cargo` is nix
-1.96.1 while `~/.cargo/bin/cargo-clippy` is rustup 1.97; mixing them fails
-with `E0514`. Build it once with a GC root so the nix garbage collector stops
-eating it — `--no-link` leaves no root and it disappeared twice in one day:
+**Clippy: the diagnosis in earlier versions of this file was wrong.** It said
+`cargo` was nix 1.96.1 and `cargo-clippy` was rustup 1.97, and told you to put
+a nix-built clippy on PATH. The real problem is that **`cargo` itself flips**:
+identical fresh shells resolve it to nix 1.96.1 or to rustup 1.97.1, so
+`target/` accumulates rlibs from both and clippy fails with `E0514`. Nothing
+in the repo pins a toolchain. What works, deterministically, is putting one
+toolchain's own `bin` first and giving it its own target dir:
 
 ```bash
-nix build --out-link ~/.cache/scout/clippy \
-  '/nix/store/z75w481isp7d6mbmlif92sabnszzrnmv-clippy-1.96.1.drv^*'
-export PATH="$HOME/.cache/scout/clippy/bin:$PATH"
-cargo clippy --workspace --all-targets
+TC=$(ls -d ~/.rustup/toolchains/*/bin | head -1)
+PATH="$TC:$PATH" CARGO_TARGET_DIR=/tmp/clippy-check "$TC/cargo" clippy --workspace --all-targets
 ```
+
+A future-incompat note about `proc-macro-error2` is pre-existing and comes
+from a transitive dependency.
 
 **Expect `dead_code` warnings between Tasks 2 and 6.** `LinkOutcome`,
 `TokenOutcome`, `link_identity`, `issue_login_token` and `consume_login_token`

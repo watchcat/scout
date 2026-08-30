@@ -162,13 +162,44 @@ mod tests {
     }
 
     #[test]
-    fn the_account_id_cannot_be_edited_without_breaking_the_signature() {
-        // The attack this defends: read your own cookie, change 42 to 1,
-        // become someone else.
-        let mine = mint(KEY, 42, 3600);
-        let theirs = mint(KEY, 1, 3600);
-        assert_ne!(mine, theirs);
-        assert_eq!(verify(KEY, &theirs), Some(1));
+    fn no_field_of_the_payload_can_be_edited_without_breaking_the_signature() {
+        // What the MAC has to cover, field by field. The version of this
+        // test that stood here checked none of it: it minted two cookies,
+        // asserted they differed, and asserted the second verified — all
+        // true of a `verify` that does no signing at all. A MAC over the
+        // account id alone passed the whole crate, and under that mutant
+        // anyone holding one valid cookie edits `expires` and has a session
+        // that never dies.
+        let minted = mint(KEY, 42, 3600);
+        assert_eq!(verify(KEY, &minted), Some(42));
+
+        // The value is `payload.signature` and the payload is
+        // `account_id.expires.nonce`, so tampering means rebuilding the
+        // payload and reattaching the *original* signature. Editing the
+        // base64 instead would only prove that a broken signature is
+        // refused, which is the test above.
+        let (payload, sig) =
+            minted.rsplit_once('.').expect("a minted cookie is payload.signature");
+        let fields: Vec<&str> = payload.split('.').collect();
+        assert_eq!(fields.len(), 3, "the payload is no longer account_id.expires.nonce");
+
+        // Ten years, which is what "this session never ends" looks like.
+        let far_future = (chrono::Utc::now().timestamp() + 315_360_000).to_string();
+        for (i, edit, what) in [
+            (0, "1", "the account id"),
+            (1, far_future.as_str(), "the expiry"),
+            (2, "0000000000000000", "the nonce"),
+        ] {
+            let mut tampered = fields.clone();
+            assert_ne!(tampered[i], edit, "the edit to {what} changed nothing");
+            tampered[i] = edit;
+            let forged = format!("{}.{sig}", tampered.join("."));
+            assert_eq!(
+                verify(KEY, &forged),
+                None,
+                "{what} was edited and the cookie still authenticated"
+            );
+        }
     }
 
     #[test]

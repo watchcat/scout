@@ -81,6 +81,30 @@ impl Core {
     pub fn start(cfg: Config, return_url: Option<String>) -> anyhow::Result<Self> {
         let store = Store::open(&cfg.db_path)?;
 
+        // A founder is admitted by `ALLOWED_TELEGRAM_USER_IDS` and holds no
+        // seat; one holding a seat anyway is a seat the round has lost for
+        // nobody, and `rounds` counts it against capacity all the same.
+        // `identity::link` stops new ones arriving — this is here because a
+        // seat handed out before that rule existed is reachable no other
+        // way, and one was: a merge moved a seat onto a founder in
+        // production before the rule was written.
+        //
+        // The trade is deliberate. Someone taken off the founder list no
+        // longer has a seat to fall back on, because their access came from
+        // the list; re-admitting them is an invite, not a leftover row.
+        //
+        // `account_for_telegram` would mint an account for an id it has not
+        // seen, so it is only ever asked about ids `active_members` just
+        // returned — every one of which already has an identity row.
+        for telegram_id in store.active_members()? {
+            if cfg.allowed_user_ids.contains(&telegram_id) {
+                let account_id = store.account_for_telegram(telegram_id)?;
+                if store.release_seat(account_id)? {
+                    tracing::info!(telegram_id, "handed back a seat held by a founder");
+                }
+            }
+        }
+
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
@@ -492,6 +516,50 @@ where
 mod tests {
     use super::*;
     use crate::store::Claim;
+
+    #[test]
+    fn starting_up_hands_back_a_seat_a_founder_should_never_have_held() {
+        // The seat a merge moved onto a founder in production predates the
+        // rule that stops it, so a restart is the only thing that can reach
+        // it. `Config::for_test` makes telegram 111 the founder.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("founder.duckdb");
+        let p = path.to_str().unwrap().to_string();
+
+        {
+            let core = Core::start(crate::config::Config::for_test(&p), None).unwrap();
+            core.store().create_round("autumn", 5).unwrap();
+            let founder = core.store().account_for_identity("telegram", "111").unwrap();
+            core.store().claim_seat(founder, "autumn").unwrap();
+            assert_eq!(core.store().rounds().unwrap()[0].used, 1);
+        }
+
+        let core = Core::start(crate::config::Config::for_test(&p), None).unwrap();
+        assert_eq!(
+            core.store().rounds().unwrap()[0].used,
+            0,
+            "the founder's seat was still counted against the round"
+        );
+    }
+
+    #[test]
+    fn starting_up_leaves_an_ordinary_member_seated() {
+        // The other half: this must reconcile founders and nobody else, or
+        // a restart quietly empties the round.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.duckdb");
+        let p = path.to_str().unwrap().to_string();
+
+        {
+            let core = Core::start(crate::config::Config::for_test(&p), None).unwrap();
+            core.store().create_round("autumn", 5).unwrap();
+            let member = core.store().account_for_identity("telegram", "222").unwrap();
+            core.store().claim_seat(member, "autumn").unwrap();
+        }
+
+        let core = Core::start(crate::config::Config::for_test(&p), None).unwrap();
+        assert_eq!(core.store().rounds().unwrap()[0].used, 1, "a restart unseated a member");
+    }
 
     #[test]
     fn a_founder_is_exempt_from_the_daily_cap_and_a_member_is_not() {

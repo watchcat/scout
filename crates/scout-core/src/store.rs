@@ -154,6 +154,21 @@ CREATE TABLE IF NOT EXISTS deliveries (
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     PRIMARY KEY (account_id, channel)
 );
+-- Magic-link tokens. A row rather than a signed value because a link must
+-- be single-use: a replayable one is a standing account key sitting in an
+-- inbox. Sign-in is rare, so the store mutex is cheap here in a way it
+-- would not be on a per-request session check.
+CREATE TABLE IF NOT EXISTS login_tokens (
+    token_hash  TEXT PRIMARY KEY,
+    email       TEXT NOT NULL,
+    -- Set when linking an address to an account that is already signed in;
+    -- NULL when the link is a sign-in and the account is not known yet.
+    account_id  BIGINT,
+    expires_at  TIMESTAMP NOT NULL,
+    -- Kept rather than deleted, so "already used" and "expired" stay
+    -- distinguishable — they call for different advice.
+    consumed_at TIMESTAMP
+);
 CREATE SEQUENCE IF NOT EXISTS conversations_id_seq;
 -- A rolling thread. `scope` keeps a group chat's history out of the
 -- account's private thread: 'direct' is the 1:1 chat and the web app, which
@@ -313,6 +328,15 @@ pub enum LinkOutcome {
     /// it: two sign-ups stay two accounts until a human decides otherwise,
     /// and a wrong merge cannot be undone.
     TakenByAnother,
+}
+
+/// What a magic link turned out to be worth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenOutcome {
+    Valid { email: String, account_id: Option<i64> },
+    Expired,
+    AlreadyUsed,
+    Unknown,
 }
 
 /// One round as `/invite status` reports it.
@@ -607,6 +631,16 @@ DO UPDATE SET address = excluded.address, updated_at = excluded.updated_at;
 DROP TABLE user_chats;
 "#;
 
+const STEP_6_LOGIN_TOKENS: &str = r#"
+CREATE TABLE IF NOT EXISTS login_tokens (
+    token_hash  TEXT PRIMARY KEY,
+    email       TEXT NOT NULL,
+    account_id  BIGINT,
+    expires_at  TIMESTAMP NOT NULL,
+    consumed_at TIMESTAMP
+);
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -614,6 +648,7 @@ fn steps() -> Vec<(i64, Step)> {
         (3, Step::Sql(STEP_3_UNCONSTRAINED)),
         (4, Step::Sql(STEP_4_REBUILDS)),
         (5, Step::Sql(STEP_5_DELIVERIES)),
+        (6, Step::Sql(STEP_6_LOGIN_TOKENS)),
     ]
 }
 
@@ -1155,6 +1190,78 @@ impl Store {
             params![account_id, kind, external_id],
         )?;
         Ok(LinkOutcome::Linked)
+    }
+
+    /// Records a token that has been mailed out.
+    ///
+    /// `token_hash` is a hash of the value in the link, never the value:
+    /// a database that leaks must not hand over working sign-in links.
+    /// `ttl_secs` is signed so a test can issue one already expired.
+    ///
+    /// `expires_at` is computed in Rust from `chrono::Utc::now()` — the same
+    /// UTC-naive clock `consume_login_token` compares against via
+    /// `current_timestamp AT TIME ZONE 'UTC'` — rather than derived with
+    /// bare `current_timestamp`, which is local. See `requests_today` for
+    /// the bug that pattern caused.
+    ///
+    /// The addition happens here rather than as `TIMESTAMP + INTERVAL` in
+    /// SQL on purpose: on a freshly opened, file-backed connection (unlike
+    /// an in-memory one, and unlike an ad-hoc `query_row` probe run after
+    /// other queries have already primed the process) DuckDB's binder can
+    /// fail that expression with "No function matches ... (TIMESTAMP,
+    /// INTERVAL)" — a startup race in this build, not a real type error.
+    /// Binding an already-computed timestamp sidesteps it; the plain `<`
+    /// comparison below over two TIMESTAMP values needs no such arithmetic
+    /// and does not carry the same risk.
+    pub fn issue_login_token(
+        &self,
+        token_hash: &str,
+        email: &str,
+        account_id: Option<i64>,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO login_tokens (token_hash, email, account_id, expires_at)
+             VALUES (?, ?, ?, ?)",
+            params![token_hash, email, account_id, expires_at.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Spends a token, if it has anything left to spend.
+    ///
+    /// Marking consumed and reading the row happen under one mutex, so two
+    /// simultaneous clicks cannot both come back `Valid`.
+    pub fn consume_login_token(&self, token_hash: &str) -> Result<TokenOutcome> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT email, account_id, consumed_at IS NOT NULL,
+                    expires_at < (current_timestamp AT TIME ZONE 'UTC')::TIMESTAMP
+             FROM login_tokens WHERE token_hash = ?",
+        )?;
+        let row: Option<(String, Option<i64>, bool, bool)> = stmt
+            .query_map(params![token_hash], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .next()
+            .transpose()?;
+        drop(stmt);
+        let Some((email, account_id, consumed, expired)) = row else {
+            return Ok(TokenOutcome::Unknown);
+        };
+        if consumed {
+            return Ok(TokenOutcome::AlreadyUsed);
+        }
+        if expired {
+            return Ok(TokenOutcome::Expired);
+        }
+        conn.execute(
+            "UPDATE login_tokens SET consumed_at = current_timestamp WHERE token_hash = ?",
+            params![token_hash],
+        )?;
+        Ok(TokenOutcome::Valid { email, account_id })
     }
 
     /// The account behind a Telegram user, creating one the first time.
@@ -2186,6 +2293,51 @@ CREATE TABLE segment_candidates (
             LinkOutcome::Linked
         );
         assert_eq!(s.account_for_identity("email", "c@example.com").unwrap(), owner);
+    }
+
+    #[test]
+    fn a_fresh_database_has_somewhere_to_put_login_tokens() {
+        let (s, _d) = test_store();
+        assert_eq!(s.schema_version().unwrap(), 6);
+        // A fresh database is built by MIGRATIONS and a migrated one by
+        // steps(); this fails if only one of the two learned about the table.
+        s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
+    }
+
+    #[test]
+    fn a_token_works_once_and_says_so_afterwards() {
+        let (s, _d) = test_store();
+        s.issue_login_token("hash-a", "a@example.com", None, 900).unwrap();
+
+        assert_eq!(
+            s.consume_login_token("hash-a").unwrap(),
+            TokenOutcome::Valid { email: "a@example.com".to_string(), account_id: None }
+        );
+        // The whole reason the row survives consumption: the second visit
+        // gets advice ("you may already be signed in"), not "expired".
+        assert_eq!(s.consume_login_token("hash-a").unwrap(), TokenOutcome::AlreadyUsed);
+        assert_eq!(s.consume_login_token("hash-never").unwrap(), TokenOutcome::Unknown);
+    }
+
+    #[test]
+    fn an_expired_token_is_refused_and_not_consumed() {
+        let (s, _d) = test_store();
+        s.issue_login_token("hash-b", "b@example.com", None, -1).unwrap();
+        assert_eq!(s.consume_login_token("hash-b").unwrap(), TokenOutcome::Expired);
+        // Expiry must not silently mark it used, or the advice above flips
+        // to the wrong branch for anyone who clicks twice.
+        assert_eq!(s.consume_login_token("hash-b").unwrap(), TokenOutcome::Expired);
+    }
+
+    #[test]
+    fn a_link_issued_while_signed_in_remembers_whose_it_is() {
+        let (s, _d) = test_store();
+        let account = s.account_for_identity("telegram", "11").unwrap();
+        s.issue_login_token("hash-c", "c@example.com", Some(account), 900).unwrap();
+        assert_eq!(
+            s.consume_login_token("hash-c").unwrap(),
+            TokenOutcome::Valid { email: "c@example.com".to_string(), account_id: Some(account) }
+        );
     }
 
     #[test]

@@ -301,11 +301,34 @@ mod tests {
         let a = s.account_for_telegram(11).unwrap();
         let c = s.start_conversation(a, "direct").unwrap();
 
+        // A real exchange has the tool call and its result sitting between
+        // the question and the answer. Without them in this fixture the
+        // test's own name would be a claim it never checks.
+        use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
+        use rig::message::{ToolCall, ToolFunction};
+        use rig::one_or_many::OneOrMany;
         save_history(
             &s,
             c,
             &[
                 LlmMessage::user("cheapest beans"),
+                LlmMessage::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                        "call-1".to_string(),
+                        ToolFunction {
+                            name: "web_search".to_string(),
+                            arguments: serde_json::json!({}),
+                        },
+                    ))),
+                },
+                LlmMessage::User {
+                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                        id: "call-1".to_string(),
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::text("three shops")),
+                    })),
+                },
                 LlmMessage::assistant("here are three"),
             ],
         )

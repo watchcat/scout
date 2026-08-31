@@ -265,7 +265,14 @@ mod tests {
         let css = include_str!("index.html");
         let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
 
-        for decl in css.split(';') {
+        // Split on `}` as well as `;`. A block whose last declaration has
+        // no trailing semicolon would otherwise be glued to the next
+        // selector — `margin-bottom:var(--s-4)}\n.mark .logo{width:66px` —
+        // and reported as a spacing violation for a width. The first
+        // version of this test did that, and the fix applied to it was to
+        // add trailing semicolons to two rules: a convention nobody knows
+        // about, enforced by a message that names the wrong line.
+        for decl in css.split([';', '}']) {
             let decl = decl.trim();
             if let Some(value) = decl.strip_prefix("font-size:") {
                 assert!(

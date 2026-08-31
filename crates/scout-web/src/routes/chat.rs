@@ -279,6 +279,7 @@ async fn send_message(
     };
     let core = auth.core.clone();
     let text = body.text;
+    let auth_for_mirror = auth.clone();
 
     let (agent_tx, agent_rx) = tokio::sync::mpsc::unbounded_channel();
     let (frames, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -297,6 +298,12 @@ async fn send_message(
         };
         let outcome = scout_core::run::run_agent(&core, agent_tx, &run, &text).await;
         let _ = pump.await;
+        // Queued before the end frame goes out, so the row is written
+        // whether or not the reader's connection survived to see the
+        // answer — a dropped stream still leaves the thread on their phone.
+        if let Ok(scout_core::run::RunOutcome::Answered(answer)) = &outcome {
+            mirror_turn(&auth_for_mirror, account_id, conversation_id, &text, answer).await;
+        }
         let _ = frames.send(Frame::End(end_frame(outcome)));
     });
 
@@ -388,12 +395,59 @@ async fn backfill(auth: &AuthState, account_id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Queues one finished exchange, if the reader asked for that.
+///
+/// Called by the run handler rather than by `run_agent`, because
+/// `run_agent` is shared by both channels and has no business knowing which
+/// one it is serving. Telegram's own handler makes the opposite call, with
+/// `delivered: true` — the two of them together are what stop a backfill
+/// echoing Telegram's messages back at it.
+///
+/// Every failure here is logged and swallowed. The answer is already on the
+/// reader's screen and already saved to history; a mirror that did not get
+/// queued is worth knowing about and is not worth failing a reply over.
+async fn mirror_turn(
+    auth: &AuthState,
+    account_id: i64,
+    conversation_id: i64,
+    asked: &str,
+    answered: &str,
+) {
+    match scout_core::mirror::is_enabled(&auth.core, account_id).await {
+        Ok(false) => return,
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the mirror setting");
+            return;
+        }
+    }
+    let Some(reply_to) = reply_to_for(auth, account_id).await else {
+        return;
+    };
+    let turns = vec![
+        scout_api::Turn { role: scout_api::Role::You, text: asked.to_string() },
+        scout_api::Turn { role: scout_api::Role::Scout, text: answered.to_string() },
+    ];
+    if let Err(e) = scout_core::mirror::enqueue(
+        &auth.core,
+        account_id,
+        &reply_to.address,
+        conversation_id,
+        &turns,
+        false,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, account_id, "could not queue a turn for Telegram");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Named imports rather than `use super::*`: the module imports axum's
     // `get` and `post`, which would shadow the test helpers of the same
     // name that every request in here goes through.
-    use super::{end_frame, reply_to_for, AuthState};
+    use super::{end_frame, mirror_turn, reply_to_for, AuthState};
     use crate::tests::*;
 
     #[test]
@@ -545,6 +599,40 @@ mod tests {
     /// stays intact everywhere else.
     async fn seed_conversation(core: &scout_core::core::Core, account_id: i64, you: &str, scout: &str) {
         scout_core::session::seed_exchange_for_tests(core, account_id, "direct", you, scout).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_is_queued_only_when_the_mirror_is_on() {
+        // `run_agent` needs a live model, so this exercises the function the
+        // run handler calls rather than driving a run.
+        let (_app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        let auth = auth_state(&core);
+
+        mirror_turn(&auth, account_id, 1, "cheapest beans", "here are three").await;
+        assert!(
+            scout_core::mirror::pending(&core, 10).await.unwrap().is_empty(),
+            "queued a turn for someone who never asked for it"
+        );
+
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        mirror_turn(&auth, account_id, 1, "cheapest beans", "here are three").await;
+        assert_eq!(scout_core::mirror::pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_turn_is_not_queued_when_there_is_nowhere_to_send_it() {
+        // Someone who switched the mirror on and later lost their delivery
+        // address. Queueing rows nothing can deliver would fill the outbox
+        // with work that fails five times each and is then abandoned.
+        let (_app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        // Deliberately no `note_address`.
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let auth = auth_state(&core);
+        mirror_turn(&auth, account_id, 1, "cheapest beans", "here are three").await;
+        assert!(scout_core::mirror::pending(&core, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

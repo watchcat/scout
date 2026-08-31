@@ -222,6 +222,27 @@ pub async fn run_agent(
         history.push(LlmMessage::assistant(&reply));
     }
 
+    // The model sometimes writes a tool call out as prose instead of making
+    // one. `rig` sees a response with no structured call in it, concludes
+    // the agent has finished, and hands the markup back as the answer — so
+    // nothing errors, nothing is logged, and the reader gets XML. Observed
+    // on minimax-m3 at turn 4 of 20.
+    //
+    // One corrective turn, because the research behind it is real and worth
+    // keeping. Ordered before the dead-link check on purpose: there is no
+    // point resolving urls inside markup, and the repaired answer is what
+    // the reader will actually see, so it is the one that has to be
+    // checked.
+    if crate::toolcall::looks_like_tool_call(&reply) {
+        tracing::warn!(conversation_id, "the model wrote a tool call as text; asking it to answer");
+        reply = strip_thinking(&agent.chat(crate::toolcall::REPAIR_NOTE, &mut history).await?);
+        if crate::toolcall::looks_like_tool_call(&reply) {
+            // Twice is not a slip. The run has not answered, and an apology
+            // the reader understands beats markup they cannot.
+            anyhow::bail!("the model wrote a tool call as text instead of answering, twice");
+        }
+    }
+
     // Guard against links the model wrote but never saw: an invented Amazon
     // /dp/<ASIN> URL reads as a real product page and answers 404. One repair
     // turn, then scrub whatever is still dead.
@@ -386,6 +407,19 @@ fn is_max_turns(e: &impl std::fmt::Display) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_call_written_as_text_is_repaired_before_the_links_are_checked() {
+        // Neither branch is reachable without a live model, so the ordering
+        // is asserted from the source instead. Resolving urls that sit
+        // inside markup is wasted work, and the repaired answer is the one
+        // the reader actually sees — so it is the one that has to be
+        // link-checked.
+        let src = include_str!("run.rs");
+        let repair = src.find("looks_like_tool_call").expect("the repair must exist");
+        let links = src.find("dead_links_in").expect("the link check must exist");
+        assert!(repair < links, "the tool-call repair must run before the dead-link check");
+    }
 
     #[test]
     fn a_stray_closer_makes_the_run_retract_the_answer_it_already_sent() {

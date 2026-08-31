@@ -1,3 +1,29 @@
+/// The marker that introduces text Scout addressed to itself.
+///
+/// Instructions handed to the model mid-conversation — "these links are
+/// dead, re-send your answer" — have to ride along as user messages,
+/// because a user message is the only way to say something to a model
+/// between turns. `rig`'s `Chat::chat` then appends the prompt it was given
+/// to the history, so those notes are saved and, until this existed, were
+/// rendered back to the person as things *they* had said.
+///
+/// The producers spell it literally; `a_note_scout_writes_to_itself_is_marked`
+/// is what stops the spelling drifting apart from this one.
+pub const SYSTEM_NOTE: &str = "[system note]";
+
+/// What a person actually said, with any note Scout appended to itself cut
+/// away. Empty when the message was nothing but a note.
+///
+/// Cutting at the marker rather than matching a whole prompt: two of the
+/// four notes are appended to a real question, so the person's words come
+/// first and have to survive.
+pub fn said_by_person(text: &str) -> &str {
+    match text.find(SYSTEM_NOTE) {
+        Some(i) => text[..i].trim(),
+        None => text.trim(),
+    }
+}
+
 /// Remove `<think>`/`<thinking>` blocks that reasoning models (MiniMax M3)
 /// sometimes emit inline in their output. An unclosed trailing block is
 /// dropped to the end of the string. Case-insensitive; result is trimmed.
@@ -168,6 +194,28 @@ mod tests {
         // Nothing but reasoning leaves nothing, which is the right answer —
         // there was no answer in it.
         assert_eq!(strip_thinking("only ever thinking</think>"), "");
+    }
+
+    #[test]
+    fn a_note_scout_wrote_to_itself_is_not_something_the_person_said() {
+        // The repair prompt is a whole message and leaves nothing behind.
+        assert_eq!(said_by_person(&crate::links::repair_prompt(&["https://x/404".into()])), "");
+        // The price note rides on the end of a real question, which stays.
+        assert_eq!(
+            said_by_person("find me cheapest gillette\n\n[system note] This is a cheapest-price request."),
+            "find me cheapest gillette"
+        );
+        assert_eq!(said_by_person("  an ordinary question  "), "an ordinary question");
+    }
+
+    #[test]
+    fn a_note_scout_writes_to_itself_is_marked() {
+        // The cut above only works while every producer spells the marker
+        // the same way. `const` cannot be built from a `const` with
+        // `concat!`, so the producers hold literals and this is what stops
+        // them drifting.
+        assert!(crate::links::repair_prompt(&["https://x/404".into()]).starts_with(SYSTEM_NOTE));
+        assert!(crate::agent::WRAP_UP_NOTE.starts_with(SYSTEM_NOTE));
     }
 
     #[test]

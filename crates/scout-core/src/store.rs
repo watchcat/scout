@@ -5,6 +5,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// How many times a mirrored message is retried before it is left alone.
+///
+/// The reminder path retries indefinitely and that is safe, because a date
+/// bounds it. An outbox row has no such bound: a reader who blocks the bot
+/// would otherwise be retried against forever.
+const MIRROR_ATTEMPTS: i64 = 5;
+
 const MIGRATIONS: &str = r#"
 CREATE SEQUENCE IF NOT EXISTS purchases_id_seq;
 CREATE TABLE IF NOT EXISTS purchases (
@@ -784,6 +791,15 @@ fn apply_steps(conn: &Connection, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One thing still waiting to go out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingMirror {
+    pub id: i64,
+    pub account_id: i64,
+    pub address: String,
+    pub body: String,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -1279,6 +1295,115 @@ impl Store {
             return Err(e);
         }
         conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Queues one turn for a channel, or does nothing if it is already
+    /// known. Returns whether a row was written.
+    ///
+    /// `delivered` is how a channel records a turn it has already shown the
+    /// reader: the row is inserted with `sent_at` set, so it occupies the
+    /// key and is never dispatched.
+    ///
+    /// Check-then-insert rather than `ON CONFLICT`, because the store holds
+    /// one mutex and is the only writer, so the pair is atomic here in a way
+    /// it would not be over a network. The `UNIQUE` constraint stays as a
+    /// backstop against a second writer nobody has added yet.
+    pub fn enqueue_mirror(
+        &self,
+        account_id: i64,
+        channel: &str,
+        address: &str,
+        body: &str,
+        turn_key: &str,
+        delivered: bool,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let known: i64 = conn.query_row(
+            "SELECT count(*) FROM outbox WHERE account_id = ? AND turn_key = ?",
+            params![account_id, turn_key],
+            |r| r.get(0),
+        )?;
+        if known > 0 {
+            return Ok(false);
+        }
+        // `now()` in the statement rather than a bound timestamp: `duckdb`
+        // is built here without its `chrono` feature, so a `NaiveDateTime`
+        // has no `ToSql`, and every other write in this file dates itself
+        // the same way.
+        let sql = if delivered {
+            "INSERT INTO outbox (id, account_id, channel, address, body, turn_key, sent_at)
+             VALUES (nextval('outbox_id_seq'), ?, ?, ?, ?, ?, now())"
+        } else {
+            "INSERT INTO outbox (id, account_id, channel, address, body, turn_key)
+             VALUES (nextval('outbox_id_seq'), ?, ?, ?, ?, ?)"
+        };
+        conn.execute(sql, params![account_id, channel, address, body, turn_key])?;
+        Ok(true)
+    }
+
+    /// Turns still waiting to go out on a channel, oldest first.
+    ///
+    /// Oldest first because a thread delivered out of order is worse than
+    /// one delivered late. Rows past [`MIRROR_ATTEMPTS`] are left behind
+    /// rather than returned.
+    pub fn pending_mirror(&self, channel: &str, limit: usize) -> Result<Vec<PendingMirror>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, address, body FROM outbox
+             WHERE channel = ? AND sent_at IS NULL AND attempts < ?
+             ORDER BY id LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![channel, MIRROR_ATTEMPTS, limit as i64], |r| {
+            Ok(PendingMirror {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                address: r.get(2)?,
+                body: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// It arrived. The row stays as the ledger entry that stops it being
+    /// sent again by a later backfill.
+    pub fn mark_mirror_sent(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE outbox SET sent_at = now() WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    /// It did not arrive. One more attempt spent; at [`MIRROR_ATTEMPTS`] the
+    /// row stops being returned by `pending_mirror`.
+    pub fn mark_mirror_failed(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    pub fn mirror_enabled(&self, account_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM mirrored_accounts WHERE account_id = ?",
+            params![account_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Presence is the setting, so turning it on twice is not an error and
+    /// turning it off is a delete.
+    pub fn set_mirror(&self, account_id: i64, on: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if on {
+            conn.execute(
+                "INSERT INTO mirrored_accounts (account_id) SELECT ?
+                 WHERE NOT EXISTS (SELECT 1 FROM mirrored_accounts WHERE account_id = ?)",
+                params![account_id, account_id],
+            )?;
+        } else {
+            conn.execute("DELETE FROM mirrored_accounts WHERE account_id = ?", params![account_id])?;
+        }
         Ok(())
     }
 
@@ -4440,4 +4565,74 @@ CREATE TABLE segment_candidates (
         assert_eq!(n, 0, "a fresh database has no pending steps and needs no copy");
     }
 
+    #[test]
+    fn enqueueing_the_same_turn_twice_leaves_one_row() {
+        // Backfill and the live path both enqueue, and toggling off and on
+        // backfills again. All three lean on this being a no-op.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        assert!(s.enqueue_mirror(a, "telegram", "11", "hello", "key-1", false).unwrap());
+        assert!(!s.enqueue_mirror(a, "telegram", "11", "hello", "key-1", false).unwrap());
+        assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_turn_the_channel_already_delivered_is_never_pending() {
+        // This is the echo guarantee. The browser and a 1:1 Telegram chat
+        // share conversation scope "direct", so backfilling the thread would
+        // send Telegram its own messages back. The channel that handled a
+        // turn records it as delivered, and the backfill then skips it
+        // because "already in the ledger" and "already sent" are one fact.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        assert!(s.enqueue_mirror(a, "telegram", "11", "from telegram", "key-2", true).unwrap());
+        assert!(s.pending_mirror("telegram", 10).unwrap().is_empty());
+        // And the backfill's later attempt at the same turn changes nothing.
+        assert!(!s.enqueue_mirror(a, "telegram", "11", "from telegram", "key-2", false).unwrap());
+        assert!(s.pending_mirror("telegram", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_rows_come_back_oldest_first_and_marking_them_clears_them() {
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        s.enqueue_mirror(a, "telegram", "11", "first", "k1", false).unwrap();
+        s.enqueue_mirror(a, "telegram", "11", "second", "k2", false).unwrap();
+        let due = s.pending_mirror("telegram", 10).unwrap();
+        assert_eq!(due.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        s.mark_mirror_sent(due[0].id).unwrap();
+        let due = s.pending_mirror("telegram", 10).unwrap();
+        assert_eq!(due.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(), ["second"]);
+    }
+
+    #[test]
+    fn a_row_is_abandoned_after_five_attempts() {
+        // The reminder path can retry forever safely because dates bound it.
+        // This one has no such bound: block the bot and an uncapped retry
+        // loops until a human notices.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        s.enqueue_mirror(a, "telegram", "11", "doomed", "k1", false).unwrap();
+        let id = s.pending_mirror("telegram", 10).unwrap()[0].id;
+        for _ in 0..4 {
+            s.mark_mirror_failed(id).unwrap();
+            assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1, "gave up too early");
+        }
+        s.mark_mirror_failed(id).unwrap();
+        assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "retried forever");
+    }
+
+    #[test]
+    fn the_mirror_setting_is_the_presence_of_a_row() {
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        assert!(!s.mirror_enabled(a).unwrap());
+        s.set_mirror(a, true).unwrap();
+        assert!(s.mirror_enabled(a).unwrap());
+        // Enabling twice is not an error -- the page can post it twice.
+        s.set_mirror(a, true).unwrap();
+        assert!(s.mirror_enabled(a).unwrap());
+        s.set_mirror(a, false).unwrap();
+        assert!(!s.mirror_enabled(a).unwrap());
+    }
 }

@@ -204,9 +204,18 @@ pub(crate) fn transcript_of(store: &crate::store::Store, conversation_id: i64) -
             LlmMessage::User { content } => {
                 text_of_user(content).map(|text| scout_api::Turn { role: scout_api::Role::You, text })
             }
-            LlmMessage::Assistant { content, .. } => {
-                text_of_assistant(content).map(|text| scout_api::Turn { role: scout_api::Role::Scout, text })
-            }
+            // Stripped, because what is *stored* is the model's raw message:
+            // `run_agent` saves `res.messages()`, tags and all, and only the
+            // reply it hands the channel goes through `strip_thinking`.
+            // Telegram never renders history so this never showed; the web
+            // page does, and rendering it raw put a whole chain of thought
+            // on screen — permanently, on every load, rather than for the
+            // moment a stream does.
+            LlmMessage::Assistant { content, .. } => text_of_assistant(content)
+                .map(|text| scout_api::Turn {
+                    role: scout_api::Role::Scout,
+                    text: crate::text::strip_thinking(&text),
+                }),
             _ => None,
         })
         .filter(|t| !t.text.trim().is_empty())
@@ -370,6 +379,34 @@ mod tests {
                 Turn { role: Role::You, text: "cheapest beans".into() },
                 Turn { role: Role::Scout, text: "here are three".into() },
             ]
+        );
+    }
+
+    #[test]
+    fn a_transcript_does_not_show_the_reasoning_stored_beside_the_answer() {
+        // What is stored is the model's raw message. The live stream strips
+        // it; a page reading history has to strip it too, or a chain of
+        // thought sits on screen every time the page is opened.
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
+        save_history(
+            &s,
+            c,
+            &[
+                LlmMessage::user("test"),
+                LlmMessage::assistant(
+                    "<think>\nThe user just sent \"test\". I should respond briefly.\n</think>\n\nHi! Scout here.",
+                ),
+            ],
+        )
+        .unwrap();
+
+        let turns = transcript_of(&s, c).unwrap();
+        assert_eq!(turns[1].text, "Hi! Scout here.");
+        assert!(
+            !turns.iter().any(|t| t.text.contains("<think>")),
+            "reasoning reached the page: {turns:?}"
         );
     }
 

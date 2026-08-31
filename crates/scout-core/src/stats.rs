@@ -407,7 +407,7 @@ pub async fn report(core: &crate::core::Core, telegram_id: i64, arg: &str) -> St
         }
     };
 
-    let admin = core.is_admin(telegram_id);
+    let admin = core.is_admin(crate::ids::TelegramId(telegram_id));
     let today = chrono::Local::now().date_naive();
     let cutoff = format!(
         "{} 00:00:00",

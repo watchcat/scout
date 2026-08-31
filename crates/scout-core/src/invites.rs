@@ -291,7 +291,7 @@ pub async fn invite(
     cmd: InviteCmd,
     bot_username: Option<&str>,
 ) -> String {
-    if !core.is_admin(admin_telegram_id) {
+    if !core.is_admin(crate::ids::TelegramId(admin_telegram_id)) {
         return NOT_ADMIN.to_string();
     }
     let store = core.store();
@@ -368,7 +368,7 @@ pub async fn kick(
     kicking: bool,
 ) -> KickOutcome {
     let no_change = |reply: String| KickOutcome { reply, membership: None };
-    if !core.is_admin(admin_telegram_id) {
+    if !core.is_admin(crate::ids::TelegramId(admin_telegram_id)) {
         return no_change(NOT_ADMIN.to_string());
     }
     let target = match parse_user_id(arg) {

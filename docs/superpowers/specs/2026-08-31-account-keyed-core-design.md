@@ -65,7 +65,11 @@ Only the parameters that change are listed; everything else keeps its shape.
 | `account_of` | `telegram_id: i64` | `TelegramId` |
 
 `Core::log_request` was missed when this document said "four call sites" and
-was found while writing the plan. It matters more than its size suggests: the
+was found while writing the plan. A fourth *handler* was missed too, and only
+found during implementation: `handle_reaction` in `bot.rs` also drives
+`log_request`, `resolve_conversation` and `run_agent`, and all three were
+silently taking a Telegram id. Nothing failed to compile, because every one
+of them takes an `i64` either way. It matters more than its size suggests: the
 daily cap counts the rows it writes, so a caller that cannot log a request
 cannot be capped, and a web client that could not be capped would be a hole
 rather than an omission.
@@ -104,11 +108,19 @@ resolve the destination at delivery time from the `deliveries` table, which
 already maps an account to an address per channel. A reminder belongs to a
 person, after all, and where to send it looks like a delivery-time question.
 
-It is not. In a group chat, `chat_id` is the *group's* id, so a reminder made
-in a group is delivered back to that group. Resolving from `deliveries` would
-silently redirect every one of those into the creator's private chat. The
-address is a property of where the reminder was asked for, not of who asked,
-and `ReplyTo` says so.
+It is not, and the reason is sharper than the first draft of this document
+claimed. That draft said resolving from `deliveries` would redirect group
+reminders "into the creator's private chat". Checked against the code, it does
+something worse: `note_sender` calls `note_chat` on *every* incoming message,
+group or private, and `note_delivery` upserts on `(account_id, channel)`, so
+`deliveries.address` is simply wherever that account last spoke. A reminder
+made in one group could later be delivered to a different group, or to a DM,
+depending on where its owner happened to talk next — non-deterministically,
+and long after the fact.
+
+In a group chat `chat_id` is the *group's* id, and a reminder made there is
+delivered back there. The address is a property of where the reminder was
+asked for, not of who asked, and `ReplyTo` says so.
 
 What the browser passes is deliberately not decided here. A reminder created on
 the web by someone with no Telegram identity has nowhere to go, and answering
@@ -174,10 +186,25 @@ moved.
 - **A reminder made in a group still addresses the group.** This property is
   what rules out the `deliveries` simplification above, and it is currently
   untested — the only new test this design adds.
-- **Mutation checks**, in the style the repository already uses: point
-  `ReplyTo` at the wrong address and watch the group-reminder test go red;
-  key `ShownFlights` on the account rather than the conversation and watch two
-  group chats bleed options into each other.
+- **Mutation checks**, in the style the repository already uses.
+
+**What the mutation checks actually found, recorded because it contradicts
+what this section first predicted.** Both mutations *survived*. Pointing
+`build_agent`'s `ReplyTo` at the wrong address does not turn the
+group-reminder test red, because that test constructs `CreateReminderTool`
+directly and so covers the tool rather than the wiring to it. Keying the
+flight tools on the account instead of the conversation fails nothing either.
+The proposed extra `ShownFlights` test would not have caught it: it would
+have duplicated `an_id_from_another_chat_is_not_answerable` and exercised the
+same direct-construction path, which is coverage theatre and worse than an
+honest gap.
+
+The wiring is instead protected by `RunContext { account_id, conversation_id,
+reply_to }`, which moves the error from a position to a name. That does not
+make a transposition impossible — `account_id: conversation_id` compiles,
+checked rather than assumed — but it makes writing one visibly wrong. A test
+was rejected because observing the wiring from outside would mean reaching
+inside a built agent to see which numbers its tools captured.
 
 ## Deferred, and why
 

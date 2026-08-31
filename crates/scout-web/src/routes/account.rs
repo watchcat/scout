@@ -373,17 +373,19 @@ mod tests {
         // accounts have been used — two accounts that each hold something
         // stay two. Were either empty this would merge instead, which is
         // the whole point of the rule and so has to be excluded by name.
-        core.log_request(888, "text").await.unwrap();
         let (SignIn::In { account_id: stranger } | SignIn::Queued { account_id: stranger }) =
             identity::sign_in(&core, "telegram", "888").await.unwrap();
+        // Against the account, not the Telegram id — `log_request` is
+        // account-keyed and the two are different numbers.
+        core.log_request(stranger, "text").await.unwrap();
         identity::link(&core, stranger, "email", "taken@example.com").await.unwrap();
 
-        core.log_request(777, "text").await.unwrap();
         let SignIn::Queued { account_id } =
             identity::sign_in(&core, "telegram", "777").await.unwrap()
         else {
             panic!("no round is open, so this should have queued");
         };
+        core.log_request(account_id, "text").await.unwrap();
         let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
 
         let csrf = form_token(&app, &cookie).await;

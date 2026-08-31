@@ -919,7 +919,7 @@ pub struct AddTripOptionTool {
     pub account_id: i64,
     /// What this chat was shown, so an invented id costs nothing to refuse.
     pub shown: Arc<ShownFlights>,
-    pub chat_id: i64,
+    pub conversation_id: i64,
 }
 
 impl Tool for AddTripOptionTool {
@@ -963,9 +963,9 @@ impl Tool for AddTripOptionTool {
         // problem again, and a made-up one otherwise costs a paid lookup to
         // discover. Chat-scoped, too — otherwise one household member could
         // bind a flight from another's search.
-        let flight = self.shown.find(self.chat_id, &args.offer_id, now).ok_or_else(|| {
-            let ids = self.shown.offer_ids(self.chat_id, now);
-            let total = self.shown.remembered(self.chat_id, now);
+        let flight = self.shown.find(self.conversation_id, &args.offer_id, now).ok_or_else(|| {
+            let ids = self.shown.offer_ids(self.conversation_id, now);
+            let total = self.shown.remembered(self.conversation_id, now);
             StoreToolError(format!(
                 "{:?} was not shown in this conversation, so it cannot be added. \
                  Search first, then use one of these offer_ids: {}",
@@ -1707,7 +1707,7 @@ mod tests {
             .unwrap();
 
         let add_opt =
-            AddTripOptionTool { store: store.clone(), account_id: 7, shown: shown.clone(), chat_id: 99 };
+            AddTripOptionTool { store: store.clone(), account_id: 7, shown: shown.clone(), conversation_id: 99 };
         for id in ["nonstop", "via-hkg"] {
             add_opt
                 .call(AddOptionArgs {
@@ -1761,7 +1761,7 @@ mod tests {
 
         // Another chat's tool, holding the same store.
         let elsewhere =
-            AddTripOptionTool { store: store.clone(), account_id: 7, shown: shown.clone(), chat_id: 12 };
+            AddTripOptionTool { store: store.clone(), account_id: 7, shown: shown.clone(), conversation_id: 12 };
         let err = elsewhere
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1799,7 +1799,7 @@ mod tests {
             .await
             .unwrap();
 
-        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, conversation_id: 99 };
         let err = add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1831,7 +1831,7 @@ mod tests {
             .await
             .unwrap();
 
-        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, conversation_id: 99 };
         let err = add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1868,7 +1868,7 @@ mod tests {
             .await
             .unwrap();
 
-        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, conversation_id: 99 };
         let err = add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1908,7 +1908,7 @@ mod tests {
             .await
             .unwrap();
 
-        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, conversation_id: 99 };
         let view = add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -1987,7 +1987,7 @@ mod tests {
         let waiting = view.not_ready.expect("a segment with no flight is not ready");
         assert!(waiting.contains("segment 1"), "and it says which: {waiting}");
 
-        let view = AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
+        let view = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
             .call(AddOptionArgs {
                 trip: "Japan".into(),
                 position: 1,
@@ -2031,7 +2031,7 @@ mod tests {
             Instant::now(),
         );
         let add = AddTripSegmentTool { store: store.clone(), account_id: 7 };
-        let park = AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 };
+        let park = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 };
         // Both legs decided, so the only thing left wrong is their order.
         for (position, o, d, date, offer) in [
             (1, "AMS", "HKG", "2026-09-19", "out"),
@@ -2087,7 +2087,7 @@ mod tests {
             .await
             .unwrap();
         }
-        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
             .call(AddOptionArgs {
                 trip: "Japan".into(),
                 position: 2,
@@ -2232,7 +2232,7 @@ mod tests {
         })
         .await
         .unwrap();
-        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
             .call(AddOptionArgs {
                 trip: "Japan".into(),
                 position: 1,
@@ -2352,7 +2352,7 @@ mod tests {
 
         // The offer must be a real, shown one so the two guards ahead of
         // the trip lookup both pass and it is that lookup being tested.
-        let add_opt = AddTripOptionTool { store, account_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store, account_id: 7, shown, conversation_id: 99 };
         let err = add_opt
             .call(AddOptionArgs { trip: "Japen".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
@@ -2757,7 +2757,7 @@ mod tests {
             })
             .await
             .unwrap();
-        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
             .call(AddOptionArgs {
                 trip: "Japan".into(),
                 position: 1,
@@ -2831,7 +2831,7 @@ mod tests {
             })
             .await
             .unwrap();
-        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
             .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
             .unwrap();
@@ -2951,7 +2951,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let add_opt = AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 };
         add_opt
             .call(AddOptionArgs { trip: "Lisbon".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
@@ -3018,7 +3018,7 @@ mod tests {
             })
             .await
             .unwrap();
-        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
             .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
             .unwrap();
@@ -3122,7 +3122,7 @@ mod tests {
             .await
             .unwrap();
         let add_opt =
-            AddTripOptionTool { store: store.clone(), account_id: 7, shown: shown.clone(), chat_id: 99 };
+            AddTripOptionTool { store: store.clone(), account_id: 7, shown: shown.clone(), conversation_id: 99 };
         add_opt
             .call(AddOptionArgs {
                 trip: "Japan".into(),
@@ -3267,7 +3267,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let add_opt = AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 };
+        let add_opt = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 };
         add_opt
             .call(AddOptionArgs { trip: "Lisbon".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
@@ -3416,7 +3416,7 @@ mod tests {
             })
             .await
             .unwrap();
-        AddTripOptionTool { store: store.clone(), account_id: 7, shown, chat_id: 99 }
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
             .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
             .await
             .unwrap();

@@ -233,12 +233,24 @@ impl Core {
         }
     }
 
-    pub fn is_founder(&self, telegram_id: i64) -> bool {
-        is_founder(&self.cfg.allowed_user_ids, telegram_id)
+    pub fn is_founder(&self, id: crate::ids::TelegramId) -> bool {
+        is_founder(&self.cfg.allowed_user_ids, id.0)
     }
 
-    pub fn is_admin(&self, telegram_id: i64) -> bool {
-        is_admin_id(&self.cfg.admin_user_ids, telegram_id)
+    /// Whether this account belongs to a founder.
+    ///
+    /// A founder is a Telegram id by configuration — `ALLOWED_TELEGRAM_USER_IDS`
+    /// — so the question can only be asked of an account by looking up which
+    /// Telegram ids it can prove. That is one query, and it buys the right
+    /// answer for a founder who signs in from a browser instead.
+    pub async fn founder_account(&self, account_id: i64) -> anyhow::Result<bool> {
+        let store = self.store();
+        let ids = blocking(move || store.telegram_ids(account_id)).await?;
+        Ok(ids.iter().any(|id| self.cfg.allowed_user_ids.contains(id)))
+    }
+
+    pub fn is_admin(&self, id: crate::ids::TelegramId) -> bool {
+        is_admin_id(&self.cfg.admin_user_ids, id.0)
     }
 
     /// A handle on the database, for this crate only. `store` is private, so
@@ -320,18 +332,10 @@ impl Core {
         .await
     }
 
-    /// Records a request against the caller's account.
-    ///
-    /// Takes a Telegram id and resolves it, so the caller never has to know
-    /// that the two are different numbers — the mistake that made /stat
-    /// report an empty week.
-    pub async fn log_request(&self, telegram_id: i64, kind: &'static str) -> anyhow::Result<()> {
+    /// Records a request against an account.
+    pub async fn log_request(&self, account_id: i64, kind: &'static str) -> anyhow::Result<()> {
         let store = self.store();
-        blocking(move || {
-            let account_id = store.account_for_telegram(telegram_id)?;
-            store.log_request(account_id, kind)
-        })
-        .await
+        blocking(move || store.log_request(account_id, kind)).await
     }
 
     /// Remembers what to call someone, under their account.

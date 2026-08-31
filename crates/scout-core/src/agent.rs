@@ -640,14 +640,14 @@ fn markup_rate(d: &AgentDeps) -> f64 {
     d.duffel.as_ref().map_or(0.0, |c| c.markup_rate())
 }
 
-/// Built per incoming message: tools capture the requesting user's identity,
-/// so the LLM never sees or chooses user ids.
+/// Built per incoming message: tools capture the requesting account's
+/// identity, so the LLM never sees or chooses ids.
 pub fn build_agent(
     d: &AgentDeps,
-    account_id: i64,
-    chat_id: i64,
+    run: &scout_api::RunContext,
     facts: &[(String, String)],
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
+    let (account_id, conversation_id) = (run.account_id, run.conversation_id);
     // One allowance per request, shared by both searching tools.
     let budget = std::sync::Arc::new(crate::tools::budget::SearchBudget::default());
     // One memo per request: a route asked for twice in one question is
@@ -674,7 +674,11 @@ pub fn build_agent(
         .tool(ComparePricesTool)
         .tool(RecordPurchaseTool { store: d.store.clone(), account_id })
         .tool(QueryPurchasesTool { store: d.store.clone(), account_id })
-        .tool(CreateReminderTool { store: d.store.clone(), account_id, chat_id })
+        .tool(CreateReminderTool {
+            store: d.store.clone(),
+            account_id,
+            reply_to: run.reply_to.clone(),
+        })
         .tool(ListRemindersTool { store: d.store.clone(), account_id })
         .tool(CancelReminderTool { store: d.store.clone(), account_id })
         .tool(RememberFactTool { store: d.store.clone(), account_id })
@@ -686,7 +690,7 @@ pub fn build_agent(
             store: d.store.clone(),
             account_id,
             shown: d.shown.clone(),
-            chat_id,
+            conversation_id,
         })
         .tool(ChooseTripOptionTool { store: d.store.clone(), account_id })
         .tool(ShowTripTool { store: d.store.clone(), account_id })
@@ -714,7 +718,7 @@ pub fn build_agent(
             // Outlives the request: booking happens a turn later, when the
             // memo above is gone.
             shown: d.shown.clone(),
-            chat_id,
+            conversation_id,
             // Priced in the traveller's own currency, or Duffel's euros
             // and Ignav's dollars never get compared.
             ignav: d
@@ -734,7 +738,7 @@ pub fn build_agent(
                 // produced it.
                 client: ignav.clone(),
                 shown: d.shown.clone(),
-                chat_id,
+                conversation_id,
             });
         }
         builder = builder.tool(crate::tools::trips::FinaliseTripTool {

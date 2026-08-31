@@ -475,11 +475,11 @@ struct RawBags {
 /// with the flight already selected.
 pub struct BookingLinksTool {
     pub client: IgnavClient,
-    /// What this chat was actually shown, which is the only record of the
-    /// quoted price by the time a booking is asked for — that happens a
-    /// turn later, when the per-request memo is already gone.
+    /// What this conversation was actually shown, which is the only record
+    /// of the quoted price by the time a booking is asked for — that
+    /// happens a turn later, when the per-request memo is already gone.
     pub shown: std::sync::Arc<crate::tools::shown::ShownFlights>,
-    pub chat_id: i64,
+    pub conversation_id: i64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -522,11 +522,11 @@ impl rig::tool::Tool for BookingLinksTool {
         // Refused before it costs anything. A 32-character hex id carried
         // across a turn by a model is the invented-ASIN problem again, and
         // a made-up one answers 404 only after the request is paid for.
-        let Some(quoted) = self.shown.find(self.chat_id, &args.ignav_id, at) else {
-            let known = self.shown.offer_ids(self.chat_id, at);
+        let Some(quoted) = self.shown.find(self.conversation_id, &args.ignav_id, at) else {
+            let known = self.shown.offer_ids(self.conversation_id, at);
             tracing::warn!(
                 ignav_id = %args.ignav_id,
-                chat_id = self.chat_id,
+                conversation_id = self.conversation_id,
                 "booking link asked for an offer id this chat was never shown"
             );
             return Err(IgnavError::Decode {
@@ -712,7 +712,7 @@ mod booking_tests {
         };
         shown.remember(7, vec![quoted], std::time::Instant::now());
 
-        let tool = BookingLinksTool { client: client(&server), shown, chat_id: 7 };
+        let tool = BookingLinksTool { client: client(&server), shown, conversation_id: 7 };
         let found = rig::tool::Tool::call(
             &tool,
             BookingLinksArgs { ignav_id: "abc123".to_string() },
@@ -756,7 +756,7 @@ mod booking_tests {
             std::time::Instant::now(),
         );
 
-        let tool = BookingLinksTool { client: client(&server), shown, chat_id: 7 };
+        let tool = BookingLinksTool { client: client(&server), shown, conversation_id: 7 };
         let found =
             rig::tool::Tool::call(&tool, BookingLinksArgs { ignav_id: "abc123".to_string() })
                 .await
@@ -855,7 +855,7 @@ mod live {
             account_id: 1,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
-            chat_id: 1,
+            conversation_id: 1,
             ignav: Some(client.clone()),
         };
         let out = rig::tool::Tool::call(&tool, query).await.unwrap();

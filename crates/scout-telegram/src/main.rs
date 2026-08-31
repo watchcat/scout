@@ -2,6 +2,7 @@ mod bot;
 mod draft;
 mod progress;
 mod scheduler;
+mod scope;
 mod text;
 
 use anyhow::Result;

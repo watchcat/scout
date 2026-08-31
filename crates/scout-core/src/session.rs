@@ -6,30 +6,16 @@ use rig::completion::Message as LlmMessage;
 /// LLM check decides whether the next message resumes it.
 pub const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// In a 1:1 chat Telegram makes the chat id equal the user id, and that is
-/// the thread the web app will share. Anywhere else is a room with other
-/// people in it and keeps its own history.
-pub fn conversation_scope(chat_id: i64, user_id: i64) -> String {
-    if chat_id == user_id {
-        "direct".to_string()
-    } else {
-        format!("telegram:{chat_id}")
-    }
-}
-
 /// The account behind a Telegram user, created on first sight.
 ///
-/// Everything below the adapter is keyed by account id; `sender_id` is a
-/// Telegram id. This is the single place the two meet, so a caller that
-/// forgets to convert gets a type that is still an `i64` but a name that
-/// says which one it is.
-pub async fn account_of(core: &Core, telegram_id: i64) -> anyhow::Result<i64> {
+/// The one place the two id spaces meet. Everything below is keyed by
+/// account id, and the argument type is now what stops a caller passing the
+/// wrong number: it used to be an `i64` with a hopeful name.
+pub async fn account_of(core: &Core, id: crate::ids::TelegramId) -> anyhow::Result<i64> {
     let store = core.deps.store.clone();
-    crate::core::blocking(move || store.account_for_telegram(telegram_id)).await
+    crate::core::blocking(move || store.account_for_telegram(id.0)).await
 }
 
-/// Runs a `Store` call off the async executor. The connection is behind a
-/// blocking mutex, so every one of these has to leave the reactor thread.
 /// Which conversation this message belongs to.
 ///
 /// After a long gap the old thread is set aside and a quick LLM check
@@ -38,11 +24,10 @@ pub async fn account_of(core: &Core, telegram_id: i64) -> anyhow::Result<i64> {
 /// survives a restart.
 pub async fn resolve_conversation(
     core: &Core,
-    user_id: i64,
+    account_id: i64,
     scope: &str,
     text: &str,
 ) -> anyhow::Result<i64> {
-    let account_id = account_of(core, user_id).await?;
     let ttl = SESSION_TTL.as_secs() as i64;
     let store = core.deps.store.clone();
     let (scope_owned, latest) = {
@@ -74,18 +59,18 @@ pub async fn resolve_conversation(
     }
     match crate::agent::continues_previous(&core.deps.llm, &excerpt, text).await {
         Ok(true) => {
-            tracing::info!(user_id, id, "session expired but topic continues; keeping context");
+            tracing::info!(account_id, id, "session expired but topic continues; keeping context");
             let store = core.deps.store.clone();
             crate::core::blocking(move || store.touch_conversation(id)).await?;
             Ok(id)
         }
         Ok(false) => {
-            tracing::info!(user_id, "session expired; starting fresh");
+            tracing::info!(account_id, "session expired; starting fresh");
             let store = core.deps.store.clone();
             crate::core::blocking(move || store.start_conversation(account_id, &scope_owned)).await
         }
         Err(e) => {
-            tracing::warn!(error = %e, user_id, "continuation check failed; starting fresh");
+            tracing::warn!(error = %e, account_id, "continuation check failed; starting fresh");
             let store = core.deps.store.clone();
             crate::core::blocking(move || store.start_conversation(account_id, &scope_owned)).await
         }
@@ -99,26 +84,28 @@ pub async fn resolve_conversation(
 /// A failed count lets the message through. The cap is a cost guard, not an
 /// access control — the gate above it already decided this person is
 /// allowed here — and a database blip should not silence everyone at once.
-pub async fn over_daily_cap(core: &Core, user_id: i64) -> Option<String> {
-    if core.is_founder(user_id) {
-        return None;
+pub async fn over_daily_cap(core: &Core, account_id: i64) -> Option<String> {
+    match core.founder_account(account_id).await {
+        Ok(true) => return None,
+        Ok(false) => {}
+        // Same reasoning as a failed count below: the cap is a cost guard,
+        // not access control, and a database blip must not silence everyone.
+        Err(e) => {
+            tracing::warn!(error = %e, account_id, "founder check failed; letting it through");
+            return None;
+        }
     }
     let cap = core.cfg.invite_daily_requests;
     let store = core.deps.store.clone();
-    let used = match crate::core::blocking(move || {
-        let account_id = store.account_for_telegram(user_id)?;
-        store.requests_today(account_id)
-    })
-    .await
-    {
+    let used = match crate::core::blocking(move || store.requests_today(account_id)).await {
         Ok(used) => used,
         Err(e) => {
-            tracing::warn!(error = %e, user_id, "daily cap check failed; letting it through");
+            tracing::warn!(error = %e, account_id, "daily cap check failed; letting it through");
             return None;
         }
     };
     (used >= cap).then(|| {
-        tracing::info!(user_id, used, cap, "daily cap reached");
+        tracing::info!(account_id, used, cap, "daily cap reached");
         format!("You've used today's {cap} requests. It resets at midnight UTC.")
     })
 }
@@ -186,14 +173,10 @@ pub(crate) fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
 ///
 /// History lives in the store now, so clearing an in-memory slot would clear
 /// nothing — /reset has to mean a new thread or it means nothing.
-pub async fn reset(core: &Core, telegram_id: i64, scope: &str) -> anyhow::Result<i64> {
+pub async fn reset(core: &Core, account_id: i64, scope: &str) -> anyhow::Result<i64> {
     let store = core.store();
     let scope = scope.to_string();
-    crate::core::blocking(move || {
-        let account_id = store.account_for_telegram(telegram_id)?;
-        store.start_conversation(account_id, &scope)
-    })
-    .await
+    crate::core::blocking(move || store.start_conversation(account_id, &scope)).await
 }
 
 #[cfg(test)]
@@ -249,14 +232,5 @@ mod tests {
 
         let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
         assert_eq!(loaded.len(), 1, "a trimmed history must not grow back");
-    }
-
-    #[test]
-    fn the_scope_of_a_private_chat_is_shared_and_a_group_is_not() {
-        // Telegram makes chat id equal user id in a 1:1 chat, and that
-        // thread is the one the web app will share. A group is a room with
-        // other people in it and keeps its own history.
-        assert_eq!(conversation_scope(4242, 4242), "direct");
-        assert_eq!(conversation_scope(-100123, 4242), "telegram:-100123");
     }
 }

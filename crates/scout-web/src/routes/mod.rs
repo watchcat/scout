@@ -7,6 +7,7 @@
 
 pub mod account;
 pub mod auth;
+pub mod chat;
 
 use crate::{pages, session, AuthState};
 use axum::http::{header, HeaderMap, Method, StatusCode};

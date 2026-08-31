@@ -135,7 +135,8 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         // policy that gets loosened for a reason that was never about it.
         Some(auth) => public.merge(
             routes::auth::routes(auth.clone())
-                .merge(routes::account::routes(auth))
+                .merge(routes::account::routes(auth.clone()))
+                .merge(routes::chat::routes(auth))
                 .layer(axum::middleware::from_fn(security_headers)),
         ),
         None => public,

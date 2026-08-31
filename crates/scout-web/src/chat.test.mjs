@@ -59,12 +59,23 @@ test('the finished answer replaces what the tokens built', () => {
   assert.equal(finalAnswer({ status: 'ok', answer: '' }, 'my reasoning'), '')
 })
 
-test('a stream that carries no answer leaves the bubble alone', () => {
+test('an ok end with no answer leaves the bubble alone', () => {
   // Absent is not empty. A server part-way through a rollout still sends
   // `{"status":"ok"}` on its own, and blanking a good reply over a deploy
   // would be worse than showing what streamed.
   assert.equal(finalAnswer({ status: 'ok' }, 'the streamed text'), 'the streamed text')
-  assert.equal(finalAnswer({ status: 'busy' }, 'the streamed text'), 'the streamed text')
-  assert.equal(finalAnswer({ status: 'error', message: 'boom' }, 'partial'), 'partial')
+  // Neither is an end this client cannot read.
+  assert.equal(finalAnswer({ status: 'something-new' }, 'the streamed text'), 'the streamed text')
   assert.equal(finalAnswer(null, 'partial'), 'partial')
+})
+
+test('a run that failed leaves no half-answer above the apology', () => {
+  // Observed: "Good — QP620/50 is in stock at MediaMarkt (27.99 + 2.99
+  // verzending). Let me grab the live price" sat directly above "Sorry,
+  // something went wrong on my side". That is the narration the model
+  // writes between tool calls, and above an apology it reads as an answer
+  // cut off mid-sentence rather than as nothing.
+  assert.equal(finalAnswer({ status: 'error', message: 'boom' }, 'Let me grab the live price'), '')
+  // Busy produced nothing either — the run never started.
+  assert.equal(finalAnswer({ status: 'busy' }, ''), '')
 })

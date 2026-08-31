@@ -21,13 +21,25 @@ export function applyUpdate(answer, update) {
 // carries what the run actually answered, so an `ok` end replaces the
 // bubble outright. Replacing with an empty string is deliberate: it means
 // the run produced nothing but reasoning, and the bubble has to clear.
+// A `busy` or `error` end clears it for the same reason — neither produced
+// an answer, and the notice beside it is the whole message.
 //
 // A missing `answer` is a different instruction from an empty one, and is
 // not a retraction. A server part-way through a rollout still sends
 // `{"status":"ok"}` on its own, and blanking a good answer because of a
 // deploy would be worse than showing what streamed.
 export function finalAnswer(end, streamed) {
-  if (end && end.status === 'ok' && typeof end.answer === 'string') return end.answer
+  if (!end) return streamed
+  if (end.status === 'ok') {
+    return typeof end.answer === 'string' ? end.answer : streamed
+  }
+  // A run that failed, or never started, produced no answer. What streamed
+  // is the model's working — the narration it writes between tool calls —
+  // and leaving that above an apology reads as an answer cut off
+  // mid-sentence rather than as nothing.
+  if (end.status === 'error' || end.status === 'busy') return ''
+  // An end this client does not recognise is not a reason to throw away
+  // what the reader can already see.
   return streamed
 }
 
@@ -233,7 +245,14 @@ function start() {
           const finished = finalAnswer(end, answer)
           if (finished !== answer) {
             answer = finished
-            renderAnswer()
+            if (answer === '' && answerLi) {
+              // An empty bubble is not a cleared one. Take the turn off the
+              // page rather than leave a blank one behind the notice.
+              answerLi.remove()
+              answerLi = null
+            } else {
+              renderAnswer()
+            }
           }
         }
       }

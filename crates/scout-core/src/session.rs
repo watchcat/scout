@@ -98,26 +98,28 @@ pub async fn resolve_conversation(
 /// A failed count lets the message through. The cap is a cost guard, not an
 /// access control — the gate above it already decided this person is
 /// allowed here — and a database blip should not silence everyone at once.
-pub async fn over_daily_cap(core: &Core, user_id: i64) -> Option<String> {
-    if core.is_founder(user_id) {
-        return None;
+pub async fn over_daily_cap(core: &Core, account_id: i64) -> Option<String> {
+    match core.founder_account(account_id).await {
+        Ok(true) => return None,
+        Ok(false) => {}
+        // Same reasoning as a failed count below: the cap is a cost guard,
+        // not access control, and a database blip must not silence everyone.
+        Err(e) => {
+            tracing::warn!(error = %e, account_id, "founder check failed; letting it through");
+            return None;
+        }
     }
     let cap = core.cfg.invite_daily_requests;
     let store = core.deps.store.clone();
-    let used = match crate::core::blocking(move || {
-        let account_id = store.account_for_telegram(user_id)?;
-        store.requests_today(account_id)
-    })
-    .await
-    {
+    let used = match crate::core::blocking(move || store.requests_today(account_id)).await {
         Ok(used) => used,
         Err(e) => {
-            tracing::warn!(error = %e, user_id, "daily cap check failed; letting it through");
+            tracing::warn!(error = %e, account_id, "daily cap check failed; letting it through");
             return None;
         }
     };
     (used >= cap).then(|| {
-        tracing::info!(user_id, used, cap, "daily cap reached");
+        tracing::info!(account_id, used, cap, "daily cap reached");
         format!("You've used today's {cap} requests. It resets at midnight UTC.")
     })
 }

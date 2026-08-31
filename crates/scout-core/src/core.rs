@@ -237,6 +237,18 @@ impl Core {
         is_founder(&self.cfg.allowed_user_ids, telegram_id)
     }
 
+    /// Whether this account belongs to a founder.
+    ///
+    /// A founder is a Telegram id by configuration — `ALLOWED_TELEGRAM_USER_IDS`
+    /// — so the question can only be asked of an account by looking up which
+    /// Telegram ids it can prove. That is one query, and it buys the right
+    /// answer for a founder who signs in from a browser instead.
+    pub async fn founder_account(&self, account_id: i64) -> anyhow::Result<bool> {
+        let store = self.store();
+        let ids = blocking(move || store.telegram_ids(account_id)).await?;
+        Ok(ids.iter().any(|id| self.cfg.allowed_user_ids.contains(id)))
+    }
+
     pub fn is_admin(&self, telegram_id: i64) -> bool {
         is_admin_id(&self.cfg.admin_user_ids, telegram_id)
     }

@@ -216,6 +216,7 @@ mod tests {
         // them drifting.
         assert!(crate::links::repair_prompt(&["https://x/404".into()]).starts_with(SYSTEM_NOTE));
         assert!(crate::agent::WRAP_UP_NOTE.starts_with(SYSTEM_NOTE));
+        assert!(crate::toolcall::REPAIR_NOTE.starts_with(SYSTEM_NOTE));
     }
 
     #[test]

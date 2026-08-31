@@ -11,20 +11,35 @@
     --base0:#839496; --base1:#93a1a1; --base2:#eee8d5; --base3:#fdf6e3;
     --yellow:#b58900; --orange:#cb4b16; --red:#dc322f; --magenta:#d33682;
     --violet:#6c71c4; --blue:#268bd2; --cyan:#2aa198; --green:#859900;
+    /* A six-step type scale. Twelve sizes drifted onto this page one
+       reasonable half-pixel at a time. The display steps carry their own
+       clamp so every use site stays a bare var() — writing the clamp at the
+       use site would make h1 the single exception to the system, which is
+       the failure this exists to remove. */
+    --t-xs:13px; --t-sm:15px; --t-base:16px; --t-lede:19px;
+    --t-word:clamp(26px,3.4vw,32px); --t-display:clamp(33px,5.5vw,44px);
+    /* Spacing on a 4px base. */
+    --s-1:4px; --s-2:8px; --s-3:12px; --s-4:16px;
+    --s-5:24px; --s-6:32px; --s-7:48px; --s-8:72px;
+    /* One curve. The built-in easings are too weak to read as deliberate. */
+    --ease-out:cubic-bezier(.23,1,.32,1);
+    /* Was a bare #0d4a5a in two separate places. */
+    --rule:#0d4a5a;
   }
   *{box-sizing:border-box}
   body{
     margin:0; background:var(--base03); color:var(--base0);
-    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+    font-size:var(--t-base); line-height:1.65;
     -webkit-font-smoothing:antialiased;
   }
-  .wrap{max-width:880px; margin:0 auto; padding:0 24px}
+  .wrap{max-width:880px; margin:0 auto; padding:0 var(--s-5)}
   a{color:var(--blue); text-decoration:none}
   a:hover{text-decoration:underline}
   code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.92em;
-    background:var(--base02); padding:1px 5px; border-radius:3px; color:var(--cyan)}
+    background:var(--base02); padding:1px var(--s-1); border-radius:3px; color:var(--cyan)}
 
-  header{padding:70px 0 42px}
+  header{padding:var(--s-8) 0 var(--s-7)}
   /* The lockup: the mark at display size, wordmark beside it. Two things
      it deliberately does not do. It does not carry the tile the .svg ships
      with — that tile is a near-black green, and against the solarized
@@ -32,19 +47,19 @@
      does not thin its strokes for the larger size: lightening them looked
      delicate next to a 700-weight wordmark, and a mark that changes shape
      with its size is two marks. The geometry here is icon.svg's, untouched. */
-  .mark{display:flex; align-items:center; gap:18px; margin-bottom:26px;
+  .mark{display:flex; align-items:center; gap:var(--s-4); margin-bottom:var(--s-5);
     color:var(--cyan)}
   .mark .logo{width:96px; height:96px; flex:none}
-  .mark .word{font-size:32px; font-weight:700; letter-spacing:-.01em;
+  .mark .word{font-size:var(--t-word); font-weight:700; letter-spacing:-.01em;
     color:var(--base2)}
-  h1{font-size:44px; line-height:1.15; margin:0 0 20px; color:var(--base2);
+  h1{font-size:var(--t-display); line-height:1.15; margin:0 0 var(--s-4); color:var(--base2);
     font-weight:700; letter-spacing:-.02em}
   h1 em{font-style:normal; color:var(--base01)}
-  .lede{font-size:19px; max-width:37em; margin:0 0 32px; color:var(--base0)}
+  .lede{font-size:var(--t-lede); max-width:37em; margin:0 0 var(--s-6); color:var(--base0)}
 
   .board{
-    background:var(--base02); border-radius:6px; padding:18px 20px; margin:0 0 12px;
-    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13.5px;
+    background:var(--base02); border-radius:6px; padding:var(--s-4); margin:0 0 var(--s-3);
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:var(--t-xs);
     overflow-x:auto; line-height:1.9;
   }
   .board .row{white-space:pre; color:var(--base1); display:block}
@@ -52,66 +67,66 @@
   .board .unit{color:var(--green); font-weight:600}
   .board .ship{color:var(--orange)}
   .board .shop{color:var(--base01)}
-  .board .hdr{color:var(--base01); border-bottom:1px solid #0d4a5a;
-    padding-bottom:6px; margin-bottom:6px; display:block}
-  .caption{font-size:13.5px; color:var(--base01); margin:0 0 34px; max-width:44em}
+  .board .hdr{color:var(--base01); border-bottom:1px solid var(--rule);
+    padding-bottom:var(--s-2); margin-bottom:var(--s-2); display:block}
+  .caption{font-size:var(--t-xs); color:var(--base01); margin:0 0 var(--s-6); max-width:44em}
 
-  .gate{background:var(--base02); border:1px solid #0d4a5a; border-radius:6px;
-    padding:22px 24px; display:flex; align-items:center; gap:20px; flex-wrap:wrap}
-  .pill{display:inline-flex; align-items:center; gap:8px; font-size:13px; font-weight:600;
-    padding:5px 12px; border-radius:999px; white-space:nowrap}
+  .gate{background:var(--base02); border:1px solid var(--rule); border-radius:6px;
+    padding:var(--s-5); display:flex; align-items:center; gap:var(--s-5); flex-wrap:wrap}
+  .pill{display:inline-flex; align-items:center; gap:var(--s-2); font-size:var(--t-xs);
+    font-weight:600; padding:var(--s-1) var(--s-3); border-radius:999px; white-space:nowrap}
   .pill.open{background:rgba(133,153,0,.14); color:var(--green); border:1px solid rgba(133,153,0,.35)}
   .pill.full{background:rgba(203,75,22,.14); color:var(--orange); border:1px solid rgba(203,75,22,.35)}
   .dot{width:7px; height:7px; border-radius:50%; background:currentColor}
-  .gate p{margin:0; flex:1; min-width:220px; font-size:15px}
-  .btn{background:var(--blue); color:var(--base03); font-weight:650; font-size:15px;
-    padding:11px 22px; border-radius:5px; border:0; white-space:nowrap}
+  .gate p{margin:0; flex:1; min-width:220px; font-size:var(--t-sm)}
+  .btn{background:var(--blue); color:var(--base03); font-weight:650;
+    font-size:var(--t-sm); padding:var(--s-3) var(--s-5); border-radius:5px;
+    border:0; white-space:nowrap}
   .btn:hover{text-decoration:none; background:#3196d8}
   .btn.ghost{background:transparent; color:var(--base1); border:1px solid var(--base01)}
 
-  section{padding:30px 0}
-  h2{font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:var(--base01);
-    margin:0 0 20px; font-weight:600}
-  h3{margin:0 0 7px; font-size:16.5px; color:var(--base1); font-weight:650}
-  .cols{display:grid; grid-template-columns:repeat(3,1fr); gap:26px}
-  .cols p{margin:0; font-size:14.5px; color:var(--base00)}
+  section{padding:var(--s-6) 0}
+  h2{font-size:var(--t-xs); letter-spacing:.14em; text-transform:uppercase;
+    color:var(--base01); margin:0 0 var(--s-4); font-weight:600}
+  h3{margin:0 0 var(--s-2); font-size:var(--t-base); color:var(--base1); font-weight:650}
+  .cols{display:grid; grid-template-columns:repeat(3,1fr); gap:var(--s-5)}
+  .cols p{margin:0; font-size:var(--t-sm); color:var(--base00)}
 
   .chat{background:var(--base02); border-left:3px solid var(--violet);
-    padding:14px 18px; border-radius:0 4px 4px 0; margin:0 0 14px; font-size:15px;
-    color:var(--base1); font-style:italic}
+    padding:var(--s-3) var(--s-4); border-radius:0 4px 4px 0; margin:0 0 var(--s-3);
+    font-size:var(--t-sm); color:var(--base1); font-style:italic}
 
-  .src{border-top:1px solid var(--base02); padding:16px 0; display:grid;
-    grid-template-columns:170px 1fr; gap:20px; align-items:start}
-  .src .who{font-weight:650; color:var(--base1); font-size:15px}
-  .src .tag{display:block; font-size:11.5px; font-weight:600; letter-spacing:.08em;
-    text-transform:uppercase; margin-top:5px}
+  .src{border-top:1px solid var(--base02); padding:var(--s-4) 0; display:grid;
+    grid-template-columns:170px 1fr; gap:var(--s-5); align-items:start}
+  .src .who{font-weight:650; color:var(--base1); font-size:var(--t-sm)}
+  .src .tag{display:block; font-size:var(--t-xs); font-weight:600; letter-spacing:.08em;
+    text-transform:uppercase; margin-top:var(--s-1)}
   .tag.official{color:var(--green)}
   .tag.unofficial{color:var(--yellow)}
   .tag.read{color:var(--cyan)}
-  .src p{margin:0; font-size:14.5px; color:var(--base00)}
+  .src p{margin:0; font-size:var(--t-sm); color:var(--base00)}
 
-  table{width:100%; border-collapse:collapse; font-size:14.5px}
-  td{padding:13px 0; vertical-align:top; border-top:1px solid var(--base02)}
-  td.bad{color:var(--base01); width:50%; padding-right:26px}
+  table{width:100%; border-collapse:collapse; font-size:var(--t-sm)}
+  td{padding:var(--s-3) 0; vertical-align:top; border-top:1px solid var(--base02)}
+  td.bad{color:var(--base01); width:50%; padding-right:var(--s-5)}
   td.good{color:var(--base0)}
   .bad b{color:var(--red); font-weight:600}
   .good b{color:var(--green); font-weight:600}
 
-  .aside{background:var(--base02); border-radius:6px; padding:18px 22px; font-size:14.5px}
-  .aside h3{margin-bottom:6px}
+  .aside{background:var(--base02); border-radius:6px; padding:var(--s-4) var(--s-5);
+    font-size:var(--t-sm)}
+  .aside h3{margin-bottom:var(--s-2)}
   .aside p{margin:0; color:var(--base00)}
 
-  footer{margin-top:36px; padding:26px 0 60px; border-top:1px solid var(--base02);
-    font-size:14px; color:var(--base01); display:flex; gap:22px; flex-wrap:wrap}
+  footer{margin-top:var(--s-6); padding:var(--s-5) 0 var(--s-8); border-top:1px solid var(--base02);
+    font-size:var(--t-sm); color:var(--base01); display:flex; gap:var(--s-5); flex-wrap:wrap}
   @media(max-width:680px){
-    .mark{gap:14px; margin-bottom:20px}
+    .mark{gap:var(--s-3); margin-bottom:var(--s-4);}
     .mark .logo{width:66px; height:66px}
-    .mark .word{font-size:26px}
-    .cols{grid-template-columns:1fr; gap:20px}
-    .src{grid-template-columns:1fr; gap:6px}
-    h1{font-size:33px}
-    td.bad,td.good{display:block; width:auto; padding-right:0}
-    td.bad{border-top:1px solid var(--base02); padding-bottom:4px}
+    .cols{grid-template-columns:1fr; gap:var(--s-4)}
+    .src{grid-template-columns:1fr; gap:var(--s-2)}
+    td.bad,td.good{display:block; width:auto; padding-right:0;}
+    td.bad{border-top:1px solid var(--base02); padding-bottom:var(--s-1)}
     td.good{border-top:0; padding-top:0}
   }
 </style>

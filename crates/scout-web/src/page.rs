@@ -251,4 +251,42 @@ mod tests {
         assert!(!page.contains(r#"href="/sign-in""#));
         assert!(!page.contains(r#"href="/chat""#));
     }
+
+    #[test]
+    fn every_size_on_the_page_comes_from_the_scale() {
+        // Twelve font sizes and nineteen spacing values did not arrive at
+        // once. They arrived one reasonable half-pixel at a time — 14px
+        // beside 14.5px, which nobody can see and everybody can feel. The
+        // tokens are the fix; this is what stops it happening again.
+        //
+        // Narrow on purpose: `border-radius`, `border-width`, `gap` and the
+        // logo's own `96px` are not spacing, and a test that claimed they
+        // were would be wrong in a way someone would eventually silence.
+        let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+
+        for decl in css.split(';') {
+            let decl = decl.trim();
+            if let Some(value) = decl.strip_prefix("font-size:") {
+                assert!(
+                    !value.contains("px"),
+                    "font-size outside the scale: {decl}\n\
+                     every size is a var(--t-…); `em` is fine, a bare px is not"
+                );
+            }
+            // `padding` and `margin` and every longhand of them:
+            // `padding-right` and `margin-top` are both in use today, and
+            // matching only the shorthand would let them keep drifting.
+            let Some((property, value)) = decl.split_once(':') else { continue };
+            if property.starts_with("padding") || property.starts_with("margin") {
+                for token in value.split_whitespace() {
+                    assert!(
+                        !token.ends_with("px") || token == "1px",
+                        "spacing outside the scale: {decl}\n\
+                         every value is a var(--s-…), 0, or a 1px hairline"
+                    );
+                }
+            }
+        }
+    }
 }

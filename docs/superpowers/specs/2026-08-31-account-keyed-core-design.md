@@ -11,11 +11,20 @@ This makes the entry points account-keyed. It is a refactor, not a feature.
 
 ## What this is not
 
-**No behaviour changes.** Every one of the 559 existing tests passes
-unmodified. That is the acceptance criterion rather than a hope: a test that
-needs editing is evidence the refactor altered something it claimed not to, and
-the edit is the bug report. The one new test named below adds coverage for a
-property that was previously untested, and does not change an existing one.
+**No behaviour changes.** The first draft of this section said every one of the
+559 existing tests passes unmodified. Writing the plan showed that to be
+unachievable and therefore useless as a criterion: changing a function
+signature forces mechanical edits at roughly ten test sites that construct the
+affected types. The rule that survives is narrower and actually checkable:
+
+> **No test's assertions or expected values change.** Only identifiers and
+> struct-literal field names change, and only where a signature changed.
+
+A changed `assert_eq!` right-hand side is evidence the refactor altered
+something it claimed not to, and is reported rather than adjusted. The plan
+enumerates the forced edits up front, so an unexpected one is visible as
+unexpected. The one new test named below adds coverage for a property that was
+previously untested, and changes no existing one.
 
 Nothing here adds an endpoint, a page, or a way for a browser to reach the
 agent. W3 does that, and can only do it once this lands.
@@ -41,7 +50,7 @@ today core calls it three times, buried inside functions that took a Telegram
 id; afterwards the adapter calls it once, at its boundary, and core never
 converts anything again.
 
-## The four call sites
+## The call sites
 
 Only the parameters that change are listed; everything else keeps its shape.
 `run_agent` still takes its event sink, its `conversation_id` and its prompt.
@@ -51,7 +60,21 @@ Only the parameters that change are listed; everything else keeps its shape.
 | `run_agent` | `user_id`, `chat_id` | `account_id`, `ReplyTo` |
 | `resolve_conversation` | `user_id` | `account_id` |
 | `over_daily_cap` | `user_id` | `account_id` |
+| `reset` | `telegram_id` | `account_id` |
+| `Core::log_request` | `telegram_id` | `account_id` |
 | `account_of` | `telegram_id: i64` | `TelegramId` |
+
+`Core::log_request` was missed when this document said "four call sites" and
+was found while writing the plan. It matters more than its size suggests: the
+daily cap counts the rows it writes, so a caller that cannot log a request
+cannot be capped, and a web client that could not be capped would be a hole
+rather than an omission.
+
+Three neighbours deliberately stay Telegram-keyed. `note_display_name` and
+`note_address` record facts only Telegram supplies. `is_founder` and
+`is_admin` read `ALLOWED_TELEGRAM_USER_IDS`, which is Telegram ids by
+definition — `Core::founder_account` asks the same question of an account by
+looking up which Telegram ids it can prove.
 
 ## Splitting `chat_id`
 

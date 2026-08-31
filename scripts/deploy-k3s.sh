@@ -136,8 +136,15 @@ step "kubectl apply namespace" \
 # that only the backup CronJob reads.
 #
 # Both are piped in and never written to the node's disk.
+#
+# The deploy's own three go the same way for the same reason. They configure
+# the ingress, the certificate issuer and this script; nothing in the bot
+# reads them, and `envsubst` substitutes them into the manifests here rather
+# than the container resolving them there. A process that renders untrusted
+# pages should not be handed the address of the machine it runs on.
+NOT_THE_BOTS='^(AWS_|RESTIC_)|^SCOUT_(DOMAIN|ACME_EMAIL|SSH)='
 step "kubectl create secret scout (bot keys only)" \
-    && grep -vE '^(AWS_|RESTIC_)' .env | "${SSH[@]}" 'kubectl -n scout create secret generic scout \
+    && grep -vE "$NOT_THE_BOTS" .env | "${SSH[@]}" 'kubectl -n scout create secret generic scout \
          --from-env-file=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -'
 
 # Only if there are any: the cluster is usable before R2 is set up.

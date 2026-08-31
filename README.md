@@ -276,10 +276,17 @@ not source the file:
 export SCOUT_DOMAIN="$(grep -m1 '^SCOUT_DOMAIN=' .env | cut -d= -f2-)"
 ```
 
-Everything in `.env` except `AWS_*` and `RESTIC_*` reaches the bot's own
-environment through that Secret, these three included. That is harmless —
-none of them is a credential — but it is worth knowing before adding
-anything else to the file.
+`.env` is the single source of truth for secrets, and it is split three ways
+on the way in. `AWS_*` and `RESTIC_*` go to a separate Secret that only the
+backup CronJob reads, so the bot cannot reach the credentials that could
+delete every backup. These three deploy variables go into neither Secret —
+they configure the ingress, the issuer and the script itself, and nothing in
+the bot reads them. Everything else becomes the bot's own environment.
+
+The rule for anything added to the file: if the running bot does not read it,
+it should not be in the bot's Secret. That process fetches arbitrary web
+pages, renders them in headless Chromium and feeds the result to a language
+model, so its environment is worth keeping small.
 
 `scripts/deploy-k3s.sh` takes **no database backup**. DuckDB is
 single-writer, so the only consistent copy comes from `/backup`, an admin

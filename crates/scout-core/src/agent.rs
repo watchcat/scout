@@ -714,7 +714,7 @@ pub fn build_agent(
             // Outlives the request: booking happens a turn later, when the
             // memo above is gone.
             shown: d.shown.clone(),
-            chat_id,
+            conversation_id: chat_id,
             // Priced in the traveller's own currency, or Duffel's euros
             // and Ignav's dollars never get compared.
             ignav: d
@@ -734,7 +734,7 @@ pub fn build_agent(
                 // produced it.
                 client: ignav.clone(),
                 shown: d.shown.clone(),
-                chat_id,
+                conversation_id: chat_id,
             });
         }
         builder = builder.tool(crate::tools::trips::FinaliseTripTool {

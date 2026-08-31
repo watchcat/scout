@@ -32,10 +32,10 @@ pub struct FlightSearchTool {
     /// than bookable, so they arrive labelled and the ranking warns when
     /// one of them undercuts a price somebody could actually pay.
     pub ignav: Option<crate::tools::ignav::IgnavClient>,
-    /// What this chat was last shown, so a booking lookup in a later
-    /// message can tell a real offer id from an invented one.
+    /// What this conversation was last shown, so a booking lookup in a
+    /// later message can tell a real offer id from an invented one.
     pub shown: std::sync::Arc<crate::tools::shown::ShownFlights>,
-    pub chat_id: i64,
+    pub conversation_id: i64,
 }
 
 impl rig::tool::Tool for FlightSearchTool {
@@ -138,7 +138,7 @@ impl rig::tool::Tool for FlightSearchTool {
         // when the per-request memo above is long gone.
         let now = std::time::Instant::now();
         self.shown.evict_expired(now);
-        self.shown.remember(self.chat_id, out.picks.all(), now);
+        self.shown.remember(self.conversation_id, out.picks.all(), now);
         // Travels with the prices it is baked into. Relying on the preamble
         // alone was measured failing in production: a reply quoted a fare
         // that silently included the fee and never mentioned it.
@@ -2894,7 +2894,7 @@ mod client_tests {
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
                 ignav: None,
                 shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
-                chat_id: 1,
+                conversation_id: 1,
             },
             dir,
         )
@@ -2968,7 +2968,7 @@ mod client_tests {
             account_id: 7,
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
-            chat_id: 1,
+            conversation_id: 1,
             ignav: Some(crate::tools::ignav::IgnavClient::new(
                 reqwest::Client::new(),
                 "k".to_string(),
@@ -3534,7 +3534,7 @@ mod links_tests {
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             ignav: None,
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
-            chat_id: 1,
+            conversation_id: 1,
         };
         let out = rig::tool::Tool::call(&tool, query()).await.unwrap();
         assert!(
@@ -3551,7 +3551,7 @@ mod links_tests {
             budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
             ignav: None,
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
-            chat_id: 1,
+            conversation_id: 1,
         };
         let out = rig::tool::Tool::call(&plain, query()).await.unwrap();
         assert!(!out.notes.iter().any(|n| n.contains("booking fee")), "got: {:?}", out.notes);
@@ -3642,7 +3642,7 @@ mod live {
                 budget: std::sync::Arc::new(crate::tools::budget::FlightBudget::default()),
                 ignav: None,
                 shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
-                chat_id: 1,
+                conversation_id: 1,
             };
             let out = rig::tool::Tool::call(&tool, query).await.unwrap();
             println!("LIVE route={} bought={}", out.route, tool.budget.spent());

@@ -39,6 +39,26 @@ function render(text) {
   return linkify(escapeHtml(text))
 }
 
+// How close to the bottom still counts as "following along". 32px rather
+// than 0 because a reader who nudged the wheel one line has not stopped
+// following, and a strict comparison would strand them a pixel short and
+// never scroll again.
+const FOLLOW_SLACK = 32
+
+// Whether new content should be scrolled into view. Pure, so the rule that
+// makes a streaming answer bearable can be tested without a browser.
+export function shouldFollow(scrollTop, clientHeight, scrollHeight, slack = FOLLOW_SLACK) {
+  return scrollHeight - scrollTop - clientHeight <= slack
+}
+
+// Tallest the composer may grow, in px — about five lines at this font.
+// Matches the `max-height` in chat.html; if one changes the other must.
+const COMPOSER_CAP = 200
+
+export function composerHeight(scrollHeight, cap = COMPOSER_CAP) {
+  return Math.min(scrollHeight, cap)
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')
@@ -48,6 +68,35 @@ function start() {
   const textEl = document.getElementById('text')
   const sendButton = document.getElementById('send')
   const resetForm = document.getElementById('reset')
+
+  // Enter sends, Shift+Enter is a newline. `requestSubmit` rather than
+  // `submit` because it runs the form's own validation — so Enter on an
+  // empty box does nothing, which is the guard the button already relied
+  // on via `required`.
+  textEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      askForm.requestSubmit()
+    }
+  })
+
+  // Grow to fit, then stop. Reset to `auto` first or `scrollHeight` keeps
+  // reporting the height already set and the box only ever grows.
+  function fitComposer() {
+    textEl.style.height = 'auto'
+    textEl.style.height = `${composerHeight(textEl.scrollHeight)}px`
+  }
+  textEl.addEventListener('input', fitComposer)
+
+  // Decide *before* appending, act after: once the new content is in the
+  // DOM the reader's position looks different and the question cannot be
+  // asked honestly any more.
+  function following() {
+    return shouldFollow(turnsEl.scrollTop, turnsEl.clientHeight, turnsEl.scrollHeight)
+  }
+  function follow(wasFollowing) {
+    if (wasFollowing) turnsEl.scrollTop = turnsEl.scrollHeight
+  }
 
   function turnElement(role, text) {
     const li = document.createElement('li')
@@ -86,6 +135,7 @@ function start() {
     for (const turn of turns) {
       turnsEl.append(turnElement(turn.role, turn.text))
     }
+    turnsEl.scrollTop = turnsEl.scrollHeight
   }
 
   // Splits one SSE block ("event: ...\ndata: ...") into its two fields.
@@ -113,11 +163,13 @@ function start() {
     let sawEnd = false
 
     function renderAnswer() {
+      const wasFollowing = following()
       if (!answerLi) {
         answerLi = turnElement('Scout', '')
         turnsEl.append(answerLi)
       }
       answerLi.innerHTML = render(answer)
+      follow(wasFollowing)
     }
 
     try {
@@ -199,8 +251,14 @@ function start() {
     const text = textEl.value.trim()
     if (!text) return
     textEl.value = ''
+    // A box grown to five lines must shrink back, or it sits tall and
+    // empty over the answer it just asked for.
+    fitComposer()
     hideNotice()
     turnsEl.append(turnElement('You', text))
+    // Unconditional, unlike the answer: sending is an act that means "show
+    // me", so it is not content arriving under a reader who moved away.
+    turnsEl.scrollTop = turnsEl.scrollHeight
 
     running = true
     sendButton.disabled = true

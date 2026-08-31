@@ -417,6 +417,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_page_still_carries_every_id_the_client_binds_to() {
+        // Restyling is exactly the edit that silently unhooks a handler:
+        // the JS asks for these by id, and a missing one fails in the
+        // browser and nowhere else. Moving the reset control between
+        // sections is the specific risk here.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+
+        for id in ["turns", "status", "notice", "ask", "text", "send", "reset"] {
+            assert!(page.contains(&format!(r#"id="{id}""#)), "the client binds to #{id}: {page}");
+        }
+    }
+
+    #[tokio::test]
     async fn the_client_script_is_served_as_javascript() {
         let (app, _core, _dir) = test_app().await;
         let res = get(&app, "/chat.js").await;

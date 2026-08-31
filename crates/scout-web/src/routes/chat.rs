@@ -51,7 +51,19 @@ async fn admitted_account(auth: &AuthState, headers: &HeaderMap) -> Result<i64, 
             return Err(sorry());
         }
     };
-    if !standing.member {
+    // Founder *or* member, the same pair the Telegram gate asks about. A
+    // founder is admitted by `ALLOWED_TELEGRAM_USER_IDS` and deliberately
+    // holds no `members` row — the account-keying work made a point of
+    // handing back a seat one had picked up by accident — so a gate reading
+    // only membership would turn away the people paying for the bot.
+    let founder = match auth.core.founder_account(account_id).await {
+        Ok(founder) => founder,
+        Err(e) => {
+            tracing::error!(error = %e, "could not tell whether an account is a founder");
+            return Err(sorry());
+        }
+    };
+    if !standing.member && !founder {
         // The chat costs real model calls, and a queued account has not
         // been admitted to spend them. `/account` already explains where
         // they stand, so it does the explaining.
@@ -340,6 +352,28 @@ mod tests {
                 address: "12345".to_string(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_founder_gets_in_without_ever_holding_a_seat() {
+        // `Config::for_test`-style config makes telegram 111 the founder.
+        // No round is open here, so nobody can be seated at all — which is
+        // the point: founders are admitted by the allow-list and hold no
+        // members row, and the reconciliation added earlier hands back any
+        // seat one picks up. A gate reading only membership locks out the
+        // people who pay for the bot.
+        let (app, core, _dir) = test_app().await;
+        let (scout_core::identity::SignIn::In { account_id }
+        | scout_core::identity::SignIn::Queued { account_id }) =
+            scout_core::identity::sign_in(&core, "telegram", "111").await.unwrap();
+        assert!(
+            !scout_core::identity::standing(&core, account_id).await.unwrap().member,
+            "this test is vacuous if the founder holds a seat"
+        );
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+
+        let res = get_with_cookie(&app, "/chat", &cookie).await;
+        assert_eq!(res.status(), StatusCode::OK, "a founder was turned away from the chat");
     }
 
     #[tokio::test]

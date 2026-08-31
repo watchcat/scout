@@ -956,7 +956,12 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         crate::progress::render_events(live, incoming),
     );
     match result {
-        Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
+        Ok(scout_core::run::RunOutcome::Answered(reply)) => {
+            deliver(&bot, &app, &mut live, chat_id, &reply).await?
+        }
+        Ok(scout_core::run::RunOutcome::Busy) => {
+            live.show("I'm still working on your last message — one moment.", true).await;
+        }
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "agent request failed");
             // Replace the progress message rather than sending a second one:
@@ -1180,7 +1185,12 @@ async fn handle_reaction(
         crate::progress::render_events(live, incoming),
     );
     match result {
-        Ok(reply) => deliver(&bot, &app, &mut live, chat_id, &reply).await?,
+        Ok(scout_core::run::RunOutcome::Answered(reply)) => {
+            deliver(&bot, &app, &mut live, chat_id, &reply).await?
+        }
+        Ok(scout_core::run::RunOutcome::Busy) => {
+            live.show("I'm still working on your last message — one moment.", true).await;
+        }
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "reaction follow-up failed");
             live.show(scout_core::run::agent_error_message(&e), true).await;

@@ -6,6 +6,16 @@ use rig::agent::MultiTurnStreamItem;
 use rig::completion::{Chat, Message as LlmMessage};
 use rig::streaming::{StreamedAssistantContent, StreamingChat};
 
+/// What a run produced.
+///
+/// `Busy` is not an error: asking two questions at once in one thread is an
+/// ordinary thing to do. Each channel words it itself rather than core
+/// writing chat copy.
+pub enum RunOutcome {
+    Answered(String),
+    Busy,
+}
+
 /// Runs the agent against a snapshot of this chat's history, then writes the
 /// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
 /// from being held across awaits.
@@ -22,7 +32,10 @@ pub async fn run_agent(
     events: scout_api::EventSink,
     run: &scout_api::RunContext,
     prompt: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RunOutcome> {
+    let Some(_guard) = begin_run(&core.deps.running, run.conversation_id) else {
+        return Ok(RunOutcome::Busy);
+    };
     let (account_id, conversation_id) = (run.account_id, run.conversation_id);
     let facts = {
         let store = core.deps.store.clone();
@@ -209,7 +222,34 @@ pub async fn run_agent(
         // worse than not saving it, but it is not worth failing the reply.
         tracing::warn!(error = %e, conversation_id, "could not save the conversation");
     }
-    Ok(reply)
+    Ok(RunOutcome::Answered(reply))
+}
+
+/// Held for the length of a run. Dropping it frees the conversation, so a
+/// panic, a timeout or a dropped future cannot wedge a thread forever —
+/// which an insert/remove pair around the body would.
+pub(crate) struct RunGuard {
+    running: std::sync::Arc<dashmap::DashSet<i64>>,
+    conversation_id: i64,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.running.remove(&self.conversation_id);
+    }
+}
+
+/// Claims a conversation, or `None` if a run already holds it.
+///
+/// `DashSet::insert` reports whether the value was new, which makes this an
+/// atomic check-and-claim rather than a check followed by a claim.
+pub(crate) fn begin_run(
+    running: &std::sync::Arc<dashmap::DashSet<i64>>,
+    conversation_id: i64,
+) -> Option<RunGuard> {
+    running
+        .insert(conversation_id)
+        .then(|| RunGuard { running: running.clone(), conversation_id })
 }
 
 /// Turn an agent failure into a user-facing message; the max-turns budget
@@ -476,5 +516,24 @@ mod tests {
         assert!(text.contains("369.94"), "and so is the answer: {text}");
         assert!(!text.contains("ToolCall"), "but the tool calls are gone");
         assert!(!text.contains("ToolResult"), "and so are their results");
+    }
+
+    #[test]
+    fn a_conversation_admits_one_run_and_frees_itself_when_it_ends() {
+        // Two runs on one thread both load the history and both write it
+        // back wholesale, so the second erases the first's exchange. A
+        // laptop and a phone on the shared `direct` thread make that
+        // ordinary rather than rare.
+        let running = std::sync::Arc::new(dashmap::DashSet::new());
+        let first = begin_run(&running, 7).expect("the first run should start");
+        assert!(begin_run(&running, 7).is_none(), "a second run got in");
+        // A different thread is unaffected.
+        assert!(begin_run(&running, 8).is_some());
+
+        drop(first);
+        assert!(
+            begin_run(&running, 7).is_some(),
+            "the conversation stayed locked after its run ended"
+        );
     }
 }

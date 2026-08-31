@@ -1,7 +1,5 @@
-//! The chat page: the seat that pays for it, what was already said, and a
-//! message going in.
-//!
-//! `POST /chat/reset` is a later task's.
+//! The chat page: the seat that pays for it, what was already said, a
+//! message going in, and a fresh thread.
 
 use super::{see_other, signed_in_as, sorry};
 use crate::{session, AuthState};
@@ -24,6 +22,7 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat.js", get(client))
         .route("/chat/history", get(history))
         .route("/chat/messages", post(send_message))
+        .route("/chat/reset", post(reset))
         // On the router rather than threaded through individual handlers —
         // the same reason it is on `account::routes` — so a handler that
         // forgot to check it is not the one that matters.
@@ -223,6 +222,23 @@ async fn send_message(
     });
 
     sse_response(rx)
+}
+
+async fn reset(axum::extract::State(auth): axum::extract::State<AuthState>, headers: HeaderMap) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match scout_core::session::reset(&auth.core, account_id, "direct").await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "could not reset a conversation");
+            sorry()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -436,5 +452,22 @@ mod tests {
             post_json_with_cookie(&app, "/chat/messages", &cookie, Some(&csrf), r#"{"text":"hi"}"#).await,
         ).await;
         assert_eq!(body.matches("event: end").count(), 1, "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_reset_starts_a_thread_that_does_not_remember_the_last_one() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        let res = post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        assert!(
+            scout_core::session::transcript(&core, account_id).await.unwrap().is_empty(),
+            "the new thread still remembers the old one"
+        );
     }
 }

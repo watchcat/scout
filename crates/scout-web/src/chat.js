@@ -12,6 +12,25 @@ export function applyUpdate(answer, update) {
   return answer
 }
 
+// What the bubble should show once the stream's `end` frame arrives.
+//
+// The bubble up to this point was built from token deltas, and those are
+// every turn of a multi-turn run concatenated — including the "let me check
+// the next shop" narration the model writes between tool calls, and any
+// link the run's dead-link repair removed afterwards. The `end` frame
+// carries what the run actually answered, so an `ok` end replaces the
+// bubble outright. Replacing with an empty string is deliberate: it means
+// the run produced nothing but reasoning, and the bubble has to clear.
+//
+// A missing `answer` is a different instruction from an empty one, and is
+// not a retraction. A server part-way through a rollout still sends
+// `{"status":"ok"}` on its own, and blanking a good answer because of a
+// deploy would be worse than showing what streamed.
+export function finalAnswer(end, streamed) {
+  if (end && end.status === 'ok' && typeof end.answer === 'string') return end.answer
+  return streamed
+}
+
 // `&` first, or escaping `<`/`>` into `&lt;`/`&gt;` would itself get its
 // `&` escaped a second time.
 export function escapeHtml(text) {
@@ -210,6 +229,11 @@ function start() {
             showNotice('Scout is already answering something else. Try again in a moment.')
           } else if (end.status === 'error') {
             showNotice(end.message)
+          }
+          const finished = finalAnswer(end, answer)
+          if (finished !== answer) {
+            answer = finished
+            renderAnswer()
           }
         }
       }

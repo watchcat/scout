@@ -1386,6 +1386,26 @@ async fn handle_kick(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_note_this_channel_writes_to_itself_is_marked_so_it_is_never_rendered() {
+        // Both notes below are appended to, or sent as, a user message, and
+        // `rig` saves the prompt into the history — so anything unmarked
+        // gets rendered back to the reader on the web page as something
+        // they said. The marker is what `session::turns_of` cuts on.
+        let asked = format!("find me the cheapest one{}", super::PRICE_REQUEST_NOTE);
+        assert_eq!(scout_core::text::said_by_person(&asked), "find me the cheapest one");
+
+        // A tripwire, not a count that matters: adding a note here should
+        // make someone check it carries the marker before changing this.
+        let src = include_str!("bot.rs");
+        assert_eq!(
+            src.matches(scout_core::text::SYSTEM_NOTE).count(),
+            2,
+            "a note this channel writes to itself must carry the marker, or the reader \
+             will see it in their transcript as their own words"
+        );
+    }
+
+    #[test]
     fn the_gate_answers_from_memory_alone() {
         // Not a style point. The gate runs on every update, including from
         // people who were never invited, so a store read here means anyone

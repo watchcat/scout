@@ -197,13 +197,39 @@ pub(crate) fn latest_direct(store: &crate::store::Store, account_id: i64) -> any
 /// flattened: that one exists to feed a classifier a blob, this one exists
 /// to be rendered.
 pub(crate) fn transcript_of(store: &crate::store::Store, conversation_id: i64) -> anyhow::Result<Vec<scout_api::Turn>> {
-    let history = load_history(store, conversation_id, HISTORY_CAP)?;
-    Ok(history
+    Ok(turns_of(&load_history(store, conversation_id, HISTORY_CAP)?))
+}
+
+/// Whether an assistant message is an answer rather than a step of one.
+///
+/// A message that carries a tool call is the model working. Whatever text
+/// sits beside the call is what it says on its way to an answer — "let me
+/// check the next shop" — and the finished reply is the turn with no call
+/// left to make, because had there been one the agent would have kept
+/// going. So the presence of a call, not the absence of text, is the test.
+fn is_answer(content: &rig::OneOrMany<rig::message::AssistantContent>) -> bool {
+    !content
+        .iter()
+        .any(|c| matches!(c, rig::message::AssistantContent::ToolCall(_)))
+}
+
+/// The turns a history should be rendered as, oldest first.
+///
+/// Split out of `transcript_of` because the store half needs a database and
+/// this half is the part that can be wrong: which messages count as things
+/// that were said, and what is stripped from them before they are shown.
+fn turns_of(history: &[LlmMessage]) -> Vec<scout_api::Turn> {
+    history
         .iter()
         .filter_map(|m| match m {
-            LlmMessage::User { content } => {
-                text_of_user(content).map(|text| scout_api::Turn { role: scout_api::Role::You, text })
-            }
+            // Cut, because `rig`'s `Chat::chat` appends the prompt it is
+            // given to the history — so the dead-link repair's own
+            // instruction was saved as a user message and rendered back to
+            // the person as something they had said.
+            LlmMessage::User { content } => text_of_user(content).map(|text| scout_api::Turn {
+                role: scout_api::Role::You,
+                text: crate::text::said_by_person(&text).to_string(),
+            }),
             // Stripped, because what is *stored* is the model's raw message:
             // `run_agent` saves `res.messages()`, tags and all, and only the
             // reply it hands the channel goes through `strip_thinking`.
@@ -211,15 +237,16 @@ pub(crate) fn transcript_of(store: &crate::store::Store, conversation_id: i64) -
             // page does, and rendering it raw put a whole chain of thought
             // on screen — permanently, on every load, rather than for the
             // moment a stream does.
-            LlmMessage::Assistant { content, .. } => text_of_assistant(content)
-                .map(|text| scout_api::Turn {
+            LlmMessage::Assistant { content, .. } if is_answer(content) => {
+                text_of_assistant(content).map(|text| scout_api::Turn {
                     role: scout_api::Role::Scout,
                     text: crate::text::strip_thinking(&text),
-                }),
+                })
+            }
             _ => None,
         })
         .filter(|t| !t.text.trim().is_empty())
-        .collect())
+        .collect()
 }
 
 /// The current thread's transcript, or empty when there is no thread yet.
@@ -277,6 +304,74 @@ pub async fn seed_exchange_for_tests(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn narrating_tool_call(text: &str, tool: &str) -> LlmMessage {
+        // What a multi-turn run actually stores for a step: the model says
+        // what it is about to do, and calls the tool in the same message.
+        LlmMessage::Assistant {
+            id: None,
+            content: rig::OneOrMany::many([
+                rig::message::AssistantContent::text(text),
+                rig::message::AssistantContent::ToolCall(rig::message::ToolCall::new(
+                    "call-1".to_string(),
+                    rig::message::ToolFunction {
+                        name: tool.to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                )),
+            ])
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn an_instruction_scout_gave_itself_is_not_shown_as_the_persons_words() {
+        // `rig`'s `Chat::chat` appends the prompt to the history, so the
+        // dead-link repair — which runs on exactly the price answers this
+        // bot exists to write — left its own instruction in the transcript
+        // wearing the reader's name.
+        let history = vec![
+            LlmMessage::user("find me cheapest gillette\n\n[system note] This is a cheapest-price request."),
+            LlmMessage::user(crate::links::repair_prompt(&["https://bol.com/404".to_string()])),
+            LlmMessage::assistant("EUR 40.44 delivered"),
+        ];
+        let turns = turns_of(&history);
+        assert_eq!(turns.len(), 2, "got: {:?}", turns.iter().map(|t| &t.text).collect::<Vec<_>>());
+        assert_eq!(turns[0].text, "find me cheapest gillette");
+        assert_eq!(turns[1].text, "EUR 40.44 delivered");
+    }
+
+    #[test]
+    fn the_narration_a_run_writes_between_tool_calls_is_not_a_turn() {
+        // Measured on a real transcript: a price comparison rendered as a
+        // page of "Let me check Kruidvat, ShaveSavings and bol.com", then
+        // "The shavesavings 8-pack is out of stock", then the answer — one
+        // bubble per step of the run, permanently, on every reload.
+        //
+        // A message carrying a tool call is the model working. The text
+        // beside the call is what it says on its way to an answer, not the
+        // answer: the finished reply is the turn with no call left to make,
+        // because had there been one the agent would have kept going.
+        let history = vec![
+            LlmMessage::user("find me cheapest gillette cartridges"),
+            narrating_tool_call("Let me check Kruidvat, ShaveSavings and bol.com.", "search"),
+            narrating_tool_call("The 8-pack is out of stock. Let me check delivery.", "fetch_page"),
+            LlmMessage::assistant("EUR 40.44 delivered — 16-pack, shavesavings.com"),
+        ];
+        let turns = turns_of(&history);
+        assert_eq!(turns.len(), 2, "got: {:?}", turns.iter().map(|t| &t.text).collect::<Vec<_>>());
+        assert_eq!(turns[0].text, "find me cheapest gillette cartridges");
+        assert_eq!(turns[1].text, "EUR 40.44 delivered — 16-pack, shavesavings.com");
+    }
+
+    #[test]
+    fn a_rendered_turn_still_has_its_reasoning_stripped() {
+        // The other half of the same guarantee: what is stored is the
+        // model's raw message, tags and all, so the answer turn is stripped
+        // at render time — including the namespaced spelling.
+        let history = vec![LlmMessage::assistant("my reasoning</mm:think>The answer")];
+        assert_eq!(turns_of(&history)[0].text, "The answer");
+    }
 
     #[test]
     fn last_messages_text_renders_roles_and_takes_tail() {

@@ -235,6 +235,32 @@ pub async fn reset(core: &Core, account_id: i64, scope: &str) -> anyhow::Result<
     crate::core::blocking(move || store.start_conversation(account_id, &scope)).await
 }
 
+/// Records an exchange as though it had already happened, without spending
+/// a model call.
+///
+/// `Store` and `save_history` stay private to this crate — that boundary is
+/// deliberate, see the module doc at the crate root — so this is the one
+/// door a caller outside the crate has to them. It exists for tests that
+/// need `transcript` to return something real: the only other public writer
+/// of history is `run::run_agent`, which means talking to a live model.
+pub async fn seed_exchange(
+    core: &Core,
+    account_id: i64,
+    scope: &str,
+    you_said: &str,
+    scout_said: &str,
+) -> anyhow::Result<i64> {
+    let store = core.store();
+    let scope = scope.to_string();
+    let (you_said, scout_said) = (you_said.to_string(), scout_said.to_string());
+    crate::core::blocking(move || {
+        let id = store.start_conversation(account_id, &scope)?;
+        save_history(&store, id, &[LlmMessage::user(you_said), LlmMessage::assistant(scout_said)])?;
+        Ok(id)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

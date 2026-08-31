@@ -20,6 +20,7 @@ pub fn routes(auth: AuthState) -> Router {
     Router::new()
         .route("/chat", get(chat))
         .route("/chat.js", get(client))
+        .route("/chat/history", get(history))
         // Nothing here changes state yet, but the layer goes on with the
         // routes rather than waiting for the first `POST` that needs it —
         // the same reason it is on `account::routes` rather than threaded
@@ -33,6 +34,11 @@ pub fn routes(auth: AuthState) -> Router {
 
 /// The account this request may spend model calls as, or the redirect that
 /// says why not.
+///
+/// Shared between `chat` and `history`: both refuse a signed-out visitor
+/// and a queued one identically, and a page that gated one way while its
+/// own history endpoint gated another would be a door with two locks that
+/// disagree.
 async fn admitted_account(auth: &AuthState, headers: &HeaderMap) -> Result<i64, Response> {
     let Some(account_id) = signed_in_as(auth, headers) else {
         return Err(see_other("/sign-in"));
@@ -66,6 +72,20 @@ async fn client() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], CLIENT)
 }
 
+async fn history(axum::extract::State(auth): axum::extract::State<AuthState>, headers: HeaderMap) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match scout_core::session::transcript(&auth.core, account_id).await {
+        Ok(turns) => axum::Json(turns).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "could not read a transcript");
+            sorry()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tests::*;
@@ -93,6 +113,21 @@ mod tests {
             panic!("the round has room, so this should have admitted");
         };
         account_id
+    }
+
+    /// Seeds a two-message exchange under the `"direct"` scope, the same
+    /// scope `/chat` reads from.
+    ///
+    /// `scout_core::session::save_history` is `pub(crate)` to scout-core,
+    /// and so is `Core::store()` — the module that holds `Store` is not
+    /// `pub` at all, so there is no path from here to write a message
+    /// directly. `scout_core::session::seed_exchange` was added to close
+    /// that gap: it is the one door through `Store` that this crate did
+    /// not already have, kept narrow (an exchange, not a `Store` handle)
+    /// so the privacy boundary the crate's top-level doc comment describes
+    /// stays intact everywhere else.
+    async fn seed_conversation(core: &scout_core::core::Core, account_id: i64, you: &str, scout: &str) {
+        scout_core::session::seed_exchange(core, account_id, "direct", you, scout).await.unwrap();
     }
 
     #[tokio::test]
@@ -147,5 +182,33 @@ mod tests {
                 .starts_with("text/javascript"),
             "a module served as the wrong type is refused by the browser"
         );
+    }
+
+    #[tokio::test]
+    async fn history_is_empty_for_someone_who_has_never_spoken_and_creates_nothing() {
+        // A page visit must not write rows.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+
+        let body = body_of(get_with_cookie(&app, "/chat/history", &cookie).await).await;
+        assert_eq!(body, "[]");
+
+        assert!(
+            scout_core::session::transcript(&core, account_id).await.unwrap().is_empty(),
+            "asking for history minted a conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_returns_what_was_said() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+
+        let body = body_of(get_with_cookie(&app, "/chat/history", &cookie).await).await;
+        assert!(body.contains("cheapest beans"), "got: {body}");
+        assert!(body.contains(r#""You""#), "the role is not on the wire: {body}");
     }
 }

@@ -16,6 +16,7 @@ pub mod identity;
 pub mod ids;
 pub mod invites;
 pub mod links;
+pub mod mirror;
 pub mod run;
 mod schedule;
 pub mod session;

@@ -1,3 +1,54 @@
+/// How a piece of streamed text changed.
+///
+/// `Replace` is not an optimisation escape hatch — it is required. The
+/// answer can *shrink*: `strip_thinking` discards everything before a
+/// closing tag that has no opener, because such a closer means the text
+/// began inside a thinking block. A client that only ever appends would go
+/// on showing reasoning the run has already retracted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TextUpdate {
+    Append(String),
+    Replace(String),
+}
+
+impl TextUpdate {
+    /// Moves accumulated text forward by this update.
+    ///
+    /// The counterpart of `Shown::update`. Every client does exactly this,
+    /// which is why it lives here rather than being written twice.
+    pub fn apply(&self, into: &mut String) {
+        match self {
+            TextUpdate::Append(delta) => into.push_str(delta),
+            TextUpdate::Replace(text) => {
+                into.clear();
+                into.push_str(text);
+            }
+        }
+    }
+}
+
+/// What a client has been shown so far, and what to send it next.
+///
+/// Producers hold one of these per stream of text and feed it the whole
+/// text each time; it works out the smallest honest update. `None` means
+/// nothing changed and no event is worth sending.
+#[derive(Debug, Default, Clone)]
+pub struct Shown(String);
+
+impl Shown {
+    pub fn update(&mut self, next: &str) -> Option<TextUpdate> {
+        if next == self.0 {
+            return None;
+        }
+        let update = match next.strip_prefix(self.0.as_str()) {
+            Some(rest) => TextUpdate::Append(rest.to_string()),
+            None => TextUpdate::Replace(next.to_string()),
+        };
+        self.0 = next.to_string();
+        Some(update)
+    }
+}
+
 /// What the agent has to say while it works, independent of who is
 /// listening.
 ///
@@ -154,5 +205,45 @@ mod tests {
 
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<ReplyTo>(&json).unwrap(), r);
+    }
+
+    #[test]
+    fn growing_text_produces_appends_and_shrinking_text_produces_a_replace() {
+        let mut shown = Shown::default();
+        assert_eq!(shown.update("Here"), Some(TextUpdate::Append("Here".into())));
+        assert_eq!(shown.update("Here are"), Some(TextUpdate::Append(" are".into())));
+        // Not an extension, so the client has to be told to start over.
+        assert_eq!(shown.update("Hello"), Some(TextUpdate::Replace("Hello".into())));
+    }
+
+    #[test]
+    fn text_that_did_not_change_produces_no_event_at_all() {
+        // Otherwise every streamed token inside a <think> block would send
+        // an empty Append.
+        let mut shown = Shown::default();
+        shown.update("same");
+        assert_eq!(shown.update("same"), None);
+    }
+
+    #[test]
+    fn becoming_empty_is_a_replace_and_not_silence() {
+        // The retraction. `strip_thinking` discards everything before a
+        // stray closer, so the answer can go from text to nothing, and a
+        // client that is not told will keep showing reasoning.
+        let mut shown = Shown::default();
+        shown.update("secret reasoning here");
+        assert_eq!(shown.update(""), Some(TextUpdate::Replace(String::new())));
+    }
+
+    #[test]
+    fn applying_updates_in_order_reproduces_the_text_that_produced_them() {
+        let mut shown = Shown::default();
+        let mut client = String::new();
+        for step in ["a", "ab", "abc", "xyz", "", "done"] {
+            if let Some(update) = shown.update(step) {
+                update.apply(&mut client);
+            }
+            assert_eq!(client, step, "client drifted from the source text");
+        }
     }
 }

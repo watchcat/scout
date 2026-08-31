@@ -21,10 +21,17 @@ pub const TELEGRAM: &str = "telegram";
 /// stable across Rust releases, and a key that changed under a toolchain
 /// upgrade would re-send every thread the reader had already read.
 ///
-/// The `\x1f` separator is a unit separator, which cannot occur in a role
-/// name and will not occur in prose. Without it, conversation 1 turn "23"
-/// and conversation 12 turn "3" hash the same, and a collision here drops a
-/// message with no error anywhere.
+/// The `\x1f` separators are insurance against a change to these fields,
+/// not a fix for a collision that exists today. Measured: with this exact
+/// layout the concatenation is already injective, because the id is digits,
+/// a role starts with a letter, and neither role name is a prefix of the
+/// other — so `1|you|23` and `12|you|3` cannot be confused even unseparated.
+///
+/// The first draft of this claimed otherwise, and shipped a test that
+/// asserted the two keys differ. They do, with or without the separators,
+/// so the test passed under its own mutation and could never have failed.
+/// The separators stay because hashing concatenated fields without them is
+/// a habit that bites the first time a field stops being digits.
 pub fn turn_key(conversation_id: i64, role: Role, text: &str) -> String {
     let role = match role {
         Role::You => "you",
@@ -73,10 +80,12 @@ mod tests {
     }
 
     #[test]
-    fn the_separator_cannot_be_moved_by_the_text() {
-        // Without a separator that cannot appear in the parts, conversation
-        // 1 turn "23" and conversation 12 turn "3" would collide. Contrived,
-        // but a collision here silently drops somebody's message.
+    fn neighbouring_fields_cannot_be_confused_for_one_another() {
+        // Kept because the property is worth holding, stated as what it is:
+        // these differ because the layout is unambiguous, and they would
+        // differ without the separators too. `a_different_turn_has_a
+        // _different_key` is what actually guards the key's job.
         assert_ne!(turn_key(1, Role::You, "23"), turn_key(12, Role::You, "3"));
+        assert_ne!(turn_key(1, Role::Scout, "x"), turn_key(1, Role::You, "scoutx"));
     }
 }

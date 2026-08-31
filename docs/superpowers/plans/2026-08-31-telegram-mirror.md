@@ -158,10 +158,10 @@ git commit -m "feat: somewhere to queue a mirrored turn"
 In `crates/scout-core/Cargo.toml`, under `[dependencies]`, after `base64 = "0.22"`:
 
 ```toml
-sha2 = "0.13"
+sha2 = "0.11"
 ```
 
-`scout-web` already depends on `sha2 = "0.13"`; use the same version so the workspace resolves one copy.
+`scout-web` already depends on `sha2 = "0.11"` — 0.11, not 0.13; the `hmac = "0.13"` on the line above it is a different crate. Use 0.11 so the workspace resolves one copy rather than a third.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -198,11 +198,15 @@ mod tests {
     }
 
     #[test]
-    fn the_separator_cannot_be_moved_by_the_text() {
-        // Without a separator that cannot appear in the parts, conversation
-        // 1 turn "23" and conversation 12 turn "3" would collide. Contrived,
-        // but a collision here silently drops somebody's message.
+    fn neighbouring_fields_cannot_be_confused_for_one_another() {
+        // Stated as what it is. Measured: with this layout the
+        // concatenation is already injective — the id is digits, a role
+        // starts with a letter, and neither role name is a prefix of the
+        // other — so these differ with or without the separators. An
+        // earlier draft claimed the separators were what made them differ,
+        // and the test passed under its own mutation as a result.
         assert_ne!(turn_key(1, Role::You, "23"), turn_key(12, Role::You, "3"));
+        assert_ne!(turn_key(1, Role::Scout, "x"), turn_key(1, Role::You, "scoutx"));
     }
 }
 ```
@@ -241,10 +245,13 @@ pub const TELEGRAM: &str = "telegram";
 /// stable across Rust releases, and a key that changed under a toolchain
 /// upgrade would re-send every thread the reader had already read.
 ///
-/// The `\x1f` separator is a unit separator, which cannot occur in a role
-/// name and will not occur in prose. Without it, conversation 1 turn "23"
-/// and conversation 12 turn "3" hash the same, and a collision here drops a
-/// message with no error anywhere.
+/// The `\x1f` separators are insurance against a change to these fields,
+/// not a fix for a collision that exists today. Measured: with this exact
+/// layout the concatenation is already injective, because the id is digits,
+/// a role starts with a letter, and neither role name is a prefix of the
+/// other — so `1|you|23` and `12|you|3` cannot be confused even unseparated.
+/// They stay because hashing concatenated fields without them is a habit
+/// that bites the first time a field stops being digits.
 pub fn turn_key(conversation_id: i64, role: Role, text: &str) -> String {
     let role = match role {
         Role::You => "you",
@@ -270,9 +277,12 @@ cargo test -p scout-core --lib mirror::
 
 Expected: PASS, 3 tests.
 
-- [ ] **Step 6: Mutation-check it**
+- [ ] **Step 6: Do not mutation-check the separators**
 
-Delete the two `hasher.update(b"\x1f");` lines, run the tests, and confirm `the_separator_cannot_be_moved_by_the_text` fails. Restore them.
+They are not load-bearing with this field layout and no test will go red when
+they are removed — that is stated in the doc comment rather than pretended
+otherwise. Mutation-check `a_different_turn_has_a_different_key` instead by
+dropping the `role` from the hash: it must fail.
 
 - [ ] **Step 7: Commit**
 

@@ -105,7 +105,19 @@ cannot issue a `POST` and the message has to go somewhere. The cost is losing
 its automatic reconnection, which the failure handling below makes
 unnecessary.
 
-Each SSE event carries one JSON `AgentEvent`. The client holds an `answer`
+Each SSE event carries one JSON `AgentEvent` under the event name `agent`,
+plus exactly one closing `end` frame carrying `{"status":"ok"}`,
+`{"status":"busy"}` or `{"status":"error","message":"..."}`.
+
+That envelope was missing from the first draft of this document and was found
+while writing the plan. `AgentEvent` has no variant meaning "finished", so a
+stream that merely stopped would be ambiguous — a completed answer, a refused
+run and a crash all look identical to a client, and two of the three would
+leave a spinner up forever. The envelope is defined in `scout-web`, not in
+`AgentEvent`, because it is about one transport rather than about what the
+agent has to say.
+
+ The client holds an `answer`
 string and applies each `TextUpdate` exactly as `render_events` does for
 Telegram — `Append` pushes, `Replace` assigns. **A client that only appended
 would keep reasoning on screen after the run retracted it**; that is the

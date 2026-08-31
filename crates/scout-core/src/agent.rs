@@ -674,7 +674,11 @@ pub fn build_agent(
         .tool(ComparePricesTool)
         .tool(RecordPurchaseTool { store: d.store.clone(), account_id })
         .tool(QueryPurchasesTool { store: d.store.clone(), account_id })
-        .tool(CreateReminderTool { store: d.store.clone(), account_id, chat_id })
+        .tool(CreateReminderTool {
+            store: d.store.clone(),
+            account_id,
+            reply_to: scout_api::ReplyTo::telegram(chat_id),
+        })
         .tool(ListRemindersTool { store: d.store.clone(), account_id })
         .tool(CancelReminderTool { store: d.store.clone(), account_id })
         .tool(RememberFactTool { store: d.store.clone(), account_id })

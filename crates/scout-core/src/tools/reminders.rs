@@ -2,6 +2,7 @@ use super::purchases::{internal, StoreToolError};
 use crate::store::{Reminder, Store};
 use chrono::{Duration, NaiveDate};
 use rig::tool::Tool;
+use scout_api::ReplyTo;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -35,7 +36,9 @@ pub struct CreateReminderArgs {
 pub struct CreateReminderTool {
     pub store: Store,
     pub account_id: i64,
-    pub chat_id: i64,
+    /// Where a reminder made in this run should be delivered. Carried
+    /// rather than looked up, because in a group the address is the group.
+    pub reply_to: scout_api::ReplyTo,
 }
 
 impl Tool for CreateReminderTool {
@@ -91,12 +94,13 @@ impl Tool for CreateReminderTool {
             }
         };
         let store = self.store.clone();
-        let (account_id, chat_id) = (self.account_id, self.chat_id);
+        let account_id = self.account_id;
+        let (channel, address) = (self.reply_to.channel.clone(), self.reply_to.address.clone());
         tokio::task::spawn_blocking(move || {
             store.create_reminder(
                 account_id,
-                "telegram",
-                &chat_id.to_string(),
+                &channel,
+                &address,
                 &args.item,
                 args.interval_days,
                 &next_due,
@@ -224,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn create_list_cancel_via_tools() {
         let (store, _d) = setup();
-        let create = CreateReminderTool { store: store.clone(), account_id: 1, chat_id: 99 };
+        let create = CreateReminderTool { store: store.clone(), account_id: 1, reply_to: ReplyTo::telegram(99) };
         let r = create
             .call(CreateReminderArgs {
                 item: "coffee".into(),
@@ -246,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn create_rejects_bad_interval_and_bad_date() {
         let (store, _d) = setup();
-        let create = CreateReminderTool { store, account_id: 1, chat_id: 99 };
+        let create = CreateReminderTool { store, account_id: 1, reply_to: ReplyTo::telegram(99) };
         assert!(create
             .call(CreateReminderArgs { item: "x".into(), interval_days: 0, next_due: None })
             .await
@@ -259,5 +263,32 @@ mod tests {
             })
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_reminder_made_in_a_group_is_addressed_to_the_group() {
+        // Why `ReplyTo` is carried for the run rather than resolved from
+        // the account's `deliveries` row at delivery time: in a group,
+        // the address is the group. Resolving per-account would send this
+        // wherever its owner last spoke instead.
+        let (store, _d) = setup();
+        let group = ReplyTo::telegram(-100_123);
+        let create = CreateReminderTool {
+            store: store.clone(),
+            account_id: 1,
+            reply_to: group.clone(),
+        };
+
+        let r = create
+            .call(CreateReminderArgs {
+                item: "team coffee".into(),
+                interval_days: 30,
+                next_due: Some("2026-09-01".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(r.channel, "telegram");
+        assert_eq!(r.address, "-100123", "a group reminder lost its group");
     }
 }

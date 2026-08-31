@@ -40,6 +40,10 @@ pub async fn run_agent(
     let mut streamed = String::new();
     // Reasoning arrives on its own channel, separate from the answer text.
     let mut thinking = String::new();
+    // What each client has been shown, so the run can send the smallest
+    // honest update rather than the whole text every token.
+    let mut answer_shown = scout_api::Shown::default();
+    let mut thinking_shown = scout_api::Shown::default();
     let mut final_response = None;
     // The whole streamed run sits inside one deadline. A guard on
     // stream.next() alone is not enough: it leaves every await in the loop
@@ -81,10 +85,13 @@ pub async fn run_agent(
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
                     streamed.push_str(&t.text);
                     // Unclosed <think> blocks render as nothing, so inline
-                    // reasoning never reaches the chat as answer text.
-                    let answer = strip_thinking(&streamed);
-                    if !answer.is_empty() {
-                        scout_api::emit(&events, scout_api::AgentEvent::Answer(answer));
+                    // reasoning never reaches the chat as answer text — and
+                    // when a stray closer proves the text so far *was*
+                    // reasoning, the update is a Replace that takes it back.
+                    // The old `if !answer.is_empty()` guard suppressed
+                    // exactly that event, which is why it is gone.
+                    if let Some(update) = answer_shown.update(&strip_thinking(&streamed)) {
+                        scout_api::emit(&events, scout_api::AgentEvent::Answer(update));
                     }
                 }
                 // MiniMax streams its reasoning on a separate channel. Shown
@@ -94,10 +101,9 @@ pub async fn run_agent(
                 ) => {
                     thinking.push_str(&reasoning);
                     if strip_thinking(&streamed).is_empty() {
-                        scout_api::emit(
-                            &events,
-                            scout_api::AgentEvent::Thinking(thinking.clone()),
-                        );
+                        if let Some(update) = thinking_shown.update(&thinking) {
+                            scout_api::emit(&events, scout_api::AgentEvent::Thinking(update));
+                        }
                     }
                 }
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
@@ -110,10 +116,9 @@ pub async fn run_agent(
                         }
                     }
                     if strip_thinking(&streamed).is_empty() {
-                        scout_api::emit(
-                            &events,
-                            scout_api::AgentEvent::Thinking(thinking.clone()),
-                        );
+                        if let Some(update) = thinking_shown.update(&thinking) {
+                            scout_api::emit(&events, scout_api::AgentEvent::Thinking(update));
+                        }
                     }
                 }
                 MultiTurnStreamItem::FinalResponse(res) => {

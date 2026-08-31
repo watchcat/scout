@@ -1,16 +1,18 @@
-//! The chat page: the seat that pays for it, and what was already said.
+//! The chat page: the seat that pays for it, what was already said, and a
+//! message going in.
 //!
-//! `POST /chat/ask` and `POST /chat/reset` are a later task's — this file
-//! is the read-only half: the page itself, the script it loads, and the
-//! transcript it starts from.
+//! `POST /chat/reset` is a later task's.
 
 use super::{see_other, signed_in_as, sorry};
 use crate::{session, AuthState};
-use axum::http::{header, HeaderMap};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use scout_core::identity;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::StreamExt;
 
 const TEMPLATE: &str = include_str!("../chat.html");
 const CLIENT: &str = include_str!("../chat.js");
@@ -21,10 +23,10 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat", get(chat))
         .route("/chat.js", get(client))
         .route("/chat/history", get(history))
-        // Nothing here changes state yet, but the layer goes on with the
-        // routes rather than waiting for the first `POST` that needs it —
-        // the same reason it is on `account::routes` rather than threaded
-        // through individual handlers.
+        .route("/chat/messages", post(send_message))
+        // On the router rather than threaded through individual handlers —
+        // the same reason it is on `account::routes` — so a handler that
+        // forgot to check it is not the one that matters.
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             super::only_from_our_own_pages,
@@ -84,6 +86,143 @@ async fn history(axum::extract::State(auth): axum::extract::State<AuthState>, he
             sorry()
         }
     }
+}
+
+/// Whether the `X-Scout-Csrf` header carries a token good for this
+/// account. The form token used elsewhere rides in a hidden field because
+/// those pages post a plain HTML form; this one posts JSON, so the same
+/// value travels as a header instead — `csrf_ok_for` does not care which.
+fn csrf_header_ok(auth: &AuthState, headers: &HeaderMap, account_id: i64) -> bool {
+    headers
+        .get("x-scout-csrf")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|token| session::csrf_ok_for(&auth.cfg.session_key, token, account_id))
+}
+
+/// Where this account's reminders should be delivered.
+///
+/// The rule this is meant to implement is "prefer the account's existing
+/// Telegram address, if it has one" — a browser is not itself a delivery
+/// channel, so a reminder made mid-run has to land somewhere else. Reading
+/// that address is not possible from here: `note_delivery` and
+/// `note_address` on `scout_core::core::Core` write the `deliveries` table
+/// but nothing public reads it back, and `Store::telegram_ids` — the one
+/// reader close enough to answer this — is `pub(crate)` to scout_core, not
+/// visible from scout-web. Rather than reach around that boundary or guess
+/// at an address, this always answers "web": a reminder made from a web
+/// run today is created but has no channel polling it, so it simply never
+/// delivers, instead of being sent to a Telegram chat this code cannot
+/// verify still belongs to the same person. Closing this gap needs a
+/// public accessor added to scout_core.
+fn reply_to_for(account_id: i64) -> scout_api::ReplyTo {
+    scout_api::ReplyTo { channel: "web".to_string(), address: account_id.to_string() }
+}
+
+/// Why a stream stopped. `AgentEvent` has no "finished", so a stream that
+/// merely ended would be ambiguous — a completed answer, a refused run and a
+/// crash all look identical to a client, and two of the three would leave a
+/// spinner up forever. Every stream ends with exactly one of these.
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum End {
+    Ok,
+    Busy,
+    Error { message: String },
+}
+
+/// One thing that goes down the wire, and which SSE event name it takes.
+///
+/// `AgentEvent` is serialised untouched under `event: agent`, so the browser
+/// and Telegram consume the identical shape — the protocol run_agent's
+/// caller already speaks, not a second one invented for the web.
+enum Frame {
+    Agent(scout_api::AgentEvent),
+    End(End),
+}
+
+/// Turns a receiver of `Frame`s into the SSE response every `/chat/messages`
+/// path returns through, however it got here — a normal run, a daily cap
+/// refused before one started, or nothing but the final `end`.
+fn sse_response(rx: tokio::sync::mpsc::UnboundedReceiver<Frame>) -> Response {
+    let stream = UnboundedReceiverStream::new(rx).map(|frame| {
+        let event = match frame {
+            Frame::Agent(e) => Event::default().event("agent").json_data(&e),
+            Frame::End(end) => Event::default().event("end").json_data(&end),
+        };
+        // `AgentEvent` and `End` are plain data with no unserialisable
+        // field, so a failure here would be a bug in one of those types,
+        // not in a caller's input — worth a loud panic, not a silent drop.
+        Ok::<_, std::convert::Infallible>(event.expect("a frame always serialises"))
+    });
+    Sse::new(stream).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct MessageIn {
+    text: String,
+}
+
+async fn send_message(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<MessageIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    if let Some(sentence) = scout_core::session::over_daily_cap(&auth.core, account_id).await {
+        let (frames, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = frames.send(Frame::End(End::Error { message: sentence }));
+        return sse_response(rx);
+    }
+
+    let conversation_id =
+        match scout_core::session::resolve_conversation(&auth.core, account_id, "direct", &body.text).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(error = %e, "could not open a conversation");
+                return sorry();
+            }
+        };
+
+    let run = scout_api::RunContext {
+        account_id,
+        conversation_id,
+        reply_to: reply_to_for(account_id),
+    };
+    let core = auth.core.clone();
+    let text = body.text;
+
+    let (agent_tx, agent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (frames, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        // Forward events as they happen. `run_agent` drops its sink when it
+        // returns, which ends this loop — so awaiting the pump is what makes
+        // `end` last rather than racing the final tokens.
+        let pump = {
+            let frames = frames.clone();
+            tokio::spawn(async move {
+                let mut agent_rx = agent_rx;
+                while let Some(event) = agent_rx.recv().await {
+                    let _ = frames.send(Frame::Agent(event));
+                }
+            })
+        };
+        let outcome = scout_core::run::run_agent(&core, agent_tx, &run, &text).await;
+        let _ = pump.await;
+        let _ = frames.send(Frame::End(match outcome {
+            Ok(scout_core::run::RunOutcome::Answered(_)) => End::Ok,
+            Ok(scout_core::run::RunOutcome::Busy) => End::Busy,
+            Err(e) => End::Error { message: scout_core::run::agent_error_message(&e).to_string() },
+        }));
+    });
+
+    sse_response(rx)
 }
 
 #[cfg(test)]
@@ -210,5 +349,92 @@ mod tests {
         let body = body_of(get_with_cookie(&app, "/chat/history", &cookie).await).await;
         assert!(body.contains("cheapest beans"), "got: {body}");
         assert!(body.contains(r#""You""#), "the role is not on the wire: {body}");
+    }
+
+    /// A JSON `POST`, carrying a session cookie and — when given — the
+    /// `X-Scout-Csrf` header a real page would attach from its `<meta>` tag.
+    async fn post_json_with_cookie(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+        csrf: Option<&str>,
+        body: &str,
+    ) -> axum::response::Response {
+        post_json_from_origin_opt(app, uri, session, csrf, "https://example.com", body).await
+    }
+
+    /// The same JSON `POST`, but naming the `Origin` a caller wants sent —
+    /// so a test can exercise `only_from_our_own_pages` from outside it.
+    async fn post_json_from_origin(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+        csrf: &str,
+        origin: &str,
+        body: &str,
+    ) -> axum::response::Response {
+        post_json_from_origin_opt(app, uri, session, Some(csrf), origin, body).await
+    }
+
+    async fn post_json_from_origin_opt(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+        csrf: Option<&str>,
+        origin: &str,
+        body: &str,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("origin", origin)
+            .header("cookie", format!("{}={session}", crate::session::COOKIE));
+        if let Some(csrf) = csrf {
+            req = req.header("x-scout-csrf", csrf);
+        }
+        let req: Request<Body> = req.body(Body::from(body.to_string())).unwrap();
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_post_without_the_csrf_header_is_refused() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let res = post_json_with_cookie(&app, "/chat/messages", &cookie, None, r#"{"text":"hi"}"#).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_post_from_another_origin_is_refused_even_with_a_good_token() {
+        // The token proves Scout exists, not that the request came from
+        // Scout. `only_from_our_own_pages` is the check that does.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+        let res = post_json_from_origin(
+            &app, "/chat/messages", &cookie, &csrf, "https://evil.example", r#"{"text":"hi"}"#,
+        ).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn every_stream_ends_with_exactly_one_end_frame() {
+        // Without it a client cannot tell a finished answer from a refusal
+        // or a crash, and leaves a spinner up forever on two of the three.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+        let body = body_of(
+            post_json_with_cookie(&app, "/chat/messages", &cookie, Some(&csrf), r#"{"text":"hi"}"#).await,
+        ).await;
+        assert_eq!(body.matches("event: end").count(), 1, "got: {body}");
     }
 }

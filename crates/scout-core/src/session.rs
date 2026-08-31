@@ -243,7 +243,11 @@ pub async fn reset(core: &Core, account_id: i64, scope: &str) -> anyhow::Result<
 /// door a caller outside the crate has to them. It exists for tests that
 /// need `transcript` to return something real: the only other public writer
 /// of history is `run::run_agent`, which means talking to a live model.
-pub async fn seed_exchange(
+///
+/// Named for what it is so that nobody reaches for it in earnest: a channel
+/// writing an exchange nobody had is a channel inventing history.
+#[doc(hidden)]
+pub async fn seed_exchange_for_tests(
     core: &Core,
     account_id: i64,
     scope: &str,

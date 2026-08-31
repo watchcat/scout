@@ -121,13 +121,13 @@ mod tests {
     /// `scout_core::session::save_history` is `pub(crate)` to scout-core,
     /// and so is `Core::store()` — the module that holds `Store` is not
     /// `pub` at all, so there is no path from here to write a message
-    /// directly. `scout_core::session::seed_exchange` was added to close
+    /// directly. `scout_core::session::seed_exchange_for_tests` was added to close
     /// that gap: it is the one door through `Store` that this crate did
     /// not already have, kept narrow (an exchange, not a `Store` handle)
     /// so the privacy boundary the crate's top-level doc comment describes
     /// stays intact everywhere else.
     async fn seed_conversation(core: &scout_core::core::Core, account_id: i64, you: &str, scout: &str) {
-        scout_core::session::seed_exchange(core, account_id, "direct", you, scout).await.unwrap();
+        scout_core::session::seed_exchange_for_tests(core, account_id, "direct", you, scout).await.unwrap();
     }
 
     #[tokio::test]

@@ -120,6 +120,24 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_mirror_queue_is_actually_drained() {
+        // Nothing else would say. Without this spawn every queue write
+        // still succeeds, the toggle still reports success, the outbox
+        // fills up, and not one message reaches a phone — with no error
+        // anywhere, because writing to a queue nobody reads is not an
+        // error until somebody looks.
+        //
+        // Stops at the test module for the same reason its neighbour does:
+        // the file below contains the string being searched for.
+        let src = include_str!("main.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        assert!(
+            src.contains("mirror::run("),
+            "the mirror queue is written and never drained"
+        );
+    }
+
+    #[test]
     fn the_front_door_is_drained_before_the_process_exits() {
         // Asserted from the source because nothing here is reachable
         // without a bot token and a bound port. The original code spawned

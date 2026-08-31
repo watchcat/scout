@@ -104,45 +104,51 @@ fn body_of(turn: &scout_api::Turn) -> String {
     }
 }
 
-/// Records an exchange a channel has already shown the reader, so a
-/// backfill does not send it back.
+/// Queues the reader's current thread for a channel.
 ///
-/// This lives here rather than in the channel because it is one half of a
-/// guarantee whose other half is `enqueue`, and the two have to agree on a
-/// key. Measured: with the logic in `scout-telegram`, passing the raw
-/// prompt instead of the cut one broke the agreement and no test in the
-/// workspace failed — that crate cannot build a `Core`, so nothing could
-/// exercise the halves against each other. Here they can be.
+/// **The transcript is the only text this feature mirrors.** Nothing passes
+/// a reply in, and that is the fix for three separate ways the halves could
+/// disagree: `strike_dead` appends a sentence to the reply after the copy
+/// in `messages` was written, the repair paths leave a superseded answer in
+/// the history beside its replacement, and the browser handler quoted the
+/// reader's raw text while Telegram's cut it. All three were the same
+/// mistake — more than one thing claiming to be "the answer".
 ///
-/// `said_by_person` and not `prompt`: what the model was given is not what
-/// the reader typed. A price request carries `PRICE_REQUEST_NOTE` on the
-/// end and a thumbs-up follow-up is nothing *but* a note, while a backfill
-/// reads the transcript, which cuts at the marker. Record the raw text and
-/// the keys differ, and the reader's own question goes back to the chat it
-/// came from.
+/// Enqueueing is idempotent, so calling this after every run costs a few
+/// hashes and writes only what is new. Backfilling and keeping up are
+/// therefore the same operation, not two that have to agree.
+pub async fn queue_thread(
+    core: &Core,
+    account_id: i64,
+    address: &str,
+) -> anyhow::Result<usize> {
+    thread_into_outbox(core, account_id, address, false).await
+}
+
+/// Records the reader's current thread as already shown to them.
+///
+/// What the Telegram channel calls after it has delivered an answer: the
+/// rows occupy their keys with `sent_at` set, so a later backfill finds
+/// nothing to send and cannot echo the chat's own messages back at it.
 pub async fn record_delivered(
     core: &Core,
     account_id: i64,
     address: &str,
-    conversation_id: i64,
-    prompt: &str,
-    answered: &str,
 ) -> anyhow::Result<usize> {
-    let mut turns = Vec::new();
-    // Empty when the prompt was nothing but a note to the model, which is
-    // every thumbs-up follow-up. A backfill drops empty turns, so there is
-    // no key for one to occupy.
-    let asked = crate::text::said_by_person(prompt);
-    if !asked.is_empty() {
-        turns.push(scout_api::Turn { role: Role::You, text: asked.to_string() });
-    }
-    if !answered.trim().is_empty() {
-        turns.push(scout_api::Turn { role: Role::Scout, text: answered.to_string() });
-    }
-    if turns.is_empty() {
+    thread_into_outbox(core, account_id, address, true).await
+}
+
+async fn thread_into_outbox(
+    core: &Core,
+    account_id: i64,
+    address: &str,
+    delivered: bool,
+) -> anyhow::Result<usize> {
+    let Some((conversation_id, turns)) = crate::session::current_thread(core, account_id).await?
+    else {
         return Ok(0);
-    }
-    enqueue(core, account_id, address, conversation_id, &turns, true).await
+    };
+    enqueue(core, account_id, address, conversation_id, &turns, delivered).await
 }
 
 /// What is still waiting to go out, oldest first.
@@ -156,10 +162,14 @@ pub async fn sent(core: &Core, id: i64) -> anyhow::Result<()> {
     crate::core::blocking(move || store.mark_mirror_sent(id)).await
 }
 
-pub async fn failed(core: &Core, id: i64) -> anyhow::Result<()> {
+/// Records a failed send and returns how many attempts the row has spent.
+pub async fn failed(core: &Core, id: i64) -> anyhow::Result<i64> {
     let store = core.store();
     crate::core::blocking(move || store.mark_mirror_failed(id)).await
 }
+
+/// How many attempts a row gets before it is left alone for good.
+pub use crate::store::MIRROR_ATTEMPTS as ATTEMPTS;
 
 pub async fn is_enabled(core: &Core, account_id: i64) -> anyhow::Result<bool> {
     let store = core.store();
@@ -269,11 +279,16 @@ mod tests {
         // The whole idempotence argument rests on this. If the key moved --
         // under a toolchain upgrade, say -- every thread would be sent again.
         assert_eq!(turn_key(7, Role::You, "cheapest beans"), turn_key(7, Role::You, "cheapest beans"));
-        // And it is a fixed hex digest, not a hash whose stability is a
-        // promise nobody made. `DefaultHasher` explicitly is not stable
-        // across releases, which is why it is not used here.
-        assert_eq!(turn_key(7, Role::You, "cheapest beans").len(), 64);
-        assert!(turn_key(7, Role::You, "cheapest beans").chars().all(|c| c.is_ascii_hexdigit()));
+        // Pinned to a literal, because calling it twice in one process
+        // cannot detect the failure that matters: reordering the fields,
+        // changing a separator or renaming a role moves every key at once,
+        // and a self-consistent test stays green while the next deploy
+        // re-sends every thread to every reader.
+        assert_eq!(
+            turn_key(7, Role::You, "cheapest beans"),
+            "a4d60f05e3a3464df156fa1c079ca634a9243b903b85bd8416693452ddcf7527",
+            "the key moved: every already-mirrored thread will be sent again"
+        );
     }
 
     #[test]
@@ -287,52 +302,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recording_a_price_request_stops_a_backfill_echoing_it() {
-        // The two halves of the echo guarantee, run against each other.
-        // Telegram is handed the prompt the model saw; the browser would
-        // backfill the transcript, which is cut at the marker. If these
-        // disagree the reader's own question is sent back to the chat it
-        // came from, and until this test existed two mutations that cause
-        // exactly that — recording the raw prompt, and recording it as not
-        // yet delivered — both left the whole workspace green.
+    async fn recording_what_telegram_showed_stops_a_backfill_echoing_it() {
+        // Both halves now read the same transcript, which is the structural
+        // fix — but the stored user message is the raw prompt the model saw,
+        // note and all, and only `turns_of` cuts it. This runs the two
+        // halves against each other through that real path.
         let (core, _dir) = test_core().await;
         let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
             .await
             .unwrap();
-        let prompt = "find me cheapest gillette\n\n[system note] This is a cheapest-price request.";
-        record_delivered(&core, account_id, "4242", 1, prompt, "EUR 24.24 at bol.com")
-            .await
-            .unwrap();
+        crate::session::seed_exchange_for_tests(
+            &core,
+            account_id,
+            "direct",
+            "find me cheapest gillette\n\n[system note] This is a cheapest-price request.",
+            "EUR 24.24 at bol.com",
+        )
+        .await
+        .unwrap();
+
+        let recorded = record_delivered(&core, account_id, "4242").await.unwrap();
+        assert_eq!(recorded, 2, "the exchange was not recorded");
         assert!(pending(&core, 10).await.unwrap().is_empty(), "a recorded turn was queued for sending");
 
-        let backfill = vec![
-            scout_api::Turn { role: Role::You, text: "find me cheapest gillette".to_string() },
-            scout_api::Turn { role: Role::Scout, text: "EUR 24.24 at bol.com".to_string() },
-        ];
-        let queued = enqueue(&core, account_id, "4242", 1, &backfill, false).await.unwrap();
+        let queued = queue_thread(&core, account_id, "4242").await.unwrap();
         assert_eq!(queued, 0, "the backfill queued a turn Telegram had already shown");
         assert!(pending(&core, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn a_prompt_that_is_only_a_note_records_just_the_answer() {
-        // The thumbs-up follow-up: the whole prompt is a system note, so
-        // there is no reader turn to record and a backfill would drop it.
+    async fn queueing_the_same_thread_twice_sends_it_once() {
         let (core, _dir) = test_core().await;
         let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
             .await
             .unwrap();
-        let recorded = record_delivered(
-            &core,
-            account_id,
-            "4242",
-            1,
-            "[system note] The user reacted with a thumbs-up.",
-            "Want me to save that one?",
+        crate::session::seed_exchange_for_tests(
+            &core, account_id, "direct", "cheapest beans", "here are three",
         )
         .await
         .unwrap();
-        assert_eq!(recorded, 1, "recorded a turn the reader never said");
+        assert_eq!(queue_thread(&core, account_id, "4242").await.unwrap(), 2);
+        assert_eq!(queue_thread(&core, account_id, "4242").await.unwrap(), 0);
+        assert_eq!(pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_reader_with_no_thread_yet_queues_nothing() {
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        assert_eq!(queue_thread(&core, account_id, "4242").await.unwrap(), 0);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 /// The reminder path retries indefinitely and that is safe, because a date
 /// bounds it. An outbox row has no such bound: a reader who blocks the bot
 /// would otherwise be retried against forever.
-const MIRROR_ATTEMPTS: i64 = 5;
+pub const MIRROR_ATTEMPTS: i64 = 5;
 
 const MIGRATIONS: &str = r#"
 CREATE SEQUENCE IF NOT EXISTS purchases_id_seq;
@@ -188,7 +188,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     attempts   BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     sent_at    TIMESTAMP,
-    UNIQUE (account_id, turn_key)
+    UNIQUE (account_id, channel, turn_key)
 );
 -- Who wants their browser thread mirrored. Presence is the setting: a row
 -- means on, no row means off, and there is no boolean that can fall out of
@@ -1305,6 +1305,11 @@ impl Store {
     /// reader: the row is inserted with `sent_at` set, so it occupies the
     /// key and is never dispatched.
     ///
+    /// Keyed by channel as well as account and turn. Without it, the first
+    /// day a second channel exists, queueing a turn for it returns `false`
+    /// because the first channel already holds that key — and that channel
+    /// never delivers, with nothing to show for it.
+    ///
     /// Check-then-insert rather than `ON CONFLICT`, because the store holds
     /// one mutex and is the only writer, so the pair is atomic here in a way
     /// it would not be over a network. The `UNIQUE` constraint stays as a
@@ -1320,8 +1325,8 @@ impl Store {
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let known: i64 = conn.query_row(
-            "SELECT count(*) FROM outbox WHERE account_id = ? AND turn_key = ?",
-            params![account_id, turn_key],
+            "SELECT count(*) FROM outbox WHERE account_id = ? AND channel = ? AND turn_key = ?",
+            params![account_id, channel, turn_key],
             |r| r.get(0),
         )?;
         if known > 0 {
@@ -1373,12 +1378,20 @@ impl Store {
         Ok(())
     }
 
-    /// It did not arrive. One more attempt spent; at [`MIRROR_ATTEMPTS`] the
-    /// row stops being returned by `pending_mirror`.
-    pub fn mark_mirror_failed(&self, id: i64) -> Result<()> {
+    /// It did not arrive. Returns how many attempts the row has now spent,
+    /// so the caller can say out loud when one is given up on.
+    ///
+    /// At [`MIRROR_ATTEMPTS`] the row stops being returned by
+    /// `pending_mirror` and there is no way back: its `turn_key` is still
+    /// occupied, so re-enqueueing it is a no-op and toggling the mirror off
+    /// and on will not recover it. That is a thing a human should be able
+    /// to find in a log afterwards.
+    pub fn mark_mirror_failed(&self, id: i64) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?", params![id])?;
-        Ok(())
+        let attempts: i64 =
+            conn.query_row("SELECT attempts FROM outbox WHERE id = ?", params![id], |r| r.get(0))?;
+        Ok(attempts)
     }
 
     pub fn mirror_enabled(&self, account_id: i64) -> Result<bool> {
@@ -4593,6 +4606,20 @@ CREATE TABLE segment_candidates (
     }
 
     #[test]
+    fn two_channels_do_not_share_one_turns_key() {
+        // The same turn goes to two places, and each has to queue it. With
+        // the channel left out of the uniqueness key the second channel's
+        // enqueue returns `false` because the first already holds the key,
+        // and that channel silently never delivers.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        assert!(s.enqueue_mirror(a, "telegram", "11", "hello", "k1", false).unwrap());
+        assert!(s.enqueue_mirror(a, "signal", "11", "hello", "k1", false).unwrap());
+        assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1);
+        assert_eq!(s.pending_mirror("signal", 10).unwrap().len(), 1);
+    }
+
+    #[test]
     fn pending_rows_come_back_oldest_first_and_marking_them_clears_them() {
         let (s, _d) = test_store();
         let a = s.account_for_telegram(11).unwrap();
@@ -4614,11 +4641,14 @@ CREATE TABLE segment_candidates (
         let a = s.account_for_telegram(11).unwrap();
         s.enqueue_mirror(a, "telegram", "11", "doomed", "k1", false).unwrap();
         let id = s.pending_mirror("telegram", 10).unwrap()[0].id;
-        for _ in 0..4 {
-            s.mark_mirror_failed(id).unwrap();
+        for attempt in 1..=4 {
+            // The count comes back so the drain can tell a retry from a row
+            // it has just given up on — the log line said "it stays queued"
+            // on the fifth failure, which was the one time it did not.
+            assert_eq!(s.mark_mirror_failed(id).unwrap(), attempt);
             assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1, "gave up too early");
         }
-        s.mark_mirror_failed(id).unwrap();
+        assert_eq!(s.mark_mirror_failed(id).unwrap(), MIRROR_ATTEMPTS);
         assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "retried forever");
     }
 

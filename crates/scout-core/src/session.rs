@@ -213,6 +213,24 @@ fn is_answer(content: &rig::OneOrMany<rig::message::AssistantContent>) -> bool {
         .any(|c| matches!(c, rig::message::AssistantContent::ToolCall(_)))
 }
 
+/// Whether the answer at `i` was replaced by the one after it.
+///
+/// The repair paths hand the model a correction and keep its second attempt,
+/// but `rig` appends rather than replaces — so the history holds both. Left
+/// in, a transcript shows the superseded answer *and* its replacement: the
+/// dead links the repair existed to remove, or the raw `<tool_call>` markup
+/// the model wrote as prose, sitting above the real answer forever.
+///
+/// A thumbs-up follow-up also opens with a system note and must NOT trigger
+/// this — the answer above that one still stands. `CORRECTION_NOTE` is what
+/// separates the two.
+fn superseded(history: &[LlmMessage], i: usize) -> bool {
+    let Some(LlmMessage::User { content }) = history.get(i + 1) else {
+        return false;
+    };
+    text_of_user(content).is_some_and(|t| t.starts_with(crate::text::CORRECTION_NOTE))
+}
+
 /// The turns a history should be rendered as, oldest first.
 ///
 /// Split out of `transcript_of` because the store half needs a database and
@@ -221,7 +239,8 @@ fn is_answer(content: &rig::OneOrMany<rig::message::AssistantContent>) -> bool {
 fn turns_of(history: &[LlmMessage]) -> Vec<scout_api::Turn> {
     history
         .iter()
-        .filter_map(|m| match m {
+        .enumerate()
+        .filter_map(|(i, m)| match m {
             // Cut, because `rig`'s `Chat::chat` appends the prompt it is
             // given to the history — so the dead-link repair's own
             // instruction was saved as a user message and rendered back to
@@ -237,7 +256,9 @@ fn turns_of(history: &[LlmMessage]) -> Vec<scout_api::Turn> {
             // page does, and rendering it raw put a whole chain of thought
             // on screen — permanently, on every load, rather than for the
             // moment a stream does.
-            LlmMessage::Assistant { content, .. } if is_answer(content) => {
+            LlmMessage::Assistant { content, .. }
+                if is_answer(content) && !superseded(history, i) =>
+            {
                 text_of_assistant(content).map(|text| scout_api::Turn {
                     role: scout_api::Role::Scout,
                     text: crate::text::strip_thinking(&text),
@@ -382,6 +403,39 @@ mod tests {
         assert_eq!(turns.len(), 2, "got: {:?}", turns.iter().map(|t| &t.text).collect::<Vec<_>>());
         assert_eq!(turns[0].text, "find me cheapest gillette cartridges");
         assert_eq!(turns[1].text, "EUR 40.44 delivered — 16-pack, shavesavings.com");
+    }
+
+    #[test]
+    fn an_answer_that_was_corrected_is_not_shown_beside_its_replacement() {
+        // `rig` appends the repair exchange rather than replacing it, so the
+        // history holds the answer with the dead links *and* the corrected
+        // one. Rendering both leaves the links this bot spent a request
+        // removing sitting above the answer, permanently — and mirroring
+        // both sends them to the reader's phone.
+        let history = vec![
+            LlmMessage::user("cheapest beans"),
+            LlmMessage::assistant("EUR 3 at https://dead.example/404"),
+            LlmMessage::user(crate::links::repair_prompt(&["https://dead.example/404".to_string()])),
+            LlmMessage::assistant("EUR 3 at bol.com"),
+        ];
+        let turns = turns_of(&history);
+        assert_eq!(turns.len(), 2, "got: {:?}", turns.iter().map(|t| &t.text).collect::<Vec<_>>());
+        assert_eq!(turns[1].text, "EUR 3 at bol.com");
+    }
+
+    #[test]
+    fn a_thumbs_up_does_not_supersede_the_answer_it_praised() {
+        // The reaction follow-up also opens with a system note, but the
+        // answer above it stands — dropping it would delete a real reply
+        // from the reader's transcript for having been liked.
+        let history = vec![
+            LlmMessage::assistant("EUR 3 at bol.com"),
+            LlmMessage::user("[system note] The user reacted with a thumbs-up to this earlier reply."),
+            LlmMessage::assistant("Want me to save that one?"),
+        ];
+        let turns = turns_of(&history);
+        assert_eq!(turns.len(), 2, "got: {:?}", turns.iter().map(|t| &t.text).collect::<Vec<_>>());
+        assert_eq!(turns[0].text, "EUR 3 at bol.com");
     }
 
     #[test]

@@ -958,7 +958,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     match result {
         Ok(scout_core::run::RunOutcome::Answered(reply)) => {
             deliver(&bot, &app, &mut live, chat_id, &reply).await?;
-            record_own_turn(&app.core, account_id, chat_id.0, conversation_id, &prompt, &reply).await;
+            record_own_turn(&app.core, account_id, chat_id.0).await;
         }
         Ok(scout_core::run::RunOutcome::Busy) => {
             live.show("I'm still working on your last message — one moment.", true).await;
@@ -1188,7 +1188,7 @@ async fn handle_reaction(
     match result {
         Ok(scout_core::run::RunOutcome::Answered(reply)) => {
             deliver(&bot, &app, &mut live, chat_id, &reply).await?;
-            record_own_turn(&app.core, account_id, chat_id.0, conversation_id, &prompt, &reply).await;
+            record_own_turn(&app.core, account_id, chat_id.0).await;
         }
         Ok(scout_core::run::RunOutcome::Busy) => {
             live.show("I'm still working on your last message — one moment.", true).await;
@@ -1235,37 +1235,21 @@ fn copy_draft_markup(draft: &str) -> InlineKeyboardMarkup {
     )]])
 }
 
-/// Records an exchange this chat has already seen, so a browser backfill
-/// does not send it back.
+/// Records what this chat has already seen, so a browser backfill does not
+/// send it back.
 ///
 /// Written unconditionally, not only when mirroring is on: the reader may
 /// switch it on tomorrow, and by then the only way to know these messages
 /// were already delivered is to have said so at the time.
 ///
-/// `said_by_person` rather than the raw prompt, because the two halves of
-/// this guarantee have to agree on a key. What the model was given is not
-/// what the reader typed — `PRICE_REQUEST_NOTE` rides on the end of a price
-/// request, and the whole prompt is a system note for a thumbs-up — while a
-/// backfill reads the transcript, which cuts at the marker. Record the raw
-/// text and the keys differ, and the backfill sends the reader's own
-/// question back to the chat it came from.
-async fn record_own_turn(
-    core: &scout_core::core::Core,
-    account_id: i64,
-    chat_id: i64,
-    conversation_id: i64,
-    prompt: &str,
-    answered: &str,
-) {
-    if let Err(e) = scout_core::mirror::record_delivered(
-        core,
-        account_id,
-        &chat_id.to_string(),
-        conversation_id,
-        prompt,
-        answered,
-    )
-    .await
+/// Reads the transcript rather than being handed the text, so it records
+/// exactly what a backfill would send. Passing `reply` in was wrong three
+/// ways at once — `strike_dead` appends to it after the stored copy is
+/// written, the repair paths leave a superseded answer beside its
+/// replacement, and the prompt the model saw is not what the reader typed.
+async fn record_own_turn(core: &scout_core::core::Core, account_id: i64, chat_id: i64) {
+    if let Err(e) =
+        scout_core::mirror::record_delivered(core, account_id, &chat_id.to_string()).await
     {
         tracing::warn!(error = %e, account_id, "could not record a Telegram turn");
     }

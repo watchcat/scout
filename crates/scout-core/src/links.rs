@@ -95,13 +95,14 @@ pub async fn dead_links_in(http: &reqwest::Client, text: &str) -> Vec<String> {
 /// dead links, asking for a corrected answer.
 pub fn repair_prompt(dead: &[String]) -> String {
     format!(
-        "[system note] These links in your last reply are dead (HTTP 404/410 — \
+        "{} These links in your last reply are dead (HTTP 404/410 — \
          the page does not exist):\n{}\n\nDo not show them again. They were \
          most likely constructed rather than taken from tool output. Re-send \
          your answer using only links you actually saw in tool results; verify \
          a replacement with fetch_page if you are unsure, or drop that option \
          and name the shop without a link. Reply with the corrected answer \
          only, no apology or explanation of this note.",
+        crate::text::CORRECTION_NOTE,
         dead.join("\n")
     )
 }

@@ -15,6 +15,15 @@ use tokio_stream::StreamExt;
 const TEMPLATE: &str = include_str!("../chat.html");
 const CLIENT: &str = include_str!("../chat.js");
 const CSRF_TOKEN: &str = "<!--CSRF-->";
+/// Where the mirror toggle's stored state goes.
+///
+/// Rendered rather than defaulted to "false", because the button is the
+/// only place that state lives on the page: served as off while it is on,
+/// the reader's first click posts `on` again — re-enabling something
+/// already enabled and re-running the backfill — and turning it off takes
+/// two presses. The stylesheet's own comment says the reader has to be able
+/// to tell at a glance, and a hardcoded attribute cannot.
+const MIRROR_STATE: &str = "<!--MIRROR-->";
 
 pub fn routes(auth: AuthState) -> Router {
     Router::new()
@@ -79,7 +88,8 @@ async fn chat(axum::extract::State(auth): axum::extract::State<AuthState>, heade
         Err(response) => return response,
     };
     let csrf = session::csrf_for(&auth.cfg.session_key, account_id);
-    let page = TEMPLATE.replace(CSRF_TOKEN, &csrf);
+    let mirrored = matches!(scout_core::mirror::is_enabled(&auth.core, account_id).await, Ok(true));
+    let page = TEMPLATE.replace(CSRF_TOKEN, &csrf).replace(MIRROR_STATE, if mirrored { "true" } else { "false" });
     // The same call that decides whether a run may promise a reminder
     // decides whether this is offered, so the two cannot disagree about
     // whether there is anywhere to send.
@@ -301,8 +311,11 @@ async fn send_message(
         // Queued before the end frame goes out, so the row is written
         // whether or not the reader's connection survived to see the
         // answer — a dropped stream still leaves the thread on their phone.
-        if let Ok(scout_core::run::RunOutcome::Answered(answer)) = &outcome {
-            mirror_turn(&auth_for_mirror, account_id, conversation_id, &text, answer).await;
+        if matches!(&outcome, Ok(scout_core::run::RunOutcome::Answered(_))) {
+            // Reads the transcript `run_agent` has just saved, so what goes
+            // to the phone is exactly what a reload would show — including
+            // any answer the dead-link repair rewrote on the way out.
+            queue_thread(&auth_for_mirror, account_id).await;
         }
         let _ = frames.send(Frame::End(end_frame(outcome)));
     });
@@ -363,88 +376,39 @@ async fn mirror(
         return sorry();
     }
     if body.on {
-        if let Err(e) = backfill(&auth, account_id).await {
-            // The setting is saved either way. A backfill that failed is a
-            // thread that starts late, which is worth logging and not worth
-            // refusing the request over.
-            tracing::warn!(error = %e, account_id, "could not queue the thread so far");
-        }
+        queue_thread(&auth, account_id).await;
     }
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Queues everything already said in the reader's current thread.
+/// Queues the reader's current thread, if they asked for that.
 ///
-/// Silently does nothing when the account has no Telegram identity — the
+/// One function for both the backfill and keeping up, because enqueueing is
+/// idempotent and the transcript is the only text this mirrors — so "send
+/// the thread so far" and "send what just happened" are the same call, and
+/// cannot drift apart.
+///
+/// Silently does nothing when the account has no Telegram identity: the
 /// toggle is not shown in that case, so reaching here means a hand-made
-/// request, and there is nowhere to send to.
-async fn backfill(auth: &AuthState, account_id: i64) -> anyhow::Result<()> {
-    let Some(reply_to) = reply_to_for(auth, account_id).await else {
-        return Ok(());
-    };
-    let Some((conversation_id, turns)) =
-        scout_core::session::current_thread(&auth.core, account_id).await?
-    else {
-        return Ok(());
-    };
-    scout_core::mirror::enqueue(
-        &auth.core,
-        account_id,
-        &reply_to.address,
-        conversation_id,
-        &turns,
-        false,
-    )
-    .await?;
-    Ok(())
-}
-
-/// Queues one finished exchange, if the reader asked for that.
+/// request, and there is nowhere to send.
 ///
-/// Called by the run handler rather than by `run_agent`, because
-/// `run_agent` is shared by both channels and has no business knowing which
-/// one it is serving. Telegram's own handler makes the opposite call, with
-/// `delivered: true` — the two of them together are what stop a backfill
-/// echoing Telegram's messages back at it.
-///
-/// Every failure here is logged and swallowed. The answer is already on the
-/// reader's screen and already saved to history; a mirror that did not get
-/// queued is worth knowing about and is not worth failing a reply over.
-async fn mirror_turn(
-    auth: &AuthState,
-    account_id: i64,
-    conversation_id: i64,
-    asked: &str,
-    answered: &str,
-) {
-    match scout_core::mirror::is_enabled(&auth.core, account_id).await {
-        Ok(false) => return,
-        Ok(true) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "could not read the mirror setting");
-            return;
-        }
+/// Failures are logged and swallowed. The answer is already on the reader's
+/// screen and already in history; a mirror that did not get queued is worth
+/// knowing about and is not worth failing a reply over.
+async fn queue_thread(auth: &AuthState, account_id: i64) {
+    if !matches!(scout_core::mirror::is_enabled(&auth.core, account_id).await, Ok(true)) {
+        return;
     }
     let Some(reply_to) = reply_to_for(auth, account_id).await else {
         return;
     };
-    let turns = vec![
-        scout_api::Turn { role: scout_api::Role::You, text: asked.to_string() },
-        scout_api::Turn { role: scout_api::Role::Scout, text: answered.to_string() },
-    ];
-    if let Err(e) = scout_core::mirror::enqueue(
-        &auth.core,
-        account_id,
-        &reply_to.address,
-        conversation_id,
-        &turns,
-        false,
-    )
-    .await
+    if let Err(e) =
+        scout_core::mirror::queue_thread(&auth.core, account_id, &reply_to.address).await
     {
-        tracing::warn!(error = %e, account_id, "could not queue a turn for Telegram");
+        tracing::warn!(error = %e, account_id, "could not queue the thread for Telegram");
     }
 }
+
 
 /// Marks the seam between two conversations in the mirrored chat.
 ///
@@ -493,7 +457,7 @@ mod tests {
     // Named imports rather than `use super::*`: the module imports axum's
     // `get` and `post`, which would shadow the test helpers of the same
     // name that every request in here goes through.
-    use super::{end_frame, mirror_turn, reply_to_for, AuthState};
+    use super::{end_frame, queue_thread, reply_to_for, AuthState};
     use crate::tests::*;
 
     #[test]
@@ -657,13 +621,13 @@ mod tests {
         // Scoped to the handler's own body. Two source-scan tests written
         // today matched their own explanatory prose and could never fail;
         // slicing one function keeps the tests below — which name
-        // `mirror_turn` repeatedly — out of range.
+        // `queue_thread` repeatedly — out of range.
         let src = include_str!("chat.rs");
         let start = src.find("async fn send_message").expect("the handler must exist");
         let end = src[start..].find("\n}").expect("the handler must end") + start;
         assert!(
-            src[start..end].contains("mirror_turn("),
-            "a finished run must queue the exchange, or the mirror only ever backfills"
+            src[start..end].contains("queue_thread("),
+            "a finished run must queue the thread, or the mirror only ever backfills"
         );
     }
 
@@ -674,16 +638,20 @@ mod tests {
         let (_app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;
         core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        // The thread the run has just saved — this reads the transcript now
+        // rather than being handed the text, which is what keeps it and a
+        // backfill sending the same thing.
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
         let auth = auth_state(&core);
 
-        mirror_turn(&auth, account_id, 1, "cheapest beans", "here are three").await;
+        queue_thread(&auth, account_id).await;
         assert!(
             scout_core::mirror::pending(&core, 10).await.unwrap().is_empty(),
             "queued a turn for someone who never asked for it"
         );
 
         scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
-        mirror_turn(&auth, account_id, 1, "cheapest beans", "here are three").await;
+        queue_thread(&auth, account_id).await;
         assert_eq!(scout_core::mirror::pending(&core, 10).await.unwrap().len(), 2);
     }
 
@@ -695,9 +663,10 @@ mod tests {
         let (_app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;
         // Deliberately no `note_address`.
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
         scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
         let auth = auth_state(&core);
-        mirror_turn(&auth, account_id, 1, "cheapest beans", "here are three").await;
+        queue_thread(&auth, account_id).await;
         assert!(scout_core::mirror::pending(&core, 10).await.unwrap().is_empty());
     }
 
@@ -1034,6 +1003,32 @@ mod tests {
         // shares `viewBox="0 0 24 24"`, so the looser check failed against
         // a page that had stripped correctly.
         assert!(!page.contains("M21.7 3.4"), "the toggle's icon outlived the toggle");
+    }
+
+    #[tokio::test]
+    async fn the_toggle_shows_the_state_it_is_actually_in() {
+        // The button is the only place this state lives on the page. Served
+        // as off while it is on, the first click posts `on` again — which
+        // re-runs the backfill — and turning it off takes two presses.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+
+        // Matched on the button, not the bare attribute: the stylesheet
+        // carries `#mirror[aria-pressed="true"]`, so the loose check passed
+        // against a page that hardcoded the state — the third assertion
+        // today to match a string that also lives somewhere else.
+        let on = r#"id="mirror" type="button" aria-pressed="true""#;
+        let off = r#"id="mirror" type="button" aria-pressed="false""#;
+
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        assert!(page.contains(off), "off is not shown as off");
+
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        assert!(page.contains(on), "on is shown as off");
+        assert!(!page.contains("<!--MIRROR-->"), "the placeholder reached the browser");
     }
 
     #[tokio::test]

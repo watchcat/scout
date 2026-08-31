@@ -42,7 +42,9 @@ pub trait Sink {
 /// rule testable rather than merely written down.
 pub trait Ledger {
     async fn sent(&self, id: i64) -> anyhow::Result<()>;
-    async fn failed(&self, id: i64) -> anyhow::Result<()>;
+    /// Returns how many attempts the row has now spent, so the caller can
+    /// tell a retry from a row it has just given up on.
+    async fn failed(&self, id: i64) -> anyhow::Result<i64>;
 }
 
 pub struct TelegramSink {
@@ -67,7 +69,7 @@ impl Ledger for CoreLedger<'_> {
     async fn sent(&self, id: i64) -> anyhow::Result<()> {
         scout_core::mirror::sent(self.0, id).await
     }
-    async fn failed(&self, id: i64) -> anyhow::Result<()> {
+    async fn failed(&self, id: i64) -> anyhow::Result<i64> {
         scout_core::mirror::failed(self.0, id).await
     }
 }
@@ -92,9 +94,19 @@ pub async fn drain<S: Sink, L: Ledger>(
         match sink.send(&row.address, &row.body).await {
             Ok(()) => ledger.sent(row.id).await?,
             Err(e) => {
-                tracing::warn!(error = %e, id = row.id, account_id = row.account_id,
-                    "a mirrored message did not send; it stays queued");
-                ledger.failed(row.id).await?;
+                // Said separately, because "it stays queued" is false on the
+                // last attempt and that is the one line a human would read.
+                // An abandoned row cannot be recovered: its key stays
+                // occupied, so re-enqueueing is a no-op and toggling the
+                // mirror off and on will not bring it back.
+                let attempts = ledger.failed(row.id).await?;
+                if attempts >= scout_core::mirror::ATTEMPTS {
+                    tracing::warn!(error = %e, id = row.id, account_id = row.account_id, attempts,
+                        "giving up on a mirrored message; it will not be sent and cannot be requeued");
+                } else {
+                    tracing::warn!(error = %e, id = row.id, account_id = row.account_id, attempts,
+                        "a mirrored message did not send; it stays queued");
+                }
                 blocked.insert(row.account_id);
                 continue;
             }
@@ -158,9 +170,9 @@ mod tests {
             self.sent.lock().unwrap().push(id);
             Ok(())
         }
-        async fn failed(&self, id: i64) -> anyhow::Result<()> {
+        async fn failed(&self, id: i64) -> anyhow::Result<i64> {
             self.failed.lock().unwrap().push(id);
-            Ok(())
+            Ok(self.failed.lock().unwrap().len() as i64)
         }
     }
 

@@ -253,6 +253,34 @@ mod tests {
     }
 
     #[test]
+    fn motion_can_be_turned_off_and_cannot_hide_the_page() {
+        // Two separate guarantees, both easy to get wrong in ways that only
+        // show up on someone else's machine.
+        //
+        // `@starting-style` is load-bearing, not stylistic: the obvious
+        // alternative — `opacity:0` plus a forwards animation — leaves the
+        // page BLANK anywhere the animation does not run, where this
+        // degrades to simply appearing.
+        //
+        // And reduced motion has to override the starting style too. With
+        // only the resting rule overridden the content still travels its
+        // eight pixels, which is exactly what was asked not to happen.
+        let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+        assert!(
+            !css.contains("animation-fill-mode"),
+            "a fill-mode entrance can leave the page blank; use @starting-style"
+        );
+        let reduced = css
+            .find("prefers-reduced-motion")
+            .expect("motion must be refusable");
+        assert!(
+            css[reduced..].contains("@starting-style"),
+            "reduced motion did not override the starting style, so the content still moves"
+        );
+    }
+
+    #[test]
     fn the_page_answers_a_press_and_shows_a_keyboard_where_it_is() {
         // The page had no `:active` and no focus styling at all, on a page
         // whose whole job is one button — and that button is a link with

@@ -140,6 +140,38 @@
 
   footer{margin-top:var(--s-6); padding:var(--s-5) 0 var(--s-8); border-top:1px solid var(--base02);
     font-size:var(--t-sm); color:var(--base01); display:flex; gap:var(--s-5); flex-wrap:wrap}
+  /* Motion is spent where it is seen rarely and withheld where it is seen
+     constantly. A visitor meets this page once or twice; /chat is used
+     every day and deliberately has none of this.
+
+     `@starting-style` rather than `opacity:0` with a forwards animation,
+     because the failure modes differ and only one is acceptable: without
+     support here the content simply appears un-animated, where a fill-mode
+     approach that does not run leaves the page blank. A decorative
+     flourish must not be able to hide the product. */
+  .cols>div,.src{
+    opacity:1; transform:translateY(0);
+    transition:opacity 320ms var(--ease-out), transform 320ms var(--ease-out);
+  }
+  @starting-style{
+    .cols>div,.src{opacity:0; transform:translateY(8px)}
+  }
+  .cols>div:nth-child(2),.src:nth-of-type(2){transition-delay:40ms}
+  .cols>div:nth-child(3),.src:nth-of-type(3){transition-delay:80ms}
+  .src:nth-of-type(4){transition-delay:120ms}
+
+  /* Movement is what causes motion sickness, not change — so the fade
+     stays and every transform goes, including the one in the starting
+     style. Without that second override the content would still travel
+     eight pixels, which is the whole thing being asked for. */
+  @media (prefers-reduced-motion:reduce){
+    .cols>div,.src{transform:none}
+    @starting-style{
+      .cols>div,.src{transform:none}
+    }
+    .btn:active{transform:none}
+  }
+
   @media(max-width:680px){
     .mark{gap:var(--s-3); margin-bottom:var(--s-4)}
     .mark .logo{width:66px; height:66px}

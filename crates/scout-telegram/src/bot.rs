@@ -957,7 +957,8 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     );
     match result {
         Ok(scout_core::run::RunOutcome::Answered(reply)) => {
-            deliver(&bot, &app, &mut live, chat_id, &reply).await?
+            deliver(&bot, &app, &mut live, chat_id, &reply).await?;
+            record_own_turn(&app.core, account_id, chat_id.0, conversation_id, &prompt, &reply).await;
         }
         Ok(scout_core::run::RunOutcome::Busy) => {
             live.show("I'm still working on your last message — one moment.", true).await;
@@ -1186,7 +1187,8 @@ async fn handle_reaction(
     );
     match result {
         Ok(scout_core::run::RunOutcome::Answered(reply)) => {
-            deliver(&bot, &app, &mut live, chat_id, &reply).await?
+            deliver(&bot, &app, &mut live, chat_id, &reply).await?;
+            record_own_turn(&app.core, account_id, chat_id.0, conversation_id, &prompt, &reply).await;
         }
         Ok(scout_core::run::RunOutcome::Busy) => {
             live.show("I'm still working on your last message — one moment.", true).await;
@@ -1231,6 +1233,62 @@ fn copy_draft_markup(draft: &str) -> InlineKeyboardMarkup {
         "📋 Copy to edit",
         InlineKeyboardButtonKind::CopyText(CopyTextButton { text }),
     )]])
+}
+
+/// Records an exchange this chat has already seen, so a browser backfill
+/// does not send it back.
+///
+/// Written unconditionally, not only when mirroring is on: the reader may
+/// switch it on tomorrow, and by then the only way to know these messages
+/// were already delivered is to have said so at the time.
+///
+/// `said_by_person` rather than the raw prompt, because the two halves of
+/// this guarantee have to agree on a key. What the model was given is not
+/// what the reader typed — `PRICE_REQUEST_NOTE` rides on the end of a price
+/// request, and the whole prompt is a system note for a thumbs-up — while a
+/// backfill reads the transcript, which cuts at the marker. Record the raw
+/// text and the keys differ, and the backfill sends the reader's own
+/// question back to the chat it came from.
+async fn record_own_turn(
+    core: &scout_core::core::Core,
+    account_id: i64,
+    chat_id: i64,
+    conversation_id: i64,
+    prompt: &str,
+    answered: &str,
+) {
+    let mut turns = Vec::new();
+    // Empty when the prompt was nothing but a note to the model, which is
+    // every thumbs-up follow-up. A backfill drops empty turns, so there is
+    // no key to occupy.
+    let asked = scout_core::text::said_by_person(prompt);
+    if !asked.is_empty() {
+        turns.push(scout_api::Turn {
+            role: scout_api::Role::You,
+            text: asked.to_string(),
+        });
+    }
+    if !answered.trim().is_empty() {
+        turns.push(scout_api::Turn {
+            role: scout_api::Role::Scout,
+            text: answered.to_string(),
+        });
+    }
+    if turns.is_empty() {
+        return;
+    }
+    if let Err(e) = scout_core::mirror::enqueue(
+        core,
+        account_id,
+        &chat_id.to_string(),
+        conversation_id,
+        &turns,
+        true,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, account_id, "could not record a Telegram turn");
+    }
 }
 
 /// Puts the finished answer where the progress message already is: the first
@@ -1385,6 +1443,26 @@ async fn handle_kick(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_answer_this_bot_delivers_is_also_written_down() {
+        // Two handlers bind `RunOutcome::Answered` — a message and a
+        // thumbs-up follow-up — and a third arrived once before without
+        // anyone noticing. If one delivers without recording, a browser
+        // backfill sends that conversation back to the chat it came from,
+        // and nothing errors.
+        //
+        // A source assertion because this crate cannot build a `Core` in a
+        // test. Scoped above the test module: this file contains the names
+        // being searched for, and a whole-file scan would match them.
+        let src = include_str!("bot.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        assert_eq!(
+            src.matches("RunOutcome::Answered(reply)").count(),
+            src.matches("record_own_turn(").count() - 1,
+            "an answered run is delivered without being recorded"
+        );
+    }
+
     #[test]
     fn a_note_this_channel_writes_to_itself_is_marked_so_it_is_never_rendered() {
         // Both notes below are appended to, or sent as, a user message, and

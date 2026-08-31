@@ -246,6 +246,29 @@ mod tests {
     }
 
     #[test]
+    fn what_a_channel_records_matches_what_a_backfill_would_send() {
+        // The echo guarantee is two halves agreeing on a key. Telegram is
+        // handed the prompt the *model* saw, which for a price request has
+        // PRICE_REQUEST_NOTE appended; a backfill reads the transcript,
+        // which cuts at the marker. Record the raw prompt and the keys
+        // differ — so the backfill sends the reader's own question back to
+        // the chat it came from, which is the one thing this design exists
+        // to prevent.
+        let raw = "find me cheapest gillette\n\n[system note] This is a cheapest-price request.";
+        let shown = crate::text::said_by_person(raw);
+        assert_eq!(
+            turn_key(1, Role::You, shown),
+            turn_key(1, Role::You, "find me cheapest gillette"),
+            "the cut text is not what a transcript would show"
+        );
+        assert_ne!(
+            turn_key(1, Role::You, raw),
+            turn_key(1, Role::You, shown),
+            "if these matched, recording the raw prompt would be harmless and this test pointless"
+        );
+    }
+
+    #[test]
     fn neighbouring_fields_cannot_be_confused_for_one_another() {
         // Kept because the property is worth holding, stated as what it is:
         // these differ because the layout is unambiguous, and they would

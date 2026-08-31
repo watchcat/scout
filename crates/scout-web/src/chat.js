@@ -39,6 +39,26 @@ function render(text) {
   return linkify(escapeHtml(text))
 }
 
+// How close to the bottom still counts as "following along". 32px rather
+// than 0 because a reader who nudged the wheel one line has not stopped
+// following, and a strict comparison would strand them a pixel short and
+// never scroll again.
+const FOLLOW_SLACK = 32
+
+// Whether new content should be scrolled into view. Pure, so the rule that
+// makes a streaming answer bearable can be tested without a browser.
+export function shouldFollow(scrollTop, clientHeight, scrollHeight, slack = FOLLOW_SLACK) {
+  return scrollHeight - scrollTop - clientHeight <= slack
+}
+
+// Tallest the composer may grow, in px — about five lines at this font.
+// Matches the `max-height` in chat.html; if one changes the other must.
+const COMPOSER_CAP = 200
+
+export function composerHeight(scrollHeight, cap = COMPOSER_CAP) {
+  return Math.min(scrollHeight, cap)
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')

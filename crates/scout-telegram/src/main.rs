@@ -25,6 +25,13 @@ fn telegram_token() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN is not set"))
 }
 
+/// How long to let the front door finish what it is already serving.
+///
+/// One run is bounded by `RUN_BUDGET` (300s), and the deployment allows 330
+/// in total — so this leaves the bot's own drain the remainder rather than
+/// racing it to the SIGKILL.
+const WEB_DRAIN: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -72,7 +79,7 @@ async fn main() -> Result<()> {
     // will not start because a port is taken is worse than that.
     let web_core = core.clone();
     let bind = std::env::var("SCOUT_WEB_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    tokio::spawn(async move {
+    let front_door = tokio::spawn(async move {
         if let Err(e) = scout_web::serve(web_core, &bind).await {
             tracing::error!(error = %e, "the front door did not open");
         }
@@ -88,5 +95,47 @@ async fn main() -> Result<()> {
 
     tracing::info!("scout is up");
     bot::run(telegram, app).await;
+
+    // The dispatcher drains Telegram's handlers and returns. Returning from
+    // here would drop the runtime and kill the front door's in-flight
+    // requests along with it — so the 330-second grace period the
+    // deployment provisions was being spent entirely on the bot, and a
+    // browser answer was cut off the instant Telegram had nothing left to
+    // finish. Which is milliseconds, when nobody is talking to the bot.
+    //
+    // Measured: a deploy killed a browser run that had already streamed its
+    // whole answer, and the reader was told it would be saved to history.
+    // It was not — the task that saves it died with the process.
+    //
+    // Bounded because Kubernetes sends SIGKILL at the grace period whatever
+    // this does, and a wedged stream must not be the reason we get there.
+    if let Err(e) = tokio::time::timeout(WEB_DRAIN, front_door).await {
+        tracing::warn!(error = %e, "the front door did not drain in time; closing anyway");
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_front_door_is_drained_before_the_process_exits() {
+        // Asserted from the source because nothing here is reachable
+        // without a bot token and a bound port. The original code spawned
+        // the server and never looked at the handle again, so returning
+        // from `main` dropped the runtime and cut every browser run in
+        // flight — while the deployment was paying for 330 seconds of
+        // grace that only the bot could spend.
+        let src = include_str!("main.rs");
+        // Stop at the test module. Below this point the file contains this
+        // test's own needles, and searching there let the assertion match
+        // the string it is written with — measured: deleting the drain
+        // entirely left this test green.
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let dispatcher = src.find("bot::run(telegram, app).await").expect("the bot must run");
+        let drained = src.rfind("front_door").expect("the front door must be awaited");
+        assert!(
+            drained > dispatcher,
+            "the front door must be drained after the dispatcher, not abandoned when it returns"
+        );
+    }
 }

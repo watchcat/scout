@@ -49,12 +49,17 @@ pub fn routes(auth: AuthState) -> Router {
         .with_state(auth)
 }
 
-async fn sign_in_page(State(auth): State<AuthState>, headers: HeaderMap) -> Html<String> {
-    // Signed in and looking at `/sign-in` is unusual but allowed, and the
-    // widget's state has to name whoever is actually holding the browser
-    // or their own press of the button would be refused.
-    let widget = widget(&auth, signed_in_as(&auth, &headers));
-    Html(pages::sign_in(&session::csrf(&auth.cfg.session_key), widget.as_deref()))
+async fn sign_in_page(State(auth): State<AuthState>, headers: HeaderMap) -> Response {
+    // Already signed in and asking to sign in: send them where they were
+    // going. This is the hop the landing page's "Open Scout" would
+    // otherwise still cost somebody whose cookie is perfectly good.
+    if signed_in_as(&auth, &headers).is_some() {
+        return see_other("/chat");
+    }
+    // Nobody signed in can reach this line now, so the widget's state names
+    // nobody — which is what `csrf_for(.., 0)` already means.
+    let widget = widget(&auth, None);
+    Html(pages::sign_in(&session::csrf(&auth.cfg.session_key), widget.as_deref())).into_response()
 }
 
 /// Telegram's login button, when the bot could name itself at start-up.
@@ -364,7 +369,10 @@ async fn telegram_callback(
 
 /// Sets the session cookie and sends them on.
 fn signed_in(auth: &AuthState, account_id: i64) -> Response {
-    signed_in_at(auth, account_id, "/account")
+    // The chat is what people came for. A queued account is sent on to
+    // `/account` by `/chat`'s own gate, which is where its explanation
+    // lives — so this needs to know nothing about membership.
+    signed_in_at(auth, account_id, "/chat")
 }
 
 /// The same, landing somewhere that says what just happened.
@@ -700,7 +708,7 @@ mod tests {
 
         let first = post_form(&app, "/auth/email", &format!("csrf={csrf}&t=tok-button")).await;
         assert_eq!(first.status(), StatusCode::SEE_OTHER);
-        assert_eq!(first.headers()["location"], "/account");
+        assert_eq!(first.headers()["location"], "/chat");
         let set = first.headers()["set-cookie"].to_str().unwrap().to_string();
         let value = set.split_once('=').unwrap().1.split_once(';').unwrap().0;
         assert!(
@@ -878,7 +886,7 @@ mod tests {
         let state = widget_state(&body_of(get(&app, "/sign-in").await).await);
         let res = get(&app, &format!("/auth/telegram?{payload}&state={state}")).await;
         assert_eq!(res.status(), StatusCode::SEE_OTHER);
-        assert_eq!(res.headers()["location"], "/account");
+        assert_eq!(res.headers()["location"], "/chat");
         let set = res.headers()["set-cookie"].to_str().unwrap().to_string();
         let value = set.split_once('=').unwrap().1.split_once(';').unwrap().0;
         let telegram_account = crate::session::verify(TEST_KEY, value)
@@ -919,6 +927,41 @@ mod tests {
             telegram_account,
             "an identity owned by someone else was moved"
         );
+    }
+
+    #[tokio::test]
+    async fn signing_in_lands_in_the_chat() {
+        // `/account` was a waypoint on the way to the thing people came
+        // for. A queued account is sent on to `/account` by `/chat`'s own
+        // gate, which is where the explanation lives.
+        let (app, _core, _dir) = app_with_a_widget().await;
+        let now = chrono::Utc::now().timestamp().to_string();
+        let payload = widget_query(&[("id", "777"), ("first_name", "Ada"), ("auth_date", &now)]);
+        let state = widget_state(&body_of(get(&app, "/sign-in").await).await);
+
+        let res = get(&app, &format!("/auth/telegram?{payload}&state={state}")).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(res.headers()["location"], "/chat");
+    }
+
+    #[tokio::test]
+    async fn a_visitor_who_is_already_signed_in_is_not_asked_again() {
+        // The hop this whole change exists to remove.
+        let (app, core, _dir) = app_with_a_widget().await;
+        let account_id = account_for(&core, "telegram", "777").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, 86_400);
+
+        let res = get_with_cookie(&app, "/sign-in", &cookie).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(res.headers()["location"], "/chat");
+    }
+
+    #[tokio::test]
+    async fn a_forged_cookie_still_gets_the_sign_in_form() {
+        // Signed out and tampered with look alike, here as everywhere else.
+        let (app, _core, _dir) = app_with_a_widget().await;
+        let res = get_with_cookie(&app, "/sign-in", "1.9999999999.notasignature").await;
+        assert_eq!(res.status(), StatusCode::OK, "a bad cookie skipped the form");
     }
 
     #[tokio::test]

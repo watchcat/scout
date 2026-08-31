@@ -21,7 +21,7 @@ mod telegram_login;
 pub use cache::{refresh_forever, AdmissionCache, REFRESH};
 
 use axum::extract::State;
-use axum::http::header;
+use axum::http::{header, HeaderMap};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
@@ -118,6 +118,7 @@ impl AuthConfig {
 /// it does not use would be an invitation to query the database from the
 /// one path that exists to avoid doing that.
 fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
+    let session_key = auth.as_ref().map(|a| a.cfg.session_key.clone());
     let public = Router::new()
         .route("/", get(index))
         // Liveness only. Deliberately says nothing about the database: a
@@ -125,7 +126,7 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         // down for a reason the site does not have.
         .route("/healthz", get(|| async { "ok" }))
         .route("/icon.svg", get(icon))
-        .with_state(Public { cache, sign_in: auth.is_some() });
+        .with_state(Public { cache, session_key });
 
     match auth {
         // The headers go on here rather than on the whole site because
@@ -175,21 +176,48 @@ async fn hsts(
     response
 }
 
-/// What the public page needs: the cached admission, and whether there is
-/// anywhere to sign in.
-///
-/// The second is a fact about the deployment, fixed at start-up, not
-/// something that changes per request — but it has to reach `render`
-/// somehow, and threading it through the one state the public routes
-/// already share beats a second extractor or a global.
+/// What the public page needs: the cached admission, and enough to tell
+/// whether a cookie is ours.
 #[derive(Clone)]
 struct Public {
     cache: AdmissionCache,
-    sign_in: bool,
+    /// Enough to tell whether a cookie is ours, and nothing else. Verifying
+    /// a session is an HMAC comparison — no store, no `Core` — which is why
+    /// this page can know who is reading it without becoming the database
+    /// query the admission cache exists to avoid.
+    ///
+    /// `None` is a deployment with no auth keys: no sessions can exist and
+    /// no sign-in route does either, so the page must link to neither.
+    session_key: Option<Vec<u8>>,
 }
 
-async fn index(State(public): State<Public>) -> Html<String> {
-    Html(page::render(&public.cache.get(), public.sign_in))
+async fn index(State(public): State<Public>, headers: HeaderMap) -> impl IntoResponse {
+    let visitor = match &public.session_key {
+        // No keys, so no sessions and no sign-in route to link to.
+        None => page::Visitor::NoAuth,
+        Some(key) => {
+            let session = headers
+                .get(header::COOKIE)
+                .and_then(|jar| jar.to_str().ok())
+                .and_then(|jar| session::read_cookie(jar, session::COOKIE))
+                .and_then(|value| session::verify(key, &value));
+            match session {
+                Some(_) => page::Visitor::SignedIn,
+                None => page::Visitor::SignedOut,
+            }
+        }
+    };
+    (
+        [
+            // This page now differs by cookie. Without both of these a
+            // shared cache may store one visitor's version and serve it to
+            // another — the headers are the cost of personalising it, not
+            // an optimisation.
+            (header::CACHE_CONTROL, "private, no-store"),
+            (header::VARY, "Cookie"),
+        ],
+        Html(page::render(&public.cache.get(), visitor)),
+    )
 }
 
 /// What the browser may load, and what it may tell others about us.
@@ -660,5 +688,85 @@ mod tests {
             .oneshot(Request::builder().uri("/sign-in").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_page_that_varies_by_cookie_is_never_stored_by_a_shared_cache() {
+        // The whole cost of personalising this page. Without these headers
+        // a proxy may hand one visitor's page to another, and nothing else
+        // in this suite would notice.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let vary = res.headers()[axum::http::header::VARY].to_str().unwrap().to_lowercase();
+        assert!(vary.contains("cookie"), "a cache would not know it varies: {vary}");
+        let cache = res.headers()[axum::http::header::CACHE_CONTROL].to_str().unwrap();
+        assert!(
+            cache.contains("private") || cache.contains("no-store"),
+            "a shared cache was not told to keep out: {cache}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_landing_page_offers_the_chat_to_a_session_and_a_door_to_everyone_else() {
+        let (app, core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let (scout_core::identity::SignIn::In { account_id }
+        | scout_core::identity::SignIn::Queued { account_id }) =
+            scout_core::identity::sign_in(&core, "telegram", "777").await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, 86_400);
+
+        let signed_out = body_of(
+            app.clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(signed_out.contains(r#"href="/sign-in""#), "no door: {signed_out}");
+
+        let signed_in = body_of(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(
+                            axum::http::header::COOKIE,
+                            format!("{}={cookie}", crate::session::COOKIE),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(signed_in.contains(r#"href="/chat""#), "no chat offered: {signed_in}");
+    }
+
+    #[tokio::test]
+    async fn a_cookie_that_does_not_verify_is_simply_signed_out() {
+        // Signed out and tampered with look alike everywhere else on this
+        // site, and the landing page is not where that changes.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let page = body_of(
+            app.oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(
+                        axum::http::header::COOKIE,
+                        format!("{}=1.9999999999.notasignature", crate::session::COOKIE),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(page.contains(r#"href="/sign-in""#));
+        assert!(!page.contains(r#"href="/chat""#), "a forged cookie opened the chat");
     }
 }

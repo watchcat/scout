@@ -812,6 +812,25 @@ Add to `mod tests` in `crates/scout-web/src/routes/chat.rs`:
     }
 ```
 
+**The first two tests need one more line of setup than they look like they do.**
+`admitted` signs a Telegram identity into a round; it does *not* write the
+`deliveries` row that `reply_to_for` reads. Without that row `reply_to_for`
+returns `None`, `backfill` returns `Ok(())` having queued nothing — by design,
+see its doc comment — and the assertion fails at 0 rather than 2. So add, after
+`admitted`, in both tests that expect a backfill:
+
+```rust
+        // `admitted` gives the account a Telegram identity, not an address:
+        // it is the Telegram side's `note_address` that records a chat to
+        // reach. Without it `reply_to_for` yields nothing and `backfill`
+        // quietly queues nothing — the same setup
+        // `a_run_promises_a_reminder_only_where_one_could_be_delivered`
+        // already needs, for the same reason.
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+```
+
+The CSRF test needs no such line — it never reaches the backfill.
+
 These are the helpers the neighbouring tests already use — `test_app_with_a_round`,
 `admitted`, `session::mint`, `session::csrf_for`, `post_json_with_cookie` and
 `seed_conversation`. Read `a_post_without_the_csrf_header_is_refused` in the same

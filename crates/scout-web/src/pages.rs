@@ -183,14 +183,21 @@ pub fn account(a: &Account) -> String {
     let standing = if a.member {
         let chat = match a.chat_url {
             Some(url) => format!(
-                "\n    <p><a class=\"btn\" href=\"{url}\">Open Scout on Telegram</a></p>",
+                "\n      <a class=\"btn quiet\" href=\"{url}\">Open Scout on Telegram</a>",
                 url = escape(url)
             ),
             None => String::new(),
         };
+        // This used to say Scout lives in Telegram, which stopped being
+        // true the day `/chat` shipped. The link and the sentence are one
+        // edit: an invitation to chat here, under a line saying the chat is
+        // somewhere else, would read as a mistake.
         format!(
-            r#"    <p>You're in. Scout lives in Telegram today — that is where you ask it
-       things.</p>{chat}"#
+            r#"    <p>You're in. Ask Scout here or in Telegram — it is one conversation
+       either way, so a question from a laptop carries on from a phone.</p>
+    <p>
+      <a class="btn" href="/chat">Open the chat</a>{chat}
+    </p>"#
         )
     } else {
         r#"    <p>You're on the list. When a round opens with room in it, you're in —
@@ -519,6 +526,14 @@ mod tests {
         let page = link_dead();
         assert!(!page.to_lowercase().contains("no record"));
         assert!(!page.to_lowercase().contains("unknown"));
+    }
+
+    #[test]
+    fn a_member_is_offered_the_web_chat() {
+        // Without a link the feature is unreachable — `/chat` is not
+        // advertised anywhere else.
+        let page = account(&member(&kinds(&["telegram"])));
+        assert!(page.contains(r#"href="/chat""#), "no way in: {page}");
     }
 
 }

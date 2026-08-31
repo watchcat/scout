@@ -5,6 +5,9 @@
 /// Orphan closers are stripped too: when the provider streams reasoning on
 /// its own channel, the text channel can begin with a bare `</think>` whose
 /// opener was never in it.
+///
+/// An XML namespace prefix on the tag is ignored, so `</mm:think>` is the
+/// same tag as `</think>`.
 pub fn strip_thinking(s: &str) -> String {
     // Openers and their contents are gone by here; `strip_thinking_blocks`
     // drops an unclosed one all the way to the end. What can survive is a
@@ -16,7 +19,7 @@ pub fn strip_thinking(s: &str) -> String {
     // everything in front of it is reasoning and goes with it. Removing the
     // tag and keeping what preceded it published a whole chain of thought
     // into a chat once, system prompt and all.
-    let stripped = strip_thinking_blocks(s);
+    let stripped = strip_thinking_blocks(&unnamespace_think_tags(s));
     let mut out = stripped.as_str();
     loop {
         let lower = out.to_ascii_lowercase();
@@ -33,6 +36,51 @@ pub fn strip_thinking(s: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Rewrites `<mm:think>` to `<think>`, and any other namespace prefix on a
+/// thinking tag likewise, so that everything below matches two spellings
+/// rather than unboundedly many.
+///
+/// A prefix rather than a wider tag search because the two are not the same
+/// risk. Matching `think` anywhere inside a tag name would swallow markup
+/// nobody meant as reasoning; dropping a `ns:` that sits immediately in
+/// front of `think` cannot, because the rest of the name still has to match.
+///
+/// Byte indices are safe here: every byte this inspects is ASCII, and an
+/// ASCII byte never occurs inside a multi-byte character, so each index it
+/// slices at is a character boundary.
+fn unnamespace_think_tags(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    // Everything before this has been copied out already.
+    let mut copied = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        // A closer's slash belongs to the tag, not to the prefix.
+        let name = if b.get(i + 1) == Some(&b'/') { i + 2 } else { i + 1 };
+        let mut end = name;
+        while end < b.len() && (b[end].is_ascii_alphanumeric() || matches!(b[end], b'_' | b'-' | b'.')) {
+            end += 1;
+        }
+        // A prefix is a non-empty name followed by a colon, and it only
+        // counts as one when `think` is what comes after the colon.
+        let is_prefixed_think = end > name
+            && b.get(end) == Some(&b':')
+            && b[end + 1..].len() >= 5
+            && b[end + 1..end + 6].eq_ignore_ascii_case(b"think");
+        if is_prefixed_think {
+            out.push_str(&s[copied..name]);
+            copied = end + 1;
+        }
+        i += 1;
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 fn strip_thinking_blocks(s: &str) -> String {
@@ -128,6 +176,32 @@ mod tests {
     }
 
     #[test]
+    fn a_namespaced_tag_is_still_a_thinking_tag() {
+        // MiniMax began namespacing the tag in August 2026. `</mm:think>`
+        // matched neither the opener search nor either closer, so it was
+        // not stripped and — worse — the rule that everything in front of
+        // an orphan closer is reasoning never fired. Measured on a real
+        // transcript: a page of deliberation reached the chat, tag and all.
+        assert_eq!(strip_thinking("my reasoning</mm:think>The answer"), "The answer");
+        assert_eq!(strip_thinking("<mm:think>hidden</mm:think>The answer"), "The answer");
+        assert_eq!(strip_thinking("<mm:thinking>hidden</mm:thinking>answer"), "answer");
+        // Later closers still win, whatever they are spelled.
+        assert_eq!(strip_thinking("a</think>b</mm:think>real answer"), "real answer");
+        // An unclosed namespaced opener drops the rest, like its bare twin.
+        assert_eq!(strip_thinking("good query <mm:think>and then it rambles"), "good query");
+    }
+
+    #[test]
+    fn a_namespace_is_only_dropped_from_thinking_tags() {
+        // The rewrite is aimed at one tag name. Markup that merely carries a
+        // prefix has to survive it, or stripping reasoning would start
+        // quietly editing the answer.
+        assert_eq!(strip_thinking("see <ns:item>one</ns:item>"), "see <ns:item>one</ns:item>");
+        assert_eq!(strip_thinking("a<b:c>d"), "a<b:c>d");
+        assert_eq!(strip_thinking("time is 10<12:30"), "time is 10<12:30");
+    }
+
+    #[test]
     fn a_client_fed_updates_sees_exactly_what_strip_thinking_says_at_every_step() {
         // The load-bearing property. A stream arrives one character at a
         // time; at every prefix, a client that applied the updates must be
@@ -138,6 +212,8 @@ mod tests {
         for source in [
             "Here are three bikes<think>actually let me reconsider",
             "secret reasoning here</think>The answer",
+            "Here are three bikes<mm:think>actually let me reconsider",
+            "secret reasoning here</mm:think>The answer",
         ] {
             let mut shown = scout_api::Shown::default();
             let mut client = String::new();

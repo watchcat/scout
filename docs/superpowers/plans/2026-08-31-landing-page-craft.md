@@ -67,8 +67,11 @@ Add to `mod tests` in `crates/scout-web/src/page.rs`:
                      every size is a var(--t-…); `em` is fine, a bare px is not"
                 );
             }
-            for property in ["padding:", "margin:"] {
-                let Some(value) = decl.strip_prefix(property) else { continue };
+            // `padding` and `margin` and every longhand of them:
+            // `padding-right` and `margin-top` are both in use today, and
+            // matching only the shorthand would let them keep drifting.
+            let Some((property, value)) = decl.split_once(':') else { continue };
+            if property.starts_with("padding") || property.starts_with("margin") {
                 for token in value.split_whitespace() {
                     assert!(
                         !token.ends_with("px") || token == "1px",

@@ -1,5 +1,6 @@
 mod bot;
 mod draft;
+mod mirror;
 mod progress;
 mod scheduler;
 mod scope;
@@ -69,6 +70,7 @@ async fn main() -> Result<()> {
     );
 
     tokio::spawn(scheduler::run(telegram.clone(), core.clone()));
+    tokio::spawn(mirror::run(telegram.clone(), core.clone()));
     // Backups belong to core, not to this channel: they must keep happening
     // whether or not Telegram is running.
     tokio::spawn(core.clone().run_maintenance());

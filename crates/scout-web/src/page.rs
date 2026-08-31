@@ -251,4 +251,92 @@ mod tests {
         assert!(!page.contains(r#"href="/sign-in""#));
         assert!(!page.contains(r#"href="/chat""#));
     }
+
+    #[test]
+    fn motion_can_be_turned_off_and_cannot_hide_the_page() {
+        // Two separate guarantees, both easy to get wrong in ways that only
+        // show up on someone else's machine.
+        //
+        // `@starting-style` is load-bearing, not stylistic: the obvious
+        // alternative — `opacity:0` plus a forwards animation — leaves the
+        // page BLANK anywhere the animation does not run, where this
+        // degrades to simply appearing.
+        //
+        // And reduced motion has to override the starting style too. With
+        // only the resting rule overridden the content still travels its
+        // eight pixels, which is exactly what was asked not to happen.
+        let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+        assert!(
+            !css.contains("animation-fill-mode"),
+            "a fill-mode entrance can leave the page blank; use @starting-style"
+        );
+        let reduced = css
+            .find("prefers-reduced-motion")
+            .expect("motion must be refusable");
+        assert!(
+            css[reduced..].contains("@starting-style"),
+            "reduced motion did not override the starting style, so the content still moves"
+        );
+    }
+
+    #[test]
+    fn the_page_answers_a_press_and_shows_a_keyboard_where_it_is() {
+        // The page had no `:active` and no focus styling at all, on a page
+        // whose whole job is one button — and that button is a link with
+        // `text-decoration:none` inside a `border:0` element, so a keyboard
+        // visitor had nothing but the browser default to go on.
+        let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+        assert!(css.contains(":active"), "nothing on this page answers a press");
+        assert!(css.contains(":focus-visible"), "a keyboard visitor cannot see where they are");
+        // Ungated, hover fires on tap on a touch device and then sticks:
+        // the Telegram button stayed lit after being pressed.
+        assert!(css.contains("hover:hover"), "hover is not gated to devices that have one");
+    }
+
+    #[test]
+    fn every_size_on_the_page_comes_from_the_scale() {
+        // Twelve font sizes and nineteen spacing values did not arrive at
+        // once. They arrived one reasonable half-pixel at a time — 14px
+        // beside 14.5px, which nobody can see and everybody can feel. The
+        // tokens are the fix; this is what stops it happening again.
+        //
+        // Narrow on purpose: `border-radius`, `border-width`, `gap` and the
+        // logo's own `96px` are not spacing, and a test that claimed they
+        // were would be wrong in a way someone would eventually silence.
+        let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+
+        // Split on `}` as well as `;`. A block whose last declaration has
+        // no trailing semicolon would otherwise be glued to the next
+        // selector — `margin-bottom:var(--s-4)}\n.mark .logo{width:66px` —
+        // and reported as a spacing violation for a width. The first
+        // version of this test did that, and the fix applied to it was to
+        // add trailing semicolons to two rules: a convention nobody knows
+        // about, enforced by a message that names the wrong line.
+        for decl in css.split([';', '}']) {
+            let decl = decl.trim();
+            if let Some(value) = decl.strip_prefix("font-size:") {
+                assert!(
+                    !value.contains("px"),
+                    "font-size outside the scale: {decl}\n\
+                     every size is a var(--t-…); `em` is fine, a bare px is not"
+                );
+            }
+            // `padding` and `margin` and every longhand of them:
+            // `padding-right` and `margin-top` are both in use today, and
+            // matching only the shorthand would let them keep drifting.
+            let Some((property, value)) = decl.split_once(':') else { continue };
+            if property.starts_with("padding") || property.starts_with("margin") {
+                for token in value.split_whitespace() {
+                    assert!(
+                        !token.ends_with("px") || token == "1px",
+                        "spacing outside the scale: {decl}\n\
+                         every value is a var(--s-…), 0, or a 1px hairline"
+                    );
+                }
+            }
+        }
+    }
 }

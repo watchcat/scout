@@ -98,23 +98,27 @@ fn csrf_header_ok(auth: &AuthState, headers: &HeaderMap, account_id: i64) -> boo
         .is_some_and(|token| session::csrf_ok_for(&auth.cfg.session_key, token, account_id))
 }
 
-/// Where this account's reminders should be delivered.
+/// Where a reminder made during this run should be delivered, or `None`.
 ///
-/// The rule this is meant to implement is "prefer the account's existing
-/// Telegram address, if it has one" — a browser is not itself a delivery
-/// channel, so a reminder made mid-run has to land somewhere else. Reading
-/// that address is not possible from here: `note_delivery` and
-/// `note_address` on `scout_core::core::Core` write the `deliveries` table
-/// but nothing public reads it back, and `Store::telegram_ids` — the one
-/// reader close enough to answer this — is `pub(crate)` to scout_core, not
-/// visible from scout-web. Rather than reach around that boundary or guess
-/// at an address, this always answers "web": a reminder made from a web
-/// run today is created but has no channel polling it, so it simply never
-/// delivers, instead of being sent to a Telegram chat this code cannot
-/// verify still belongs to the same person. Closing this gap needs a
-/// public accessor added to scout_core.
-fn reply_to_for(account_id: i64) -> scout_api::ReplyTo {
-    scout_api::ReplyTo { channel: "web".to_string(), address: account_id.to_string() }
+/// A browser is not a delivery channel: nothing polls it, so a reminder
+/// recorded against one would simply never arrive. The account's Telegram
+/// chat is the only place a web run can promise to come back to, and when
+/// there is no Telegram identity there is nowhere at all — in which case
+/// `build_agent` does not offer the reminder tool, and the model cannot
+/// accept a promise the system would silently break.
+async fn reply_to_for(auth: &AuthState, account_id: i64) -> Option<scout_api::ReplyTo> {
+    match identity::delivery_address(&auth.core, account_id, "telegram").await {
+        Ok(address) => address.map(|address| scout_api::ReplyTo {
+            channel: "telegram".to_string(),
+            address,
+        }),
+        Err(e) => {
+            // Not fatal: the run is still worth doing, it just cannot take
+            // on a reminder.
+            tracing::warn!(error = %e, "could not read a delivery address");
+            None
+        }
+    }
 }
 
 /// Why a stream stopped. `AgentEvent` has no "finished", so a stream that
@@ -192,7 +196,7 @@ async fn send_message(
     let run = scout_api::RunContext {
         account_id,
         conversation_id,
-        reply_to: reply_to_for(account_id),
+        reply_to: reply_to_for(&auth, account_id).await,
     };
     let core = auth.core.clone();
     let text = body.text;
@@ -243,7 +247,27 @@ async fn reset(axum::extract::State(auth): axum::extract::State<AuthState>, head
 
 #[cfg(test)]
 mod tests {
+    // Named imports rather than `use super::*`: the module imports axum's
+    // `get` and `post`, which would shadow the test helpers of the same
+    // name that every request in here goes through.
+    use super::{reply_to_for, AuthState};
     use crate::tests::*;
+
+    /// The state the handlers take, built the way `build_app` builds it —
+    /// needed for the helpers that are tested directly rather than through
+    /// a request.
+    fn auth_state(core: &std::sync::Arc<scout_core::core::Core>) -> AuthState {
+        AuthState::new(
+            crate::AuthConfig {
+                session_key: TEST_KEY.to_vec(),
+                bot_token: "123456:test-bot-token".to_string(),
+                resend_api_key: "test-key".to_string(),
+                mail_from: "Scout <hello@example.com>".to_string(),
+                base_url: "https://example.com".to_string(),
+            },
+            core.clone(),
+        )
+    }
     use axum::http::StatusCode;
 
     const DAY: i64 = 86_400;
@@ -283,6 +307,39 @@ mod tests {
     /// stays intact everywhere else.
     async fn seed_conversation(core: &scout_core::core::Core, account_id: i64, you: &str, scout: &str) {
         scout_core::session::seed_exchange_for_tests(core, account_id, "direct", you, scout).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_run_promises_a_reminder_only_where_one_could_be_delivered() {
+        // A browser is not a delivery channel. If this returned something
+        // for an account with no Telegram, `build_agent` would offer the
+        // reminder tool and the model would accept a promise that nothing
+        // polls — the reminder would be written and never arrive.
+        let (_app, core, _dir) = test_app_with_a_round().await;
+
+        // Someone who signed in by email and never linked Telegram.
+        let scout_core::identity::SignIn::In { account_id: web_only } =
+            scout_core::identity::sign_in(&core, "email", "ada@example.com").await.unwrap()
+        else {
+            panic!("the round had room");
+        };
+        let auth = auth_state(&core);
+        assert_eq!(
+            reply_to_for(&auth, web_only).await,
+            None,
+            "a run with nowhere to deliver was handed a destination anyway"
+        );
+
+        // Someone whose Telegram chat Scout has actually seen.
+        let telegram = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        assert_eq!(
+            reply_to_for(&auth, telegram).await,
+            Some(scout_api::ReplyTo {
+                channel: "telegram".to_string(),
+                address: "12345".to_string(),
+            })
+        );
     }
 
     #[tokio::test]

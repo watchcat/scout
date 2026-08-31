@@ -133,7 +133,11 @@ pub struct ReplyTo {
 pub struct RunContext {
     pub account_id: i64,
     pub conversation_id: i64,
-    pub reply_to: ReplyTo,
+    /// Where a reminder made during this run should be delivered, or
+    /// `None` when there is nowhere — a browser is not a delivery channel.
+    /// A run with `None` is not offered the reminder tool at all, so the
+    /// model never promises something that would silently never arrive.
+    pub reply_to: Option<ReplyTo>,
 }
 
 impl ReplyTo {

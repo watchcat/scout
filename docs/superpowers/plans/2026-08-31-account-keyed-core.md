@@ -132,8 +132,10 @@ Add to `crates/scout-api/src/lib.rs`, after `DueDelivery`:
 /// has to be sent somewhere later. That destination is a property of *where
 /// the request arrived*, not of who made it — in a group chat the address is
 /// the group, so a reminder asked for there goes back there. Resolving it
-/// from the account's `deliveries` row instead would silently redirect every
-/// group reminder into a private chat.
+/// from the account's `deliveries` row instead would send it wherever that
+/// account last spoke: `note_chat` records incoming chats, group or private
+/// alike, last write wins. The destination would then depend on unrelated
+/// later activity — quietly, and long after the reminder was made.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplyTo {
     pub channel: String,

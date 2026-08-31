@@ -46,6 +46,30 @@ pub struct DueDelivery {
     pub text: String,
 }
 
+/// Where the side effects of a run should be delivered.
+///
+/// A run produces more than an answer: a reminder created mid-conversation
+/// has to be sent somewhere later. That destination is a property of *where
+/// the request arrived*, not of who made it — in a group chat the address is
+/// the group, so a reminder asked for there goes back there. Resolving it
+/// from the account's `deliveries` row instead would send it wherever that
+/// account last spoke: `note_chat` records incoming chats, group or private
+/// alike, last write wins. The destination would then depend on unrelated
+/// later activity — quietly, and long after the reminder was made.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplyTo {
+    pub channel: String,
+    pub address: String,
+}
+
+impl ReplyTo {
+    /// A Telegram chat, by id. The channel string is written once here so
+    /// no caller has to spell it.
+    pub fn telegram(chat_id: i64) -> Self {
+        Self { channel: "telegram".to_string(), address: chat_id.to_string() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +120,17 @@ mod tests {
             let back: AgentEvent = serde_json::from_str(&wire).unwrap();
             assert_eq!(back, event, "round trip changed the event: {wire}");
         }
+    }
+
+    #[test]
+    fn a_reply_to_survives_a_round_trip_and_names_its_channel() {
+        // W4 puts this on a wire, so it has to serialise; the Telegram
+        // constructor exists so an adapter cannot spell "telegram" wrong.
+        let r = ReplyTo::telegram(-100123);
+        assert_eq!(r.channel, "telegram");
+        assert_eq!(r.address, "-100123");
+
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<ReplyTo>(&json).unwrap(), r);
     }
 }

@@ -104,11 +104,19 @@ resolve the destination at delivery time from the `deliveries` table, which
 already maps an account to an address per channel. A reminder belongs to a
 person, after all, and where to send it looks like a delivery-time question.
 
-It is not. In a group chat, `chat_id` is the *group's* id, so a reminder made
-in a group is delivered back to that group. Resolving from `deliveries` would
-silently redirect every one of those into the creator's private chat. The
-address is a property of where the reminder was asked for, not of who asked,
-and `ReplyTo` says so.
+It is not, and the reason is sharper than the first draft of this document
+claimed. That draft said resolving from `deliveries` would redirect group
+reminders "into the creator's private chat". Checked against the code, it does
+something worse: `note_sender` calls `note_chat` on *every* incoming message,
+group or private, and `note_delivery` upserts on `(account_id, channel)`, so
+`deliveries.address` is simply wherever that account last spoke. A reminder
+made in one group could later be delivered to a different group, or to a DM,
+depending on where its owner happened to talk next — non-deterministically,
+and long after the fact.
+
+In a group chat `chat_id` is the *group's* id, and a reminder made there is
+delivered back there. The address is a property of where the reminder was
+asked for, not of who asked, and `ReplyTo` says so.
 
 What the browser passes is deliberately not decided here. A reminder created on
 the web by someone with no Telegram identity has nowhere to go, and answering

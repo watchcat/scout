@@ -109,7 +109,7 @@ pub async fn link(
     if let LinkOutcome::Merged { account_id: survivor } = outcome {
         let store = core.store();
         let ids = blocking(move || store.telegram_ids(survivor)).await?;
-        if ids.iter().any(|id| core.is_founder(*id)) {
+        if ids.iter().any(|id| core.is_founder(crate::ids::TelegramId(*id))) {
             let store = core.store();
             blocking(move || store.release_seat(survivor)).await?;
         }

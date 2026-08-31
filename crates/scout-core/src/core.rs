@@ -233,8 +233,8 @@ impl Core {
         }
     }
 
-    pub fn is_founder(&self, telegram_id: i64) -> bool {
-        is_founder(&self.cfg.allowed_user_ids, telegram_id)
+    pub fn is_founder(&self, id: crate::ids::TelegramId) -> bool {
+        is_founder(&self.cfg.allowed_user_ids, id.0)
     }
 
     /// Whether this account belongs to a founder.
@@ -249,8 +249,8 @@ impl Core {
         Ok(ids.iter().any(|id| self.cfg.allowed_user_ids.contains(id)))
     }
 
-    pub fn is_admin(&self, telegram_id: i64) -> bool {
-        is_admin_id(&self.cfg.admin_user_ids, telegram_id)
+    pub fn is_admin(&self, id: crate::ids::TelegramId) -> bool {
+        is_admin_id(&self.cfg.admin_user_ids, id.0)
     }
 
     /// A handle on the database, for this crate only. `store` is private, so

@@ -261,7 +261,7 @@ fn is_member(app: &App, msg: &Message) -> bool {
 /// The gate: founders from `ALLOWED_TELEGRAM_USER_IDS`, plus everyone
 /// admitted through an invite round and not since revoked.
 fn is_member_id(app: &App, user_id: i64) -> bool {
-    app.core.is_founder(user_id) || app.members.contains(&user_id)
+    app.core.is_founder(scout_core::ids::TelegramId(user_id)) || app.members.contains(&user_id)
 }
 
 /// True for `/start`, with or without an `@bot` suffix and with or without
@@ -309,7 +309,7 @@ fn display_name(user: &teloxide::types::User) -> String {
 
 /// `/help`'s text for one person: admins get their own commands appended.
 fn help_for(app: &App, user_id: i64) -> String {
-    match app.core.is_admin(user_id) {
+    match app.core.is_admin(scout_core::ids::TelegramId(user_id)) {
         true => format!("{HELP}{ADMIN_HELP}"),
         false => HELP.to_string(),
     }
@@ -416,8 +416,21 @@ async fn handle_command(
             // History lives in the store now, so clearing the slot alone
             // would leave the thread intact and /reset would do nothing.
             // A fresh conversation is what "cleared" has to mean.
-            let scope = scout_core::session::conversation_scope(msg.chat.id.0, user_id);
-            if let Err(e) = scout_core::session::reset(&app.core, user_id, &scope).await {
+            let account_id = match scout_core::session::account_of(
+                &app.core,
+                scout_core::ids::TelegramId(user_id),
+            )
+            .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, user_id, "could not resolve an account");
+                    bot.send_message(msg.chat.id, CLAIM_FAILED).await?;
+                    return Ok(());
+                }
+            };
+            let scope = crate::scope::conversation_scope(msg.chat.id.0, user_id);
+            if let Err(e) = scout_core::session::reset(&app.core, account_id, &scope).await {
                 tracing::error!(error = %e, user_id, "could not clear the conversation");
                 bot.send_message(msg.chat.id, CLAIM_FAILED).await?;
                 return Ok(());
@@ -428,7 +441,7 @@ async fn handle_command(
             let Some(user_id) = msg.from.as_ref().map(|u| u.id.0 as i64) else {
                 return Ok(());
             };
-            if !app.core.is_admin(user_id) {
+            if !app.core.is_admin(scout_core::ids::TelegramId(user_id)) {
                 bot.send_message(msg.chat.id, scout_core::invites::NOT_ADMIN).await?;
                 return Ok(());
             }
@@ -448,7 +461,7 @@ async fn handle_command(
             // Same gate as the cross-user /stat view: the admin list is
             // the whole access-control surface for anything that reaches
             // beyond the caller.
-            if !app.core.is_admin(user_id) {
+            if !app.core.is_admin(scout_core::ids::TelegramId(user_id)) {
                 bot.send_message(msg.chat.id, scout_core::invites::NOT_ADMIN).await?;
                 return Ok(());
             }
@@ -561,10 +574,10 @@ fn chat_display_name(chat: &teloxide::types::ChatFullInfo) -> Option<String> {
 }
 
 /// Fire-and-forget usage logging; never delays request handling.
-fn log_request(app: &Arc<App>, user_id: i64, kind: &'static str) {
+fn log_request(app: &Arc<App>, account_id: i64, kind: &'static str) {
     let core = app.core.clone();
     tokio::spawn(async move {
-        if let Err(e) = core.log_request(user_id, kind).await {
+        if let Err(e) = core.log_request(account_id, kind).await {
             tracing::warn!(error = %e, "request logging failed");
         }
     });
@@ -849,14 +862,29 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     let text = msg.text().unwrap_or_default().to_string();
     let chat_id = msg.chat.id;
     let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    // Resolved once, before anything below is asked a question: everything
+    // core stores for this person hangs off the account id, and a Telegram
+    // id smuggled past here would read and write somebody else's row.
+    let account_id = match scout_core::session::account_of(
+        &app.core,
+        scout_core::ids::TelegramId(user_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not resolve an account");
+            return Ok(());
+        }
+    };
     // Checked before the request is logged: otherwise somebody over their
     // cap would push their own count up by being told they are over it, and
     // /stat would report refusals as work.
-    if let Some(refusal) = scout_core::session::over_daily_cap(&app.core, user_id).await {
+    if let Some(refusal) = scout_core::session::over_daily_cap(&app.core, account_id).await {
         bot.send_message(chat_id, refusal).await?;
         return Ok(());
     }
-    log_request(&app, user_id, "text");
+    log_request(&app, account_id, "text");
     note_sender(&app, &msg);
 
     // Session expiry: after a long gap the old context is set aside; a quick
@@ -870,8 +898,8 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         let mut chat = app.chats.entry(key).or_default();
         take_expired_session(&mut chat, std::time::Instant::now());
     }
-    let scope = scout_core::session::conversation_scope(chat_id.0, user_id);
-    let conversation_id = match scout_core::session::resolve_conversation(&app.core, user_id, &scope, &text).await {
+    let scope = crate::scope::conversation_scope(chat_id.0, user_id);
+    let conversation_id = match scout_core::session::resolve_conversation(&app.core, account_id, &scope, &text).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not open a conversation");
@@ -915,8 +943,11 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     // join! rather than spawn: both futures run in this task, so the
     // renderer's futures need no Send bound. `events` moves into the run and
     // drops when it returns, which is what ends the renderer.
+    // Bound rather than passed inline: the destination has to outlive the
+    // borrow the run holds on it.
+    let reply_to = scout_api::ReplyTo::telegram(chat_id.0);
     let (result, mut live) = tokio::join!(
-        scout_core::run::run_agent(&app.core, events, user_id, chat_id.0, conversation_id, &prompt),
+        scout_core::run::run_agent(&app.core, events, account_id, &reply_to, conversation_id, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {
@@ -973,10 +1004,26 @@ fn looks_like_price_request(text: &str) -> bool {
 async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
     let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    // Resolved once, before anything below is asked a question: everything
+    // core stores for this person hangs off the account id, and a Telegram
+    // id smuggled past here would read and write somebody else's row.
+    let account_id = match scout_core::session::account_of(
+        &app.core,
+        scout_core::ids::TelegramId(user_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not resolve an account");
+            bot.send_message(chat_id, CLAIM_FAILED).await?;
+            return Ok(());
+        }
+    };
     // Before the session is touched as well as before the request is
     // logged: a refused photo should leave the conversation exactly as it
     // was, not clear a history and disarm a draft on its way out.
-    if let Some(refusal) = scout_core::session::over_daily_cap(&app.core, user_id).await {
+    if let Some(refusal) = scout_core::session::over_daily_cap(&app.core, account_id).await {
         bot.send_message(chat_id, refusal).await?;
         return Ok(());
     }
@@ -993,7 +1040,7 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
     let Some(photo) = msg.photo().and_then(|sizes| sizes.last()) else {
         return Ok(());
     };
-    log_request(&app, user_id, "photo");
+    log_request(&app, account_id, "photo");
     note_sender(&app, &msg);
     // Download plus a vision call, with no progress message in this path —
     // the indicator is the only sign anything is happening.
@@ -1075,7 +1122,22 @@ async fn handle_reaction(
         return Ok(());
     };
 
-    log_request(&app, user_id, "reaction");
+    // Resolved after the membership gate, not before it: `account_of`
+    // creates an account on first sight, so asking earlier would mint one
+    // for every stranger whose 👍 this handler is about to drop.
+    let account_id = match scout_core::session::account_of(
+        &app.core,
+        scout_core::ids::TelegramId(user_id),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not resolve an account");
+            return Ok(());
+        }
+    };
+    log_request(&app, account_id, "reaction");
     note_user(&app, user_id, display_name(user));
     let _typing = Typing::start(bot.clone(), chat_id);
     let prompt = format!(
@@ -1090,8 +1152,8 @@ async fn handle_reaction(
     // A reaction continues whatever thread this chat is already in, so it
     // never starts one: an empty excerpt would just make the classifier
     // guess.
-    let scope = scout_core::session::conversation_scope(chat_id.0, user_id);
-    let conversation_id = match scout_core::session::resolve_conversation(&app.core, user_id, &scope, &prompt).await {
+    let scope = crate::scope::conversation_scope(chat_id.0, user_id);
+    let conversation_id = match scout_core::session::resolve_conversation(&app.core, account_id, &scope, &prompt).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "could not open a conversation");
@@ -1100,8 +1162,11 @@ async fn handle_reaction(
     };
     let (events, incoming) = tokio::sync::mpsc::unbounded_channel();
     let live = Live::new(bot.clone(), chat_id, app.streams.clone());
+    // Bound rather than passed inline: the destination has to outlive the
+    // borrow the run holds on it.
+    let reply_to = scout_api::ReplyTo::telegram(chat_id.0);
     let (result, mut live) = tokio::join!(
-        scout_core::run::run_agent(&app.core, events, user_id, chat_id.0, conversation_id, &prompt),
+        scout_core::run::run_agent(&app.core, events, account_id, &reply_to, conversation_id, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {
@@ -1242,7 +1307,7 @@ async fn handle_invite(bot: &Bot, msg: &Message, app: &Arc<App>, arg: &str) -> R
     let Some(user_id) = sender_id(msg) else { return Ok(()) };
     // Checked here as well as inside core: announce does not go through
     // `invite`, so relying on core's check alone would leave it open.
-    if !app.core.is_admin(user_id) {
+    if !app.core.is_admin(scout_core::ids::TelegramId(user_id)) {
         bot.send_message(msg.chat.id, scout_core::invites::NOT_ADMIN).await?;
         return Ok(());
     }

@@ -104,6 +104,47 @@ fn body_of(turn: &scout_api::Turn) -> String {
     }
 }
 
+/// Records an exchange a channel has already shown the reader, so a
+/// backfill does not send it back.
+///
+/// This lives here rather than in the channel because it is one half of a
+/// guarantee whose other half is `enqueue`, and the two have to agree on a
+/// key. Measured: with the logic in `scout-telegram`, passing the raw
+/// prompt instead of the cut one broke the agreement and no test in the
+/// workspace failed — that crate cannot build a `Core`, so nothing could
+/// exercise the halves against each other. Here they can be.
+///
+/// `said_by_person` and not `prompt`: what the model was given is not what
+/// the reader typed. A price request carries `PRICE_REQUEST_NOTE` on the
+/// end and a thumbs-up follow-up is nothing *but* a note, while a backfill
+/// reads the transcript, which cuts at the marker. Record the raw text and
+/// the keys differ, and the reader's own question goes back to the chat it
+/// came from.
+pub async fn record_delivered(
+    core: &Core,
+    account_id: i64,
+    address: &str,
+    conversation_id: i64,
+    prompt: &str,
+    answered: &str,
+) -> anyhow::Result<usize> {
+    let mut turns = Vec::new();
+    // Empty when the prompt was nothing but a note to the model, which is
+    // every thumbs-up follow-up. A backfill drops empty turns, so there is
+    // no key for one to occupy.
+    let asked = crate::text::said_by_person(prompt);
+    if !asked.is_empty() {
+        turns.push(scout_api::Turn { role: Role::You, text: asked.to_string() });
+    }
+    if !answered.trim().is_empty() {
+        turns.push(scout_api::Turn { role: Role::Scout, text: answered.to_string() });
+    }
+    if turns.is_empty() {
+        return Ok(0);
+    }
+    enqueue(core, account_id, address, conversation_id, &turns, true).await
+}
+
 /// What is still waiting to go out, oldest first.
 pub async fn pending(core: &Core, limit: usize) -> anyhow::Result<Vec<PendingMirror>> {
     let store = core.store();
@@ -243,6 +284,55 @@ mod tests {
         assert_ne!(turn_key(7, Role::You, "beans"), turn_key(7, Role::Scout, "beans"));
         assert_ne!(turn_key(7, Role::You, "beans"), turn_key(8, Role::You, "beans"));
         assert_ne!(turn_key(7, Role::You, "beans"), turn_key(7, Role::You, "rice"));
+    }
+
+    #[tokio::test]
+    async fn recording_a_price_request_stops_a_backfill_echoing_it() {
+        // The two halves of the echo guarantee, run against each other.
+        // Telegram is handed the prompt the model saw; the browser would
+        // backfill the transcript, which is cut at the marker. If these
+        // disagree the reader's own question is sent back to the chat it
+        // came from, and until this test existed two mutations that cause
+        // exactly that — recording the raw prompt, and recording it as not
+        // yet delivered — both left the whole workspace green.
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        let prompt = "find me cheapest gillette\n\n[system note] This is a cheapest-price request.";
+        record_delivered(&core, account_id, "4242", 1, prompt, "EUR 24.24 at bol.com")
+            .await
+            .unwrap();
+        assert!(pending(&core, 10).await.unwrap().is_empty(), "a recorded turn was queued for sending");
+
+        let backfill = vec![
+            scout_api::Turn { role: Role::You, text: "find me cheapest gillette".to_string() },
+            scout_api::Turn { role: Role::Scout, text: "EUR 24.24 at bol.com".to_string() },
+        ];
+        let queued = enqueue(&core, account_id, "4242", 1, &backfill, false).await.unwrap();
+        assert_eq!(queued, 0, "the backfill queued a turn Telegram had already shown");
+        assert!(pending(&core, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_is_only_a_note_records_just_the_answer() {
+        // The thumbs-up follow-up: the whole prompt is a system note, so
+        // there is no reader turn to record and a backfill would drop it.
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        let recorded = record_delivered(
+            &core,
+            account_id,
+            "4242",
+            1,
+            "[system note] The user reacted with a thumbs-up.",
+            "Want me to save that one?",
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded, 1, "recorded a turn the reader never said");
     }
 
     #[test]

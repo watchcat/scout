@@ -1257,33 +1257,13 @@ async fn record_own_turn(
     prompt: &str,
     answered: &str,
 ) {
-    let mut turns = Vec::new();
-    // Empty when the prompt was nothing but a note to the model, which is
-    // every thumbs-up follow-up. A backfill drops empty turns, so there is
-    // no key to occupy.
-    let asked = scout_core::text::said_by_person(prompt);
-    if !asked.is_empty() {
-        turns.push(scout_api::Turn {
-            role: scout_api::Role::You,
-            text: asked.to_string(),
-        });
-    }
-    if !answered.trim().is_empty() {
-        turns.push(scout_api::Turn {
-            role: scout_api::Role::Scout,
-            text: answered.to_string(),
-        });
-    }
-    if turns.is_empty() {
-        return;
-    }
-    if let Err(e) = scout_core::mirror::enqueue(
+    if let Err(e) = scout_core::mirror::record_delivered(
         core,
         account_id,
         &chat_id.to_string(),
         conversation_id,
-        &turns,
-        true,
+        prompt,
+        answered,
     )
     .await
     {

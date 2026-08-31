@@ -79,7 +79,37 @@ async fn chat(axum::extract::State(auth): axum::extract::State<AuthState>, heade
         Err(response) => return response,
     };
     let csrf = session::csrf_for(&auth.cfg.session_key, account_id);
-    Html(TEMPLATE.replace(CSRF_TOKEN, &csrf)).into_response()
+    let page = TEMPLATE.replace(CSRF_TOKEN, &csrf);
+    // The same call that decides whether a run may promise a reminder
+    // decides whether this is offered, so the two cannot disagree about
+    // whether there is anywhere to send.
+    let page = if reply_to_for(&auth, account_id).await.is_some() {
+        page
+    } else {
+        strip_mirror_toggle(&page)
+    };
+    Html(page).into_response()
+}
+
+/// Removes the mirror control from the page.
+///
+/// A string edit rather than a template engine, because this page is a
+/// static file with one conditional element in it and a dependency for one
+/// `if` is a dependency to maintain forever. Returning the page unchanged
+/// when the markers are missing means a restyle that renames the button
+/// shows the control to everyone rather than serving a broken page — the
+/// test below is what catches that instead.
+fn strip_mirror_toggle(page: &str) -> String {
+    let Some(start) = page.find(r#"<button id="mirror""#) else {
+        return page.to_string();
+    };
+    let Some(end) = page[start..].find("</button>") else {
+        return page.to_string();
+    };
+    let mut out = String::with_capacity(page.len());
+    out.push_str(&page[..start]);
+    out.push_str(&page[start + end + "</button>".len()..]);
+    out
 }
 
 async fn client() -> impl IntoResponse {
@@ -804,6 +834,34 @@ mod tests {
         let res = post_json_with_cookie(&app, "/chat/mirror", &cookie, None, r#"{"on":true}"#).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(!scout_core::mirror::is_enabled(&core, account_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_mirror_toggle_is_absent_without_a_telegram_identity() {
+        // A control that cannot work is a promise the page cannot keep. The
+        // same call that decides whether a run may promise a reminder
+        // decides whether this is shown, so the two cannot drift — and
+        // `/chat/mirror`'s backfill quietly does nothing in this state,
+        // which would be baffling if the button were there to press.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let scout_core::identity::SignIn::In { account_id: web_only } =
+            scout_core::identity::sign_in(&core, "email", "ada@example.com").await.unwrap()
+        else {
+            panic!("the round had room");
+        };
+        let cookie = crate::session::mint(TEST_KEY, web_only, DAY);
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        assert!(!page.contains(r#"id="mirror""#), "offered a mirror with nowhere to send it");
+    }
+
+    #[tokio::test]
+    async fn the_mirror_toggle_is_offered_to_someone_on_telegram() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        assert!(page.contains(r#"id="mirror""#), "no way to switch the mirror on");
     }
 
     #[tokio::test]

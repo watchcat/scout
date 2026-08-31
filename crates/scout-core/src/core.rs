@@ -332,18 +332,10 @@ impl Core {
         .await
     }
 
-    /// Records a request against the caller's account.
-    ///
-    /// Takes a Telegram id and resolves it, so the caller never has to know
-    /// that the two are different numbers — the mistake that made /stat
-    /// report an empty week.
-    pub async fn log_request(&self, telegram_id: i64, kind: &'static str) -> anyhow::Result<()> {
+    /// Records a request against an account.
+    pub async fn log_request(&self, account_id: i64, kind: &'static str) -> anyhow::Result<()> {
         let store = self.store();
-        blocking(move || {
-            let account_id = store.account_for_telegram(telegram_id)?;
-            store.log_request(account_id, kind)
-        })
-        .await
+        blocking(move || store.log_request(account_id, kind)).await
     }
 
     /// Remembers what to call someone, under their account.

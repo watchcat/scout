@@ -27,6 +27,20 @@ pub enum RunOutcome {
 /// `events` is taken by value: returning drops it, which closes the channel
 /// and ends whoever is rendering. That is the only shutdown signal the
 /// renderer gets, so it must not be held anywhere else.
+/// The event a streamed chunk should produce, if anything changed.
+///
+/// A function rather than three lines inline, because `run_agent` needs a
+/// live model and so nothing can test what happens inside it. Measured: with
+/// this logic inline, reinstating the old `if !answer.is_empty()` guard —
+/// which suppresses the retraction of reasoning already sent — was caught by
+/// no test in the workspace. Here it is caught.
+fn answer_event(
+    shown: &mut scout_api::Shown,
+    streamed: &str,
+) -> Option<scout_api::AgentEvent> {
+    shown.update(&strip_thinking(streamed)).map(scout_api::AgentEvent::Answer)
+}
+
 pub async fn run_agent(
     core: &Core,
     events: scout_api::EventSink,
@@ -103,8 +117,8 @@ pub async fn run_agent(
                     // reasoning, the update is a Replace that takes it back.
                     // The old `if !answer.is_empty()` guard suppressed
                     // exactly that event, which is why it is gone.
-                    if let Some(update) = answer_shown.update(&strip_thinking(&streamed)) {
-                        scout_api::emit(&events, scout_api::AgentEvent::Answer(update));
+                    if let Some(event) = answer_event(&mut answer_shown, &streamed) {
+                        scout_api::emit(&events, event);
                     }
                 }
                 // MiniMax streams its reasoning on a separate channel. Shown
@@ -364,6 +378,33 @@ fn is_max_turns(e: &impl std::fmt::Display) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stray_closer_makes_the_run_retract_the_answer_it_already_sent() {
+        // `Shown` is tested on its own, but this is the wiring: a guard
+        // added here would swallow the retraction while every unit test
+        // stayed green. That is not hypothetical — it was true until this
+        // test existed.
+        let source = "secret reasoning here</think>The answer";
+        let mut shown = scout_api::Shown::default();
+
+        assert!(
+            matches!(
+                answer_event(&mut shown, &source[..21]),
+                Some(scout_api::AgentEvent::Answer(scout_api::TextUpdate::Append(ref t)))
+                    if t == "secret reasoning here"
+            ),
+            "reasoning should reach the client before the closer proves what it is"
+        );
+        assert!(
+            matches!(
+                answer_event(&mut shown, &source[..29]),
+                Some(scout_api::AgentEvent::Answer(scout_api::TextUpdate::Replace(ref t)))
+                    if t.is_empty()
+            ),
+            "the run did not retract reasoning it had already sent"
+        );
+    }
     use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
     use rig::message::ToolCall;
     use rig::one_or_many::OneOrMany;

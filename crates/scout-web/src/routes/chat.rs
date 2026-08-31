@@ -163,9 +163,14 @@ fn end_frame(outcome: anyhow::Result<scout_core::run::RunOutcome>) -> End {
     match outcome {
         Ok(scout_core::run::RunOutcome::Answered(answer)) => End::Ok { answer },
         Ok(scout_core::run::RunOutcome::Busy) => End::Busy,
-        Err(e) => End::Error {
-            message: scout_core::run::agent_error_message(&e).to_string(),
-        },
+        // Telegram has always logged this; the browser path did not, so a
+        // failed run left no trace anywhere and the only record of it was
+        // the reader's screenshot. `run_agent` logs the stream errors it
+        // raises itself, but not every failure comes from there.
+        Err(e) => {
+            tracing::error!(error = %e, "a browser run failed");
+            End::Error { message: scout_core::run::agent_error_message(&e).to_string() }
+        }
     }
 }
 
@@ -284,6 +289,21 @@ mod tests {
     // name that every request in here goes through.
     use super::{end_frame, reply_to_for, AuthState};
     use crate::tests::*;
+
+    #[test]
+    fn a_failed_run_is_written_down_before_it_is_apologised_for() {
+        // Measured: a run died at turn 2 of 20 and the whole pod log held
+        // no WARN and no ERROR, because this path turned the error into a
+        // sentence for the browser and dropped it. The apology is what the
+        // reader gets; the log is the only thing left to diagnose from.
+        let src = include_str!("chat.rs");
+        let start = src.find("fn end_frame").expect("the end frame must exist");
+        let end = src[start..].find("\n}").expect("it must end") + start;
+        assert!(
+            src[start..end].contains("tracing::error!"),
+            "a failed run must be logged, not only apologised for"
+        );
+    }
 
     #[test]
     fn the_last_frame_carries_the_finished_answer() {

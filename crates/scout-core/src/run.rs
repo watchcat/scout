@@ -162,7 +162,15 @@ pub async fn run_agent(
     // the deadline is still in `streamed`/`thinking` for the wrap-up.
     let salvage = match outcome {
         Ok(Ok(reason)) => reason,
-        Ok(Err(e)) => return Err(e),
+        // Logged here rather than left to the channel: this is where the
+        // conversation is known, and a channel that forgot would be silent
+        // about the one thing worth knowing. The web channel did forget —
+        // a run that died at turn 2 of 20 left the whole pod log without a
+        // single WARN or ERROR in it, so there was nothing to diagnose.
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, account_id, conversation_id, "the run failed");
+            return Err(e);
+        }
         Err(_) => Some("this took too long"),
     };
 

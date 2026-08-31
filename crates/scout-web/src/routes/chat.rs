@@ -327,6 +327,29 @@ mod tests {
     }
 
     #[test]
+    fn a_long_url_wraps_instead_of_widening_the_page() {
+        // Answers are full of links, and `linkify` makes the whole url the
+        // anchor's text. A percent-encoded one is a single token of 200-odd
+        // characters with no whitespace, so `pre-wrap` alone cannot break it:
+        // observed running out of the bubble, giving the transcript a
+        // horizontal scrollbar and shifting the composer out of line.
+        //
+        // `break-word` would not do — it wraps but leaves the intrinsic
+        // min-content width alone, and that width is what widens the page.
+        // Scoped to the declaration, not the file. Written the loose way it
+        // matched the word "anywhere" in the comment explaining the rule and
+        // stayed green when the rule itself was weakened to `break-word` —
+        // the second source-scan test today to assert against its own prose.
+        let page = include_str!("../chat.html");
+        let start = page.find(".turns li{").expect("the bubbles must be styled");
+        let rule = &page[start..start + page[start..].find('}').expect("the rule must end")];
+        assert!(
+            rule.contains("overflow-wrap:anywhere"),
+            "message bubbles must break an unbreakable token, or a long url widens the page"
+        );
+    }
+
+    #[test]
     fn the_last_frame_carries_the_finished_answer() {
         // The bubble the reader is looking at was built from token deltas,
         // and those are every turn of the run concatenated. The finished

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { applyUpdate, escapeHtml, finalAnswer, linkify, shouldFollow, composerHeight } from './chat.js'
+import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
   // The browser half of the protocol's security property: reasoning the
@@ -78,4 +78,19 @@ test('a run that failed leaves no half-answer above the apology', () => {
   assert.equal(finalAnswer({ status: 'error', message: 'boom' }, 'Let me grab the live price'), '')
   // Busy produced nothing either — the run never started.
   assert.equal(finalAnswer({ status: 'busy' }, ''), '')
+})
+
+test('a keep-alive comment is not mistaken for a frame', () => {
+  // The server sends comment blocks so a silent run does not look idle to
+  // whatever sits between us — a stream that sends nothing at all gets
+  // dropped, and the reader is told the connection failed on a run that
+  // was going fine. A comment carries no `event:` line.
+  assert.equal(parseFrame(':'), null)
+  assert.equal(parseFrame(': '), null)
+  assert.equal(parseFrame(''), null)
+  // And a real frame still parses beside them.
+  assert.deepEqual(parseFrame('event: end\ndata: {"status":"ok","answer":"hi"}'), {
+    event: 'end',
+    data: '{"status":"ok","answer":"hi"}',
+  })
 })

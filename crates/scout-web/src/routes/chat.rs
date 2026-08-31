@@ -4,7 +4,7 @@
 use super::{see_other, signed_in_as, sorry};
 use crate::{session, AuthState};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -198,7 +198,14 @@ fn sse_response(rx: tokio::sync::mpsc::UnboundedReceiver<Frame>) -> Response {
         // not in a caller's input — worth a loud panic, not a silent drop.
         Ok::<_, std::convert::Infallible>(event.expect("a frame always serialises"))
     });
-    Sse::new(stream).into_response()
+    // A run is silent for long stretches — a tool call takes most of a
+    // minute, and after the last token the dead-link probes can hold the
+    // connection for another twelve seconds without sending anything. With
+    // no traffic at all, any intermediary with an idle timeout is free to
+    // drop the stream, and the reader gets "the connection dropped" for a
+    // run that was going perfectly well. The comment frames this sends are
+    // ignored by `parseFrame`, which needs an `event:` line.
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -302,6 +309,20 @@ mod tests {
         assert!(
             src[start..end].contains("tracing::error!"),
             "a failed run must be logged, not only apologised for"
+        );
+    }
+
+    #[test]
+    fn the_stream_is_kept_alive_through_a_silent_run() {
+        // Not assertable from the response type, so it is asserted from the
+        // source. A run goes quiet for a whole tool call, and a stream that
+        // sends nothing at all invites an intermediary to close it.
+        let src = include_str!("chat.rs");
+        let start = src.find("fn sse_response").expect("the response builder must exist");
+        let end = src[start..].find("\n}").expect("it must end") + start;
+        assert!(
+            src[start..end].contains("keep_alive"),
+            "a silent stream must still send something, or it gets dropped as idle"
         );
     }
 

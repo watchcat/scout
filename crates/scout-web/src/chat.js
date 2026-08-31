@@ -78,6 +78,25 @@ const FOLLOW_SLACK = 32
 
 // Whether new content should be scrolled into view. Pure, so the rule that
 // makes a streaming answer bearable can be tested without a browser.
+// Splits one SSE block ("event: ...\ndata: ...") into its two fields, or
+// null when the block carries no event. Multiple `data:` lines are legal
+// SSE and get joined with `\n`, though this protocol only ever sends one.
+//
+// Null is the common case as well as the error case: the server keeps the
+// stream alive through a silent run by sending comment blocks, and a
+// comment has no `event:` line. Lifted out of `start` so it can be tested —
+// it touches no DOM.
+export function parseFrame(block) {
+  let event = null
+  const dataLines = []
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice('event:'.length).trim()
+    else if (line.startsWith('data:')) dataLines.push(line.slice('data:'.length).trim())
+  }
+  if (!event) return null
+  return { event, data: dataLines.join('\n') }
+}
+
 export function shouldFollow(scrollTop, clientHeight, scrollHeight, slack = FOLLOW_SLACK) {
   return scrollHeight - scrollTop - clientHeight <= slack
 }
@@ -167,20 +186,6 @@ function start() {
       turnsEl.append(turnElement(turn.role, turn.text))
     }
     turnsEl.scrollTop = turnsEl.scrollHeight
-  }
-
-  // Splits one SSE block ("event: ...\ndata: ...") into its two fields.
-  // Multiple `data:` lines are legal SSE and get joined with `\n`, though
-  // this protocol only ever sends one.
-  function parseFrame(block) {
-    let event = null
-    const dataLines = []
-    for (const line of block.split('\n')) {
-      if (line.startsWith('event:')) event = line.slice('event:'.length).trim()
-      else if (line.startsWith('data:')) dataLines.push(line.slice('data:'.length).trim())
-    }
-    if (!event) return null
-    return { event, data: dataLines.join('\n') }
   }
 
   // Runs one turn: posts the question, streams `agent` events into the

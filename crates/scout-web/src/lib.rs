@@ -349,17 +349,32 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
 /// listeners for one signal is what tokio's signal handling is for, and the
 /// alternative is a channel threaded through two crates for the sake of one
 /// bool.
+///
+/// Both signals, because `main` awaits the server before it returns: the
+/// dispatcher stops on either one, so a door deaf to Ctrl-C would keep the
+/// process alive for the whole drain budget after every local interrupt.
 async fn closing_time() {
-    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            // Nothing to do but keep serving, which is the behaviour this
-            // function replaced.
-            tracing::warn!(error = %e, "cannot listen for SIGTERM; the page will serve until the process dies");
-            return std::future::pending().await;
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                // Nothing to do but keep serving, which is the behaviour
+                // this function replaced. Ctrl-C below still closes it.
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; only Ctrl-C will close the front door");
+                std::future::pending::<()>().await;
+            }
         }
     };
-    term.recv().await;
+    tokio::select! {
+        _ = term => {}
+        // The dispatcher stops on Ctrl-C as well, and `main` now waits for
+        // this future before it returns. A door that only listened for
+        // SIGTERM would hold every local Ctrl-C hostage for the whole drain
+        // budget — five minutes of a process that looked hung.
+        _ = tokio::signal::ctrl_c() => {}
+    }
     tracing::info!("the front door is closing");
 }
 

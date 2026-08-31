@@ -855,6 +855,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_page_without_a_mirror_toggle_is_still_a_whole_page() {
+        // Stripping means a reader with no Telegram gets different markup
+        // from everyone else, and `the_page_still_carries_every_id_the
+        // _client_binds_to` only ever sees the unstripped one. A cut that
+        // took the reset form or the composer with it would pass every
+        // other test in this file and break the page for exactly the people
+        // who cannot mirror.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let scout_core::identity::SignIn::In { account_id: web_only } =
+            scout_core::identity::sign_in(&core, "email", "ada@example.com").await.unwrap()
+        else {
+            panic!("the round had room");
+        };
+        let cookie = crate::session::mint(TEST_KEY, web_only, DAY);
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        for id in ["turns", "status", "notice", "ask", "text", "send", "reset"] {
+            assert!(page.contains(&format!(r#"id="{id}""#)), "the client binds to #{id}");
+        }
+        assert!(!page.contains(r#"id="mirror""#));
+        // And the cut left no orphaned markup behind it.
+        assert_eq!(page.matches("<div class=\"controls\">").count(), 1);
+        // The paper-plane path, not the viewBox: the send button's icon
+        // shares `viewBox="0 0 24 24"`, so the looser check failed against
+        // a page that had stripped correctly.
+        assert!(!page.contains("M21.7 3.4"), "the toggle's icon outlived the toggle");
+    }
+
+    #[tokio::test]
     async fn the_mirror_toggle_is_offered_to_someone_on_telegram() {
         let (app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;

@@ -126,4 +126,51 @@ mod tests {
     fn strip_thinking_leaves_plain_text_alone() {
         assert_eq!(strip_thinking("  plain query  "), "plain query");
     }
+
+    #[test]
+    fn a_client_fed_updates_sees_exactly_what_strip_thinking_says_at_every_step() {
+        // The load-bearing property. A stream arrives one character at a
+        // time; at every prefix, a client that applied the updates must be
+        // showing precisely what `strip_thinking` would have shown. The
+        // second case is the one that matters: a closer with no opener
+        // means everything before it was reasoning, so the client has to be
+        // told to throw away what it already displayed.
+        for source in [
+            "Here are three bikes<think>actually let me reconsider",
+            "secret reasoning here</think>The answer",
+        ] {
+            let mut shown = scout_api::Shown::default();
+            let mut client = String::new();
+            for (i, _) in source.char_indices().chain(std::iter::once((source.len(), ' '))) {
+                let answer = strip_thinking(&source[..i]);
+                if let Some(update) = shown.update(&answer) {
+                    update.apply(&mut client);
+                }
+                assert_eq!(
+                    client, answer,
+                    "client drifted at prefix {i:?} of {source:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stray_closer_retracts_what_was_already_shown() {
+        // Named separately because this is the security property, not a
+        // formatting one: without the Replace the client keeps the
+        // reasoning on screen.
+        let source = "secret reasoning here</think>The answer";
+        let mut shown = scout_api::Shown::default();
+        // Everything up to the closer is shown as answer text.
+        assert!(matches!(
+            shown.update(&strip_thinking(&source[..21])),
+            Some(scout_api::TextUpdate::Append(ref t)) if t == "secret reasoning here"
+        ));
+        // The completed closer retracts all of it.
+        assert_eq!(
+            shown.update(&strip_thinking(&source[..29])),
+            Some(scout_api::TextUpdate::Replace(String::new())),
+            "the retraction was not sent, so a client would still be showing reasoning"
+        );
+    }
 }

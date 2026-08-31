@@ -52,10 +52,138 @@ pub fn turn_key(conversation_id: i64, role: Role, text: &str) -> String {
         .collect()
 }
 
+use crate::core::Core;
+
+pub use crate::store::PendingMirror;
+
+/// Queues a thread's turns for one channel, skipping any already known.
+/// Returns how many rows were written.
+///
+/// `delivered` is the channel saying "I have already shown the reader
+/// these" — see the module's own tests, and the echo they exist to stop.
+pub async fn enqueue(
+    core: &Core,
+    account_id: i64,
+    address: &str,
+    conversation_id: i64,
+    turns: &[scout_api::Turn],
+    delivered: bool,
+) -> anyhow::Result<usize> {
+    let store = core.store();
+    let address = address.to_string();
+    let rows: Vec<(String, String)> = turns
+        .iter()
+        .map(|t| (turn_key(conversation_id, t.role, &t.text), body_of(t)))
+        .collect();
+    let written = crate::core::blocking(move || {
+        let mut written = 0;
+        for (key, body) in &rows {
+            if store.enqueue_mirror(account_id, TELEGRAM, &address, body, key, delivered)? {
+                written += 1;
+            }
+        }
+        Ok(written)
+    })
+    .await?;
+    if written > 0 && !delivered {
+        core.wake_mirror();
+    }
+    Ok(written)
+}
+
+/// How a turn reads once it is somebody else's message.
+///
+/// The reader's own question is quoted with a literal `>`, in plain text.
+/// Not MarkdownV2: an answer is model output full of `*`, `_`, `[` and `.`,
+/// every one of which MarkdownV2 requires escaped, and a missed escape turns
+/// a price list into a parse error. A literal `>` reads fine and cannot fail.
+fn body_of(turn: &scout_api::Turn) -> String {
+    match turn.role {
+        Role::You => turn.text.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n"),
+        Role::Scout => turn.text.clone(),
+    }
+}
+
+/// What is still waiting to go out, oldest first.
+pub async fn pending(core: &Core, limit: usize) -> anyhow::Result<Vec<PendingMirror>> {
+    let store = core.store();
+    crate::core::blocking(move || store.pending_mirror(TELEGRAM, limit)).await
+}
+
+pub async fn sent(core: &Core, id: i64) -> anyhow::Result<()> {
+    let store = core.store();
+    crate::core::blocking(move || store.mark_mirror_sent(id)).await
+}
+
+pub async fn failed(core: &Core, id: i64) -> anyhow::Result<()> {
+    let store = core.store();
+    crate::core::blocking(move || store.mark_mirror_failed(id)).await
+}
+
+pub async fn is_enabled(core: &Core, account_id: i64) -> anyhow::Result<bool> {
+    let store = core.store();
+    crate::core::blocking(move || store.mirror_enabled(account_id)).await
+}
+
+pub async fn set_enabled(core: &Core, account_id: i64, on: bool) -> anyhow::Result<()> {
+    let store = core.store();
+    crate::core::blocking(move || store.set_mirror(account_id, on)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use scout_api::Role;
+
+    async fn test_core() -> (crate::core::Core, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mirror.duckdb");
+        let cfg = crate::config::Config::for_test(path.to_str().unwrap());
+        (crate::core::Core::start(cfg, None).unwrap(), dir)
+    }
+
+    #[tokio::test]
+    async fn a_thread_is_queued_once_however_often_it_is_offered() {
+        // Turning the toggle on backfills; every completed run enqueues;
+        // turning it off and on backfills again. One row per turn, always.
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        let turns = vec![
+            scout_api::Turn { role: Role::You, text: "cheapest beans".to_string() },
+            scout_api::Turn { role: Role::Scout, text: "here are three".to_string() },
+        ];
+        let queued = enqueue(&core, account_id, "4242", 1, &turns, false).await.unwrap();
+        assert_eq!(queued, 2);
+        let queued = enqueue(&core, account_id, "4242", 1, &turns, false).await.unwrap();
+        assert_eq!(queued, 0, "the same thread was queued a second time");
+        assert_eq!(pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn what_telegram_already_showed_is_never_queued_for_telegram() {
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        let turns = vec![scout_api::Turn { role: Role::Scout, text: "here are three".to_string() }];
+        enqueue(&core, account_id, "4242", 1, &turns, true).await.unwrap();
+        assert!(pending(&core, 10).await.unwrap().is_empty());
+        enqueue(&core, account_id, "4242", 1, &turns, false).await.unwrap();
+        assert!(pending(&core, 10).await.unwrap().is_empty(), "the backfill echoed Telegram back at itself");
+    }
+
+    #[test]
+    fn the_readers_own_words_are_quoted_line_by_line() {
+        // A literal `>`, not a MarkdownV2 blockquote: the bot sends plain
+        // text everywhere but two admin paths, and an unescaped `*` in an
+        // answer would be a parse error rather than a price.
+        let you = scout_api::Turn { role: Role::You, text: "find me\ntwo things".to_string() };
+        assert_eq!(body_of(&you), "> find me\n> two things");
+        let scout = scout_api::Turn { role: Role::Scout, text: "EUR 24.24 *delivered*".to_string() };
+        assert_eq!(body_of(&scout), "EUR 24.24 *delivered*", "an answer must go out untouched");
+    }
 
     #[test]
     fn the_same_turn_always_has_the_same_key() {

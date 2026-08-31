@@ -253,6 +253,21 @@ mod tests {
     }
 
     #[test]
+    fn the_page_answers_a_press_and_shows_a_keyboard_where_it_is() {
+        // The page had no `:active` and no focus styling at all, on a page
+        // whose whole job is one button — and that button is a link with
+        // `text-decoration:none` inside a `border:0` element, so a keyboard
+        // visitor had nothing but the browser default to go on.
+        let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+        assert!(css.contains(":active"), "nothing on this page answers a press");
+        assert!(css.contains(":focus-visible"), "a keyboard visitor cannot see where they are");
+        // Ungated, hover fires on tap on a touch device and then sticks:
+        // the Telegram button stayed lit after being pressed.
+        assert!(css.contains("hover:hover"), "hover is not gated to devices that have one");
+    }
+
+    #[test]
     fn every_size_on_the_page_comes_from_the_scale() {
         // Twelve font sizes and nineteen spacing values did not arrive at
         // once. They arrived one reasonable half-pixel at a time — 14px

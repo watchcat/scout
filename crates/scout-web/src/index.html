@@ -34,8 +34,8 @@
     -webkit-font-smoothing:antialiased;
   }
   .wrap{max-width:880px; margin:0 auto; padding:0 var(--s-5)}
-  a{color:var(--blue); text-decoration:none}
-  a:hover{text-decoration:underline}
+  a{color:var(--blue); text-decoration:none;
+    transition:color 150ms var(--ease-out)}
   code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.92em;
     background:var(--base02); padding:1px var(--s-1); border-radius:3px; color:var(--cyan)}
 
@@ -60,15 +60,20 @@
   .board{
     background:var(--base02); border-radius:6px; padding:var(--s-4); margin:0 0 var(--s-3);
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:var(--t-xs);
-    overflow-x:auto; line-height:1.9;
+    overflow-x:auto; line-height:2;
   }
-  .board .row{white-space:pre; color:var(--base1); display:block}
-  .board .row.win{color:var(--base2)}
+  .board .row{white-space:pre; color:var(--base1); display:block;
+    padding-left:var(--s-3); border-left:2px solid transparent}
+  /* The winner is marked, not merely brighter: the eye should land on it
+     before it reads a single number. `--green` because that is already the
+     colour the per-unit figure is written in. */
+  .board .row.win{color:var(--base2); border-left-color:var(--green)}
   .board .unit{color:var(--green); font-weight:600}
   .board .ship{color:var(--orange)}
   .board .shop{color:var(--base01)}
   .board .hdr{color:var(--base01); border-bottom:1px solid var(--rule);
-    padding-bottom:var(--s-2); margin-bottom:var(--s-2); display:block}
+    padding-bottom:var(--s-2); margin-bottom:var(--s-2); display:block;
+    padding-left:var(--s-3)}
   .caption{font-size:var(--t-xs); color:var(--base01); margin:0 0 var(--s-6); max-width:44em}
 
   .gate{background:var(--base02); border:1px solid var(--rule); border-radius:6px;
@@ -82,8 +87,23 @@
   .btn{background:var(--blue); color:var(--base03); font-weight:650;
     font-size:var(--t-sm); padding:var(--s-3) var(--s-5); border-radius:5px;
     border:0; white-space:nowrap}
-  .btn:hover{text-decoration:none; background:#3196d8}
   .btn.ghost{background:transparent; color:var(--base1); border:1px solid var(--base01)}
+  .btn{transition:transform 160ms var(--ease-out), background 150ms var(--ease-out)}
+  /* Every pressable answers a press. A button that does not move when
+     pressed does not feel like it heard you. */
+  .btn:active{transform:scale(.97)}
+  /* A keyboard visitor has to be able to see where they are. The primary
+     call to action is a link with no underline inside a borderless button,
+     so before this there was nothing but the browser default to go on. */
+  a:focus-visible,.btn:focus-visible{outline:2px solid var(--blue);
+    outline-offset:2px; border-radius:3px}
+  /* Gated: on a touch device hover fires on tap and then sticks, so the
+     Telegram button stayed lit after it had been pressed. */
+  @media (hover:hover) and (pointer:fine){
+    a:hover{text-decoration:underline}
+    .btn:hover{text-decoration:none; background:#3196d8}
+    .btn.ghost:hover{background:transparent; color:var(--base2)}
+  }
 
   section{padding:var(--s-6) 0}
   h2{font-size:var(--t-xs); letter-spacing:.14em; text-transform:uppercase;

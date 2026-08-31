@@ -686,7 +686,7 @@ pub fn build_agent(
             store: d.store.clone(),
             account_id,
             shown: d.shown.clone(),
-            chat_id,
+            conversation_id: chat_id,
         })
         .tool(ChooseTripOptionTool { store: d.store.clone(), account_id })
         .tool(ShowTripTool { store: d.store.clone(), account_id })

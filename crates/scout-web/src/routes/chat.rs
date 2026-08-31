@@ -601,6 +601,26 @@ mod tests {
         scout_core::session::seed_exchange_for_tests(core, account_id, "direct", you, scout).await.unwrap();
     }
 
+    #[test]
+    fn a_finished_run_queues_the_exchange_it_just_answered() {
+        // `run_agent` needs a live model, so nothing in this workspace can
+        // drive `send_message` end to end: deleting the call leaves every
+        // other test in this file green, and the mirror would silently
+        // never advance past its first backfill.
+        //
+        // Scoped to the handler's own body. Two source-scan tests written
+        // today matched their own explanatory prose and could never fail;
+        // slicing one function keeps the tests below — which name
+        // `mirror_turn` repeatedly — out of range.
+        let src = include_str!("chat.rs");
+        let start = src.find("async fn send_message").expect("the handler must exist");
+        let end = src[start..].find("\n}").expect("the handler must end") + start;
+        assert!(
+            src[start..end].contains("mirror_turn("),
+            "a finished run must queue the exchange, or the mirror only ever backfills"
+        );
+    }
+
     #[tokio::test]
     async fn a_completed_turn_is_queued_only_when_the_mirror_is_on() {
         // `run_agent` needs a live model, so this exercises the function the

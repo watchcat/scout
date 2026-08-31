@@ -38,11 +38,10 @@ pub async fn account_of(core: &Core, telegram_id: i64) -> anyhow::Result<i64> {
 /// survives a restart.
 pub async fn resolve_conversation(
     core: &Core,
-    user_id: i64,
+    account_id: i64,
     scope: &str,
     text: &str,
 ) -> anyhow::Result<i64> {
-    let account_id = account_of(core, user_id).await?;
     let ttl = SESSION_TTL.as_secs() as i64;
     let store = core.deps.store.clone();
     let (scope_owned, latest) = {
@@ -74,18 +73,18 @@ pub async fn resolve_conversation(
     }
     match crate::agent::continues_previous(&core.deps.llm, &excerpt, text).await {
         Ok(true) => {
-            tracing::info!(user_id, id, "session expired but topic continues; keeping context");
+            tracing::info!(account_id, id, "session expired but topic continues; keeping context");
             let store = core.deps.store.clone();
             crate::core::blocking(move || store.touch_conversation(id)).await?;
             Ok(id)
         }
         Ok(false) => {
-            tracing::info!(user_id, "session expired; starting fresh");
+            tracing::info!(account_id, "session expired; starting fresh");
             let store = core.deps.store.clone();
             crate::core::blocking(move || store.start_conversation(account_id, &scope_owned)).await
         }
         Err(e) => {
-            tracing::warn!(error = %e, user_id, "continuation check failed; starting fresh");
+            tracing::warn!(error = %e, account_id, "continuation check failed; starting fresh");
             let store = core.deps.store.clone();
             crate::core::blocking(move || store.start_conversation(account_id, &scope_owned)).await
         }
@@ -186,14 +185,10 @@ pub(crate) fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
 ///
 /// History lives in the store now, so clearing an in-memory slot would clear
 /// nothing — /reset has to mean a new thread or it means nothing.
-pub async fn reset(core: &Core, telegram_id: i64, scope: &str) -> anyhow::Result<i64> {
+pub async fn reset(core: &Core, account_id: i64, scope: &str) -> anyhow::Result<i64> {
     let store = core.store();
     let scope = scope.to_string();
-    crate::core::blocking(move || {
-        let account_id = store.account_for_telegram(telegram_id)?;
-        store.start_conversation(account_id, &scope)
-    })
-    .await
+    crate::core::blocking(move || store.start_conversation(account_id, &scope)).await
 }
 
 #[cfg(test)]

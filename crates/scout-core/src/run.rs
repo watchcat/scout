@@ -20,17 +20,16 @@ use rig::streaming::{StreamedAssistantContent, StreamingChat};
 pub async fn run_agent(
     core: &Core,
     events: scout_api::EventSink,
-    user_id: i64,
-    chat_id: i64,
+    account_id: i64,
+    reply_to: &scout_api::ReplyTo,
     conversation_id: i64,
     prompt: &str,
 ) -> anyhow::Result<String> {
-    let account_id = crate::session::account_of(core, user_id).await?;
     let facts = {
         let store = core.deps.store.clone();
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
-    let agent = build_agent(&core.deps, account_id, chat_id, &facts);
+    let agent = build_agent(&core.deps, account_id, reply_to, conversation_id, &facts);
     // History comes from the conversation the caller opened, so an
     // in-flight run always reads and writes that thread and never anyone
     // else's — the isolation the (chat, user) map used to provide.
@@ -151,7 +150,7 @@ pub async fn run_agent(
     }
 
     if let Some(reason) = salvage {
-        tracing::warn!(chat_id, reason, "run interrupted; writing up from notes");
+        tracing::warn!(conversation_id, reason, "run interrupted; writing up from notes");
         scout_api::emit(
             &events,
             scout_api::AgentEvent::Notice(
@@ -189,12 +188,12 @@ pub async fn run_agent(
     // turn, then scrub whatever is still dead.
     let dead = crate::links::dead_links_in(&core.deps.http, &reply).await;
     if !dead.is_empty() {
-        tracing::warn!(?dead, chat_id, "dead links in reply; asking the agent to correct it");
+        tracing::warn!(?dead, conversation_id, "dead links in reply; asking the agent to correct it");
         let note = crate::links::repair_prompt(&dead);
         reply = strip_thinking(&agent.chat(note, &mut history).await?);
         let still_dead = crate::links::dead_links_in(&core.deps.http, &reply).await;
         if !still_dead.is_empty() {
-            tracing::warn!(?still_dead, chat_id, "dead links survived the correction; stripping");
+            tracing::warn!(?still_dead, conversation_id, "dead links survived the correction; stripping");
             reply = crate::links::strike_dead(&reply, &still_dead);
         }
     }

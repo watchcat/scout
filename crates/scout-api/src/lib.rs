@@ -1,18 +1,70 @@
+/// How a piece of streamed text changed.
+///
+/// `Replace` is not an optimisation escape hatch — it is required. The
+/// answer can *shrink*: `strip_thinking` discards everything before a
+/// closing tag that has no opener, because such a closer means the text
+/// began inside a thinking block. A client that only ever appends would go
+/// on showing reasoning the run has already retracted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TextUpdate {
+    Append(String),
+    Replace(String),
+}
+
+impl TextUpdate {
+    /// Moves accumulated text forward by this update.
+    ///
+    /// The counterpart of `Shown::update`. Every client does exactly this,
+    /// which is why it lives here rather than being written twice.
+    pub fn apply(&self, into: &mut String) {
+        match self {
+            TextUpdate::Append(delta) => into.push_str(delta),
+            TextUpdate::Replace(text) => {
+                into.clear();
+                into.push_str(text);
+            }
+        }
+    }
+}
+
+/// What a client has been shown so far, and what to send it next.
+///
+/// Producers hold one of these per stream of text and feed it the whole
+/// text each time; it works out the smallest honest update. `None` means
+/// nothing changed and no event is worth sending.
+#[derive(Debug, Default, Clone)]
+pub struct Shown(String);
+
+impl Shown {
+    pub fn update(&mut self, next: &str) -> Option<TextUpdate> {
+        if next == self.0 {
+            return None;
+        }
+        let update = match next.strip_prefix(self.0.as_str()) {
+            Some(rest) => TextUpdate::Append(rest.to_string()),
+            None => TextUpdate::Replace(next.to_string()),
+        };
+        self.0 = next.to_string();
+        Some(update)
+    }
+}
+
 /// What the agent has to say while it works, independent of who is
 /// listening.
 ///
-/// Every variant carries the whole text rather than a delta, because that is
-/// what `Live::show` already takes and `Live` diffs it against what is on
-/// screen. A socket would rather have deltas; that is a phase-2b question,
-/// and changing it here would alter behaviour while claiming not to.
+/// `Answer` and `Thinking` carry a `TextUpdate` rather than the whole text —
+/// see `TextUpdate` for why that update is sometimes a `Replace` rather than
+/// an append. `Tool` and `Notice` stay whole text: each is one discrete
+/// sentence that never grows, so there is nothing for an update to be
+/// relative to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentEvent {
     /// A tool started, already rendered as a human sentence.
     Tool(String),
-    /// The answer so far, with reasoning stripped out.
-    Answer(String),
-    /// Reasoning so far. Shown only while the answer is still empty.
-    Thinking(String),
+    /// The answer, as it changes.
+    Answer(TextUpdate),
+    /// Reasoning, as it changes. Shown only while the answer is empty.
+    Thinking(TextUpdate),
     /// A line from the run itself rather than from the model — today only
     /// the wrap-up notice when a run is salvaged.
     Notice(String),
@@ -102,15 +154,15 @@ mod tests {
         drop(rx);
         // Nobody is listening. A run that is still doing useful work must
         // not be brought down because the chat went away.
-        emit(&tx, AgentEvent::Answer("still working".to_string()));
+        emit(&tx, AgentEvent::Answer(TextUpdate::Append("still working".to_string())));
     }
 
     #[test]
     fn events_arrive_in_the_order_they_were_sent() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         emit(&tx, AgentEvent::Tool("searching Kagi".to_string()));
-        emit(&tx, AgentEvent::Thinking("comparing".to_string()));
-        emit(&tx, AgentEvent::Answer("The cheapest".to_string()));
+        emit(&tx, AgentEvent::Thinking(TextUpdate::Append("comparing".to_string())));
+        emit(&tx, AgentEvent::Answer(TextUpdate::Append("The cheapest".to_string())));
         drop(tx);
 
         let mut got = Vec::new();
@@ -121,8 +173,8 @@ mod tests {
             got,
             vec![
                 AgentEvent::Tool("searching Kagi".to_string()),
-                AgentEvent::Thinking("comparing".to_string()),
-                AgentEvent::Answer("The cheapest".to_string()),
+                AgentEvent::Thinking(TextUpdate::Append("comparing".to_string())),
+                AgentEvent::Answer(TextUpdate::Append("The cheapest".to_string())),
             ]
         );
     }
@@ -133,8 +185,8 @@ mod tests {
         // that the two ends cannot disagree about what an event is.
         let each_kind = vec![
             AgentEvent::Tool("🔎 searching: wasmiddel".to_string()),
-            AgentEvent::Answer("The cheapest is".to_string()),
-            AgentEvent::Thinking("comparing fares".to_string()),
+            AgentEvent::Answer(TextUpdate::Append("The cheapest is".to_string())),
+            AgentEvent::Thinking(TextUpdate::Append("comparing fares".to_string())),
             AgentEvent::Notice("wrapped up early".to_string()),
         ];
         for event in each_kind {
@@ -154,5 +206,45 @@ mod tests {
 
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<ReplyTo>(&json).unwrap(), r);
+    }
+
+    #[test]
+    fn growing_text_produces_appends_and_shrinking_text_produces_a_replace() {
+        let mut shown = Shown::default();
+        assert_eq!(shown.update("Here"), Some(TextUpdate::Append("Here".into())));
+        assert_eq!(shown.update("Here are"), Some(TextUpdate::Append(" are".into())));
+        // Not an extension, so the client has to be told to start over.
+        assert_eq!(shown.update("Hello"), Some(TextUpdate::Replace("Hello".into())));
+    }
+
+    #[test]
+    fn text_that_did_not_change_produces_no_event_at_all() {
+        // Otherwise every streamed token inside a <think> block would send
+        // an empty Append.
+        let mut shown = Shown::default();
+        shown.update("same");
+        assert_eq!(shown.update("same"), None);
+    }
+
+    #[test]
+    fn becoming_empty_is_a_replace_and_not_silence() {
+        // The retraction. `strip_thinking` discards everything before a
+        // stray closer, so the answer can go from text to nothing, and a
+        // client that is not told will keep showing reasoning.
+        let mut shown = Shown::default();
+        shown.update("secret reasoning here");
+        assert_eq!(shown.update(""), Some(TextUpdate::Replace(String::new())));
+    }
+
+    #[test]
+    fn applying_updates_in_order_reproduces_the_text_that_produced_them() {
+        let mut shown = Shown::default();
+        let mut client = String::new();
+        for step in ["a", "ab", "abc", "xyz", "", "done"] {
+            if let Some(update) = shown.update(step) {
+                update.apply(&mut client);
+            }
+            assert_eq!(client, step, "client drifted from the source text");
+        }
     }
 }

@@ -172,9 +172,23 @@ core writing chat copy: Telegram replies, the web shows it inline.
 - **Telegram renders what it rendered before.** `render_events` over a
   delta stream produces the same sequence of rendered strings as the current
   code over a whole-text stream.
-- **A second run on a busy conversation is `Busy`**, and the first run's
-  history survives. Mutation check: drop the guard and watch the exchange
-  vanish.
+- **A second run on a busy conversation is `Busy`.** This covers
+  `begin_run`'s claim-and-release, not that history survives a genuine
+  concurrent pair — which would need two live agents.
+
+**What verification actually found.** Two of the mutation checks above did
+not behave as this section predicted: reinstating the `is_empty` guard, and
+dropping the run guard, each failed *no test at all*. Both mutate logic
+inline in `run_agent`, which needs a live model and is therefore unreachable
+from any test. `Shown`, `begin_run` and `render_events` are testable seams
+and their mutations are caught; the wiring between them was not — the same
+pattern the account-keying refactor hit, where a unit test of a unit said
+nothing about the wiring to it.
+
+The answer decision was therefore extracted into a seam of its own,
+`answer_event`, and the retraction mutation now fails as claimed. The run
+guard's lifetime inside `run_agent` stays unverified, and is stated here
+rather than covered by a test that would only appear to cover it.
 - The existing suite passes with only mechanical edits, as in the
   account-keying refactor: `progress.rs`'s tests construct `AgentEvent`
   values and must wrap them in `TextUpdate`. No assertion or expected value

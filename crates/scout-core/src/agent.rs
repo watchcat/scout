@@ -328,6 +328,8 @@ pub struct AgentDeps {
     /// What each chat was last shown, so a booking lookup a turn later can
     /// tell a real offer id from an invented one. Shared across requests.
     pub shown: std::sync::Arc<crate::tools::shown::ShownFlights>,
+    /// Conversations with a run in flight. See `run::begin_run`.
+    pub running: std::sync::Arc<dashmap::DashSet<i64>>,
     pub marktplaats: MarktplaatsClient,
     pub store: Store,
     pub secondhand_sites: Vec<String>,

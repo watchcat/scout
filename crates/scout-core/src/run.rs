@@ -6,6 +6,16 @@ use rig::agent::MultiTurnStreamItem;
 use rig::completion::{Chat, Message as LlmMessage};
 use rig::streaming::{StreamedAssistantContent, StreamingChat};
 
+/// What a run produced.
+///
+/// `Busy` is not an error: asking two questions at once in one thread is an
+/// ordinary thing to do. Each channel words it itself rather than core
+/// writing chat copy.
+pub enum RunOutcome {
+    Answered(String),
+    Busy,
+}
+
 /// Runs the agent against a snapshot of this chat's history, then writes the
 /// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
 /// from being held across awaits.
@@ -17,12 +27,29 @@ use rig::streaming::{StreamedAssistantContent, StreamingChat};
 /// `events` is taken by value: returning drops it, which closes the channel
 /// and ends whoever is rendering. That is the only shutdown signal the
 /// renderer gets, so it must not be held anywhere else.
+/// The event a streamed chunk should produce, if anything changed.
+///
+/// A function rather than three lines inline, because `run_agent` needs a
+/// live model and so nothing can test what happens inside it. Measured: with
+/// this logic inline, reinstating the old `if !answer.is_empty()` guard —
+/// which suppresses the retraction of reasoning already sent — was caught by
+/// no test in the workspace. Here it is caught.
+fn answer_event(
+    shown: &mut scout_api::Shown,
+    streamed: &str,
+) -> Option<scout_api::AgentEvent> {
+    shown.update(&strip_thinking(streamed)).map(scout_api::AgentEvent::Answer)
+}
+
 pub async fn run_agent(
     core: &Core,
     events: scout_api::EventSink,
     run: &scout_api::RunContext,
     prompt: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RunOutcome> {
+    let Some(_guard) = begin_run(&core.deps.running, run.conversation_id) else {
+        return Ok(RunOutcome::Busy);
+    };
     let (account_id, conversation_id) = (run.account_id, run.conversation_id);
     let facts = {
         let store = core.deps.store.clone();
@@ -40,6 +67,10 @@ pub async fn run_agent(
     let mut streamed = String::new();
     // Reasoning arrives on its own channel, separate from the answer text.
     let mut thinking = String::new();
+    // What each client has been shown, so the run can send the smallest
+    // honest update rather than the whole text every token.
+    let mut answer_shown = scout_api::Shown::default();
+    let mut thinking_shown = scout_api::Shown::default();
     let mut final_response = None;
     // The whole streamed run sits inside one deadline. A guard on
     // stream.next() alone is not enough: it leaves every await in the loop
@@ -81,10 +112,13 @@ pub async fn run_agent(
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
                     streamed.push_str(&t.text);
                     // Unclosed <think> blocks render as nothing, so inline
-                    // reasoning never reaches the chat as answer text.
-                    let answer = strip_thinking(&streamed);
-                    if !answer.is_empty() {
-                        scout_api::emit(&events, scout_api::AgentEvent::Answer(answer));
+                    // reasoning never reaches the chat as answer text — and
+                    // when a stray closer proves the text so far *was*
+                    // reasoning, the update is a Replace that takes it back.
+                    // The old `if !answer.is_empty()` guard suppressed
+                    // exactly that event, which is why it is gone.
+                    if let Some(event) = answer_event(&mut answer_shown, &streamed) {
+                        scout_api::emit(&events, event);
                     }
                 }
                 // MiniMax streams its reasoning on a separate channel. Shown
@@ -94,10 +128,9 @@ pub async fn run_agent(
                 ) => {
                     thinking.push_str(&reasoning);
                     if strip_thinking(&streamed).is_empty() {
-                        scout_api::emit(
-                            &events,
-                            scout_api::AgentEvent::Thinking(thinking.clone()),
-                        );
+                        if let Some(update) = thinking_shown.update(&thinking) {
+                            scout_api::emit(&events, scout_api::AgentEvent::Thinking(update));
+                        }
                     }
                 }
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
@@ -110,10 +143,9 @@ pub async fn run_agent(
                         }
                     }
                     if strip_thinking(&streamed).is_empty() {
-                        scout_api::emit(
-                            &events,
-                            scout_api::AgentEvent::Thinking(thinking.clone()),
-                        );
+                        if let Some(update) = thinking_shown.update(&thinking) {
+                            scout_api::emit(&events, scout_api::AgentEvent::Thinking(update));
+                        }
                     }
                 }
                 MultiTurnStreamItem::FinalResponse(res) => {
@@ -204,7 +236,34 @@ pub async fn run_agent(
         // worse than not saving it, but it is not worth failing the reply.
         tracing::warn!(error = %e, conversation_id, "could not save the conversation");
     }
-    Ok(reply)
+    Ok(RunOutcome::Answered(reply))
+}
+
+/// Held for the length of a run. Dropping it frees the conversation, so a
+/// panic, a timeout or a dropped future cannot wedge a thread forever —
+/// which an insert/remove pair around the body would.
+pub(crate) struct RunGuard {
+    running: std::sync::Arc<dashmap::DashSet<i64>>,
+    conversation_id: i64,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.running.remove(&self.conversation_id);
+    }
+}
+
+/// Claims a conversation, or `None` if a run already holds it.
+///
+/// `DashSet::insert` reports whether the value was new, which makes this an
+/// atomic check-and-claim rather than a check followed by a claim.
+pub(crate) fn begin_run(
+    running: &std::sync::Arc<dashmap::DashSet<i64>>,
+    conversation_id: i64,
+) -> Option<RunGuard> {
+    running
+        .insert(conversation_id)
+        .then(|| RunGuard { running: running.clone(), conversation_id })
 }
 
 /// Turn an agent failure into a user-facing message; the max-turns budget
@@ -319,6 +378,33 @@ fn is_max_turns(e: &impl std::fmt::Display) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stray_closer_makes_the_run_retract_the_answer_it_already_sent() {
+        // `Shown` is tested on its own, but this is the wiring: a guard
+        // added here would swallow the retraction while every unit test
+        // stayed green. That is not hypothetical — it was true until this
+        // test existed.
+        let source = "secret reasoning here</think>The answer";
+        let mut shown = scout_api::Shown::default();
+
+        assert!(
+            matches!(
+                answer_event(&mut shown, &source[..21]),
+                Some(scout_api::AgentEvent::Answer(scout_api::TextUpdate::Append(ref t)))
+                    if t == "secret reasoning here"
+            ),
+            "reasoning should reach the client before the closer proves what it is"
+        );
+        assert!(
+            matches!(
+                answer_event(&mut shown, &source[..29]),
+                Some(scout_api::AgentEvent::Answer(scout_api::TextUpdate::Replace(ref t)))
+                    if t.is_empty()
+            ),
+            "the run did not retract reasoning it had already sent"
+        );
+    }
     use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
     use rig::message::ToolCall;
     use rig::one_or_many::OneOrMany;
@@ -471,5 +557,24 @@ mod tests {
         assert!(text.contains("369.94"), "and so is the answer: {text}");
         assert!(!text.contains("ToolCall"), "but the tool calls are gone");
         assert!(!text.contains("ToolResult"), "and so are their results");
+    }
+
+    #[test]
+    fn a_conversation_admits_one_run_and_frees_itself_when_it_ends() {
+        // Two runs on one thread both load the history and both write it
+        // back wholesale, so the second erases the first's exchange. A
+        // laptop and a phone on the shared `direct` thread make that
+        // ordinary rather than rare.
+        let running = std::sync::Arc::new(dashmap::DashSet::new());
+        let first = begin_run(&running, 7).expect("the first run should start");
+        assert!(begin_run(&running, 7).is_none(), "a second run got in");
+        // A different thread is unaffected.
+        assert!(begin_run(&running, 8).is_some());
+
+        drop(first);
+        assert!(
+            begin_run(&running, 7).is_some(),
+            "the conversation stayed locked after its run ended"
+        );
     }
 }

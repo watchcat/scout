@@ -350,13 +350,24 @@ pub async fn render_events<R: Renderer>(
     mut events: tokio::sync::mpsc::UnboundedReceiver<scout_api::AgentEvent>,
 ) -> R {
     use scout_api::AgentEvent;
+    // What the answer has grown to. `Tool` and `Notice` deliberately do not
+    // touch it: each is a one-off sentence that momentarily replaces the
+    // display, and the next answer update re-renders the whole answer over
+    // it — which is exactly what the whole-text protocol used to do.
+    let mut answer = String::new();
+    let mut thinking = String::new();
     while let Some(event) = events.recv().await {
         match event {
-            AgentEvent::Tool(text) | AgentEvent::Answer(text) | AgentEvent::Notice(text) => {
+            AgentEvent::Tool(text) | AgentEvent::Notice(text) => {
                 renderer.render(&text, false).await;
             }
-            AgentEvent::Thinking(text) => {
-                renderer.render_thinking(&text).await;
+            AgentEvent::Answer(update) => {
+                update.apply(&mut answer);
+                renderer.render(&answer, false).await;
+            }
+            AgentEvent::Thinking(update) => {
+                update.apply(&mut thinking);
+                renderer.render_thinking(&thinking).await;
             }
         }
     }
@@ -366,7 +377,7 @@ pub async fn render_events<R: Renderer>(
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use scout_api::AgentEvent;
+    use scout_api::{AgentEvent, TextUpdate};
 
     /// A renderer that writes to a list instead of to Telegram. This is the
     /// thing phase two was for: progress rendering can now be tested with no
@@ -391,8 +402,8 @@ mod render_tests {
     async fn every_event_reaches_the_renderer_in_order_and_in_the_right_mode() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         scout_api::emit(&tx, AgentEvent::Tool("searching Kagi".into()));
-        scout_api::emit(&tx, AgentEvent::Thinking("comparing fares".into()));
-        scout_api::emit(&tx, AgentEvent::Answer("The cheapest".into()));
+        scout_api::emit(&tx, AgentEvent::Thinking(TextUpdate::Append("comparing fares".into())));
+        scout_api::emit(&tx, AgentEvent::Answer(TextUpdate::Append("The cheapest".into())));
         scout_api::emit(&tx, AgentEvent::Notice("wrapping up".into()));
         drop(tx);
 
@@ -414,7 +425,7 @@ mod render_tests {
         // The caller needs it afterwards to send the final answer, so the
         // loop must return it rather than consume it.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        scout_api::emit(&tx, AgentEvent::Answer("done".into()));
+        scout_api::emit(&tx, AgentEvent::Answer(TextUpdate::Append("done".into())));
         drop(tx);
         let rec = render_events(Recorder::default(), rx).await;
         assert_eq!(rec.frames.len(), 1);
@@ -426,5 +437,28 @@ mod render_tests {
         drop(tx);
         let rec = render_events(Recorder::default(), rx).await;
         assert!(rec.frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retracted_answer_is_not_left_on_screen() {
+        // The reason the protocol has a Replace at all. If the renderer only
+        // appended, reasoning would stay on screen after the run decided it
+        // was reasoning — the leak `strip_thinking` exists to prevent.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        scout_api::emit(&tx, AgentEvent::Answer(TextUpdate::Append("secret reasoning".into())));
+        scout_api::emit(&tx, AgentEvent::Answer(TextUpdate::Replace(String::new())));
+        scout_api::emit(&tx, AgentEvent::Answer(TextUpdate::Append("The answer".into())));
+        drop(tx);
+
+        let rec = render_events(Recorder::default(), rx).await;
+        assert_eq!(
+            rec.frames,
+            vec![
+                ("secret reasoning".to_string(), false),
+                (String::new(), false),
+                ("The answer".to_string(), false),
+            ],
+            "a Replace must clear what was shown, not extend it"
+        );
     }
 }

@@ -154,6 +154,42 @@ CREATE TABLE IF NOT EXISTS deliveries (
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     PRIMARY KEY (account_id, channel)
 );
+CREATE SEQUENCE IF NOT EXISTS outbox_id_seq;
+-- Messages waiting to be mirrored to a channel the reader also uses.
+--
+-- A table rather than an in-memory queue because the web crate cannot reach
+-- the Telegram bot — the dependency runs scout-telegram -> scout-web ->
+-- scout-core — and because an in-memory queue loses a half-sent backfill on
+-- every deploy.
+--
+-- `turn_key` is what makes enqueueing idempotent, and it exists because no
+-- stored message has a stable identity: `replace_messages` deletes and
+-- reinserts the whole conversation on every save and renumbers `position`
+-- from zero, so "mirrored up to here" cannot be a pointer. "Have I already
+-- sent this turn" can be answered; "how far did I get" cannot.
+--
+-- A row with `sent_at` already set was never going to be sent: that is how
+-- the Telegram channel records its own messages so a backfill does not echo
+-- them back at it.
+CREATE TABLE IF NOT EXISTS outbox (
+    id         BIGINT PRIMARY KEY DEFAULT nextval('outbox_id_seq'),
+    account_id BIGINT NOT NULL,
+    channel    TEXT NOT NULL,
+    address    TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    turn_key   TEXT NOT NULL,
+    attempts   BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    sent_at    TIMESTAMP,
+    UNIQUE (account_id, turn_key)
+);
+-- Who wants their browser thread mirrored. Presence is the setting: a row
+-- means on, no row means off, and there is no boolean that can fall out of
+-- step with itself.
+CREATE TABLE IF NOT EXISTS mirrored_accounts (
+    account_id BIGINT PRIMARY KEY,
+    enabled_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
 -- Magic-link tokens. A row rather than a signed value because a link must
 -- be single-use: a replayable one is a standing account key sitting in an
 -- inbox. Sign-in is rare, so the store mutex is cheap here in a way it
@@ -3185,6 +3221,26 @@ CREATE TABLE segment_candidates (
                 )
                 .unwrap();
             assert_eq!(n, 1, "{table} should exist");
+        }
+    }
+
+    #[test]
+    fn a_fresh_store_has_somewhere_to_queue_a_mirror() {
+        // Both tables are pure additions with nothing to migrate, so they
+        // live in MIGRATIONS alone — `open` runs that batch every time, on
+        // existing databases as well as new ones, and the numbered steps
+        // exist only for transforms.
+        let (s, _d) = test_store();
+        let conn = s.conn.lock().unwrap();
+        for table in ["outbox", "mirrored_accounts"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table} is missing");
         }
     }
 

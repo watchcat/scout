@@ -644,11 +644,10 @@ fn markup_rate(d: &AgentDeps) -> f64 {
 /// identity, so the LLM never sees or chooses ids.
 pub fn build_agent(
     d: &AgentDeps,
-    account_id: i64,
-    reply_to: &scout_api::ReplyTo,
-    conversation_id: i64,
+    run: &scout_api::RunContext,
     facts: &[(String, String)],
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
+    let (account_id, conversation_id) = (run.account_id, run.conversation_id);
     // One allowance per request, shared by both searching tools.
     let budget = std::sync::Arc::new(crate::tools::budget::SearchBudget::default());
     // One memo per request: a route asked for twice in one question is
@@ -678,7 +677,7 @@ pub fn build_agent(
         .tool(CreateReminderTool {
             store: d.store.clone(),
             account_id,
-            reply_to: reply_to.clone(),
+            reply_to: run.reply_to.clone(),
         })
         .tool(ListRemindersTool { store: d.store.clone(), account_id })
         .tool(CancelReminderTool { store: d.store.clone(), account_id })

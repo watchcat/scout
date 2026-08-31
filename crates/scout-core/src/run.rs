@@ -20,16 +20,15 @@ use rig::streaming::{StreamedAssistantContent, StreamingChat};
 pub async fn run_agent(
     core: &Core,
     events: scout_api::EventSink,
-    account_id: i64,
-    reply_to: &scout_api::ReplyTo,
-    conversation_id: i64,
+    run: &scout_api::RunContext,
     prompt: &str,
 ) -> anyhow::Result<String> {
+    let (account_id, conversation_id) = (run.account_id, run.conversation_id);
     let facts = {
         let store = core.deps.store.clone();
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
-    let agent = build_agent(&core.deps, account_id, reply_to, conversation_id, &facts);
+    let agent = build_agent(&core.deps, run, &facts);
     // History comes from the conversation the caller opened, so an
     // in-flight run always reads and writes that thread and never anyone
     // else's — the isolation the (chat, user) map used to provide.

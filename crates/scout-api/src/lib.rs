@@ -62,6 +62,28 @@ pub struct ReplyTo {
     pub address: String,
 }
 
+/// Who a run is for, which thread it belongs to, and where its side effects
+/// should go.
+///
+/// Grouped rather than passed as three parameters because two of them are
+/// bare `i64` and sat next to each other. `build_agent(d, account_id,
+/// conversation_id, ..)` accepted them transposed, and a mutation check
+/// confirmed nothing caught it: the reminder and flight tools were simply
+/// wired to the wrong numbers, silently.
+///
+/// This does not make the mistake impossible — `account_id: conversation_id`
+/// still compiles, and that was checked rather than assumed. What it does is
+/// move the error from a position to a name, so making it now means writing
+/// a line that is wrong on its face. That is worth more here than a test
+/// would be, because observing the wiring from outside would mean reaching
+/// inside a built agent to see which numbers its tools captured.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunContext {
+    pub account_id: i64,
+    pub conversation_id: i64,
+    pub reply_to: ReplyTo,
+}
+
 impl ReplyTo {
     /// A Telegram chat, by id. The channel string is written once here so
     /// no caller has to spell it.

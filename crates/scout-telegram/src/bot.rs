@@ -943,11 +943,16 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     // join! rather than spawn: both futures run in this task, so the
     // renderer's futures need no Send bound. `events` moves into the run and
     // drops when it returns, which is what ends the renderer.
-    // Bound rather than passed inline: the destination has to outlive the
-    // borrow the run holds on it.
-    let reply_to = scout_api::ReplyTo::telegram(chat_id.0);
+    // Bound rather than passed inline: it has to outlive the borrow the run
+    // holds on it. Every field is named here, which is what stops the two
+    // adjacent i64s being handed over the wrong way round.
+    let run = scout_api::RunContext {
+        account_id,
+        conversation_id,
+        reply_to: scout_api::ReplyTo::telegram(chat_id.0),
+    };
     let (result, mut live) = tokio::join!(
-        scout_core::run::run_agent(&app.core, events, account_id, &reply_to, conversation_id, &prompt),
+        scout_core::run::run_agent(&app.core, events, &run, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {
@@ -1162,11 +1167,16 @@ async fn handle_reaction(
     };
     let (events, incoming) = tokio::sync::mpsc::unbounded_channel();
     let live = Live::new(bot.clone(), chat_id, app.streams.clone());
-    // Bound rather than passed inline: the destination has to outlive the
-    // borrow the run holds on it.
-    let reply_to = scout_api::ReplyTo::telegram(chat_id.0);
+    // Bound rather than passed inline: it has to outlive the borrow the run
+    // holds on it. Every field is named here, which is what stops the two
+    // adjacent i64s being handed over the wrong way round.
+    let run = scout_api::RunContext {
+        account_id,
+        conversation_id,
+        reply_to: scout_api::ReplyTo::telegram(chat_id.0),
+    };
     let (result, mut live) = tokio::join!(
-        scout_core::run::run_agent(&app.core, events, account_id, &reply_to, conversation_id, &prompt),
+        scout_core::run::run_agent(&app.core, events, &run, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {

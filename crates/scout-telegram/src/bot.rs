@@ -949,7 +949,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     let run = scout_api::RunContext {
         account_id,
         conversation_id,
-        reply_to: scout_api::ReplyTo::telegram(chat_id.0),
+        reply_to: Some(scout_api::ReplyTo::telegram(chat_id.0)),
     };
     let (result, mut live) = tokio::join!(
         scout_core::run::run_agent(&app.core, events, &run, &prompt),
@@ -1178,7 +1178,7 @@ async fn handle_reaction(
     let run = scout_api::RunContext {
         account_id,
         conversation_id,
-        reply_to: scout_api::ReplyTo::telegram(chat_id.0),
+        reply_to: Some(scout_api::ReplyTo::telegram(chat_id.0)),
     };
     let (result, mut live) = tokio::join!(
         scout_core::run::run_agent(&app.core, events, &run, &prompt),

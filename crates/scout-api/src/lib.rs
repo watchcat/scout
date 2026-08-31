@@ -133,7 +133,11 @@ pub struct ReplyTo {
 pub struct RunContext {
     pub account_id: i64,
     pub conversation_id: i64,
-    pub reply_to: ReplyTo,
+    /// Where a reminder made during this run should be delivered, or
+    /// `None` when there is nowhere — a browser is not a delivery channel.
+    /// A run with `None` is not offered the reminder tool at all, so the
+    /// model never promises something that would silently never arrive.
+    pub reply_to: Option<ReplyTo>,
 }
 
 impl ReplyTo {
@@ -142,6 +146,25 @@ impl ReplyTo {
     pub fn telegram(chat_id: i64) -> Self {
         Self { channel: "telegram".to_string(), address: chat_id.to_string() }
     }
+}
+
+/// Who said a thing, as a reader sees it.
+///
+/// An enum rather than a string so a client cannot invent a third role, and
+/// named for what appears on screen rather than for `rig`'s vocabulary — a
+/// page that has to translate "assistant" into "Scout" is a page that will
+/// eventually translate it inconsistently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Role {
+    You,
+    Scout,
+}
+
+/// One thing said in a conversation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Turn {
+    pub role: Role,
+    pub text: String,
 }
 
 #[cfg(test)]

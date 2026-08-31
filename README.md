@@ -431,6 +431,7 @@ Roughly 24,300 lines of Rust across 39 focused modules.
 
 ```bash
 cargo test --workspace      # 559 tests across four crates, no network
+node --test 'crates/scout-web/src/*.test.mjs'  # the chat client's own tests
 cargo clippy --workspace --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now

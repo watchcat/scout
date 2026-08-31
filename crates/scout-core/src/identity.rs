@@ -85,6 +85,20 @@ pub async fn standing(core: &Core, account_id: i64) -> anyhow::Result<Standing> 
     .await
 }
 
+/// Where this account can be reached on a channel, if anywhere.
+///
+/// A run needs this to decide whether it can honour a reminder: the browser
+/// is not a delivery channel, so a reminder asked for on the web has to go
+/// to the person's Telegram chat or nowhere at all.
+pub async fn delivery_address(
+    core: &Core,
+    account_id: i64,
+    channel: &'static str,
+) -> anyhow::Result<Option<String>> {
+    let store = core.store();
+    blocking(move || store.delivery_address(account_id, channel)).await
+}
+
 /// Attaches a second way of proving the same account.
 pub async fn link(
     core: &Core,

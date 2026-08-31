@@ -1515,6 +1515,22 @@ impl Store {
         self.account_for_identity("telegram", &telegram_id.to_string())
     }
 
+    /// Where this account can be reached on a channel, if anywhere.
+    ///
+    /// The counterpart of `note_delivery`. Nothing could read a single
+    /// account's address before: the only reader was the announce query,
+    /// which wants the whole waitlist at once. A run that has to decide
+    /// whether it can honour a reminder needs to ask about one person.
+    pub fn delivery_address(&self, account_id: i64, channel: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT address FROM deliveries WHERE account_id = ? AND channel = ?",
+        )?;
+        let found: Option<String> =
+            stmt.query_map(params![account_id, channel], |r| r.get(0))?.next().transpose()?;
+        Ok(found)
+    }
+
     /// Records where this person last spoke, for announcements.
     ///
     /// A user id and a chat id are the same number in a private chat and

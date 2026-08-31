@@ -138,6 +138,31 @@ pub(crate) fn load_history(store: &crate::store::Store, conversation_id: i64, ca
     Ok(out)
 }
 
+/// The sayable text of a user turn, or `None` when it holds only tool
+/// results — the rule shared by `last_messages_text` and `transcript_of` so
+/// what counts as "something a person said" cannot drift between the two.
+fn text_of_user(content: &rig::OneOrMany<rig::message::UserContent>) -> Option<String> {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            rig::message::UserContent::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .reduce(|a, b| format!("{a}\n{b}"))
+}
+
+/// The sayable text of an assistant turn, or `None` when it holds only tool
+/// calls — see `text_of_user`.
+fn text_of_assistant(content: &rig::OneOrMany<rig::message::AssistantContent>) -> Option<String> {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            rig::message::AssistantContent::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .reduce(|a, b| format!("{a}\n{b}"))
+}
+
 /// The last `n` plain-text messages of a history, rendered as
 /// "user:/assistant:" lines for the continuation classifier.
 pub(crate) fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
@@ -145,28 +170,59 @@ pub(crate) fn last_messages_text(history: &[LlmMessage], n: usize) -> String {
         .iter()
         .rev()
         .filter_map(|m| match m {
-            LlmMessage::User { content } => content
-                .iter()
-                .filter_map(|c| match c {
-                    rig::message::UserContent::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .reduce(|a, b| format!("{a}\n{b}"))
-                .map(|t| format!("user: {t}")),
-            LlmMessage::Assistant { content, .. } => content
-                .iter()
-                .filter_map(|c| match c {
-                    rig::message::AssistantContent::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .reduce(|a, b| format!("{a}\n{b}"))
-                .map(|t| format!("assistant: {t}")),
+            LlmMessage::User { content } => text_of_user(content).map(|t| format!("user: {t}")),
+            LlmMessage::Assistant { content, .. } => text_of_assistant(content).map(|t| format!("assistant: {t}")),
             _ => None,
         })
         .take(n)
         .collect();
     lines.reverse();
     lines.join("\n")
+}
+
+/// The conversation a page should show, without starting one.
+///
+/// `resolve_conversation` is wrong here twice over: it needs the message
+/// text, because after a long gap it asks the model whether the new message
+/// continues the old thread, and it creates a conversation when there is
+/// none. Opening a page must create nothing.
+pub(crate) fn latest_direct(store: &crate::store::Store, account_id: i64) -> anyhow::Result<Option<i64>> {
+    let ttl = SESSION_TTL.as_secs() as i64;
+    Ok(store.latest_conversation(account_id, "direct", ttl)?.map(|(id, _aged)| id))
+}
+
+/// What was said, oldest first, with the tool traffic left out.
+///
+/// The same line `last_messages_text` draws, kept structured rather than
+/// flattened: that one exists to feed a classifier a blob, this one exists
+/// to be rendered.
+pub(crate) fn transcript_of(store: &crate::store::Store, conversation_id: i64) -> anyhow::Result<Vec<scout_api::Turn>> {
+    let history = load_history(store, conversation_id, HISTORY_CAP)?;
+    Ok(history
+        .iter()
+        .filter_map(|m| match m {
+            LlmMessage::User { content } => {
+                text_of_user(content).map(|text| scout_api::Turn { role: scout_api::Role::You, text })
+            }
+            LlmMessage::Assistant { content, .. } => {
+                text_of_assistant(content).map(|text| scout_api::Turn { role: scout_api::Role::Scout, text })
+            }
+            _ => None,
+        })
+        .filter(|t| !t.text.trim().is_empty())
+        .collect())
+}
+
+/// The current thread's transcript, or empty when there is no thread yet.
+pub async fn transcript(core: &Core, account_id: i64) -> anyhow::Result<Vec<scout_api::Turn>> {
+    let store = core.store();
+    crate::core::blocking(move || {
+        let Some(id) = latest_direct(&store, account_id)? else {
+            return Ok(Vec::new());
+        };
+        transcript_of(&store, id)
+    })
+    .await
 }
 
 /// Starts a fresh conversation, discarding whatever thread was live.
@@ -177,6 +233,36 @@ pub async fn reset(core: &Core, account_id: i64, scope: &str) -> anyhow::Result<
     let store = core.store();
     let scope = scope.to_string();
     crate::core::blocking(move || store.start_conversation(account_id, &scope)).await
+}
+
+/// Records an exchange as though it had already happened, without spending
+/// a model call.
+///
+/// `Store` and `save_history` stay private to this crate — that boundary is
+/// deliberate, see the module doc at the crate root — so this is the one
+/// door a caller outside the crate has to them. It exists for tests that
+/// need `transcript` to return something real: the only other public writer
+/// of history is `run::run_agent`, which means talking to a live model.
+///
+/// Named for what it is so that nobody reaches for it in earnest: a channel
+/// writing an exchange nobody had is a channel inventing history.
+#[doc(hidden)]
+pub async fn seed_exchange_for_tests(
+    core: &Core,
+    account_id: i64,
+    scope: &str,
+    you_said: &str,
+    scout_said: &str,
+) -> anyhow::Result<i64> {
+    let store = core.store();
+    let scope = scope.to_string();
+    let (you_said, scout_said) = (you_said.to_string(), scout_said.to_string());
+    crate::core::blocking(move || {
+        let id = store.start_conversation(account_id, &scope)?;
+        save_history(&store, id, &[LlmMessage::user(you_said), LlmMessage::assistant(scout_said)])?;
+        Ok(id)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -232,5 +318,68 @@ mod tests {
 
         let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
         assert_eq!(loaded.len(), 1, "a trimmed history must not grow back");
+    }
+
+    #[test]
+    fn a_transcript_is_the_exchange_without_the_tool_traffic() {
+        // History holds tool calls and their results as well as the
+        // conversation. A page shows what was said, not how it was found —
+        // and `last_messages_text` already draws that line for the
+        // continuation classifier, so this draws the same one.
+        use scout_api::{Role, Turn};
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
+
+        // A real exchange has the tool call and its result sitting between
+        // the question and the answer. Without them in this fixture the
+        // test's own name would be a claim it never checks.
+        use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
+        use rig::message::{ToolCall, ToolFunction};
+        use rig::one_or_many::OneOrMany;
+        save_history(
+            &s,
+            c,
+            &[
+                LlmMessage::user("cheapest beans"),
+                LlmMessage::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                        "call-1".to_string(),
+                        ToolFunction {
+                            name: "web_search".to_string(),
+                            arguments: serde_json::json!({}),
+                        },
+                    ))),
+                },
+                LlmMessage::User {
+                    content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                        id: "call-1".to_string(),
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::text("three shops")),
+                    })),
+                },
+                LlmMessage::assistant("here are three"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            transcript_of(&s, c).unwrap(),
+            vec![
+                Turn { role: Role::You, text: "cheapest beans".into() },
+                Turn { role: Role::Scout, text: "here are three".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_conversation_that_was_never_started_is_not_started_by_asking() {
+        // Opening a page must not write rows. `resolve_conversation` would
+        // create one, which is why the page does not use it.
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        assert_eq!(latest_direct(&s, a).unwrap(), None);
+        assert_eq!(latest_direct(&s, a).unwrap(), None, "asking twice created one");
     }
 }

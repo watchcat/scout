@@ -676,11 +676,6 @@ pub fn build_agent(
         .tool(ComparePricesTool)
         .tool(RecordPurchaseTool { store: d.store.clone(), account_id })
         .tool(QueryPurchasesTool { store: d.store.clone(), account_id })
-        .tool(CreateReminderTool {
-            store: d.store.clone(),
-            account_id,
-            reply_to: run.reply_to.clone(),
-        })
         .tool(ListRemindersTool { store: d.store.clone(), account_id })
         .tool(CancelReminderTool { store: d.store.clone(), account_id })
         .tool(RememberFactTool { store: d.store.clone(), account_id })
@@ -701,6 +696,18 @@ pub fn build_agent(
         .tool(DeleteTripTool { store: d.store.clone(), account_id });
     // Offered only when configured, so the model never sees a tool that
     // cannot work.
+    // Offered only when the run has somewhere to deliver to. A reminder is
+    // a promise to come back later, and a browser is not a channel anyone
+    // polls — so on the web, for someone with no Telegram, the honest thing
+    // is for the model never to see the tool rather than to accept a
+    // reminder that would silently never arrive.
+    if let Some(reply_to) = &run.reply_to {
+        builder = builder.tool(CreateReminderTool {
+            store: d.store.clone(),
+            account_id,
+            reply_to: reply_to.clone(),
+        });
+    }
     if let Some(bol) = &d.bol {
         builder = builder.tool(crate::tools::bol::BolSearchTool { client: bol.clone() });
     }

@@ -174,6 +174,44 @@ mod tests {
         assert!(pending(&core, 10).await.unwrap().is_empty(), "the backfill echoed Telegram back at itself");
     }
 
+    #[tokio::test]
+    async fn queueing_something_wakes_whoever_delivers_it() {
+        // The plan called this wiring untestable. It is not: `notify_one`
+        // leaves a permit when nobody is waiting, so a later `notified()`
+        // returns at once. Without the wake the mirror still arrives, on
+        // the drain's sixty-second floor — a thread that turns up a minute
+        // after you picked up your phone, which is the whole thing this
+        // feature exists to avoid.
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        let turns = vec![scout_api::Turn { role: Role::Scout, text: "here are three".to_string() }];
+        enqueue(&core, account_id, "4242", 1, &turns, false).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(50), core.mirror_waiting())
+            .await
+            .expect("queueing a turn did not wake the drain");
+    }
+
+    #[tokio::test]
+    async fn recording_what_was_already_shown_wakes_nobody() {
+        // There is nothing to deliver, so waking a drain would only spend a
+        // database read to find an empty queue. Every Telegram turn takes
+        // this path, so it is not a rare case.
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        let turns = vec![scout_api::Turn { role: Role::Scout, text: "here are three".to_string() }];
+        enqueue(&core, account_id, "4242", 1, &turns, true).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), core.mirror_waiting())
+                .await
+                .is_err(),
+            "recording a delivered turn woke the drain for nothing"
+        );
+    }
+
     #[test]
     fn the_readers_own_words_are_quoted_line_by_line() {
         // A literal `>`, not a MarkdownV2 blockquote: the bot sends plain

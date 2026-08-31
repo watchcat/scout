@@ -318,6 +318,10 @@ async fn reset(axum::extract::State(auth): axum::extract::State<AuthState>, head
     if !csrf_header_ok(&auth, &headers, account_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // Before the new thread is started, not after: the divider belongs to
+    // the conversation it closes, and after the reset that conversation is
+    // no longer the one `current_thread` returns.
+    mirror_divider(&auth, account_id).await;
     match scout_core::session::reset(&auth.core, account_id, "direct").await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
@@ -439,6 +443,48 @@ async fn mirror_turn(
     .await
     {
         tracing::warn!(error = %e, account_id, "could not queue a turn for Telegram");
+    }
+}
+
+/// Marks the seam between two conversations in the mirrored chat.
+///
+/// Keyed to the conversation being *closed*, which is what gives it a turn
+/// key nobody else will mint — so pressing the button twice cannot send the
+/// same divider twice.
+///
+/// Skipped when that conversation had nothing in it. The second press of
+/// "New thread" closes a thread nobody used, and a divider for that is two
+/// dividers in a row with nothing between them.
+async fn mirror_divider(auth: &AuthState, account_id: i64) {
+    if !matches!(scout_core::mirror::is_enabled(&auth.core, account_id).await, Ok(true)) {
+        return;
+    }
+    let Some(reply_to) = reply_to_for(auth, account_id).await else {
+        return;
+    };
+    let Ok(Some((conversation_id, turns))) =
+        scout_core::session::current_thread(&auth.core, account_id).await
+    else {
+        return;
+    };
+    if turns.is_empty() {
+        return;
+    }
+    let seam = vec![scout_api::Turn {
+        role: scout_api::Role::Scout,
+        text: "— New thread —".to_string(),
+    }];
+    if let Err(e) = scout_core::mirror::enqueue(
+        &auth.core,
+        account_id,
+        &reply_to.address,
+        conversation_id,
+        &seam,
+        false,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, account_id, "could not queue a thread divider");
     }
 }
 
@@ -1015,5 +1061,67 @@ mod tests {
             scout_core::session::transcript(&core, account_id).await.unwrap().is_empty(),
             "the new thread still remembers the old one"
         );
+    }
+
+    #[tokio::test]
+    async fn starting_a_new_thread_marks_the_seam_in_telegram() {
+        // Without it, scrolling back through Telegram runs two unrelated
+        // conversations together with nothing between them, which is
+        // precisely the continuity this feature is for.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        let res = post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
+        assert!(
+            queued.iter().any(|r| r.body.contains("New thread")),
+            "no seam between two conversations: {:?}",
+            queued.iter().map(|r| &r.body).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn pressing_new_thread_twice_does_not_queue_two_seams() {
+        // The second press closes a thread nobody said anything in, and a
+        // divider closing an empty thread is just two dividers in a row.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+        post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+
+        let seams = scout_core::mirror::pending(&core, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.body.contains("New thread"))
+            .count();
+        assert_eq!(seams, 1, "queued a divider for a thread nobody used");
+    }
+
+    #[tokio::test]
+    async fn a_new_thread_queues_nothing_when_the_mirror_is_off() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+
+        assert!(scout_core::mirror::pending(&core, 10).await.unwrap().is_empty());
     }
 }

@@ -38,7 +38,7 @@ pub struct CreateReminderTool {
     pub account_id: i64,
     /// Where a reminder made in this run should be delivered. Carried
     /// rather than looked up, because in a group the address is the group.
-    pub reply_to: scout_api::ReplyTo,
+    pub reply_to: ReplyTo,
 }
 
 impl Tool for CreateReminderTool {

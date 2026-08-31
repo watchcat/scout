@@ -140,9 +140,33 @@ async fn reply_to_for(auth: &AuthState, account_id: i64) -> Option<scout_api::Re
 #[derive(serde::Serialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 enum End {
-    Ok,
+    Ok { answer: String },
     Busy,
     Error { message: String },
+}
+
+/// The last frame of a stream, given how the run ended.
+///
+/// A function rather than three arms inline, because the arm that matters
+/// is invisible from a test otherwise: `run_agent` needs a live model, so
+/// nothing in this workspace can drive `send_message` end to end.
+///
+/// Measured with this inline: `Answered(_)` threw the finished answer away
+/// and the page kept whatever the token stream had left in the bubble.
+/// That is not the answer. `streamed` accumulates every text delta of every
+/// turn of a multi-turn run, so it holds all the "let me check the next
+/// shop" narration the model writes between tool calls, and it predates
+/// both the wrap-up rewrite and the dead-link repair — so the page could
+/// also show links that `run_agent` had already removed for being dead.
+/// Telegram has always used the returned reply; only the browser did not.
+fn end_frame(outcome: anyhow::Result<scout_core::run::RunOutcome>) -> End {
+    match outcome {
+        Ok(scout_core::run::RunOutcome::Answered(answer)) => End::Ok { answer },
+        Ok(scout_core::run::RunOutcome::Busy) => End::Busy,
+        Err(e) => End::Error {
+            message: scout_core::run::agent_error_message(&e).to_string(),
+        },
+    }
 }
 
 /// One thing that goes down the wire, and which SSE event name it takes.
@@ -230,11 +254,7 @@ async fn send_message(
         };
         let outcome = scout_core::run::run_agent(&core, agent_tx, &run, &text).await;
         let _ = pump.await;
-        let _ = frames.send(Frame::End(match outcome {
-            Ok(scout_core::run::RunOutcome::Answered(_)) => End::Ok,
-            Ok(scout_core::run::RunOutcome::Busy) => End::Busy,
-            Err(e) => End::Error { message: scout_core::run::agent_error_message(&e).to_string() },
-        }));
+        let _ = frames.send(Frame::End(end_frame(outcome)));
     });
 
     sse_response(rx)
@@ -262,8 +282,51 @@ mod tests {
     // Named imports rather than `use super::*`: the module imports axum's
     // `get` and `post`, which would shadow the test helpers of the same
     // name that every request in here goes through.
-    use super::{reply_to_for, AuthState};
+    use super::{end_frame, reply_to_for, AuthState};
     use crate::tests::*;
+
+    #[test]
+    fn the_last_frame_carries_the_finished_answer() {
+        // The bubble the reader is looking at was built from token deltas,
+        // and those are every turn of the run concatenated. The finished
+        // answer only exists in `run_agent`'s return value; if the last
+        // frame does not carry it across, nothing else will and the page
+        // keeps the narration.
+        let end = end_frame(Ok(scout_core::run::RunOutcome::Answered(
+            "EUR 10.99 at bol.com".to_string(),
+        )));
+        assert_eq!(
+            serde_json::to_value(&end).unwrap(),
+            serde_json::json!({"status": "ok", "answer": "EUR 10.99 at bol.com"})
+        );
+    }
+
+    #[test]
+    fn an_answer_that_was_all_reasoning_arrives_as_an_empty_one() {
+        // Not a missing field: `strip_thinking` leaving nothing means there
+        // was no answer in it, and the page has to be told to clear the
+        // bubble rather than keep what it had. Absent and empty are
+        // different instructions and the client reads them differently.
+        let end = end_frame(Ok(scout_core::run::RunOutcome::Answered(String::new())));
+        assert_eq!(
+            serde_json::to_value(&end).unwrap(),
+            serde_json::json!({"status": "ok", "answer": ""})
+        );
+    }
+
+    #[test]
+    fn a_busy_or_failed_run_claims_no_answer() {
+        assert_eq!(
+            serde_json::to_value(end_frame(Ok(scout_core::run::RunOutcome::Busy))).unwrap(),
+            serde_json::json!({"status": "busy"})
+        );
+        let failed = serde_json::to_value(end_frame(Err(anyhow::anyhow!("boom")))).unwrap();
+        assert_eq!(failed["status"], "error");
+        assert!(
+            failed.get("answer").is_none(),
+            "a run that failed must not hand the page an answer to display"
+        );
+    }
 
     /// The state the handlers take, built the way `build_app` builds it —
     /// needed for the helpers that are tested directly rather than through

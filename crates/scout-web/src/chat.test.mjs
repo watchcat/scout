@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { applyUpdate, escapeHtml, linkify, shouldFollow, composerHeight } from './chat.js'
+import { applyUpdate, escapeHtml, finalAnswer, linkify, shouldFollow, composerHeight } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
   // The browser half of the protocol's security property: reasoning the
@@ -44,4 +44,27 @@ test('the composer grows with its content and then stops', () => {
   assert.equal(composerHeight(199), 199)
   assert.equal(composerHeight(200), 200)
   assert.equal(composerHeight(4000), 200, 'the cap did not hold')
+})
+
+test('the finished answer replaces what the tokens built', () => {
+  // The streamed bubble is every turn of a multi-turn run concatenated, so
+  // it holds the narration the model writes between tool calls. Only the
+  // end frame carries what the run actually answered.
+  assert.equal(
+    finalAnswer({ status: 'ok', answer: 'EUR 10.99 at bol.com' }, 'Let me check Kruidvat, then bol'),
+    'EUR 10.99 at bol.com',
+  )
+  // Empty means the run produced nothing but reasoning. Clearing the bubble
+  // is the right answer, not a bug — there was no answer in it.
+  assert.equal(finalAnswer({ status: 'ok', answer: '' }, 'my reasoning'), '')
+})
+
+test('a stream that carries no answer leaves the bubble alone', () => {
+  // Absent is not empty. A server part-way through a rollout still sends
+  // `{"status":"ok"}` on its own, and blanking a good reply over a deploy
+  // would be worse than showing what streamed.
+  assert.equal(finalAnswer({ status: 'ok' }, 'the streamed text'), 'the streamed text')
+  assert.equal(finalAnswer({ status: 'busy' }, 'the streamed text'), 'the streamed text')
+  assert.equal(finalAnswer({ status: 'error', message: 'boom' }, 'partial'), 'partial')
+  assert.equal(finalAnswer(null, 'partial'), 'partial')
 })

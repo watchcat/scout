@@ -887,11 +887,13 @@ mod tests {
         // Both accounts have to have been *used*, or they are two empty
         // halves of one person and linking merges them instead. That is
         // the case the next test covers; this one is the genuine clash.
-        core.log_request(777, "text").await.unwrap();
-        core.log_request(888, "text").await.unwrap();
         let other = scout_core::identity::sign_in(&core, "telegram", "888").await.unwrap();
         let (scout_core::identity::SignIn::In { account_id: other }
         | scout_core::identity::SignIn::Queued { account_id: other }) = other;
+        // Logged against the accounts, not the Telegram ids: `log_request`
+        // is account-keyed, and the two are different numbers.
+        core.log_request(telegram_account, "text").await.unwrap();
+        core.log_request(other, "text").await.unwrap();
         assert_ne!(other, telegram_account);
         let cookie = crate::session::mint(TEST_KEY, other, 86_400);
 
@@ -926,9 +928,9 @@ mod tests {
         // seen — which mints a second, empty account — and then press the
         // Telegram button from it.
         let (app, core, _dir) = app_with_a_widget().await;
-        core.log_request(777, "text").await.unwrap();
         let telegram_account =
             account_for(&core, "telegram", "777").await;
+        core.log_request(telegram_account, "text").await.unwrap();
 
         // Signed in by email, as the empty account that sign-in minted.
         let web = account_for(&core, "email", "ada@example.com").await;

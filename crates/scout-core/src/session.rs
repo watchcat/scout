@@ -16,8 +16,6 @@ pub async fn account_of(core: &Core, id: crate::ids::TelegramId) -> anyhow::Resu
     crate::core::blocking(move || store.account_for_telegram(id.0)).await
 }
 
-/// Runs a `Store` call off the async executor. The connection is behind a
-/// blocking mutex, so every one of these has to leave the reactor thread.
 /// Which conversation this message belongs to.
 ///
 /// After a long gap the old thread is set aside and a quick LLM check

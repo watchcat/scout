@@ -17,6 +17,13 @@ use scout_api::DueDelivery;
 pub struct Core {
     pub(crate) cfg: Config,
     pub(crate) deps: AgentDeps,
+    /// Woken when something is queued for a channel to deliver.
+    ///
+    /// The reminder tick runs every fifteen minutes, which is right for a
+    /// date-scheduled reminder and far too slow for a thread someone is
+    /// about to read on their phone. The tick stays as a floor, so a missed
+    /// signal is a delay rather than a lost mirror.
+    pub(crate) mirror_wake: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// What a reorder reminder says, wherever it is delivered.
@@ -194,7 +201,7 @@ impl Core {
             }),
         };
 
-        Ok(Self { cfg, deps })
+        Ok(Self { cfg, deps, mirror_wake: std::sync::Arc::new(tokio::sync::Notify::new()) })
     }
 
     /// Everyone currently admitted, as Telegram ids, for the adapter's gate.
@@ -258,6 +265,17 @@ impl Core {
     /// a return type of `Store` is itself what keeps this in here.
     pub(crate) fn store(&self) -> crate::store::Store {
         self.deps.store.clone()
+    }
+
+    /// Something is waiting. Wakes a drain that is asleep; harmless if none
+    /// is listening.
+    pub fn wake_mirror(&self) {
+        self.mirror_wake.notify_one();
+    }
+
+    /// Resolves when something has been queued.
+    pub async fn mirror_waiting(&self) {
+        self.mirror_wake.notified().await;
     }
 
     /// Everything due to be delivered on one channel today.

@@ -30,7 +30,7 @@ pub fn looks_like_tool_call(reply: &str) -> bool {
 /// The follow-up handed to the agent when it wrote a call instead of making
 /// one. Opens with the marker so `session::turns_of` never renders it as
 /// something the reader said.
-pub const REPAIR_NOTE: &str = "[system note] Your last reply contained a tool call written out \
+pub const REPAIR_NOTE: &str = "[system note] Correcting your last reply. It contained a tool call written out \
 as text instead of an actual tool call, so no tool ran and the user saw markup. Either make the \
 call properly now, or answer from what you have already found. Reply with the answer only — no \
 markup, no apology, and no explanation of this note.";

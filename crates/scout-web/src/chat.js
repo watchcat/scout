@@ -118,6 +118,7 @@ function start() {
   const textEl = document.getElementById('text')
   const sendButton = document.getElementById('send')
   const resetForm = document.getElementById('reset')
+  const mirrorButton = document.getElementById('mirror')
 
   // Enter sends, Shift+Enter is a newline. `requestSubmit` rather than
   // `submit` because it runs the form's own validation — so Enter on an
@@ -317,6 +318,30 @@ function start() {
       sendButton.disabled = false
     }
   })
+
+  if (mirrorButton) {
+    mirrorButton.addEventListener('click', async () => {
+      // Read the state off the DOM rather than a variable: the button is
+      // the only place it lives, and two copies would disagree the first
+      // time a request failed.
+      const on = mirrorButton.getAttribute('aria-pressed') !== 'true'
+      mirrorButton.disabled = true
+      try {
+        const res = await fetch('/chat/mirror', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+          body: JSON.stringify({ on }),
+        })
+        if (!res.ok) throw new Error('refused')
+        mirrorButton.setAttribute('aria-pressed', String(on))
+        showNotice(on ? 'This thread is being sent to Telegram.' : 'No longer sending to Telegram.')
+      } catch {
+        showNotice('Could not change that. Try again.')
+      } finally {
+        mirrorButton.disabled = false
+      }
+    })
+  }
 
   resetForm.addEventListener('submit', async (e) => {
     e.preventDefault()

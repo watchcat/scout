@@ -11,6 +11,18 @@
 /// is what stops the spelling drifting apart from this one.
 pub const SYSTEM_NOTE: &str = "[system note]";
 
+/// The marker for a note that asks the model to redo the reply above it.
+///
+/// Distinct from an ordinary [`SYSTEM_NOTE`] because the two mean opposite
+/// things to a transcript. A thumbs-up follow-up is a note about an answer
+/// that stands; a correction means the answer above it was *replaced*, and
+/// rendering both leaves the superseded one on the page — with its dead
+/// links, or as the raw tool-call markup the model wrote as prose.
+///
+/// Starts with `SYSTEM_NOTE` so `said_by_person` still cuts it out of the
+/// reader's own words.
+pub const CORRECTION_NOTE: &str = "[system note] Correcting your last reply.";
+
 /// What a person actually said, with any note Scout appended to itself cut
 /// away. Empty when the message was nothing but a note.
 ///

@@ -15,6 +15,15 @@ use tokio_stream::StreamExt;
 const TEMPLATE: &str = include_str!("../chat.html");
 const CLIENT: &str = include_str!("../chat.js");
 const CSRF_TOKEN: &str = "<!--CSRF-->";
+/// Where the mirror toggle's stored state goes.
+///
+/// Rendered rather than defaulted to "false", because the button is the
+/// only place that state lives on the page: served as off while it is on,
+/// the reader's first click posts `on` again — re-enabling something
+/// already enabled and re-running the backfill — and turning it off takes
+/// two presses. The stylesheet's own comment says the reader has to be able
+/// to tell at a glance, and a hardcoded attribute cannot.
+const MIRROR_STATE: &str = "<!--MIRROR-->";
 
 pub fn routes(auth: AuthState) -> Router {
     Router::new()
@@ -23,6 +32,7 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/history", get(history))
         .route("/chat/messages", post(send_message))
         .route("/chat/reset", post(reset))
+        .route("/chat/mirror", post(mirror))
         // On the router rather than threaded through individual handlers —
         // the same reason it is on `account::routes` — so a handler that
         // forgot to check it is not the one that matters.
@@ -78,7 +88,38 @@ async fn chat(axum::extract::State(auth): axum::extract::State<AuthState>, heade
         Err(response) => return response,
     };
     let csrf = session::csrf_for(&auth.cfg.session_key, account_id);
-    Html(TEMPLATE.replace(CSRF_TOKEN, &csrf)).into_response()
+    let mirrored = matches!(scout_core::mirror::is_enabled(&auth.core, account_id).await, Ok(true));
+    let page = TEMPLATE.replace(CSRF_TOKEN, &csrf).replace(MIRROR_STATE, if mirrored { "true" } else { "false" });
+    // The same call that decides whether a run may promise a reminder
+    // decides whether this is offered, so the two cannot disagree about
+    // whether there is anywhere to send.
+    let page = if reply_to_for(&auth, account_id).await.is_some() {
+        page
+    } else {
+        strip_mirror_toggle(&page)
+    };
+    Html(page).into_response()
+}
+
+/// Removes the mirror control from the page.
+///
+/// A string edit rather than a template engine, because this page is a
+/// static file with one conditional element in it and a dependency for one
+/// `if` is a dependency to maintain forever. Returning the page unchanged
+/// when the markers are missing means a restyle that renames the button
+/// shows the control to everyone rather than serving a broken page — the
+/// test below is what catches that instead.
+fn strip_mirror_toggle(page: &str) -> String {
+    let Some(start) = page.find(r#"<button id="mirror""#) else {
+        return page.to_string();
+    };
+    let Some(end) = page[start..].find("</button>") else {
+        return page.to_string();
+    };
+    let mut out = String::with_capacity(page.len());
+    out.push_str(&page[..start]);
+    out.push_str(&page[start + end + "</button>".len()..]);
+    out
 }
 
 async fn client() -> impl IntoResponse {
@@ -248,6 +289,7 @@ async fn send_message(
     };
     let core = auth.core.clone();
     let text = body.text;
+    let auth_for_mirror = auth.clone();
 
     let (agent_tx, agent_rx) = tokio::sync::mpsc::unbounded_channel();
     let (frames, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -266,6 +308,15 @@ async fn send_message(
         };
         let outcome = scout_core::run::run_agent(&core, agent_tx, &run, &text).await;
         let _ = pump.await;
+        // Queued before the end frame goes out, so the row is written
+        // whether or not the reader's connection survived to see the
+        // answer — a dropped stream still leaves the thread on their phone.
+        if matches!(&outcome, Ok(scout_core::run::RunOutcome::Answered(_))) {
+            // Reads the transcript `run_agent` has just saved, so what goes
+            // to the phone is exactly what a reload would show — including
+            // any answer the dead-link repair rewrote on the way out.
+            queue_thread(&auth_for_mirror, account_id).await;
+        }
         let _ = frames.send(Frame::End(end_frame(outcome)));
     });
 
@@ -280,6 +331,10 @@ async fn reset(axum::extract::State(auth): axum::extract::State<AuthState>, head
     if !csrf_header_ok(&auth, &headers, account_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // Before the new thread is started, not after: the divider belongs to
+    // the conversation it closes, and after the reset that conversation is
+    // no longer the one `current_thread` returns.
+    mirror_divider(&auth, account_id).await;
     match scout_core::session::reset(&auth.core, account_id, "direct").await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
@@ -289,12 +344,120 @@ async fn reset(axum::extract::State(auth): axum::extract::State<AuthState>, head
     }
 }
 
+#[derive(serde::Deserialize)]
+struct MirrorIn {
+    on: bool,
+}
+
+/// Switches mirroring for this account, and backfills the current thread
+/// when switching on.
+///
+/// Backfilling here rather than in the drain because this is where the
+/// decision is made, and because it is cheap: it writes rows and returns.
+/// The drain does the sending, so a twenty-row backfill is a fast database
+/// write and a slow background delivery, not a slow request.
+///
+/// Enqueueing is idempotent, so ticking the box twice — or after a spell
+/// with it off — costs nothing and cannot duplicate a message.
+async fn mirror(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<MirrorIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(e) = scout_core::mirror::set_enabled(&auth.core, account_id, body.on).await {
+        tracing::error!(error = %e, "could not switch the mirror");
+        return sorry();
+    }
+    if body.on {
+        queue_thread(&auth, account_id).await;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Queues the reader's current thread, if they asked for that.
+///
+/// One function for both the backfill and keeping up, because enqueueing is
+/// idempotent and the transcript is the only text this mirrors — so "send
+/// the thread so far" and "send what just happened" are the same call, and
+/// cannot drift apart.
+///
+/// Silently does nothing when the account has no Telegram identity: the
+/// toggle is not shown in that case, so reaching here means a hand-made
+/// request, and there is nowhere to send.
+///
+/// Failures are logged and swallowed. The answer is already on the reader's
+/// screen and already in history; a mirror that did not get queued is worth
+/// knowing about and is not worth failing a reply over.
+async fn queue_thread(auth: &AuthState, account_id: i64) {
+    if !matches!(scout_core::mirror::is_enabled(&auth.core, account_id).await, Ok(true)) {
+        return;
+    }
+    let Some(reply_to) = reply_to_for(auth, account_id).await else {
+        return;
+    };
+    if let Err(e) =
+        scout_core::mirror::queue_thread(&auth.core, account_id, &reply_to.address).await
+    {
+        tracing::warn!(error = %e, account_id, "could not queue the thread for Telegram");
+    }
+}
+
+
+/// Marks the seam between two conversations in the mirrored chat.
+///
+/// Keyed to the conversation being *closed*, which is what gives it a turn
+/// key nobody else will mint — so pressing the button twice cannot send the
+/// same divider twice.
+///
+/// Skipped when that conversation had nothing in it. The second press of
+/// "New thread" closes a thread nobody used, and a divider for that is two
+/// dividers in a row with nothing between them.
+async fn mirror_divider(auth: &AuthState, account_id: i64) {
+    if !matches!(scout_core::mirror::is_enabled(&auth.core, account_id).await, Ok(true)) {
+        return;
+    }
+    let Some(reply_to) = reply_to_for(auth, account_id).await else {
+        return;
+    };
+    let Ok(Some((conversation_id, turns))) =
+        scout_core::session::current_thread(&auth.core, account_id).await
+    else {
+        return;
+    };
+    if turns.is_empty() {
+        return;
+    }
+    let seam = vec![scout_api::Turn {
+        role: scout_api::Role::Scout,
+        text: "— New thread —".to_string(),
+    }];
+    if let Err(e) = scout_core::mirror::enqueue(
+        &auth.core,
+        account_id,
+        &reply_to.address,
+        conversation_id,
+        &seam,
+        false,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, account_id, "could not queue a thread divider");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Named imports rather than `use super::*`: the module imports axum's
     // `get` and `post`, which would shadow the test helpers of the same
     // name that every request in here goes through.
-    use super::{end_frame, reply_to_for, AuthState};
+    use super::{end_frame, queue_thread, reply_to_for, AuthState};
     use crate::tests::*;
 
     #[test]
@@ -446,6 +609,65 @@ mod tests {
     /// stays intact everywhere else.
     async fn seed_conversation(core: &scout_core::core::Core, account_id: i64, you: &str, scout: &str) {
         scout_core::session::seed_exchange_for_tests(core, account_id, "direct", you, scout).await.unwrap();
+    }
+
+    #[test]
+    fn a_finished_run_queues_the_exchange_it_just_answered() {
+        // `run_agent` needs a live model, so nothing in this workspace can
+        // drive `send_message` end to end: deleting the call leaves every
+        // other test in this file green, and the mirror would silently
+        // never advance past its first backfill.
+        //
+        // Scoped to the handler's own body. Two source-scan tests written
+        // today matched their own explanatory prose and could never fail;
+        // slicing one function keeps the tests below — which name
+        // `queue_thread` repeatedly — out of range.
+        let src = include_str!("chat.rs");
+        let start = src.find("async fn send_message").expect("the handler must exist");
+        let end = src[start..].find("\n}").expect("the handler must end") + start;
+        assert!(
+            src[start..end].contains("queue_thread("),
+            "a finished run must queue the thread, or the mirror only ever backfills"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_is_queued_only_when_the_mirror_is_on() {
+        // `run_agent` needs a live model, so this exercises the function the
+        // run handler calls rather than driving a run.
+        let (_app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        // The thread the run has just saved — this reads the transcript now
+        // rather than being handed the text, which is what keeps it and a
+        // backfill sending the same thing.
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        let auth = auth_state(&core);
+
+        queue_thread(&auth, account_id).await;
+        assert!(
+            scout_core::mirror::pending(&core, 10).await.unwrap().is_empty(),
+            "queued a turn for someone who never asked for it"
+        );
+
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        queue_thread(&auth, account_id).await;
+        assert_eq!(scout_core::mirror::pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_turn_is_not_queued_when_there_is_nowhere_to_send_it() {
+        // Someone who switched the mirror on and later lost their delivery
+        // address. Queueing rows nothing can deliver would fill the outbox
+        // with work that fails five times each and is then abandoned.
+        let (_app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        // Deliberately no `note_address`.
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let auth = auth_state(&core);
+        queue_thread(&auth, account_id).await;
+        assert!(scout_core::mirror::pending(&core, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -689,6 +911,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turning_the_mirror_on_queues_the_thread_that_is_already_there() {
+        // The point of backfilling: you tick the box because you are about
+        // to pick the thread up on your phone, and a thread that starts
+        // mid-story is not the thread.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        // Backfilling needs somewhere to send to. `admitted` only signs in;
+        // it is the Telegram webhook's `note_address` that records a chat
+        // to deliver into, so a test that skips it has nowhere for
+        // `reply_to_for` to find and `pending` never rises off zero — the
+        // same setup `a_run_promises_a_reminder_only_where_one_could_be_delivered`
+        // needs for the same reason.
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+        let res =
+            post_json_with_cookie(&app, "/chat/mirror", &cookie, Some(&csrf), r#"{"on":true}"#).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(scout_core::mirror::pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn turning_it_on_twice_queues_the_thread_once() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+        for _ in 0..2 {
+            post_json_with_cookie(&app, "/chat/mirror", &cookie, Some(&csrf), r#"{"on":true}"#).await;
+        }
+        assert_eq!(scout_core::mirror::pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_mirror_cannot_be_switched_without_the_csrf_header() {
+        // Same guard as /chat/messages and /chat/reset: without it, any page
+        // on the internet can turn a reader's chat into a Telegram feed.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let res = post_json_with_cookie(&app, "/chat/mirror", &cookie, None, r#"{"on":true}"#).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(!scout_core::mirror::is_enabled(&core, account_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_mirror_toggle_is_absent_without_a_telegram_identity() {
+        // A control that cannot work is a promise the page cannot keep. The
+        // same call that decides whether a run may promise a reminder
+        // decides whether this is shown, so the two cannot drift — and
+        // `/chat/mirror`'s backfill quietly does nothing in this state,
+        // which would be baffling if the button were there to press.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let scout_core::identity::SignIn::In { account_id: web_only } =
+            scout_core::identity::sign_in(&core, "email", "ada@example.com").await.unwrap()
+        else {
+            panic!("the round had room");
+        };
+        let cookie = crate::session::mint(TEST_KEY, web_only, DAY);
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        assert!(!page.contains(r#"id="mirror""#), "offered a mirror with nowhere to send it");
+    }
+
+    #[tokio::test]
+    async fn the_page_without_a_mirror_toggle_is_still_a_whole_page() {
+        // Stripping means a reader with no Telegram gets different markup
+        // from everyone else, and `the_page_still_carries_every_id_the
+        // _client_binds_to` only ever sees the unstripped one. A cut that
+        // took the reset form or the composer with it would pass every
+        // other test in this file and break the page for exactly the people
+        // who cannot mirror.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let scout_core::identity::SignIn::In { account_id: web_only } =
+            scout_core::identity::sign_in(&core, "email", "ada@example.com").await.unwrap()
+        else {
+            panic!("the round had room");
+        };
+        let cookie = crate::session::mint(TEST_KEY, web_only, DAY);
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        for id in ["turns", "status", "notice", "ask", "text", "send", "reset"] {
+            assert!(page.contains(&format!(r#"id="{id}""#)), "the client binds to #{id}");
+        }
+        assert!(!page.contains(r#"id="mirror""#));
+        // And the cut left no orphaned markup behind it.
+        assert_eq!(page.matches("<div class=\"controls\">").count(), 1);
+        // The paper-plane path, not the viewBox: the send button's icon
+        // shares `viewBox="0 0 24 24"`, so the looser check failed against
+        // a page that had stripped correctly.
+        assert!(!page.contains("M21.7 3.4"), "the toggle's icon outlived the toggle");
+    }
+
+    #[tokio::test]
+    async fn the_toggle_shows_the_state_it_is_actually_in() {
+        // The button is the only place this state lives on the page. Served
+        // as off while it is on, the first click posts `on` again — which
+        // re-runs the backfill — and turning it off takes two presses.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+
+        // Matched on the button, not the bare attribute: the stylesheet
+        // carries `#mirror[aria-pressed="true"]`, so the loose check passed
+        // against a page that hardcoded the state — the third assertion
+        // today to match a string that also lives somewhere else.
+        let on = r#"id="mirror" type="button" aria-pressed="true""#;
+        let off = r#"id="mirror" type="button" aria-pressed="false""#;
+
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        assert!(page.contains(off), "off is not shown as off");
+
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        assert!(page.contains(on), "on is shown as off");
+        assert!(!page.contains("<!--MIRROR-->"), "the placeholder reached the browser");
+    }
+
+    #[tokio::test]
+    async fn the_mirror_toggle_is_offered_to_someone_on_telegram() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
+        assert!(page.contains(r#"id="mirror""#), "no way to switch the mirror on");
+    }
+
+    #[tokio::test]
     async fn a_reset_starts_a_thread_that_does_not_remember_the_last_one() {
         let (app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;
@@ -703,5 +1056,67 @@ mod tests {
             scout_core::session::transcript(&core, account_id).await.unwrap().is_empty(),
             "the new thread still remembers the old one"
         );
+    }
+
+    #[tokio::test]
+    async fn starting_a_new_thread_marks_the_seam_in_telegram() {
+        // Without it, scrolling back through Telegram runs two unrelated
+        // conversations together with nothing between them, which is
+        // precisely the continuity this feature is for.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        let res = post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
+        assert!(
+            queued.iter().any(|r| r.body.contains("New thread")),
+            "no seam between two conversations: {:?}",
+            queued.iter().map(|r| &r.body).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn pressing_new_thread_twice_does_not_queue_two_seams() {
+        // The second press closes a thread nobody said anything in, and a
+        // divider closing an empty thread is just two dividers in a row.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+        post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+
+        let seams = scout_core::mirror::pending(&core, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.body.contains("New thread"))
+            .count();
+        assert_eq!(seams, 1, "queued a divider for a thread nobody used");
+    }
+
+    #[tokio::test]
+    async fn a_new_thread_queues_nothing_when_the_mirror_is_off() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+
+        assert!(scout_core::mirror::pending(&core, 10).await.unwrap().is_empty());
     }
 }

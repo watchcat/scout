@@ -23,6 +23,7 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/history", get(history))
         .route("/chat/messages", post(send_message))
         .route("/chat/reset", post(reset))
+        .route("/chat/mirror", post(mirror))
         // On the router rather than threaded through individual handlers —
         // the same reason it is on `account::routes` — so a handler that
         // forgot to check it is not the one that matters.
@@ -287,6 +288,74 @@ async fn reset(axum::extract::State(auth): axum::extract::State<AuthState>, head
             sorry()
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct MirrorIn {
+    on: bool,
+}
+
+/// Switches mirroring for this account, and backfills the current thread
+/// when switching on.
+///
+/// Backfilling here rather than in the drain because this is where the
+/// decision is made, and because it is cheap: it writes rows and returns.
+/// The drain does the sending, so a twenty-row backfill is a fast database
+/// write and a slow background delivery, not a slow request.
+///
+/// Enqueueing is idempotent, so ticking the box twice — or after a spell
+/// with it off — costs nothing and cannot duplicate a message.
+async fn mirror(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<MirrorIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(e) = scout_core::mirror::set_enabled(&auth.core, account_id, body.on).await {
+        tracing::error!(error = %e, "could not switch the mirror");
+        return sorry();
+    }
+    if body.on {
+        if let Err(e) = backfill(&auth, account_id).await {
+            // The setting is saved either way. A backfill that failed is a
+            // thread that starts late, which is worth logging and not worth
+            // refusing the request over.
+            tracing::warn!(error = %e, account_id, "could not queue the thread so far");
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Queues everything already said in the reader's current thread.
+///
+/// Silently does nothing when the account has no Telegram identity — the
+/// toggle is not shown in that case, so reaching here means a hand-made
+/// request, and there is nowhere to send to.
+async fn backfill(auth: &AuthState, account_id: i64) -> anyhow::Result<()> {
+    let Some(reply_to) = reply_to_for(auth, account_id).await else {
+        return Ok(());
+    };
+    let Some((conversation_id, turns)) =
+        scout_core::session::current_thread(&auth.core, account_id).await?
+    else {
+        return Ok(());
+    };
+    scout_core::mirror::enqueue(
+        &auth.core,
+        account_id,
+        &reply_to.address,
+        conversation_id,
+        &turns,
+        false,
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -686,6 +755,55 @@ mod tests {
             post_json_with_cookie(&app, "/chat/messages", &cookie, Some(&csrf), r#"{"text":"hi"}"#).await,
         ).await;
         assert_eq!(body.matches("event: end").count(), 1, "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn turning_the_mirror_on_queues_the_thread_that_is_already_there() {
+        // The point of backfilling: you tick the box because you are about
+        // to pick the thread up on your phone, and a thread that starts
+        // mid-story is not the thread.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        // Backfilling needs somewhere to send to. `admitted` only signs in;
+        // it is the Telegram webhook's `note_address` that records a chat
+        // to deliver into, so a test that skips it has nowhere for
+        // `reply_to_for` to find and `pending` never rises off zero — the
+        // same setup `a_run_promises_a_reminder_only_where_one_could_be_delivered`
+        // needs for the same reason.
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+        let res =
+            post_json_with_cookie(&app, "/chat/mirror", &cookie, Some(&csrf), r#"{"on":true}"#).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(scout_core::mirror::pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn turning_it_on_twice_queues_the_thread_once() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+        for _ in 0..2 {
+            post_json_with_cookie(&app, "/chat/mirror", &cookie, Some(&csrf), r#"{"on":true}"#).await;
+        }
+        assert_eq!(scout_core::mirror::pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_mirror_cannot_be_switched_without_the_csrf_header() {
+        // Same guard as /chat/messages and /chat/reset: without it, any page
+        // on the internet can turn a reader's chat into a Telegram feed.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let res = post_json_with_cookie(&app, "/chat/mirror", &cookie, None, r#"{"on":true}"#).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(!scout_core::mirror::is_enabled(&core, account_id).await.unwrap());
     }
 
     #[tokio::test]

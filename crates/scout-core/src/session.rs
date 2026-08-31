@@ -261,6 +261,26 @@ pub async fn transcript(core: &Core, account_id: i64) -> anyhow::Result<Vec<scou
     .await
 }
 
+/// The current thread's id and transcript, or `None` when there is no
+/// thread yet.
+///
+/// `transcript` answers the page, which only needs the turns. Mirroring
+/// needs the id as well, because a turn's key is scoped to its conversation
+/// — the same question asked again in a new thread is a new turn.
+pub async fn current_thread(
+    core: &Core,
+    account_id: i64,
+) -> anyhow::Result<Option<(i64, Vec<scout_api::Turn>)>> {
+    let store = core.store();
+    crate::core::blocking(move || {
+        let Some(id) = latest_direct(&store, account_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((id, transcript_of(&store, id)?)))
+    })
+    .await
+}
+
 /// Starts a fresh conversation, discarding whatever thread was live.
 ///
 /// History lives in the store now, so clearing an in-memory slot would clear

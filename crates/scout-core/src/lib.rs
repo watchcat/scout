@@ -13,6 +13,7 @@ pub mod config;
 pub mod core;
 pub mod describe;
 pub mod identity;
+pub mod ids;
 pub mod invites;
 pub mod links;
 pub mod run;

@@ -144,6 +144,25 @@ impl ReplyTo {
     }
 }
 
+/// Who said a thing, as a reader sees it.
+///
+/// An enum rather than a string so a client cannot invent a third role, and
+/// named for what appears on screen rather than for `rig`'s vocabulary — a
+/// page that has to translate "assistant" into "Scout" is a page that will
+/// eventually translate it inconsistently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Role {
+    You,
+    Scout,
+}
+
+/// One thing said in a conversation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Turn {
+    pub role: Role,
+    pub text: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -295,6 +295,116 @@ mod tests {
         assert!(css.contains("hover:hover"), "hover is not gated to devices that have one");
     }
 
+    /// Relative luminance, per WCAG 2.1.
+    fn luminance(hex: &str) -> f64 {
+        let v = |i: usize| {
+            let c = u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
+            if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * v(1) + 0.7152 * v(3) + 0.0722 * v(5)
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    /// Every `--name:#rrggbb` declared in the stylesheet.
+    fn palette() -> std::collections::HashMap<String, String> {
+        let css = include_str!("index.html");
+        let mut out = std::collections::HashMap::new();
+        for (i, _) in css.match_indices("--") {
+            let rest = &css[i + 2..];
+            let Some(colon) = rest.find(':') else { continue };
+            let name = &rest[..colon];
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                continue;
+            }
+            let value = rest[colon + 1..].trim_start();
+            if value.starts_with('#') && value.len() >= 7
+                && value[1..7].chars().all(|c| c.is_ascii_hexdigit())
+            {
+                out.insert(name.to_string(), value[..7].to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_token_is_used_without_being_defined() {
+        // Nearly shipped: a string replace that added `--link` silently
+        // matched nothing, so the stylesheet referenced `var(--link)` that
+        // did not exist. Every link and the primary call to action would
+        // have rendered with no colour, and no test would have said a word.
+        let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+        let defined = palette();
+        for (i, _) in css.match_indices("var(--") {
+            let rest = &css[i + 6..];
+            let name = &rest[..rest.find(')').expect("a var() must close")];
+            // Sizes and curves are not colours; only colours land in `palette`.
+            if name.starts_with("t-") || name.starts_with("s-") || name.starts_with("ease") {
+                continue;
+            }
+            assert!(defined.contains_key(name), "var(--{name}) is used but never defined");
+        }
+    }
+
+    #[test]
+    fn the_text_on_this_page_can_be_read() {
+        // Measured, not judged. Ten of fifteen pairs failed WCAG AA before
+        // this: a third of the prose, every section label, and — worst —
+        // the primary call to action and every link on the page.
+        //
+        // Solarized's dimmer values are *designed* to recede, which is why
+        // they were reached for. WCAG does not grade on intent.
+        let p = palette();
+        let c = |name: &str| p.get(name).unwrap_or_else(|| panic!("no --{name}")).clone();
+        let (bg, surface) = (c("base03"), c("base02"));
+
+        // (what it is, colour, behind, minimum)
+        let pairs: &[(&str, String, String, f64)] = &[
+            ("body and lede", c("base1"), bg.clone(), 4.5),
+            ("prose in columns and sources", c("base0"), bg.clone(), 4.5),
+            ("section labels, caption, footer", c("base0"), bg.clone(), 4.5),
+            // 44px display: large text, so 3:1 is the bar and the quieter
+            // value survives.
+            ("the second line of the headline", c("base00"), bg.clone(), 3.0),
+            ("anything on a raised surface", c("base1"), surface.clone(), 4.5),
+            ("the board's per-unit price", c("unit"), surface.clone(), 4.5),
+            ("the board's shipping cost", c("ship"), surface.clone(), 4.5),
+            ("link text", c("link"), bg.clone(), 4.5),
+            ("the button's label on its fill", bg.clone(), c("link"), 4.5),
+            ("the button's label, hovered", bg.clone(), c("link-hover"), 4.5),
+        ];
+        for (what, fg, back, need) in pairs {
+            let got = contrast(fg, back);
+            assert!(
+                got >= *need,
+                "{what}: {fg} on {back} is {got:.2}:1, needs {need}:1"
+            );
+        }
+
+        // The pairs above prove the palette is sound. They do not prove the
+        // rules reach for the right entries — reverting one rule to
+        // `base00` left this test green, which is the "passes for a
+        // different reason" failure. So: the two values that cannot carry
+        // text here must not be used as text.
+        let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+        assert!(
+            !css.contains("color:var(--base01)"),
+            "base01 is 2.79:1 on the page background — it cannot carry text here"
+        );
+        // base00 is 3.37:1: under AA for body, over the 3:1 bar for large
+        // text. The headline's second line is the one place that holds.
+        assert_eq!(
+            css.matches("color:var(--base00)").count(),
+            1,
+            "base00 is only legible at display size; the headline is the one place for it"
+        );
+    }
+
     #[test]
     fn every_size_on_the_page_comes_from_the_scale() {
         // Twelve font sizes and nineteen spacing values did not arrive at

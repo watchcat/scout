@@ -25,16 +25,26 @@
     --ease-out:cubic-bezier(.23,1,.32,1);
     /* Was a bare #0d4a5a in two separate places. */
     --rule:#0d4a5a;
+    /* Solarized's own blue is 4.08:1 here — under AA both as link text and
+       as the button fill behind base03 text. Lightened until both clear
+       4.5. This exact value was already the hover colour, so the hover
+       state had been more legible than the resting one all along. */
+    --link:#3196d8; --link-hover:#4aa3e0;
+    /* The board's two accents carry real numbers — the per-wash price and
+       the shipping cost — so they are text, not decoration. Solarized's
+       green and orange measure 4.06 and 2.82 on the board's surface;
+       these are the same hues lifted until they read. */
+    --unit:#93a800; --ship:#eb7a45;
   }
   *{box-sizing:border-box}
   body{
-    margin:0; background:var(--base03); color:var(--base0);
+    margin:0; background:var(--base03); color:var(--base1);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
     font-size:var(--t-base); line-height:1.65;
     -webkit-font-smoothing:antialiased;
   }
   .wrap{max-width:880px; margin:0 auto; padding:0 var(--s-5)}
-  a{color:var(--blue); text-decoration:none;
+  a{color:var(--link); text-decoration:none;
     transition:color 150ms var(--ease-out)}
   code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.92em;
     background:var(--base02); padding:1px var(--s-1); border-radius:3px; color:var(--cyan)}
@@ -57,8 +67,10 @@
     color:var(--base2)}
   h1{font-size:var(--t-display); line-height:1.15; margin:0 0 var(--s-4); color:var(--base2);
     font-weight:700; letter-spacing:-.02em}
-  h1 em{font-style:normal; color:var(--base01)}
-  .lede{font-size:var(--t-lede); max-width:37em; margin:0 0 var(--s-6); color:var(--base0)}
+  /* base00, not base0: at 44px this is large text, which needs 3:1 rather
+     than 4.5, so the quieter value survives the fix. */
+  h1 em{font-style:normal; color:var(--base00)}
+  .lede{font-size:var(--t-lede); max-width:37em; margin:0 0 var(--s-6); color:var(--base1)}
 
   .board{
     background:var(--base02); border-radius:6px; padding:var(--s-4); margin:0 0 var(--s-3);
@@ -71,12 +83,12 @@
      before it reads a single number. `--green` because that is already the
      colour the per-unit figure is written in. */
   .board .row.win{color:var(--base2); border-left-color:var(--green)}
-  .board .unit{color:var(--green); font-weight:600}
-  .board .ship{color:var(--orange)}
-  .board .shop{color:var(--base01)}
-  .board .hdr{color:var(--base01); border-bottom:1px solid var(--rule);
+  .board .unit{color:var(--unit); font-weight:600}
+  .board .ship{color:var(--ship)}
+  .board .shop{color:var(--base1)}
+  .board .hdr{color:var(--base1); border-bottom:1px solid var(--rule);
     padding-bottom:var(--s-2); margin-bottom:var(--s-2); display:block}
-  .caption{font-size:var(--t-xs); color:var(--base01); margin:0 0 var(--s-6); max-width:44em}
+  .caption{font-size:var(--t-xs); color:var(--base0); margin:0 0 var(--s-6); max-width:44em}
 
   /* The sign-in line below this reuses `.caption`, which sets no top
      margin — under the board that is right, because the board sets its
@@ -89,7 +101,7 @@
   .pill.full{background:rgba(203,75,22,.14); color:var(--orange); border:1px solid rgba(203,75,22,.35)}
   .dot{width:7px; height:7px; border-radius:50%; background:currentColor}
   .gate p{margin:0; flex:1; min-width:220px; font-size:var(--t-sm)}
-  .btn{background:var(--blue); color:var(--base03); font-weight:650;
+  .btn{background:var(--link); color:var(--base03); font-weight:650;
     font-size:var(--t-sm); padding:var(--s-3) var(--s-5); border-radius:5px;
     border:0; white-space:nowrap}
   .btn.ghost{background:transparent; color:var(--base1); border:1px solid var(--base01)}
@@ -100,22 +112,22 @@
   /* A keyboard visitor has to be able to see where they are. The primary
      call to action is a link with no underline inside a borderless button,
      so before this there was nothing but the browser default to go on. */
-  a:focus-visible,.btn:focus-visible{outline:2px solid var(--blue);
+  a:focus-visible,.btn:focus-visible{outline:2px solid var(--link);
     outline-offset:2px; border-radius:3px}
   /* Gated: on a touch device hover fires on tap and then sticks, so the
      Telegram button stayed lit after it had been pressed. */
   @media (hover:hover) and (pointer:fine){
     a:hover{text-decoration:underline}
-    .btn:hover{text-decoration:none; background:#3196d8}
+    .btn:hover{text-decoration:none; background:var(--link-hover)}
     .btn.ghost:hover{background:transparent; color:var(--base2)}
   }
 
   section{padding:var(--s-6) 0}
   h2{font-size:var(--t-xs); letter-spacing:.14em; text-transform:uppercase;
-    color:var(--base01); margin:0 0 var(--s-4); font-weight:600}
+    color:var(--base0); margin:0 0 var(--s-4); font-weight:600}
   h3{margin:0 0 var(--s-2); font-size:var(--t-base); color:var(--base1); font-weight:650}
   .cols{display:grid; grid-template-columns:repeat(3,1fr); gap:var(--s-5)}
-  .cols p{margin:0; font-size:var(--t-sm); color:var(--base00)}
+  .cols p{margin:0; font-size:var(--t-sm); color:var(--base0)}
 
   .chat{background:var(--base02); border-left:3px solid var(--violet);
     padding:var(--s-3) var(--s-4); border-radius:0 4px 4px 0; margin:0 0 var(--s-3);
@@ -129,22 +141,22 @@
   .tag.official{color:var(--green)}
   .tag.unofficial{color:var(--yellow)}
   .tag.read{color:var(--cyan)}
-  .src p{margin:0; font-size:var(--t-sm); color:var(--base00)}
+  .src p{margin:0; font-size:var(--t-sm); color:var(--base0)}
 
   table{width:100%; border-collapse:collapse; font-size:var(--t-sm)}
   td{padding:var(--s-3) 0; vertical-align:top; border-top:1px solid var(--base02)}
-  td.bad{color:var(--base01); width:50%; padding-right:var(--s-5)}
-  td.good{color:var(--base0)}
+  td.bad{color:var(--base0); width:50%; padding-right:var(--s-5)}
+  td.good{color:var(--base1)}
   .bad b{color:var(--red); font-weight:600}
   .good b{color:var(--green); font-weight:600}
 
   .aside{background:var(--base02); border-radius:6px; padding:var(--s-4) var(--s-5);
     font-size:var(--t-sm)}
   .aside h3{margin-bottom:var(--s-2)}
-  .aside p{margin:0; color:var(--base00)}
+  .aside p{margin:0; color:var(--base1)}
 
   footer{margin-top:var(--s-6); padding:var(--s-5) 0 var(--s-8); border-top:1px solid var(--base02);
-    font-size:var(--t-sm); color:var(--base01); display:flex; gap:var(--s-5); flex-wrap:wrap}
+    font-size:var(--t-sm); color:var(--base0); display:flex; gap:var(--s-5); flex-wrap:wrap}
   /* Motion is spent where it is seen rarely and withheld where it is seen
      constantly. A visitor meets this page once or twice; /chat is used
      every day and deliberately has none of this.

@@ -39,7 +39,10 @@
   code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.92em;
     background:var(--base02); padding:1px var(--s-1); border-radius:3px; color:var(--cyan)}
 
-  header{padding:var(--s-8) 0 var(--s-7)}
+  /* No bottom padding: the last thing in here is a `.caption`, which
+     brings its own 32px, and the section below brings another 32. Three
+     spacings stacked to ninety-odd pixels of nothing under the gate. */
+  header{padding:var(--s-8) 0 0}
   /* The lockup: the mark at display size, wordmark beside it. Two things
      it deliberately does not do. It does not carry the tile the .svg ships
      with — that tile is a near-black green, and against the solarized
@@ -72,12 +75,14 @@
   .board .ship{color:var(--orange)}
   .board .shop{color:var(--base01)}
   .board .hdr{color:var(--base01); border-bottom:1px solid var(--rule);
-    padding-bottom:var(--s-2); margin-bottom:var(--s-2); display:block;
-    padding-left:var(--s-3)}
+    padding-bottom:var(--s-2); margin-bottom:var(--s-2); display:block}
   .caption{font-size:var(--t-xs); color:var(--base01); margin:0 0 var(--s-6); max-width:44em}
 
+  /* The sign-in line below this reuses `.caption`, which sets no top
+     margin — under the board that is right, because the board sets its
+     own. Here it left the link touching the box. */
   .gate{background:var(--base02); border:1px solid var(--rule); border-radius:6px;
-    padding:var(--s-5); display:flex; align-items:center; gap:var(--s-5); flex-wrap:wrap}
+    margin:0 0 var(--s-3); padding:var(--s-5); display:flex; align-items:center; gap:var(--s-5); flex-wrap:wrap}
   .pill{display:inline-flex; align-items:center; gap:var(--s-2); font-size:var(--t-xs);
     font-weight:600; padding:var(--s-1) var(--s-3); border-radius:999px; white-space:nowrap}
   .pill.open{background:rgba(133,153,0,.14); color:var(--green); border:1px solid rgba(133,153,0,.35)}

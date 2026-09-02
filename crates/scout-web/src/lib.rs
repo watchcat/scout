@@ -119,6 +119,13 @@ impl AuthConfig {
 /// one path that exists to avoid doing that.
 fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
     let session_key = auth.as_ref().map(|a| a.cfg.session_key.clone());
+    // Only when we know an https address to send people to. A deployment
+    // configured with an http base URL is a local one, and redirecting it
+    // would make it unusable.
+    let https_origin = auth
+        .as_ref()
+        .map(|a| a.cfg.base_url.clone())
+        .filter(|u| u.starts_with("https://"));
     let public = Router::new()
         .route("/", get(index))
         // Liveness only. Deliberately says nothing about the database: a
@@ -151,6 +158,53 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
     // been running without it; serving it from here means it does not
     // depend on which proxy is in front.
     .layer(axum::middleware::from_fn(hsts))
+    // Outermost, so a plain-HTTP request is turned around before any other
+    // layer has an opinion about it — `only_from_our_own_pages` compares
+    // schemes, so without this a form served over HTTP posts back an
+    // `Origin` that cannot match and the visitor is told their form is out
+    // of date. Measured on an iPhone: Opera in a private window has no HSTS
+    // memory, went to HTTP, and got exactly that.
+    .layer(axum::middleware::from_fn_with_state(https_origin, force_https))
+}
+
+/// Sends a plain-HTTP request to the same address over HTTPS.
+///
+/// HSTS alone cannot do this. It is only honoured on a connection that was
+/// already secure, so it protects the second visit and every one after —
+/// never the first, which is the one that carries the password field.
+///
+/// Absent `x-forwarded-proto` means nothing is in front of us: the
+/// kubelet's probe on `/healthz`, or a local run. Both must pass through,
+/// so the check is "the proxy said http", not "the proxy did not say
+/// https".
+///
+/// 308 rather than 301: it preserves the method, so a form posted over
+/// HTTP is re-posted over HTTPS instead of being silently downgraded to a
+/// GET and losing its body.
+async fn force_https(
+    axum::extract::State(https_origin): axum::extract::State<Option<String>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(origin) = https_origin.as_deref() else {
+        return next.run(request).await;
+    };
+    let forwarded = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        // A chain of proxies appends, so the client's scheme is the first.
+        .map(|v| v.split(',').next().unwrap_or_default().trim().to_string());
+    if forwarded.is_some_and(|p| !p.eq_ignore_ascii_case("https")) {
+        let path = request.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let to = format!("{}{}", origin.trim_end_matches('/'), path);
+        return (
+            axum::http::StatusCode::PERMANENT_REDIRECT,
+            [(header::LOCATION, to)],
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Tells the browser never to speak to this host over plain HTTP.
@@ -499,6 +553,60 @@ mod tests {
     pub(crate) async fn issue(core: &scout_core::core::Core, token: &str) {
         scout_core::identity::issue_token(core, &hash(token), "a@example.com", None, 900)
             .await.unwrap();
+    }
+
+    async fn over(app: &axum::Router, proto: Option<&str>, method: &str, uri: &str) -> Response {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(p) = proto {
+            req = req.header("x-forwarded-proto", p);
+        }
+        app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_visitor_who_arrives_over_http_is_sent_to_https() {
+        // Measured on an iPhone: Opera in a private window has no HSTS
+        // memory, so it went to plain HTTP, was served the sign-in form,
+        // and posting it failed the origin check — which compares schemes —
+        // and told the visitor their form was out of date.
+        //
+        // HSTS could not have prevented it. It is only honoured on a
+        // connection that was already secure, so it protects the second
+        // visit and never the first: the one carrying the email address.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = over(&app, Some("http"), "GET", "/sign-in?next=%2Fchat").await;
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            res.headers().get("location").unwrap(),
+            "https://example.com/sign-in?next=%2Fchat",
+            "the path and query have to survive, or the redirect loses where they were going"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_form_posted_over_http_is_redirected_rather_than_refused() {
+        // The actual failure. Without this the POST reaches
+        // `only_from_our_own_pages`, whose scheme comparison cannot match,
+        // and the visitor is told their form expired. 308 and not 301,
+        // so the body survives the hop.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = over(&app, Some("http"), "POST", "/sign-in/email").await;
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    }
+
+    #[tokio::test]
+    async fn https_and_the_probe_pass_straight_through() {
+        // Absent means nothing is in front of us: the kubelet dials
+        // `/healthz` directly, and a local run has no proxy at all.
+        // Redirecting either would break it.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        assert_eq!(over(&app, Some("https"), "GET", "/healthz").await.status(), StatusCode::OK);
+        assert_eq!(over(&app, None, "GET", "/healthz").await.status(), StatusCode::OK);
+        // And a proxy chain names the client first.
+        assert_eq!(
+            over(&app, Some("https, http"), "GET", "/healthz").await.status(),
+            StatusCode::OK
+        );
     }
 
     pub(crate) async fn get(app: &axum::Router, uri: &str) -> Response {

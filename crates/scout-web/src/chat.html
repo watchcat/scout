@@ -66,6 +66,15 @@
      at the top of the visible area as the text scrolls under it. */
   .status.long{-webkit-mask-image:linear-gradient(to bottom, transparent, #000 30px);
     mask-image:linear-gradient(to bottom, transparent, #000 30px)}
+  /* One treatment for every box that scrolls: the transcript, the
+     narration, and the composer once it has grown past its cap.
+     `color-scheme` above only swaps the browser's default light bar for
+     its default grey one — this puts it in the page's own palette.
+     `#0d4a5a` is the line the composer is already drawn with, so the
+     thumb reads as the same structural colour rather than a new one.
+     Track transparent: on a page this dark a track is just a seam. */
+  .turns,.status,.ask textarea{scrollbar-width:thin;
+    scrollbar-color:#0d4a5a transparent}
   .notice{font-size:13.5px; color:var(--red); margin:0 0 10px; flex:none}
   .ask{flex:none; display:flex; align-items:flex-end; gap:8px;
     margin:0 0 20px; padding:8px 8px 8px 16px;

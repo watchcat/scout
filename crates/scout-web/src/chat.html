@@ -7,6 +7,10 @@
 <title>Chat — Scout</title>
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <style>
+  /* Without this the scrollbars are drawn light-on-light, which the capped
+     status box made obvious: a white bar down a dark page. Also fixes the
+     composer's own scrollbar and any native control on the page. */
+  :root{color-scheme:dark}
   :root{--base03:#002b36; --base02:#073642; --base01:#586e75; --base00:#657b83;
     --base0:#839496; --base1:#93a1a1; --base2:#eee8d5; --blue:#268bd2;
     --red:#dc322f; --green:#859900}
@@ -47,7 +51,21 @@
     font-size:15px; white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.6}
   .turns li.you{align-self:flex-end; background:#1c4f66; color:var(--base2)}
   .turns li.scout{align-self:flex-start; background:var(--base02); color:var(--base1)}
-  .status{font-size:13.5px; color:var(--base01); margin:0 0 10px; flex:none}
+  /* The narration the model writes between tool calls, and it can run to
+     several thousand words. With `flex:none` and no ceiling it took the
+     whole column: the transcript collapsed to nothing and the answer was
+     pushed off screen entirely. A quarter of the viewport, then scroll.
+     `dvh` for the same reason `body` uses it — `vh` is wrong under the
+     mobile URL bar, and this box sits directly above the composer. */
+  .status{font-size:13.5px; color:var(--base01); margin:0 0 10px; flex:none;
+    max-height:25dvh; overflow-y:auto}
+  /* Reasoning scrolled past dissolves at the cut instead of being sliced
+     mid-word. Applied only while there is something above to dissolve:
+     on a status short enough to fit, this would fade the one line it has.
+     The mask is fixed to the box, not the content, so the soft edge stays
+     at the top of the visible area as the text scrolls under it. */
+  .status.long{-webkit-mask-image:linear-gradient(to bottom, transparent, #000 30px);
+    mask-image:linear-gradient(to bottom, transparent, #000 30px)}
   .notice{font-size:13.5px; color:var(--red); margin:0 0 10px; flex:none}
   .ask{flex:none; display:flex; align-items:flex-end; gap:8px;
     margin:0 0 20px; padding:8px 8px 8px 16px;

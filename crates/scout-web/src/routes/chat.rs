@@ -513,6 +513,31 @@ mod tests {
     }
 
     #[test]
+    fn the_narration_cannot_squeeze_the_transcript_off_the_screen() {
+        // `.status` holds the model's working, which on a real run is
+        // thousands of words. It is a `flex:none` sibling of the scrolling
+        // transcript, so without a ceiling it takes every pixel it asks
+        // for: observed with `.turns` collapsed to zero height and the
+        // answer nowhere on screen.
+        //
+        // Scoped to the declaration rather than the file. Both words appear
+        // in the comment above the rule, and a file-wide `contains` would
+        // stay green with the rule itself deleted — which is exactly the
+        // way the url-wrapping test above was once wrong.
+        let page = include_str!("../chat.html");
+        let start = page.find(".status{").expect("the status line must be styled");
+        let rule = &page[start..start + page[start..].find('}').expect("the rule must end")];
+        assert!(
+            rule.contains("max-height"),
+            "the narration needs a ceiling, or it takes the whole column"
+        );
+        assert!(
+            rule.contains("overflow-y:auto"),
+            "a capped box must scroll, or the newest reasoning is unreachable"
+        );
+    }
+
+    #[test]
     fn the_last_frame_carries_the_finished_answer() {
         // The bubble the reader is looking at was built from token deltas,
         // and those are every turn of the run concatenated. The finished

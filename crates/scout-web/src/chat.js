@@ -156,14 +156,25 @@ function start() {
     return li
   }
 
+  // The status box is capped at a quarter of the viewport, so on a long
+  // run the newest reasoning is the part below the fold. Tail it — but ask
+  // the same question `.turns` asks, and for the same reason: a reader who
+  // scrolled up to read something should not be dragged back down by the
+  // next token. While hidden every measurement is 0, which reads as "at the
+  // bottom", so the first status of a run always follows.
   function showStatus(text) {
+    const wasFollowing = shouldFollow(
+      statusEl.scrollTop, statusEl.clientHeight, statusEl.scrollHeight)
     statusEl.textContent = text
     statusEl.hidden = false
+    if (wasFollowing) statusEl.scrollTop = statusEl.scrollHeight
+    statusEl.classList.toggle('long', statusEl.scrollHeight > statusEl.clientHeight)
   }
 
   function hideStatus() {
     statusEl.hidden = true
     statusEl.textContent = ''
+    statusEl.classList.remove('long')
   }
 
   function showNotice(text) {

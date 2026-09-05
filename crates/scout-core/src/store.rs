@@ -221,6 +221,12 @@ CREATE TABLE IF NOT EXISTS conversations (
     account_id    BIGINT NOT NULL,
     scope         TEXT NOT NULL,
     pending_draft TEXT,
+    -- What the sidebar calls it. Null until the first answer lands; then
+    -- the first message trimmed, unless someone renamed it. See the
+    -- threads design doc.
+    title         TEXT,
+    -- "Permanent": exempt from the 48-hour expiry. Nothing else.
+    pinned        BOOLEAN NOT NULL DEFAULT false,
     started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
     updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
@@ -695,6 +701,22 @@ CREATE TABLE IF NOT EXISTS login_tokens (
 );
 "#;
 
+/// Threads in the browser: a name and a pin.
+///
+/// Split into five statements because this DuckDB refuses `ADD COLUMN`
+/// with a constraint ("Adding columns with constraints not yet supported"):
+/// the column is added bare, existing rows are backfilled, and only then
+/// does it get its default and its NOT NULL. `IF NOT EXISTS` so a database
+/// created by `MIGRATIONS` after this shipped, but somehow recorded at 6,
+/// is not broken by the step.
+const STEP_7_THREADS: &str = r#"
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN;
+UPDATE conversations SET pinned = false WHERE pinned IS NULL;
+ALTER TABLE conversations ALTER COLUMN pinned SET DEFAULT false;
+ALTER TABLE conversations ALTER COLUMN pinned SET NOT NULL;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -703,6 +725,7 @@ fn steps() -> Vec<(i64, Step)> {
         (4, Step::Sql(STEP_4_REBUILDS)),
         (5, Step::Sql(STEP_5_DELIVERIES)),
         (6, Step::Sql(STEP_6_LOGIN_TOKENS)),
+        (7, Step::Sql(STEP_7_THREADS)),
     ]
 }
 
@@ -2949,7 +2972,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 6);
+        assert_eq!(s.schema_version().unwrap(), 7);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -3013,7 +3036,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -4730,5 +4753,51 @@ CREATE TABLE segment_candidates (
         s.replace_messages(conversation, &["{}".to_string()])
             .expect("a transactional write must work after a poisoned lock");
         assert_eq!(s.conversation_messages(conversation, 10).unwrap().len(), 1);
+    }
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_name = ? AND column_name = ?",
+                params![table, column],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n == 1
+    }
+
+    #[test]
+    fn a_fresh_database_has_a_title_and_a_pin_on_every_conversation() {
+        let (s, _dir) = test_store();
+        let conn = s.conn();
+        assert!(has_column(&conn, "conversations", "title"));
+        assert!(has_column(&conn, "conversations", "pinned"));
+    }
+
+    #[test]
+    fn a_database_from_before_threads_grows_the_two_columns_and_keeps_its_rows() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("legacy.duckdb");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(LEGACY_SCHEMA).unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        // Step 6 was the last one before this; a database that stops there
+        // is exactly the production file.
+        assert!(s.schema_version().unwrap() >= 7, "step 7 did not run");
+        let a = s.account_for_telegram(11).unwrap();
+        let id = s.start_conversation(a, "direct").unwrap();
+        let conn = s.conn();
+        assert!(has_column(&conn, "conversations", "title"));
+        let pinned: bool = conn
+            .query_row("SELECT pinned FROM conversations WHERE id = ?", params![id], |r| r.get(0))
+            .unwrap();
+        assert!(!pinned, "a thread starts unpinned");
+        let null_pins: i64 = conn
+            .query_row("SELECT count(*) FROM conversations WHERE pinned IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(null_pins, 0, "the backfill must leave no null pins behind");
     }
 }

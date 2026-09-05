@@ -193,6 +193,9 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - Hard caps on searches, page opens and turns per request, so no single
   question can run away with your API budget. Asking the same route twice in
   one request is answered from memory rather than bought twice
+- And a cap on runs in flight across everyone (8), so a burst of people is a
+  short queue rather than a long bill. Anyone waiting is told so, and a wait
+  past two minutes ends with "try again in a minute" — nothing spent
 - **Deploys without cutting anyone off.** `scripts/deploy.sh` builds the new
   image while the old one is still serving, then hands over: the bot stops
   taking messages and finishes what it is already doing before it exits

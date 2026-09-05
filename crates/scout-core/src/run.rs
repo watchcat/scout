@@ -14,6 +14,10 @@ use rig::streaming::{StreamedAssistantContent, StreamingChat};
 pub enum RunOutcome {
     Answered(String),
     Busy,
+    /// Every slot was taken by someone else's run for the whole of
+    /// `QUEUE_WAIT`. Nothing was spent. Distinct from `Busy`, which is
+    /// about this thread; this is about everybody else's.
+    Overloaded,
 }
 
 /// Runs the agent against a snapshot of this chat's history, then writes the
@@ -51,6 +55,12 @@ pub async fn run_agent(
         return Ok(RunOutcome::Busy);
     };
     let (account_id, conversation_id) = (run.account_id, run.conversation_id);
+    // After the thread is claimed, so a second message in the same thread
+    // is told "still working" rather than queued behind strangers; before
+    // anything is built, because nothing below this line is free.
+    let Some(_slot) = take_slot(&core.deps.runs, &events).await else {
+        return Ok(RunOutcome::Overloaded);
+    };
     let facts = {
         let store = core.deps.store.clone();
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
@@ -268,6 +278,45 @@ pub async fn run_agent(
     Ok(RunOutcome::Answered(reply))
 }
 
+/// Runs allowed at once across every conversation and channel.
+///
+/// The per-conversation claim above stops one person from stacking runs;
+/// this stops a hundred people from doing it at the same moment. Each run
+/// is up to `MAX_TURNS` model calls plus searches billed per query, on one
+/// key for the whole process, so a burst is a bill as much as a load.
+pub const MAX_CONCURRENT_RUNS: usize = 8;
+
+/// How long a run will wait for a slot before giving up.
+///
+/// Long enough that a burst clears — a slot frees every time a run ends,
+/// and most end well inside a minute — and short enough that nobody waits
+/// longer for their turn than the answer itself would take.
+const QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Takes one of the process-wide run slots, saying so if it has to wait.
+///
+/// Silent when a slot is free: the common case should read exactly as it
+/// did before the cap existed. `None` after `QUEUE_WAIT`, having spent
+/// nothing — the caller turns that into an outcome the channel can word.
+pub(crate) async fn take_slot(
+    runs: &std::sync::Arc<tokio::sync::Semaphore>,
+    events: &scout_api::EventSink,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if let Ok(slot) = runs.clone().try_acquire_owned() {
+        return Some(slot);
+    }
+    scout_api::emit(
+        &events.clone(),
+        scout_api::AgentEvent::Notice(
+            "⏳ Scout is busy with other requests; yours is queued".to_string(),
+        ),
+    );
+    tokio::time::timeout(QUEUE_WAIT, runs.clone().acquire_owned())
+        .await
+        .ok()
+        .and_then(|acquired| acquired.ok())
+}
+
 /// Held for the length of a run. Dropping it frees the conversation, so a
 /// panic, a timeout or a dropped future cannot wedge a thread forever —
 /// which an insert/remove pair around the body would.
@@ -419,6 +468,69 @@ mod tests {
         let repair = src.find("looks_like_tool_call").expect("the repair must exist");
         let links = src.find("dead_links_in").expect("the link check must exist");
         assert!(repair < links, "the tool-call repair must run before the dead-link check");
+    }
+
+    fn slots(n: usize) -> std::sync::Arc<tokio::sync::Semaphore> {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(n))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_free_slot_is_taken_without_a_word() {
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+
+        let slot = take_slot(&slots(1), &events).await;
+
+        assert!(slot.is_some());
+        assert!(seen.try_recv().is_err(), "nothing waited, so nothing should have been said");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_house_says_so_and_then_proceeds_when_a_slot_frees() {
+        let runs = slots(1);
+        let held = runs.clone().acquire_owned().await.unwrap();
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+
+        let waiting = tokio::spawn({
+            let runs = runs.clone();
+            async move { take_slot(&runs, &events).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            matches!(seen.try_recv(), Ok(scout_api::AgentEvent::Notice(ref n)) if n.contains("queued")),
+            "the person waiting was not told they were queued"
+        );
+
+        drop(held);
+        let slot = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("a freed slot should end the wait")
+            .unwrap();
+        assert!(slot.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_past_the_limit_gives_up() {
+        let runs = slots(1);
+        let _held = runs.clone().acquire_owned().await.unwrap();
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+
+        let slot = take_slot(&runs, &events).await;
+
+        assert!(slot.is_none(), "a run that never got a slot must not pretend it did");
+    }
+
+    #[test]
+    fn every_run_takes_a_slot_before_it_spends_anything() {
+        // The slot has to be taken after the conversation is claimed — a
+        // second message in the same thread must be told "still working",
+        // not queued behind strangers — and before the agent is built,
+        // because building it is where the model calls start.
+        let src = include_str!("run.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let claim = src.find("begin_run(").expect("the conversation claim must exist");
+        let slot = src.find("take_slot(").expect("the run cap must exist");
+        let build = src.find("build_agent(").expect("the agent build must exist");
+        assert!(claim < slot && slot < build, "the run cap is in the wrong place");
     }
 
     #[test]

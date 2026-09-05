@@ -204,6 +204,13 @@ fn end_frame(outcome: anyhow::Result<scout_core::run::RunOutcome>) -> End {
     match outcome {
         Ok(scout_core::run::RunOutcome::Answered(answer)) => End::Ok { answer },
         Ok(scout_core::run::RunOutcome::Busy) => End::Busy,
+        // An error frame rather than a new status: the page already knows
+        // how to show a sentence and clear the composer, which is all this
+        // needs, and a status it has never heard of would show nothing.
+        Ok(scout_core::run::RunOutcome::Overloaded) => End::Error {
+            message: "Scout is busy with other people's requests right now. Try again in a minute."
+                .to_string(),
+        },
         // Telegram has always logged this; the browser path did not, so a
         // failed run left no trace anywhere and the only record of it was
         // the reader's screenshot. `run_agent` logs the stream errors it

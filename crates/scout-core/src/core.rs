@@ -199,6 +199,7 @@ impl Core {
             links_enabled: cfg.duffel_links_enabled,
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),
             running: std::sync::Arc::new(dashmap::DashSet::new()),
+            runs: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::run::MAX_CONCURRENT_RUNS)),
             ignav: cfg.ignav_api_key.clone().map(|key| {
                 crate::tools::ignav::IgnavClient::new(
                     http_for_ignav,

@@ -42,6 +42,11 @@ pub struct App {
     pub members: Arc<dashmap::DashSet<i64>>,
 }
 
+/// Every run slot was taken by other people for as long as core was
+/// willing to wait. Nothing was spent, and nothing was started.
+const OVERLOADED: &str =
+    "Scout is busy with other people's requests right now — please try again in a minute.";
+
 /// How many of the bot's own recent replies to keep per chat so reactions
 /// (which carry only a message id) can be resolved back to their text.
 const SENT_REPLY_CAP: usize = 30;
@@ -964,6 +969,9 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         Ok(scout_core::run::RunOutcome::Busy) => {
             live.show("I'm still working on your last message — one moment.", true).await;
         }
+        Ok(scout_core::run::RunOutcome::Overloaded) => {
+            live.show(OVERLOADED, true).await;
+        }
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "agent request failed");
             // Replace the progress message rather than sending a second one:
@@ -1193,6 +1201,9 @@ async fn handle_reaction(
         }
         Ok(scout_core::run::RunOutcome::Busy) => {
             live.show("I'm still working on your last message — one moment.", true).await;
+        }
+        Ok(scout_core::run::RunOutcome::Overloaded) => {
+            live.show(OVERLOADED, true).await;
         }
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "reaction follow-up failed");

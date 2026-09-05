@@ -330,6 +330,8 @@ pub struct AgentDeps {
     pub shown: std::sync::Arc<crate::tools::shown::ShownFlights>,
     /// Conversations with a run in flight. See `run::begin_run`.
     pub running: std::sync::Arc<dashmap::DashSet<i64>>,
+    /// The process-wide run slots; see `run::MAX_CONCURRENT_RUNS`.
+    pub runs: std::sync::Arc<tokio::sync::Semaphore>,
     pub marktplaats: MarktplaatsClient,
     pub store: Store,
     pub secondhand_sites: Vec<String>,

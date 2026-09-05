@@ -1784,6 +1784,39 @@ mod tests {
         assert!(css.contains("li:focus-within .tools"), "a keyboard cannot reach a non-current row's tools");
     }
 
+    #[test]
+    fn a_threads_name_is_the_biggest_thing_on_its_row() {
+        // A thread is found by its name, and in a 240px column the name was
+        // drawn at the same size as the four tool glyphs beside it and cut
+        // to a one-line ellipsis — "Haribo Ho…" on the current row, where
+        // the tools are always showing. Two lines and a larger type size
+        // are what make the row scannable.
+        //
+        // Scoped to the declaration rather than the file: both properties
+        // are named in the comment above the rule, and a file-wide
+        // `contains` would stay green with the rule itself deleted.
+        let page = include_str!("../chat.html");
+        let start = page.find(".threads .title{").expect("the title must be styled");
+        let rule = &page[start..start + page[start..].find('}').expect("the rule must end")];
+        assert!(
+            rule.contains("-webkit-line-clamp"),
+            "a thread's name is cut to one line, so a long one is unreadable"
+        );
+        assert!(
+            !rule.contains("white-space:nowrap"),
+            "a clamped title still refuses to wrap, so it can only ever show one line"
+        );
+
+        // And on the row where the tools are permanently on screen, they
+        // take a line of their own rather than the title's width.
+        let start = page.find(".threads li.current{").expect("the current row must be styled");
+        let rule = &page[start..start + page[start..].find('}').expect("the rule must end")];
+        assert!(
+            rule.contains("flex-wrap:wrap"),
+            "the current row cannot drop its tools onto their own line"
+        );
+    }
+
     #[tokio::test]
     async fn the_client_script_is_never_cached() {
         // The 422 arm's advice is "reload to keep going", and a reload that

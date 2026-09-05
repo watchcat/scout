@@ -102,8 +102,12 @@
   #mirror[aria-pressed="true"]{color:var(--blue); border-color:var(--blue)}
   /* Two columns above 720px, one below. `.wrap` was capped at 720px for
      a single column of text; with a sidebar beside it, it may be wider. */
-  .wrap{max-width:1040px}
-  .columns{flex:1; min-height:0; display:grid; grid-template-columns:240px 1fr; gap:24px}
+  /* 260px, not 240: a thread's name is now the row's primary text at
+     14.5px over two lines, and twenty more pixels is most of a word on
+     each of them. `.wrap` grows by the same amount so the transcript
+     column is exactly as wide as it was. */
+  .wrap{max-width:1080px}
+  .columns{flex:1; min-height:0; display:grid; grid-template-columns:260px 1fr; gap:24px}
   /* `min-height:0` for the same reason `.turns` has it: a grid child will
      not scroll unless it is allowed to be shorter than its content.
      `flex:1` is for the phone, where `.columns` is a flex column and this
@@ -125,17 +129,37 @@
   .threads li{display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:8px 10px;
     border-radius:10px; font-size:14px; color:var(--base0); cursor:pointer; min-width:0}
   .threads li:hover{background:var(--base02)}
-  .threads li.current{background:var(--base02); color:var(--base2)}
+  /* The current row is the one whose tools are permanently on screen, so
+     it is the one where four 28px targets and a name were competing for a
+     260px column — and the name lost, down to "Haribo Ho…". Wrapping lets
+     the tools drop to a line of their own beneath the title (see `.tools`
+     below), which is the only way both can be full size. */
+  .threads li.current{background:var(--base02); color:var(--base2); flex-wrap:wrap}
   /* The title is a real `<button>`, so it is reachable by keyboard for
      free — and so it needs the browser's button chrome stripped back to
-     the row's own type and colour before the ellipsis rules can bite. */
-  .threads .title{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-    background:transparent; border:0; color:inherit; font:inherit; text-align:left;
-    padding:0; cursor:pointer}
+     the row's own type before anything below can style it.
+     Bigger than the row's other text and heavier than it, because a thread
+     is found by its name: everything else here is metadata about a row the
+     reader has already located. Two lines rather than one, clamped: a
+     one-line ellipsis on a 260px column shows about three words, and three
+     words is not enough to tell two afternoons of price research apart.
+     The clamp needs all four of these declarations together — the box
+     display, the vertical orientation, the line count, and `overflow` —
+     and `white-space:normal` because the row's old rule was `nowrap`,
+     under which a clamp can only ever have one line to count. */
+  .threads .title{flex:1; min-width:0; display:-webkit-box; -webkit-box-orient:vertical;
+    -webkit-line-clamp:2; overflow:hidden; white-space:normal; overflow-wrap:anywhere;
+    background:transparent; border:0; font:inherit; font-size:14.5px; font-weight:500;
+    line-height:1.35; color:var(--base1); text-align:left; padding:0; cursor:pointer}
+  .threads li.current .title{font-weight:600; color:var(--base2)}
   /* A thread nobody has named yet says so in the muted, italic voice the
      page uses for absence, so it does not read as a thread called "New
-     thread". */
-  .threads .title.unnamed{color:var(--base01); font-style:italic}
+     thread".
+     Written with the `li` it does not need, to match the specificity of
+     the current-row colour above: without it that rule is the more
+     specific of the two and the current thread's placeholder would be
+     drawn as though it had a name. */
+  .threads li .title.unnamed{color:var(--base01); font-style:italic}
   /* Renaming happens in place: the input replaces the title button inside
      the row, so the row does not jump when it appears. Matched on the `li`
      rather than on `.title`, because the input is the button's replacement
@@ -168,6 +192,15 @@
      unreachable without a mouse. */
   .threads .tools{display:none; gap:4px; flex:none}
   .threads li:hover .tools,.threads li.current .tools,.threads li:focus-within .tools{display:flex}
+  /* On the current row the tools are on screen permanently, so they take
+     a full-width line under the title instead of standing beside it —
+     the title is then the whole width of the column on both its lines,
+     and the four targets keep their full size. Ranged right, under the
+     text rather than beside its start, so the eye reading the name is not
+     crossing them. On any other row they appear only while it is pointed
+     at or focused, next to a title the reader is already reading, and
+     that is a moment, not a layout. */
+  .threads li.current .tools{flex-basis:100%; justify-content:flex-end}
   /* 28px, not the 17px these were: on touch the current row's tools are
      the only way to act on a thread, and delete sits right beside
      auto-name — a pitch that small makes losing a thread a slip of the
@@ -175,6 +208,11 @@
   .threads .tools button{background:transparent; border:0; color:var(--base01); cursor:pointer;
     min-width:28px; min-height:28px; padding:6px; font-size:13px; line-height:1;
     display:flex; align-items:center; justify-content:center}
+  /* Inline on a row that is merely hovered, where they share the line
+     with the title: smaller, but never under 24px, which is the smallest
+     target a finger can be asked for — and a hovered row is a pointer,
+     which is more accurate than a finger anyway. */
+  .threads li:not(.current) .tools button{min-width:24px; min-height:24px; padding:5px; font-size:12px}
   .threads .tools button:hover{color:var(--base1)}
   .threads .tools button[aria-pressed="true"]{color:var(--blue)}
   /* Every control the sidebar reaches by keyboard says so, inset so the

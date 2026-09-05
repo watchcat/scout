@@ -378,6 +378,13 @@ impl Core {
     }
 
     /// Records a request against an account.
+    /// How many text and photo requests this account has made since
+    /// midnight UTC — the number the daily cap is measured against.
+    pub async fn requests_today(&self, account_id: i64) -> anyhow::Result<i64> {
+        let store = self.store();
+        blocking(move || store.requests_today(account_id)).await
+    }
+
     pub async fn log_request(&self, account_id: i64, kind: &'static str) -> anyhow::Result<()> {
         let store = self.store();
         blocking(move || store.log_request(account_id, kind)).await

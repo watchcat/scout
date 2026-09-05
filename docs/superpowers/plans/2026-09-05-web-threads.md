@@ -1151,6 +1151,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 10: The thread routes
 
+**Status: done in ee2ade2/99fa4f2 plus the fix commit after. Not deployable until Task 13: the client does not yet send `thread`.**
+
 **Files:**
 - Modify: `crates/scout-web/src/routes/chat.rs` — `routes()`, `MessageIn`, `send_message`, new handlers.
 - Test: same file's tests module (helpers `test_app_with_a_round`, `admitted`, `seed_conversation`, `get_with_cookie`, `post_json_with_cookie`, `body_of`, `TEST_KEY`, `DAY` already exist there).
@@ -2035,7 +2037,50 @@ Replace the `resetForm` submit handler body with:
 
 Update the import list at the top of `start()`'s file is not needed — the pure functions are in the same module.
 
-- [ ] **Step 2: Run every test**
+Every one of these `fetch` calls must name the statuses the routes actually
+answer with before it reaches the generic `!res.ok` arm. A bare "Try again"
+is wrong advice for two of the three, and trying again is what makes the
+third worse:
+
+- `404` — the thread is gone, expired or deleted on another tab. `vanished()`
+  already handles it; every thread route can answer it, including `/title`
+  and `/chat/messages`.
+- `422` — the client and the server disagree about the request body. This is
+  what an old page cached in a browser gets from `/chat/messages` after this
+  ships, because it posts no `thread` field and the extractor refuses the
+  body before any handler runs. The notice must say *reload*: retrying sends
+  the same unacceptable body forever.
+- `502` from `/chat/threads/{id}/title` — the model declined to name the
+  thread. Show "Scout could not think of a name. Try again, or rename it
+  yourself." The body is JSON with an `error` key, not an HTML page, and a
+  `429` from the same route means the naming quota is spent — say so rather
+  than showing the model's notice for a request that never reached it.
+
+- [ ] **Step 2: Add the one assertion that can fail here, then run every test**
+
+DOM wiring has no unit test, but the join this whole task exists for does:
+the composer must name the thread it is sending into. Miss it and every
+message goes to whichever thread is newest when the request lands — the
+exact race `MessageIn.thread` was added to close — and the server answers
+`422`, so nothing sends at all and no other test notices. Add to the tests
+module in `crates/scout-web/src/routes/chat.rs`:
+
+```rust
+    #[test]
+    fn the_client_names_the_thread_it_is_sending_into() {
+        // Sliced to the one call, not the file: `thread` appears all over
+        // this client, and a file-wide check would stay green with the
+        // body left as `{ text }`. Lowercased before matching, so it holds
+        // for `sendBody(text, currentThread)` as well as a literal field.
+        let src = include_str!("../chat.js");
+        let start = src.find("fetch('/chat/messages'").expect("the composer must post somewhere");
+        let end = src[start..].find("})").expect("the call must end") + start;
+        assert!(
+            src[start..end].to_lowercase().contains("thread"),
+            "a message that names no thread lands in whichever one is newest"
+        );
+    }
+```
 
 Run: `cargo test -p scout-web && node --test 'crates/scout-web/src/*.test.mjs'`
 Expected: PASS.

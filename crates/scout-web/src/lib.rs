@@ -48,6 +48,14 @@ pub struct AuthState {
     pub core: Arc<Core>,
     pub by_address: Arc<ratelimit::Limiter>,
     pub by_ip: Arc<ratelimit::Limiter>,
+    /// The throttle on things a signed-in account can spend money with.
+    ///
+    /// Keyed on a server-derived account id, so the module's warning about
+    /// limits keyed on a string a stranger typed does not apply here: this
+    /// key comes out of the session cookie, and retyping it means minting a
+    /// signature. It bounds a stuck client or a happy clicker to about a
+    /// hundred and twenty model calls an hour.
+    pub by_account: Arc<ratelimit::Limiter>,
     pub mailer: email::Mailer,
 }
 
@@ -67,6 +75,7 @@ impl AuthState {
             mailer,
             by_address: Arc::new(ratelimit::Limiter::new(3, Duration::from_secs(900))),
             by_ip: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(3600))),
+            by_account: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(300))),
         }
     }
 }

@@ -290,6 +290,9 @@ async fn send_message(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // Before `open_thread`, on purpose: opening bumps a thread to current,
+    // so checking the cap afterwards would let somebody who is capped
+    // reorder their own sidebar by pressing send.
     if let Some(sentence) = scout_core::session::over_daily_cap(&auth.core, account_id).await {
         let (frames, rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = frames.send(Frame::End(End::Error { message: sentence }));
@@ -446,9 +449,26 @@ async fn open_thread(
         Ok(id) => id,
         Err(response) => return response,
     };
+    // Which thread they were on, read before opening changes the answer.
+    // Clicking the row you are already reading is not a switch, and the
+    // client re-opens the current thread on ordinary things — a tap in the
+    // sidebar, the refresh after a delete — so a note for it would be a
+    // line on the phone saying the reader moved to where they already were.
+    let was = match scout_core::session::current_thread(&auth.core, account_id).await {
+        Ok(current) => current.map(|(id, _turns)| id),
+        // Not fatal, and not a reason to refuse the open. An unknown
+        // previous thread is treated as a switch: a note too many is a
+        // smaller failure than an open that errors.
+        Err(e) => {
+            tracing::warn!(error = %e, account_id, "could not tell which thread was open");
+            None
+        }
+    };
     match scout_core::session::open_thread(&auth.core, account_id, id).await {
         Ok(Some(turns)) => {
-            mirror_switch_note(&auth, account_id, id).await;
+            if was != Some(id) {
+                mirror_switch_note(&auth, account_id, id).await;
+            }
             axum::Json(turns).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -544,14 +564,30 @@ async fn suggest_title(
         Ok(id) => id,
         Err(response) => return response,
     };
+    // The one route on this page that spends money per press, and the
+    // press is a click away in a list of rows. Ten in five minutes leaves
+    // an honest reader naming every thread they have and bounds a stuck
+    // client — or a happy clicker — at about a hundred and twenty model
+    // calls an hour.
+    if !auth.by_account.allow(&format!("title:{account_id}")) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
     match scout_core::session::suggest_title(&auth.core, account_id, id).await {
         Ok(Some(title)) => axum::Json(TitleOut { title }).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         // A warning, not an error: the model gave nothing usable, which is
         // a thing models do and not a fault in the machine.
+        //
+        // JSON under a 502, not `sorry()`. This is asked for over `fetch`
+        // and the answer is read by the page, which cannot do anything
+        // with an HTML apology — and a 500 claims the machine broke for a
+        // thing that is the far end declining to name a thread. The
+        // database-shaped failures on the routes above keep `sorry()`,
+        // because those really are the machine.
         Err(e) => {
-            tracing::warn!(error = %e, "could not suggest a title");
-            sorry()
+            tracing::warn!(error = %e, account_id, "could not suggest a title");
+            (StatusCode::BAD_GATEWAY, axum::Json(serde_json::json!({"error": "no title"})))
+                .into_response()
         }
     }
 }
@@ -566,10 +602,14 @@ async fn mirror_switch_note(auth: &AuthState, account_id: i64, conversation_id: 
     let Some(reply_to) = reply_to_for(auth, account_id).await else {
         return;
     };
-    let title = match scout_core::session::threads(&auth.core, account_id).await {
-        Ok(list) => list.into_iter().find(|t| t.id == conversation_id).and_then(|t| t.title),
-        Err(_) => None,
-    };
+    // One row's name, not the whole sidebar. Listing every thread and
+    // then discarding all but one reads and expiry-checks the account's
+    // entire history to render a single line.
+    // A failed read is an unnamed thread here: the note is worth sending
+    // under its generic name, and is not worth failing an open over.
+    let title = scout_core::session::thread_title(&auth.core, account_id, conversation_id)
+        .await
+        .unwrap_or_default();
     let text = format!("── {} ──", title.unwrap_or_else(|| "New thread".to_string()));
     let at = chrono::Utc::now().timestamp();
     if let Err(e) = scout_core::mirror::note(&auth.core, account_id, &reply_to.address, &text, at).await {
@@ -663,7 +703,6 @@ async fn queue_conversation(auth: &AuthState, account_id: i64, conversation_id: 
     }
 }
 
-
 /// Marks the seam between two conversations in the mirrored chat.
 ///
 /// Keyed to the conversation being *closed*, which is what gives it a turn
@@ -673,6 +712,10 @@ async fn queue_conversation(auth: &AuthState, account_id: i64, conversation_id: 
 /// Skipped when that conversation had nothing in it. The second press of
 /// "New thread" closes a thread nobody used, and a divider for that is two
 /// dividers in a row with nothing between them.
+///
+/// Drawn with the same box-drawing rule as the switch note. Two seams in
+/// one chat spelled two different ways read as two different kinds of
+/// thing, and they are not: both say "a thread ended here".
 async fn mirror_divider(auth: &AuthState, account_id: i64) {
     if !matches!(scout_core::mirror::is_enabled(&auth.core, account_id).await, Ok(true)) {
         return;
@@ -690,7 +733,7 @@ async fn mirror_divider(auth: &AuthState, account_id: i64) {
     }
     let seam = vec![scout_api::Turn {
         role: scout_api::Role::Scout,
-        text: "— New thread —".to_string(),
+        text: "── New thread ──".to_string(),
     }];
     if let Err(e) = scout_core::mirror::enqueue(
         &auth.core,
@@ -1560,6 +1603,139 @@ mod tests {
 
         let pending = scout_core::mirror::pending(&core, 10).await.unwrap();
         assert!(pending.iter().any(|p| p.body == "── cheapest beans ──"), "no note about the switch: {pending:?}");
+    }
+
+    #[tokio::test]
+    async fn opening_the_thread_you_are_on_sends_nothing_to_the_phone() {
+        // Clicking the row you are already reading is not a switch, and a
+        // divider for it is a line in the Telegram chat saying the reader
+        // moved to where they already were. The client re-opens the current
+        // thread on ordinary things — a tap in the sidebar, a refresh after
+        // a delete — so this is not a rare case.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        let only = scout_core::session::seed_exchange_for_tests(&core, account_id, "direct", "beans", "three")
+            .await
+            .unwrap();
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        let res = post_json_with_cookie(&app, &format!("/chat/threads/{only}/open"), &cookie, Some(&csrf), "").await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let pending = scout_core::mirror::pending(&core, 10).await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "opening the thread already open announced a switch: {:?}",
+            pending.iter().map(|p| &p.body).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_a_new_thread_from_the_threads_route_marks_the_seam_in_telegram() {
+        // `/chat/reset` is covered; this is the button the sidebar actually
+        // presses, and it is a separate handler — the divider can be
+        // missing from one while the other keeps its test green.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
+        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
+        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        let res = post_json_with_cookie(&app, "/chat/threads", &cookie, Some(&csrf), "").await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
+        assert!(
+            queued.iter().any(|r| r.body == "── New thread ──"),
+            "no seam between two conversations: {:?}",
+            queued.iter().map(|r| &r.body).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_thread_post_refuses_a_request_without_the_csrf_header() {
+        // `someone_elses_thread_is_not_found_on_every_route` proves the
+        // ownership half on every route; this is the other half, on the
+        // account's own thread, where a missing check would actually do
+        // something. Without it any page on the internet can rename, pin
+        // or delete a reader's threads, or spend their model calls.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let mine = scout_core::session::seed_exchange_for_tests(&core, account_id, "direct", "beans", "three")
+            .await
+            .unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+
+        for (path, body) in [
+            ("open", ""),
+            ("rename", r#"{"title":"mine"}"#),
+            ("pin", r#"{"pinned":true}"#),
+            ("delete", ""),
+            ("title", ""),
+        ] {
+            let res =
+                post_json_with_cookie(&app, &format!("/chat/threads/{mine}/{path}"), &cookie, None, body).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{path} answered {}", res.status());
+        }
+        assert_eq!(
+            scout_core::session::transcript(&core, account_id).await.unwrap().len(),
+            2,
+            "a token-less request changed the thread anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_title_the_model_could_not_give_is_a_502_the_page_can_read() {
+        // The client asks for this over `fetch` and shows a notice from
+        // what comes back. `sorry()` answers an HTML apology page under a
+        // 500, which the page cannot read and which says "the machine
+        // broke" for a thing that is a model declining to name a thread.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let mine = scout_core::session::seed_exchange_for_tests(&core, account_id, "direct", "beans", "three")
+            .await
+            .unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        let res =
+            post_json_with_cookie(&app, &format!("/chat/threads/{mine}/title"), &cookie, Some(&csrf), "").await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY, "no model is reachable from a test");
+        let body = body_of(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| panic!("not JSON: {body}"));
+        assert!(json.get("error").is_some(), "the page has nothing to read: {body}");
+    }
+
+    #[tokio::test]
+    async fn the_eleventh_title_request_in_five_minutes_is_refused() {
+        // Every press of ✦ is a model call somebody pays for, and the
+        // button is a click away in a list of threads. A stuck client
+        // retrying, or a reader enjoying themselves, must not be able to
+        // spend without a ceiling.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let mine = scout_core::session::seed_exchange_for_tests(&core, account_id, "direct", "beans", "three")
+            .await
+            .unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+        let uri = format!("/chat/threads/{mine}/title");
+
+        for n in 1..=10 {
+            let res = post_json_with_cookie(&app, &uri, &cookie, Some(&csrf), "").await;
+            assert_ne!(
+                res.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "request {n} of the quota was refused"
+            );
+        }
+        let res = post_json_with_cookie(&app, &uri, &cookie, Some(&csrf), "").await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS, "the eleventh call was paid for");
     }
 
     #[test]

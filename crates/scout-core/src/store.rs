@@ -1432,6 +1432,50 @@ impl Store {
         }
     }
 
+    /// Deletes every unpinned conversation, any scope, idle for longer than
+    /// `older_than_secs`, with its messages. Returns how many conversations
+    /// went.
+    ///
+    /// Also sweeps messages whose conversation is already gone. A run that
+    /// ends after its thread was deleted still writes its messages —
+    /// `replace_messages` inserts regardless — and nothing else would ever
+    /// collect them.
+    pub fn expire_conversations(&self, older_than_secs: i64) -> Result<usize> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<usize> {
+            conn.execute(
+                "DELETE FROM messages WHERE conversation_id IN (
+                     SELECT id FROM conversations
+                     WHERE NOT pinned
+                       AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?))",
+                params![older_than_secs],
+            )?;
+            let gone = conn.execute(
+                "DELETE FROM conversations
+                 WHERE NOT pinned
+                   AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?)",
+                params![older_than_secs],
+            )?;
+            conn.execute(
+                "DELETE FROM messages
+                 WHERE conversation_id NOT IN (SELECT id FROM conversations)",
+                [],
+            )?;
+            Ok(gone)
+        })();
+        match result {
+            Ok(gone) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(gone)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// The last `limit` messages, oldest first — the order a provider wants.
     pub fn conversation_messages(&self, conversation_id: i64, limit: usize) -> Result<Vec<String>> {
         let conn = self.conn();
@@ -5127,5 +5171,51 @@ CREATE TABLE conversations (
         s.set_thread_title(a, id, "renamed").unwrap();
         assert!(!s.set_thread_title_if_missing(id, "third").unwrap());
         assert_eq!(s.thread_title(a, id).unwrap().as_deref(), Some("renamed"));
+    }
+
+    #[test]
+    fn expiry_takes_an_idle_unpinned_thread_and_leaves_a_pinned_or_recent_one() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let idle = s.start_conversation(a, "direct").unwrap();
+        let pinned = s.start_conversation(a, "direct").unwrap();
+        let recent = s.start_conversation(a, "direct").unwrap();
+        let group = s.start_conversation(a, "telegram:-100").unwrap();
+        for id in [idle, pinned, recent, group] {
+            s.replace_messages(id, &["{}".to_string()]).unwrap();
+        }
+        s.set_thread_pinned(a, pinned, true).unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(49 * 3600) WHERE id IN ({idle}, {pinned}, {group});
+                 UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(47 * 3600) WHERE id = {recent};"
+            ))
+            .unwrap();
+
+        let gone = s.expire_conversations(48 * 3600).unwrap();
+
+        assert_eq!(gone, 2, "the idle direct thread and the idle group thread");
+        let left: Vec<i64> = s.threads_of(a).unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(left, vec![pinned, recent]);
+        assert!(s.conversation_messages(idle, 10).unwrap().is_empty(), "messages outlived their thread");
+        assert!(s.conversation_messages(group, 10).unwrap().is_empty(), "the group's messages outlived it");
+        assert_eq!(s.conversation_messages(pinned, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expiry_also_sweeps_messages_whose_thread_is_already_gone() {
+        // A run that finishes after its thread was deleted still writes its
+        // messages: `replace_messages` inserts regardless. Nothing else
+        // would ever collect them.
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let id = s.start_conversation(a, "direct").unwrap();
+        assert!(s.delete_conversation(a, id).unwrap());
+        s.replace_messages(id, &["{}".to_string(), "{}".to_string()]).unwrap();
+        assert_eq!(s.conversation_messages(id, 10).unwrap().len(), 2, "the orphans must exist for this test to mean anything");
+
+        assert_eq!(s.expire_conversations(48 * 3600).unwrap(), 0, "no conversation expired");
+
+        assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "orphaned messages were not swept");
     }
 }

@@ -302,6 +302,68 @@ pub async fn current_thread(
     .await
 }
 
+/// The longest a person may make a title.
+const RENAME_CHARS: usize = 80;
+
+/// The account's threads for the sidebar: pinned first, then by last use,
+/// with `current` on the one `latest_direct` returns.
+pub async fn threads(core: &Core, account_id: i64) -> anyhow::Result<Vec<scout_api::Thread>> {
+    let store = core.store();
+    crate::core::blocking(move || {
+        let current = latest_direct(&store, account_id)?;
+        Ok(store
+            .threads_of(account_id)?
+            .into_iter()
+            .map(|row| scout_api::Thread {
+                current: Some(row.id) == current,
+                id: row.id,
+                title: row.title,
+                pinned: row.pinned,
+                updated_at: row.updated_at,
+            })
+            .collect())
+    })
+    .await
+}
+
+/// Switches to a thread: bumps it to current and returns its transcript.
+/// `None` when the account has no such thread.
+pub async fn open_thread(
+    core: &Core,
+    account_id: i64,
+    conversation_id: i64,
+) -> anyhow::Result<Option<Vec<scout_api::Turn>>> {
+    let store = core.store();
+    crate::core::blocking(move || {
+        if !store.open_conversation(account_id, conversation_id)? {
+            return Ok(None);
+        }
+        Ok(Some(transcript_of(&store, conversation_id)?))
+    })
+    .await
+}
+
+/// A name the person chose. Trimmed, refused when empty, cut at
+/// `RENAME_CHARS`. `false` when the thread is not theirs.
+pub async fn rename(core: &Core, account_id: i64, conversation_id: i64, title: &str) -> anyhow::Result<bool> {
+    let title: String = title.trim().chars().take(RENAME_CHARS).collect();
+    if title.is_empty() {
+        anyhow::bail!("a thread needs a name");
+    }
+    let store = core.store();
+    crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &title)).await
+}
+
+pub async fn set_pinned(core: &Core, account_id: i64, conversation_id: i64, pinned: bool) -> anyhow::Result<bool> {
+    let store = core.store();
+    crate::core::blocking(move || store.set_thread_pinned(account_id, conversation_id, pinned)).await
+}
+
+pub async fn delete_thread(core: &Core, account_id: i64, conversation_id: i64) -> anyhow::Result<bool> {
+    let store = core.store();
+    crate::core::blocking(move || store.delete_conversation(account_id, conversation_id)).await
+}
+
 /// Starts a fresh conversation, discarding whatever thread was live.
 ///
 /// History lives in the store now, so clearing an in-memory slot would clear
@@ -645,6 +707,75 @@ mod tests {
         title_if_missing(&core, id, "only under 20 euro").await;
 
         assert_eq!(store.thread_title(a, id).unwrap().as_deref(), Some("wasmiddel per kilo, bol.com"));
+    }
+
+    async fn threads_core() -> (Core, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.duckdb");
+        let core = Core::start(crate::config::Config::for_test(path.to_str().unwrap()), None).unwrap();
+        (core, dir)
+    }
+
+    #[tokio::test]
+    async fn the_list_marks_exactly_the_thread_telegram_would_continue() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let older = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+        let newer = seed_exchange_for_tests(&core, a, "direct", "hubs", "two").await.unwrap();
+        core.store().set_thread_pinned(a, older, true).unwrap();
+
+        let list = threads(&core, a).await.unwrap();
+
+        // Pinned first in the list, but current is by last use — so the
+        // pinned row is first and the newer row is current.
+        assert_eq!(list.iter().map(|t| t.id).collect::<Vec<_>>(), vec![older, newer]);
+        assert_eq!(list.iter().filter(|t| t.current).count(), 1);
+        assert!(list[1].current);
+        assert_eq!(list[0].title.as_deref(), None, "seeding does not run the agent, so no title");
+    }
+
+    #[tokio::test]
+    async fn opening_a_thread_makes_it_the_one_a_message_continues_and_returns_it() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let older = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+        let _newer = seed_exchange_for_tests(&core, a, "direct", "hubs", "two").await.unwrap();
+
+        let turns = open_thread(&core, a, older).await.unwrap().expect("my own thread");
+
+        assert_eq!(turns[0].text, "beans");
+        assert_eq!(latest_direct(&core.store(), a).unwrap(), Some(older));
+        assert_eq!(open_thread(&core, a, 424242).await.unwrap(), None, "opened nothing");
+    }
+
+    #[tokio::test]
+    async fn rename_pin_and_delete_answer_not_found_for_someone_elses_thread() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let b = core.store().account_for_telegram(22).unwrap();
+        let mine = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+
+        assert!(!rename(&core, b, mine, "theirs").await.unwrap());
+        assert!(!set_pinned(&core, b, mine, true).await.unwrap());
+        assert!(!delete_thread(&core, b, mine).await.unwrap());
+
+        assert!(rename(&core, a, mine, "  beans, cheapest  ").await.unwrap());
+        assert_eq!(core.store().thread_title(a, mine).unwrap().as_deref(), Some("beans, cheapest"));
+        assert!(set_pinned(&core, a, mine, true).await.unwrap());
+        assert!(threads(&core, a).await.unwrap()[0].pinned);
+        assert!(delete_thread(&core, a, mine).await.unwrap());
+        assert!(threads(&core, a).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rename_refuses_an_empty_name_and_cuts_a_long_one() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let mine = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+
+        assert!(rename(&core, a, mine, "   ").await.is_err(), "an empty name is not a name");
+        rename(&core, a, mine, &"x".repeat(100)).await.unwrap();
+        assert_eq!(core.store().thread_title(a, mine).unwrap().unwrap().chars().count(), 80);
     }
 
     #[test]

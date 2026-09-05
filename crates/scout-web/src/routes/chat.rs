@@ -1807,13 +1807,14 @@ mod tests {
             "a clamped title still refuses to wrap, so it can only ever show one line"
         );
 
-        // And on the row where the tools are permanently on screen, they
-        // take a line of their own rather than the title's width.
-        let start = page.find(".threads li.current{").expect("the current row must be styled");
+        // And a row's tools can take a line of their own rather than eat
+        // the title's width — which is what the current row, the one whose
+        // tools are permanently on screen, depends on.
+        let start = page.find(".threads li{").expect("a thread row must be styled");
         let rule = &page[start..start + page[start..].find('}').expect("the rule must end")];
         assert!(
             rule.contains("flex-wrap:wrap"),
-            "the current row cannot drop its tools onto their own line"
+            "a row cannot drop its tools onto their own line"
         );
     }
 

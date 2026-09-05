@@ -131,10 +131,11 @@
   .threads li:hover{background:var(--base02)}
   /* The current row is the one whose tools are permanently on screen, so
      it is the one where four 28px targets and a name were competing for a
-     260px column — and the name lost, down to "Haribo Ho…". Wrapping lets
-     the tools drop to a line of their own beneath the title (see `.tools`
-     below), which is the only way both can be full size. */
-  .threads li.current{background:var(--base02); color:var(--base2); flex-wrap:wrap}
+     260px column — and the name lost, down to "Haribo Ho…". The wrap the
+     rule above already sets lets the tools drop to a line of their own
+     beneath the title (see `.tools` below), which is the only way both can
+     be full size. */
+  .threads li.current{background:var(--base02); color:var(--base2)}
   /* The title is a real `<button>`, so it is reachable by keyboard for
      free — and so it needs the browser's button chrome stripped back to
      the row's own type before anything below can style it.

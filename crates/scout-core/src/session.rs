@@ -130,6 +130,12 @@ pub async fn over_daily_cap(core: &Core, account_id: i64) -> Option<String> {
 /// practice a page shows the thread from its first word — which is the
 /// point. It is a ceiling rather than a promise, so that one pathological
 /// conversation cannot make a page render megabytes.
+///
+/// Rows, not exchanges: at the ~28 rows a tool-heavy run stores — the
+/// question, a dozen-odd tool call/result pairs, the answer — this is
+/// roughly fourteen exchanges. `turns_of` keeps only the text turns, so
+/// what the page shows for a very long thread is its last dozen-or-so
+/// exchanges rather than four hundred bubbles.
 pub(crate) const TRANSCRIPT_CAP: usize = 400;
 
 /// Rewrites a conversation's stored messages to match `history`.
@@ -186,16 +192,20 @@ pub(crate) fn load_history_raw(store: &crate::store::Store, conversation_id: i64
 /// thread no longer than the model's window — the trim drops from the
 /// front, and what it dropped was gone.
 ///
-/// One row more than the cap is read, and that extra row is load-bearing:
-/// `trim_history` returns untouched when it is handed no more than `cap`
-/// messages, so reading exactly `cap` would make the trim a no-op and hand
-/// the model a window opening on an orphaned tool result — the failure this
-/// whole path exists to prevent. Reading `cap + 1` is also what makes "is
-/// this the whole conversation?" answerable: fewer rows came back than were
-/// asked for, so the window starts where the thread does, and a thread
-/// always starts with somebody's question.
+/// The read is wide and the trim is narrow, and that order is the whole
+/// point. `trim_history` takes the newest `cap` and, when they are tool
+/// traffic all the way up with no plain-user head to open on, falls back to
+/// keeping the prose — which is only a good answer if it can see prose. A
+/// run stores the question, a dozen-odd tool call/result pairs and the
+/// answer, so a read of `cap + 1` rows on a thread like that hands the
+/// fallback nothing but tool traffic and one reply: the model was given its
+/// own last answer and never the question that prompted it. Reading
+/// `TRANSCRIPT_CAP` puts the earlier turns back within the fallback's
+/// reach. It also closes a smaller hole — a row that no longer
+/// deserializes used to make the raw read return exactly `cap`, and the
+/// trim skips a history no longer than the cap.
 pub(crate) fn load_history(store: &crate::store::Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
-    let mut history = load_history_raw(store, conversation_id, cap.saturating_add(1))?;
+    let mut history = load_history_raw(store, conversation_id, TRANSCRIPT_CAP)?;
     crate::run::trim_history(&mut history, cap);
     Ok(history)
 }
@@ -990,6 +1000,83 @@ mod tests {
         // the question the trim could not fit.
         let turns = transcript_of(&s, c).unwrap();
         assert_eq!(turns[0].text, "cheapest beans");
+    }
+
+    fn a_tool_call(id: &str) -> LlmMessage {
+        LlmMessage::Assistant {
+            id: None,
+            content: rig::OneOrMany::one(rig::message::AssistantContent::ToolCall(
+                rig::message::ToolCall::new(
+                    id.to_string(),
+                    rig::message::ToolFunction {
+                        name: "web_search".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                ),
+            )),
+        }
+    }
+
+    fn a_tool_result(id: &str) -> LlmMessage {
+        LlmMessage::User {
+            content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(
+                rig::message::ToolResult {
+                    id: id.to_string(),
+                    call_id: None,
+                    content: rig::OneOrMany::one(rig::message::ToolResultContent::text("three shops")),
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn the_model_still_sees_the_question_after_a_thread_of_tool_heavy_runs() {
+        // The window collapsed to a single message on exactly the threads
+        // this bot has: a run stores the question, a dozen-odd tool
+        // call/result pairs, and the answer — about twenty-eight rows. Read
+        // `cap + 1` of those and every row in hand is tool traffic bar the
+        // answer, so `trim_history` finds no plain-user head and its
+        // text-only fallback has only those twenty-one rows to filter: one
+        // assistant message, and the model is handed its own reply with the
+        // question that prompted it nowhere in sight.
+        //
+        // The fix is to read wide and trim narrow. The fallback is a good
+        // answer when it can see the whole log — it keeps the prose, which
+        // is what was asked and what was said — and a useless one when the
+        // log it can see is tool traffic by construction.
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
+
+        for exchange in 0..3 {
+            let mut written = vec![LlmMessage::user(format!("question {exchange}"))];
+            for step in 0..13 {
+                let id = format!("call-{exchange}-{step}");
+                written.push(a_tool_call(&id));
+                written.push(a_tool_result(&id));
+            }
+            written.push(LlmMessage::assistant(format!("answer {exchange}")));
+            append_history(&s, c, &written).unwrap();
+        }
+
+        let window = load_history(&s, c, HISTORY_CAP).unwrap();
+
+        assert!(window.len() <= HISTORY_CAP, "the model was sent {} messages", window.len());
+        let excerpt = last_messages_text(&window, 10);
+        assert!(
+            excerpt.contains("question 2"),
+            "the model never sees the question it is answering (window_len={}): {excerpt:?}",
+            window.len()
+        );
+        assert!(excerpt.contains("answer 2"), "the model lost its own last answer: {excerpt:?}");
+        assert!(
+            matches!(
+                window.first(),
+                Some(LlmMessage::User { content })
+                    if content.iter().all(|p| matches!(p, rig::message::UserContent::Text(_)))
+            ),
+            "the window does not open on something a person said: {window:?}"
+        );
     }
 
     #[test]

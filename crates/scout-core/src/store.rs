@@ -1468,6 +1468,12 @@ impl Store {
     /// `outbox` for an expired thread are not swept — the outbox has no
     /// conversation id — so a mirror message enqueued before expiry may
     /// still arrive.
+    ///
+    /// A pinned thread is skipped here by design and so is bounded by
+    /// nothing this does. `trim_message_logs` is what keeps its log from
+    /// growing forever: age is the wrong measure for a thread whose whole
+    /// point is that it does not age out, so it is capped by row count
+    /// instead.
     pub fn expire_conversations(&self, older_than_secs: i64, except: &[i64]) -> Result<usize> {
         // DuckDB's bindings have no array parameter, so `IN` gets one `?`
         // per id and the ids ride in the parameter list next to
@@ -1527,6 +1533,34 @@ impl Store {
                 Err(e)
             }
         }
+    }
+
+    /// Drops every conversation's rows beyond its newest `keep`. Returns
+    /// how many rows went.
+    ///
+    /// The `messages` table is a full log now — a run appends what it added
+    /// and nothing trims it back — and `expire_conversations` spares pinned
+    /// threads, which leaves one thread a person keeps forever as a table
+    /// that only ever grows. This is the ceiling on it: a cap by row count
+    /// rather than by age, because a pinned thread's whole point is that it
+    /// does not age out.
+    ///
+    /// Per conversation, not overall: one busy thread must not evict a
+    /// quiet one's history. The cut is by `position`, the same order a read
+    /// comes back in, so what survives is the newest end of each log.
+    pub fn trim_message_logs(&self, keep: usize) -> Result<usize> {
+        let conn = self.conn();
+        Ok(conn.execute(
+            "DELETE FROM messages WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, row_number() OVER (
+                         PARTITION BY conversation_id ORDER BY position DESC
+                     ) AS rn
+                     FROM messages
+                 ) WHERE rn > ?
+             )",
+            params![keep as i64],
+        )?)
     }
 
     /// The last `limit` messages, oldest first — the order a provider wants.
@@ -3488,6 +3522,37 @@ CREATE TABLE segment_candidates (
         assert_eq!(last_three.len(), 3);
         assert!(last_three[0].contains(r#""n":2"#), "the window is not the newest three: {last_three:?}");
         assert!(last_three[2].contains(r#""n":4"#));
+    }
+
+    #[test]
+    fn a_log_past_the_cap_loses_its_oldest_rows_and_a_short_one_loses_nothing() {
+        // A pinned thread is exempt from the 48-hour sweep, so nothing else
+        // ever bounds its log — and the log holds every tool call and
+        // result a run made, not just what was said.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let long = s.start_conversation(a, "direct").unwrap();
+        let short = s.start_conversation(a, "telegram:-100").unwrap();
+
+        let bodies: Vec<String> = (0..2005).map(|i| format!(r#"{{"n":{i}}}"#)).collect();
+        s.append_messages(long, &bodies).unwrap();
+        s.append_messages(short, &bodies[..10]).unwrap();
+
+        assert_eq!(s.trim_message_logs(2000).unwrap(), 5, "the cut is not the overflow");
+
+        // The newest 2000, still in order: the oldest five went, and the
+        // thread reads from `n:5` onward rather than coming back shuffled.
+        let kept = s.conversation_messages(long, 5000).unwrap();
+        assert_eq!(kept.len(), 2000);
+        assert!(kept[0].contains(r#""n":5"#), "the wrong end was cut: {:?}", &kept[..3]);
+        assert!(kept[1999].contains(r#""n":2004"#), "the newest row went");
+
+        // Per conversation: the quiet thread is not touched by the busy
+        // one's overflow.
+        assert_eq!(s.conversation_messages(short, 5000).unwrap().len(), 10);
+
+        // And a second pass has nothing left to do.
+        assert_eq!(s.trim_message_logs(2000).unwrap(), 0);
     }
 
     #[test]

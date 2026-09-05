@@ -10,6 +10,13 @@ pub struct Config {
     /// whoever set the bot up; `SCOUT_ADMIN_USER_IDS` overrides that.
     pub admin_user_ids: HashSet<i64>,
     pub minimax_api_key: String,
+    /// Where the OpenAI-shaped model API lives. Configurable because a
+    /// self-hoster may front MiniMax with a proxy of their own — a gateway
+    /// that meters spend, or an in-house deployment — and because the
+    /// tests need an address that refuses instead of one that answers:
+    /// `for_test` points it at a closed port so no packet leaves the
+    /// machine. Defaults to MiniMax itself.
+    pub minimax_base_url: String,
     pub kagi_api_key: String,
     /// Perplexity Search API key; without it search runs on Kagi alone.
     pub perplexity_api_key: Option<String>,
@@ -53,12 +60,17 @@ impl Config {
 
     /// A Config with only the four required variables set and the database
     /// somewhere temporary. Mirrors `base_env()` in this module's tests.
+    ///
+    /// The model endpoint is a port nothing listens on, so anything that
+    /// reaches for the model under test fails at once with a connection
+    /// error and no packet leaves the machine.
     #[cfg(test)]
     pub fn for_test(db_path: &str) -> Self {
         Self::from_lookup(|k| match k {
             "TELEGRAM_BOT_TOKEN" => Some("tok".to_string()),
             "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
             "MINIMAX_API_KEY" => Some("mk".to_string()),
+            "MINIMAX_BASE_URL" => Some("http://127.0.0.1:1".to_string()),
             "KAGI_API_KEY" => Some("kk".to_string()),
             "SCOUT_DB_PATH" => Some(db_path.to_string()),
             _ => None,
@@ -157,6 +169,8 @@ impl Config {
             allowed_user_ids,
             admin_user_ids,
             minimax_api_key: required("MINIMAX_API_KEY")?,
+            minimax_base_url: non_empty("MINIMAX_BASE_URL")
+                .unwrap_or_else(|| crate::agent::MINIMAX_BASE_URL.to_string()),
             kagi_api_key: required("KAGI_API_KEY")?,
             perplexity_api_key: non_empty("PERPLEXITY_API_KEY"),
             db_path: get("SCOUT_DB_PATH").unwrap_or_else(|| "scout.duckdb".to_string()),
@@ -256,6 +270,26 @@ mod tests {
         let mut env = base_env();
         env.insert("ALLOWED_TELEGRAM_USER_IDS", "111,abc");
         assert!(load(&env).is_err());
+    }
+
+    #[test]
+    fn the_model_endpoint_defaults_to_minimax_and_can_be_pointed_elsewhere() {
+        assert_eq!(
+            load(&base_env()).unwrap().minimax_base_url,
+            crate::agent::MINIMAX_BASE_URL
+        );
+
+        let mut env = base_env();
+        env.insert("MINIMAX_BASE_URL", "http://127.0.0.1:1");
+        assert_eq!(load(&env).unwrap().minimax_base_url, "http://127.0.0.1:1");
+
+        // Blank counts as unset, like every other optional here — an empty
+        // line in a .env must not point the agent at nowhere.
+        env.insert("MINIMAX_BASE_URL", "  ");
+        assert_eq!(
+            load(&env).unwrap().minimax_base_url,
+            crate::agent::MINIMAX_BASE_URL
+        );
     }
 
     #[test]

@@ -302,6 +302,295 @@ pub async fn current_thread(
     .await
 }
 
+/// Which thread is current, without reading what is in it.
+///
+/// `current_thread` answers the same question, but it loads and shapes the
+/// whole transcript to do it — so a caller that only wants to compare one
+/// id against another pays for every turn of a long conversation to throw
+/// them all away. The switch note is exactly that caller.
+pub async fn current_thread_id(core: &Core, account_id: i64) -> anyhow::Result<Option<i64>> {
+    let store = core.store();
+    crate::core::blocking(move || latest_direct(&store, account_id)).await
+}
+
+/// The longest a person may make a title.
+const RENAME_CHARS: usize = 80;
+
+/// The account's threads for the sidebar: pinned first, then by last use,
+/// with `current` on the one `latest_direct` returns.
+///
+/// The two reads are separate statements, not one transaction, so a thread
+/// can vanish between them — a caller must tolerate a list with no `current`
+/// row rather than assume exactly one is always marked.
+pub async fn threads(core: &Core, account_id: i64) -> anyhow::Result<Vec<scout_api::Thread>> {
+    let store = core.store();
+    crate::core::blocking(move || {
+        let current = latest_direct(&store, account_id)?;
+        Ok(store
+            .threads_of(account_id)?
+            .into_iter()
+            .map(|row| scout_api::Thread {
+                current: Some(row.id) == current,
+                id: row.id,
+                title: row.title,
+                pinned: row.pinned,
+                updated_at: row.updated_at,
+            })
+            .collect())
+    })
+    .await
+}
+
+/// One thread's name, for a caller that wants the name and not the list.
+pub async fn thread_title(
+    core: &Core,
+    account_id: i64,
+    conversation_id: i64,
+) -> anyhow::Result<Option<String>> {
+    let store = core.store();
+    crate::core::blocking(move || store.thread_title(account_id, conversation_id)).await
+}
+
+/// Switches to a thread: bumps it to current and returns its transcript.
+/// `None` when the account has no such thread.
+pub async fn open_thread(
+    core: &Core,
+    account_id: i64,
+    conversation_id: i64,
+) -> anyhow::Result<Option<Vec<scout_api::Turn>>> {
+    let store = core.store();
+    crate::core::blocking(move || {
+        if !store.open_conversation(account_id, conversation_id)? {
+            return Ok(None);
+        }
+        Ok(Some(transcript_of(&store, conversation_id)?))
+    })
+    .await
+}
+
+/// What a rename did. A blank name is refused as an outcome rather than an
+/// error, so the caller can tell "not a name" from "the database failed"
+/// without parsing a message — and so the rule lives here, once, rather
+/// than in every route that calls this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renamed {
+    Done,
+    NotFound,
+    Blank,
+}
+
+/// A name the person chose. Trimmed, stripped of layout characters, cut at
+/// `RENAME_CHARS`, and the cut itself is silent — no ellipsis, because a
+/// name a person typed should not grow punctuation it never had. A caller
+/// that shows the name back to the person after a cut must re-read it
+/// rather than echo what it sent.
+///
+/// The strip happens before the cut so the budget is spent on characters
+/// that are actually shown, and it happens at all because a name that
+/// arrives over HTTP is no more trustworthy than one a model wrote — the
+/// same bidi override that would flip a suggested title flips a typed one.
+pub async fn rename(core: &Core, account_id: i64, conversation_id: i64, title: &str) -> anyhow::Result<Renamed> {
+    let title: String = strip_layout_chars(title.trim())
+        .chars()
+        .take(RENAME_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    if title.is_empty() {
+        return Ok(Renamed::Blank);
+    }
+    let store = core.store();
+    let done = crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &title)).await?;
+    Ok(if done { Renamed::Done } else { Renamed::NotFound })
+}
+
+/// Permanent: exempt from expiry. Nothing else.
+pub async fn set_pinned(core: &Core, account_id: i64, conversation_id: i64, pinned: bool) -> anyhow::Result<bool> {
+    let store = core.store();
+    crate::core::blocking(move || store.set_thread_pinned(account_id, conversation_id, pinned)).await
+}
+
+/// See `Store::delete_conversation` for what this deliberately leaves
+/// behind: a mirror row already queued in the outbox is not swept.
+pub async fn delete_thread(core: &Core, account_id: i64, conversation_id: i64) -> anyhow::Result<bool> {
+    let store = core.store();
+    crate::core::blocking(move || store.delete_conversation(account_id, conversation_id)).await
+}
+
+/// Drops a leading list marker (`1. `, `1) `, `- `, `* `, `• `), which is
+/// how a model that was asked for one title answers with a list of one.
+fn strip_list_marker(line: &str) -> &str {
+    for bullet in ["- ", "* ", "• "] {
+        if let Some(rest) = line.strip_prefix(bullet) {
+            return rest.trim_start();
+        }
+    }
+    // At most two digits: a list a model writes never reaches a hundred
+    // items, and a longer run is the title itself — "2024. Year in review"
+    // is a name, not the two-thousand-and-twenty-fourth bullet.
+    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+    if (1..=2).contains(&digits) {
+        let rest = &line[digits..];
+        if let Some(rest) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            return rest.trim_start();
+        }
+    }
+    line
+}
+
+/// Drops a leading `Title:`, in any case and with markdown bold around it,
+/// which the preamble asks for but a model volunteers anyway.
+fn strip_title_label(line: &str) -> &str {
+    let rest = line.strip_prefix("**").unwrap_or(line);
+    let Some(after) = rest.to_ascii_lowercase().strip_prefix("title:").map(str::len) else {
+        return line;
+    };
+    let rest = &rest[rest.len() - after..];
+    rest.strip_prefix("**").unwrap_or(rest).trim()
+}
+
+/// Drops the markdown a model dresses a title in when it forgets it was
+/// asked for plain text: a leading `#` run from a heading, and a symmetric
+/// emphasis wrap. Symmetric on purpose — `*` alone at the front is a bullet
+/// `strip_list_marker` already took, and an unmatched one is punctuation
+/// inside the name, not decoration around it.
+fn strip_markdown(line: &str) -> &str {
+    let line = line.trim_start_matches('#').trim_start();
+    for wrap in ["**", "__", "*", "_"] {
+        if let Some(inner) = line.strip_prefix(wrap).and_then(|l| l.strip_suffix(wrap)) {
+            return inner.trim();
+        }
+    }
+    line
+}
+
+/// What the model said, made fit for a sidebar: the answer line, a leading
+/// list marker, a leading "Title:", markdown decoration and wrapping quotes
+/// dropped, trailing punctuation dropped, layout characters filtered out,
+/// cut at `RENAME_CHARS` with no trailing space left by the cut. `None`
+/// when nothing is left.
+///
+/// The answer line is the first non-empty one, unless — once its marker and
+/// label are off — it is empty or ends in a colon and another line follows.
+/// Then it was the preamble to the answer, not the answer.
+///
+/// Quotes are stripped on both sides of the punctuation pass, because the
+/// two orders each leave one real answer intact: `'A title'.` keeps its
+/// closing quote if quotes go first, and `"A title."` keeps its full stop
+/// if punctuation does.
+pub fn clean_title(raw: &str) -> Option<String> {
+    let quote = |c: char| matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’');
+    let text = crate::text::strip_thinking(raw);
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    // "Here is a title for your conversation:" is the announcement, not the
+    // answer — a line that ends in a colon with another line behind it is
+    // the model clearing its throat. The markers come off first, because a
+    // line that is nothing but `**Title:**` only looks like an answer until
+    // the label is gone.
+    let first = strip_title_label(strip_list_marker(lines.next()?));
+    let line = if first.is_empty() || first.ends_with(':') {
+        lines
+            .next()
+            .map(|l| strip_title_label(strip_list_marker(l)))
+            .unwrap_or(first)
+    } else {
+        first
+    };
+    let line = strip_markdown(line);
+    let line = line.trim_matches(quote);
+    let line = line.trim_end_matches(['.', '!', '?', ':']);
+    let line = line.trim_matches(quote);
+    let cleaned = strip_layout_chars(line.trim())
+        .chars()
+        .take(RENAME_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// A character a sidebar row must never carry: a control character, a line
+/// or paragraph separator, one of the bidi overrides and isolates, which
+/// can make a title render as something other than what it says — and,
+/// unclosed, drag the row after it along too — or one of the invisibles
+/// (zero-width space and joiners, the RTL/LTR marks, the byte-order mark,
+/// the soft hyphen) that leave a name looking like one thing and matching
+/// another.
+fn is_layout_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{00AD}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}' | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}')
+}
+
+/// The one rule about what a title may contain, for all three ways a thread
+/// gets named: the model's suggestion, the name a person types, and the cut
+/// of a first message.
+///
+/// A layout character that is also whitespace — a newline, a tab, a line
+/// separator — becomes a space rather than nothing. Dropping it would weld
+/// the words on either side together, which is a worse title than the one
+/// the character was hiding in.
+fn strip_layout_chars(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| match (is_layout_char(c), c.is_whitespace()) {
+            (false, _) => Some(c),
+            (true, true) => Some(' '),
+            (true, false) => None,
+        })
+        .collect()
+}
+
+/// Asks the model for a name and stores it. `None` when the thread is not
+/// the account's, has nothing in it to name, or went away while the model
+/// was thinking. An unusable answer is an error the caller reports; the old
+/// title stays.
+///
+/// The thread is read, not opened: naming an old sidebar row must not make
+/// it the thread Telegram continues, which is what `open_thread` would do.
+pub async fn suggest_title(core: &Core, account_id: i64, conversation_id: i64) -> anyhow::Result<Option<String>> {
+    let store = core.store();
+    let Some(turns) = crate::core::blocking(move || {
+        if !store.owns_thread(account_id, conversation_id)? {
+            return Ok(None);
+        }
+        Ok(Some(transcript_of(&store, conversation_id)?))
+    })
+    .await?
+    else {
+        return Ok(None);
+    };
+    if turns.is_empty() {
+        return Ok(None);
+    }
+    let text: String = turns
+        .iter()
+        .take(6)
+        .map(|t| {
+            let who = match t.role {
+                scout_api::Role::You => "user",
+                scout_api::Role::Scout => "scout",
+            };
+            format!("{who}: {}", t.text.chars().take(400).collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let raw = crate::agent::title_for(&core.deps.llm, &text).await?;
+    let Some(title) = clean_title(&raw) else {
+        anyhow::bail!("the model gave no usable title");
+    };
+    let store = core.store();
+    let written = title.clone();
+    // The thread can be deleted while the model is thinking; then nothing
+    // was named, and saying otherwise would put a title on a gone row.
+    let stored = crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &written)).await?;
+    Ok(stored.then_some(title))
+}
+
 /// Starts a fresh conversation, discarding whatever thread was live.
 ///
 /// History lives in the store now, so clearing an in-memory slot would clear
@@ -340,6 +629,49 @@ pub async fn seed_exchange_for_tests(
         Ok(id)
     })
     .await
+}
+
+/// How many characters of a first message become the thread's name.
+const TITLE_CHARS: usize = 40;
+
+/// The automatic name: the first message, whitespace collapsed to single
+/// spaces, cut at `TITLE_CHARS` chars, not grapheme clusters, with an
+/// ellipsis when cut. A flag emoji built from two code points can be split
+/// at the cut; the cut is on a char boundary, so the result is still valid
+/// text, and a title is a label, not a rendering.
+///
+/// Layout characters go first, before the collapse, so the space a stripped
+/// newline leaves behind is collapsed with the rest rather than surviving
+/// as a double space.
+pub fn first_message_title(text: &str) -> String {
+    let text = strip_layout_chars(text);
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = one_line.chars();
+    let head: String = chars.by_ref().take(TITLE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// Names a thread after its first answer, unless it already has a name.
+///
+/// Called by `run_agent` after a successful save, only when the run carries
+/// the person's own words (`RunContext::title_source`). The prompt is never
+/// the source: on Telegram the prompt carries a system note the person
+/// never wrote, and a title cut from it would read as one. Failure is
+/// logged, not returned: a missing title is not worth failing an answer
+/// that is already written.
+pub async fn title_if_missing(core: &Core, conversation_id: i64, source: &str) {
+    let title = first_message_title(source);
+    if title.is_empty() {
+        return;
+    }
+    let store = core.store();
+    if let Err(e) = crate::core::blocking(move || store.set_thread_title_if_missing(conversation_id, &title)).await {
+        tracing::warn!(error = %e, conversation_id, "could not name the thread");
+    }
 }
 
 #[cfg(test)]
@@ -577,6 +909,201 @@ mod tests {
             !turns.iter().any(|t| t.text.contains("<think>")),
             "reasoning reached the page: {turns:?}"
         );
+    }
+
+    #[test]
+    fn a_title_is_the_first_message_on_one_line_cut_at_forty_characters() {
+        assert_eq!(first_message_title("cheapest OneBlade cartridges"), "cheapest OneBlade cartridges");
+        assert_eq!(
+            first_message_title("  find me   the\ncheapest\n\nPhilips OneBlade replacement cartridges please "),
+            "find me the cheapest Philips OneBlade re…"
+        );
+        // Cut on a character boundary, never inside one.
+        assert_eq!(first_message_title(&"ë".repeat(50)), format!("{}…", "ë".repeat(40)));
+        assert_eq!(first_message_title("   "), "");
+        // The boundary itself: exactly forty is not cut, forty-one is.
+        assert_eq!(first_message_title(&"a".repeat(40)), "a".repeat(40));
+        assert_eq!(first_message_title(&"a".repeat(41)), format!("{}…", "a".repeat(40)));
+        // The automatic name obeys the same rule as the other two: a title
+        // cut from a message carries no character that would make the row
+        // read as something the message did not say.
+        assert_eq!(first_message_title("Be\u{202E}ans"), "Beans");
+    }
+
+    #[tokio::test]
+    async fn the_first_answer_names_the_thread_and_the_second_does_not_rename_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("titles.duckdb");
+        let core = Core::start(crate::config::Config::for_test(path.to_str().unwrap()), None).unwrap();
+        let store = core.store();
+        let a = store.account_for_telegram(11).unwrap();
+        let id = store.start_conversation(a, "direct").unwrap();
+
+        title_if_missing(&core, id, "wasmiddel per kilo, bol.com").await;
+        title_if_missing(&core, id, "only under 20 euro").await;
+
+        assert_eq!(store.thread_title(a, id).unwrap().as_deref(), Some("wasmiddel per kilo, bol.com"));
+    }
+
+    async fn threads_core() -> (Core, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.duckdb");
+        let core = Core::start(crate::config::Config::for_test(path.to_str().unwrap()), None).unwrap();
+        (core, dir)
+    }
+
+    #[tokio::test]
+    async fn the_list_marks_exactly_the_thread_telegram_would_continue() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let older = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+        let newer = seed_exchange_for_tests(&core, a, "direct", "hubs", "two").await.unwrap();
+        core.store().set_thread_pinned(a, older, true).unwrap();
+        core.store().open_conversation(a, newer).unwrap(); // used last, not merely inserted last
+
+        let list = threads(&core, a).await.unwrap();
+
+        // Pinned first in the list, but current is by last use — so the
+        // pinned row is first and the newer row is current.
+        assert_eq!(list.iter().map(|t| t.id).collect::<Vec<_>>(), vec![older, newer]);
+        assert_eq!(list.iter().filter(|t| t.current).count(), 1);
+        assert!(list[1].current);
+        assert_eq!(list[0].title.as_deref(), None, "seeding does not run the agent, so no title");
+    }
+
+    #[tokio::test]
+    async fn opening_a_thread_makes_it_the_one_a_message_continues_and_returns_it() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let older = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+        let _newer = seed_exchange_for_tests(&core, a, "direct", "hubs", "two").await.unwrap();
+
+        let turns = open_thread(&core, a, older).await.unwrap().expect("my own thread");
+
+        assert_eq!(turns[0].text, "beans");
+        assert_eq!(latest_direct(&core.store(), a).unwrap(), Some(older));
+        assert_eq!(open_thread(&core, a, 424242).await.unwrap(), None, "opened nothing");
+    }
+
+    #[tokio::test]
+    async fn opening_a_thread_that_has_no_messages_yet_returns_an_empty_transcript() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let id = reset(&core, a, "direct").await.unwrap();
+
+        assert_eq!(open_thread(&core, a, id).await.unwrap(), Some(vec![]));
+        assert_eq!(suggest_title(&core, a, id).await.unwrap(), None, "an empty thread must not reach the model");
+    }
+
+    #[tokio::test]
+    async fn rename_pin_and_delete_answer_not_found_for_someone_elses_thread() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let b = core.store().account_for_telegram(22).unwrap();
+        let mine = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+
+        assert_eq!(rename(&core, b, mine, "theirs").await.unwrap(), Renamed::NotFound);
+        assert!(!set_pinned(&core, b, mine, true).await.unwrap());
+        assert!(!delete_thread(&core, b, mine).await.unwrap());
+
+        assert_eq!(rename(&core, a, mine, "  beans, cheapest  ").await.unwrap(), Renamed::Done);
+        assert_eq!(core.store().thread_title(a, mine).unwrap().as_deref(), Some("beans, cheapest"));
+        assert!(set_pinned(&core, a, mine, true).await.unwrap());
+        assert!(threads(&core, a).await.unwrap()[0].pinned);
+        assert!(set_pinned(&core, a, mine, false).await.unwrap());
+        assert!(!threads(&core, a).await.unwrap()[0].pinned, "an unpin that fails makes a thread immortal");
+        assert!(delete_thread(&core, a, mine).await.unwrap());
+        assert!(threads(&core, a).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rename_refuses_an_empty_name_and_cuts_a_long_one() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let mine = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+
+        assert_eq!(rename(&core, a, mine, "   ").await.unwrap(), Renamed::Blank, "an empty name is not a name");
+        rename(&core, a, mine, &"x".repeat(100)).await.unwrap();
+        assert_eq!(core.store().thread_title(a, mine).unwrap().unwrap().chars().count(), 80);
+
+        // A name typed into a browser gets the same rule as one a model
+        // wrote: a bidi override in a sidebar row is no less a lie for
+        // having arrived over HTTP.
+        rename(&core, a, mine, "Be\u{202E}ans").await.unwrap();
+        assert_eq!(core.store().thread_title(a, mine).unwrap().as_deref(), Some("Beans"));
+    }
+
+    #[test]
+    fn a_suggested_title_is_one_line_without_quotes_and_never_empty() {
+        assert_eq!(clean_title("\"Cheapest OneBlade cartridges\"\n"), Some("Cheapest OneBlade cartridges".to_string()));
+        assert_eq!(clean_title("Title: 'AMS to LIS in October'."), Some("AMS to LIS in October".to_string()));
+        assert_eq!(clean_title("<think>hmm</think>Wasmiddel per kilo"), Some("Wasmiddel per kilo".to_string()));
+        assert_eq!(clean_title("   "), None);
+        // A chatty model announces the title on the line before it.
+        assert_eq!(
+            clean_title("Sure! Here is a title for your conversation:\nBeans, cheapest"),
+            Some("Beans, cheapest".to_string())
+        );
+        assert_eq!(clean_title("**Title:** Beans"), Some("Beans".to_string()));
+        // The label can be the whole line, and then the answer is the next
+        // one — which it only looks like once the label is off.
+        assert_eq!(clean_title("**Title:**\nBeans"), Some("Beans".to_string()));
+        assert_eq!(
+            clean_title("1. Cheapest OneBlade cartridges"),
+            Some("Cheapest OneBlade cartridges".to_string())
+        );
+        // Two digits is a list; four is a year the title starts with.
+        assert_eq!(clean_title("2024. Year in review"), Some("2024. Year in review".to_string()));
+        // Markdown is decoration, not part of the name.
+        assert_eq!(clean_title("**Beans, cheapest**"), Some("Beans, cheapest".to_string()));
+        assert_eq!(clean_title("Here is your title:\n\n**Beans**"), Some("Beans".to_string()));
+        assert_eq!(clean_title("### Beans"), Some("Beans".to_string()));
+        // A title is one line of plain text: no control characters, no
+        // bidi override to make a sidebar row read backwards, and no
+        // invisible that leaves a name looking like another one.
+        assert_eq!(clean_title("Beans\u{202E}cheapest\r"), Some("Beanscheapest".to_string()));
+        assert_eq!(clean_title("Bea\u{200B}ns"), Some("Beans".to_string()));
+        // The cut is at `RENAME_CHARS` and never leaves a trailing space:
+        // "word " is five characters, so the cut lands on the space after
+        // the sixteenth word and the trim takes it back off.
+        let long = clean_title(&"word ".repeat(30)).unwrap();
+        assert_eq!(long.chars().count(), 79);
+    }
+
+    #[tokio::test]
+    async fn suggesting_a_title_for_someone_elses_thread_asks_nobody_and_finds_nothing() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let b = core.store().account_for_telegram(22).unwrap();
+        let mine = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+        // No model is reachable in tests; reaching one would be an error,
+        // not `None`, so `None` proves the check ran first.
+        assert_eq!(suggest_title(&core, b, mine).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn suggesting_a_title_does_not_make_the_thread_current() {
+        // Pressing "name this" on an old sidebar row names it. It must not
+        // also make it the thread Telegram continues — the person did not
+        // switch threads, they asked for a label.
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let older = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+        let newer = seed_exchange_for_tests(&core, a, "direct", "hubs", "two").await.unwrap();
+        core.store().open_conversation(a, newer).unwrap();
+        assert_eq!(latest_direct(&core.store(), a).unwrap(), Some(newer));
+
+        // No model is reachable in tests, so this ends in an error — after
+        // the read that used to bump the thread. Asserting the error is
+        // what keeps the test honest: an ownership check that silently
+        // returned `None` would never reach the read, and the assertion
+        // below would pass for the wrong reason.
+        assert!(
+            suggest_title(&core, a, older).await.is_err(),
+            "the call must have reached the model"
+        );
+
+        assert_eq!(latest_direct(&core.store(), a).unwrap(), Some(newer), "naming a thread switched to it");
     }
 
     #[test]

@@ -146,6 +146,11 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   memory, so a deploy or a crash no longer costs you the thread. Scout was
   restarted 24 times in 20 minutes once when Telegram's API went quiet, and
   every conversation in flight went with it. That no longer costs anything
+- **Threads, in the browser.** The web chat lists your conversations; switch
+  between them and each keeps its own context, and the thread you last used
+  is the one your Telegram chat continues. A thread nobody touches for two
+  days is deleted — pin it from the web and it stays until you delete it
+  yourself
 - **You are an account, not a Telegram id.** A Telegram login is one identity
   pointing at an account, which is what will let the same purchase history,
   trips and profile answer to a web login later without a second copy of you
@@ -235,6 +240,7 @@ compiles from source.
 | `SCOUT_ADMIN_USER_IDS` | no | first allowed id | who sees everyone's numbers in `/stat` and may run `/advert`, `/invite` and `/kick`; everyone else sees only their own |
 | `INVITE_DAILY_REQUESTS` | no | `20` | messages per day for someone admitted through `/invite`. Founders are exempt |
 | `MINIMAX_API_KEY` | **yes** | — | the LLM |
+| `MINIMAX_BASE_URL` | no | `https://api.minimax.io/v1` | where the OpenAI-shaped model API lives; point it at a proxy of your own |
 | `KAGI_API_KEY` | **yes** | — | search: small-retailer coverage, `site:` scoping |
 | `PERPLEXITY_API_KEY` | no | — | second engine, merged with Kagi; carries the multi-language fan-out cheaply |
 | `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` | no | — | eBay Browse API: live prices, condition, shipping |
@@ -333,23 +339,25 @@ Telegram ──► bot.rs ──► core ──► rig agent ──────�
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **446 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **728 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,
 and the row counts were compared either side.
 
 That middle arrow is a crate boundary, not a convention. Scout is a cargo
-workspace of three:
+workspace of four:
 
 ```
-scout-core       21,800 lines  the agent, the tools, the database — everything
+scout-core       27,000 lines  the agent, the tools, the database — everything
                                that answers a question, and nothing that knows
                                who asked
-scout-telegram    2,400 lines  teloxide, streaming into one edited message,
+scout-telegram    3,100 lines  teloxide, streaming into one edited message,
                                chunking, flood control, delivery
-scout-api           100 lines  the events core emits and a channel renders,
+scout-api           300 lines  the events core emits and a channel renders,
                                so the two cannot disagree about what one is
+scout-web         6,700 lines  the website and the browser chat: sign-in, the
+                               thread list, streaming into the page
 ```
 
 `scout-core` does not export its store. The adapter cannot open a database,
@@ -367,7 +375,7 @@ That is what makes the second front end cheap. A web app talks to the same
 core, and neither side can reach around the other, because the crate graph
 will not compile it.
 
-Roughly 24,300 lines of Rust across 39 focused modules.
+Roughly 37,100 lines of Rust across 60 focused modules.
 
 ---
 
@@ -433,7 +441,7 @@ Roughly 24,300 lines of Rust across 39 focused modules.
 ## Development
 
 ```bash
-cargo test --workspace      # 559 tests across four crates, no network
+cargo test --workspace      # 728 tests across four crates, no network
 node --test 'crates/scout-web/src/*.test.mjs'  # the chat client's own tests
 cargo clippy --workspace --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs

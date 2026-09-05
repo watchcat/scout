@@ -20,6 +20,8 @@
 
 ### Task 1: Two columns on `conversations`
 
+**Status: done in ea84cd1 and the fix commit after it; the text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-core/src/store.rs` — `MIGRATIONS` (the `conversations` table near line 219), the `steps()` list near line 698, a new `STEP_7_THREADS` const beside `STEP_6_LOGIN_TOKENS`.
 - Test: `crates/scout-core/src/store.rs` tests module (append before the final `}`).
@@ -38,7 +40,7 @@ Append inside `mod tests` in `store.rs`:
                 |r| r.get(0),
             )
             .unwrap();
-        n == 1
+        n > 0
     }
 
     #[test]
@@ -60,7 +62,7 @@ Append inside `mod tests` in `store.rs`:
         let s = Store::open(&db).unwrap();
         // Step 6 was the last one before this; a database that stops there
         // is exactly the production file.
-        assert!(s.schema_version().unwrap() >= 7, "step 7 did not run");
+        assert_eq!(s.schema_version().unwrap(), 8, "the threads steps did not run");
         let a = s.account_for_telegram(11).unwrap();
         let id = s.start_conversation(a, "direct").unwrap();
         let conn = s.conn();
@@ -87,30 +89,53 @@ CREATE TABLE IF NOT EXISTS conversations (
     account_id    BIGINT NOT NULL,
     scope         TEXT NOT NULL,
     pending_draft TEXT,
+    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    -- Last two, so a fresh database and a migrated one — where these
+    -- arrive by ALTER TABLE in step 7 — have the same column order.
     -- What the sidebar calls it. Null until the first answer lands; then
     -- the first message trimmed, unless someone renamed it. See the
     -- threads design doc.
     title         TEXT,
     -- "Permanent": exempt from the 48-hour expiry. Nothing else.
-    pinned        BOOLEAN NOT NULL DEFAULT false,
-    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
-    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+    pinned        BOOLEAN NOT NULL DEFAULT false
 );
 ```
 
 Below `STEP_6_LOGIN_TOKENS` add:
 
 ```rust
-/// Threads in the browser: a name and a pin. `IF NOT EXISTS` so a database
-/// created by `MIGRATIONS` after this shipped, but somehow recorded at 6,
-/// is not broken by the step.
+/// Threads in the browser: a name and a pin.
+///
+/// The `pinned` column is added bare, backfilled and given its default
+/// here, and made NOT NULL in step 8 — a separate step because DuckDB
+/// refuses `SET NOT NULL` in a transaction that has already touched the
+/// table's rows, and the `ADD COLUMN` in this one counts. `apply_steps`
+/// runs each step in its own transaction, so a separate step is what a
+/// separate transaction costs. (`ADD COLUMN` with a constraint is refused
+/// outright, which is why the constraint is not simply on the add.)
+/// `IF NOT EXISTS` so a database created by `MIGRATIONS` after this
+/// shipped, but somehow recorded below 7, is not broken by the step. The
+/// backfill and the `SET DEFAULT` are separate statements, rather than
+/// folding the default into `ADD COLUMN pinned BOOLEAN DEFAULT false`,
+/// because `ADD COLUMN IF NOT EXISTS` may no-op on a file that already has
+/// the column — from an interrupted prior run of this same step — and the
+/// explicit backfill and default still need to run against that file too.
 const STEP_7_THREADS: &str = r#"
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT;
-ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN;
+UPDATE conversations SET pinned = false WHERE pinned IS NULL;
+ALTER TABLE conversations ALTER COLUMN pinned SET DEFAULT false;
+"#;
+
+/// See `STEP_7_THREADS`. Dying between 7 and 8 leaves a nullable column
+/// that holds no nulls, and this runs alone on the next boot.
+const STEP_8_PINNED_NOT_NULL: &str = r#"
+ALTER TABLE conversations ALTER COLUMN pinned SET NOT NULL;
 "#;
 ```
 
-In `steps()` add `(7, Step::Sql(STEP_7_THREADS)),` after step 6.
+In `steps()` add `(7, Step::Sql(STEP_7_THREADS)),` and `(8, Step::Sql(STEP_8_PINNED_NOT_NULL)),` after step 6.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -129,6 +154,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 2: Account-keyed thread methods on the store
+
+**Status: done; see the commit log. The text below is what shipped.**
 
 **Files:**
 - Modify: `crates/scout-core/src/store.rs` — a `ThreadRow` struct near `PendingMirror` (line ~796), methods after `touch_conversation`.
@@ -369,6 +396,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 3: Expiry in the store
 
+**Status: done; see the commit log. The text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-core/src/store.rs` — after `delete_conversation`.
 - Test: same tests module.
@@ -465,6 +494,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 4: `Thread` on the wire
 
+**Status: done; see the commit log. The text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-api/src/lib.rs` — after `Turn` (line ~168).
 - Test: same file's tests module.
@@ -533,6 +564,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 5: An automatic title after the first answer
+
+**Status: done; see the commit log. The text below is what shipped.**
 
 **Files:**
 - Modify: `crates/scout-core/src/session.rs` — new pure fn `first_message_title`, new `title_if_missing`.
@@ -664,6 +697,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 6: Thread operations in `session.rs`
+
+**Status: done; see the commit log. The text below is what shipped.**
 
 **Files:**
 - Modify: `crates/scout-core/src/session.rs` — after `current_thread`.
@@ -833,6 +868,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 7: A model-suggested title
 
+**Status: done; see the commit log. The text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-core/src/agent.rs` — `title_for` beside `continues_previous` (line ~345).
 - Modify: `crates/scout-core/src/session.rs` — `clean_title` pure fn and `suggest_title`.
@@ -896,18 +933,24 @@ pub fn clean_title(raw: &str) -> Option<String> {
 }
 
 /// Asks the model for a name and stores it. `None` when the thread is not
-/// the account's, or is empty. An unusable answer is an error the caller
-/// reports; the old title stays.
+/// the account's, has nothing in it to name, or went away while the model
+/// was thinking. An unusable answer is an error the caller reports; the old
+/// title stays.
+///
+/// The thread is read, not opened: naming an old sidebar row must not make
+/// it the thread Telegram continues, which is what `open_thread` would do.
 pub async fn suggest_title(core: &Core, account_id: i64, conversation_id: i64) -> anyhow::Result<Option<String>> {
     let store = core.store();
-    let turns = crate::core::blocking(move || {
-        if !store.open_conversation(account_id, conversation_id)? {
+    let Some(turns) = crate::core::blocking(move || {
+        if !store.owns_thread(account_id, conversation_id)? {
             return Ok(None);
         }
         Ok(Some(transcript_of(&store, conversation_id)?))
     })
-    .await?;
-    let Some(turns) = turns else { return Ok(None) };
+    .await?
+    else {
+        return Ok(None);
+    };
     if turns.is_empty() {
         return Ok(None);
     }
@@ -922,13 +965,15 @@ pub async fn suggest_title(core: &Core, account_id: i64, conversation_id: i64) -
         anyhow::bail!("the model gave no usable title");
     };
     let store = core.store();
-    let stored = title.clone();
-    crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &stored)).await?;
-    Ok(Some(title))
+    let written = title.clone();
+    // The thread can be deleted while the model is thinking; then nothing
+    // was named, and saying otherwise would put a title on a gone row.
+    let stored = crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &written)).await?;
+    Ok(stored.then_some(title))
 }
 ```
 
-Note: `open_conversation` here doubles as the ownership check and bumps the thread to current, which a person pressing a button on it expects.
+Note: `owns_thread` is the ownership check on its own — the same predicate `open_conversation` uses, without the bump. Naming a thread must not switch to it: a person naming an old row does not expect their phone to continue it. And the write's own `bool` is the answer, not a discarded one: the row can go while the model is thinking, and `Some(title)` for a thread that no longer exists is a lie the caller would show.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -948,6 +993,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 8: Expiry in maintenance
 
+**Status: done; see the commit log. The text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-core/src/core.rs` — `run_maintenance` (line ~457) and a private helper beside `prune_login_tokens`.
 - Test: `core.rs` tests module.
@@ -963,10 +1010,22 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
         let src = include_str!("core.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
-        let body = &src[start..];
+        let end = src[start..].find("\n    }").expect("the loop must end") + start;
+        let body = &src[start..end];
         assert!(body.contains("expire_threads("), "idle threads are never expired");
+        // And above the backup's `continue`: a `Ok(false) => continue` sits
+        // between them, so an expiry placed after it would only run on the
+        // one tick a day that a backup is due.
+        let expiry = body.find("expire_threads(").unwrap();
+        let backup = body.find("backup::is_due").expect("the backup check must exist");
+        assert!(expiry < backup, "expiry sits below the backup's continue and would run once a day");
     }
 ```
+
+The slice must end at the function, not run to the end of the file: the
+private `expire_threads` helper below `run_maintenance` contains the same
+text, so an unbounded body would find the definition and call the call
+proven.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1016,6 +1075,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 9: A divider the mirror sends on a switch
+
+**Status: done; see the commit log.**
 
 **Files:**
 - Modify: `crates/scout-core/src/mirror.rs` — `note` after `enqueue`.
@@ -1091,6 +1152,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 10: The thread routes
+
+**Status: done in ee2ade2/99fa4f2 plus the fix commit after. Task 13 shipped; the client sends `thread`.**
 
 **Files:**
 - Modify: `crates/scout-web/src/routes/chat.rs` — `routes()`, `MessageIn`, `send_message`, new handlers.
@@ -1374,12 +1437,15 @@ async fn rename_thread(
         Ok(id) => id,
         Err(response) => return response,
     };
-    if body.title.trim().is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
+    // No `trim().is_empty()` pre-check here. `session::rename` already
+    // decides what counts as a name — it trims, strips layout characters
+    // and cuts — and a handler with its own idea of "blank" would disagree
+    // with it the first time that rule grows: `"\u{202E}"` is not empty to
+    // a `trim()`, and is nothing at all by the time it is stored.
     match scout_core::session::rename(&auth.core, account_id, id, &body.title).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Ok(scout_core::session::Renamed::Done) => StatusCode::NO_CONTENT.into_response(),
+        Ok(scout_core::session::Renamed::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Ok(scout_core::session::Renamed::Blank) => StatusCode::BAD_REQUEST.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "could not rename a thread");
             sorry()
@@ -1496,6 +1562,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 11: The sidebar on the page
+
+**Status: done; see the commit log.**
 
 **Files:**
 - Modify: `crates/scout-web/src/chat.html`.
@@ -1633,6 +1701,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 12: Pure client functions
 
+**Status: done; see the commit log.**
+
 **Files:**
 - Modify: `crates/scout-web/src/chat.js` — exports after `composerHeight`.
 - Test: `crates/scout-web/src/chat.test.mjs`.
@@ -1719,6 +1789,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 13: Wiring the sidebar
+
+**Status: done; see the commit log.**
 
 **Files:**
 - Modify: `crates/scout-web/src/chat.js` — inside `start()`.
@@ -1973,7 +2045,50 @@ Replace the `resetForm` submit handler body with:
 
 Update the import list at the top of `start()`'s file is not needed — the pure functions are in the same module.
 
-- [ ] **Step 2: Run every test**
+Every one of these `fetch` calls must name the statuses the routes actually
+answer with before it reaches the generic `!res.ok` arm. A bare "Try again"
+is wrong advice for two of the three, and trying again is what makes the
+third worse:
+
+- `404` — the thread is gone, expired or deleted on another tab. `vanished()`
+  already handles it; every thread route can answer it, including `/title`
+  and `/chat/messages`.
+- `422` — the client and the server disagree about the request body. This is
+  what an old page cached in a browser gets from `/chat/messages` after this
+  ships, because it posts no `thread` field and the extractor refuses the
+  body before any handler runs. The notice must say *reload*: retrying sends
+  the same unacceptable body forever.
+- `502` from `/chat/threads/{id}/title` — the model declined to name the
+  thread. Show "Scout could not think of a name. Try again, or rename it
+  yourself." The body is JSON with an `error` key, not an HTML page, and a
+  `429` from the same route means the naming quota is spent — say so rather
+  than showing the model's notice for a request that never reached it.
+
+- [ ] **Step 2: Add the one assertion that can fail here, then run every test**
+
+DOM wiring has no unit test, but the join this whole task exists for does:
+the composer must name the thread it is sending into. Miss it and every
+message goes to whichever thread is newest when the request lands — the
+exact race `MessageIn.thread` was added to close — and the server answers
+`422`, so nothing sends at all and no other test notices. Add to the tests
+module in `crates/scout-web/src/routes/chat.rs`:
+
+```rust
+    #[test]
+    fn the_client_names_the_thread_it_is_sending_into() {
+        // Sliced to the one call, not the file: `thread` appears all over
+        // this client, and a file-wide check would stay green with the
+        // body left as `{ text }`. Lowercased before matching, so it holds
+        // for `sendBody(text, currentThread)` as well as a literal field.
+        let src = include_str!("../chat.js");
+        let start = src.find("fetch('/chat/messages'").expect("the composer must post somewhere");
+        let end = src[start..].find("})").expect("the call must end") + start;
+        assert!(
+            src[start..end].to_lowercase().contains("thread"),
+            "a message that names no thread lands in whichever one is newest"
+        );
+    }
+```
 
 Run: `cargo test -p scout-web && node --test 'crates/scout-web/src/*.test.mjs'`
 Expected: PASS.
@@ -1999,6 +2114,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 14: README and the whole suite
+
+**Status: done; see the commit log.**
 
 **Files:**
 - Modify: `README.md` — the "Remembers things" list and the `/chat` mention.

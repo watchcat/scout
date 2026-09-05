@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight } from './chat.js'
+import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent, threadVanished } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
   // The browser half of the protocol's security property: reasoning the
@@ -93,4 +93,97 @@ test('a keep-alive comment is not mistaken for a frame', () => {
     event: 'end',
     data: '{"status":"ok","answer":"hi"}',
   })
+})
+
+test('a thread is labelled by its title, or as new when it has none', () => {
+  assert.deepEqual(threadLabel({ title: 'wasmiddel per kilo' }), { text: 'wasmiddel per kilo', unnamed: false })
+  assert.deepEqual(threadLabel({ title: null }), { text: 'New thread', unnamed: true })
+})
+
+test('an empty title is no title', () => {
+  // A title that was cleared to '' must read the same as one that was
+  // never set — not as a thread named "".
+  assert.deepEqual(threadLabel({ title: '' }), { text: 'New thread', unnamed: true })
+})
+
+test('a thread says when it was last used, and when it is about to go', () => {
+  const now = Date.parse('2026-09-05T12:00:00Z')
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-05T11:58:00Z', pinned: false }, now), { text: 'now', expiring: false })
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-05T09:30:00Z', pinned: false }, now), { text: '2h', expiring: false })
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-04T00:00:00Z', pinned: false }, now), { text: 'expires in 12h', expiring: true })
+  // Pinned never expires, however old.
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-01T00:00:00Z', pinned: true }, now), { text: '4d', expiring: false })
+})
+
+test('whenLabel guards: clock skew and the last hour before expiry', () => {
+  const now = Date.parse('2026-09-05T12:00:00Z')
+  // Clock skew: an `updated_at` in the future must not go negative or throw.
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-05T12:05:00Z', pinned: false }, now), { text: 'now', expiring: false })
+  // Exactly 48h old: rounds up to "1h", never "0h" — 0 would read as already gone.
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-03T12:00:00Z', pinned: false }, now), { text: 'expires in 1h', expiring: true })
+})
+
+test('a date the client cannot read says nothing rather than "NaNd"', () => {
+  // Every arithmetic path below runs off `Date.parse`, and NaN propagates
+  // silently through all of them — so a row whose timestamp the client
+  // cannot parse would render "NaNd" beside its title.
+  const now = Date.parse('2026-09-05T12:00:00Z')
+  assert.deepEqual(whenLabel({ updated_at: 'garbage', pinned: false }, now), { text: '', expiring: false })
+})
+
+test('a message names the thread it belongs to', () => {
+  assert.deepEqual(JSON.parse(sendBody('hi', 42)), { text: 'hi', thread: 42 })
+})
+
+test('a list refresh does not move the composer off the thread on screen', () => {
+  // The race `MessageIn.thread` exists to close. The server's `current` is
+  // whichever thread was touched last *anywhere* — the phone, another tab,
+  // a run in another thread that just finished and wrote its history. The
+  // reader is looking at 2; the next message belongs in 2.
+  const list = [{ id: 1, current: true }, { id: 2 }]
+  assert.equal(resolveCurrent(list, 2), 2)
+})
+
+test('a thread that has gone from the list hands the composer to the server', () => {
+  // Expired, or deleted on the phone. There is no transcript to protect any
+  // more, so the server's answer is the only one left.
+  assert.equal(resolveCurrent([{ id: 1, current: true }], 2), 1)
+})
+
+test('a page with no thread of its own takes the server\'s', () => {
+  assert.equal(resolveCurrent([{ id: 1, current: true }, { id: 2 }], null), 1)
+})
+
+test('the openers that redraw the transcript adopt the server\'s answer', () => {
+  // `loadHistory` and `vanished` both render `/chat/history` — which *is*
+  // the server's current thread — so there the server's answer and what is
+  // on screen are the same thing, and adopting it is right.
+  assert.equal(resolveCurrent([{ id: 1, current: true }, { id: 2 }], 2, true), 1)
+})
+
+test('a thread that went while the tab slept is noticed, not quietly swapped', () => {
+  // The 48h sweep runs while the tab is in the background, and the wake-up
+  // refresh is the first thing to see the thread gone. Without this the
+  // composer would retarget under an unchanged transcript and the next
+  // message would land in a conversation the reader never opened.
+  assert.equal(threadVanished([{ id: 1, current: true }], 2), true)
+  // Still there: nothing happened.
+  assert.equal(threadVanished([{ id: 1, current: true }, { id: 2 }], 2), false)
+  // Nothing on screen to lose — a first load, before any transcript.
+  assert.equal(threadVanished([{ id: 1, current: true }], null), false)
+  // The adopting callers have just drawn `/chat/history` themselves, so the
+  // thread they are moving to is by construction the server's current one.
+  // Reporting it gone there would announce the move that was just made —
+  // and, since `vanished` refreshes with `adopt`, would never terminate.
+  assert.equal(threadVanished([{ id: 1, current: true }], 2, true), false)
+})
+
+test('an account with no threads at all leaves the composer with none', () => {
+  // Not `undefined`: the composer tests `currentThread === null` to decide
+  // whether to make a thread before sending.
+  assert.equal(resolveCurrent([], 7), null)
+  assert.equal(resolveCurrent([], null), null)
+  // A list where nothing is marked current — `threads` reads the list and
+  // the current id in two statements, so a thread can vanish between them.
+  assert.equal(resolveCurrent([{ id: 1 }, { id: 2 }], null), null)
 })

@@ -294,10 +294,14 @@ pub type LlmClient = openai::CompletionsClient;
 /// configured client is not possible here (rig-core is on reqwest 0.12,
 /// this crate on 0.13, so the `Client` types are unrelated), so the guard
 /// lives in bot.rs instead, around the stream itself.
-pub fn llm_client(api_key: &str) -> Result<LlmClient> {
+///
+/// `base_url` is `MINIMAX_BASE_URL` in production and comes from
+/// `Config::minimax_base_url`, which a self-hoster may point at a proxy of
+/// their own and which the tests point at a closed port.
+pub fn llm_client(api_key: &str, base_url: &str) -> Result<LlmClient> {
     Ok(openai::CompletionsClient::builder()
         .api_key(api_key)
-        .base_url(MINIMAX_BASE_URL)
+        .base_url(base_url)
         .build()?)
 }
 
@@ -360,6 +364,33 @@ pub async fn continues_previous(
     );
     let verdict = crate::text::strip_thinking(&rig::completion::Prompt::prompt(&agent, question).await?);
     Ok(verdict.to_uppercase().contains("CONTINUE"))
+}
+
+/// How long one call to name a thread may take. The same 30s the outbound
+/// HTTP client gives any other single call.
+const TITLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One-shot: a short name for a conversation, from its text. Tool-less,
+/// like `continues_previous`, and for the same reason.
+///
+/// Bounded in time because nothing else bounds it: rig's client has no
+/// timeout of its own (see [`llm_client`]), and this call sits under an HTTP
+/// handler rather than under the run loop, whose `STREAM_STALL` guard is the
+/// only other thing that would cut a hung connection loose.
+pub async fn title_for(llm: &LlmClient, transcript: &str) -> Result<String> {
+    let agent = llm
+        .agent(MODEL)
+        .preamble(
+            "You name chat threads. Reply with a title of at most five words \
+             in the language of the conversation, no quotes, no trailing \
+             punctuation, nothing else.",
+        )
+        .build();
+    let question = format!("Conversation:\n{transcript}\n\nTitle:");
+    let answer = tokio::time::timeout(TITLE_BUDGET, rig::completion::Prompt::prompt(&agent, question))
+        .await
+        .map_err(|_| anyhow::anyhow!("the model did not answer in time"))??;
+    Ok(crate::text::strip_thinking(&answer))
 }
 
 /// Cap on injected profile facts, bounding prompt growth.
@@ -977,5 +1008,20 @@ mod tests {
     fn profile_block_states_the_search_languages() {
         let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]), 0.0, ALL_TOOLS);
         assert!(p.contains("Search languages for this user: English, Dutch."), "got: {p}");
+    }
+
+    #[test]
+    fn the_call_that_names_a_thread_is_bounded_in_time() {
+        // No model is reachable in a test, so the budget is asserted from
+        // the source. `title_for` runs under an HTTP handler, outside the
+        // run loop's stall guard, and rig's client has no timeout — without
+        // this the request hangs as long as the connection does. Bounded to
+        // the function's own body, so a `timeout(TITLE_BUDGET` anywhere
+        // else in the file cannot stand in for it.
+        let src = include_str!("agent.rs");
+        let start = src.find("pub async fn title_for").expect("title_for must exist");
+        let end = src[start..].find("\n}").expect("title_for must end") + start;
+        let body = &src[start..end];
+        assert!(body.contains("timeout(TITLE_BUDGET"), "the title call must carry its own budget");
     }
 }

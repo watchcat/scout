@@ -222,7 +222,15 @@ CREATE TABLE IF NOT EXISTS conversations (
     scope         TEXT NOT NULL,
     pending_draft TEXT,
     started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
-    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    -- Last two, so a fresh database and a migrated one — where these
+    -- arrive by ALTER TABLE in step 7 — have the same column order.
+    -- What the sidebar calls it. Null until the first answer lands; then
+    -- the first message trimmed, unless someone renamed it. See the
+    -- threads design doc.
+    title         TEXT,
+    -- "Permanent": exempt from the 48-hour expiry. Nothing else.
+    pinned        BOOLEAN NOT NULL DEFAULT false
 );
 CREATE SEQUENCE IF NOT EXISTS messages_id_seq;
 -- `body` is a serde_json `rig::completion::Message`. Storing the whole
@@ -695,6 +703,35 @@ CREATE TABLE IF NOT EXISTS login_tokens (
 );
 "#;
 
+/// Threads in the browser: a name and a pin.
+///
+/// The `pinned` column is added bare, backfilled and given its default
+/// here, and made NOT NULL in step 8 — a separate step because DuckDB
+/// refuses `SET NOT NULL` in a transaction that has already touched the
+/// table's rows, and the `ADD COLUMN` in this one counts. `apply_steps`
+/// runs each step in its own transaction, so a separate step is what a
+/// separate transaction costs. (`ADD COLUMN` with a constraint is refused
+/// outright, which is why the constraint is not simply on the add.)
+/// `IF NOT EXISTS` so a database created by `MIGRATIONS` after this
+/// shipped, but somehow recorded below 7, is not broken by the step. The
+/// backfill and the `SET DEFAULT` are separate statements, rather than
+/// folding the default into `ADD COLUMN pinned BOOLEAN DEFAULT false`,
+/// because `ADD COLUMN IF NOT EXISTS` may no-op on a file that already has
+/// the column — from an interrupted prior run of this same step — and the
+/// explicit backfill and default still need to run against that file too.
+const STEP_7_THREADS: &str = r#"
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN;
+UPDATE conversations SET pinned = false WHERE pinned IS NULL;
+ALTER TABLE conversations ALTER COLUMN pinned SET DEFAULT false;
+"#;
+
+/// See `STEP_7_THREADS`. Dying between 7 and 8 leaves a nullable column
+/// that holds no nulls, and this runs alone on the next boot.
+const STEP_8_PINNED_NOT_NULL: &str = r#"
+ALTER TABLE conversations ALTER COLUMN pinned SET NOT NULL;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -703,6 +740,8 @@ fn steps() -> Vec<(i64, Step)> {
         (4, Step::Sql(STEP_4_REBUILDS)),
         (5, Step::Sql(STEP_5_DELIVERIES)),
         (6, Step::Sql(STEP_6_LOGIN_TOKENS)),
+        (7, Step::Sql(STEP_7_THREADS)),
+        (8, Step::Sql(STEP_8_PINNED_NOT_NULL)),
     ]
 }
 
@@ -798,6 +837,17 @@ pub struct PendingMirror {
     pub account_id: i64,
     pub address: String,
     pub body: String,
+}
+
+/// One row of the sidebar. `current` is not here: the store does not know
+/// which thread a channel would continue, `session::latest_direct` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRow {
+    pub id: i64,
+    pub title: Option<String>,
+    pub pinned: bool,
+    /// RFC 3339, UTC.
+    pub updated_at: String,
 }
 
 #[derive(Clone)]
@@ -1241,11 +1291,13 @@ impl Store {
         let conn = self.conn();
         // The cast is load-bearing: `current_timestamp` is TIMESTAMPTZ and
         // DuckDB has no `TIMESTAMPTZ - INTERVAL` overload.
+        // `id DESC` breaks a tie the same way `threads_of` orders its list,
+        // so the two reads cannot disagree about which thread is current.
         let mut stmt = conn.prepare(
             "SELECT id,
                     updated_at <= CAST(current_timestamp AS TIMESTAMP) - to_seconds(?)
              FROM conversations WHERE account_id = ? AND scope = ?
-             ORDER BY updated_at DESC LIMIT 1",
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
         )?;
         let row: Option<(i64, bool)> = stmt
             .query_map(params![ttl_secs, account_id, scope], |r| {
@@ -1274,6 +1326,178 @@ impl Store {
             params![conversation_id],
         )?;
         Ok(())
+    }
+
+    /// The account's `direct` threads, pinned first, then newest use first.
+    pub fn threads_of(&self, account_id: i64) -> Result<Vec<ThreadRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, pinned, strftime(updated_at, '%Y-%m-%dT%H:%M:%SZ')
+             FROM conversations WHERE account_id = ? AND scope = 'direct'
+             ORDER BY pinned DESC, updated_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id], |r| {
+            Ok(ThreadRow { id: r.get(0)?, title: r.get(1)?, pinned: r.get(2)?, updated_at: r.get(3)? })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Bumps `updated_at`, which is what makes a thread current. `false`
+    /// when the account does not own a `direct` thread by that id — which is
+    /// also what a thread that no longer exists looks like, on purpose.
+    pub fn open_conversation(&self, account_id: i64, conversation_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE conversations SET updated_at = now()
+             WHERE id = ? AND account_id = ? AND scope = 'direct'",
+            params![conversation_id, account_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The ownership check on its own, for a caller that must not bump the
+    /// thread the way `open_conversation` does.
+    pub fn owns_thread(&self, account_id: i64, conversation_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM conversations WHERE id = ? AND account_id = ? AND scope = 'direct'",
+            params![conversation_id, account_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// `None` means "no title yet" as much as "not yours or gone" — this is
+    /// a read accessor, not something to base a not-found decision on.
+    pub fn thread_title(&self, account_id: i64, conversation_id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT title FROM conversations WHERE id = ? AND account_id = ? AND scope = 'direct'",
+        )?;
+        let row: Option<Option<String>> = stmt
+            .query_map(params![conversation_id, account_id], |r| r.get(0))?
+            .next()
+            .transpose()?;
+        Ok(row.flatten())
+    }
+
+    /// A rename. Owner-checked.
+    pub fn set_thread_title(&self, account_id: i64, conversation_id: i64, title: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE conversations SET title = ? WHERE id = ? AND account_id = ? AND scope = 'direct'",
+            params![title, conversation_id, account_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The automatic title after a first answer. Not owner-checked: the
+    /// caller is `run_agent`, which already holds the conversation. Writes
+    /// only over null, so a rename is never undone.
+    pub fn set_thread_title_if_missing(&self, conversation_id: i64, title: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE conversations SET title = ? WHERE id = ? AND title IS NULL",
+            params![title, conversation_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// `direct` only: a group thread can never be pinned, from anywhere — a
+    /// pinned thread is exempt from expiry forever, and a group thread has no
+    /// sidebar row to unpin it from.
+    pub fn set_thread_pinned(&self, account_id: i64, conversation_id: i64, pinned: bool) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE conversations SET pinned = ? WHERE id = ? AND account_id = ? AND scope = 'direct'",
+            params![pinned, conversation_id, account_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The thread and its messages, in one transaction. Owner-checked. Rows
+    /// already queued in `outbox` for this thread are deliberately not swept
+    /// — the outbox has no conversation id, only turn keys the transcript
+    /// can mint — so a mirror message enqueued before the delete may still
+    /// arrive.
+    pub fn delete_conversation(&self, account_id: i64, conversation_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<bool> {
+            let owned = conn.execute(
+                "DELETE FROM conversations WHERE id = ? AND account_id = ? AND scope = 'direct'",
+                params![conversation_id, account_id],
+            )?;
+            if owned == 0 {
+                return Ok(false);
+            }
+            conn.execute("DELETE FROM messages WHERE conversation_id = ?", params![conversation_id])?;
+            Ok(true)
+        })();
+        match result {
+            Ok(deleted) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(deleted)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Deletes every unpinned conversation, any scope, idle for longer than
+    /// `older_than_secs`, with its messages. Returns how many conversations
+    /// went.
+    ///
+    /// Also sweeps messages whose conversation is already gone. A run that
+    /// ends after its thread was deleted still writes its messages —
+    /// `replace_messages` inserts regardless — and nothing else would ever
+    /// collect them. As with `delete_conversation`, rows already queued in
+    /// `outbox` for an expired thread are not swept — the outbox has no
+    /// conversation id — so a mirror message enqueued before expiry may
+    /// still arrive.
+    pub fn expire_conversations(&self, older_than_secs: i64) -> Result<usize> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<usize> {
+            // This DELETE targets the same rows the orphan sweep below would
+            // eventually catch, on purpose: it keeps expiry correct without
+            // depending on the sweep's predicate staying "any conversation
+            // gone". If that predicate is ever narrowed — say to orphans
+            // older than an hour, so a live run's save can't race it — this
+            // explicit delete is what stops expired threads' messages from
+            // leaking through instead.
+            conn.execute(
+                "DELETE FROM messages WHERE conversation_id IN (
+                     SELECT id FROM conversations
+                     WHERE NOT pinned
+                       AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?))",
+                params![older_than_secs],
+            )?;
+            let gone = conn.execute(
+                "DELETE FROM conversations
+                 WHERE NOT pinned
+                   AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?)",
+                params![older_than_secs],
+            )?;
+            conn.execute(
+                "DELETE FROM messages
+                 WHERE conversation_id NOT IN (SELECT id FROM conversations)",
+                [],
+            )?;
+            Ok(gone)
+        })();
+        match result {
+            Ok(gone) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(gone)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// The last `limit` messages, oldest first — the order a provider wants.
@@ -2949,7 +3173,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 6);
+        assert_eq!(s.schema_version().unwrap(), 8);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -3013,7 +3237,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 8);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -4730,5 +4954,296 @@ CREATE TABLE segment_candidates (
         s.replace_messages(conversation, &["{}".to_string()])
             .expect("a transactional write must work after a poisoned lock");
         assert_eq!(s.conversation_messages(conversation, 10).unwrap().len(), 1);
+    }
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_name = ? AND column_name = ?",
+                params![table, column],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    #[test]
+    fn a_fresh_database_has_a_title_and_a_pin_on_every_conversation() {
+        let (s, _dir) = test_store();
+        let conn = s.conn();
+        assert!(has_column(&conn, "conversations", "title"));
+        assert!(has_column(&conn, "conversations", "pinned"));
+    }
+
+    /// `conversations` exactly as it stood at schema version 6, before the
+    /// title and the pin. Frozen, like `LEGACY_SCHEMA`: its value is being
+    /// an honest picture of the table the step will actually meet.
+    const PRE_THREADS_CONVERSATIONS: &str = r#"
+DROP TABLE conversations;
+CREATE TABLE conversations (
+    id            BIGINT PRIMARY KEY DEFAULT nextval('conversations_id_seq'),
+    account_id    BIGINT NOT NULL,
+    scope         TEXT NOT NULL,
+    pending_draft TEXT,
+    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+"#;
+
+    /// A database in the production shape: everything `MIGRATIONS` builds,
+    /// with `conversations` rolled back to its version-6 form, the version
+    /// recorded as 6, and a thread already in it. The row is what matters —
+    /// the step is trivially safe on an empty table and refuses to run on a
+    /// full one, which is the whole bug.
+    fn version_six_db_with_a_thread() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v6.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS).unwrap();
+        conn.execute_batch(PRE_THREADS_CONVERSATIONS).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version BIGINT NOT NULL);
+             INSERT INTO schema_version VALUES (6);
+             INSERT INTO accounts (id) VALUES (nextval('accounts_id_seq'));
+             INSERT INTO conversations (id, account_id, scope)
+                 VALUES (nextval('conversations_id_seq'), 1, 'direct');",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
+        let (_dir, db) = version_six_db_with_a_thread();
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 8, "the threads steps did not run");
+        let conn = s.conn();
+        assert!(has_column(&conn, "conversations", "title"));
+        assert!(has_column(&conn, "conversations", "pinned"));
+        let old: bool = conn
+            .query_row("SELECT pinned FROM conversations WHERE id = 1", [], |r| r.get(0))
+            .expect("the thread that was already there must survive");
+        assert!(!old, "a thread that predates the pin is unpinned");
+        let null_pins: i64 = conn
+            .query_row("SELECT count(*) FROM conversations WHERE pinned IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(null_pins, 0, "the backfill must leave no null pins behind");
+        drop(conn);
+        let id = s.start_conversation(1, "direct").unwrap();
+        let conn = s.conn();
+        let fresh: bool = conn
+            .query_row("SELECT pinned FROM conversations WHERE id = ?", params![id], |r| r.get(0))
+            .unwrap();
+        assert!(!fresh, "a thread started after the migration is unpinned too");
+        assert!(
+            conn.execute_batch(
+                "INSERT INTO conversations (id, account_id, scope, pinned)
+                 VALUES (nextval('conversations_id_seq'), 1, 'direct', NULL)"
+            )
+            .is_err(),
+            "the pin must be NOT NULL on a migrated file"
+        );
+    }
+
+    #[test]
+    fn a_database_interrupted_between_the_two_thread_steps_finishes_on_the_next_boot() {
+        // The one interleaving a partial deploy can produce: step 7 landed,
+        // the process died, step 8 never ran. `STEP_8_PINNED_NOT_NULL`'s
+        // comment promises the next boot finishes the job.
+        let (_dir, db) = version_six_db_with_a_thread();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(STEP_7_THREADS).unwrap();
+            conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 8);
+        let conn = s.conn();
+        assert!(
+            conn.execute_batch(
+                "INSERT INTO conversations (id, account_id, scope, pinned)
+                 VALUES (nextval('conversations_id_seq'), 1, 'direct', NULL)"
+            )
+            .is_err(),
+            "step 8 did not run on the second boot"
+        );
+    }
+
+    #[test]
+    fn a_migrated_conversations_table_has_exactly_the_shape_a_fresh_one_has() {
+        // `MIGRATIONS` and the steps are two descriptions of one table, and
+        // nothing else keeps them in step. Name, order, type, nullability
+        // and default — the whole of what a query can see.
+        fn shape(conn: &Connection) -> Vec<(String, i64, String, String, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT column_name, ordinal_position, data_type, is_nullable, column_default
+                     FROM information_schema.columns
+                     WHERE table_name = 'conversations' ORDER BY ordinal_position",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+        let (fresh, _d1) = test_store();
+        let (_d2, db) = version_six_db_with_a_thread();
+        let migrated = Store::open(&db).unwrap();
+        assert_eq!(shape(&fresh.conn()), shape(&migrated.conn()));
+    }
+
+    #[test]
+    fn threads_are_listed_pinned_first_and_then_by_last_use() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let old = s.start_conversation(a, "direct").unwrap();
+        let pinned = s.start_conversation(a, "direct").unwrap();
+        let newest = s.start_conversation(a, "direct").unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(3600) WHERE id = {old};
+                 UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(7200) WHERE id = {pinned};"
+            ))
+            .unwrap();
+        assert!(s.set_thread_pinned(a, pinned, true).unwrap());
+        // Not this account's thread, and not `direct`: neither may appear.
+        let b = s.account_for_telegram(22).unwrap();
+        s.start_conversation(b, "direct").unwrap();
+        s.start_conversation(a, "telegram:-100").unwrap();
+
+        let ids: Vec<i64> = s.threads_of(a).unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![pinned, newest, old]);
+    }
+
+    #[test]
+    fn a_thread_row_carries_what_the_sidebar_shows() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let id = s.start_conversation(a, "direct").unwrap();
+        assert!(s.set_thread_title(a, id, "wasmiddel per kilo").unwrap());
+        let rows = s.threads_of(a).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title.as_deref(), Some("wasmiddel per kilo"));
+        assert!(!rows[0].pinned);
+        assert!(rows[0].updated_at.ends_with('Z'), "not RFC 3339 UTC: {}", rows[0].updated_at);
+        let stamped = chrono::NaiveDateTime::parse_from_str(&rows[0].updated_at, "%Y-%m-%dT%H:%M:%SZ")
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let skew = (chrono::Utc::now().timestamp() - stamped).abs();
+        assert!(skew < 5, "updated_at not close to now: skew {skew}s");
+    }
+
+    #[test]
+    fn opening_a_thread_makes_it_the_newest_and_only_for_its_owner() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let first = s.start_conversation(a, "direct").unwrap();
+        let second = s.start_conversation(a, "direct").unwrap();
+        s.conn()
+            .execute(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(60) WHERE id = ?",
+                params![first],
+            )
+            .unwrap();
+        assert_eq!(s.latest_conversation(a, "direct", 600).unwrap().map(|(id, _)| id), Some(second));
+
+        assert!(s.open_conversation(a, first).unwrap());
+        assert_eq!(s.latest_conversation(a, "direct", 600).unwrap().map(|(id, _)| id), Some(first));
+
+        let stranger = s.account_for_telegram(22).unwrap();
+        assert!(!s.open_conversation(stranger, first).unwrap(), "opened someone else's thread");
+        assert!(!s.open_conversation(a, 999_999).unwrap(), "opened a thread that does not exist");
+
+        let group = s.start_conversation(a, "telegram:-100").unwrap();
+        assert!(!s.open_conversation(a, group).unwrap(), "opened a group thread as a browser thread");
+        assert!(!s.set_thread_pinned(a, group, true).unwrap(), "pinned a group thread, which would make it immortal");
+        assert!(!s.set_thread_title(a, group, "x").unwrap(), "renamed a group thread from the browser");
+        assert!(!s.delete_conversation(a, group).unwrap(), "deleted a group thread from the browser");
+        assert_eq!(s.thread_title(a, group).unwrap(), None);
+        // `owns_thread` is the same rule without the bump, so it draws the
+        // same line: a group thread is not the browser's to name.
+        assert!(!s.owns_thread(a, group).unwrap(), "a group thread counted as a browser thread");
+        assert!(s.owns_thread(a, first).unwrap());
+    }
+
+    #[test]
+    fn a_thread_can_only_be_renamed_pinned_or_deleted_by_its_owner() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let stranger = s.account_for_telegram(22).unwrap();
+        let id = s.start_conversation(a, "direct").unwrap();
+        s.replace_messages(id, &["{}".to_string()]).unwrap();
+
+        assert!(!s.set_thread_title(stranger, id, "mine now").unwrap());
+        assert!(!s.set_thread_pinned(stranger, id, true).unwrap());
+        assert!(!s.delete_conversation(stranger, id).unwrap());
+        assert_eq!(s.threads_of(a).unwrap().len(), 1, "a stranger changed something");
+        assert_eq!(s.thread_title(a, id).unwrap(), None);
+
+        assert!(s.delete_conversation(a, id).unwrap());
+        assert!(s.threads_of(a).unwrap().is_empty());
+        assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "messages outlived their thread");
+    }
+
+    #[test]
+    fn a_title_written_only_when_missing_never_covers_a_rename() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let id = s.start_conversation(a, "direct").unwrap();
+        assert!(s.set_thread_title_if_missing(id, "first message").unwrap());
+        assert!(!s.set_thread_title_if_missing(id, "second message").unwrap());
+        assert_eq!(s.thread_title(a, id).unwrap().as_deref(), Some("first message"));
+        s.set_thread_title(a, id, "renamed").unwrap();
+        assert!(!s.set_thread_title_if_missing(id, "third").unwrap());
+        assert_eq!(s.thread_title(a, id).unwrap().as_deref(), Some("renamed"));
+    }
+
+    #[test]
+    fn expiry_takes_an_idle_unpinned_thread_and_leaves_a_pinned_or_recent_one() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let idle = s.start_conversation(a, "direct").unwrap();
+        let pinned = s.start_conversation(a, "direct").unwrap();
+        let recent = s.start_conversation(a, "direct").unwrap();
+        let group = s.start_conversation(a, "telegram:-100").unwrap();
+        for id in [idle, pinned, recent, group] {
+            s.replace_messages(id, &["{}".to_string()]).unwrap();
+        }
+        s.set_thread_pinned(a, pinned, true).unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(49 * 3600) WHERE id IN ({idle}, {pinned}, {group});
+                 UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(47 * 3600) WHERE id = {recent};"
+            ))
+            .unwrap();
+
+        let gone = s.expire_conversations(48 * 3600).unwrap();
+
+        assert_eq!(gone, 2, "the idle direct thread and the idle group thread");
+        let left: Vec<i64> = s.threads_of(a).unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(left, vec![pinned, recent]);
+        assert!(s.conversation_messages(idle, 10).unwrap().is_empty(), "messages outlived their thread");
+        assert!(s.conversation_messages(group, 10).unwrap().is_empty(), "the group's messages outlived it");
+        assert_eq!(s.conversation_messages(pinned, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expiry_also_sweeps_messages_whose_thread_is_already_gone() {
+        // A run that finishes after its thread was deleted still writes its
+        // messages: `replace_messages` inserts regardless. Nothing else
+        // would ever collect them.
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let id = s.start_conversation(a, "direct").unwrap();
+        assert!(s.delete_conversation(a, id).unwrap());
+        s.replace_messages(id, &["{}".to_string(), "{}".to_string()]).unwrap();
+        assert_eq!(s.conversation_messages(id, 10).unwrap().len(), 2, "the orphans must exist for this test to mean anything");
+
+        assert_eq!(s.expire_conversations(48 * 3600).unwrap(), 0, "no conversation expired");
+
+        assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "orphaned messages were not swept");
     }
 }

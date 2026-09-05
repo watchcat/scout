@@ -138,6 +138,16 @@ pub struct RunContext {
     /// A run with `None` is not offered the reminder tool at all, so the
     /// model never promises something that would silently never arrive.
     pub reply_to: Option<ReplyTo>,
+    /// The person's own words, for naming a thread that has no name yet —
+    /// or `None` when this run has none worth naming it after. Separate
+    /// from the prompt because the prompt is not the message: Telegram
+    /// appends a `[system note]` to price requests and builds a reaction
+    /// follow-up from nothing else, and a title cut from that would read
+    /// `cheapest usb hub [system note] This is a…`.
+    ///
+    /// This carries message text, so it must not be debug-logged whole.
+    #[serde(default)]
+    pub title_source: Option<String>,
 }
 
 impl ReplyTo {
@@ -167,9 +177,33 @@ pub struct Turn {
     pub text: String,
 }
 
+/// One thread in the browser's list. `current` is the one a Telegram
+/// message would continue and the mirror follows; exactly one row has it
+/// whenever the list is non-empty.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Thread {
+    pub id: i64,
+    /// Null until the first answer lands.
+    pub title: Option<String>,
+    pub pinned: bool,
+    /// RFC 3339, UTC. A string so the page does not need a date library
+    /// to show "2h ago".
+    pub updated_at: String,
+    pub current: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_context_without_a_title_source_still_arrives() {
+        // The field was added after clients existed. A stored or in-flight
+        // context written before it must still decode, nameless.
+        let run: RunContext =
+            serde_json::from_str(r#"{"account_id":1,"conversation_id":2,"reply_to":null}"#).unwrap();
+        assert_eq!(run.title_source, None);
+    }
 
     #[test]
     fn emitting_into_a_closed_channel_is_not_an_error() {
@@ -269,5 +303,22 @@ mod tests {
             }
             assert_eq!(client, step, "client drifted from the source text");
         }
+    }
+
+    #[test]
+    fn a_thread_serialises_with_the_names_the_page_reads() {
+        let t = Thread {
+            id: 7,
+            title: None,
+            pinned: true,
+            updated_at: "2026-09-05T10:00:00Z".to_string(),
+            current: false,
+        };
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["id"], 7);
+        assert!(json["title"].is_null());
+        assert_eq!(json["pinned"], true);
+        assert_eq!(json["updated_at"], "2026-09-05T10:00:00Z");
+        assert_eq!(json["current"], false);
     }
 }

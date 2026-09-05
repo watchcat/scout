@@ -91,6 +91,26 @@ pub async fn enqueue(
     Ok(written)
 }
 
+/// One line to the phone that is an event, not a turn: "you switched to
+/// this thread". Keyed on `at` (Unix seconds) as well as the text, so the
+/// same switch made twice is sent twice, and a double-click inside one
+/// second is sent once.
+pub async fn note(core: &Core, account_id: i64, address: &str, text: &str, at: i64) -> anyhow::Result<usize> {
+    let store = core.store();
+    let address = address.to_string();
+    // Negative, so it can never collide with a real conversation id.
+    let key = turn_key(-at, Role::Scout, text);
+    let body = text.to_string();
+    let written = crate::core::blocking(move || {
+        Ok(usize::from(store.enqueue_mirror(account_id, TELEGRAM, &address, &body, &key, false)?))
+    })
+    .await?;
+    if written > 0 {
+        core.wake_mirror();
+    }
+    Ok(written)
+}
+
 /// How a turn reads once it is somebody else's message.
 ///
 /// The reader's own question is quoted with a literal `>`, in plain text.
@@ -123,6 +143,44 @@ pub async fn queue_thread(
     address: &str,
 ) -> anyhow::Result<usize> {
     thread_into_outbox(core, account_id, address, false).await
+}
+
+/// Queues one named thread, whatever the reader's current one has become.
+///
+/// The difference from `queue_thread` is *when* the caller knows the id.
+/// A backfill is deciding "send me what I am looking at now", so resolving
+/// the current thread is the right question. A finished run is not: it
+/// started on a particular conversation and takes minutes, and by the time
+/// it returns the account's current thread may be a different one — a
+/// Telegram message arrived, another tab pressed New thread, the reader
+/// deleted this one. Re-resolving there would mirror somebody else's
+/// transcript to the phone, under the answer the reader just read.
+///
+/// Idempotent for the same reason `queue_thread` is: the keys are the
+/// thread's own turns.
+///
+/// The id is checked against the account here rather than trusted from the
+/// caller. `queue_thread` resolves the thread itself and so cannot name one
+/// that is not the reader's; this one takes an id, and an id is a thing a
+/// caller can get wrong — a stale one held across a run, or one that simply
+/// belongs to somebody else. Getting it wrong would send a stranger's
+/// transcript to this account's phone, so a thread that is not the
+/// account's queues nothing at all.
+pub async fn queue_conversation(
+    core: &Core,
+    account_id: i64,
+    address: &str,
+    conversation_id: i64,
+) -> anyhow::Result<usize> {
+    let store = core.store();
+    let turns = crate::core::blocking(move || {
+        if !store.owns_thread(account_id, conversation_id)? {
+            return Ok(Vec::new());
+        }
+        crate::session::transcript_of(&store, conversation_id)
+    })
+    .await?;
+    enqueue(core, account_id, address, conversation_id, &turns, false).await
 }
 
 /// Records the reader's current thread as already shown to them.
@@ -263,6 +321,20 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_note_is_queued_every_time_not_once_per_wording() {
+        let (core, _dir) = test_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+
+        assert_eq!(note(&core, a, "12345", "── beans ──", 1_000).await.unwrap(), 1);
+        assert_eq!(note(&core, a, "12345", "── beans ──", 1_001).await.unwrap(), 1, "the second switch was swallowed");
+        assert_eq!(note(&core, a, "12345", "── beans ──", 1_001).await.unwrap(), 0, "a double-click inside one second is one note");
+
+        let pending = pending(&core, 10).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|p| p.body == "── beans ──"));
+    }
+
     #[test]
     fn the_readers_own_words_are_quoted_line_by_line() {
         // A literal `>`, not a MarkdownV2 blockquote: the bot sends plain
@@ -344,6 +416,59 @@ mod tests {
         assert_eq!(queue_thread(&core, account_id, "4242").await.unwrap(), 2);
         assert_eq!(queue_thread(&core, account_id, "4242").await.unwrap(), 0);
         assert_eq!(pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_thread_that_ran_is_queued_and_not_whichever_is_newest_now() {
+        // The web handler queues after the run returns, and by then "the
+        // current thread" can have moved on: Telegram started one, another
+        // tab pressed New thread, the reader deleted this one. Re-resolving
+        // by account at that point mirrors a different conversation's
+        // transcript to the phone, under the answer the reader just read.
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        let older = crate::session::seed_exchange_for_tests(
+            &core, account_id, "direct", "cheapest beans", "here are three",
+        )
+        .await
+        .unwrap();
+        crate::session::seed_exchange_for_tests(&core, account_id, "direct", "cheapest hubs", "here are two")
+            .await
+            .unwrap();
+
+        assert_eq!(queue_conversation(&core, account_id, "4242", older).await.unwrap(), 2);
+        let bodies: Vec<String> =
+            pending(&core, 10).await.unwrap().into_iter().map(|p| p.body).collect();
+        assert_eq!(
+            bodies,
+            vec!["> cheapest beans".to_string(), "here are three".to_string()],
+            "the newest thread was mirrored instead of the one that ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_that_is_not_the_accounts_is_not_queued() {
+        // The id arrives from a caller, and the only thing that had checked
+        // it was the handler that happened to be calling — so a second
+        // caller with a stale or guessed id would mirror a stranger's
+        // transcript to this account's phone.
+        let (core, _dir) = test_core().await;
+        let a = crate::session::account_of(&core, crate::ids::TelegramId(4242)).await.unwrap();
+        let b = crate::session::account_of(&core, crate::ids::TelegramId(5353)).await.unwrap();
+        let theirs = crate::session::seed_exchange_for_tests(
+            &core, a, "direct", "cheapest beans", "here are three",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            queue_conversation(&core, b, "12345", theirs).await.unwrap(),
+            0,
+            "a stranger's thread was queued for this account's phone"
+        );
+        assert!(pending(&core, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

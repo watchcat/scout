@@ -924,14 +924,18 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
             chat.pending_draft = None;
         }
     }
-    let prompt = match resolution {
-        DraftResolution::NoDraft => text,
+    // Two things, not one: what the agent is asked, and what the person
+    // actually said. They part company on the next two lines — a draft is
+    // wrapped in an instruction and a price request gets a note appended —
+    // and a thread named after the prompt would be named after those.
+    let (prompt, said) = match resolution {
+        DraftResolution::NoDraft => (text.clone(), text),
         DraftResolution::Cancelled => {
             bot.send_message(chat_id, "Okay, dropped it.").await?;
             return Ok(());
         }
         DraftResolution::Confirmed(draft) | DraftResolution::Replaced(draft) => {
-            format!("Find this product for me: {draft}")
+            (format!("Find this product for me: {draft}"), draft)
         }
     };
 
@@ -956,6 +960,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         account_id,
         conversation_id,
         reply_to: Some(scout_api::ReplyTo::telegram(chat_id.0)),
+        title_source: Some(said),
     };
     let (result, mut live) = tokio::join!(
         scout_core::run::run_agent(&app.core, events, &run, &prompt),
@@ -1189,6 +1194,10 @@ async fn handle_reaction(
         account_id,
         conversation_id,
         reply_to: Some(scout_api::ReplyTo::telegram(chat_id.0)),
+        // A reaction has no words of the person's to name a thread after.
+        // If it happens to start one — the continuation check can — the
+        // thread stays nameless until their next message names it.
+        title_source: None,
     };
     let (result, mut live) = tokio::join!(
         scout_core::run::run_agent(&app.core, events, &run, &prompt),
@@ -1456,6 +1465,37 @@ mod tests {
             2,
             "a note this channel writes to itself must carry the marker, or the reader \
              will see it in their transcript as their own words"
+        );
+    }
+
+    #[test]
+    fn a_thread_started_here_is_never_named_after_the_prompt() {
+        // The prompt is not the message on this channel: a price request
+        // has `PRICE_REQUEST_NOTE` appended, a confirmed photo draft gets
+        // "Find this product for me: " in front, and the reaction follow-up
+        // is nothing but a system note. A title cut from any of those reads
+        // `cheapest usb hub …This is a cheapest-price request…`.
+        //
+        // A source assertion because this crate cannot build a `Core` in a
+        // test. Scoped above the test module, which contains these names.
+        let src = include_str!("bot.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        assert_eq!(
+            src.matches("title_source: None").count(),
+            1,
+            "only the reaction follow-up has no words of the person's to be named after"
+        );
+        assert!(
+            src.contains("title_source: Some("),
+            "a message the person typed must name the thread it starts"
+        );
+        assert!(
+            !src.contains("title_source: Some(prompt"),
+            "the augmented prompt must never name a thread"
+        );
+        assert!(
+            src.contains("title_source: Some(said)"),
+            "the text path must name a thread from what the person said"
         );
     }
 

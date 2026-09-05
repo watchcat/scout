@@ -48,6 +48,14 @@ pub struct AuthState {
     pub core: Arc<Core>,
     pub by_address: Arc<ratelimit::Limiter>,
     pub by_ip: Arc<ratelimit::Limiter>,
+    /// The throttle on things a signed-in account can spend money with.
+    ///
+    /// Keyed on a server-derived account id, so the module's warning about
+    /// limits keyed on a string a stranger typed does not apply here: this
+    /// key comes out of the session cookie, and retyping it means minting a
+    /// signature. It bounds a stuck client or a happy clicker to about a
+    /// hundred and twenty model calls an hour.
+    pub by_account: Arc<ratelimit::Limiter>,
     pub mailer: email::Mailer,
 }
 
@@ -67,6 +75,7 @@ impl AuthState {
             mailer,
             by_address: Arc::new(ratelimit::Limiter::new(3, Duration::from_secs(900))),
             by_ip: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(3600))),
+            by_account: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(300))),
         }
     }
 }
@@ -517,6 +526,11 @@ mod tests {
             "TELEGRAM_BOT_TOKEN" => Some("123456:test-bot-token".to_string()),
             "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
             "MINIMAX_API_KEY" => Some("mk".to_string()),
+            // A port nothing listens on, as `Config::for_test` does. A
+            // route that reaches the model under test fails at once with a
+            // connection error instead of putting a request with a bogus
+            // key on the wire.
+            "MINIMAX_BASE_URL" => Some("http://127.0.0.1:1".to_string()),
             "KAGI_API_KEY" => Some("kk".to_string()),
             "SCOUT_DB_PATH" => Some(db.to_str().unwrap().to_string()),
             _ => None,
@@ -538,7 +552,8 @@ mod tests {
         // HTTPS request at api.resend.com, which makes the suite depend on
         // someone else's uptime and hands a test address to a third party.
         // Nothing else in this repository's tests binds a socket or
-        // reaches the network.
+        // reaches the network — the model endpoint above is the other half
+        // of that promise, and it points at a closed port.
         let mut state = crate::AuthState::new(auth, core.clone());
         state.mailer = mailer;
         let app = crate::router(cache, Some(state));

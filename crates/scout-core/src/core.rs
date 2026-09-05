@@ -123,7 +123,7 @@ impl Core {
             .timeout(Duration::from_secs(30))
             .build()?;
         let kagi = KagiClient::new(http.clone(), cfg.kagi_api_key.clone(), KAGI_API_BASE.to_string());
-        let llm = crate::agent::llm_client(&cfg.minimax_api_key)?;
+        let llm = crate::agent::llm_client(&cfg.minimax_api_key, &cfg.minimax_base_url)?;
         let ebay = cfg.ebay_credentials.clone().map(|(id, secret)| {
             crate::tools::ebay::EbayClient::new(
                 http.clone(),
@@ -474,6 +474,14 @@ impl Core {
                 Err(e) => tracing::warn!(error = %e, "could not prune login tokens"),
             }
 
+            // The other thing that grows on its own. Two days idle and not
+            // pinned, any scope — see the threads design doc.
+            match self.expire_threads().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(expired = n, "idle threads dropped"),
+                Err(e) => tracing::warn!(error = %e, "could not expire idle threads"),
+            }
+
             match crate::backup::is_due(&dir) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -500,6 +508,16 @@ impl Core {
     async fn prune_login_tokens(&self) -> anyhow::Result<usize> {
         let store = self.store();
         blocking(move || store.prune_login_tokens(Self::LOGIN_TOKEN_KEEP_SECS)).await
+    }
+
+    /// How long a thread may sit untouched before it goes, unless pinned.
+    const THREAD_IDLE_SECS: i64 = 48 * 3600;
+
+    /// Drops idle, unpinned threads. Returns how many went. Private for
+    /// the same reason `prune_login_tokens` is.
+    async fn expire_threads(&self) -> anyhow::Result<usize> {
+        let store = self.store();
+        blocking(move || store.expire_conversations(Self::THREAD_IDLE_SECS)).await
     }
 
     /// Turns a photo into a search description.
@@ -785,4 +803,22 @@ mod tests {
         assert_eq!(leftovers, 0);
     }
 
+    #[test]
+    fn maintenance_actually_expires_threads() {
+        // The store method is tested on its own; nothing else says it is
+        // ever called. A forgotten call leaves every thread forever and
+        // the sidebar growing without bound.
+        let src = include_str!("core.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
+        let end = src[start..].find("\n    }").expect("the loop must end") + start;
+        let body = &src[start..end];
+        assert!(body.contains("expire_threads("), "idle threads are never expired");
+        // And above the backup's `continue`: a `Ok(false) => continue` sits
+        // between them, so an expiry placed after it would only run on the
+        // one tick a day that a backup is due.
+        let expiry = body.find("expire_threads(").unwrap();
+        let backup = body.find("backup::is_due").expect("the backup check must exist");
+        assert!(expiry < backup, "expiry sits below the backup's continue and would run once a day");
+    }
 }

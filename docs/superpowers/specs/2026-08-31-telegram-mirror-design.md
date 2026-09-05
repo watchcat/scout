@@ -172,7 +172,7 @@ cannot keep, and `/account` is where you attach a way in. If you link Telegram
 later, the toggle appears.
 
 `POST /chat/mirror` carries the CSRF header, like `/chat/messages` and
-`/chat/reset`.
+`/chat/reset` (replaced by `POST /chat/threads` on 2026-09-05).
 
 ## Draining
 
@@ -202,9 +202,10 @@ pace, worst case.
 
 ## New thread
 
-`/chat/reset` enqueues a divider when mirroring is on. Without one, scrolling
-back through Telegram runs two unrelated conversations together with no seam,
-which works against the whole point.
+`/chat/reset` (replaced by `POST /chat/threads` on 2026-09-05) enqueues a
+divider when mirroring is on. Without one, scrolling back through Telegram
+runs two unrelated conversations together with no seam, which works against
+the whole point.
 
 The divider is a row like any other, with its own `turn_key` derived from the
 conversation it closes, so it cannot be sent twice.

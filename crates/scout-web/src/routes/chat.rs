@@ -1797,4 +1797,47 @@ mod tests {
             "a reload can be answered from cache"
         );
     }
+
+    #[test]
+    fn a_message_the_page_could_not_send_is_taken_off_the_screen() {
+        // The 422 arm is the page finding out its own request no longer
+        // makes sense — the send body no longer matches what the server
+        // wants. The bubble the submit handler already appended for the
+        // words has to come off by hand here, or they sit twice on the
+        // page: once back in the composer, once in a turn that was never
+        // asked.
+        let js = include_str!("../chat.js");
+        let start = js.find("res.status === 422").expect("the 422 arm must exist");
+        let end = js[start..].find('}').expect("the arm must end") + start;
+        let body = &js[start..end];
+        assert!(body.contains("retract()"), "a refused send leaves its bubble on the screen");
+    }
+
+    #[test]
+    fn the_expiry_countdown_ticks_only_while_the_tab_is_visible() {
+        // A hidden tab's labels are seen by nobody, so ticking them anyway
+        // is a request nobody asked for — `visibilitychange` refreshes the
+        // list outright when the tab comes back into view instead.
+        let js = include_str!("../chat.js");
+        let start = js.find("function tickWhenLabels").expect("the ticker must exist");
+        let end = js[start..].find("\n  }\n").expect("the function must end") + start;
+        let body = &js[start..end];
+        assert!(body.contains("document.hidden"), "the ticker does not check tab visibility");
+        assert!(body.contains(".when"), "the ticker does not touch the when labels");
+    }
+
+    #[tokio::test]
+    async fn the_reset_route_is_gone() {
+        // The sidebar starts threads now; nothing on the page posts here
+        // any more. A stale bookmark, or an old cached page, finding the
+        // route gone — rather than it quietly doing something else — is
+        // the point.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        let res = post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "the reset route answered {}", res.status());
+    }
 }

@@ -524,6 +524,14 @@ impl Core {
     /// taken here rather than held: `running` is claimed and released by
     /// `run::begin_run`, and a run that starts a moment after this reads it
     /// is a run whose thread was young enough to survive this pass anyway.
+    ///
+    /// The ordering is airtight on the web path — `open_conversation`
+    /// checks ownership and bumps `updated_at` in the same `UPDATE`, so
+    /// there is no gap for this sweep to land in. Telegram's continuation
+    /// check is not that: it reads the thread, waits on a model call, and
+    /// only then bumps it, and this sweep can run in between and take the
+    /// row. `resolve_conversation` falls back to starting a fresh thread
+    /// when that bump finds nothing there.
     async fn expire_threads(&self) -> anyhow::Result<usize> {
         let store = self.store();
         let running: Vec<i64> = self.deps.running.iter().map(|r| *r).collect();

@@ -29,7 +29,7 @@ web and Telegram draw on one allowance rather than two.
 | `GET /chat` | the page |
 | `GET /chat/history` | recent turns of the `direct` conversation, JSON |
 | `POST /chat/messages` | send a message; responds `text/event-stream` |
-| `POST /chat/reset` | start a fresh thread |
+| `POST /chat/reset` (replaced by `POST /chat/threads` on 2026-09-05) | start a fresh thread |
 | `GET /chat.js` | the client script |
 
 They live in `crates/scout-web/src/routes/chat.rs`, on the authenticated
@@ -132,8 +132,9 @@ searches looks broken otherwise.
 
 The page embeds `session::csrf_for(account_id)`; `chat.js` returns it in an
 `X-Scout-Csrf` request header, checked with `csrf_ok_for`. A header rather
-than a body field so that `POST /chat/reset`, which has no body, is protected
-the same way as `POST /chat/messages`, which has one. This is the token the account
+than a body field so that `POST /chat/reset` (replaced by `POST /chat/threads`
+on 2026-09-05), which has no body, is protected the same way as
+`POST /chat/messages`, which has one. This is the token the account
 page's forms already use, in the one form a `fetch` can carry.
 
 The Origin refusal added in the W2 security review still applies to these

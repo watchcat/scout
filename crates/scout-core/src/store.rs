@@ -1318,14 +1318,16 @@ impl Store {
         )?)
     }
 
-    /// Marks a conversation as spoken in, so its TTL runs from now.
-    pub fn touch_conversation(&self, conversation_id: i64) -> Result<()> {
+    /// Marks a conversation as spoken in, so its TTL runs from now. `false`
+    /// when there was no such row to bump — the thread expired and was
+    /// deleted between the continuation check and this call.
+    pub fn touch_conversation(&self, conversation_id: i64) -> Result<bool> {
         let conn = self.conn();
-        conn.execute(
+        let n = conn.execute(
             "UPDATE conversations SET updated_at = now() WHERE id = ?",
             params![conversation_id],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// The account's `direct` threads, pinned first, then newest use first.
@@ -3431,7 +3433,7 @@ CREATE TABLE segment_candidates (
         assert_eq!(s.latest_conversation(a, "direct", 600).unwrap(), Some((first, true)));
 
         // Speaking in it makes it live again without starting a new one.
-        s.touch_conversation(first).unwrap();
+        assert!(s.touch_conversation(first).unwrap(), "touching a thread that still exists must report true");
         assert_eq!(s.latest_conversation(a, "direct", 600).unwrap(), Some((first, false)));
 
         // An account with nothing has nothing — the caller starts the thread.
@@ -5263,27 +5265,40 @@ CREATE TABLE conversations (
         // the question is asked. Deleting it there loses the question, the
         // answer lands in a thread that no longer exists, and the reader
         // watches their conversation disappear as they wait for it.
+        //
+        // Two ids in `except`, not one: `expire_conversations` builds its
+        // `NOT IN (...)` placeholder list with `.join(", ")`, and a single
+        // id never exercises the separator — the query text would come out
+        // the same with the join dropped entirely.
         let (s, _dir) = test_store();
         let a = s.account_for_telegram(11).unwrap();
         let running = s.start_conversation(a, "direct").unwrap();
+        let also_running = s.start_conversation(a, "direct").unwrap();
         let idle = s.start_conversation(a, "direct").unwrap();
-        for id in [running, idle] {
+        for id in [running, also_running, idle] {
             s.replace_messages(id, &["{}".to_string()]).unwrap();
         }
         s.conn()
             .execute_batch(&format!(
-                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(49 * 3600) WHERE id IN ({running}, {idle});"
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(49 * 3600) WHERE id IN ({running}, {also_running}, {idle});"
             ))
             .unwrap();
 
-        let gone = s.expire_conversations(48 * 3600, &[running]).unwrap();
+        let gone = s.expire_conversations(48 * 3600, &[running, also_running]).unwrap();
 
         assert_eq!(gone, 1, "only the thread with nothing running in it");
         let left: Vec<i64> = s.threads_of(a).unwrap().iter().map(|t| t.id).collect();
-        assert_eq!(left, vec![running]);
+        assert_eq!(left.len(), 2, "both running threads survive");
+        assert!(left.contains(&running));
+        assert!(left.contains(&also_running));
         // The transcript matters as much as the row: the orphan sweep in the
         // same transaction would take the messages even if the row survived.
         assert_eq!(s.conversation_messages(running, 10).unwrap().len(), 1, "the running thread lost its transcript");
+        assert_eq!(
+            s.conversation_messages(also_running, 10).unwrap().len(),
+            1,
+            "the second running thread lost its transcript"
+        );
     }
 
     #[test]

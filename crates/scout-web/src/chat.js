@@ -365,13 +365,31 @@ function start() {
     if (document.hidden) return
     const rows = threadsEl.children
     if (rows.length !== lastList.length) return
+    let anyExpired = false
     for (let i = 0; i < lastList.length; i++) {
       const whenEl = rows[i].querySelector('.when')
       if (!whenEl) continue
-      const when = whenLabel(lastList[i])
+      const thread = lastList[i]
+      const when = whenLabel(thread)
       whenEl.textContent = when.text
       whenEl.className = when.expiring ? 'when expiring' : 'when'
+      // `whenLabel`'s countdown pins at "expires in 1h" once the window is
+      // under an hour — `Math.max(1, ...)` never goes lower — so a tab left
+      // open past the real deadline would keep reading a thread as an hour
+      // from gone, forever. The thread is deleted server-side the moment
+      // its age actually reaches 48h; catching that here and refreshing
+      // once is what drops the row instead of leaving a countdown that has
+      // stopped meaning anything.
+      if (!anyExpired && when.text.startsWith('expires in 1h')) {
+        const age = Date.now() - Date.parse(thread.updated_at)
+        if (age >= EXPIRES_AFTER_MS) anyExpired = true
+      }
     }
+    // One refresh for the whole pass, not per row: several threads can
+    // cross at once, and this is still the narrow update described above
+    // for every row that has not — only a row that has just gone triggers
+    // the fetch that redraws the list.
+    if (anyExpired) refreshThreads().catch(() => {})
   }
 
   setInterval(tickWhenLabels, WHEN_TICK_MS)

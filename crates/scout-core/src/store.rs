@@ -1353,10 +1353,12 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// `None` means "no title yet" as much as "not yours or gone" — this is
+    /// a read accessor, not something to base a not-found decision on.
     pub fn thread_title(&self, account_id: i64, conversation_id: i64) -> Result<Option<String>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT title FROM conversations WHERE id = ? AND account_id = ?",
+            "SELECT title FROM conversations WHERE id = ? AND account_id = ? AND scope = 'direct'",
         )?;
         let row: Option<Option<String>> = stmt
             .query_map(params![conversation_id, account_id], |r| r.get(0))?
@@ -1369,7 +1371,7 @@ impl Store {
     pub fn set_thread_title(&self, account_id: i64, conversation_id: i64, title: &str) -> Result<bool> {
         let conn = self.conn();
         let n = conn.execute(
-            "UPDATE conversations SET title = ? WHERE id = ? AND account_id = ?",
+            "UPDATE conversations SET title = ? WHERE id = ? AND account_id = ? AND scope = 'direct'",
             params![title, conversation_id, account_id],
         )?;
         Ok(n > 0)
@@ -1387,22 +1389,29 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// `direct` only: a group thread can never be pinned, from anywhere — a
+    /// pinned thread is exempt from expiry forever, and a group thread has no
+    /// sidebar row to unpin it from.
     pub fn set_thread_pinned(&self, account_id: i64, conversation_id: i64, pinned: bool) -> Result<bool> {
         let conn = self.conn();
         let n = conn.execute(
-            "UPDATE conversations SET pinned = ? WHERE id = ? AND account_id = ?",
+            "UPDATE conversations SET pinned = ? WHERE id = ? AND account_id = ? AND scope = 'direct'",
             params![pinned, conversation_id, account_id],
         )?;
         Ok(n > 0)
     }
 
-    /// The thread and its messages, in one transaction. Owner-checked.
+    /// The thread and its messages, in one transaction. Owner-checked. Rows
+    /// already queued in `outbox` for this thread are deliberately not swept
+    /// — the outbox has no conversation id, only turn keys the transcript
+    /// can mint — so a mirror message enqueued before the delete may still
+    /// arrive.
     pub fn delete_conversation(&self, account_id: i64, conversation_id: i64) -> Result<bool> {
         let conn = self.conn();
         conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<bool> {
             let owned = conn.execute(
-                "DELETE FROM conversations WHERE id = ? AND account_id = ?",
+                "DELETE FROM conversations WHERE id = ? AND account_id = ? AND scope = 'direct'",
                 params![conversation_id, account_id],
             )?;
             if owned == 0 {
@@ -5051,6 +5060,12 @@ CREATE TABLE conversations (
         assert_eq!(rows[0].title.as_deref(), Some("wasmiddel per kilo"));
         assert!(!rows[0].pinned);
         assert!(rows[0].updated_at.ends_with('Z'), "not RFC 3339 UTC: {}", rows[0].updated_at);
+        let stamped = chrono::NaiveDateTime::parse_from_str(&rows[0].updated_at, "%Y-%m-%dT%H:%M:%SZ")
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let skew = (chrono::Utc::now().timestamp() - stamped).abs();
+        assert!(skew < 5, "updated_at not close to now: skew {skew}s");
     }
 
     #[test]
@@ -5073,6 +5088,13 @@ CREATE TABLE conversations (
         let stranger = s.account_for_telegram(22).unwrap();
         assert!(!s.open_conversation(stranger, first).unwrap(), "opened someone else's thread");
         assert!(!s.open_conversation(a, 999_999).unwrap(), "opened a thread that does not exist");
+
+        let group = s.start_conversation(a, "telegram:-100").unwrap();
+        assert!(!s.open_conversation(a, group).unwrap(), "opened a group thread as a browser thread");
+        assert!(!s.set_thread_pinned(a, group, true).unwrap(), "pinned a group thread, which would make it immortal");
+        assert!(!s.set_thread_title(a, group, "x").unwrap(), "renamed a group thread from the browser");
+        assert!(!s.delete_conversation(a, group).unwrap(), "deleted a group thread from the browser");
+        assert_eq!(s.thread_title(a, group).unwrap(), None);
     }
 
     #[test]

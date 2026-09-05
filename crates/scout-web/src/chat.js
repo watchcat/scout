@@ -613,7 +613,12 @@ function start() {
   // status line and the answer bubble, and stops on the one `end` frame
   // every stream carries. `EventSource` cannot POST, so the stream is
   // parsed by hand off the `fetch` body reader instead.
-  async function runMessage(text) {
+  //
+  // `retract` takes the "You" bubble the submit handler already appended
+  // back off the page. It is called only where the words go back into the
+  // composer, so that the message the reader is about to send again is in
+  // one place rather than two — see the 422 arm.
+  async function runMessage(text, retract = () => {}) {
     // The thread this run belongs to. A reader who switches away mid-stream
     // is no longer looking at this conversation, and its tokens must not be
     // painted into the one they moved to. The run carries on server-side
@@ -679,7 +684,13 @@ function start() {
       if (res.status === 422) {
         refused = true
         // Same: a reload is the advice, and a reader who takes it should
-        // find what they typed still in front of them.
+        // find what they typed still in front of them. Nothing here redraws
+        // the transcript, though — unlike the 404 above, which hands over to
+        // `vanished` — so the bubble the submit handler appended has to come
+        // off by hand, or the words sit twice on the page: once in the
+        // composer they are going back into, and once in a turn that was
+        // never asked.
+        retract()
         textEl.value = text
         fitComposer()
         showNotice('This page is out of date. Reload to keep going.')
@@ -798,11 +809,18 @@ function start() {
       // A box grown to five lines must shrink back, or it sits tall and
       // empty over the answer it just asked for.
       fitComposer()
-      turnsEl.append(turnElement('You', text))
+      // Held rather than appended and forgotten: a send the server refuses
+      // outright never became a turn, and `runMessage` takes the bubble back
+      // off in the arm that puts the words back in the composer.
+      const youLi = turnElement('You', text)
+      turnsEl.append(youLi)
       // Unconditional, unlike the answer: sending is an act that means "show
       // me", so it is not content arriving under a reader who moved away.
       turnsEl.scrollTop = turnsEl.scrollHeight
-      await runMessage(text)
+      // `remove` on a node already detached — a reader who switched threads
+      // mid-send had the transcript replaced under them — is a no-op, so
+      // this needs no guard of its own.
+      await runMessage(text, () => youLi.remove())
     } finally {
       running = false
       sendButton.disabled = false

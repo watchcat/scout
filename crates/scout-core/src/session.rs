@@ -330,6 +330,16 @@ pub async fn threads(core: &Core, account_id: i64) -> anyhow::Result<Vec<scout_a
     .await
 }
 
+/// One thread's name, for a caller that wants the name and not the list.
+pub async fn thread_title(
+    core: &Core,
+    account_id: i64,
+    conversation_id: i64,
+) -> anyhow::Result<Option<String>> {
+    let store = core.store();
+    crate::core::blocking(move || store.thread_title(account_id, conversation_id)).await
+}
+
 /// Switches to a thread: bumps it to current and returns its transcript.
 /// `None` when the account has no such thread.
 pub async fn open_thread(

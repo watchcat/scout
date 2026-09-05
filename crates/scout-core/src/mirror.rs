@@ -158,6 +158,14 @@ pub async fn queue_thread(
 ///
 /// Idempotent for the same reason `queue_thread` is: the keys are the
 /// thread's own turns.
+///
+/// The id is checked against the account here rather than trusted from the
+/// caller. `queue_thread` resolves the thread itself and so cannot name one
+/// that is not the reader's; this one takes an id, and an id is a thing a
+/// caller can get wrong — a stale one held across a run, or one that simply
+/// belongs to somebody else. Getting it wrong would send a stranger's
+/// transcript to this account's phone, so a thread that is not the
+/// account's queues nothing at all.
 pub async fn queue_conversation(
     core: &Core,
     account_id: i64,
@@ -165,8 +173,13 @@ pub async fn queue_conversation(
     conversation_id: i64,
 ) -> anyhow::Result<usize> {
     let store = core.store();
-    let turns =
-        crate::core::blocking(move || crate::session::transcript_of(&store, conversation_id)).await?;
+    let turns = crate::core::blocking(move || {
+        if !store.owns_thread(account_id, conversation_id)? {
+            return Ok(Vec::new());
+        }
+        crate::session::transcript_of(&store, conversation_id)
+    })
+    .await?;
     enqueue(core, account_id, address, conversation_id, &turns, false).await
 }
 
@@ -433,6 +446,29 @@ mod tests {
             vec!["> cheapest beans".to_string(), "here are three".to_string()],
             "the newest thread was mirrored instead of the one that ran"
         );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_that_is_not_the_accounts_is_not_queued() {
+        // The id arrives from a caller, and the only thing that had checked
+        // it was the handler that happened to be calling — so a second
+        // caller with a stale or guessed id would mirror a stranger's
+        // transcript to this account's phone.
+        let (core, _dir) = test_core().await;
+        let a = crate::session::account_of(&core, crate::ids::TelegramId(4242)).await.unwrap();
+        let b = crate::session::account_of(&core, crate::ids::TelegramId(5353)).await.unwrap();
+        let theirs = crate::session::seed_exchange_for_tests(
+            &core, a, "direct", "cheapest beans", "here are three",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            queue_conversation(&core, b, "12345", theirs).await.unwrap(),
+            0,
+            "a stranger's thread was queued for this account's phone"
+        );
+        assert!(pending(&core, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

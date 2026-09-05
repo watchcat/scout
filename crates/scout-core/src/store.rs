@@ -2394,7 +2394,17 @@ impl Store {
 
     pub fn display_names(&self) -> Result<BTreeMap<i64, String>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT account_id, display_name FROM users")?;
+        // The Telegram name when there is one; otherwise the email the
+        // account signed in with, so a web-only account is not a dash in
+        // `/stat`. An account with neither is left out, as before.
+        let mut stmt = conn.prepare(
+            "SELECT account_id, display_name FROM users
+             UNION ALL
+             SELECT account_id, min(external_id) FROM identities
+             WHERE kind = 'email'
+               AND account_id NOT IN (SELECT account_id FROM users)
+             GROUP BY account_id",
+        )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
@@ -5489,5 +5499,25 @@ CREATE TABLE conversations (
         assert_eq!(s.expire_conversations(48 * 3600, &[]).unwrap(), 0, "no conversation expired");
 
         assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "orphaned messages were not swept");
+    }
+
+    #[test]
+    fn a_web_only_account_is_named_by_its_email_in_the_stats() {
+        // Display names come from Telegram. An account that only ever
+        // signed in by email had no row there and showed as a dash.
+        let (s, _dir) = test_store();
+        let by_email = s.account_for_identity("email", "ada@example.com").unwrap();
+        let by_telegram = s.account_for_telegram(11).unwrap();
+        s.remember_user(by_telegram, "Grace").unwrap();
+        // Both ways in: the Telegram name wins, the email is the fallback.
+        let both = s.account_for_telegram(22).unwrap();
+        s.remember_user(both, "Ada L").unwrap();
+        s.link_identity(both, "email", "ada.l@example.com").unwrap();
+
+        let names = s.display_names().unwrap();
+
+        assert_eq!(names.get(&by_email).map(String::as_str), Some("ada@example.com"));
+        assert_eq!(names.get(&by_telegram).map(String::as_str), Some("Grace"));
+        assert_eq!(names.get(&both).map(String::as_str), Some("Ada L"));
     }
 }

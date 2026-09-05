@@ -1101,6 +1101,14 @@ mod tests {
         for id in ["turns", "status", "notice", "ask", "text", "send", "reset", "threads", "menu", "side"] {
             assert!(page.contains(&format!(r#"id="{id}""#)), "the client binds to #{id}: {page}");
         }
+
+        // Present is not enough: the reset control used to live in the
+        // header, and a stray edit that moves it back would leave every
+        // assertion above passing while the sidebar lost its first control.
+        let side = page.find(r#"id="side""#).expect("the sidebar");
+        let reset = page.find(r#"id="reset""#).expect("the reset form");
+        let close = page.find("</aside>").expect("the sidebar closes");
+        assert!(side < reset && reset < close, "New thread belongs in the sidebar, not the header");
     }
 
     #[tokio::test]

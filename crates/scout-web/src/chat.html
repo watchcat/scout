@@ -27,7 +27,7 @@
   a{color:var(--blue); text-decoration:none}
   a:hover{text-decoration:underline}
   header{padding:24px 0 14px; display:flex; align-items:center; gap:14px;
-    flex:none; justify-content:space-between}
+    flex:none}
   .mark{display:flex; align-items:center; gap:12px; color:var(--cyan,#2aa198)}
   .mark .logo{width:32px; height:32px; flex:none}
   .mark .word{font-size:18px; font-weight:700; color:var(--base2)}
@@ -67,13 +67,14 @@
   .status.long{-webkit-mask-image:linear-gradient(to bottom, transparent, #000 30px);
     mask-image:linear-gradient(to bottom, transparent, #000 30px)}
   /* One treatment for every box that scrolls: the transcript, the
-     narration, and the composer once it has grown past its cap.
+     narration, the sidebar's list of threads, and the composer once it has
+     grown past its cap.
      `color-scheme` above only swaps the browser's default light bar for
      its default grey one — this puts it in the page's own palette.
      `#0d4a5a` is the line the composer is already drawn with, so the
      thumb reads as the same structural colour rather than a new one.
      Track transparent: on a page this dark a track is just a seam. */
-  .turns,.status,.ask textarea{scrollbar-width:thin;
+  .turns,.status,.side,.ask textarea{scrollbar-width:thin;
     scrollbar-color:#0d4a5a transparent}
   .notice{font-size:13.5px; color:var(--red); margin:0 0 10px; flex:none}
   .ask{flex:none; display:flex; align-items:flex-end; gap:8px;
@@ -89,8 +90,8 @@
     border:0; border-radius:11px; cursor:pointer}
   #send:hover{background:#3196d8}
   .controls{display:flex; align-items:center; gap:8px}
-  /* Shares the reset control's look so the header reads as one row of
-     controls rather than two unrelated things. */
+  /* One control vocabulary: the sidebar's New thread and the header's
+     mirror toggle are drawn the same. */
   .reset button,#mirror{background:transparent; color:var(--base01);
     border:1px solid var(--base01); border-radius:8px; font:inherit;
     font-size:13px; font-weight:600; padding:6px 12px; cursor:pointer}
@@ -111,42 +112,71 @@
   .main{display:flex; flex-direction:column; min-height:0; flex:1}
   /* The header gained a third child (the menu button, hidden on desktop),
      and `space-between` would have floated the logo into the middle of the
-     row on a phone. An auto margin pins it beside the menu instead. */
+     row on a phone. An auto margin here pins the logo beside the menu and
+     pushes the controls to the far end, which is why the header no longer
+     asks for `space-between` at all. */
   .mark{margin-right:auto}
-  .side{min-height:0; overflow-y:auto; padding:4px 12px 16px 0; border-right:1px solid #0d4a5a;
-    scrollbar-width:thin; scrollbar-color:#0d4a5a transparent}
+  .side{min-height:0; overflow-y:auto; padding:4px 12px 16px 0; border-right:1px solid #0d4a5a}
   .side .reset{margin:0 0 10px}
   .side .reset button{width:100%}
   .threads{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px}
   /* `min-width:0` again: without it a long title refuses to shrink and the
      row pushes the whole sidebar wider than its track. */
-  .threads li{display:flex; align-items:center; gap:6px; padding:8px 10px; border-radius:10px;
-    font-size:14px; color:var(--base0); cursor:pointer; min-width:0}
+  .threads li{display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:8px 10px;
+    border-radius:10px; font-size:14px; color:var(--base0); cursor:pointer; min-width:0}
   .threads li:hover{background:var(--base02)}
   .threads li.current{background:var(--base02); color:var(--base2)}
-  .threads .title{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  /* The title is a real `<button>`, so it is reachable by keyboard for
+     free — and so it needs the browser's button chrome stripped back to
+     the row's own type and colour before the ellipsis rules can bite. */
+  .threads .title{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    background:transparent; border:0; color:inherit; font:inherit; text-align:left;
+    padding:0; cursor:pointer}
   /* A thread nobody has named yet says so in the muted, italic voice the
      page uses for absence, so it does not read as a thread called "New
      thread". */
   .threads .title.unnamed{color:var(--base01); font-style:italic}
-  /* Renaming happens in place: the input takes the title's box so the row
-     does not jump when it appears. */
-  .threads .title input{width:100%; font:inherit; background:var(--base03); color:var(--base2);
+  /* Renaming happens in place: the input replaces the title button inside
+     the row, so the row does not jump when it appears. Matched on the `li`
+     rather than on `.title`, because the input is the button's replacement
+     and not its child. */
+  .threads li input{flex:1; min-width:0; font:inherit; background:var(--base03); color:var(--base2);
     border:1px solid var(--blue); border-radius:6px; padding:2px 6px}
-  .threads .when{font-size:12px; color:var(--base01); flex:none}
-  /* A thread about to age out is the one piece of the row worth alarming
-     about, so it borrows the notice colour. */
-  .threads .when.expiring{color:var(--red)}
-  .threads .pin{flex:none; font-size:12px; color:var(--blue)}
+  .threads .when{font-size:12px; color:var(--base0); flex:none}
+  /* A thread about to age out is the one piece of the row meant to alarm,
+     so it is the one that has to be legible: `--red` on `--base02` is
+     2.8:1, which fails at 12px. A lighter red and a heavier weight carry
+     the same warning and can actually be read. It also takes a line of its
+     own under the row, so a warning long enough to be a sentence never
+     competes with the title for the column's width. */
+  .threads .when.expiring{color:#ff6e67; font-weight:600; flex:0 0 100%; order:1}
+  .threads .pin{flex:none; display:flex; color:var(--blue)}
+  /* Pointing at a row trades its ambient metadata for its controls, the
+     way a mail list does: 28px targets and a title cannot both fit a
+     240px column, and once you are acting on a row its name and its
+     buttons are what you need. The pin mark goes for the same reason it
+     can — the pin toggle in the tools, pressed, says the same thing in
+     the same place. The expiry warning stays: it has its own line. */
+  .threads li:hover .pin,.threads li.current .pin,
+  .threads li:hover .when:not(.expiring),.threads li.current .when:not(.expiring){display:none}
   /* Controls show on hover and on the current row. Touch has no hover,
      so the current row is the row a phone can act on. */
-  .threads .tools{display:none; gap:2px; flex:none}
+  .threads .tools{display:none; gap:4px; flex:none}
   .threads li:hover .tools,.threads li.current .tools{display:flex}
+  /* 28px, not the 17px these were: on touch the current row's tools are
+     the only way to act on a thread, and delete sits right beside
+     auto-name — a pitch that small makes losing a thread a slip of the
+     thumb. */
   .threads .tools button{background:transparent; border:0; color:var(--base01); cursor:pointer;
-    padding:2px 4px; font-size:13px; line-height:1}
+    min-width:28px; min-height:28px; padding:6px; font-size:13px; line-height:1;
+    display:flex; align-items:center; justify-content:center}
   .threads .tools button:hover{color:var(--base1)}
   .threads .tools button[aria-pressed="true"]{color:var(--blue)}
-  .menu{display:none; background:transparent; border:0; color:var(--base1); cursor:pointer; padding:4px}
+  /* Every control the sidebar reaches by keyboard says so, inset so the
+     ring is not clipped by the scrolling box it sits in. */
+  .threads .title:focus-visible,.threads .tools button:focus-visible,.menu:focus-visible{
+    outline:2px solid var(--blue); outline-offset:-2px}
+  .menu{display:none; background:transparent; border:0; color:var(--base1); cursor:pointer; padding:8px}
   /* Below the two-column threshold the sidebar becomes a drawer: it stacks
      above the transcript rather than beside it, is out of the way until the
      menu button opens it, and is capped so it can never take the screen the
@@ -162,7 +192,8 @@
 <body>
 <div class="wrap">
 <header>
-  <button id="menu" type="button" class="menu" aria-label="Threads" aria-expanded="false">
+  <button id="menu" type="button" class="menu" aria-label="Threads"
+          aria-controls="side" aria-expanded="false">
     <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
       <path d="M4 7h16M4 12h16M4 17h16" fill="none" stroke="currentColor"
             stroke-width="2.2" stroke-linecap="round"/>

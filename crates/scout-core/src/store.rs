@@ -1441,11 +1441,21 @@ impl Store {
     /// Also sweeps messages whose conversation is already gone. A run that
     /// ends after its thread was deleted still writes its messages —
     /// `replace_messages` inserts regardless — and nothing else would ever
-    /// collect them.
+    /// collect them. As with `delete_conversation`, rows already queued in
+    /// `outbox` for an expired thread are not swept — the outbox has no
+    /// conversation id — so a mirror message enqueued before expiry may
+    /// still arrive.
     pub fn expire_conversations(&self, older_than_secs: i64) -> Result<usize> {
         let conn = self.conn();
         conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<usize> {
+            // This DELETE targets the same rows the orphan sweep below would
+            // eventually catch, on purpose: it keeps expiry correct without
+            // depending on the sweep's predicate staying "any conversation
+            // gone". If that predicate is ever narrowed — say to orphans
+            // older than an hour, so a live run's save can't race it — this
+            // explicit delete is what stops expired threads' messages from
+            // leaking through instead.
             conn.execute(
                 "DELETE FROM messages WHERE conversation_id IN (
                      SELECT id FROM conversations

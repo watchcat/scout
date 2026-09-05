@@ -145,6 +145,31 @@ pub async fn queue_thread(
     thread_into_outbox(core, account_id, address, false).await
 }
 
+/// Queues one named thread, whatever the reader's current one has become.
+///
+/// The difference from `queue_thread` is *when* the caller knows the id.
+/// A backfill is deciding "send me what I am looking at now", so resolving
+/// the current thread is the right question. A finished run is not: it
+/// started on a particular conversation and takes minutes, and by the time
+/// it returns the account's current thread may be a different one — a
+/// Telegram message arrived, another tab pressed New thread, the reader
+/// deleted this one. Re-resolving there would mirror somebody else's
+/// transcript to the phone, under the answer the reader just read.
+///
+/// Idempotent for the same reason `queue_thread` is: the keys are the
+/// thread's own turns.
+pub async fn queue_conversation(
+    core: &Core,
+    account_id: i64,
+    address: &str,
+    conversation_id: i64,
+) -> anyhow::Result<usize> {
+    let store = core.store();
+    let turns =
+        crate::core::blocking(move || crate::session::transcript_of(&store, conversation_id)).await?;
+    enqueue(core, account_id, address, conversation_id, &turns, false).await
+}
+
 /// Records the reader's current thread as already shown to them.
 ///
 /// What the Telegram channel calls after it has delivered an answer: the
@@ -378,6 +403,36 @@ mod tests {
         assert_eq!(queue_thread(&core, account_id, "4242").await.unwrap(), 2);
         assert_eq!(queue_thread(&core, account_id, "4242").await.unwrap(), 0);
         assert_eq!(pending(&core, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_thread_that_ran_is_queued_and_not_whichever_is_newest_now() {
+        // The web handler queues after the run returns, and by then "the
+        // current thread" can have moved on: Telegram started one, another
+        // tab pressed New thread, the reader deleted this one. Re-resolving
+        // by account at that point mirrors a different conversation's
+        // transcript to the phone, under the answer the reader just read.
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        let older = crate::session::seed_exchange_for_tests(
+            &core, account_id, "direct", "cheapest beans", "here are three",
+        )
+        .await
+        .unwrap();
+        crate::session::seed_exchange_for_tests(&core, account_id, "direct", "cheapest hubs", "here are two")
+            .await
+            .unwrap();
+
+        assert_eq!(queue_conversation(&core, account_id, "4242", older).await.unwrap(), 2);
+        let bodies: Vec<String> =
+            pending(&core, 10).await.unwrap().into_iter().map(|p| p.body).collect();
+        assert_eq!(
+            bodies,
+            vec!["> cheapest beans".to_string(), "here are three".to_string()],
+            "the newest thread was mirrored instead of the one that ran"
+        );
     }
 
     #[tokio::test]

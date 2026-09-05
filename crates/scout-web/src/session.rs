@@ -38,6 +38,11 @@ fn sign(key: &[u8], payload: &str) -> String {
 ///
 /// The nonce makes two sessions minted in the same second for the same
 /// account differ, so one cannot be recognised as a copy of the other.
+/// How long a sign-in lasts. The form token below lives exactly as long,
+/// because a page holds one token from load and a shorter one means a
+/// tab left open stops working while the session it belongs to is fine.
+pub const SESSION_TTL_SECS: i64 = 30 * 24 * 3600;
+
 pub fn mint(key: &[u8], account_id: i64, ttl_secs: i64) -> String {
     let expires = chrono::Utc::now().timestamp() + ttl_secs;
     let nonce: u64 = rand::random();
@@ -128,7 +133,11 @@ pub fn csrf_ok(key: &[u8], value: &str) -> bool {
 /// check on `/sign-out` and `/account/link/email` for *everybody*, and the
 /// hidden field would be proving only that Scout exists.
 pub fn csrf_for(key: &[u8], account_id: i64) -> String {
-    mint(&csrf_key(key), account_id, 900)
+    // As long as the session, not fifteen minutes: the token is bound to
+    // the account and to the key, and the cookie's `SameSite=Lax` is the
+    // defence that does the work — a short life bought nothing and cost a
+    // phone left on the page every send after the first quarter hour.
+    mint(&csrf_key(key), account_id, SESSION_TTL_SECS)
 }
 
 /// True when this form token is ours, unexpired, and was minted for this
@@ -166,6 +175,22 @@ mod tests {
 
         // A different key is a different server.
         assert_eq!(verify(b"another key entirely", &minted), None);
+    }
+
+    #[test]
+    fn a_form_token_lives_as_long_as_the_session_it_belongs_to() {
+        // The chat page embeds one token at load and sends it with every
+        // POST. When it lived fifteen minutes, a phone left on the page
+        // failed every send after that with a 400 the page could only
+        // call "could not be reached".
+        let token = csrf_for(KEY, 42);
+        let expires: i64 = token.split('.').nth(1).unwrap().parse().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            expires - now >= SESSION_TTL_SECS - 60,
+            "a form token that dies before the session: {}s",
+            expires - now
+        );
     }
 
     #[test]

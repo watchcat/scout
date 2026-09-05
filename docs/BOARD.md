@@ -43,7 +43,7 @@ _(nothing)_
 
 ## Done
 
-- [x] 2026-09-05 — **Two things a web-only user ran into** (`web-only-users` merge): the page's form token now lives as long as the session, so a phone left on the chat keeps sending instead of failing every POST after 15 minutes; `/stat` names an account by its email when it has no Telegram name
+- [x] 2026-09-05 — **Two things a web-only user ran into** (`de08a65`): the page's form token now lives as long as the session, so a phone left on the chat keeps sending instead of failing every POST after 15 minutes; `/stat` names an account by its email when it has no Telegram name
 - [x] 2026-09-05 — **Web messages count in `/stat` and toward the daily cap** (`0157c4f`): one `log_request` in the web send path after the ownership check; a refused message still counts for nothing
 - [x] 2026-09-05 — **The whole thread on the page, and titles you can read** (`3a6a74e`): the message table is the full log and only the model's window is trimmed from it; rig's final response excludes the input history, so every save had been dropping earlier turns — follow-ups now really have context; pinned threads' logs are bounded at 2000 rows; sidebar titles are the biggest thing on their row, two lines, tools beneath on the current row
 - [x] 2026-09-05 — **Four cards from the board** (`80b1ad9`): the `/chat/reset` route is gone; a 422 takes its "You" bubble off the screen; expiry spares a thread with a run in flight, and a Telegram continuation that finds its thread gone starts a fresh one; the expiry countdown keeps ticking on an open tab

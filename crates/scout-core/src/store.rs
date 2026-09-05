@@ -939,6 +939,32 @@ fn move_rows(conn: &Connection, absorbed: i64, survivor: i64) -> Result<()> {
 }
 
 impl Store {
+    /// The connection, whatever happened to the last thread that held it.
+    ///
+    /// Every store call comes through here rather than unwrapping the lock
+    /// itself. A poisoned mutex means some earlier holder panicked; the
+    /// value it guards is a DuckDB connection that is whole whenever the
+    /// guard is not held, so there is nothing to protect anyone from — and
+    /// an unwrap would turn one panic into every later call panicking for
+    /// the life of the process, while `/healthz` kept saying ok.
+    ///
+    /// The one thing a panic can leave behind is an open transaction, which
+    /// DuckDB will not start another inside. It is rolled back on recovery;
+    /// when there is none the `ROLLBACK` errors, and that error is the
+    /// uninteresting one.
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        match self.conn.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.conn.clear_poison();
+                tracing::error!("the store's lock was poisoned by a panic; recovering");
+                let _ = guard.execute_batch("ROLLBACK");
+                guard
+            }
+        }
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path.as_ref())?;
         conn.execute_batch(MIGRATIONS)?;
@@ -954,18 +980,18 @@ impl Store {
     /// this database's size that is imperceptible; it is worth knowing because
     /// it scales with the file.
     pub(crate) fn backup_to(&self, path: &Path) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         backup_connection(&conn, path)
     }
 
     /// Highest migration step applied to this database.
     pub fn schema_version(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         Ok(conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?)
     }
 
     pub fn record_purchase(&self, account_id: i64, p: NewPurchase) -> Result<Purchase> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let id: i64 = conn.query_row(
             "INSERT INTO purchases (account_id, item, store, url, price, currency, notes, purchased_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
@@ -994,7 +1020,7 @@ impl Store {
         const SELECT: &str =
             "SELECT id, item, store, url, price, currency, notes, purchased_at FROM purchases";
         const ORDER: &str = "ORDER BY coalesce(purchased_at, '') DESC, id DESC LIMIT ?";
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut out = Vec::new();
         match term {
             Some(t) => {
@@ -1034,7 +1060,7 @@ impl Store {
         interval_days: i64,
         next_due: &str,
     ) -> Result<Reminder> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let id: i64 = conn.query_row(
             "INSERT INTO reminders (account_id, channel, address, item, interval_days, next_due)
              VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
@@ -1054,7 +1080,7 @@ impl Store {
 
     /// Active reminders for one user, soonest first.
     pub fn list_reminders(&self, account_id: i64) -> Result<Vec<Reminder>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, account_id, channel, address, item, interval_days, next_due FROM reminders
              WHERE account_id = ? AND active ORDER BY next_due ASC, id ASC",
@@ -1065,7 +1091,7 @@ impl Store {
 
     /// Returns true if an active reminder belonging to this user was cancelled.
     pub fn cancel_reminder(&self, account_id: i64, id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let n = conn.execute(
             "UPDATE reminders SET active = false WHERE id = ? AND account_id = ? AND active",
             params![id, account_id],
@@ -1075,7 +1101,7 @@ impl Store {
 
     /// All users' active reminders with next_due <= today (ISO date string).
     pub fn due_reminders(&self, today: &str) -> Result<Vec<Reminder>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, account_id, channel, address, item, interval_days, next_due FROM reminders
              WHERE active AND next_due <= ? ORDER BY next_due ASC, id ASC",
@@ -1086,7 +1112,7 @@ impl Store {
 
     /// Internal: id must come from a trusted source (the scheduler) — no owner check.
     pub fn set_next_due(&self, id: i64, next_due: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE reminders SET next_due = ? WHERE id = ?",
             params![next_due, id],
@@ -1096,7 +1122,7 @@ impl Store {
 
     /// Insert or overwrite one user-profile fact.
     pub fn upsert_fact(&self, account_id: i64, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO user_facts (account_id, key, value) VALUES (?, ?, ?)
              ON CONFLICT (account_id, key)
@@ -1108,7 +1134,7 @@ impl Store {
 
     /// One user's profile facts as (key, value), sorted by key.
     pub fn list_facts(&self, account_id: i64) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT key, value FROM user_facts WHERE account_id = ? ORDER BY key ASC")?;
         let rows = stmt.query_map(params![account_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -1117,7 +1143,7 @@ impl Store {
 
     /// Returns true if the fact existed and was removed.
     pub fn forget_fact(&self, account_id: i64, key: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let n = conn.execute(
             "DELETE FROM user_facts WHERE account_id = ? AND key = ?",
             params![account_id, key],
@@ -1132,7 +1158,7 @@ impl Store {
     pub const FLIGHT_SEARCH: &'static str = "flight_search";
 
     pub fn log_request(&self, account_id: i64, kind: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO request_log (account_id, kind) VALUES (?, ?)",
             params![account_id, kind],
@@ -1148,7 +1174,7 @@ impl Store {
         if name.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO users (account_id, display_name) VALUES (?, ?)
              ON CONFLICT (account_id)
@@ -1160,7 +1186,7 @@ impl Store {
 
     #[cfg(test)]
     fn log_request_at(&self, account_id: i64, kind: &str, at: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO request_log (account_id, kind, created_at) VALUES (?, ?, CAST(? AS TIMESTAMP))",
             params![account_id, kind, at],
@@ -1174,7 +1200,7 @@ impl Store {
     /// so they only ever see their own volume however many users share the
     /// bot.
     pub fn usage_stats_for(&self, cutoff: &str, account_id: i64) -> Result<Vec<(i64, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT account_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
              FROM request_log WHERE account_id = ? AND created_at >= CAST(? AS TIMESTAMP)
@@ -1190,7 +1216,7 @@ impl Store {
     /// the caller is in `Config::admin_user_ids` — the callers of this
     /// method are the whole access-control surface for cross-user data.
     pub fn usage_stats_all(&self, cutoff: &str) -> Result<Vec<(i64, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT account_id, strftime(created_at, '%Y-%m-%d') AS day, count(*)
              FROM request_log WHERE created_at >= CAST(? AS TIMESTAMP)
@@ -1212,7 +1238,7 @@ impl Store {
         scope: &str,
         ttl_secs: i64,
     ) -> Result<Option<(i64, bool)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         // The cast is load-bearing: `current_timestamp` is TIMESTAMPTZ and
         // DuckDB has no `TIMESTAMPTZ - INTERVAL` overload.
         let mut stmt = conn.prepare(
@@ -1231,7 +1257,7 @@ impl Store {
     }
 
     pub fn start_conversation(&self, account_id: i64, scope: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         Ok(conn.query_row(
             "INSERT INTO conversations (id, account_id, scope)
              VALUES (nextval('conversations_id_seq'), ?, ?) RETURNING id",
@@ -1242,7 +1268,7 @@ impl Store {
 
     /// Marks a conversation as spoken in, so its TTL runs from now.
     pub fn touch_conversation(&self, conversation_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE conversations SET updated_at = now() WHERE id = ?",
             params![conversation_id],
@@ -1252,7 +1278,7 @@ impl Store {
 
     /// The last `limit` messages, oldest first — the order a provider wants.
     pub fn conversation_messages(&self, conversation_id: i64, limit: usize) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT body FROM (
                  SELECT body, position FROM messages WHERE conversation_id = ?
@@ -1270,7 +1296,7 @@ impl Store {
     /// from the front: what is stored has to be what the agent will actually
     /// be sent next time, not a growing log that disagrees with it.
     pub fn replace_messages(&self, conversation_id: i64, bodies: &[String]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<()> {
             conn.execute(
@@ -1323,7 +1349,7 @@ impl Store {
         turn_key: &str,
         delivered: bool,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let known: i64 = conn.query_row(
             "SELECT count(*) FROM outbox WHERE account_id = ? AND channel = ? AND turn_key = ?",
             params![account_id, channel, turn_key],
@@ -1353,7 +1379,7 @@ impl Store {
     /// one delivered late. Rows past [`MIRROR_ATTEMPTS`] are left behind
     /// rather than returned.
     pub fn pending_mirror(&self, channel: &str, limit: usize) -> Result<Vec<PendingMirror>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, account_id, address, body FROM outbox
              WHERE channel = ? AND sent_at IS NULL AND attempts < ?
@@ -1373,7 +1399,7 @@ impl Store {
     /// It arrived. The row stays as the ledger entry that stops it being
     /// sent again by a later backfill.
     pub fn mark_mirror_sent(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute("UPDATE outbox SET sent_at = now() WHERE id = ?", params![id])?;
         Ok(())
     }
@@ -1387,7 +1413,7 @@ impl Store {
     /// and on will not recover it. That is a thing a human should be able
     /// to find in a log afterwards.
     pub fn mark_mirror_failed(&self, id: i64) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?", params![id])?;
         let attempts: i64 =
             conn.query_row("SELECT attempts FROM outbox WHERE id = ?", params![id], |r| r.get(0))?;
@@ -1395,7 +1421,7 @@ impl Store {
     }
 
     pub fn mirror_enabled(&self, account_id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let n: i64 = conn.query_row(
             "SELECT count(*) FROM mirrored_accounts WHERE account_id = ?",
             params![account_id],
@@ -1407,7 +1433,7 @@ impl Store {
     /// Presence is the setting, so turning it on twice is not an error and
     /// turning it off is a delete.
     pub fn set_mirror(&self, account_id: i64, on: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         if on {
             conn.execute(
                 "INSERT INTO mirrored_accounts (account_id) SELECT ?
@@ -1431,7 +1457,7 @@ impl Store {
     /// Both branches run under the same lock, so two updates arriving from
     /// the same person cannot mint two accounts for them.
     pub fn account_for_identity(&self, kind: &'static str, external_id: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT account_id FROM identities WHERE kind = ? AND external_id = ?")?;
         let found: Option<i64> =
@@ -1463,7 +1489,7 @@ impl Store {
         kind: &'static str,
         external_id: &str,
     ) -> Result<LinkOutcome> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT account_id FROM identities WHERE kind = ? AND external_id = ?")?;
         let owner: Option<i64> =
@@ -1515,7 +1541,7 @@ impl Store {
     /// page that renders this list writes it out in order, and without
     /// this it reads "Signed in with Telegram, Telegram."
     pub fn identity_kinds(&self, account_id: i64) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT kind FROM identities WHERE account_id = ? ORDER BY kind ASC",
         )?;
@@ -1531,7 +1557,7 @@ impl Store {
     /// is skipped rather than failing the call — one unreadable identity
     /// must not make an account impossible to ask about.
     pub fn telegram_ids(&self, account_id: i64) -> Result<Vec<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT external_id FROM identities WHERE account_id = ? AND kind = 'telegram'",
         )?;
@@ -1551,7 +1577,7 @@ impl Store {
     /// reported standing by calling `claim_seat` would seat a queued
     /// visitor the moment they looked at it, and spend a seat on a `GET`.
     pub fn is_member(&self, account_id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT revoked_at IS NULL FROM members WHERE account_id = ?")?;
         let standing: Option<bool> =
@@ -1599,7 +1625,7 @@ impl Store {
         ttl_secs: i64,
     ) -> Result<()> {
         let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO login_tokens (token_hash, email, account_id, expires_at)
              VALUES (?, ?, ?, ?)",
@@ -1627,7 +1653,7 @@ impl Store {
     /// also be correct, because then all three writers of a timestamp in
     /// this table are the same line and there is nothing to compare.
     pub fn consume_login_token(&self, token_hash: &str) -> Result<TokenOutcome> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT email, account_id, consumed_at IS NOT NULL,
                     expires_at < (current_timestamp AT TIME ZONE 'UTC')::TIMESTAMP
@@ -1674,7 +1700,7 @@ impl Store {
     /// documented on `requests_today` as having caused a real bug.
     pub fn prune_login_tokens(&self, keep_secs: i64) -> Result<usize> {
         let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(keep_secs);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         Ok(conn.execute(
             "DELETE FROM login_tokens WHERE expires_at < ?",
             params![cutoff.to_string()],
@@ -1696,7 +1722,7 @@ impl Store {
     /// which wants the whole waitlist at once. A run that has to decide
     /// whether it can honour a reminder needs to ask about one person.
     pub fn delivery_address(&self, account_id: i64, channel: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT address FROM deliveries WHERE account_id = ? AND channel = ?",
         )?;
@@ -1710,7 +1736,7 @@ impl Store {
     /// A user id and a chat id are the same number in a private chat and
     /// different in a group, so the chat is stored rather than derived.
     pub fn note_delivery(&self, account_id: i64, channel: &str, address: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO deliveries (account_id, channel, address) VALUES (?, ?, ?)
              ON CONFLICT (account_id, channel)
@@ -1723,7 +1749,7 @@ impl Store {
     /// Everyone the bot could announce something to on a channel, as
     /// (account, address).
     pub fn broadcast_targets(&self) -> Result<Vec<(i64, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT account_id, CAST(address AS BIGINT) FROM deliveries
              WHERE channel = 'telegram' ORDER BY account_id ASC",
@@ -1740,7 +1766,7 @@ impl Store {
     /// would put a database read in front of every message from every
     /// stranger, which is the cost this set exists to avoid.
     pub fn active_members(&self) -> Result<Vec<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT CAST(i.external_id AS BIGINT)
              FROM members m
@@ -1759,7 +1785,7 @@ impl Store {
     /// press START at the same moment. There is no counter to drift from
     /// the rows — seats used *is* `count(*)` over them.
     pub fn claim_seat(&self, account_id: i64, code: &str) -> Result<Claim> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
 
         // Membership decides before the round does. Checking the round
         // first would let a revoked person be told "that round is full",
@@ -1815,7 +1841,7 @@ impl Store {
     /// Opens a round. False when the name is already taken — reusing one
     /// would silently pool two rounds' seats under a single capacity.
     pub fn create_round(&self, code: &str, capacity: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let changed = conn.execute(
             "INSERT INTO invite_rounds (code, capacity) VALUES (?, ?)
              ON CONFLICT (code) DO NOTHING",
@@ -1826,7 +1852,7 @@ impl Store {
 
     /// Stops or resumes admitting. False when there is no such round.
     pub fn set_round_open(&self, code: &str, open: bool) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE invite_rounds SET open = ? WHERE code = ?",
             params![open, code],
@@ -1836,7 +1862,7 @@ impl Store {
 
     /// Every round, oldest first, with seats counted from the member rows.
     pub fn rounds(&self) -> Result<Vec<RoundStatus>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT r.code, r.capacity, r.open,
                     (SELECT count(*) FROM members m WHERE m.code = r.code)
@@ -1855,7 +1881,7 @@ impl Store {
 
     /// How many people are queued and have not been told about a new round.
     pub fn waiting_count(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT count(*) FROM waitlist WHERE invited_at IS NULL")?;
         let n: i64 = stmt.query_map([], |row| row.get(0))?.next().transpose()?.unwrap_or(0);
@@ -1866,7 +1892,7 @@ impl Store {
     /// removed). The row stays: the seat is spent, and moderation must not
     /// quietly reopen a round.
     pub fn revoke(&self, account_id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE members SET revoked_at = current_timestamp
              WHERE account_id = ? AND revoked_at IS NULL",
@@ -1885,7 +1911,7 @@ impl Store {
     /// consults `members` at all, so a seat that lands on one is a seat the
     /// round has lost for no reason. False when there was none to hand back.
     pub fn release_seat(&self, account_id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let changed =
             conn.execute("DELETE FROM members WHERE account_id = ?", params![account_id])?;
         Ok(changed > 0)
@@ -1894,7 +1920,7 @@ impl Store {
     /// Undoes a revoke. False when they were not revoked. Consumes no seat,
     /// for the same reason revoking returned none.
     pub fn restore(&self, account_id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE members SET revoked_at = NULL WHERE account_id = ? AND revoked_at IS NOT NULL",
             params![account_id],
@@ -1906,7 +1932,7 @@ impl Store {
     /// the new round is smaller than the queue, the people who have waited
     /// longest hear first.
     pub fn waitlist_to_invite(&self) -> Result<Vec<(i64, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         // An inner join, deliberately: someone with no recorded address
         // cannot be reached, and silently announcing to nobody would look
         // like a delivered invitation.
@@ -1924,7 +1950,7 @@ impl Store {
     /// Stamped per successful send, so re-running an announce reaches only
     /// the people the first run missed.
     pub fn mark_invited(&self, account_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE waitlist SET invited_at = current_timestamp WHERE account_id = ?",
             params![account_id],
@@ -1937,7 +1963,7 @@ impl Store {
     /// is an opt-out, and carrying them forward would mean retrying that
     /// same failure at every future round.
     pub fn forget_waitlist(&self, account_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute("DELETE FROM waitlist WHERE account_id = ?", params![account_id])?;
         Ok(())
     }
@@ -1959,7 +1985,7 @@ impl Store {
     /// offset. The container runs UTC, so the two agreed and production
     /// never saw it. The test suite did, nightly.
     pub fn requests_today(&self, account_id: i64) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT count(*) FROM request_log
              WHERE account_id = ? AND kind IN ('text', 'photo')
@@ -1995,7 +2021,7 @@ impl Store {
         kind: &str,
         account_id: Option<i64>,
     ) -> Result<BTreeMap<i64, i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT account_id, count(*) FROM request_log
              WHERE kind = ? AND created_at >= CAST(? AS TIMESTAMP)
@@ -2018,7 +2044,7 @@ impl Store {
     /// id is what let a display-name backfill call `get_chat` on an account
     /// id and mint a bogus identity from the result.
     pub fn accounts_missing_display_names(&self, limit: usize) -> Result<Vec<(i64, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT i.account_id, CAST(i.external_id AS BIGINT)
              FROM identities i
@@ -2031,7 +2057,7 @@ impl Store {
     }
 
     pub fn display_names(&self) -> Result<BTreeMap<i64, String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare("SELECT account_id, display_name FROM users")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
@@ -2053,7 +2079,7 @@ impl Store {
             anyhow::bail!("a trip needs a name — ask the traveller what to call it");
         }
         let key = name.to_lowercase();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let inserted = conn.execute(
             "INSERT INTO trips (account_id, name, name_key) VALUES (?, ?, ?)
              ON CONFLICT (account_id, name_key) DO NOTHING",
@@ -2095,7 +2121,7 @@ impl Store {
 
     /// Used by finalisation to record that a trip has been priced.
     pub fn set_trip_status(&self, trip_id: i64, status: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE trips SET status = ?, updated_at = current_timestamp WHERE id = ?",
             params![status, trip_id],
@@ -2105,7 +2131,7 @@ impl Store {
 
     pub fn find_trip(&self, account_id: i64, name: &str) -> Result<Option<Trip>> {
         let key = name.trim().to_lowercase();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT id FROM trips WHERE account_id = ? AND name_key = ?")?;
         let id: Option<i64> = stmt
@@ -2120,7 +2146,7 @@ impl Store {
 
     /// Every trip this user has, newest activity first.
     pub fn list_trips(&self, account_id: i64) -> Result<Vec<Trip>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT id FROM trips WHERE account_id = ? ORDER BY updated_at DESC, id DESC")?;
         let ids: Vec<i64> = stmt
@@ -2141,7 +2167,7 @@ impl Store {
         destination: &str,
         departure_date: &str,
     ) -> Result<Trip> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         // Checked before anything is written: without this, a bad trip_id
         // still passed the count query (as 0) and reached the INSERT below,
         // leaving a segment row for a trip that does not exist — and no read
@@ -2211,7 +2237,7 @@ impl Store {
         destination: Option<&str>,
         departure_date: Option<&str>,
     ) -> Result<(Trip, usize, bool)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let current = conn
             .query_row(
                 "SELECT origin, destination, departure_date FROM trip_segments
@@ -2252,7 +2278,7 @@ impl Store {
     }
 
     pub fn drop_segment(&self, trip_id: i64, position: i64) -> Result<Trip> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let removed = conn.execute(
             "DELETE FROM trip_segments WHERE trip_id = ? AND position = ?",
             params![trip_id, position],
@@ -2301,7 +2327,7 @@ impl Store {
         new: NewCandidate,
         decided: bool,
     ) -> Result<Trip> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         // Distinguished from the segment check below: "no such trip" and
         // "this trip has no segment N" point the caller at different fixes.
         let known: i64 = conn.query_row(
@@ -2385,7 +2411,7 @@ impl Store {
     }
 
     pub fn choose_candidate(&self, trip_id: i64, position: i64, candidate: i64) -> Result<Trip> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         // choose_within only checks the segment_candidates row, which a
         // deleted trip has none of — indistinguishable, from there, from a
         // numbering mistake on a trip that still exists. Checked here,
@@ -2405,7 +2431,7 @@ impl Store {
     }
 
     pub fn drop_candidate(&self, trip_id: i64, position: i64, candidate: i64) -> Result<Trip> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let removed = conn.execute(
             "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ? AND candidate = ?",
             params![trip_id, position, candidate],
@@ -2421,7 +2447,7 @@ impl Store {
     /// the state the caller wanted, not a failure.
     pub fn delete_trip(&self, account_id: i64, name: &str) -> Result<bool> {
         let key = name.trim().to_lowercase();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT id FROM trips WHERE account_id = ? AND name_key = ?")?;
         let mut ids = stmt.query_map(params![account_id, key], |row| row.get::<_, i64>(0))?;
@@ -4664,5 +4690,45 @@ CREATE TABLE segment_candidates (
         assert!(s.mirror_enabled(a).unwrap());
         s.set_mirror(a, false).unwrap();
         assert!(!s.mirror_enabled(a).unwrap());
+    }
+
+    /// The connection sits behind one mutex shared by every store call. A
+    /// panic while holding it poisons the lock, and a store that then
+    /// unwraps every `lock()` panics on every call for the life of the
+    /// process — with `/healthz` still saying ok, because liveness
+    /// deliberately does not look at the database.
+    #[test]
+    fn a_panic_under_the_lock_does_not_take_the_store_down() {
+        let (s, _dir) = test_store();
+        let conn = s.conn.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = conn.lock().unwrap();
+            panic!("something went wrong while the lock was held");
+        })
+        .join();
+
+        s.log_request(1, "text").expect("the store must recover from a poisoned lock");
+        assert_eq!(s.requests_today(1).unwrap(), 1);
+    }
+
+    /// A panic mid-transaction leaves that transaction open on the
+    /// connection, and DuckDB refuses to `BEGIN` inside one. Recovery has
+    /// to roll it back, or the first transactional write after the panic
+    /// fails for a reason nobody will connect to it.
+    #[test]
+    fn a_panic_inside_a_transaction_leaves_the_next_one_able_to_begin() {
+        let (s, _dir) = test_store();
+        let conversation = s.start_conversation(1, "direct").unwrap();
+        let conn = s.conn.clone();
+        let _ = std::thread::spawn(move || {
+            let held = conn.lock().unwrap();
+            held.execute_batch("BEGIN").unwrap();
+            panic!("something went wrong inside a transaction");
+        })
+        .join();
+
+        s.replace_messages(conversation, &["{}".to_string()])
+            .expect("a transactional write must work after a poisoned lock");
+        assert_eq!(s.conversation_messages(conversation, 10).unwrap().len(), 1);
     }
 }

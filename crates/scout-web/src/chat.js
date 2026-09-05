@@ -146,6 +146,19 @@ export function sendBody(text, thread) {
   return JSON.stringify({ text, thread })
 }
 
+// Which thread the composer sends into after a list refresh. The page's own
+// choice wins: the server's `current` is whichever thread was touched last
+// anywhere — the phone, another tab, a run that just finished — and adopting
+// it would send the next message into a conversation not on screen.
+//
+// `adopt` is for the two callers that redraw the transcript from
+// `/chat/history` in the same breath: there the server's current thread and
+// the one on screen are the same thing, so taking its answer is right.
+export function resolveCurrent(list, shown, adopt = false) {
+  if (!adopt && shown !== null && list.some((t) => t.id === shown)) return shown
+  return list.find((t) => t.current)?.id ?? null
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')
@@ -161,7 +174,17 @@ function start() {
   const menuButton = document.getElementById('menu')
   // The thread the page is showing. Every message names it, so a thread
   // the phone started meanwhile cannot swallow a message meant for this one.
+  //
+  // Set in four places and no others: `loadHistory`, `openThread`,
+  // `newThread` and `vanished` — every one of which puts that thread's
+  // transcript on screen in the same breath. A list refresh is not one of
+  // them: see `resolveCurrent`.
   let currentThread = null
+  // Two list refreshes can be in flight at once — a run finishing while the
+  // tab wakes up — and the older answer describes a list that has since
+  // moved on. Same for two rows tapped in quick succession.
+  let refreshSeq = 0
+  let openSeq = 0
 
   // Enter sends, Shift+Enter is a newline. `requestSubmit` rather than
   // `submit` because it runs the form's own validation — so Enter on an
@@ -237,7 +260,9 @@ function start() {
       return
     }
     showTurns(await res.json())
-    await refreshThreads()
+    // The transcript just drawn is the server's current thread, so this is
+    // one of the two refreshes that may adopt the server's answer.
+    await refreshThreads(true)
   }
 
   // Replaces the transcript wholesale rather than appending: every caller
@@ -259,20 +284,33 @@ function start() {
     })
   }
 
-  // The server is the authority on which thread is current, so the list is
-  // where `currentThread` comes from — never from what this page last did.
-  async function refreshThreads() {
-    const res = await fetch('/chat/threads')
-    if (!res.ok) return
-    const list = await res.json()
-    const current = list.find((t) => t.current)
-    currentThread = current ? current.id : null
+  // Redraws the list. What the composer sends into is decided by
+  // `resolveCurrent`, not taken from the server's `current` flag — the
+  // reader's transcript is the thing that names the thread.
+  async function refreshThreads(adopt = false) {
+    const seq = ++refreshSeq
+    let list
+    try {
+      const res = await fetch('/chat/threads')
+      if (!res.ok) return
+      list = await res.json()
+    } catch {
+      // A tab waking up on a dead network. The list on screen is stale
+      // rather than wrong, and a console error helps nobody.
+      return
+    }
+    // A refresh started after this one has already answered: its list is
+    // the newer truth, and painting this one over it would undo it.
+    if (seq !== refreshSeq) return
+    currentThread = resolveCurrent(list, currentThread, adopt)
     renderThreads(list)
   }
 
+  // The highlight follows `currentThread` — what this page is showing —
+  // and not `thread.current`, which is the server's separate answer.
   function renderThreads(list) {
     threadsEl.replaceChildren()
-    for (const thread of list) threadsEl.append(threadRow(thread))
+    for (const thread of list) threadsEl.append(threadRow(thread, thread.id === currentThread))
   }
 
   // Inline SVG rather than an emoji: an emoji pin ignores `color`, so the
@@ -294,10 +332,9 @@ function start() {
   // Built node by node rather than from a template string: a thread title
   // is text the reader typed, or text the model wrote, and the transcript
   // above is the only place on this page that is allowed to take markup.
-  function threadRow(thread) {
+  function threadRow(thread, current) {
     const li = document.createElement('li')
-    li.dataset.id = thread.id
-    if (thread.current) li.classList.add('current')
+    if (current) li.classList.add('current')
 
     const label = threadLabel(thread)
     const title = document.createElement('button')
@@ -306,7 +343,9 @@ function start() {
     title.textContent = label.text
     // The row ellipsises a long name, so the full one has to be reachable.
     title.title = label.text
-    title.addEventListener('click', () => openThread(thread.id))
+    // Nothing awaits this, so a network that dies mid-click would be an
+    // unhandled rejection; the notice inside is the report that matters.
+    title.addEventListener('click', () => { openThread(thread.id).catch(() => {}) })
     li.append(title)
 
     if (thread.pinned) {
@@ -348,39 +387,62 @@ function start() {
       // The whole row opens a thread. Acting on a row must not also switch
       // to it — least of all delete, which would open what it just removed.
       e.stopPropagation()
-      onClick()
+      // None of these is awaited. Every one of them reports its own failure
+      // in the notice, so a throw has nowhere left to go but the console.
+      Promise.resolve(onClick()).catch(() => {})
     })
     return b
   }
 
-  function closeDrawer() {
+  // `to` is where focus should land. Closing the drawer on a phone puts it
+  // under `display:none`, and the browser answers that by dropping focus to
+  // the body — which sends a keyboard reader back to the top of the page.
+  function closeDrawer(to) {
+    if (sideEl.contains(document.activeElement)) (to ?? menuButton).focus()
     sideEl.classList.remove('open')
     menuButton.setAttribute('aria-expanded', 'false')
   }
 
   // A 404 from any thread route means the thread went — expired, or
   // deleted on another tab. Refresh the list and show whatever is current.
+  //
+  // The one place besides `loadHistory` where the server's answer is
+  // adopted: the transcript below is fetched from `/chat/history`, which
+  // *is* the server's current thread, so the two agree by construction.
   async function vanished() {
     showNotice('That thread is gone. Showing the newest one.')
-    await refreshThreads()
-    const res = await fetch('/chat/history')
-    if (res.ok) showTurns(await res.json())
+    await refreshThreads(true)
+    try {
+      const res = await fetch('/chat/history')
+      if (res.ok) showTurns(await res.json())
+    } catch {
+      // Same as the list: what is on screen is stale, not wrong.
+    }
   }
 
   async function openThread(id) {
     hideNotice()
+    const seq = ++openSeq
     const res = await post(`/chat/threads/${id}/open`)
     if (res.status === 404) return vanished()
     if (!res.ok) {
       showNotice('Could not open that thread. Try again.')
       return
     }
-    showTurns(await res.json())
-    closeDrawer()
+    const turns = await res.json()
+    // Two rows tapped in a row: the first answer can arrive last, and it
+    // would paint its transcript over the thread actually asked for.
+    if (seq !== openSeq) return
+    showTurns(turns)
+    // Set here rather than left to the refresh below, which never moves it:
+    // the composer's target is the transcript now on screen.
+    currentThread = id
+    closeDrawer(textEl)
     await refreshThreads()
   }
 
   async function pinThread(thread) {
+    hideNotice()
     const res = await post(`/chat/threads/${thread.id}/pin`, { pinned: !thread.pinned })
     if (res.status === 404) return vanished()
     if (!res.ok) showNotice('Could not change that. Try again.')
@@ -405,21 +467,35 @@ function start() {
       if (done) return
       done = true
       const title = input.value.trim()
-      if (save && title && title !== thread.title) {
-        const res = await post(`/chat/threads/${thread.id}/rename`, { title })
-        if (res.status === 404) return vanished()
-        if (!res.ok) showNotice('Could not rename that thread. Try again.')
+      try {
+        if (save && title && title !== thread.title) {
+          const res = await post(`/chat/threads/${thread.id}/rename`, { title })
+          if (res.status === 404) return vanished()
+          // Core keeps the blank rule, and it is stricter than `trim`: a
+          // name made only of invisible characters is not a name.
+          if (res.status === 400) showNotice('That name has nothing in it.')
+          else if (!res.ok) showNotice('Could not rename that thread. Try again.')
+          else thread.title = title
+        }
+      } finally {
+        // Rebuilt from the thread already in hand, and before the list is
+        // asked for: a fetch that fails or never answers must not leave the
+        // row as a bare input with no way back out of it.
+        li.replaceWith(threadRow(thread, thread.id === currentThread))
       }
       await refreshThreads()
     }
+    // The listeners do not await it, and the row is put back in the
+    // `finally` above whatever happens, so a throw has nothing left to say.
+    const settle = (save) => { finish(save).catch(() => {}) }
     input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); finish(true) }
+      if (e.key === 'Enter') { e.preventDefault(); settle(true) }
       // Held here rather than let through: on a phone this rename is
       // happening inside the open drawer, and the drawer's own Escape
       // would close it — cancelling the rename and the list with it.
-      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false) }
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); settle(false) }
     })
-    input.addEventListener('blur', () => finish(true))
+    input.addEventListener('blur', () => settle(true))
   }
 
   async function suggestTitle(thread) {
@@ -438,6 +514,7 @@ function start() {
   }
 
   async function deleteThread(thread) {
+    hideNotice()
     const name = threadLabel(thread).text
     if (!window.confirm(`Delete "${name}"? This cannot be undone.`)) return
     const res = await post(`/chat/threads/${thread.id}/delete`)
@@ -487,7 +564,11 @@ function start() {
   // A thread renamed on the phone, or one that aged out while this tab sat
   // in the background, should not still be on screen as it was.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') refreshThreads()
+    // Not adopted: a thread the phone started while this tab slept is the
+    // server's current one, and this reader is still looking at theirs.
+    // Not awaited either — a tab woken on a dead network is not an error
+    // worth a console entry.
+    if (document.visibilityState === 'visible') refreshThreads().catch(() => {})
   })
 
   // Runs one turn: posts the question, streams `agent` events into the
@@ -495,6 +576,11 @@ function start() {
   // every stream carries. `EventSource` cannot POST, so the stream is
   // parsed by hand off the `fetch` body reader instead.
   async function runMessage(text) {
+    // The thread this run belongs to. A reader who switches away mid-stream
+    // is no longer looking at this conversation, and its tokens must not be
+    // painted into the one they moved to. The run carries on server-side
+    // and its answer is saved to history, so switching back shows it.
+    const runThread = currentThread
     let answer = ''
     let thinking = ''
     let answerLi = null
@@ -505,6 +591,13 @@ function start() {
     let refused = false
 
     function renderAnswer() {
+      // `showTurns` replaced the transcript under us, so the bubble this
+      // run was writing into is off the page. Holding the detached node
+      // would write the rest of the answer into nothing.
+      if (answerLi && !answerLi.isConnected) answerLi = null
+      // Not the thread on screen any more. Neither the bubble nor the
+      // scroll belongs to this reader's view.
+      if (runThread !== currentThread) return
       const wasFollowing = following()
       if (!answerLi) {
         answerLi = turnElement('Scout', '')
@@ -526,11 +619,20 @@ function start() {
       // the connection.
       if (res.status === 404) {
         refused = true
+        // Nothing was asked, so the words go back in the box rather than
+        // being lost with the thread. `vanished` moves the page to whatever
+        // is current, and the next Enter asks the question there.
+        textEl.value = text
+        fitComposer()
         await vanished()
         return
       }
       if (res.status === 422) {
         refused = true
+        // Same: a reload is the advice, and a reader who takes it should
+        // find what they typed still in front of them.
+        textEl.value = text
+        fitComposer()
         showNotice('This page is out of date. Reload to keep going.')
         return
       }
@@ -602,7 +704,12 @@ function start() {
       hideStatus()
       // Not awaited: the first answer is what names a thread, and the row
       // should pick that name up without holding the composer shut for it.
-      refreshThreads()
+      // Not adopted either — this run's `save_history` just made its thread
+      // the server's current one, and if the reader has since switched
+      // away, taking that would move the composer off what they are
+      // reading. And not left to reject on its own: a dropped connection
+      // here is already reported below.
+      refreshThreads().catch(() => {})
       if (!sawEnd && !refused) {
         // The run continues server-side even though our connection did
         // not, and history is written when it finishes — so this is not
@@ -680,7 +787,9 @@ function start() {
     await newThread()
   })
 
-  loadHistory()
+  // Nothing awaits the page's first load, and its own failure already
+  // shows as a notice — a rejection on top of that is only console noise.
+  loadHistory().catch(() => {})
 }
 
 // Guarded so `node --test` can import the pure functions above without a

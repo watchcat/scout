@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight, threadLabel, whenLabel, sendBody } from './chat.js'
+import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
   // The browser half of the protocol's security property: reasoning the
@@ -133,4 +133,40 @@ test('a date the client cannot read says nothing rather than "NaNd"', () => {
 
 test('a message names the thread it belongs to', () => {
   assert.deepEqual(JSON.parse(sendBody('hi', 42)), { text: 'hi', thread: 42 })
+})
+
+test('a list refresh does not move the composer off the thread on screen', () => {
+  // The race `MessageIn.thread` exists to close. The server's `current` is
+  // whichever thread was touched last *anywhere* — the phone, another tab,
+  // a run in another thread that just finished and wrote its history. The
+  // reader is looking at 2; the next message belongs in 2.
+  const list = [{ id: 1, current: true }, { id: 2 }]
+  assert.equal(resolveCurrent(list, 2), 2)
+})
+
+test('a thread that has gone from the list hands the composer to the server', () => {
+  // Expired, or deleted on the phone. There is no transcript to protect any
+  // more, so the server's answer is the only one left.
+  assert.equal(resolveCurrent([{ id: 1, current: true }], 2), 1)
+})
+
+test('a page with no thread of its own takes the server\'s', () => {
+  assert.equal(resolveCurrent([{ id: 1, current: true }, { id: 2 }], null), 1)
+})
+
+test('the openers that redraw the transcript adopt the server\'s answer', () => {
+  // `loadHistory` and `vanished` both render `/chat/history` — which *is*
+  // the server's current thread — so there the server's answer and what is
+  // on screen are the same thing, and adopting it is right.
+  assert.equal(resolveCurrent([{ id: 1, current: true }, { id: 2 }], 2, true), 1)
+})
+
+test('an account with no threads at all leaves the composer with none', () => {
+  // Not `undefined`: the composer tests `currentThread === null` to decide
+  // whether to make a thread before sending.
+  assert.equal(resolveCurrent([], 7), null)
+  assert.equal(resolveCurrent([], null), null)
+  // A list where nothing is marked current — `threads` reads the list and
+  // the current id in two statements, so a thread can vanish between them.
+  assert.equal(resolveCurrent([{ id: 1 }, { id: 2 }], null), null)
 })

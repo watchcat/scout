@@ -157,12 +157,17 @@
      buttons are what you need. The pin mark goes for the same reason it
      can — the pin toggle in the tools, pressed, says the same thing in
      the same place. The expiry warning stays: it has its own line. */
-  .threads li:hover .pin,.threads li.current .pin,
-  .threads li:hover .when:not(.expiring),.threads li.current .when:not(.expiring){display:none}
-  /* Controls show on hover and on the current row. Touch has no hover,
-     so the current row is the row a phone can act on. */
+  .threads li:hover .pin,.threads li.current .pin,.threads li:focus-within .pin,
+  .threads li:hover .when:not(.expiring),.threads li.current .when:not(.expiring),
+  .threads li:focus-within .when:not(.expiring){display:none}
+  /* Controls show on hover, on the current row, and — the keyboard's turn —
+     while focus is anywhere in the row. Touch has no hover, so the current
+     row is the row a phone can act on; a keyboard has no hover either, and
+     without `:focus-within` Tab would move focus onto a `display:none`
+     button, which is to say nowhere. Every row but the current one would be
+     unreachable without a mouse. */
   .threads .tools{display:none; gap:4px; flex:none}
-  .threads li:hover .tools,.threads li.current .tools{display:flex}
+  .threads li:hover .tools,.threads li.current .tools,.threads li:focus-within .tools{display:flex}
   /* 28px, not the 17px these were: on touch the current row's tools are
      the only way to act on a thread, and delete sits right beside
      auto-name — a pitch that small makes losing a thread a slip of the

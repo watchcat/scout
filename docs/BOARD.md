@@ -10,6 +10,7 @@ _(nothing)_
 
 ## Next
 
+- [ ] **Web messages count in `/stat` and toward the daily cap** — `send_message` never writes `request_log`; only the Telegram handlers do, so `/stat` undercounts and an invited member can send unlimited web messages. One `log_request` in the web send path after the ownership check, with a route test
 - [ ] **Poller liveness** — record the last successful `getUpdates`; fail `/healthz` when it is stale so k8s restarts a bot Telegram has gone quiet on (24 restarts in 20 minutes happened once with nothing to catch it)
 - [ ] **Retention for the rest** — `outbox` never deletes sent rows, `request_log` never prunes; two DELETEs in `run_maintenance` next to the thread expiry
 - [ ] **CI** — `.github/workflows`: `cargo test`, `cargo clippy -D warnings`, `cargo audit`, `node --test 'crates/scout-web/src/*.test.mjs'`, cached with `Swatinem/rust-cache`

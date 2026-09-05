@@ -6,7 +6,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## In progress
 
-- [ ] Deploy `df4c178` (threads in the browser) to the k3s node — first boot runs migration steps 7 and 8 on the production database
+_(nothing)_
 
 ## Next
 
@@ -47,6 +47,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## Done
 
+- [x] 2026-09-05 — **Deployed `df4c178`** to the k3s node; migration steps 7 and 8 ran on the production database on first boot
 - [x] 2026-09-05 — **Threads in the browser** (`df4c178`): sidebar, switch, rename, model-suggested rename, pin, delete; 48-hour expiry; titles from the person's words; the mirror queues the thread that ran; `MINIMAX_BASE_URL` configurable and every test off the network
 - [x] 2026-09-05 — **Retry with backoff** on every paid provider (`a159bf7`): 429/5xx/refused connection, Retry-After honoured to 10 s, timeouts deliberately not retried
 - [x] 2026-09-05 — **Cap on runs in flight** (`5319ebd`): eight slots, queued notice, "try again in a minute" after two minutes

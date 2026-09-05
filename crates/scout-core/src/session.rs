@@ -385,6 +385,61 @@ pub async fn delete_thread(core: &Core, account_id: i64, conversation_id: i64) -
     crate::core::blocking(move || store.delete_conversation(account_id, conversation_id)).await
 }
 
+/// What the model said, made fit for a sidebar: first non-empty line, a
+/// leading "Title:" and wrapping quotes dropped, trailing punctuation
+/// dropped, cut at `RENAME_CHARS`. `None` when nothing is left.
+///
+/// Quotes are stripped on both sides of the punctuation pass, because the
+/// two orders each leave one real answer intact: `'A title'.` keeps its
+/// closing quote if quotes go first, and `"A title."` keeps its full stop
+/// if punctuation does.
+pub fn clean_title(raw: &str) -> Option<String> {
+    let quote = |c: char| matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’');
+    let line = crate::text::strip_thinking(raw);
+    let line = line.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let line = line.strip_prefix("Title:").map(str::trim).unwrap_or(line);
+    let line = line.trim_matches(quote);
+    let line = line.trim_end_matches(['.', '!', '?', ':']);
+    let line = line.trim_matches(quote);
+    let cleaned: String = line.trim().chars().take(RENAME_CHARS).collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Asks the model for a name and stores it. `None` when the thread is not
+/// the account's, or has nothing in it to name. An unusable answer is an
+/// error the caller reports; the old title stays.
+///
+/// Opening the thread doubles as the ownership check and bumps it to
+/// current, which a person pressing a button on it expects.
+pub async fn suggest_title(core: &Core, account_id: i64, conversation_id: i64) -> anyhow::Result<Option<String>> {
+    let Some(turns) = open_thread(core, account_id, conversation_id).await? else {
+        return Ok(None);
+    };
+    if turns.is_empty() {
+        return Ok(None);
+    }
+    let text: String = turns
+        .iter()
+        .take(6)
+        .map(|t| {
+            let who = match t.role {
+                scout_api::Role::You => "user",
+                scout_api::Role::Scout => "scout",
+            };
+            format!("{who}: {}", t.text.chars().take(400).collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let raw = crate::agent::title_for(&core.deps.llm, &text).await?;
+    let Some(title) = clean_title(&raw) else {
+        anyhow::bail!("the model gave no usable title");
+    };
+    let store = core.store();
+    let stored = title.clone();
+    crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &stored)).await?;
+    Ok(Some(title))
+}
+
 /// Starts a fresh conversation, discarding whatever thread was live.
 ///
 /// History lives in the store now, so clearing an in-memory slot would clear
@@ -809,6 +864,26 @@ mod tests {
         assert_eq!(rename(&core, a, mine, "   ").await.unwrap(), Renamed::Blank, "an empty name is not a name");
         rename(&core, a, mine, &"x".repeat(100)).await.unwrap();
         assert_eq!(core.store().thread_title(a, mine).unwrap().unwrap().chars().count(), 80);
+    }
+
+    #[test]
+    fn a_suggested_title_is_one_line_without_quotes_and_never_empty() {
+        assert_eq!(clean_title("\"Cheapest OneBlade cartridges\"\n"), Some("Cheapest OneBlade cartridges".to_string()));
+        assert_eq!(clean_title("Title: 'AMS to LIS in October'."), Some("AMS to LIS in October".to_string()));
+        assert_eq!(clean_title("<think>hmm</think>Wasmiddel per kilo"), Some("Wasmiddel per kilo".to_string()));
+        assert_eq!(clean_title("   "), None);
+        assert_eq!(clean_title(&"word ".repeat(30)).unwrap().chars().count(), 80);
+    }
+
+    #[tokio::test]
+    async fn suggesting_a_title_for_someone_elses_thread_asks_nobody_and_finds_nothing() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let b = core.store().account_for_telegram(22).unwrap();
+        let mine = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+        // No model is reachable in tests; reaching one would be an error,
+        // not `None`, so `None` proves the check ran first.
+        assert_eq!(suggest_title(&core, b, mine).await.unwrap(), None);
     }
 
     #[test]

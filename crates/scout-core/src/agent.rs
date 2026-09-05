@@ -362,6 +362,21 @@ pub async fn continues_previous(
     Ok(verdict.to_uppercase().contains("CONTINUE"))
 }
 
+/// One-shot: a short name for a conversation, from its text. Tool-less,
+/// like `continues_previous`, and for the same reason.
+pub async fn title_for(llm: &LlmClient, transcript: &str) -> Result<String> {
+    let agent = llm
+        .agent(MODEL)
+        .preamble(
+            "You name chat threads. Reply with a title of at most five words \
+             in the language of the conversation, no quotes, no trailing \
+             punctuation, nothing else.",
+        )
+        .build();
+    let question = format!("Conversation:\n{transcript}\n\nTitle:");
+    Ok(crate::text::strip_thinking(&rig::completion::Prompt::prompt(&agent, question).await?))
+}
+
 /// Cap on injected profile facts, bounding prompt growth.
 const MAX_PROFILE_FACTS: usize = 50;
 

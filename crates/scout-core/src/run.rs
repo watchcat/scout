@@ -556,7 +556,10 @@ mod tests {
         // Named from the person's words. The prompt is not the message:
         // Telegram appends a `[system note]` to a price request, and a
         // title cut from that reads `cheapest usb hub [system note] This…`.
-        assert!(src.contains("run.title_source"), "the thread is named from something other than the caller's title source");
+        assert!(
+            src.contains("title_if_missing(core, conversation_id, source)"),
+            "the thread is named from something other than the caller's title source"
+        );
     }
 
     #[test]

@@ -1194,9 +1194,9 @@ async fn handle_reaction(
         account_id,
         conversation_id,
         reply_to: Some(scout_api::ReplyTo::telegram(chat_id.0)),
-        // A thumbs-up is not words. The prompt here is a system note and
-        // nothing else, so there is nothing to name a thread after —
-        // and a reaction only ever continues a thread that already exists.
+        // A reaction has no words of the person's to name a thread after.
+        // If it happens to start one — the continuation check can — the
+        // thread stays nameless until their next message names it.
         title_source: None,
     };
     let (result, mut live) = tokio::join!(
@@ -1492,6 +1492,10 @@ mod tests {
         assert!(
             !src.contains("title_source: Some(prompt"),
             "the augmented prompt must never name a thread"
+        );
+        assert!(
+            src.contains("title_source: Some(said)"),
+            "the text path must name a thread from what the person said"
         );
     }
 

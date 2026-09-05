@@ -363,11 +363,14 @@ pub fn first_message_title(text: &str) -> String {
 
 /// Names a thread after its first answer, unless it already has a name.
 ///
-/// Called by `run_agent` on every answered run, so a thread begun on
-/// Telegram is named too. Failure is logged, not returned: a missing title
-/// is not worth failing an answer that is already written.
-pub async fn title_if_missing(core: &Core, conversation_id: i64, prompt: &str) {
-    let title = first_message_title(prompt);
+/// Called by `run_agent` after a successful save, only when the run carries
+/// the person's own words (`RunContext::title_source`). The prompt is never
+/// the source: on Telegram the prompt carries a system note the person
+/// never wrote, and a title cut from it would read as one. Failure is
+/// logged, not returned: a missing title is not worth failing an answer
+/// that is already written.
+pub async fn title_if_missing(core: &Core, conversation_id: i64, source: &str) {
+    let title = first_message_title(source);
     if title.is_empty() {
         return;
     }

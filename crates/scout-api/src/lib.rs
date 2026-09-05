@@ -144,6 +144,8 @@ pub struct RunContext {
     /// appends a `[system note]` to price requests and builds a reaction
     /// follow-up from nothing else, and a title cut from that would read
     /// `cheapest usb hub [system note] This is a…`.
+    ///
+    /// This carries message text, so it must not be debug-logged whole.
     #[serde(default)]
     pub title_source: Option<String>,
 }

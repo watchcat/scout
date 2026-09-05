@@ -48,12 +48,14 @@ transaction that has already touched the table's rows — the `ADD COLUMN` and
 the backfill in step 7 both count — and `apply_steps` gives each step its own
 transaction.
 
-`title` is null until the thread's first answer lands. Then it is the first
-user message, whitespace-collapsed, cut to 40 characters on a character
-boundary with `…` appended when cut. It is set in exactly one place — the end
-of `run_agent`, via `title_if_missing` — so a thread started from Telegram
-gets a name too. A rename overwrites it and is never overwritten by
-`title_if_missing`, because that only writes when the column is null.
+`title` is null until the thread's first answer lands. Then it is the
+person's own first message, whitespace-collapsed, cut to 40 characters on a
+character boundary with `…` appended when cut — never the prompt the model
+saw, which on Telegram can carry a system note the person never wrote. It is
+set in exactly one place — the end of `run_agent`, via `title_if_missing` —
+so a thread started from Telegram gets a name too. A rename overwrites it
+and is never overwritten by `title_if_missing`, because that only writes
+when the column is null.
 
 `pinned` is "permanent". Nothing else changes about a pinned thread.
 
@@ -105,13 +107,19 @@ In `session.rs`, all account-keyed, all through `blocking`:
 | `set_pinned(core, account, id, bool)` | |
 | `delete_thread(core, account, id)` | the conversation and its messages |
 | `suggest_title(core, account, id)` | one tool-less model call over the transcript, "a title of at most five words"; stores and returns it |
-| `title_if_missing(store, id, prompt)` | called by `run_agent`; writes only when `title` is null |
+| `title_if_missing(core, id, source)` | called by `run_agent` after a successful save, only when `RunContext::title_source` is `Some`; writes only when `title` is null |
 
 The store gains matching methods plus `expire_conversations`. `latest_direct`
 is unchanged and remains the single definition of "current".
 
-`run_agent` is otherwise untouched: it already reads and writes the
-conversation it is handed.
+`RunContext` gains `title_source: Option<String>`, set by each channel to
+the person's own words for naming a thread, or `None` when this run has
+none worth naming it after: Telegram sets it to the plain message or the
+bare photo draft, never the augmented prompt the model is asked; a reaction
+sets it to `None`, since a reaction has no words of its own; the web route
+sets it to the message body, which is the prompt there with nothing
+appended. `run_agent` is otherwise untouched: it already reads and writes
+the conversation it is handed.
 
 ## Web routes
 

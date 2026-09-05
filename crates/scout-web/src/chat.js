@@ -557,7 +557,10 @@ function start() {
       return
     }
     const wasCurrent = thread.id === currentThread
-    await refreshThreads()
+    // Adopt the server's current when the deleted thread was the one on
+    // screen: the reader asked for this, so it is not a thread that "went",
+    // and the redraw below is the one this function owns.
+    await refreshThreads(wasCurrent)
     if (wasCurrent) {
       const history = await fetch('/chat/history')
       showTurns(history.ok ? await history.json() : [])

@@ -24,6 +24,13 @@ pub struct Core {
     /// about to read on their phone. The tick stays as a floor, so a missed
     /// signal is a delay rather than a lost mirror.
     pub(crate) mirror_wake: std::sync::Arc<tokio::sync::Notify>,
+    /// Woken when who may talk to the bot has changed somewhere the bot
+    /// did not see — a web sign-in, a Telegram id linked on the account
+    /// page. The Telegram gate reads an in-memory set that was loaded at
+    /// start-up, and the web crate cannot reach it, so without this a
+    /// person admitted in the browser stayed a stranger at the gate until
+    /// the next deploy.
+    pub(crate) membership_wake: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// What a reorder reminder says, wherever it is delivered.
@@ -201,7 +208,12 @@ impl Core {
             }),
         };
 
-        Ok(Self { cfg, deps, mirror_wake: std::sync::Arc::new(tokio::sync::Notify::new()) })
+        Ok(Self {
+            cfg,
+            deps,
+            mirror_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            membership_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+        })
     }
 
     /// Everyone currently admitted, as Telegram ids, for the adapter's gate.
@@ -276,6 +288,19 @@ impl Core {
     /// Resolves when something has been queued.
     pub async fn mirror_waiting(&self) {
         self.mirror_wake.notified().await;
+    }
+
+    /// Membership changed where the bot could not see it. Wakes a watcher
+    /// that is asleep; a permit is kept if none is listening yet, so a
+    /// change made before the watcher started is not lost.
+    pub fn note_membership_changed(&self) {
+        self.membership_wake.notify_one();
+    }
+
+    /// Resolves once membership has changed since the last time this
+    /// resolved. Read `members` after it does.
+    pub async fn membership_changed(&self) {
+        self.membership_wake.notified().await;
     }
 
     /// Everything due to be delivered on one channel today.

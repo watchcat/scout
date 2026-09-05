@@ -55,6 +55,15 @@ pub async fn sign_in(core: &Core, kind: &'static str, external_id: &str) -> anyh
         })
     })
     .await
+    .inspect(|outcome| {
+        // Whether the seat was taken just now or the identity was merely
+        // new on an old seat, the set of Telegram ids that may talk to the
+        // bot can have changed. Telling it is cheaper than working out
+        // whether it did.
+        if matches!(outcome, SignIn::In { .. }) {
+            core.note_membership_changed();
+        }
+    })
 }
 
 /// Where an account stands, and how it can prove itself.
@@ -128,6 +137,9 @@ pub async fn link(
             blocking(move || store.release_seat(survivor)).await?;
         }
     }
+    // A link can put a Telegram id on a member account, or merge two
+    // accounts so that one does. Either way the gate's set is stale.
+    core.note_membership_changed();
     Ok(outcome)
 }
 
@@ -356,5 +368,42 @@ mod tests {
 
         let second = consume_token(&core, "hash-1").await.unwrap();
         assert_eq!(second, TokenOutcome::AlreadyUsed);
+    }
+
+    /// The Telegram gate reads an in-memory set loaded at start-up, and the
+    /// web crate cannot reach it. Someone who signed in by email and then
+    /// linked Telegram on the account page was a member in the table and a
+    /// stranger at the gate until the next deploy: their messages dropped
+    /// silently, their bare `/start` told they were not invited.
+    #[tokio::test]
+    async fn linking_telegram_to_a_member_account_wakes_the_membership_watcher() {
+        let (core, _dir) = test_core().await;
+        core.store().create_round("autumn", 1).unwrap();
+        let SignIn::In { account_id } = sign_in(&core, "email", "new@example.com").await.unwrap()
+        else {
+            panic!("the round had room");
+        };
+
+        link(&core, account_id, "telegram", "888").await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), core.membership_changed())
+            .await
+            .expect("nobody was told that membership changed");
+        assert!(core.members().unwrap().contains(&888), "the table must already show them");
+    }
+
+    /// The Login Widget on a fresh visitor is the other web path that ends
+    /// with a Telegram id holding a seat.
+    #[tokio::test]
+    async fn signing_in_with_telegram_on_the_web_wakes_the_membership_watcher() {
+        let (core, _dir) = test_core().await;
+        core.store().create_round("autumn", 1).unwrap();
+
+        assert!(matches!(sign_in(&core, "telegram", "888").await.unwrap(), SignIn::In { .. }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), core.membership_changed())
+            .await
+            .expect("nobody was told that membership changed");
+        assert!(core.members().unwrap().contains(&888));
     }
 }

@@ -1,5 +1,6 @@
 mod bot;
 mod draft;
+mod membership;
 mod mirror;
 mod progress;
 mod scheduler;
@@ -58,7 +59,7 @@ async fn main() -> Result<()> {
 
     // The gate reads this set on every update, so it is built once here
     // from the table that survives restarts.
-    let members: dashmap::DashSet<i64> = core.members()?.into_iter().collect();
+    let members: Arc<dashmap::DashSet<i64>> = Arc::new(core.members()?.into_iter().collect());
     let population = core.population();
     tracing::info!(
         founders = population.founders,
@@ -69,6 +70,10 @@ async fn main() -> Result<()> {
         "who may talk to this bot"
     );
 
+    // The web admits people too, and cannot reach this set. Without this
+    // a person who signed in by email and linked Telegram was a member in
+    // the table and a stranger at the gate until the next deploy.
+    tokio::spawn(membership::watch(core.clone(), members.clone()));
     tokio::spawn(scheduler::run(telegram.clone(), core.clone()));
     tokio::spawn(mirror::run(telegram.clone(), core.clone()));
     // Backups belong to core, not to this channel: they must keep happening
@@ -119,6 +124,18 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gate_is_actually_told_when_the_web_admits_someone() {
+        // Same shape as the mirror check below: `membership::watch` is
+        // tested on its own, and nothing but this says it is ever spawned.
+        let src = include_str!("main.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        assert!(
+            src.contains("membership::watch("),
+            "membership changes on the web never reach the Telegram gate"
+        );
+    }
+
     #[test]
     fn the_mirror_queue_is_actually_drained() {
         // Nothing else would say. Without this spawn every queue write

@@ -37,8 +37,9 @@ pub struct App {
     /// every message from someone who was never invited. Reading DuckDB
     /// there would take the connection mutex on each one, so anybody who
     /// found the bot could contend with real work just by typing at it.
-    /// Disk is touched only when membership actually changes.
-    pub members: dashmap::DashSet<i64>,
+    /// Disk is touched only when membership actually changes — and the
+    /// web can change it, which is what `membership::watch` is for.
+    pub members: Arc<dashmap::DashSet<i64>>,
 }
 
 /// How many of the bot's own recent replies to keep per chat so reactions

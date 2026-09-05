@@ -1098,7 +1098,7 @@ mod tests {
         let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
         let page = body_of(get_with_cookie(&app, "/chat", &cookie).await).await;
 
-        for id in ["turns", "status", "notice", "ask", "text", "send", "reset"] {
+        for id in ["turns", "status", "notice", "ask", "text", "send", "reset", "threads", "menu", "side"] {
             assert!(page.contains(&format!(r#"id="{id}""#)), "the client binds to #{id}: {page}");
         }
     }

@@ -91,6 +91,26 @@ pub async fn enqueue(
     Ok(written)
 }
 
+/// One line to the phone that is an event, not a turn: "you switched to
+/// this thread". Keyed on `at` (Unix seconds) as well as the text, so the
+/// same switch made twice is sent twice, and a double-click inside one
+/// second is sent once.
+pub async fn note(core: &Core, account_id: i64, address: &str, text: &str, at: i64) -> anyhow::Result<usize> {
+    let store = core.store();
+    let address = address.to_string();
+    // Negative, so it can never collide with a real conversation id.
+    let key = turn_key(-at, Role::Scout, text);
+    let body = text.to_string();
+    let written = crate::core::blocking(move || {
+        Ok(usize::from(store.enqueue_mirror(account_id, TELEGRAM, &address, &body, &key, false)?))
+    })
+    .await?;
+    if written > 0 {
+        core.wake_mirror();
+    }
+    Ok(written)
+}
+
 /// How a turn reads once it is somebody else's message.
 ///
 /// The reader's own question is quoted with a literal `>`, in plain text.
@@ -261,6 +281,20 @@ mod tests {
                 .is_err(),
             "recording a delivered turn woke the drain for nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn a_note_is_queued_every_time_not_once_per_wording() {
+        let (core, _dir) = test_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+
+        assert_eq!(note(&core, a, "12345", "── beans ──", 1_000).await.unwrap(), 1);
+        assert_eq!(note(&core, a, "12345", "── beans ──", 1_001).await.unwrap(), 1, "the second switch was swallowed");
+        assert_eq!(note(&core, a, "12345", "── beans ──", 1_001).await.unwrap(), 0, "a double-click inside one second is one note");
+
+        let pending = pending(&core, 10).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|p| p.body == "── beans ──"));
     }
 
     #[test]

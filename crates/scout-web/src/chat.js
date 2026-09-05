@@ -851,8 +851,8 @@ function start() {
     })
   }
 
-  // `/chat/threads` rather than `/chat/reset`: the sidebar has to learn the
-  // new thread's id, and only the threads route hands it back.
+  // Through `newThread`, which posts `/chat/threads`: the sidebar has to
+  // learn the new thread's id, and the threads route is what hands it back.
   resetForm.addEventListener('submit', async (e) => {
     e.preventDefault()
     await newThread()

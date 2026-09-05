@@ -129,7 +129,7 @@ POST:
 | route | does |
 |---|---|
 | `GET /chat/threads` | the list, JSON `Vec<Thread>` |
-| `POST /chat/threads` | new thread; returns its `Thread`. `/chat/reset` stays as an alias |
+| `POST /chat/threads` | new thread; returns its `Thread`. This replaced `/chat/reset`, which was removed once the sidebar was the only caller |
 | `POST /chat/threads/{id}/open` | switch; returns the transcript |
 | `POST /chat/threads/{id}/rename` | body `{"title": "…"}` |
 | `POST /chat/threads/{id}/pin` | body `{"pinned": true}` |

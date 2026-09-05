@@ -31,7 +31,6 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat.js", get(client))
         .route("/chat/history", get(history))
         .route("/chat/messages", post(send_message))
-        .route("/chat/reset", post(reset))
         .route("/chat/mirror", post(mirror))
         .route("/chat/threads", get(list_threads).post(new_thread))
         .route("/chat/threads/{id}/open", post(open_thread))
@@ -369,27 +368,6 @@ async fn send_message(
     sse_response(rx)
 }
 
-async fn reset(axum::extract::State(auth): axum::extract::State<AuthState>, headers: HeaderMap) -> Response {
-    let account_id = match admitted_account(&auth, &headers).await {
-        Ok(id) => id,
-        Err(response) => return response,
-    };
-    if !csrf_header_ok(&auth, &headers, account_id) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    // Before the new thread is started, not after: the divider belongs to
-    // the conversation it closes, and after the reset that conversation is
-    // no longer the one `current_thread` returns.
-    mirror_divider(&auth, account_id).await;
-    match scout_core::session::reset(&auth.core, account_id, "direct").await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "could not reset a conversation");
-            sorry()
-        }
-    }
-}
-
 /// The account and the CSRF check every thread route starts with.
 ///
 /// One function rather than two lines repeated six times: a thread route
@@ -432,8 +410,9 @@ async fn new_thread(
         Ok(id) => id,
         Err(response) => return response,
     };
-    // Before the new thread exists, for the reason `reset` gives: the
-    // divider belongs to the conversation it closes.
+    // Before the new thread exists, not after: the divider belongs to the
+    // conversation it closes, and once the new thread is started that
+    // conversation is no longer the one `current_thread` returns.
     mirror_divider(&auth, account_id).await;
     let id = match scout_core::session::reset(&auth.core, account_id, "direct").await {
         Ok(id) => id,
@@ -1310,7 +1289,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_mirror_cannot_be_switched_without_the_csrf_header() {
-        // Same guard as /chat/messages and /chat/reset: without it, any page
+        // Same guard as /chat/messages and the thread routes: without it, any page
         // on the internet can turn a reader's chat into a Telegram feed.
         let (app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;
@@ -1403,43 +1382,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reset_starts_a_thread_that_does_not_remember_the_last_one() {
+    async fn a_new_thread_does_not_remember_the_last_one() {
         let (app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;
         seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
         let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
         let csrf = crate::session::csrf_for(TEST_KEY, account_id);
 
-        let res = post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = post_json_with_cookie(&app, "/chat/threads", &cookie, Some(&csrf), "").await;
+        assert_eq!(res.status(), StatusCode::OK);
 
         assert!(
             scout_core::session::transcript(&core, account_id).await.unwrap().is_empty(),
             "the new thread still remembers the old one"
-        );
-    }
-
-    #[tokio::test]
-    async fn starting_a_new_thread_marks_the_seam_in_telegram() {
-        // Without it, scrolling back through Telegram runs two unrelated
-        // conversations together with nothing between them, which is
-        // precisely the continuity this feature is for.
-        let (app, core, _dir) = test_app_with_a_round().await;
-        let account_id = admitted(&core, "777").await;
-        core.note_address(777, "telegram", "12345".to_string()).await.unwrap();
-        seed_conversation(&core, account_id, "cheapest beans", "here are three").await;
-        scout_core::mirror::set_enabled(&core, account_id, true).await.unwrap();
-        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
-        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
-
-        let res = post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
-
-        let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
-        assert!(
-            queued.iter().any(|r| r.body.contains("New thread")),
-            "no seam between two conversations: {:?}",
-            queued.iter().map(|r| &r.body).collect::<Vec<_>>()
         );
     }
 
@@ -1455,8 +1410,8 @@ mod tests {
         let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
         let csrf = crate::session::csrf_for(TEST_KEY, account_id);
 
-        post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
-        post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+        post_json_with_cookie(&app, "/chat/threads", &cookie, Some(&csrf), "").await;
+        post_json_with_cookie(&app, "/chat/threads", &cookie, Some(&csrf), "").await;
 
         let seams = scout_core::mirror::pending(&core, 10)
             .await
@@ -1476,7 +1431,7 @@ mod tests {
         let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
         let csrf = crate::session::csrf_for(TEST_KEY, account_id);
 
-        post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
+        post_json_with_cookie(&app, "/chat/threads", &cookie, Some(&csrf), "").await;
 
         assert!(scout_core::mirror::pending(&core, 10).await.unwrap().is_empty());
     }
@@ -1656,10 +1611,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn starting_a_new_thread_from_the_threads_route_marks_the_seam_in_telegram() {
-        // `/chat/reset` is covered; this is the button the sidebar actually
-        // presses, and it is a separate handler — the divider can be
-        // missing from one while the other keeps its test green.
+    async fn starting_a_new_thread_marks_the_seam_in_telegram() {
+        // Without it, scrolling back through Telegram runs two unrelated
+        // conversations together with nothing between them, which is
+        // precisely the continuity the mirror is for.
         let (app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;
         core.note_address(777, "telegram", "12345".to_string()).await.unwrap();

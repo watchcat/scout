@@ -1756,8 +1756,8 @@ mod tests {
     #[test]
     fn a_list_refresh_never_moves_the_composer_by_itself() {
         // The server's `current` is whichever thread was touched last
-        // anywhere — the phone, another tab, a run in another thread whose
-        // `save_history` just bumped it. A refresh that adopted it would
+        // anywhere — the phone, another tab, a run in another thread that
+        // just appended its answer. A refresh that adopted it would
         // retarget the composer while the reader is looking at a different
         // transcript, and the next message would be answered in a thread
         // nobody is reading. `resolveCurrent` is where that rule lives, and

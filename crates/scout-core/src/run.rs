@@ -73,6 +73,14 @@ pub async fn run_agent(
         let store = core.deps.store.clone();
         crate::core::blocking(move || crate::session::load_history(&store, conversation_id, HISTORY_CAP)).await?
     };
+    // Where the store's copy ends and this run's own messages begin. The
+    // store holds the whole conversation and this run was handed a window
+    // of it, so only what is appended past this mark is new — everything
+    // below it is already written down, and writing it again would be
+    // writing it twice. Nothing between here and the append may drop from
+    // the front of `history`, or the mark moves under the messages it
+    // points at.
+    let loaded_len = history.len();
 
     let mut streamed = String::new();
     // Reasoning arrives on its own channel, separate from the answer text.
@@ -190,8 +198,13 @@ pub async fn run_agent(
         Some(res) => (res.output().to_string(), res.messages().map(|m| m.to_vec())),
         None => (streamed.clone(), None),
     };
+    // Extended, not replaced. `rig`'s `messages()` is documented as "the
+    // prompt plus all assistant turns and tool results, *excluding the
+    // input history*" — so assigning it here dropped the loaded prefix on
+    // the floor, and the repair turns below then ran against a history that
+    // had lost everything said before this question.
     if let Some(h) = new_history {
-        history = h;
+        history.extend(h);
     }
     let mut reply = strip_thinking(&text);
     if reply.is_empty() {
@@ -268,9 +281,9 @@ pub async fn run_agent(
         }
     }
 
-    trim_history(&mut history, HISTORY_CAP);
+    let added = new_since(&history, loaded_len);
     let store = core.deps.store.clone();
-    match crate::core::blocking(move || crate::session::save_history(&store, conversation_id, &history)).await {
+    match crate::core::blocking(move || crate::session::append_history(&store, conversation_id, &added)).await {
         // The answer is already on its way to the user; losing the thread is
         // worse than not saving it, but it is not worth failing the reply.
         Err(e) => tracing::warn!(error = %e, conversation_id, "could not save the conversation"),
@@ -369,6 +382,17 @@ pub fn agent_error_message(e: &anyhow::Error) -> &'static str {
 fn tail_chars(text: &str, max: usize) -> String {
     let count = text.chars().count();
     text.chars().skip(count.saturating_sub(max)).collect()
+}
+
+/// The messages a run added to the history it was handed.
+///
+/// A function rather than a slice expression inline, because the run around
+/// it cannot be tested without a live model and this is the part that can be
+/// wrong. `loaded_len` is a promise that nothing reordered or shortened
+/// `history` in between; `saturating_sub` keeps a broken promise from being
+/// a panic in front of a reader who has already been given their answer.
+fn new_since(history: &[LlmMessage], loaded_len: usize) -> Vec<LlmMessage> {
+    history[loaded_len.min(history.len())..].to_vec()
 }
 
 /// Caps `history` at `cap` messages, then trims further so it never starts
@@ -542,6 +566,64 @@ mod tests {
     }
 
     #[test]
+    fn a_run_writes_down_only_what_it_added() {
+        // The pure half of the fix. A run's own messages are everything past
+        // the prefix it loaded — the model's turns, plus whatever the repair
+        // paths appended after them. Nothing above `loaded_len` is written
+        // again, because the store already holds it.
+        let history = vec![
+            user_text("q1"),
+            assistant_text("a1"),
+            user_text("q2"),
+            assistant_tool_call("call-1", "search"),
+            tool_result("call-1"),
+            assistant_text("a2"),
+            // What a repair turn leaves behind: `rig`'s `chat` appends its
+            // correction and the answer to it onto the same history.
+            user_text("two of those links are dead"),
+            assistant_text("a2, corrected"),
+        ];
+
+        assert_eq!(
+            new_since(&history, 3),
+            history[3..].to_vec(),
+            "the run wrote down something other than its own new messages"
+        );
+        // A run that added nothing writes nothing, rather than rewriting the
+        // thread it was handed.
+        assert!(new_since(&history, history.len()).is_empty());
+    }
+
+    #[test]
+    fn nothing_shifts_the_history_under_the_tail_the_run_saves() {
+        // `trim_history` drops from the *front*, so a trim between the load
+        // and the tail would renumber every index and `history[loaded_len..]`
+        // would save the middle of the conversation as if it were new. The
+        // trim now lives in `session::load_history`, where it shapes what the
+        // model is sent and nothing else — so `run_agent` must not carry one.
+        //
+        // Asserted from the source because neither the run nor its repair
+        // turns can be reached without a live model.
+        let src = include_str!("run.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let body = &src[src.find("pub async fn run_agent").expect("the run must exist")..];
+        let body = &body[..body.find("\n/// Runs allowed at once").unwrap_or(body.len())];
+
+        let loaded = body.find("loaded_len").expect("the run must remember where the loaded prefix ends");
+        let tail = body.find("new_since(").expect("the run must save only what it added");
+        assert!(loaded < tail, "the tail is taken before the run knows where the prefix ended");
+        assert!(
+            !body.contains("trim_history("),
+            "a trim inside the run shifts the indexes the tail is cut at"
+        );
+        assert!(
+            !body.contains("replace_messages") && !body.contains("save_history("),
+            "the run rewrites the conversation instead of appending to it"
+        );
+        assert!(body.contains("append_history("), "the run does not append what it added");
+    }
+
+    #[test]
     fn every_answered_run_names_a_thread_that_has_no_name_yet() {
         // Telegram never shows titles, so a thread started there would sit
         // nameless in the sidebar forever if only the web path titled it.
@@ -549,7 +631,7 @@ mod tests {
         let src = include_str!("run.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         let src = &src[src.find("pub async fn run_agent").expect("the run must exist")..];
-        let saved = src.find("save_history(").expect("the save must exist");
+        let saved = src.find("append_history(").expect("the save must exist");
         let titled = src.find("title_if_missing(").expect("the title must be set");
         assert_eq!(src.matches("title_if_missing(").count(), 1, "the thread is named more than once");
         assert!(saved < titled, "the title is set before the history is saved");

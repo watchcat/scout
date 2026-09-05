@@ -121,23 +121,51 @@ pub async fn over_daily_cap(core: &Core, account_id: i64) -> Option<String> {
     })
 }
 
+/// How many stored rows a transcript is built from.
+///
+/// Twenty times the model's window, because the two caps answer different
+/// questions: the model's is a context budget, and this one only has to be
+/// larger than any thread can become before the 48-hour sweep takes it. A
+/// long afternoon of price research runs to a few hundred rows, so in
+/// practice a page shows the thread from its first word — which is the
+/// point. It is a ceiling rather than a promise, so that one pathological
+/// conversation cannot make a page render megabytes.
+pub(crate) const TRANSCRIPT_CAP: usize = 400;
+
 /// Rewrites a conversation's stored messages to match `history`.
 ///
-/// A whole rewrite rather than an append: `trim_history` drops messages
-/// from the front, so what is stored has to be what the agent will actually
-/// be sent next time, not a growing log that disagrees with it.
+/// For a caller that means "this conversation is exactly these messages".
+/// A run does not: it appends, see `append_history`.
 pub(crate) fn save_history(store: &crate::store::Store, conversation_id: i64, history: &[LlmMessage]) -> anyhow::Result<()> {
-    let bodies = history
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    store.replace_messages(conversation_id, &bodies)
+    store.replace_messages(conversation_id, &bodies_of(history)?)
 }
 
-/// Stored messages, oldest first. A row that no longer deserializes —
-/// because rig changed shape under us — is dropped rather than fatal:
-/// losing some context is survivable, refusing to answer at all is not.
-pub(crate) fn load_history(store: &crate::store::Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
+/// Adds messages to the end of a conversation's log.
+///
+/// How a run writes what it produced. The stored log is not the model's
+/// window and does not have to agree with it: the window is cut on the way
+/// out, by `load_history`.
+pub(crate) fn append_history(store: &crate::store::Store, conversation_id: i64, messages: &[LlmMessage]) -> anyhow::Result<()> {
+    store.append_messages(conversation_id, &bodies_of(messages)?)
+}
+
+fn bodies_of(messages: &[LlmMessage]) -> anyhow::Result<Vec<String>> {
+    Ok(messages
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// The last `cap` stored messages, oldest first, exactly as they were
+/// written. A row that no longer deserializes — because rig changed shape
+/// under us — is dropped rather than fatal: losing some context is
+/// survivable, refusing to answer at all is not.
+///
+/// What a *reader* wants. Nothing here is shaped for a provider, so a
+/// window cut at `cap` may well open mid-tool-call — which is fine for a
+/// transcript, where tool traffic is not rendered at all, and fatal for the
+/// model. `load_history` is the one that makes it safe to send.
+pub(crate) fn load_history_raw(store: &crate::store::Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
     let bodies = store.conversation_messages(conversation_id, cap)?;
     let mut out = Vec::with_capacity(bodies.len());
     for body in bodies {
@@ -147,6 +175,29 @@ pub(crate) fn load_history(store: &crate::store::Store, conversation_id: i64, ca
         }
     }
     Ok(out)
+}
+
+/// The last `cap` messages, shaped so a provider will accept them.
+///
+/// The trim lives here rather than at the call site because this *is* the
+/// question "what does the model get": a window cut by row count can land
+/// between a tool call and its result, and a provider rejects that outright.
+/// It used to run just before saving instead, which is what made the stored
+/// thread no longer than the model's window — the trim drops from the
+/// front, and what it dropped was gone.
+///
+/// One row more than the cap is read, and that extra row is load-bearing:
+/// `trim_history` returns untouched when it is handed no more than `cap`
+/// messages, so reading exactly `cap` would make the trim a no-op and hand
+/// the model a window opening on an orphaned tool result — the failure this
+/// whole path exists to prevent. Reading `cap + 1` is also what makes "is
+/// this the whole conversation?" answerable: fewer rows came back than were
+/// asked for, so the window starts where the thread does, and a thread
+/// always starts with somebody's question.
+pub(crate) fn load_history(store: &crate::store::Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
+    let mut history = load_history_raw(store, conversation_id, cap.saturating_add(1))?;
+    crate::run::trim_history(&mut history, cap);
+    Ok(history)
 }
 
 /// The sayable text of a user turn, or `None` when it holds only tool
@@ -207,8 +258,16 @@ pub(crate) fn latest_direct(store: &crate::store::Store, account_id: i64) -> any
 /// The same line `last_messages_text` draws, kept structured rather than
 /// flattened: that one exists to feed a classifier a blob, this one exists
 /// to be rendered.
+///
+/// Reads far more than the model's window, and reads it raw. A page is
+/// showing a person their own conversation, so the only reason to leave
+/// anything out is size; the agent's trim exists to keep a provider happy
+/// and has nothing to say here. A transcript cut at `TRANSCRIPT_CAP` may
+/// therefore open on an answer rather than a question, which reads as a
+/// conversation joined late — correct, and far better than one that starts
+/// at the last exchange because everything above it was deleted.
 pub(crate) fn transcript_of(store: &crate::store::Store, conversation_id: i64) -> anyhow::Result<Vec<scout_api::Turn>> {
-    Ok(turns_of(&load_history(store, conversation_id, HISTORY_CAP)?))
+    Ok(turns_of(&load_history_raw(store, conversation_id, TRANSCRIPT_CAP)?))
 }
 
 /// Whether an assistant message is an answer rather than a step of one.
@@ -833,12 +892,104 @@ mod tests {
         let c = s.start_conversation(a, "direct").unwrap();
 
         save_history(&s, c, &[LlmMessage::user("one"), LlmMessage::assistant("two")]).unwrap();
-        // trim_history can drop from the front; the store must follow it
-        // down rather than keeping the messages the agent will never see.
+        // `save_history` is the seeding door, not the run's writer: it says
+        // "this conversation is exactly these messages". A run appends
+        // instead — see `append_history` — so nothing here can shorten a
+        // thread by accident.
         save_history(&s, c, &[LlmMessage::assistant("two")]).unwrap();
 
         let loaded = load_history(&s, c, HISTORY_CAP).unwrap();
-        assert_eq!(loaded.len(), 1, "a trimmed history must not grow back");
+        assert_eq!(loaded.len(), 1, "a replace must not leave the old messages behind");
+    }
+
+    /// A conversation long enough that the model's window cannot hold it:
+    /// 30 exchanges, 60 messages, written the way a run writes them.
+    fn a_long_thread(s: &crate::store::Store, account_id: i64) -> i64 {
+        let c = s.start_conversation(account_id, "direct").unwrap();
+        for i in 0..30 {
+            append_history(
+                s,
+                c,
+                &[LlmMessage::user(format!("question {i}")), LlmMessage::assistant(format!("answer {i}"))],
+            )
+            .unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn the_page_gets_the_whole_thread_and_the_model_gets_its_window() {
+        // The bug: what was stored *was* the model's window, so a thread
+        // longer than `HISTORY_CAP` opened in the browser showing only its
+        // last exchange — and the earlier turns were not merely hidden,
+        // they had been deleted. The store is the whole log now, and the
+        // cap applies to the load, not to what is kept.
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = a_long_thread(&s, a);
+
+        let turns = transcript_of(&s, c).unwrap();
+        assert_eq!(turns.len(), 60, "the page lost turns it should have shown");
+        assert_eq!(turns[0].text, "question 0", "the page does not start at the beginning");
+        assert_eq!(turns[59].text, "answer 29");
+
+        let window = load_history(&s, c, HISTORY_CAP).unwrap();
+        assert!(window.len() <= HISTORY_CAP, "the model was sent {} messages", window.len());
+        assert_eq!(
+            last_messages_text(&window, 2),
+            "user: question 29\nassistant: answer 29",
+            "the window is not the newest end of the thread"
+        );
+    }
+
+    #[test]
+    fn the_model_never_opens_on_a_dangling_tool_result() {
+        // The window is cut by row count, and a cut can land between a tool
+        // call and its result — which providers reject outright. The trim
+        // that used to run before saving now runs on the load, so the rule
+        // is enforced where the messages are actually handed to the model.
+        use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
+        use rig::message::{ToolCall, ToolFunction};
+        use rig::one_or_many::OneOrMany;
+        let (s, _d) = crate::store::tests::test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
+
+        let mut written = vec![LlmMessage::user("cheapest beans")];
+        for i in 0..12 {
+            written.push(LlmMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                    format!("call-{i}"),
+                    ToolFunction { name: "web_search".to_string(), arguments: serde_json::json!({}) },
+                ))),
+            });
+            written.push(LlmMessage::User {
+                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                    id: format!("call-{i}"),
+                    call_id: None,
+                    content: OneOrMany::one(ToolResultContent::text("three shops")),
+                })),
+            });
+        }
+        written.push(LlmMessage::assistant("here are three"));
+        append_history(&s, c, &written).unwrap();
+
+        let window = load_history(&s, c, HISTORY_CAP).unwrap();
+
+        assert!(!window.is_empty(), "the window must not be empty");
+        assert!(
+            !matches!(
+                window.first(),
+                Some(LlmMessage::User { content })
+                    if content.iter().any(|p| matches!(p, UserContent::ToolResult(_)))
+            ),
+            "the window opens on an orphaned tool result: {window:?}"
+        );
+        // Nothing was thrown away to achieve that: the full log still holds
+        // the question the trim could not fit.
+        let turns = transcript_of(&s, c).unwrap();
+        assert_eq!(turns[0].text, "cheapest beans");
     }
 
     #[test]

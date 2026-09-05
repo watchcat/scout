@@ -1450,6 +1450,14 @@ impl Store {
     /// `older_than_secs`, with its messages. Returns how many conversations
     /// went.
     ///
+    /// `except` names conversations that must survive whatever their age —
+    /// the ids with a run in flight. `updated_at` moves when a run *writes*
+    /// its answer, so a thread already at 47h idle when a question is asked
+    /// crosses the threshold while the model is still thinking; without this
+    /// the hourly sweep deletes the conversation out from under a run that
+    /// then writes its answer into nothing, and the reader watches the
+    /// conversation they are waiting on disappear.
+    ///
     /// Also sweeps messages whose conversation is already gone. A run that
     /// ends after its thread was deleted still writes its messages —
     /// `replace_messages` inserts regardless — and nothing else would ever
@@ -1457,7 +1465,21 @@ impl Store {
     /// `outbox` for an expired thread are not swept — the outbox has no
     /// conversation id — so a mirror message enqueued before expiry may
     /// still arrive.
-    pub fn expire_conversations(&self, older_than_secs: i64) -> Result<usize> {
+    pub fn expire_conversations(&self, older_than_secs: i64, except: &[i64]) -> Result<usize> {
+        // DuckDB's bindings have no array parameter, so `IN` gets one `?`
+        // per id and the ids ride in the parameter list next to
+        // `older_than_secs` — the SQL is formatted, the values never are.
+        // An empty `except` omits the clause outright: `id NOT IN ()` is a
+        // syntax error, not an empty set.
+        let not_running = if except.is_empty() {
+            String::new()
+        } else {
+            format!(" AND id NOT IN ({})", ["?"].repeat(except.len()).join(", "))
+        };
+        let mut args = Vec::with_capacity(except.len() + 1);
+        args.push(older_than_secs);
+        args.extend_from_slice(except);
+
         let conn = self.conn();
         conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<usize> {
@@ -1469,17 +1491,21 @@ impl Store {
             // explicit delete is what stops expired threads' messages from
             // leaking through instead.
             conn.execute(
-                "DELETE FROM messages WHERE conversation_id IN (
-                     SELECT id FROM conversations
-                     WHERE NOT pinned
-                       AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?))",
-                params![older_than_secs],
+                &format!(
+                    "DELETE FROM messages WHERE conversation_id IN (
+                         SELECT id FROM conversations
+                         WHERE NOT pinned
+                           AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?){not_running})"
+                ),
+                duckdb::params_from_iter(args.iter()),
             )?;
             let gone = conn.execute(
-                "DELETE FROM conversations
-                 WHERE NOT pinned
-                   AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?)",
-                params![older_than_secs],
+                &format!(
+                    "DELETE FROM conversations
+                     WHERE NOT pinned
+                       AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?){not_running}"
+                ),
+                duckdb::params_from_iter(args.iter()),
             )?;
             conn.execute(
                 "DELETE FROM messages
@@ -5220,7 +5246,7 @@ CREATE TABLE conversations (
             ))
             .unwrap();
 
-        let gone = s.expire_conversations(48 * 3600).unwrap();
+        let gone = s.expire_conversations(48 * 3600, &[]).unwrap();
 
         assert_eq!(gone, 2, "the idle direct thread and the idle group thread");
         let left: Vec<i64> = s.threads_of(a).unwrap().iter().map(|t| t.id).collect();
@@ -5228,6 +5254,36 @@ CREATE TABLE conversations (
         assert!(s.conversation_messages(idle, 10).unwrap().is_empty(), "messages outlived their thread");
         assert!(s.conversation_messages(group, 10).unwrap().is_empty(), "the group's messages outlived it");
         assert_eq!(s.conversation_messages(pinned, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expiry_leaves_alone_a_thread_named_as_still_running() {
+        // A run takes minutes and a thread can cross 48h idle in the middle
+        // of one — `updated_at` moves when the answer is written, not when
+        // the question is asked. Deleting it there loses the question, the
+        // answer lands in a thread that no longer exists, and the reader
+        // watches their conversation disappear as they wait for it.
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let running = s.start_conversation(a, "direct").unwrap();
+        let idle = s.start_conversation(a, "direct").unwrap();
+        for id in [running, idle] {
+            s.replace_messages(id, &["{}".to_string()]).unwrap();
+        }
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(49 * 3600) WHERE id IN ({running}, {idle});"
+            ))
+            .unwrap();
+
+        let gone = s.expire_conversations(48 * 3600, &[running]).unwrap();
+
+        assert_eq!(gone, 1, "only the thread with nothing running in it");
+        let left: Vec<i64> = s.threads_of(a).unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(left, vec![running]);
+        // The transcript matters as much as the row: the orphan sweep in the
+        // same transaction would take the messages even if the row survived.
+        assert_eq!(s.conversation_messages(running, 10).unwrap().len(), 1, "the running thread lost its transcript");
     }
 
     #[test]
@@ -5242,7 +5298,7 @@ CREATE TABLE conversations (
         s.replace_messages(id, &["{}".to_string(), "{}".to_string()]).unwrap();
         assert_eq!(s.conversation_messages(id, 10).unwrap().len(), 2, "the orphans must exist for this test to mean anything");
 
-        assert_eq!(s.expire_conversations(48 * 3600).unwrap(), 0, "no conversation expired");
+        assert_eq!(s.expire_conversations(48 * 3600, &[]).unwrap(), 0, "no conversation expired");
 
         assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "orphaned messages were not swept");
     }

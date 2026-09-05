@@ -1756,8 +1756,8 @@ mod tests {
     #[test]
     fn a_list_refresh_never_moves_the_composer_by_itself() {
         // The server's `current` is whichever thread was touched last
-        // anywhere — the phone, another tab, a run in another thread whose
-        // `save_history` just bumped it. A refresh that adopted it would
+        // anywhere — the phone, another tab, a run in another thread that
+        // just appended its answer. A refresh that adopted it would
         // retarget the composer while the reader is looking at a different
         // transcript, and the next message would be answered in a thread
         // nobody is reading. `resolveCurrent` is where that rule lives, and
@@ -1782,6 +1782,40 @@ mod tests {
         // to say nowhere, and the row would be unreachable without a mouse.
         let css = include_str!("../chat.html");
         assert!(css.contains("li:focus-within .tools"), "a keyboard cannot reach a non-current row's tools");
+    }
+
+    #[test]
+    fn a_threads_name_is_the_biggest_thing_on_its_row() {
+        // A thread is found by its name, and in a 240px column the name was
+        // drawn at the same size as the four tool glyphs beside it and cut
+        // to a one-line ellipsis — "Haribo Ho…" on the current row, where
+        // the tools are always showing. Two lines and a larger type size
+        // are what make the row scannable.
+        //
+        // Scoped to the declaration rather than the file: both properties
+        // are named in the comment above the rule, and a file-wide
+        // `contains` would stay green with the rule itself deleted.
+        let page = include_str!("../chat.html");
+        let start = page.find(".threads .title{").expect("the title must be styled");
+        let rule = &page[start..start + page[start..].find('}').expect("the rule must end")];
+        assert!(
+            rule.contains("-webkit-line-clamp"),
+            "a thread's name is cut to one line, so a long one is unreadable"
+        );
+        assert!(
+            !rule.contains("white-space:nowrap"),
+            "a clamped title still refuses to wrap, so it can only ever show one line"
+        );
+
+        // And a row's tools can take a line of their own rather than eat
+        // the title's width — which is what the current row, the one whose
+        // tools are permanently on screen, depends on.
+        let start = page.find(".threads li{").expect("a thread row must be styled");
+        let rule = &page[start..start + page[start..].find('}').expect("the rule must end")];
+        assert!(
+            rule.contains("flex-wrap:wrap"),
+            "a row cannot drop its tools onto their own line"
+        );
     }
 
     #[tokio::test]

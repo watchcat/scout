@@ -169,11 +169,12 @@ CREATE SEQUENCE IF NOT EXISTS outbox_id_seq;
 -- scout-core — and because an in-memory queue loses a half-sent backfill on
 -- every deploy.
 --
--- `turn_key` is what makes enqueueing idempotent, and it exists because no
--- stored message has a stable identity: `replace_messages` deletes and
--- reinserts the whole conversation on every save and renumbers `position`
--- from zero, so "mirrored up to here" cannot be a pointer. "Have I already
--- sent this turn" can be answered; "how far did I get" cannot.
+-- `turn_key` is what makes enqueueing idempotent, and it exists because a
+-- position is not something the mirror can hold on to: messages are swept
+-- when their thread expires, a channel mirrors turns rather than rows, and
+-- what a run appends is model traffic that `turns_of` mostly discards. So
+-- "mirrored up to here" cannot be a pointer into `messages`. "Have I
+-- already sent this turn" can be answered; "how far did I get" cannot.
 --
 -- A row with `sent_at` already set was never going to be sent: that is how
 -- the Telegram channel records its own messages so a backfill does not echo
@@ -1462,11 +1463,17 @@ impl Store {
     ///
     /// Also sweeps messages whose conversation is already gone. A run that
     /// ends after its thread was deleted still writes its messages —
-    /// `replace_messages` inserts regardless — and nothing else would ever
+    /// `append_messages` inserts regardless — and nothing else would ever
     /// collect them. As with `delete_conversation`, rows already queued in
     /// `outbox` for an expired thread are not swept — the outbox has no
     /// conversation id — so a mirror message enqueued before expiry may
     /// still arrive.
+    ///
+    /// A pinned thread is skipped here by design and so is bounded by
+    /// nothing this does. `trim_message_logs` is what keeps its log from
+    /// growing forever: age is the wrong measure for a thread whose whole
+    /// point is that it does not age out, so it is capped by row count
+    /// instead.
     pub fn expire_conversations(&self, older_than_secs: i64, except: &[i64]) -> Result<usize> {
         // DuckDB's bindings have no array parameter, so `IN` gets one `?`
         // per id and the ids ride in the parameter list next to
@@ -1528,6 +1535,34 @@ impl Store {
         }
     }
 
+    /// Drops every conversation's rows beyond its newest `keep`. Returns
+    /// how many rows went.
+    ///
+    /// The `messages` table is a full log now — a run appends what it added
+    /// and nothing trims it back — and `expire_conversations` spares pinned
+    /// threads, which leaves one thread a person keeps forever as a table
+    /// that only ever grows. This is the ceiling on it: a cap by row count
+    /// rather than by age, because a pinned thread's whole point is that it
+    /// does not age out.
+    ///
+    /// Per conversation, not overall: one busy thread must not evict a
+    /// quiet one's history. The cut is by `position`, the same order a read
+    /// comes back in, so what survives is the newest end of each log.
+    pub fn trim_message_logs(&self, keep: usize) -> Result<usize> {
+        let conn = self.conn();
+        Ok(conn.execute(
+            "DELETE FROM messages WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, row_number() OVER (
+                         PARTITION BY conversation_id ORDER BY position DESC
+                     ) AS rn
+                     FROM messages
+                 ) WHERE rn > ?
+             )",
+            params![keep as i64],
+        )?)
+    }
+
     /// The last `limit` messages, oldest first — the order a provider wants.
     pub fn conversation_messages(&self, conversation_id: i64, limit: usize) -> Result<Vec<String>> {
         let conn = self.conn();
@@ -1541,12 +1576,61 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Adds messages after whatever the conversation already holds, in one
+    /// lock so a reader never sees the thread half-written.
+    ///
+    /// This is how a run writes: the table is the conversation's whole log,
+    /// and a run only ever knows about its own turns. `replace_messages`
+    /// used to be the writer, on the argument that the store should hold
+    /// exactly what the agent would be sent next — which made the model's
+    /// twenty-message window the whole of the thread anybody could read, so
+    /// a long conversation opened in the browser showing only its last
+    /// exchange. The window is applied on the way *out* now; see
+    /// `session::load_history`.
+    ///
+    /// `updated_at` moves even for an empty append, because a run that
+    /// produced nothing still happened: the sidebar orders by that column
+    /// and the 48-hour sweep deletes by it.
+    pub fn append_messages(&self, conversation_id: i64, bodies: &[String]) -> Result<()> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<()> {
+            // Read inside the transaction: the next position has to be
+            // decided against the rows this insert will sit beside.
+            let next: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(position) + 1, 0) FROM messages WHERE conversation_id = ?",
+                params![conversation_id],
+                |r| r.get(0),
+            )?;
+            for (i, body) in bodies.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO messages (id, conversation_id, position, body)
+                     VALUES (nextval('messages_id_seq'), ?, ?, ?)",
+                    params![conversation_id, next + i as i64, body],
+                )?;
+            }
+            conn.execute(
+                "UPDATE conversations SET updated_at = now() WHERE id = ?",
+                params![conversation_id],
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
     /// Replaces a conversation's messages wholesale, in one lock so a reader
     /// never sees the thread half-written.
     ///
-    /// A rewrite rather than an append because `trim_history` drops messages
-    /// from the front: what is stored has to be what the agent will actually
-    /// be sent next time, not a growing log that disagrees with it.
+    /// Not what a run uses — that appends. This is for a caller that means
+    /// "this conversation is exactly these messages": seeding an exchange in
+    /// a test, and anything else that writes a thread rather than continuing
+    /// one. Kept because "set the log" and "add to the log" are different
+    /// claims, and only one of them can lose a conversation.
     pub fn replace_messages(&self, conversation_id: i64, bodies: &[String]) -> Result<()> {
         let conn = self.conn();
         conn.execute_batch("BEGIN")?;
@@ -3408,6 +3492,95 @@ CREATE TABLE segment_candidates (
         assert_eq!(got.len(), 20);
         assert!(got[0].contains(r#""n":5"#), "should drop the oldest five");
         assert!(got[19].contains(r#""n":24"#), "and end at the newest");
+    }
+
+    #[test]
+    fn appending_continues_after_what_is_already_stored() {
+        // The `messages` table is the whole log now, written a run at a
+        // time. An append that restarted `position` at zero would interleave
+        // the runs when they are read back in position order — the thread
+        // would come out shuffled rather than short.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
+
+        s.append_messages(c, &[r#"{"n":0}"#.to_string(), r#"{"n":1}"#.to_string()]).unwrap();
+        s.append_messages(
+            c,
+            &[r#"{"n":2}"#.to_string(), r#"{"n":3}"#.to_string(), r#"{"n":4}"#.to_string()],
+        )
+        .unwrap();
+
+        let all = s.conversation_messages(c, 20).unwrap();
+        assert_eq!(all.len(), 5, "the first append was overwritten");
+        for (i, body) in all.iter().enumerate() {
+            assert!(body.contains(&format!(r#""n":{i}"#)), "out of order at {i}: {all:?}");
+        }
+
+        // And the window a reader asks for is still the newest end of it.
+        let last_three = s.conversation_messages(c, 3).unwrap();
+        assert_eq!(last_three.len(), 3);
+        assert!(last_three[0].contains(r#""n":2"#), "the window is not the newest three: {last_three:?}");
+        assert!(last_three[2].contains(r#""n":4"#));
+    }
+
+    #[test]
+    fn a_log_past_the_cap_loses_its_oldest_rows_and_a_short_one_loses_nothing() {
+        // A pinned thread is exempt from the 48-hour sweep, so nothing else
+        // ever bounds its log — and the log holds every tool call and
+        // result a run made, not just what was said.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let long = s.start_conversation(a, "direct").unwrap();
+        let short = s.start_conversation(a, "telegram:-100").unwrap();
+
+        let bodies: Vec<String> = (0..2005).map(|i| format!(r#"{{"n":{i}}}"#)).collect();
+        s.append_messages(long, &bodies).unwrap();
+        s.append_messages(short, &bodies[..10]).unwrap();
+
+        assert_eq!(s.trim_message_logs(2000).unwrap(), 5, "the cut is not the overflow");
+
+        // The newest 2000, still in order: the oldest five went, and the
+        // thread reads from `n:5` onward rather than coming back shuffled.
+        let kept = s.conversation_messages(long, 5000).unwrap();
+        assert_eq!(kept.len(), 2000);
+        assert!(kept[0].contains(r#""n":5"#), "the wrong end was cut: {:?}", &kept[..3]);
+        assert!(kept[1999].contains(r#""n":2004"#), "the newest row went");
+
+        // Per conversation: the quiet thread is not touched by the busy
+        // one's overflow.
+        assert_eq!(s.conversation_messages(short, 5000).unwrap().len(), 10);
+
+        // And a second pass has nothing left to do.
+        assert_eq!(s.trim_message_logs(2000).unwrap(), 0);
+    }
+
+    #[test]
+    fn appending_marks_the_thread_as_just_used() {
+        // The sidebar orders by `updated_at` and the 48-hour sweep reads it.
+        // `replace_messages` bumped it; an append that did not would let a
+        // thread being talked in right now expire underneath the reader.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let c = s.start_conversation(a, "direct").unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE conversations
+                 SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(3600)
+                 WHERE id = ?",
+                params![c],
+            )
+            .unwrap();
+        }
+        assert_eq!(s.latest_conversation(a, "direct", 600).unwrap(), Some((c, true)));
+
+        s.append_messages(c, &["{}".to_string()]).unwrap();
+
+        assert!(
+            s.latest_conversation(a, "direct", 600).unwrap().is_some_and(|(id, aged)| id == c && !aged),
+            "a thread just appended to still reads as stale"
+        );
     }
 
     #[test]
@@ -5304,8 +5477,8 @@ CREATE TABLE conversations (
     #[test]
     fn expiry_also_sweeps_messages_whose_thread_is_already_gone() {
         // A run that finishes after its thread was deleted still writes its
-        // messages: `replace_messages` inserts regardless. Nothing else
-        // would ever collect them.
+        // messages: an append inserts regardless. Nothing else would ever
+        // collect them.
         let (s, _dir) = test_store();
         let a = s.account_for_telegram(11).unwrap();
         let id = s.start_conversation(a, "direct").unwrap();

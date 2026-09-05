@@ -482,6 +482,15 @@ impl Core {
                 Err(e) => tracing::warn!(error = %e, "could not expire idle threads"),
             }
 
+            // And the one the sweep above cannot reach: a pinned thread
+            // never ages out, so its log — a full one now, tool traffic
+            // included — grows for as long as the person keeps using it.
+            match self.trim_message_logs().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(trimmed = n, "message log rows beyond the cap dropped"),
+                Err(e) => tracing::warn!(error = %e, "could not trim the message logs"),
+            }
+
             match crate::backup::is_due(&dir) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -536,6 +545,21 @@ impl Core {
         let store = self.store();
         let running: Vec<i64> = self.deps.running.iter().map(|r| *r).collect();
         blocking(move || store.expire_conversations(Self::THREAD_IDLE_SECS, &running)).await
+    }
+
+    /// The most rows one conversation's log may keep.
+    ///
+    /// About seventy exchanges at the ~28 rows a tool-heavy run stores, and
+    /// far above `session::TRANSCRIPT_CAP`, so nothing a page or the model
+    /// would have read is ever cut by this. It is a bound on a pinned
+    /// thread, which the idle sweep is forbidden to touch — not a window.
+    const MESSAGE_LOG_KEEP: usize = 2000;
+
+    /// Caps every conversation's log at `MESSAGE_LOG_KEEP` rows. Returns
+    /// how many rows went. Private for the same reason `expire_threads` is.
+    async fn trim_message_logs(&self) -> anyhow::Result<usize> {
+        let store = self.store();
+        blocking(move || store.trim_message_logs(Self::MESSAGE_LOG_KEEP)).await
     }
 
     /// Turns a photo into a search description.
@@ -838,6 +862,14 @@ mod tests {
         let expiry = body.find("expire_threads(").unwrap();
         let backup = body.find("backup::is_due").expect("the backup check must exist");
         assert!(expiry < backup, "expiry sits below the backup's continue and would run once a day");
+
+        // The half of the same job the expiry cannot do: a pinned thread is
+        // spared by age forever, so its log is bounded by row count here or
+        // by nothing at all.
+        let trim = body
+            .find("trim_message_logs(")
+            .expect("a pinned thread's log is never trimmed, so it grows without bound");
+        assert!(trim < backup, "the trim sits below the backup's continue and would run once a day");
     }
 
     #[test]

@@ -9,10 +9,11 @@ pub const TELEGRAM: &str = "telegram";
 
 /// A stable name for one turn of one conversation.
 ///
-/// This is what replaces a watermark. No stored message has a stable
-/// identity — `replace_messages` deletes and reinserts the whole
-/// conversation on every save and renumbers `position` from zero, and
-/// `trim_history` drops messages off the front — so "mirrored up to here"
+/// This is what replaces a watermark. A position in `messages` is not
+/// something this can hold on to: a thread's rows are swept when it
+/// expires, and what a run appends is model traffic — tool calls, results,
+/// superseded answers — that `turns_of` mostly discards, so the nth row and
+/// the nth turn are different things. "Mirrored up to here" therefore
 /// cannot be a pointer into `messages`. "Have I already sent this turn" is
 /// answerable regardless, and that single change makes backfill, live
 /// mirroring, and toggling the feature off and on the same operation.
@@ -56,8 +57,26 @@ use crate::core::Core;
 
 pub use crate::store::PendingMirror;
 
+/// How much of a thread arrives on the phone when the mirror is switched on.
+///
+/// Backfill is paced at just over a second a message, because Telegram's
+/// sustained ceiling for a private chat is about one a second and a
+/// `RetryAfter` here was once measured at 238 seconds. That pacing was safe
+/// while a stored thread could not exceed the model's twenty-message window;
+/// now the store holds the whole conversation, and an unbounded backfill
+/// would spend several minutes delivering messages the reader is already
+/// looking at. Twenty is what the reader used to get, and it is enough to
+/// pick the thread up on the phone.
+pub const MIRROR_BACKFILL_TURNS: usize = 20;
+
 /// Queues a thread's turns for one channel, skipping any already known.
 /// Returns how many rows were written.
+///
+/// Only the last `MIRROR_BACKFILL_TURNS` are considered — the cap lives
+/// here rather than at each caller because every path into the outbox comes
+/// through this one function, and a path that forgot it would not fail, it
+/// would just flood somebody's phone. Keeping up costs nothing under it: a
+/// finished run adds two turns at a time.
 ///
 /// `delivered` is the channel saying "I have already shown the reader
 /// these" — see the module's own tests, and the echo they exist to stop.
@@ -71,7 +90,7 @@ pub async fn enqueue(
 ) -> anyhow::Result<usize> {
     let store = core.store();
     let address = address.to_string();
-    let rows: Vec<(String, String)> = turns
+    let rows: Vec<(String, String)> = turns[turns.len().saturating_sub(MIRROR_BACKFILL_TURNS)..]
         .iter()
         .map(|t| (turn_key(conversation_id, t.role, &t.text), body_of(t)))
         .collect();
@@ -400,6 +419,31 @@ mod tests {
         let queued = queue_thread(&core, account_id, "4242").await.unwrap();
         assert_eq!(queued, 0, "the backfill queued a turn Telegram had already shown");
         assert!(pending(&core, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_long_thread_backfills_only_its_last_turns() {
+        // Toggling the mirror on sends the current thread to the phone,
+        // paced at just over a second a message so Telegram does not answer
+        // with a four-minute `RetryAfter`. That was bounded by the model's
+        // twenty-message window; now the transcript is the whole log, and
+        // an afternoon's thread would arrive as a several-minute burst of
+        // messages the reader has already read on screen.
+        let (core, _dir) = test_core().await;
+        let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
+            .await
+            .unwrap();
+        let turns: Vec<scout_api::Turn> = (0..30)
+            .map(|i| scout_api::Turn { role: Role::Scout, text: format!("answer {i}") })
+            .collect();
+
+        let queued = enqueue(&core, account_id, "4242", 7, &turns, false).await.unwrap();
+
+        assert_eq!(queued, MIRROR_BACKFILL_TURNS, "the whole thread was queued for the phone");
+        let bodies: Vec<String> =
+            pending(&core, 100).await.unwrap().into_iter().map(|p| p.body).collect();
+        assert_eq!(bodies.first().map(String::as_str), Some("answer 10"), "got: {bodies:?}");
+        assert_eq!(bodies.last().map(String::as_str), Some("answer 29"), "the newest turn was dropped");
     }
 
     #[tokio::test]

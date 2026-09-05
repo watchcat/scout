@@ -1,6 +1,6 @@
 # Scout
 
-**A Telegram shopping and flight researcher that doesn't make things up.**
+**A shopping and flight researcher, on Telegram and in the browser, that doesn't make things up.**
 
 ### 🟢 [goodscout.fyi](https://goodscout.fyi) — invites are open
 
@@ -146,6 +146,9 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   memory, so a deploy or a crash no longer costs you the thread. Scout was
   restarted 24 times in 20 minutes once when Telegram's API went quiet, and
   every conversation in flight went with it. That no longer costs anything
+- **The whole thread is kept.** The model is shown its last 20 messages; the
+  page shows everything said. Those used to be the same thing, and a run
+  with a dozen tool calls would push the earlier exchanges out of both
 - **Threads, in the browser.** The web chat lists your conversations; switch
   between them and each keeps its own context, and the thread you last used
   is the one your Telegram chat continues. A thread nobody touches for two
@@ -165,6 +168,21 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - `/advert <text>` — admin only, announces something to everyone who has
   used the bot. It goes to the chat each person actually talks in, says who
   sent it, and reports who could not be reached
+
+**In the browser**
+- **Sign in** with the Telegram Login Widget or an email link, and it is the
+  same account either way — link the other later and the two merge, history
+  and all
+- **The same Scout, in a page.** Ask, watch the tools run and the answer
+  stream in, exactly as in Telegram. Every link is verified before it is
+  shown, the same as in the chat
+- **Threads.** A sidebar of your conversations: switch, rename (or ask Scout
+  for a name), pin, delete. The thread you last used is the one your
+  Telegram chat continues, and a thread nobody touches for two days is
+  deleted unless pinned
+- **Your phone follows along.** A toggle sends the browser thread to your
+  Telegram chat as it happens, so a question asked at a desk is answered on
+  the train
 
 **Lets people in without a redeploy**
 - **Invite rounds.** `/invite new autumn 100` opens a named round and hands
@@ -201,6 +219,14 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - And a cap on runs in flight across everyone (8), so a burst of people is a
   short queue rather than a long bill. Anyone waiting is told so, and a wait
   past two minutes ends with "try again in a minute" — nothing spent
+- **A paid API gets one more try.** A 429, a 5xx or a refused connection from
+  Kagi, Perplexity, Duffel, Ignav, eBay, bol.com or Marktplaats is retried
+  twice with a short wait, honouring `Retry-After`. A timeout is not: the
+  request may have run and been billed, and a second one is a second charge
+- **Nothing takes the whole bot down with it.** A panic inside one request
+  used to poison the database lock and fail every request after it, with
+  the health check still reporting fine. The lock recovers now, and a member
+  admitted on the web is known to the Telegram gate without a restart
 - **Deploys without cutting anyone off.** `scripts/deploy.sh` builds the new
   image while the old one is still serving, then hands over: the bot stops
   taking messages and finishes what it is already doing before it exits
@@ -254,6 +280,11 @@ compiles from source.
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
 | `SCOUT_CHROME` | no | auto-detected | Chrome/Chromium for the headless fallback |
 | `SCOUT_DB_PATH` | no | `scout.duckdb` | DuckDB file |
+| `SCOUT_WEB_BIND` | no | `0.0.0.0:8080` | where the website listens; the bot serves it from the same process |
+| `SCOUT_SESSION_KEY` | web sign-in | — | signs session cookies; 32+ bytes. All four web variables must be set or sign-in does not mount and the site serves the public page only |
+| `RESEND_API_KEY` | web sign-in | — | sends the email sign-in link |
+| `SCOUT_MAIL_FROM` | web sign-in | — | the address that link comes from, unquoted |
+| `SCOUT_BASE_URL` | web sign-in | — | the site's own https address, used in the link and to send plain http to https |
 
 Keys are read from `.env` at runtime and never baked into the image. Memory
 lives in the `scout-data` volume and survives rebuilds.
@@ -307,7 +338,8 @@ data.
 ## How it works
 
 ```
-Telegram ──► bot.rs ──► core ──► rig agent ──────► 23 tools
+Telegram ──► bot.rs ─────┐
+Browser  ──► scout-web ──┴► core ──► rig agent ──────► 23 tools
                 │                                    │
                 │  streams progress + answer         ├─ search_web        Kagi + Perplexity, merged
                 │  back into one edited message      ├─ search_secondhand eBay / Marktplaats / Vinted
@@ -339,7 +371,7 @@ Telegram ──► bot.rs ──► core ──► rig agent ──────�
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **728 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **747 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,
@@ -349,14 +381,14 @@ That middle arrow is a crate boundary, not a convention. Scout is a cargo
 workspace of four:
 
 ```
-scout-core       27,000 lines  the agent, the tools, the database — everything
+scout-core       27,800 lines  the agent, the tools, the database — everything
                                that answers a question, and nothing that knows
                                who asked
 scout-telegram    3,100 lines  teloxide, streaming into one edited message,
                                chunking, flood control, delivery
 scout-api           300 lines  the events core emits and a channel renders,
                                so the two cannot disagree about what one is
-scout-web         6,700 lines  the website and the browser chat: sign-in, the
+scout-web         6,800 lines  the website and the browser chat: sign-in, the
                                thread list, streaming into the page
 ```
 
@@ -375,7 +407,7 @@ That is what makes the second front end cheap. A web app talks to the same
 core, and neither side can reach around the other, because the crate graph
 will not compile it.
 
-Roughly 37,100 lines of Rust across 60 focused modules.
+Roughly 38,000 lines of Rust across 60 focused modules.
 
 ---
 
@@ -421,6 +453,10 @@ Roughly 37,100 lines of Rust across 60 focused modules.
   `/invite announce` sends the join *command* (`/start autumn`, tap to copy)
   rather than a link, and why a dead round's link stays dead: codes do not
   carry between rounds.
+- **Threads expire, and only the web can pin.** A conversation untouched
+  for 48 hours is deleted, in every scope. The pin that exempts one lives in
+  the browser's sidebar; there is no Telegram command for it yet. History
+  that was trimmed before the full log landed is gone for good.
 - **Invited, not isolated.** Conversation state, purchase memory and `/stat`
   are scoped per account — but everyone admitted shares one process, one
   database file and one API budget. Rounds bound how many people there are
@@ -441,7 +477,7 @@ Roughly 37,100 lines of Rust across 60 focused modules.
 ## Development
 
 ```bash
-cargo test --workspace      # 728 tests across four crates, no network
+cargo test --workspace      # 747 tests across four crates, no network
 node --test 'crates/scout-web/src/*.test.mjs'  # the chat client's own tests
 cargo clippy --workspace --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs
@@ -450,6 +486,10 @@ scripts/deploy.sh           # compose: test, build, drain, hand over
 scripts/deploy-k3s.sh       # production: build on the node, apply, wait
 scripts/deploy-k3s.sh --dry-run # show the plan, change nothing
 ```
+
+What is being worked on, what is next and what is waiting lives in
+[`docs/BOARD.md`](docs/BOARD.md), one line per card; the design docs and
+plans under `docs/superpowers/` carry the detail.
 
 A handful of tests are `#[ignore]`d because they call the real APIs. They are
 how the local-time trap, the USD-instead-of-EUR default and a booking lookup

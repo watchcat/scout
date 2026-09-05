@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight } from './chat.js'
+import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight, threadLabel, whenLabel, sendBody } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
   // The browser half of the protocol's security property: reasoning the
@@ -93,4 +93,36 @@ test('a keep-alive comment is not mistaken for a frame', () => {
     event: 'end',
     data: '{"status":"ok","answer":"hi"}',
   })
+})
+
+test('a thread is labelled by its title, or as new when it has none', () => {
+  assert.deepEqual(threadLabel({ title: 'wasmiddel per kilo' }), { text: 'wasmiddel per kilo', unnamed: false })
+  assert.deepEqual(threadLabel({ title: null }), { text: 'New thread', unnamed: true })
+})
+
+test('an empty title is no title', () => {
+  // A title that was cleared to '' must read the same as one that was
+  // never set — not as a thread named "".
+  assert.deepEqual(threadLabel({ title: '' }), { text: 'New thread', unnamed: true })
+})
+
+test('a thread says when it was last used, and when it is about to go', () => {
+  const now = Date.parse('2026-09-05T12:00:00Z')
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-05T11:58:00Z', pinned: false }, now), { text: 'now', expiring: false })
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-05T09:30:00Z', pinned: false }, now), { text: '2h', expiring: false })
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-04T00:00:00Z', pinned: false }, now), { text: 'expires in 12h', expiring: true })
+  // Pinned never expires, however old.
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-01T00:00:00Z', pinned: true }, now), { text: '4d', expiring: false })
+})
+
+test('whenLabel guards: clock skew and the last hour before expiry', () => {
+  const now = Date.parse('2026-09-05T12:00:00Z')
+  // Clock skew: an `updated_at` in the future must not go negative or throw.
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-05T12:05:00Z', pinned: false }, now), { text: 'now', expiring: false })
+  // Exactly 48h old: rounds up to "1h", never "0h" — 0 would read as already gone.
+  assert.deepEqual(whenLabel({ updated_at: '2026-09-03T12:00:00Z', pinned: false }, now), { text: 'expires in 1h', expiring: true })
+})
+
+test('a message names the thread it belongs to', () => {
+  assert.deepEqual(JSON.parse(sendBody('hi', 42)), { text: 'hi', thread: 42 })
 })

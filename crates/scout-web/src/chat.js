@@ -109,6 +109,38 @@ export function composerHeight(scrollHeight, cap = COMPOSER_CAP) {
   return Math.min(scrollHeight, cap)
 }
 
+// The idle window after which an unpinned thread is deleted, and the point
+// at which the sidebar starts saying so. Both mirror core: 48h expiry in
+// `Core::THREAD_IDLE_SECS`, and "worth warning" at 36h.
+const EXPIRES_AFTER_MS = 48 * 3600 * 1000
+const WARN_AFTER_MS = 36 * 3600 * 1000
+
+export function threadLabel(thread) {
+  return thread.title ? { text: thread.title, unnamed: false } : { text: 'New thread', unnamed: true }
+}
+
+// "2h", "4d", or "expires in 12h" once an unpinned thread is close to
+// going — so nobody learns about expiry by losing something.
+export function whenLabel(thread, now = Date.now()) {
+  const age = Math.max(0, now - Date.parse(thread.updated_at))
+  if (!thread.pinned && age >= WARN_AFTER_MS) {
+    const left = Math.max(1, Math.ceil((EXPIRES_AFTER_MS - age) / 3600000))
+    return { text: `expires in ${left}h`, expiring: true }
+  }
+  const minutes = Math.floor(age / 60000)
+  if (minutes < 5) return { text: 'now', expiring: false }
+  if (minutes < 60) return { text: `${minutes}m`, expiring: false }
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return { text: `${hours}h`, expiring: false }
+  return { text: `${Math.floor(hours / 24)}d`, expiring: false }
+}
+
+// The composer's request body. Named rather than inlined so the one place
+// the thread id crosses the wire is the one place a test can hold.
+export function sendBody(text, thread) {
+  return JSON.stringify({ text, thread })
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')

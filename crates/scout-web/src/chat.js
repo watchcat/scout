@@ -198,6 +198,9 @@ function start() {
   // moved on. Same for two rows tapped in quick succession.
   let refreshSeq = 0
   let openSeq = 0
+  // The threads the rows on screen were built from, held so the minute
+  // ticker below can re-label them without asking the server again.
+  let lastList = []
 
   // Enter sends, Shift+Enter is a newline. `requestSubmit` rather than
   // `submit` because it runs the form's own validation — so Enter on an
@@ -333,9 +336,45 @@ function start() {
   // The highlight follows `currentThread` — what this page is showing —
   // and not `thread.current`, which is the server's separate answer.
   function renderThreads(list) {
+    lastList = list
     threadsEl.replaceChildren()
     for (const thread of list) threadsEl.append(threadRow(thread, thread.id === currentThread))
   }
+
+  // How often the "2h" / "expires in 12h" labels are recomputed. The
+  // coarsest thing they say changes by is an hour, so a minute is already
+  // far finer than it needs to be — and cheap enough to be the safe choice
+  // for the row that ticks from "expires in 1h" to gone.
+  const WHEN_TICK_MS = 60_000
+
+  // Re-labels the rows already on screen from the list they were built
+  // from. `whenLabel` runs at render time, so a tab left open all afternoon
+  // kept saying "expires in 12h" about a thread with two hours left — the
+  // one number on this page whose whole purpose is to be watched.
+  //
+  // Deliberately narrow: not a refetch, because nothing has changed on the
+  // server that this needs to learn — only the clock moved — and a request
+  // a minute from every idle tab is a poll nobody asked for. And not a
+  // re-render either: `renderThreads` replaces every row, which would throw
+  // away a rename input the reader is halfway through typing into. Only the
+  // `.when` span of each row is touched, and a row with none (that rename
+  // in progress) is left alone.
+  function tickWhenLabels() {
+    // A hidden tab's labels are seen by nobody, and `visibilitychange`
+    // refreshes the list outright when it comes back.
+    if (document.hidden) return
+    const rows = threadsEl.children
+    if (rows.length !== lastList.length) return
+    for (let i = 0; i < lastList.length; i++) {
+      const whenEl = rows[i].querySelector('.when')
+      if (!whenEl) continue
+      const when = whenLabel(lastList[i])
+      whenEl.textContent = when.text
+      whenEl.className = when.expiring ? 'when expiring' : 'when'
+    }
+  }
+
+  setInterval(tickWhenLabels, WHEN_TICK_MS)
 
   // Inline SVG rather than an emoji: an emoji pin ignores `color`, so the
   // pinned state would lose its colour affordance.

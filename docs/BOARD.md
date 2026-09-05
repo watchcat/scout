@@ -40,13 +40,10 @@ _(nothing)_
 
 ### Threads follow-ups (from the reviews)
 - [ ] Drop the dead `conversations.pending_draft` column — nothing reads it; the live draft is in the Telegram adapter
-- [ ] Remove the `/chat/reset` alias — no client calls it since the sidebar posts `/chat/threads`
-- [ ] On a 422 the "You" bubble stays alongside the restored composer text
-- [ ] `expire_conversations` has no "not currently running" guard — a thread crossing 48h mid-run is deleted; the answer is delivered, the orphans are swept next hour
-- [ ] "expires in Nh" is computed at render time only; a tab left open shows a stale number until it regains focus
 
 ## Done
 
+- [x] 2026-09-05 — **Four cards from the board** (`80b1ad9`): the `/chat/reset` route is gone; a 422 takes its "You" bubble off the screen; expiry spares a thread with a run in flight, and a Telegram continuation that finds its thread gone starts a fresh one; the expiry countdown keeps ticking on an open tab
 - [x] 2026-09-05 — **Deployed `df4c178`** to the k3s node; migration steps 7 and 8 ran on the production database on first boot
 - [x] 2026-09-05 — **Threads in the browser** (`df4c178`): sidebar, switch, rename, model-suggested rename, pin, delete; 48-hour expiry; titles from the person's words; the mirror queues the thread that ran; `MINIMAX_BASE_URL` configurable and every test off the network
 - [x] 2026-09-05 — **Retry with backoff** on every paid provider (`a159bf7`): 429/5xx/refused connection, Retry-After honoured to 10 s, timeouts deliberately not retried

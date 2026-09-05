@@ -323,6 +323,15 @@ async fn send_message(
         }
     };
 
+    // Counted where Telegram counts its own: after the message is accepted
+    // and before anything is spent. `/stat` and the daily cap both read this
+    // row, and until it was written here the web was invisible to the one
+    // and exempt from the other. Awaited rather than spawned so a failure
+    // is logged in order; one insert is not worth a race with the run.
+    if let Err(e) = auth.core.log_request(account_id, "text").await {
+        tracing::warn!(error = %e, account_id, "request logging failed");
+    }
+
     let run = scout_api::RunContext {
         account_id,
         conversation_id,
@@ -1221,6 +1230,49 @@ mod tests {
             &app, "/chat/messages", &cookie, &csrf, "https://evil.example", r#"{"text":"hi","thread":1}"#,
         ).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_web_message_counts_like_a_telegram_one() {
+        // `/stat` and the daily cap both read `request_log`, and only the
+        // Telegram handlers wrote to it — so the web undercounted in the
+        // one and was exempt from the other.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        let thread = scout_core::session::seed_exchange_for_tests(&core, account_id, "direct", "beans", "three")
+            .await
+            .unwrap();
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+        assert_eq!(core.requests_today(account_id).await.unwrap(), 0);
+
+        let res = post_json_with_cookie(
+            &app,
+            "/chat/messages",
+            &cookie,
+            Some(&csrf),
+            &format!(r#"{{"text":"hi","thread":{thread}}}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        assert_eq!(core.requests_today(account_id).await.unwrap(), 1, "the web message was not counted");
+    }
+
+    #[tokio::test]
+    async fn a_message_into_someone_elses_thread_is_not_counted_either() {
+        // Refused before anything runs, so it costs nothing and counts for
+        // nothing — the same as a Telegram message the gate drops.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let owner = admitted(&core, "777").await;
+        let theirs = scout_core::session::seed_exchange_for_tests(&core, owner, "direct", "beans", "three").await.unwrap();
+        let me = admitted(&core, "888").await;
+        let cookie = crate::session::mint(TEST_KEY, me, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, me);
+
+        let res = post_json_with_cookie(&app, "/chat/messages", &cookie, Some(&csrf), &format!(r#"{{"text":"hi","thread":{theirs}}}"#)).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(core.requests_today(me).await.unwrap(), 0, "a refused message was counted");
     }
 
     #[tokio::test]

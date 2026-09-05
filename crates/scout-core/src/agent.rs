@@ -294,10 +294,14 @@ pub type LlmClient = openai::CompletionsClient;
 /// configured client is not possible here (rig-core is on reqwest 0.12,
 /// this crate on 0.13, so the `Client` types are unrelated), so the guard
 /// lives in bot.rs instead, around the stream itself.
-pub fn llm_client(api_key: &str) -> Result<LlmClient> {
+///
+/// `base_url` is `MINIMAX_BASE_URL` in production and comes from
+/// `Config::minimax_base_url`, which a self-hoster may point at a proxy of
+/// their own and which the tests point at a closed port.
+pub fn llm_client(api_key: &str, base_url: &str) -> Result<LlmClient> {
     Ok(openai::CompletionsClient::builder()
         .api_key(api_key)
-        .base_url(MINIMAX_BASE_URL)
+        .base_url(base_url)
         .build()?)
 }
 

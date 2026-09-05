@@ -526,6 +526,11 @@ mod tests {
             "TELEGRAM_BOT_TOKEN" => Some("123456:test-bot-token".to_string()),
             "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
             "MINIMAX_API_KEY" => Some("mk".to_string()),
+            // A port nothing listens on, as `Config::for_test` does. A
+            // route that reaches the model under test fails at once with a
+            // connection error instead of putting a request with a bogus
+            // key on the wire.
+            "MINIMAX_BASE_URL" => Some("http://127.0.0.1:1".to_string()),
             "KAGI_API_KEY" => Some("kk".to_string()),
             "SCOUT_DB_PATH" => Some(db.to_str().unwrap().to_string()),
             _ => None,
@@ -547,7 +552,8 @@ mod tests {
         // HTTPS request at api.resend.com, which makes the suite depend on
         // someone else's uptime and hands a test address to a third party.
         // Nothing else in this repository's tests binds a socket or
-        // reaches the network.
+        // reaches the network — the model endpoint above is the other half
+        // of that promise, and it points at a closed port.
         let mut state = crate::AuthState::new(auth, core.clone());
         state.mailer = mailer;
         let app = crate::router(cache, Some(state));

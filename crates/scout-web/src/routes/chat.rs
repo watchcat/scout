@@ -1695,6 +1695,11 @@ mod tests {
         // what comes back. `sorry()` answers an HTML apology page under a
         // 500, which the page cannot read and which says "the machine
         // broke" for a thing that is a model declining to name a thread.
+        //
+        // End to end on purpose, model call included — and the model this
+        // harness is configured with is a closed port on loopback
+        // (`MINIMAX_BASE_URL` in `build_app`), so the call fails on connect
+        // in microseconds and nothing goes onto the network.
         let (app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;
         let mine = scout_core::session::seed_exchange_for_tests(&core, account_id, "direct", "beans", "three")
@@ -1717,21 +1722,27 @@ mod tests {
         // button is a click away in a list of threads. A stuck client
         // retrying, or a reader enjoying themselves, must not be able to
         // spend without a ceiling.
+        //
+        // An empty thread, because what is under test is the counter and
+        // not the model: with no messages `suggest_title` returns
+        // `Ok(None)` and the route answers 404 before it would call one.
+        // The limiter is checked first either way, so ten 404s spend ten
+        // of the quota and the eleventh press is refused — the same shape
+        // as ten real titles, with nothing to reach for.
         let (app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;
-        let mine = scout_core::session::seed_exchange_for_tests(&core, account_id, "direct", "beans", "three")
-            .await
-            .unwrap();
+        let mine = scout_core::session::reset(&core, account_id, "direct").await.unwrap();
         let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
         let csrf = crate::session::csrf_for(TEST_KEY, account_id);
         let uri = format!("/chat/threads/{mine}/title");
 
         for n in 1..=10 {
             let res = post_json_with_cookie(&app, &uri, &cookie, Some(&csrf), "").await;
-            assert_ne!(
+            assert_eq!(
                 res.status(),
-                StatusCode::TOO_MANY_REQUESTS,
-                "request {n} of the quota was refused"
+                StatusCode::NOT_FOUND,
+                "request {n} of the quota answered {} — an empty thread has no title to give",
+                res.status()
             );
         }
         let res = post_json_with_cookie(&app, &uri, &cookie, Some(&csrf), "").await;

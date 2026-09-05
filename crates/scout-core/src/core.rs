@@ -123,7 +123,7 @@ impl Core {
             .timeout(Duration::from_secs(30))
             .build()?;
         let kagi = KagiClient::new(http.clone(), cfg.kagi_api_key.clone(), KAGI_API_BASE.to_string());
-        let llm = crate::agent::llm_client(&cfg.minimax_api_key)?;
+        let llm = crate::agent::llm_client(&cfg.minimax_api_key, &cfg.minimax_base_url)?;
         let ebay = cfg.ebay_credentials.clone().map(|(id, secret)| {
             crate::tools::ebay::EbayClient::new(
                 http.clone(),

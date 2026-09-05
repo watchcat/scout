@@ -43,6 +43,7 @@ _(nothing)_
 
 ## Done
 
+- [x] 2026-09-05 — **The whole thread on the page, and titles you can read** (`3a6a74e`): the message table is the full log and only the model's window is trimmed from it; rig's final response excludes the input history, so every save had been dropping earlier turns — follow-ups now really have context; pinned threads' logs are bounded at 2000 rows; sidebar titles are the biggest thing on their row, two lines, tools beneath on the current row
 - [x] 2026-09-05 — **Four cards from the board** (`80b1ad9`): the `/chat/reset` route is gone; a 422 takes its "You" bubble off the screen; expiry spares a thread with a run in flight, and a Telegram continuation that finds its thread gone starts a fresh one; the expiry countdown keeps ticking on an open tab
 - [x] 2026-09-05 — **Deployed `df4c178`** to the k3s node; migration steps 7 and 8 ran on the production database on first boot
 - [x] 2026-09-05 — **Threads in the browser** (`df4c178`): sidebar, switch, rename, model-suggested rename, pin, delete; 48-hour expiry; titles from the person's words; the mirror queues the thread that ran; `MINIMAX_BASE_URL` configurable and every test off the network

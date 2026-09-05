@@ -275,6 +275,9 @@ pub async fn run_agent(
         // worse than not saving it, but it is not worth failing the reply.
         tracing::warn!(error = %e, conversation_id, "could not save the conversation");
     }
+    // After the save, so a thread that failed to save is not named as if
+    // it had. Writes only over a null title, so a rename survives.
+    crate::session::title_if_missing(core, conversation_id, prompt).await;
     Ok(RunOutcome::Answered(reply))
 }
 
@@ -531,6 +534,18 @@ mod tests {
         let slot = src.find("take_slot(").expect("the run cap must exist");
         let build = src.find("build_agent(").expect("the agent build must exist");
         assert!(claim < slot && slot < build, "the run cap is in the wrong place");
+    }
+
+    #[test]
+    fn every_answered_run_names_a_thread_that_has_no_name_yet() {
+        // Telegram never shows titles, so a thread started there would sit
+        // nameless in the sidebar forever if only the web path titled it.
+        // The one place both channels pass through is here.
+        let src = include_str!("run.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let saved = src.find("save_history(").expect("the save must exist");
+        let titled = src.find("title_if_missing(").expect("the title must be set");
+        assert!(saved < titled, "the title is set before the history is saved");
     }
 
     #[test]

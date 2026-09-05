@@ -342,6 +342,38 @@ pub async fn seed_exchange_for_tests(
     .await
 }
 
+/// How many characters of a first message become the thread's name.
+const TITLE_CHARS: usize = 40;
+
+/// The automatic name: the first message, whitespace collapsed to single
+/// spaces, cut at `TITLE_CHARS` with an ellipsis when cut.
+pub fn first_message_title(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = one_line.chars();
+    let head: String = chars.by_ref().take(TITLE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// Names a thread after its first answer, unless it already has a name.
+///
+/// Called by `run_agent` on every answered run, so a thread begun on
+/// Telegram is named too. Failure is logged, not returned: a missing title
+/// is not worth failing an answer that is already written.
+pub async fn title_if_missing(core: &Core, conversation_id: i64, prompt: &str) {
+    let title = first_message_title(prompt);
+    if title.is_empty() {
+        return;
+    }
+    let store = core.store();
+    if let Err(e) = crate::core::blocking(move || store.set_thread_title_if_missing(conversation_id, &title)).await {
+        tracing::warn!(error = %e, conversation_id, "could not name the thread");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +609,33 @@ mod tests {
             !turns.iter().any(|t| t.text.contains("<think>")),
             "reasoning reached the page: {turns:?}"
         );
+    }
+
+    #[test]
+    fn a_title_is_the_first_message_on_one_line_cut_at_forty_characters() {
+        assert_eq!(first_message_title("cheapest OneBlade cartridges"), "cheapest OneBlade cartridges");
+        assert_eq!(
+            first_message_title("  find me   the\ncheapest\n\nPhilips OneBlade replacement cartridges please "),
+            "find me the cheapest Philips OneBlade re…"
+        );
+        // Cut on a character boundary, never inside one.
+        assert_eq!(first_message_title(&"ë".repeat(50)), format!("{}…", "ë".repeat(40)));
+        assert_eq!(first_message_title("   "), "");
+    }
+
+    #[tokio::test]
+    async fn the_first_answer_names_the_thread_and_the_second_does_not_rename_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("titles.duckdb");
+        let core = Core::start(crate::config::Config::for_test(path.to_str().unwrap()), None).unwrap();
+        let store = core.store();
+        let a = store.account_for_telegram(11).unwrap();
+        let id = store.start_conversation(a, "direct").unwrap();
+
+        title_if_missing(&core, id, "wasmiddel per kilo, bol.com").await;
+        title_if_missing(&core, id, "only under 20 euro").await;
+
+        assert_eq!(store.thread_title(a, id).unwrap().as_deref(), Some("wasmiddel per kilo, bol.com"));
     }
 
     #[test]

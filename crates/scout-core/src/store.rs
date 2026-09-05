@@ -1291,11 +1291,13 @@ impl Store {
         let conn = self.conn();
         // The cast is load-bearing: `current_timestamp` is TIMESTAMPTZ and
         // DuckDB has no `TIMESTAMPTZ - INTERVAL` overload.
+        // `id DESC` breaks a tie the same way `threads_of` orders its list,
+        // so the two reads cannot disagree about which thread is current.
         let mut stmt = conn.prepare(
             "SELECT id,
                     updated_at <= CAST(current_timestamp AS TIMESTAMP) - to_seconds(?)
              FROM conversations WHERE account_id = ? AND scope = ?
-             ORDER BY updated_at DESC LIMIT 1",
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
         )?;
         let row: Option<(i64, bool)> = stmt
             .query_map(params![ttl_secs, account_id, scope], |r| {

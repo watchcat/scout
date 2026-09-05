@@ -307,6 +307,10 @@ const RENAME_CHARS: usize = 80;
 
 /// The account's threads for the sidebar: pinned first, then by last use,
 /// with `current` on the one `latest_direct` returns.
+///
+/// The two reads are separate statements, not one transaction, so a thread
+/// can vanish between them — a caller must tolerate a list with no `current`
+/// row rather than assume exactly one is always marked.
 pub async fn threads(core: &Core, account_id: i64) -> anyhow::Result<Vec<scout_api::Thread>> {
     let store = core.store();
     crate::core::blocking(move || {
@@ -343,22 +347,39 @@ pub async fn open_thread(
     .await
 }
 
-/// A name the person chose. Trimmed, refused when empty, cut at
-/// `RENAME_CHARS`. `false` when the thread is not theirs.
-pub async fn rename(core: &Core, account_id: i64, conversation_id: i64, title: &str) -> anyhow::Result<bool> {
-    let title: String = title.trim().chars().take(RENAME_CHARS).collect();
-    if title.is_empty() {
-        anyhow::bail!("a thread needs a name");
-    }
-    let store = core.store();
-    crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &title)).await
+/// What a rename did. A blank name is refused as an outcome rather than an
+/// error, so the caller can tell "not a name" from "the database failed"
+/// without parsing a message — and so the rule lives here, once, rather
+/// than in every route that calls this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renamed {
+    Done,
+    NotFound,
+    Blank,
 }
 
+/// A name the person chose. Trimmed, cut at `RENAME_CHARS`, and the cut
+/// itself is silent — no ellipsis, because a name a person typed should not
+/// grow punctuation it never had. A caller that shows the name back to the
+/// person after a cut must re-read it rather than echo what it sent.
+pub async fn rename(core: &Core, account_id: i64, conversation_id: i64, title: &str) -> anyhow::Result<Renamed> {
+    let title: String = title.trim().chars().take(RENAME_CHARS).collect::<String>().trim_end().to_string();
+    if title.is_empty() {
+        return Ok(Renamed::Blank);
+    }
+    let store = core.store();
+    let done = crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &title)).await?;
+    Ok(if done { Renamed::Done } else { Renamed::NotFound })
+}
+
+/// Permanent: exempt from expiry. Nothing else.
 pub async fn set_pinned(core: &Core, account_id: i64, conversation_id: i64, pinned: bool) -> anyhow::Result<bool> {
     let store = core.store();
     crate::core::blocking(move || store.set_thread_pinned(account_id, conversation_id, pinned)).await
 }
 
+/// See `Store::delete_conversation` for what this deliberately leaves
+/// behind: a mirror row already queued in the outbox is not swept.
 pub async fn delete_thread(core: &Core, account_id: i64, conversation_id: i64) -> anyhow::Result<bool> {
     let store = core.store();
     crate::core::blocking(move || store.delete_conversation(account_id, conversation_id)).await
@@ -723,6 +744,7 @@ mod tests {
         let older = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
         let newer = seed_exchange_for_tests(&core, a, "direct", "hubs", "two").await.unwrap();
         core.store().set_thread_pinned(a, older, true).unwrap();
+        core.store().open_conversation(a, newer).unwrap(); // used last, not merely inserted last
 
         let list = threads(&core, a).await.unwrap();
 
@@ -749,20 +771,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_a_thread_that_has_no_messages_yet_returns_an_empty_transcript() {
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let id = reset(&core, a, "direct").await.unwrap();
+
+        assert_eq!(open_thread(&core, a, id).await.unwrap(), Some(vec![]));
+    }
+
+    #[tokio::test]
     async fn rename_pin_and_delete_answer_not_found_for_someone_elses_thread() {
         let (core, _dir) = threads_core().await;
         let a = core.store().account_for_telegram(11).unwrap();
         let b = core.store().account_for_telegram(22).unwrap();
         let mine = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
 
-        assert!(!rename(&core, b, mine, "theirs").await.unwrap());
+        assert_eq!(rename(&core, b, mine, "theirs").await.unwrap(), Renamed::NotFound);
         assert!(!set_pinned(&core, b, mine, true).await.unwrap());
         assert!(!delete_thread(&core, b, mine).await.unwrap());
 
-        assert!(rename(&core, a, mine, "  beans, cheapest  ").await.unwrap());
+        assert_eq!(rename(&core, a, mine, "  beans, cheapest  ").await.unwrap(), Renamed::Done);
         assert_eq!(core.store().thread_title(a, mine).unwrap().as_deref(), Some("beans, cheapest"));
         assert!(set_pinned(&core, a, mine, true).await.unwrap());
         assert!(threads(&core, a).await.unwrap()[0].pinned);
+        assert!(set_pinned(&core, a, mine, false).await.unwrap());
+        assert!(!threads(&core, a).await.unwrap()[0].pinned, "an unpin that fails makes a thread immortal");
         assert!(delete_thread(&core, a, mine).await.unwrap());
         assert!(threads(&core, a).await.unwrap().is_empty());
     }
@@ -773,7 +806,7 @@ mod tests {
         let a = core.store().account_for_telegram(11).unwrap();
         let mine = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
 
-        assert!(rename(&core, a, mine, "   ").await.is_err(), "an empty name is not a name");
+        assert_eq!(rename(&core, a, mine, "   ").await.unwrap(), Renamed::Blank, "an empty name is not a name");
         rename(&core, a, mine, &"x".repeat(100)).await.unwrap();
         assert_eq!(core.store().thread_title(a, mine).unwrap().unwrap().chars().count(), 80);
     }

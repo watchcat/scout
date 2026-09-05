@@ -839,6 +839,17 @@ pub struct PendingMirror {
     pub body: String,
 }
 
+/// One row of the sidebar. `current` is not here: the store does not know
+/// which thread a channel would continue, `session::latest_direct` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRow {
+    pub id: i64,
+    pub title: Option<String>,
+    pub pinned: bool,
+    /// RFC 3339, UTC.
+    pub updated_at: String,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -1313,6 +1324,103 @@ impl Store {
             params![conversation_id],
         )?;
         Ok(())
+    }
+
+    /// The account's `direct` threads, pinned first, then newest use first.
+    pub fn threads_of(&self, account_id: i64) -> Result<Vec<ThreadRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, pinned, strftime(updated_at, '%Y-%m-%dT%H:%M:%SZ')
+             FROM conversations WHERE account_id = ? AND scope = 'direct'
+             ORDER BY pinned DESC, updated_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id], |r| {
+            Ok(ThreadRow { id: r.get(0)?, title: r.get(1)?, pinned: r.get(2)?, updated_at: r.get(3)? })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Bumps `updated_at`, which is what makes a thread current. `false`
+    /// when the account does not own a `direct` thread by that id — which is
+    /// also what a thread that no longer exists looks like, on purpose.
+    pub fn open_conversation(&self, account_id: i64, conversation_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE conversations SET updated_at = now()
+             WHERE id = ? AND account_id = ? AND scope = 'direct'",
+            params![conversation_id, account_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn thread_title(&self, account_id: i64, conversation_id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT title FROM conversations WHERE id = ? AND account_id = ?",
+        )?;
+        let row: Option<Option<String>> = stmt
+            .query_map(params![conversation_id, account_id], |r| r.get(0))?
+            .next()
+            .transpose()?;
+        Ok(row.flatten())
+    }
+
+    /// A rename. Owner-checked.
+    pub fn set_thread_title(&self, account_id: i64, conversation_id: i64, title: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE conversations SET title = ? WHERE id = ? AND account_id = ?",
+            params![title, conversation_id, account_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The automatic title after a first answer. Not owner-checked: the
+    /// caller is `run_agent`, which already holds the conversation. Writes
+    /// only over null, so a rename is never undone.
+    pub fn set_thread_title_if_missing(&self, conversation_id: i64, title: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE conversations SET title = ? WHERE id = ? AND title IS NULL",
+            params![title, conversation_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn set_thread_pinned(&self, account_id: i64, conversation_id: i64, pinned: bool) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE conversations SET pinned = ? WHERE id = ? AND account_id = ?",
+            params![pinned, conversation_id, account_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The thread and its messages, in one transaction. Owner-checked.
+    pub fn delete_conversation(&self, account_id: i64, conversation_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<bool> {
+            let owned = conn.execute(
+                "DELETE FROM conversations WHERE id = ? AND account_id = ?",
+                params![conversation_id, account_id],
+            )?;
+            if owned == 0 {
+                return Ok(false);
+            }
+            conn.execute("DELETE FROM messages WHERE conversation_id = ?", params![conversation_id])?;
+            Ok(true)
+        })();
+        match result {
+            Ok(deleted) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(deleted)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// The last `limit` messages, oldest first — the order a provider wants.
@@ -4907,5 +5015,95 @@ CREATE TABLE conversations (
         let (_d2, db) = version_six_db_with_a_thread();
         let migrated = Store::open(&db).unwrap();
         assert_eq!(shape(&fresh.conn()), shape(&migrated.conn()));
+    }
+
+    #[test]
+    fn threads_are_listed_pinned_first_and_then_by_last_use() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let old = s.start_conversation(a, "direct").unwrap();
+        let pinned = s.start_conversation(a, "direct").unwrap();
+        let newest = s.start_conversation(a, "direct").unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(3600) WHERE id = {old};
+                 UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(7200) WHERE id = {pinned};"
+            ))
+            .unwrap();
+        assert!(s.set_thread_pinned(a, pinned, true).unwrap());
+        // Not this account's thread, and not `direct`: neither may appear.
+        let b = s.account_for_telegram(22).unwrap();
+        s.start_conversation(b, "direct").unwrap();
+        s.start_conversation(a, "telegram:-100").unwrap();
+
+        let ids: Vec<i64> = s.threads_of(a).unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![pinned, newest, old]);
+    }
+
+    #[test]
+    fn a_thread_row_carries_what_the_sidebar_shows() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let id = s.start_conversation(a, "direct").unwrap();
+        assert!(s.set_thread_title(a, id, "wasmiddel per kilo").unwrap());
+        let rows = s.threads_of(a).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title.as_deref(), Some("wasmiddel per kilo"));
+        assert!(!rows[0].pinned);
+        assert!(rows[0].updated_at.ends_with('Z'), "not RFC 3339 UTC: {}", rows[0].updated_at);
+    }
+
+    #[test]
+    fn opening_a_thread_makes_it_the_newest_and_only_for_its_owner() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let first = s.start_conversation(a, "direct").unwrap();
+        let second = s.start_conversation(a, "direct").unwrap();
+        s.conn()
+            .execute(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(60) WHERE id = ?",
+                params![first],
+            )
+            .unwrap();
+        assert_eq!(s.latest_conversation(a, "direct", 600).unwrap().map(|(id, _)| id), Some(second));
+
+        assert!(s.open_conversation(a, first).unwrap());
+        assert_eq!(s.latest_conversation(a, "direct", 600).unwrap().map(|(id, _)| id), Some(first));
+
+        let stranger = s.account_for_telegram(22).unwrap();
+        assert!(!s.open_conversation(stranger, first).unwrap(), "opened someone else's thread");
+        assert!(!s.open_conversation(a, 999_999).unwrap(), "opened a thread that does not exist");
+    }
+
+    #[test]
+    fn a_thread_can_only_be_renamed_pinned_or_deleted_by_its_owner() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let stranger = s.account_for_telegram(22).unwrap();
+        let id = s.start_conversation(a, "direct").unwrap();
+        s.replace_messages(id, &["{}".to_string()]).unwrap();
+
+        assert!(!s.set_thread_title(stranger, id, "mine now").unwrap());
+        assert!(!s.set_thread_pinned(stranger, id, true).unwrap());
+        assert!(!s.delete_conversation(stranger, id).unwrap());
+        assert_eq!(s.threads_of(a).unwrap().len(), 1, "a stranger changed something");
+        assert_eq!(s.thread_title(a, id).unwrap(), None);
+
+        assert!(s.delete_conversation(a, id).unwrap());
+        assert!(s.threads_of(a).unwrap().is_empty());
+        assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "messages outlived their thread");
+    }
+
+    #[test]
+    fn a_title_written_only_when_missing_never_covers_a_rename() {
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let id = s.start_conversation(a, "direct").unwrap();
+        assert!(s.set_thread_title_if_missing(id, "first message").unwrap());
+        assert!(!s.set_thread_title_if_missing(id, "second message").unwrap());
+        assert_eq!(s.thread_title(a, id).unwrap().as_deref(), Some("first message"));
+        s.set_thread_title(a, id, "renamed").unwrap();
+        assert!(!s.set_thread_title_if_missing(id, "third").unwrap());
+        assert_eq!(s.thread_title(a, id).unwrap().as_deref(), Some("renamed"));
     }
 }

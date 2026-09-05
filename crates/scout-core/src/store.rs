@@ -713,7 +713,12 @@ CREATE TABLE IF NOT EXISTS login_tokens (
 /// separate transaction costs. (`ADD COLUMN` with a constraint is refused
 /// outright, which is why the constraint is not simply on the add.)
 /// `IF NOT EXISTS` so a database created by `MIGRATIONS` after this
-/// shipped, but somehow recorded below 7, is not broken by the step.
+/// shipped, but somehow recorded below 7, is not broken by the step. The
+/// backfill and the `SET DEFAULT` are separate statements, rather than
+/// folding the default into `ADD COLUMN pinned BOOLEAN DEFAULT false`,
+/// because `ADD COLUMN IF NOT EXISTS` may no-op on a file that already has
+/// the column — from an interrupted prior run of this same step — and the
+/// explicit backfill and default still need to run against that file too.
 const STEP_7_THREADS: &str = r#"
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN;
@@ -4827,7 +4832,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert!(s.schema_version().unwrap() >= 8, "the threads steps did not run");
+        assert_eq!(s.schema_version().unwrap(), 8, "the threads steps did not run");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -4846,5 +4851,61 @@ CREATE TABLE conversations (
             .query_row("SELECT pinned FROM conversations WHERE id = ?", params![id], |r| r.get(0))
             .unwrap();
         assert!(!fresh, "a thread started after the migration is unpinned too");
+        assert!(
+            conn.execute_batch(
+                "INSERT INTO conversations (id, account_id, scope, pinned)
+                 VALUES (nextval('conversations_id_seq'), 1, 'direct', NULL)"
+            )
+            .is_err(),
+            "the pin must be NOT NULL on a migrated file"
+        );
+    }
+
+    #[test]
+    fn a_database_interrupted_between_the_two_thread_steps_finishes_on_the_next_boot() {
+        // The one interleaving a partial deploy can produce: step 7 landed,
+        // the process died, step 8 never ran. `STEP_8_PINNED_NOT_NULL`'s
+        // comment promises the next boot finishes the job.
+        let (_dir, db) = version_six_db_with_a_thread();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(STEP_7_THREADS).unwrap();
+            conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 8);
+        let conn = s.conn();
+        assert!(
+            conn.execute_batch(
+                "INSERT INTO conversations (id, account_id, scope, pinned)
+                 VALUES (nextval('conversations_id_seq'), 1, 'direct', NULL)"
+            )
+            .is_err(),
+            "step 8 did not run on the second boot"
+        );
+    }
+
+    #[test]
+    fn a_migrated_conversations_table_has_exactly_the_shape_a_fresh_one_has() {
+        // `MIGRATIONS` and the steps are two descriptions of one table, and
+        // nothing else keeps them in step. Name, order, type, nullability
+        // and default — the whole of what a query can see.
+        fn shape(conn: &Connection) -> Vec<(String, i64, String, String, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT column_name, ordinal_position, data_type, is_nullable, column_default
+                     FROM information_schema.columns
+                     WHERE table_name = 'conversations' ORDER BY ordinal_position",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+        let (fresh, _d1) = test_store();
+        let (_d2, db) = version_six_db_with_a_thread();
+        let migrated = Store::open(&db).unwrap();
+        assert_eq!(shape(&fresh.conn()), shape(&migrated.conn()));
     }
 }

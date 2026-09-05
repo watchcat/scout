@@ -20,6 +20,8 @@
 
 ### Task 1: Two columns on `conversations`
 
+**Status: done in ea84cd1 and the fix commit after it; the text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-core/src/store.rs` — `MIGRATIONS` (the `conversations` table near line 219), the `steps()` list near line 698, a new `STEP_7_THREADS` const beside `STEP_6_LOGIN_TOKENS`.
 - Test: `crates/scout-core/src/store.rs` tests module (append before the final `}`).
@@ -38,7 +40,7 @@ Append inside `mod tests` in `store.rs`:
                 |r| r.get(0),
             )
             .unwrap();
-        n == 1
+        n > 0
     }
 
     #[test]
@@ -60,7 +62,7 @@ Append inside `mod tests` in `store.rs`:
         let s = Store::open(&db).unwrap();
         // Step 6 was the last one before this; a database that stops there
         // is exactly the production file.
-        assert!(s.schema_version().unwrap() >= 7, "step 7 did not run");
+        assert_eq!(s.schema_version().unwrap(), 8, "the threads steps did not run");
         let a = s.account_for_telegram(11).unwrap();
         let id = s.start_conversation(a, "direct").unwrap();
         let conn = s.conn();
@@ -87,30 +89,53 @@ CREATE TABLE IF NOT EXISTS conversations (
     account_id    BIGINT NOT NULL,
     scope         TEXT NOT NULL,
     pending_draft TEXT,
+    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    -- Last two, so a fresh database and a migrated one — where these
+    -- arrive by ALTER TABLE in step 7 — have the same column order.
     -- What the sidebar calls it. Null until the first answer lands; then
     -- the first message trimmed, unless someone renamed it. See the
     -- threads design doc.
     title         TEXT,
     -- "Permanent": exempt from the 48-hour expiry. Nothing else.
-    pinned        BOOLEAN NOT NULL DEFAULT false,
-    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
-    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+    pinned        BOOLEAN NOT NULL DEFAULT false
 );
 ```
 
 Below `STEP_6_LOGIN_TOKENS` add:
 
 ```rust
-/// Threads in the browser: a name and a pin. `IF NOT EXISTS` so a database
-/// created by `MIGRATIONS` after this shipped, but somehow recorded at 6,
-/// is not broken by the step.
+/// Threads in the browser: a name and a pin.
+///
+/// The `pinned` column is added bare, backfilled and given its default
+/// here, and made NOT NULL in step 8 — a separate step because DuckDB
+/// refuses `SET NOT NULL` in a transaction that has already touched the
+/// table's rows, and the `ADD COLUMN` in this one counts. `apply_steps`
+/// runs each step in its own transaction, so a separate step is what a
+/// separate transaction costs. (`ADD COLUMN` with a constraint is refused
+/// outright, which is why the constraint is not simply on the add.)
+/// `IF NOT EXISTS` so a database created by `MIGRATIONS` after this
+/// shipped, but somehow recorded below 7, is not broken by the step. The
+/// backfill and the `SET DEFAULT` are separate statements, rather than
+/// folding the default into `ADD COLUMN pinned BOOLEAN DEFAULT false`,
+/// because `ADD COLUMN IF NOT EXISTS` may no-op on a file that already has
+/// the column — from an interrupted prior run of this same step — and the
+/// explicit backfill and default still need to run against that file too.
 const STEP_7_THREADS: &str = r#"
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT;
-ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN;
+UPDATE conversations SET pinned = false WHERE pinned IS NULL;
+ALTER TABLE conversations ALTER COLUMN pinned SET DEFAULT false;
+"#;
+
+/// See `STEP_7_THREADS`. Dying between 7 and 8 leaves a nullable column
+/// that holds no nulls, and this runs alone on the next boot.
+const STEP_8_PINNED_NOT_NULL: &str = r#"
+ALTER TABLE conversations ALTER COLUMN pinned SET NOT NULL;
 "#;
 ```
 
-In `steps()` add `(7, Step::Sql(STEP_7_THREADS)),` after step 6.
+In `steps()` add `(7, Step::Sql(STEP_7_THREADS)),` and `(8, Step::Sql(STEP_8_PINNED_NOT_NULL)),` after step 6.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 

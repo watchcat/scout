@@ -346,7 +346,10 @@ pub async fn seed_exchange_for_tests(
 const TITLE_CHARS: usize = 40;
 
 /// The automatic name: the first message, whitespace collapsed to single
-/// spaces, cut at `TITLE_CHARS` with an ellipsis when cut.
+/// spaces, cut at `TITLE_CHARS` chars, not grapheme clusters, with an
+/// ellipsis when cut. A flag emoji built from two code points can be split
+/// at the cut; the cut is on a char boundary, so the result is still valid
+/// text, and a title is a label, not a rendering.
 pub fn first_message_title(text: &str) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = one_line.chars();
@@ -621,6 +624,9 @@ mod tests {
         // Cut on a character boundary, never inside one.
         assert_eq!(first_message_title(&"ë".repeat(50)), format!("{}…", "ë".repeat(40)));
         assert_eq!(first_message_title("   "), "");
+        // The boundary itself: exactly forty is not cut, forty-one is.
+        assert_eq!(first_message_title(&"a".repeat(40)), "a".repeat(40));
+        assert_eq!(first_message_title(&"a".repeat(41)), format!("{}…", "a".repeat(40)));
     }
 
     #[tokio::test]

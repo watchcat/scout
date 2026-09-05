@@ -138,6 +138,14 @@ pub struct RunContext {
     /// A run with `None` is not offered the reminder tool at all, so the
     /// model never promises something that would silently never arrive.
     pub reply_to: Option<ReplyTo>,
+    /// The person's own words, for naming a thread that has no name yet —
+    /// or `None` when this run has none worth naming it after. Separate
+    /// from the prompt because the prompt is not the message: Telegram
+    /// appends a `[system note]` to price requests and builds a reaction
+    /// follow-up from nothing else, and a title cut from that would read
+    /// `cheapest usb hub [system note] This is a…`.
+    #[serde(default)]
+    pub title_source: Option<String>,
 }
 
 impl ReplyTo {
@@ -185,6 +193,15 @@ pub struct Thread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_context_without_a_title_source_still_arrives() {
+        // The field was added after clients existed. A stored or in-flight
+        // context written before it must still decode, nameless.
+        let run: RunContext =
+            serde_json::from_str(r#"{"account_id":1,"conversation_id":2,"reply_to":null}"#).unwrap();
+        assert_eq!(run.title_source, None);
+    }
 
     #[test]
     fn emitting_into_a_closed_channel_is_not_an_error() {

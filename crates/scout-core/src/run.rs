@@ -270,14 +270,19 @@ pub async fn run_agent(
 
     trim_history(&mut history, HISTORY_CAP);
     let store = core.deps.store.clone();
-    if let Err(e) = crate::core::blocking(move || crate::session::save_history(&store, conversation_id, &history)).await {
+    match crate::core::blocking(move || crate::session::save_history(&store, conversation_id, &history)).await {
         // The answer is already on its way to the user; losing the thread is
         // worse than not saving it, but it is not worth failing the reply.
-        tracing::warn!(error = %e, conversation_id, "could not save the conversation");
+        Err(e) => tracing::warn!(error = %e, conversation_id, "could not save the conversation"),
+        // Named only once saved, so a thread that failed to save is not
+        // named as if it had. Writes only over a null title, so a rename
+        // survives. Named from the person's words, never the prompt.
+        Ok(()) => {
+            if let Some(source) = &run.title_source {
+                crate::session::title_if_missing(core, conversation_id, source).await;
+            }
+        }
     }
-    // After the save, so a thread that failed to save is not named as if
-    // it had. Writes only over a null title, so a rename survives.
-    crate::session::title_if_missing(core, conversation_id, prompt).await;
     Ok(RunOutcome::Answered(reply))
 }
 
@@ -543,9 +548,15 @@ mod tests {
         // The one place both channels pass through is here.
         let src = include_str!("run.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let src = &src[src.find("pub async fn run_agent").expect("the run must exist")..];
         let saved = src.find("save_history(").expect("the save must exist");
         let titled = src.find("title_if_missing(").expect("the title must be set");
+        assert_eq!(src.matches("title_if_missing(").count(), 1, "the thread is named more than once");
         assert!(saved < titled, "the title is set before the history is saved");
+        // Named from the person's words. The prompt is not the message:
+        // Telegram appends a `[system note]` to a price request, and a
+        // title cut from that reads `cheapest usb hub [system note] This…`.
+        assert!(src.contains("run.title_source"), "the thread is named from something other than the caller's title source");
     }
 
     #[test]

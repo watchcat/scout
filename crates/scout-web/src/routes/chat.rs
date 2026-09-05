@@ -293,6 +293,8 @@ async fn send_message(
         account_id,
         conversation_id,
         reply_to: reply_to_for(&auth, account_id).await,
+        // On the web the body is the message: nothing is appended to it.
+        title_source: Some(body.text.clone()),
     };
     let core = auth.core.clone();
     let text = body.text;

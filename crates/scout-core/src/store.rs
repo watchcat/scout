@@ -1355,6 +1355,18 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// The ownership check on its own, for a caller that must not bump the
+    /// thread the way `open_conversation` does.
+    pub fn owns_thread(&self, account_id: i64, conversation_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM conversations WHERE id = ? AND account_id = ? AND scope = 'direct'",
+            params![conversation_id, account_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// `None` means "no title yet" as much as "not yours or gone" — this is
     /// a read accessor, not something to base a not-found decision on.
     pub fn thread_title(&self, account_id: i64, conversation_id: i64) -> Result<Option<String>> {

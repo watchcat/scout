@@ -362,8 +362,17 @@ pub async fn continues_previous(
     Ok(verdict.to_uppercase().contains("CONTINUE"))
 }
 
+/// How long one call to name a thread may take. The same 30s the outbound
+/// HTTP client gives any other single call.
+const TITLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// One-shot: a short name for a conversation, from its text. Tool-less,
 /// like `continues_previous`, and for the same reason.
+///
+/// Bounded in time because nothing else bounds it: rig's client has no
+/// timeout of its own (see [`llm_client`]), and this call sits under an HTTP
+/// handler rather than under the run loop, whose `STREAM_STALL` guard is the
+/// only other thing that would cut a hung connection loose.
 pub async fn title_for(llm: &LlmClient, transcript: &str) -> Result<String> {
     let agent = llm
         .agent(MODEL)
@@ -374,7 +383,10 @@ pub async fn title_for(llm: &LlmClient, transcript: &str) -> Result<String> {
         )
         .build();
     let question = format!("Conversation:\n{transcript}\n\nTitle:");
-    Ok(crate::text::strip_thinking(&rig::completion::Prompt::prompt(&agent, question).await?))
+    let answer = tokio::time::timeout(TITLE_BUDGET, rig::completion::Prompt::prompt(&agent, question))
+        .await
+        .map_err(|_| anyhow::anyhow!("the model did not answer in time"))??;
+    Ok(crate::text::strip_thinking(&answer))
 }
 
 /// Cap on injected profile facts, bounding prompt growth.

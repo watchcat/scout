@@ -385,9 +385,43 @@ pub async fn delete_thread(core: &Core, account_id: i64, conversation_id: i64) -
     crate::core::blocking(move || store.delete_conversation(account_id, conversation_id)).await
 }
 
-/// What the model said, made fit for a sidebar: first non-empty line, a
-/// leading "Title:" and wrapping quotes dropped, trailing punctuation
-/// dropped, cut at `RENAME_CHARS`. `None` when nothing is left.
+/// Drops a leading list marker (`1. `, `1) `, `- `, `* `, `• `), which is
+/// how a model that was asked for one title answers with a list of one.
+fn strip_list_marker(line: &str) -> &str {
+    for bullet in ["- ", "* ", "• "] {
+        if let Some(rest) = line.strip_prefix(bullet) {
+            return rest.trim_start();
+        }
+    }
+    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 {
+        let rest = &line[digits..];
+        if let Some(rest) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            return rest.trim_start();
+        }
+    }
+    line
+}
+
+/// Drops a leading `Title:`, in any case and with markdown bold around it,
+/// which the preamble asks for but a model volunteers anyway.
+fn strip_title_label(line: &str) -> &str {
+    let rest = line.strip_prefix("**").unwrap_or(line);
+    let Some(after) = rest.to_ascii_lowercase().strip_prefix("title:").map(str::len) else {
+        return line;
+    };
+    let rest = &rest[rest.len() - after..];
+    rest.strip_prefix("**").unwrap_or(rest).trim()
+}
+
+/// What the model said, made fit for a sidebar: the answer line, a leading
+/// list marker, a leading "Title:" and wrapping quotes dropped, trailing
+/// punctuation dropped, control and bidi characters filtered out, cut at
+/// `RENAME_CHARS` with no trailing space left by the cut. `None` when
+/// nothing is left.
+///
+/// The answer line is the first non-empty one, unless it ends in a colon
+/// and another line follows — then it was the preamble to the answer.
 ///
 /// Quotes are stripped on both sides of the punctuation pass, because the
 /// two orders each leave one real answer intact: `'A title'.` keeps its
@@ -395,24 +429,57 @@ pub async fn delete_thread(core: &Core, account_id: i64, conversation_id: i64) -
 /// if punctuation does.
 pub fn clean_title(raw: &str) -> Option<String> {
     let quote = |c: char| matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’');
-    let line = crate::text::strip_thinking(raw);
-    let line = line.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let line = line.strip_prefix("Title:").map(str::trim).unwrap_or(line);
+    let text = crate::text::strip_thinking(raw);
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next()?;
+    // "Here is a title for your conversation:" is the announcement, not the
+    // answer — a line that ends in a colon with another line behind it is
+    // the model clearing its throat.
+    let line = match first.ends_with(':') {
+        true => lines.next().unwrap_or(first),
+        false => first,
+    };
+    let line = strip_list_marker(line);
+    let line = strip_title_label(line);
     let line = line.trim_matches(quote);
     let line = line.trim_end_matches(['.', '!', '?', ':']);
     let line = line.trim_matches(quote);
-    let cleaned: String = line.trim().chars().take(RENAME_CHARS).collect();
+    let cleaned: String = line
+        .trim()
+        .chars()
+        .filter(|c| !is_layout_char(*c))
+        .take(RENAME_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
+/// A character a sidebar row must never carry: a control character, a line
+/// or paragraph separator, or one of the bidi overrides and isolates, which
+/// can make a title render as something other than what it says — and,
+/// unclosed, drag the row after it along too.
+fn is_layout_char(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
 /// Asks the model for a name and stores it. `None` when the thread is not
-/// the account's, or has nothing in it to name. An unusable answer is an
-/// error the caller reports; the old title stays.
+/// the account's, has nothing in it to name, or went away while the model
+/// was thinking. An unusable answer is an error the caller reports; the old
+/// title stays.
 ///
-/// Opening the thread doubles as the ownership check and bumps it to
-/// current, which a person pressing a button on it expects.
+/// The thread is read, not opened: naming an old sidebar row must not make
+/// it the thread Telegram continues, which is what `open_thread` would do.
 pub async fn suggest_title(core: &Core, account_id: i64, conversation_id: i64) -> anyhow::Result<Option<String>> {
-    let Some(turns) = open_thread(core, account_id, conversation_id).await? else {
+    let store = core.store();
+    let Some(turns) = crate::core::blocking(move || {
+        if !store.owns_thread(account_id, conversation_id)? {
+            return Ok(None);
+        }
+        Ok(Some(transcript_of(&store, conversation_id)?))
+    })
+    .await?
+    else {
         return Ok(None);
     };
     if turns.is_empty() {
@@ -435,9 +502,11 @@ pub async fn suggest_title(core: &Core, account_id: i64, conversation_id: i64) -
         anyhow::bail!("the model gave no usable title");
     };
     let store = core.store();
-    let stored = title.clone();
-    crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &stored)).await?;
-    Ok(Some(title))
+    let written = title.clone();
+    // The thread can be deleted while the model is thinking; then nothing
+    // was named, and saying otherwise would put a title on a gone row.
+    let stored = crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &written)).await?;
+    Ok(stored.then_some(title))
 }
 
 /// Starts a fresh conversation, discarding whatever thread was live.
@@ -832,6 +901,7 @@ mod tests {
         let id = reset(&core, a, "direct").await.unwrap();
 
         assert_eq!(open_thread(&core, a, id).await.unwrap(), Some(vec![]));
+        assert_eq!(suggest_title(&core, a, id).await.unwrap(), None, "an empty thread must not reach the model");
     }
 
     #[tokio::test]
@@ -872,7 +942,22 @@ mod tests {
         assert_eq!(clean_title("Title: 'AMS to LIS in October'."), Some("AMS to LIS in October".to_string()));
         assert_eq!(clean_title("<think>hmm</think>Wasmiddel per kilo"), Some("Wasmiddel per kilo".to_string()));
         assert_eq!(clean_title("   "), None);
-        assert_eq!(clean_title(&"word ".repeat(30)).unwrap().chars().count(), 80);
+        // A chatty model announces the title on the line before it.
+        assert_eq!(
+            clean_title("Sure! Here is a title for your conversation:\nBeans, cheapest"),
+            Some("Beans, cheapest".to_string())
+        );
+        assert_eq!(clean_title("**Title:** Beans"), Some("Beans".to_string()));
+        assert_eq!(
+            clean_title("1. Cheapest OneBlade cartridges"),
+            Some("Cheapest OneBlade cartridges".to_string())
+        );
+        // A title is one line of plain text: no control characters, and no
+        // bidi override to make a sidebar row read backwards.
+        assert_eq!(clean_title("Beans\u{202E}cheapest\r"), Some("Beanscheapest".to_string()));
+        // The cut is at `RENAME_CHARS` and never leaves a trailing space.
+        let long = clean_title(&"word ".repeat(30)).unwrap();
+        assert!(long.chars().count() <= 80 && !long.ends_with(' '));
     }
 
     #[tokio::test]
@@ -884,6 +969,36 @@ mod tests {
         // No model is reachable in tests; reaching one would be an error,
         // not `None`, so `None` proves the check ran first.
         assert_eq!(suggest_title(&core, b, mine).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn suggesting_a_title_does_not_make_the_thread_current() {
+        // Pressing "name this" on an old sidebar row names it. It must not
+        // also make it the thread Telegram continues — the person did not
+        // switch threads, they asked for a label.
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let older = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+        let newer = seed_exchange_for_tests(&core, a, "direct", "hubs", "two").await.unwrap();
+        core.store().open_conversation(a, newer).unwrap();
+        assert_eq!(latest_direct(&core.store(), a).unwrap(), Some(newer));
+
+        // No model is reachable in tests, so this ends in an error — after
+        // the read that used to bump the thread.
+        let _ = suggest_title(&core, a, older).await;
+
+        assert_eq!(latest_direct(&core.store(), a).unwrap(), Some(newer), "naming a thread switched to it");
+    }
+
+    #[test]
+    fn the_call_that_names_a_thread_is_bounded_in_time() {
+        // No model is reachable in a test, so the budget is asserted from
+        // the source. `title_for` runs under an HTTP handler, outside the
+        // run loop's stall guard, and rig's client has no timeout — without
+        // this the request hangs as long as the connection does.
+        let src = include_str!("agent.rs");
+        let body = src.split("pub async fn title_for").nth(1).expect("title_for must exist");
+        assert!(body.contains("timeout(TITLE_BUDGET"), "the title call must carry its own budget");
     }
 
     #[test]

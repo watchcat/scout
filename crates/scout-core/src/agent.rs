@@ -1005,4 +1005,19 @@ mod tests {
         let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]), 0.0, ALL_TOOLS);
         assert!(p.contains("Search languages for this user: English, Dutch."), "got: {p}");
     }
+
+    #[test]
+    fn the_call_that_names_a_thread_is_bounded_in_time() {
+        // No model is reachable in a test, so the budget is asserted from
+        // the source. `title_for` runs under an HTTP handler, outside the
+        // run loop's stall guard, and rig's client has no timeout — without
+        // this the request hangs as long as the connection does. Bounded to
+        // the function's own body, so a `timeout(TITLE_BUDGET` anywhere
+        // else in the file cannot stand in for it.
+        let src = include_str!("agent.rs");
+        let start = src.find("pub async fn title_for").expect("title_for must exist");
+        let end = src[start..].find("\n}").expect("title_for must end") + start;
+        let body = &src[start..end];
+        assert!(body.contains("timeout(TITLE_BUDGET"), "the title call must carry its own budget");
+    }
 }

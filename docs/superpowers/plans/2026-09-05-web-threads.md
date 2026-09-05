@@ -155,6 +155,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 2: Account-keyed thread methods on the store
 
+**Status: done; see the commit log. The text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-core/src/store.rs` — a `ThreadRow` struct near `PendingMirror` (line ~796), methods after `touch_conversation`.
 - Test: same file, tests module.
@@ -394,6 +396,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 3: Expiry in the store
 
+**Status: done; see the commit log. The text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-core/src/store.rs` — after `delete_conversation`.
 - Test: same tests module.
@@ -490,6 +494,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 4: `Thread` on the wire
 
+**Status: done; see the commit log. The text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-api/src/lib.rs` — after `Turn` (line ~168).
 - Test: same file's tests module.
@@ -558,6 +564,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 5: An automatic title after the first answer
+
+**Status: done; see the commit log. The text below is what shipped.**
 
 **Files:**
 - Modify: `crates/scout-core/src/session.rs` — new pure fn `first_message_title`, new `title_if_missing`.
@@ -689,6 +697,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 6: Thread operations in `session.rs`
+
+**Status: done; see the commit log. The text below is what shipped.**
 
 **Files:**
 - Modify: `crates/scout-core/src/session.rs` — after `current_thread`.
@@ -858,6 +868,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 7: A model-suggested title
 
+**Status: done; see the commit log. The text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-core/src/agent.rs` — `title_for` beside `continues_previous` (line ~345).
 - Modify: `crates/scout-core/src/session.rs` — `clean_title` pure fn and `suggest_title`.
@@ -921,18 +933,24 @@ pub fn clean_title(raw: &str) -> Option<String> {
 }
 
 /// Asks the model for a name and stores it. `None` when the thread is not
-/// the account's, or is empty. An unusable answer is an error the caller
-/// reports; the old title stays.
+/// the account's, has nothing in it to name, or went away while the model
+/// was thinking. An unusable answer is an error the caller reports; the old
+/// title stays.
+///
+/// The thread is read, not opened: naming an old sidebar row must not make
+/// it the thread Telegram continues, which is what `open_thread` would do.
 pub async fn suggest_title(core: &Core, account_id: i64, conversation_id: i64) -> anyhow::Result<Option<String>> {
     let store = core.store();
-    let turns = crate::core::blocking(move || {
-        if !store.open_conversation(account_id, conversation_id)? {
+    let Some(turns) = crate::core::blocking(move || {
+        if !store.owns_thread(account_id, conversation_id)? {
             return Ok(None);
         }
         Ok(Some(transcript_of(&store, conversation_id)?))
     })
-    .await?;
-    let Some(turns) = turns else { return Ok(None) };
+    .await?
+    else {
+        return Ok(None);
+    };
     if turns.is_empty() {
         return Ok(None);
     }
@@ -947,13 +965,15 @@ pub async fn suggest_title(core: &Core, account_id: i64, conversation_id: i64) -
         anyhow::bail!("the model gave no usable title");
     };
     let store = core.store();
-    let stored = title.clone();
-    crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &stored)).await?;
-    Ok(Some(title))
+    let written = title.clone();
+    // The thread can be deleted while the model is thinking; then nothing
+    // was named, and saying otherwise would put a title on a gone row.
+    let stored = crate::core::blocking(move || store.set_thread_title(account_id, conversation_id, &written)).await?;
+    Ok(stored.then_some(title))
 }
 ```
 
-Note: `open_conversation` here doubles as the ownership check and bumps the thread to current, which a person pressing a button on it expects.
+Note: `owns_thread` is the ownership check on its own — the same predicate `open_conversation` uses, without the bump. Naming a thread must not switch to it: a person naming an old row does not expect their phone to continue it. And the write's own `bool` is the answer, not a discarded one: the row can go while the model is thinking, and `Some(title)` for a thread that no longer exists is a lie the caller would show.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -973,6 +993,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 8: Expiry in maintenance
 
+**Status: done; see the commit log. The text below is what shipped.**
+
 **Files:**
 - Modify: `crates/scout-core/src/core.rs` — `run_maintenance` (line ~457) and a private helper beside `prune_login_tokens`.
 - Test: `core.rs` tests module.
@@ -988,10 +1010,22 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
         let src = include_str!("core.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
-        let body = &src[start..];
+        let end = src[start..].find("\n    }").expect("the loop must end") + start;
+        let body = &src[start..end];
         assert!(body.contains("expire_threads("), "idle threads are never expired");
+        // And above the backup's `continue`: a `Ok(false) => continue` sits
+        // between them, so an expiry placed after it would only run on the
+        // one tick a day that a backup is due.
+        let expiry = body.find("expire_threads(").unwrap();
+        let backup = body.find("backup::is_due").expect("the backup check must exist");
+        assert!(expiry < backup, "expiry sits below the backup's continue and would run once a day");
     }
 ```
+
+The slice must end at the function, not run to the end of the file: the
+private `expire_threads` helper below `run_maintenance` contains the same
+text, so an unbounded body would find the definition and call the call
+proven.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1399,12 +1433,15 @@ async fn rename_thread(
         Ok(id) => id,
         Err(response) => return response,
     };
-    if body.title.trim().is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
+    // No `trim().is_empty()` pre-check here. `session::rename` already
+    // decides what counts as a name — it trims, strips layout characters
+    // and cuts — and a handler with its own idea of "blank" would disagree
+    // with it the first time that rule grows: `"\u{202E}"` is not empty to
+    // a `trim()`, and is nothing at all by the time it is stored.
     match scout_core::session::rename(&auth.core, account_id, id, &body.title).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Ok(scout_core::session::Renamed::Done) => StatusCode::NO_CONTENT.into_response(),
+        Ok(scout_core::session::Renamed::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Ok(scout_core::session::Renamed::Blank) => StatusCode::BAD_REQUEST.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "could not rename a thread");
             sorry()

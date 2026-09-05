@@ -358,12 +358,23 @@ pub enum Renamed {
     Blank,
 }
 
-/// A name the person chose. Trimmed, cut at `RENAME_CHARS`, and the cut
-/// itself is silent — no ellipsis, because a name a person typed should not
-/// grow punctuation it never had. A caller that shows the name back to the
-/// person after a cut must re-read it rather than echo what it sent.
+/// A name the person chose. Trimmed, stripped of layout characters, cut at
+/// `RENAME_CHARS`, and the cut itself is silent — no ellipsis, because a
+/// name a person typed should not grow punctuation it never had. A caller
+/// that shows the name back to the person after a cut must re-read it
+/// rather than echo what it sent.
+///
+/// The strip happens before the cut so the budget is spent on characters
+/// that are actually shown, and it happens at all because a name that
+/// arrives over HTTP is no more trustworthy than one a model wrote — the
+/// same bidi override that would flip a suggested title flips a typed one.
 pub async fn rename(core: &Core, account_id: i64, conversation_id: i64, title: &str) -> anyhow::Result<Renamed> {
-    let title: String = title.trim().chars().take(RENAME_CHARS).collect::<String>().trim_end().to_string();
+    let title: String = strip_layout_chars(title.trim())
+        .chars()
+        .take(RENAME_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
     if title.is_empty() {
         return Ok(Renamed::Blank);
     }
@@ -393,8 +404,11 @@ fn strip_list_marker(line: &str) -> &str {
             return rest.trim_start();
         }
     }
+    // At most two digits: a list a model writes never reaches a hundred
+    // items, and a longer run is the title itself — "2024. Year in review"
+    // is a name, not the two-thousand-and-twenty-fourth bullet.
     let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits > 0 {
+    if (1..=2).contains(&digits) {
         let rest = &line[digits..];
         if let Some(rest) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
             return rest.trim_start();
@@ -414,14 +428,30 @@ fn strip_title_label(line: &str) -> &str {
     rest.strip_prefix("**").unwrap_or(rest).trim()
 }
 
+/// Drops the markdown a model dresses a title in when it forgets it was
+/// asked for plain text: a leading `#` run from a heading, and a symmetric
+/// emphasis wrap. Symmetric on purpose — `*` alone at the front is a bullet
+/// `strip_list_marker` already took, and an unmatched one is punctuation
+/// inside the name, not decoration around it.
+fn strip_markdown(line: &str) -> &str {
+    let line = line.trim_start_matches('#').trim_start();
+    for wrap in ["**", "__", "*", "_"] {
+        if let Some(inner) = line.strip_prefix(wrap).and_then(|l| l.strip_suffix(wrap)) {
+            return inner.trim();
+        }
+    }
+    line
+}
+
 /// What the model said, made fit for a sidebar: the answer line, a leading
-/// list marker, a leading "Title:" and wrapping quotes dropped, trailing
-/// punctuation dropped, control and bidi characters filtered out, cut at
-/// `RENAME_CHARS` with no trailing space left by the cut. `None` when
-/// nothing is left.
+/// list marker, a leading "Title:", markdown decoration and wrapping quotes
+/// dropped, trailing punctuation dropped, layout characters filtered out,
+/// cut at `RENAME_CHARS` with no trailing space left by the cut. `None`
+/// when nothing is left.
 ///
-/// The answer line is the first non-empty one, unless it ends in a colon
-/// and another line follows — then it was the preamble to the answer.
+/// The answer line is the first non-empty one, unless — once its marker and
+/// label are off — it is empty or ends in a colon and another line follows.
+/// Then it was the preamble to the answer, not the answer.
 ///
 /// Quotes are stripped on both sides of the punctuation pass, because the
 /// two orders each leave one real answer intact: `'A title'.` keeps its
@@ -431,23 +461,26 @@ pub fn clean_title(raw: &str) -> Option<String> {
     let quote = |c: char| matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’');
     let text = crate::text::strip_thinking(raw);
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-    let first = lines.next()?;
     // "Here is a title for your conversation:" is the announcement, not the
     // answer — a line that ends in a colon with another line behind it is
-    // the model clearing its throat.
-    let line = match first.ends_with(':') {
-        true => lines.next().unwrap_or(first),
-        false => first,
+    // the model clearing its throat. The markers come off first, because a
+    // line that is nothing but `**Title:**` only looks like an answer until
+    // the label is gone.
+    let first = strip_title_label(strip_list_marker(lines.next()?));
+    let line = if first.is_empty() || first.ends_with(':') {
+        lines
+            .next()
+            .map(|l| strip_title_label(strip_list_marker(l)))
+            .unwrap_or(first)
+    } else {
+        first
     };
-    let line = strip_list_marker(line);
-    let line = strip_title_label(line);
+    let line = strip_markdown(line);
     let line = line.trim_matches(quote);
     let line = line.trim_end_matches(['.', '!', '?', ':']);
     let line = line.trim_matches(quote);
-    let cleaned: String = line
-        .trim()
+    let cleaned = strip_layout_chars(line.trim())
         .chars()
-        .filter(|c| !is_layout_char(*c))
         .take(RENAME_CHARS)
         .collect::<String>()
         .trim_end()
@@ -456,11 +489,39 @@ pub fn clean_title(raw: &str) -> Option<String> {
 }
 
 /// A character a sidebar row must never carry: a control character, a line
-/// or paragraph separator, or one of the bidi overrides and isolates, which
+/// or paragraph separator, one of the bidi overrides and isolates, which
 /// can make a title render as something other than what it says — and,
-/// unclosed, drag the row after it along too.
+/// unclosed, drag the row after it along too — or one of the invisibles
+/// (zero-width space and joiners, the RTL/LTR marks, the byte-order mark,
+/// the soft hyphen) that leave a name looking like one thing and matching
+/// another.
 fn is_layout_char(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    c.is_control()
+        || matches!(c,
+            '\u{00AD}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}' | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}')
+}
+
+/// The one rule about what a title may contain, for all three ways a thread
+/// gets named: the model's suggestion, the name a person types, and the cut
+/// of a first message.
+///
+/// A layout character that is also whitespace — a newline, a tab, a line
+/// separator — becomes a space rather than nothing. Dropping it would weld
+/// the words on either side together, which is a worse title than the one
+/// the character was hiding in.
+fn strip_layout_chars(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| match (is_layout_char(c), c.is_whitespace()) {
+            (false, _) => Some(c),
+            (true, true) => Some(' '),
+            (true, false) => None,
+        })
+        .collect()
 }
 
 /// Asks the model for a name and stores it. `None` when the thread is not
@@ -557,7 +618,12 @@ const TITLE_CHARS: usize = 40;
 /// ellipsis when cut. A flag emoji built from two code points can be split
 /// at the cut; the cut is on a char boundary, so the result is still valid
 /// text, and a title is a label, not a rendering.
+///
+/// Layout characters go first, before the collapse, so the space a stripped
+/// newline leaves behind is collapsed with the rest rather than surviving
+/// as a double space.
 pub fn first_message_title(text: &str) -> String {
+    let text = strip_layout_chars(text);
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = one_line.chars();
     let head: String = chars.by_ref().take(TITLE_CHARS).collect();
@@ -837,6 +903,10 @@ mod tests {
         // The boundary itself: exactly forty is not cut, forty-one is.
         assert_eq!(first_message_title(&"a".repeat(40)), "a".repeat(40));
         assert_eq!(first_message_title(&"a".repeat(41)), format!("{}…", "a".repeat(40)));
+        // The automatic name obeys the same rule as the other two: a title
+        // cut from a message carries no character that would make the row
+        // read as something the message did not say.
+        assert_eq!(first_message_title("Be\u{202E}ans"), "Beans");
     }
 
     #[tokio::test]
@@ -934,6 +1004,12 @@ mod tests {
         assert_eq!(rename(&core, a, mine, "   ").await.unwrap(), Renamed::Blank, "an empty name is not a name");
         rename(&core, a, mine, &"x".repeat(100)).await.unwrap();
         assert_eq!(core.store().thread_title(a, mine).unwrap().unwrap().chars().count(), 80);
+
+        // A name typed into a browser gets the same rule as one a model
+        // wrote: a bidi override in a sidebar row is no less a lie for
+        // having arrived over HTTP.
+        rename(&core, a, mine, "Be\u{202E}ans").await.unwrap();
+        assert_eq!(core.store().thread_title(a, mine).unwrap().as_deref(), Some("Beans"));
     }
 
     #[test]
@@ -948,16 +1024,29 @@ mod tests {
             Some("Beans, cheapest".to_string())
         );
         assert_eq!(clean_title("**Title:** Beans"), Some("Beans".to_string()));
+        // The label can be the whole line, and then the answer is the next
+        // one — which it only looks like once the label is off.
+        assert_eq!(clean_title("**Title:**\nBeans"), Some("Beans".to_string()));
         assert_eq!(
             clean_title("1. Cheapest OneBlade cartridges"),
             Some("Cheapest OneBlade cartridges".to_string())
         );
-        // A title is one line of plain text: no control characters, and no
-        // bidi override to make a sidebar row read backwards.
+        // Two digits is a list; four is a year the title starts with.
+        assert_eq!(clean_title("2024. Year in review"), Some("2024. Year in review".to_string()));
+        // Markdown is decoration, not part of the name.
+        assert_eq!(clean_title("**Beans, cheapest**"), Some("Beans, cheapest".to_string()));
+        assert_eq!(clean_title("Here is your title:\n\n**Beans**"), Some("Beans".to_string()));
+        assert_eq!(clean_title("### Beans"), Some("Beans".to_string()));
+        // A title is one line of plain text: no control characters, no
+        // bidi override to make a sidebar row read backwards, and no
+        // invisible that leaves a name looking like another one.
         assert_eq!(clean_title("Beans\u{202E}cheapest\r"), Some("Beanscheapest".to_string()));
-        // The cut is at `RENAME_CHARS` and never leaves a trailing space.
+        assert_eq!(clean_title("Bea\u{200B}ns"), Some("Beans".to_string()));
+        // The cut is at `RENAME_CHARS` and never leaves a trailing space:
+        // "word " is five characters, so the cut lands on the space after
+        // the sixteenth word and the trim takes it back off.
         let long = clean_title(&"word ".repeat(30)).unwrap();
-        assert!(long.chars().count() <= 80 && !long.ends_with(' '));
+        assert_eq!(long.chars().count(), 79);
     }
 
     #[tokio::test]
@@ -984,21 +1073,16 @@ mod tests {
         assert_eq!(latest_direct(&core.store(), a).unwrap(), Some(newer));
 
         // No model is reachable in tests, so this ends in an error — after
-        // the read that used to bump the thread.
-        let _ = suggest_title(&core, a, older).await;
+        // the read that used to bump the thread. Asserting the error is
+        // what keeps the test honest: an ownership check that silently
+        // returned `None` would never reach the read, and the assertion
+        // below would pass for the wrong reason.
+        assert!(
+            suggest_title(&core, a, older).await.is_err(),
+            "the call must have reached the model"
+        );
 
         assert_eq!(latest_direct(&core.store(), a).unwrap(), Some(newer), "naming a thread switched to it");
-    }
-
-    #[test]
-    fn the_call_that_names_a_thread_is_bounded_in_time() {
-        // No model is reachable in a test, so the budget is asserted from
-        // the source. `title_for` runs under an HTTP handler, outside the
-        // run loop's stall guard, and rig's client has no timeout — without
-        // this the request hangs as long as the connection does.
-        let src = include_str!("agent.rs");
-        let body = src.split("pub async fn title_for").nth(1).expect("title_for must exist");
-        assert!(body.contains("timeout(TITLE_BUDGET"), "the title call must carry its own budget");
     }
 
     #[test]

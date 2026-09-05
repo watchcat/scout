@@ -5163,6 +5163,10 @@ CREATE TABLE conversations (
         assert!(!s.set_thread_title(a, group, "x").unwrap(), "renamed a group thread from the browser");
         assert!(!s.delete_conversation(a, group).unwrap(), "deleted a group thread from the browser");
         assert_eq!(s.thread_title(a, group).unwrap(), None);
+        // `owns_thread` is the same rule without the bump, so it draws the
+        // same line: a group thread is not the browser's to name.
+        assert!(!s.owns_thread(a, group).unwrap(), "a group thread counted as a browser thread");
+        assert!(s.owns_thread(a, first).unwrap());
     }
 
     #[test]

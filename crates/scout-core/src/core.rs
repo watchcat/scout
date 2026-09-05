@@ -811,7 +811,14 @@ mod tests {
         let src = include_str!("core.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
-        let body = &src[start..];
+        let end = src[start..].find("\n    }").expect("the loop must end") + start;
+        let body = &src[start..end];
         assert!(body.contains("expire_threads("), "idle threads are never expired");
+        // And above the backup's `continue`: a `Ok(false) => continue` sits
+        // between them, so an expiry placed after it would only run on the
+        // one tick a day that a backup is due.
+        let expiry = body.find("expire_threads(").unwrap();
+        let backup = body.find("backup::is_due").expect("the backup check must exist");
+        assert!(expiry < backup, "expiry sits below the backup's continue and would run once a day");
     }
 }

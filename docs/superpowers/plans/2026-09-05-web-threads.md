@@ -1076,6 +1076,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 9: A divider the mirror sends on a switch
 
+**Status: done; see the commit log.**
+
 **Files:**
 - Modify: `crates/scout-core/src/mirror.rs` — `note` after `enqueue`.
 - Test: `mirror.rs` tests module.
@@ -1151,7 +1153,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 10: The thread routes
 
-**Status: done in ee2ade2/99fa4f2 plus the fix commit after. Not deployable until Task 13: the client does not yet send `thread`.**
+**Status: done in ee2ade2/99fa4f2 plus the fix commit after. Task 13 shipped; the client sends `thread`.**
 
 **Files:**
 - Modify: `crates/scout-web/src/routes/chat.rs` — `routes()`, `MessageIn`, `send_message`, new handlers.
@@ -1561,6 +1563,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 11: The sidebar on the page
 
+**Status: done; see the commit log.**
+
 **Files:**
 - Modify: `crates/scout-web/src/chat.html`.
 - Modify: `crates/scout-web/src/routes/chat.rs` — the id list in `the_page_still_carries_every_id_the_client_binds_to` (line ~811).
@@ -1697,6 +1701,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ### Task 12: Pure client functions
 
+**Status: done; see the commit log.**
+
 **Files:**
 - Modify: `crates/scout-web/src/chat.js` — exports after `composerHeight`.
 - Test: `crates/scout-web/src/chat.test.mjs`.
@@ -1783,6 +1789,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 13: Wiring the sidebar
+
+**Status: done; see the commit log.**
 
 **Files:**
 - Modify: `crates/scout-web/src/chat.js` — inside `start()`.
@@ -2106,6 +2114,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ---
 
 ### Task 14: README and the whole suite
+
+**Status: done; see the commit log.**
 
 **Files:**
 - Modify: `README.md` — the "Remembers things" list and the `/chat` mention.

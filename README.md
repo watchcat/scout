@@ -149,7 +149,8 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - **Threads, in the browser.** The web chat lists your conversations; switch
   between them and each keeps its own context, and the thread you last used
   is the one your Telegram chat continues. A thread nobody touches for two
-  days is deleted — pin it and it stays until you delete it yourself
+  days is deleted — pin it from the web and it stays until you delete it
+  yourself
 - **You are an account, not a Telegram id.** A Telegram login is one identity
   pointing at an account, which is what will let the same purchase history,
   trips and profile answer to a web login later without a second copy of you

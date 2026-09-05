@@ -302,6 +302,17 @@ pub async fn current_thread(
     .await
 }
 
+/// Which thread is current, without reading what is in it.
+///
+/// `current_thread` answers the same question, but it loads and shapes the
+/// whole transcript to do it — so a caller that only wants to compare one
+/// id against another pays for every turn of a long conversation to throw
+/// them all away. The switch note is exactly that caller.
+pub async fn current_thread_id(core: &Core, account_id: i64) -> anyhow::Result<Option<i64>> {
+    let store = core.store();
+    crate::core::blocking(move || latest_direct(&store, account_id)).await
+}
+
 /// The longest a person may make a title.
 const RENAME_CHARS: usize = 80;
 

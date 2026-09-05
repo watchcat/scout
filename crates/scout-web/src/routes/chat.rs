@@ -128,8 +128,22 @@ fn strip_mirror_toggle(page: &str) -> String {
     out
 }
 
+/// The page's client script.
+///
+/// `no-store` said here as well as by the signed-half layer, which inserts
+/// the same value over the top of it. Not redundant where it counts: the
+/// advice this script gives on a 422 is "reload to keep going", and that
+/// only works if the reload fetches the script that stopped saying it. A
+/// route moved to the public half — this one needs no session to serve —
+/// would lose the layer and keep this.
 async fn client() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], CLIENT)
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        CLIENT,
+    )
 }
 
 async fn history(axum::extract::State(auth): axum::extract::State<AuthState>, headers: HeaderMap) -> Response {
@@ -454,8 +468,8 @@ async fn open_thread(
     // client re-opens the current thread on ordinary things — a tap in the
     // sidebar, the refresh after a delete — so a note for it would be a
     // line on the phone saying the reader moved to where they already were.
-    let was = match scout_core::session::current_thread(&auth.core, account_id).await {
-        Ok(current) => current.map(|(id, _turns)| id),
+    let was = match scout_core::session::current_thread_id(&auth.core, account_id).await {
+        Ok(current) => current,
         // Not fatal, and not a reason to refuse the open. An unknown
         // previous thread is treated as a switch: a note too many is a
         // smaller failure than an open that errors.
@@ -1782,5 +1796,50 @@ mod tests {
         let start = js.find("fetch('/chat/messages'").expect("the client must post messages");
         let end = js[start..].find("})").expect("the call must end") + start;
         assert!(js[start..end].to_lowercase().contains("thread"), "the send body names no thread");
+    }
+
+    #[test]
+    fn a_list_refresh_never_moves_the_composer_by_itself() {
+        // The server's `current` is whichever thread was touched last
+        // anywhere — the phone, another tab, a run in another thread whose
+        // `save_history` just bumped it. A refresh that adopted it would
+        // retarget the composer while the reader is looking at a different
+        // transcript, and the next message would be answered in a thread
+        // nobody is reading. `resolveCurrent` is where that rule lives, and
+        // it is a pure function with its own tests — this is the assertion
+        // that the refresh actually goes through it.
+        let js = include_str!("../chat.js");
+        let start = js.find("async function refreshThreads").expect("the client must refresh its list");
+        let end = js[start..].find("\n  }\n").expect("the function must end") + start;
+        let body = &js[start..end];
+        assert!(body.contains("resolveCurrent("), "the refresh decides the composer's thread by hand");
+        assert!(
+            !body.contains("currentThread = current"),
+            "the refresh adopts whatever the server calls current"
+        );
+    }
+
+    #[test]
+    fn a_threads_row_can_be_acted_on_from_the_keyboard() {
+        // The tools are hidden until `:hover` or `.current`, and neither
+        // happens to a keyboard. Tabbing to a non-current row's rename
+        // button would move focus to something `display:none` — which is
+        // to say nowhere, and the row would be unreachable without a mouse.
+        let css = include_str!("../chat.html");
+        assert!(css.contains("li:focus-within .tools"), "a keyboard cannot reach a non-current row's tools");
+    }
+
+    #[tokio::test]
+    async fn the_client_script_is_never_cached() {
+        // The 422 arm's advice is "reload to keep going", and a reload that
+        // re-served the stale script from cache would leave the page giving
+        // the same advice forever.
+        let (app, _core, _dir) = test_app().await;
+        let res = get(&app, "/chat.js").await;
+        assert_eq!(
+            res.headers()[axum::http::header::CACHE_CONTROL].to_str().unwrap(),
+            "no-store",
+            "a reload can be answered from cache"
+        );
     }
 }

@@ -1,3 +1,4 @@
+use crate::retry::SendWithRetry;
 use serde::{Deserialize, Serialize};
 
 pub const KAGI_API_BASE: &str = "https://kagi.com/api";
@@ -84,7 +85,7 @@ impl KagiClient {
             .post(format!("{}/v1/search", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&serde_json::json!({ "query": query, "limit": limit }))
-            .send()
+            .send_with_retry()
             .await?;
         let body: SearchResponse = decode(check(resp).await?).await?;
         Ok(body

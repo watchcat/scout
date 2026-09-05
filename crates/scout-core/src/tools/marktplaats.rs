@@ -1,3 +1,4 @@
+use crate::retry::SendWithRetry;
 use super::fetch::browser_get;
 use serde::Deserialize;
 
@@ -97,7 +98,7 @@ impl MarktplaatsClient {
                 ("limit", &limit.to_string()),
                 ("offset", "0"),
             ])
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

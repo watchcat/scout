@@ -13,6 +13,8 @@
 //! The tool the agent calls is first; everything below it is what that call
 //! is made of — the query, the client, the response parsing, the ranking.
 
+use crate::retry::SendWithRetry;
+
 /// Live flight search. Registered only when `DUFFEL_API_KEY` is set, so the
 /// model never sees a tool that cannot work.
 pub struct FlightSearchTool {
@@ -993,7 +995,7 @@ impl DuffelClient {
             .header("Duffel-Version", DUFFEL_VERSION)
             .header("Accept", "application/json")
             .json(&serde_json::json!({"data": data}))
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -1041,7 +1043,7 @@ impl DuffelClient {
             // second round trip to be worth anything.
             .query(&[("return_offers", "true")])
             .json(&body)
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

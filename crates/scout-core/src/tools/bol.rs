@@ -1,3 +1,4 @@
+use crate::retry::SendWithRetry;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -128,7 +129,7 @@ impl BolClient {
             .http
             .post(format!("{}/token?grant_type=client_credentials", self.login_base))
             .basic_auth(&self.client_id, Some(&self.client_secret))
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -159,7 +160,7 @@ impl BolClient {
                 ("page-size", &limit.clamp(1, 50).to_string()),
                 ("include-offer", "true"),
             ])
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

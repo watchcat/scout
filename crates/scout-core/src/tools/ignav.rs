@@ -16,6 +16,7 @@
 //! has no rate limits, states times in UTC as well as local, and surfaces
 //! self-transfer itineraries that Duffel never shows.
 
+use crate::retry::SendWithRetry;
 use crate::tools::duffel::{Flight, Leg, PriceStatus, Source};
 
 pub const IGNAV_API_BASE: &str = "https://ignav.com/api";
@@ -103,7 +104,7 @@ impl IgnavClient {
             .header("X-Api-Key", &self.api_key)
             .header("Accept", "application/json")
             .json(&body)
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -135,7 +136,7 @@ impl IgnavClient {
             // passenger or market fields" — because the id already carries
             // the market and passengers of the search that produced it.
             .json(&serde_json::json!({"ignav_id": ignav_id}))
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

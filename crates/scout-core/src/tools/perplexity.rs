@@ -1,3 +1,4 @@
+use crate::retry::SendWithRetry;
 use super::kagi::SearchResult;
 use serde::Deserialize;
 
@@ -66,7 +67,7 @@ impl PerplexityClient {
             .post(format!("{}/search", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&serde_json::json!({ "query": queries, "max_results": max_results }))
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

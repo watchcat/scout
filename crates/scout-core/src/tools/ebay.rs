@@ -1,3 +1,4 @@
+use crate::retry::SendWithRetry;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -122,7 +123,7 @@ impl EbayClient {
                 ("grant_type", "client_credentials"),
                 ("scope", "https://api.ebay.com/oauth/api_scope"),
             ])
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -146,7 +147,7 @@ impl EbayClient {
             .bearer_auth(token)
             .header("X-EBAY-C-MARKETPLACE-ID", &self.marketplace)
             .query(&[("q", query), ("limit", &limit.to_string())])
-            .send()
+            .send_with_retry()
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

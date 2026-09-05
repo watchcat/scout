@@ -198,6 +198,9 @@ function start() {
   // moved on. Same for two rows tapped in quick succession.
   let refreshSeq = 0
   let openSeq = 0
+  // The threads the rows on screen were built from, held so the minute
+  // ticker below can re-label them without asking the server again.
+  let lastList = []
 
   // Enter sends, Shift+Enter is a newline. `requestSubmit` rather than
   // `submit` because it runs the form's own validation — so Enter on an
@@ -333,9 +336,63 @@ function start() {
   // The highlight follows `currentThread` — what this page is showing —
   // and not `thread.current`, which is the server's separate answer.
   function renderThreads(list) {
+    lastList = list
     threadsEl.replaceChildren()
     for (const thread of list) threadsEl.append(threadRow(thread, thread.id === currentThread))
   }
+
+  // How often the "2h" / "expires in 12h" labels are recomputed. The
+  // coarsest thing they say changes by is an hour, so a minute is already
+  // far finer than it needs to be — and cheap enough to be the safe choice
+  // for the row that ticks from "expires in 1h" to gone.
+  const WHEN_TICK_MS = 60_000
+
+  // Re-labels the rows already on screen from the list they were built
+  // from. `whenLabel` runs at render time, so a tab left open all afternoon
+  // kept saying "expires in 12h" about a thread with two hours left — the
+  // one number on this page whose whole purpose is to be watched.
+  //
+  // Deliberately narrow: not a refetch, because nothing has changed on the
+  // server that this needs to learn — only the clock moved — and a request
+  // a minute from every idle tab is a poll nobody asked for. And not a
+  // re-render either: `renderThreads` replaces every row, which would throw
+  // away a rename input the reader is halfway through typing into. Only the
+  // `.when` span of each row is touched, and a row with none (that rename
+  // in progress) is left alone.
+  function tickWhenLabels() {
+    // A hidden tab's labels are seen by nobody, and `visibilitychange`
+    // refreshes the list outright when it comes back.
+    if (document.hidden) return
+    const rows = threadsEl.children
+    if (rows.length !== lastList.length) return
+    let anyExpired = false
+    for (let i = 0; i < lastList.length; i++) {
+      const whenEl = rows[i].querySelector('.when')
+      if (!whenEl) continue
+      const thread = lastList[i]
+      const when = whenLabel(thread)
+      whenEl.textContent = when.text
+      whenEl.className = when.expiring ? 'when expiring' : 'when'
+      // `whenLabel`'s countdown pins at "expires in 1h" once the window is
+      // under an hour — `Math.max(1, ...)` never goes lower — so a tab left
+      // open past the real deadline would keep reading a thread as an hour
+      // from gone, forever. The thread is deleted server-side the moment
+      // its age actually reaches 48h; catching that here and refreshing
+      // once is what drops the row instead of leaving a countdown that has
+      // stopped meaning anything.
+      if (!anyExpired && when.text.startsWith('expires in 1h')) {
+        const age = Date.now() - Date.parse(thread.updated_at)
+        if (age >= EXPIRES_AFTER_MS) anyExpired = true
+      }
+    }
+    // One refresh for the whole pass, not per row: several threads can
+    // cross at once, and this is still the narrow update described above
+    // for every row that has not — only a row that has just gone triggers
+    // the fetch that redraws the list.
+    if (anyExpired) refreshThreads().catch(() => {})
+  }
+
+  setInterval(tickWhenLabels, WHEN_TICK_MS)
 
   // Inline SVG rather than an emoji: an emoji pin ignores `color`, so the
   // pinned state would lose its colour affordance.
@@ -613,7 +670,12 @@ function start() {
   // status line and the answer bubble, and stops on the one `end` frame
   // every stream carries. `EventSource` cannot POST, so the stream is
   // parsed by hand off the `fetch` body reader instead.
-  async function runMessage(text) {
+  //
+  // `retract` takes the "You" bubble the submit handler already appended
+  // back off the page. It is called only where the words go back into the
+  // composer, so that the message the reader is about to send again is in
+  // one place rather than two — see the 422 arm.
+  async function runMessage(text, retract = () => {}) {
     // The thread this run belongs to. A reader who switches away mid-stream
     // is no longer looking at this conversation, and its tokens must not be
     // painted into the one they moved to. The run carries on server-side
@@ -679,7 +741,13 @@ function start() {
       if (res.status === 422) {
         refused = true
         // Same: a reload is the advice, and a reader who takes it should
-        // find what they typed still in front of them.
+        // find what they typed still in front of them. Nothing here redraws
+        // the transcript, though — unlike the 404 above, which hands over to
+        // `vanished` — so the bubble the submit handler appended has to come
+        // off by hand, or the words sit twice on the page: once in the
+        // composer they are going back into, and once in a turn that was
+        // never asked.
+        retract()
         textEl.value = text
         fitComposer()
         showNotice('This page is out of date. Reload to keep going.')
@@ -798,11 +866,18 @@ function start() {
       // A box grown to five lines must shrink back, or it sits tall and
       // empty over the answer it just asked for.
       fitComposer()
-      turnsEl.append(turnElement('You', text))
+      // Held rather than appended and forgotten: a send the server refuses
+      // outright never became a turn, and `runMessage` takes the bubble back
+      // off in the arm that puts the words back in the composer.
+      const youLi = turnElement('You', text)
+      turnsEl.append(youLi)
       // Unconditional, unlike the answer: sending is an act that means "show
       // me", so it is not content arriving under a reader who moved away.
       turnsEl.scrollTop = turnsEl.scrollHeight
-      await runMessage(text)
+      // `remove` on a node already detached — a reader who switched threads
+      // mid-send had the transcript replaced under them — is a no-op, so
+      // this needs no guard of its own.
+      await runMessage(text, () => youLi.remove())
     } finally {
       running = false
       sendButton.disabled = false
@@ -833,8 +908,8 @@ function start() {
     })
   }
 
-  // `/chat/threads` rather than `/chat/reset`: the sidebar has to learn the
-  // new thread's id, and only the threads route hands it back.
+  // Through `newThread`, which posts `/chat/threads`: the sidebar has to
+  // learn the new thread's id, and the threads route is what hands it back.
   resetForm.addEventListener('submit', async (e) => {
     e.preventDefault()
     await newThread()

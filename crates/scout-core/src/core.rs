@@ -515,9 +515,27 @@ impl Core {
 
     /// Drops idle, unpinned threads. Returns how many went. Private for
     /// the same reason `prune_login_tokens` is.
+    ///
+    /// Threads with a run in flight are spared however idle they look. A
+    /// run moves `updated_at` when it writes its answer, not when the
+    /// question arrives, so a thread at 47h can cross the threshold while
+    /// the model is still thinking — and this sweep would delete the
+    /// conversation the reader is watching, mid-answer. The snapshot is
+    /// taken here rather than held: `running` is claimed and released by
+    /// `run::begin_run`, and a run that starts a moment after this reads it
+    /// is a run whose thread was young enough to survive this pass anyway.
+    ///
+    /// The ordering is airtight on the web path — `open_conversation`
+    /// checks ownership and bumps `updated_at` in the same `UPDATE`, so
+    /// there is no gap for this sweep to land in. Telegram's continuation
+    /// check is not that: it reads the thread, waits on a model call, and
+    /// only then bumps it, and this sweep can run in between and take the
+    /// row. `resolve_conversation` falls back to starting a fresh thread
+    /// when that bump finds nothing there.
     async fn expire_threads(&self) -> anyhow::Result<usize> {
         let store = self.store();
-        blocking(move || store.expire_conversations(Self::THREAD_IDLE_SECS)).await
+        let running: Vec<i64> = self.deps.running.iter().map(|r| *r).collect();
+        blocking(move || store.expire_conversations(Self::THREAD_IDLE_SECS, &running)).await
     }
 
     /// Turns a photo into a search description.
@@ -820,5 +838,27 @@ mod tests {
         let expiry = body.find("expire_threads(").unwrap();
         let backup = body.find("backup::is_due").expect("the backup check must exist");
         assert!(expiry < backup, "expiry sits below the backup's continue and would run once a day");
+    }
+
+    #[test]
+    fn expiry_tells_the_store_which_threads_have_a_run_in_flight() {
+        // The store's guard is tested against the database; this is the wire
+        // that reaches it. Ageing a conversation by 49h needs `Store::conn`,
+        // which is private to `store.rs`, so a real run of `expire_threads`
+        // from here could not tell a skipped thread from an untouched one —
+        // and an `expire_threads` that passed `&[]` would look identical.
+        let src = include_str!("core.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let start = src.find("async fn expire_threads").expect("the method must exist");
+        let end = src[start..].find("\n    }").expect("the method must end") + start;
+        let body = &src[start..end];
+        assert!(
+            body.contains("self.deps.running"),
+            "expiry does not consult the runs in flight, so a thread can be deleted under one"
+        );
+        assert!(
+            body.contains("expire_conversations(Self::THREAD_IDLE_SECS, &running)"),
+            "the running ids are read but not handed to the store"
+        );
     }
 }

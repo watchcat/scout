@@ -61,7 +61,18 @@ pub async fn resolve_conversation(
         Ok(true) => {
             tracing::info!(account_id, id, "session expired but topic continues; keeping context");
             let store = core.deps.store.clone();
-            crate::core::blocking(move || store.touch_conversation(id)).await?;
+            if !crate::core::blocking(move || store.touch_conversation(id)).await? {
+                // The continuation check took long enough that the thread's
+                // own TTL ran out and it was deleted underneath it — the
+                // window `expire_threads`'s ordering closes on the web path
+                // stays open here, since this check and the bump are two
+                // separate round trips with an LLM call between them. `id`
+                // no longer names anything; a fresh thread is the only
+                // honest answer left.
+                tracing::info!(account_id, id, "continuation confirmed but the thread was gone by the time it was bumped; starting fresh");
+                let store = core.deps.store.clone();
+                return crate::core::blocking(move || store.start_conversation(account_id, &scope_owned)).await;
+            }
             Ok(id)
         }
         Ok(false) => {
@@ -1031,6 +1042,39 @@ mod tests {
         // having arrived over HTTP.
         rename(&core, a, mine, "Be\u{202E}ans").await.unwrap();
         assert_eq!(core.store().thread_title(a, mine).unwrap().as_deref(), Some("Beans"));
+    }
+
+    #[tokio::test]
+    async fn touching_a_thread_thats_already_gone_reports_it() {
+        // The continuation check and the bump that follows it are two
+        // separate round trips with an LLM call between them — long enough
+        // for the thread's own TTL to run out and the row to be deleted
+        // before the bump lands. `touch_conversation` has to say so rather
+        // than silently updating nothing.
+        let (core, _dir) = threads_core().await;
+        let a = core.store().account_for_telegram(11).unwrap();
+        let id = seed_exchange_for_tests(&core, a, "direct", "beans", "three").await.unwrap();
+
+        assert!(core.store().delete_conversation(a, id).unwrap());
+        assert!(!core.store().touch_conversation(id).unwrap(), "a deleted thread has nothing to bump");
+    }
+
+    #[test]
+    fn a_thread_gone_by_the_time_the_continuation_bumps_it_starts_fresh() {
+        // `resolve_conversation` needs a live model to reach this branch —
+        // `continues_previous` only comes back `Ok(true)` after a real
+        // call — so this is asserted from the source instead: the
+        // continuation branch must check `touch_conversation`'s result and
+        // fall back to `start_conversation` when it comes back false,
+        // rather than handing back an id for a row that is already gone.
+        let src = include_str!("session.rs");
+        let start = src.find("Ok(true) => {").expect("the continuation branch must exist");
+        let end = src[start..].find("Ok(false) => {").expect("the next arm must exist") + start;
+        let body = &src[start..end];
+        assert!(body.contains("if !"), "the branch does not check whether the bump found a row");
+        let touch_at = body.find("touch_conversation").expect("the branch must bump the thread");
+        let start_at = body.find("start_conversation").expect("a thread gone underneath it must fall back to a fresh one");
+        assert!(start_at > touch_at, "the fallback must run after the bump, not before it");
     }
 
     #[test]

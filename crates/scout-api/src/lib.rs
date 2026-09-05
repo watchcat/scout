@@ -167,6 +167,21 @@ pub struct Turn {
     pub text: String,
 }
 
+/// One thread in the browser's list. `current` is the one a Telegram
+/// message would continue and the mirror follows; exactly one row has it
+/// whenever the list is non-empty.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Thread {
+    pub id: i64,
+    /// Null until the first answer lands.
+    pub title: Option<String>,
+    pub pinned: bool,
+    /// RFC 3339, UTC. A string so the page does not need a date library
+    /// to show "2h ago".
+    pub updated_at: String,
+    pub current: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +284,22 @@ mod tests {
             }
             assert_eq!(client, step, "client drifted from the source text");
         }
+    }
+
+    #[test]
+    fn a_thread_serialises_with_the_names_the_page_reads() {
+        let t = Thread {
+            id: 7,
+            title: None,
+            pinned: true,
+            updated_at: "2026-09-05T10:00:00Z".to_string(),
+            current: false,
+        };
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["id"], 7);
+        assert!(json["title"].is_null());
+        assert_eq!(json["pinned"], true);
+        assert_eq!(json["updated_at"], "2026-09-05T10:00:00Z");
+        assert_eq!(json["current"], false);
     }
 }

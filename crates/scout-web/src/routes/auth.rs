@@ -30,7 +30,7 @@ const LINK_TTL_SECS: i64 = 900;
 /// laptop left in a café is not signed in forever. A session cannot be
 /// revoked (see `session.rs`), so this number is also the longest a
 /// stolen cookie is worth stealing.
-const SESSION_TTL_SECS: i64 = 30 * 24 * 3600;
+use crate::session::SESSION_TTL_SECS;
 
 /// The signed-in half of the site, over its own state.
 pub fn routes(auth: AuthState) -> Router {

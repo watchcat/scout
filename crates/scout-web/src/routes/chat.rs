@@ -1773,4 +1773,14 @@ mod tests {
         assert!(body.contains("queue_conversation("), "the mirror re-resolves the thread after the run");
         assert!(!body.contains("queue_thread("), "the mirror could send a different thread than the one that ran");
     }
+
+    #[test]
+    fn the_client_names_the_thread_it_is_sending_into() {
+        // `MessageIn.thread` has no default: a client that omits it gets a
+        // 422 and the page shows "could not be reached" for every message.
+        let js = include_str!("../chat.js");
+        let start = js.find("fetch('/chat/messages'").expect("the client must post messages");
+        let end = js[start..].find("})").expect("the call must end") + start;
+        assert!(js[start..end].to_lowercase().contains("thread"), "the send body names no thread");
+    }
 }

@@ -122,7 +122,12 @@ export function threadLabel(thread) {
 // "2h", "4d", or "expires in 12h" once an unpinned thread is close to
 // going — so nobody learns about expiry by losing something.
 export function whenLabel(thread, now = Date.now()) {
-  const age = Math.max(0, now - Date.parse(thread.updated_at))
+  // NaN propagates silently through every comparison below, so an
+  // unparseable timestamp would reach the row as "NaNd". Saying nothing is
+  // the honest answer: the row still has its title and its controls.
+  const then = Date.parse(thread.updated_at)
+  if (Number.isNaN(then)) return { text: '', expiring: false }
+  const age = Math.max(0, now - then)
   if (!thread.pinned && age >= WARN_AFTER_MS) {
     const left = Math.max(1, Math.ceil((EXPIRES_AFTER_MS - age) / 3600000))
     return { text: `expires in ${left}h`, expiring: true }
@@ -151,6 +156,12 @@ function start() {
   const sendButton = document.getElementById('send')
   const resetForm = document.getElementById('reset')
   const mirrorButton = document.getElementById('mirror')
+  const sideEl = document.getElementById('side')
+  const threadsEl = document.getElementById('threads')
+  const menuButton = document.getElementById('menu')
+  // The thread the page is showing. Every message names it, so a thread
+  // the phone started meanwhile cannot swallow a message meant for this one.
+  let currentThread = null
 
   // Enter sends, Shift+Enter is a newline. `requestSubmit` rather than
   // `submit` because it runs the form's own validation — so Enter on an
@@ -225,12 +236,259 @@ function start() {
       showNotice('Could not load the conversation so far. Reload to try again.')
       return
     }
-    const turns = await res.json()
-    for (const turn of turns) {
-      turnsEl.append(turnElement(turn.role, turn.text))
-    }
+    showTurns(await res.json())
+    await refreshThreads()
+  }
+
+  // Replaces the transcript wholesale rather than appending: every caller
+  // is switching what the page is showing, not adding to it.
+  function showTurns(turns) {
+    turnsEl.replaceChildren()
+    for (const turn of turns) turnsEl.append(turnElement(turn.role, turn.text))
     turnsEl.scrollTop = turnsEl.scrollHeight
   }
+
+  // Every thread route is a POST behind the CSRF header, and most carry no
+  // body at all — so the header set lives here once rather than at each of
+  // the eight call sites.
+  async function post(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+  }
+
+  // The server is the authority on which thread is current, so the list is
+  // where `currentThread` comes from — never from what this page last did.
+  async function refreshThreads() {
+    const res = await fetch('/chat/threads')
+    if (!res.ok) return
+    const list = await res.json()
+    const current = list.find((t) => t.current)
+    currentThread = current ? current.id : null
+    renderThreads(list)
+  }
+
+  function renderThreads(list) {
+    threadsEl.replaceChildren()
+    for (const thread of list) threadsEl.append(threadRow(thread))
+  }
+
+  // Inline SVG rather than an emoji: an emoji pin ignores `color`, so the
+  // pinned state would lose its colour affordance.
+  function pinIcon() {
+    const ns = 'http://www.w3.org/2000/svg'
+    const svg = document.createElementNS(ns, 'svg')
+    svg.setAttribute('viewBox', '0 0 24 24')
+    svg.setAttribute('width', '14')
+    svg.setAttribute('height', '14')
+    svg.setAttribute('aria-hidden', 'true')
+    const path = document.createElementNS(ns, 'path')
+    path.setAttribute('d', 'M16 3v2l-1 1v5l3 3v2h-5v5l-1 1-1-1v-5H6v-2l3-3V6L8 5V3z')
+    path.setAttribute('fill', 'currentColor')
+    svg.append(path)
+    return svg
+  }
+
+  // Built node by node rather than from a template string: a thread title
+  // is text the reader typed, or text the model wrote, and the transcript
+  // above is the only place on this page that is allowed to take markup.
+  function threadRow(thread) {
+    const li = document.createElement('li')
+    li.dataset.id = thread.id
+    if (thread.current) li.classList.add('current')
+
+    const label = threadLabel(thread)
+    const title = document.createElement('button')
+    title.type = 'button'
+    title.className = label.unnamed ? 'title unnamed' : 'title'
+    title.textContent = label.text
+    // The row ellipsises a long name, so the full one has to be reachable.
+    title.title = label.text
+    title.addEventListener('click', () => openThread(thread.id))
+    li.append(title)
+
+    if (thread.pinned) {
+      const pin = document.createElement('span')
+      pin.className = 'pin'
+      pin.append(pinIcon())
+      li.append(pin)
+    }
+
+    const when = whenLabel(thread)
+    const whenEl = document.createElement('span')
+    whenEl.className = when.expiring ? 'when expiring' : 'when'
+    whenEl.textContent = when.text
+    li.append(whenEl)
+
+    const tools = document.createElement('span')
+    tools.className = 'tools'
+    tools.append(
+      toolButton(pinIcon(), thread.pinned ? 'Unpin' : 'Pin', () => pinThread(thread), thread.pinned),
+      toolButton('✎', 'Rename', () => renameInline(li, thread)),
+      toolButton('✦', 'Ask Scout for a name', () => suggestTitle(thread)),
+      toolButton('✕', 'Delete', () => deleteThread(thread)),
+    )
+    li.append(tools)
+    return li
+  }
+
+  function toolButton(glyph, label, onClick, pressed) {
+    const b = document.createElement('button')
+    b.type = 'button'
+    if (typeof glyph === 'string') b.textContent = glyph
+    else b.append(glyph)
+    b.title = label
+    // The glyph is decoration; the label is the only name a screen reader
+    // or a hovering cursor can read.
+    b.setAttribute('aria-label', label)
+    if (pressed !== undefined) b.setAttribute('aria-pressed', String(pressed))
+    b.addEventListener('click', (e) => {
+      // The whole row opens a thread. Acting on a row must not also switch
+      // to it — least of all delete, which would open what it just removed.
+      e.stopPropagation()
+      onClick()
+    })
+    return b
+  }
+
+  function closeDrawer() {
+    sideEl.classList.remove('open')
+    menuButton.setAttribute('aria-expanded', 'false')
+  }
+
+  // A 404 from any thread route means the thread went — expired, or
+  // deleted on another tab. Refresh the list and show whatever is current.
+  async function vanished() {
+    showNotice('That thread is gone. Showing the newest one.')
+    await refreshThreads()
+    const res = await fetch('/chat/history')
+    if (res.ok) showTurns(await res.json())
+  }
+
+  async function openThread(id) {
+    hideNotice()
+    const res = await post(`/chat/threads/${id}/open`)
+    if (res.status === 404) return vanished()
+    if (!res.ok) {
+      showNotice('Could not open that thread. Try again.')
+      return
+    }
+    showTurns(await res.json())
+    closeDrawer()
+    await refreshThreads()
+  }
+
+  async function pinThread(thread) {
+    const res = await post(`/chat/threads/${thread.id}/pin`, { pinned: !thread.pinned })
+    if (res.status === 404) return vanished()
+    if (!res.ok) showNotice('Could not change that. Try again.')
+    await refreshThreads()
+  }
+
+  function renameInline(li, thread) {
+    const input = document.createElement('input')
+    input.value = thread.title ?? ''
+    input.maxLength = 80
+    input.setAttribute('aria-label', 'Thread name')
+    // The row's button and tools give way to the input; the list is
+    // rebuilt from the server afterwards, so nothing here is restored by hand.
+    li.replaceChildren(input)
+    input.focus()
+    input.select()
+    // Enter, Escape and blur can all arrive for one rename — Enter moves
+    // focus off the input, which blurs it. Without this the row would be
+    // rebuilt twice and, worse, saved twice.
+    let done = false
+    const finish = async (save) => {
+      if (done) return
+      done = true
+      const title = input.value.trim()
+      if (save && title && title !== thread.title) {
+        const res = await post(`/chat/threads/${thread.id}/rename`, { title })
+        if (res.status === 404) return vanished()
+        if (!res.ok) showNotice('Could not rename that thread. Try again.')
+      }
+      await refreshThreads()
+    }
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true) }
+      // Held here rather than let through: on a phone this rename is
+      // happening inside the open drawer, and the drawer's own Escape
+      // would close it — cancelling the rename and the list with it.
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false) }
+    })
+    input.addEventListener('blur', () => finish(true))
+  }
+
+  async function suggestTitle(thread) {
+    hideNotice()
+    const res = await post(`/chat/threads/${thread.id}/title`)
+    if (res.status === 404) return vanished()
+    if (res.status === 429) {
+      showNotice('Too many names asked for in a row. Give it a few minutes.')
+      return
+    }
+    if (!res.ok) {
+      showNotice('Scout could not think of a name. Try again, or rename it yourself.')
+      return
+    }
+    await refreshThreads()
+  }
+
+  async function deleteThread(thread) {
+    const name = threadLabel(thread).text
+    if (!window.confirm(`Delete "${name}"? This cannot be undone.`)) return
+    const res = await post(`/chat/threads/${thread.id}/delete`)
+    // A 404 here is the outcome asked for: the thread is already gone.
+    if (!res.ok && res.status !== 404) {
+      showNotice('Could not delete that thread. Try again.')
+      return
+    }
+    const wasCurrent = thread.id === currentThread
+    await refreshThreads()
+    if (wasCurrent) {
+      const history = await fetch('/chat/history')
+      showTurns(history.ok ? await history.json() : [])
+    }
+  }
+
+  // Returns whether there is now a thread to send into — the composer
+  // waits on this, because a message with no thread is a 422.
+  async function newThread() {
+    hideNotice()
+    const res = await post('/chat/threads')
+    if (!res.ok) {
+      showNotice('Could not start a new thread. Reload to try again.')
+      return false
+    }
+    currentThread = (await res.json()).id
+    turnsEl.replaceChildren()
+    closeDrawer()
+    await refreshThreads()
+    return true
+  }
+
+  menuButton.addEventListener('click', () => {
+    const open = sideEl.classList.toggle('open')
+    menuButton.setAttribute('aria-expanded', String(open))
+    // A drawer opened by keyboard has to put focus inside it, or Tab
+    // carries on into the composer behind it.
+    if (open) sideEl.querySelector('button')?.focus()
+  })
+  // The drawer's ways out: Escape, or a tap anywhere else.
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sideEl.classList.contains('open')) closeDrawer()
+  })
+  document.addEventListener('click', (e) => {
+    if (sideEl.classList.contains('open') && !sideEl.contains(e.target) && !menuButton.contains(e.target)) closeDrawer()
+  })
+  // A thread renamed on the phone, or one that aged out while this tab sat
+  // in the background, should not still be on screen as it was.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshThreads()
+  })
 
   // Runs one turn: posts the question, streams `agent` events into the
   // status line and the answer bubble, and stops on the one `end` frame
@@ -241,6 +499,10 @@ function start() {
     let thinking = ''
     let answerLi = null
     let sawEnd = false
+    // A request the server refused outright never opened a stream, so the
+    // "connection dropped" report below — which promises the answer is
+    // still being written — would be a lie.
+    let refused = false
 
     function renderAnswer() {
       const wasFollowing = following()
@@ -256,9 +518,24 @@ function start() {
       const res = await fetch('/chat/messages', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
-        body: JSON.stringify({ text }),
+        body: sendBody(text, currentThread),
       })
+      // Both of these are plain refusals, not streams: the thread went
+      // between the page loading and this send, or the page predates the
+      // server that now requires a thread. Say which, rather than blaming
+      // the connection.
+      if (res.status === 404) {
+        refused = true
+        await vanished()
+        return
+      }
+      if (res.status === 422) {
+        refused = true
+        showNotice('This page is out of date. Reload to keep going.')
+        return
+      }
       if (!res.ok || !res.body) {
+        refused = true
         showNotice('Scout could not be reached. Reload to try again.')
         return
       }
@@ -323,7 +600,10 @@ function start() {
       // the same situation as one that stopped without an `end` frame.
     } finally {
       hideStatus()
-      if (!sawEnd) {
+      // Not awaited: the first answer is what names a thread, and the row
+      // should pick that name up without holding the composer shut for it.
+      refreshThreads()
+      if (!sawEnd && !refused) {
         // The run continues server-side even though our connection did
         // not, and history is written when it finishes — so this is not
         // an error to apologise for, it's a status to report.
@@ -342,19 +622,26 @@ function start() {
     if (running) return
     const text = textEl.value.trim()
     if (!text) return
-    textEl.value = ''
-    // A box grown to five lines must shrink back, or it sits tall and
-    // empty over the answer it just asked for.
-    fitComposer()
     hideNotice()
-    turnsEl.append(turnElement('You', text))
-    // Unconditional, unlike the answer: sending is an act that means "show
-    // me", so it is not content arriving under a reader who moved away.
-    turnsEl.scrollTop = turnsEl.scrollHeight
 
+    // Held from here rather than from the run, because the thread below is
+    // made across an await: two quick Enters would otherwise start two.
     running = true
     sendButton.disabled = true
     try {
+      // An account with no threads at all — a first sign-in — has nothing
+      // to name in the body, and the send would be a 422. Make one before
+      // the box is cleared and before the bubble is appended: `newThread`
+      // empties the transcript, and it would take that bubble with it.
+      if (currentThread === null && !(await newThread())) return
+      textEl.value = ''
+      // A box grown to five lines must shrink back, or it sits tall and
+      // empty over the answer it just asked for.
+      fitComposer()
+      turnsEl.append(turnElement('You', text))
+      // Unconditional, unlike the answer: sending is an act that means "show
+      // me", so it is not content arriving under a reader who moved away.
+      turnsEl.scrollTop = turnsEl.scrollHeight
       await runMessage(text)
     } finally {
       running = false
@@ -386,18 +673,11 @@ function start() {
     })
   }
 
+  // `/chat/threads` rather than `/chat/reset`: the sidebar has to learn the
+  // new thread's id, and only the threads route hands it back.
   resetForm.addEventListener('submit', async (e) => {
     e.preventDefault()
-    hideNotice()
-    const res = await fetch('/chat/reset', {
-      method: 'POST',
-      headers: { 'x-scout-csrf': csrfToken },
-    })
-    if (res.ok) {
-      turnsEl.replaceChildren()
-    } else {
-      showNotice('Could not start a new thread. Reload to try again.')
-    }
+    await newThread()
   })
 
   loadHistory()

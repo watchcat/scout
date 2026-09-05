@@ -123,6 +123,14 @@ test('whenLabel guards: clock skew and the last hour before expiry', () => {
   assert.deepEqual(whenLabel({ updated_at: '2026-09-03T12:00:00Z', pinned: false }, now), { text: 'expires in 1h', expiring: true })
 })
 
+test('a date the client cannot read says nothing rather than "NaNd"', () => {
+  // Every arithmetic path below runs off `Date.parse`, and NaN propagates
+  // silently through all of them — so a row whose timestamp the client
+  // cannot parse would render "NaNd" beside its title.
+  const now = Date.parse('2026-09-05T12:00:00Z')
+  assert.deepEqual(whenLabel({ updated_at: 'garbage', pinned: false }, now), { text: '', expiring: false })
+})
+
 test('a message names the thread it belongs to', () => {
   assert.deepEqual(JSON.parse(sendBody('hi', 42)), { text: 'hi', thread: 42 })
 })

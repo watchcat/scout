@@ -221,14 +221,16 @@ CREATE TABLE IF NOT EXISTS conversations (
     account_id    BIGINT NOT NULL,
     scope         TEXT NOT NULL,
     pending_draft TEXT,
+    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    -- Last two, so a fresh database and a migrated one — where these
+    -- arrive by ALTER TABLE in step 7 — have the same column order.
     -- What the sidebar calls it. Null until the first answer lands; then
     -- the first message trimmed, unless someone renamed it. See the
     -- threads design doc.
     title         TEXT,
     -- "Permanent": exempt from the 48-hour expiry. Nothing else.
-    pinned        BOOLEAN NOT NULL DEFAULT false,
-    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
-    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+    pinned        BOOLEAN NOT NULL DEFAULT false
 );
 CREATE SEQUENCE IF NOT EXISTS messages_id_seq;
 -- `body` is a serde_json `rig::completion::Message`. Storing the whole
@@ -703,17 +705,25 @@ CREATE TABLE IF NOT EXISTS login_tokens (
 
 /// Threads in the browser: a name and a pin.
 ///
-/// Split into five statements because this DuckDB refuses `ADD COLUMN`
-/// with a constraint ("Adding columns with constraints not yet supported"):
-/// the column is added bare, existing rows are backfilled, and only then
-/// does it get its default and its NOT NULL. `IF NOT EXISTS` so a database
-/// created by `MIGRATIONS` after this shipped, but somehow recorded at 6,
-/// is not broken by the step.
+/// The `pinned` column is added bare, backfilled and given its default
+/// here, and made NOT NULL in step 8 — a separate step because DuckDB
+/// refuses `SET NOT NULL` in a transaction that has already touched the
+/// table's rows, and the `ADD COLUMN` in this one counts. `apply_steps`
+/// runs each step in its own transaction, so a separate step is what a
+/// separate transaction costs. (`ADD COLUMN` with a constraint is refused
+/// outright, which is why the constraint is not simply on the add.)
+/// `IF NOT EXISTS` so a database created by `MIGRATIONS` after this
+/// shipped, but somehow recorded below 7, is not broken by the step.
 const STEP_7_THREADS: &str = r#"
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN;
 UPDATE conversations SET pinned = false WHERE pinned IS NULL;
 ALTER TABLE conversations ALTER COLUMN pinned SET DEFAULT false;
+"#;
+
+/// See `STEP_7_THREADS`. Dying between 7 and 8 leaves a nullable column
+/// that holds no nulls, and this runs alone on the next boot.
+const STEP_8_PINNED_NOT_NULL: &str = r#"
 ALTER TABLE conversations ALTER COLUMN pinned SET NOT NULL;
 "#;
 
@@ -726,6 +736,7 @@ fn steps() -> Vec<(i64, Step)> {
         (5, Step::Sql(STEP_5_DELIVERIES)),
         (6, Step::Sql(STEP_6_LOGIN_TOKENS)),
         (7, Step::Sql(STEP_7_THREADS)),
+        (8, Step::Sql(STEP_8_PINNED_NOT_NULL)),
     ]
 }
 
@@ -2972,7 +2983,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 7);
+        assert_eq!(s.schema_version().unwrap(), 8);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -3036,7 +3047,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), 8);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -4764,7 +4775,7 @@ CREATE TABLE segment_candidates (
                 |r| r.get(0),
             )
             .unwrap();
-        n == 1
+        n > 0
     }
 
     #[test]
@@ -4775,29 +4786,65 @@ CREATE TABLE segment_candidates (
         assert!(has_column(&conn, "conversations", "pinned"));
     }
 
-    #[test]
-    fn a_database_from_before_threads_grows_the_two_columns_and_keeps_its_rows() {
+    /// `conversations` exactly as it stood at schema version 6, before the
+    /// title and the pin. Frozen, like `LEGACY_SCHEMA`: its value is being
+    /// an honest picture of the table the step will actually meet.
+    const PRE_THREADS_CONVERSATIONS: &str = r#"
+DROP TABLE conversations;
+CREATE TABLE conversations (
+    id            BIGINT PRIMARY KEY DEFAULT nextval('conversations_id_seq'),
+    account_id    BIGINT NOT NULL,
+    scope         TEXT NOT NULL,
+    pending_draft TEXT,
+    started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+"#;
+
+    /// A database in the production shape: everything `MIGRATIONS` builds,
+    /// with `conversations` rolled back to its version-6 form, the version
+    /// recorded as 6, and a thread already in it. The row is what matters —
+    /// the step is trivially safe on an empty table and refuses to run on a
+    /// full one, which is the whole bug.
+    fn version_six_db_with_a_thread() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
-        let db = dir.path().join("legacy.duckdb");
-        {
-            let conn = Connection::open(&db).unwrap();
-            conn.execute_batch(LEGACY_SCHEMA).unwrap();
-        }
+        let path = dir.path().join("v6.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS).unwrap();
+        conn.execute_batch(PRE_THREADS_CONVERSATIONS).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version BIGINT NOT NULL);
+             INSERT INTO schema_version VALUES (6);
+             INSERT INTO accounts (id) VALUES (nextval('accounts_id_seq'));
+             INSERT INTO conversations (id, account_id, scope)
+                 VALUES (nextval('conversations_id_seq'), 1, 'direct');",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
+        let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        // Step 6 was the last one before this; a database that stops there
-        // is exactly the production file.
-        assert!(s.schema_version().unwrap() >= 7, "step 7 did not run");
-        let a = s.account_for_telegram(11).unwrap();
-        let id = s.start_conversation(a, "direct").unwrap();
+        assert!(s.schema_version().unwrap() >= 8, "the threads steps did not run");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
-        let pinned: bool = conn
-            .query_row("SELECT pinned FROM conversations WHERE id = ?", params![id], |r| r.get(0))
-            .unwrap();
-        assert!(!pinned, "a thread starts unpinned");
+        assert!(has_column(&conn, "conversations", "pinned"));
+        let old: bool = conn
+            .query_row("SELECT pinned FROM conversations WHERE id = 1", [], |r| r.get(0))
+            .expect("the thread that was already there must survive");
+        assert!(!old, "a thread that predates the pin is unpinned");
         let null_pins: i64 = conn
             .query_row("SELECT count(*) FROM conversations WHERE pinned IS NULL", [], |r| r.get(0))
             .unwrap();
         assert_eq!(null_pins, 0, "the backfill must leave no null pins behind");
+        drop(conn);
+        let id = s.start_conversation(1, "direct").unwrap();
+        let conn = s.conn();
+        let fresh: bool = conn
+            .query_row("SELECT pinned FROM conversations WHERE id = ?", params![id], |r| r.get(0))
+            .unwrap();
+        assert!(!fresh, "a thread started after the migration is unpinned too");
     }
 }

@@ -29,12 +29,24 @@ them.
 
 ## Data
 
-Migration step 7 adds two columns to `conversations`:
+Migration step 7 adds two columns to `conversations`, and step 8 makes the
+pin non-null:
 
 ```sql
-ALTER TABLE conversations ADD COLUMN title TEXT;
-ALTER TABLE conversations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false;
+-- step 7
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned BOOLEAN;
+UPDATE conversations SET pinned = false WHERE pinned IS NULL;
+ALTER TABLE conversations ALTER COLUMN pinned SET DEFAULT false;
+
+-- step 8
+ALTER TABLE conversations ALTER COLUMN pinned SET NOT NULL;
 ```
+
+The NOT NULL is a step of its own because DuckDB refuses `SET NOT NULL` in a
+transaction that has already touched the table's rows — the `ADD COLUMN` and
+the backfill in step 7 both count — and `apply_steps` gives each step its own
+transaction.
 
 `title` is null until the thread's first answer lands. Then it is the first
 user message, whitespace-collapsed, cut to 40 characters on a character

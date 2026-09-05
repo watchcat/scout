@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent } from './chat.js'
+import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent, threadVanished } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
   // The browser half of the protocol's security property: reasoning the
@@ -159,6 +159,23 @@ test('the openers that redraw the transcript adopt the server\'s answer', () => 
   // the server's current thread — so there the server's answer and what is
   // on screen are the same thing, and adopting it is right.
   assert.equal(resolveCurrent([{ id: 1, current: true }, { id: 2 }], 2, true), 1)
+})
+
+test('a thread that went while the tab slept is noticed, not quietly swapped', () => {
+  // The 48h sweep runs while the tab is in the background, and the wake-up
+  // refresh is the first thing to see the thread gone. Without this the
+  // composer would retarget under an unchanged transcript and the next
+  // message would land in a conversation the reader never opened.
+  assert.equal(threadVanished([{ id: 1, current: true }], 2), true)
+  // Still there: nothing happened.
+  assert.equal(threadVanished([{ id: 1, current: true }, { id: 2 }], 2), false)
+  // Nothing on screen to lose — a first load, before any transcript.
+  assert.equal(threadVanished([{ id: 1, current: true }], null), false)
+  // The adopting callers have just drawn `/chat/history` themselves, so the
+  // thread they are moving to is by construction the server's current one.
+  // Reporting it gone there would announce the move that was just made —
+  // and, since `vanished` refreshes with `adopt`, would never terminate.
+  assert.equal(threadVanished([{ id: 1, current: true }], 2, true), false)
 })
 
 test('an account with no threads at all leaves the composer with none', () => {

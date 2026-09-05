@@ -159,6 +159,19 @@ export function resolveCurrent(list, shown, adopt = false) {
   return list.find((t) => t.current)?.id ?? null
 }
 
+// Whether the thread on screen has gone from the list — expired by the 48h
+// sweep while the tab slept, or deleted from the phone. `resolveCurrent`
+// answers this by silently handing the composer to the server's current
+// thread, which is right as far as it goes but leaves the old transcript on
+// screen with nothing said. The caller asks this first so it can say so.
+//
+// Never true while adopting: those callers redraw from `/chat/history`, so
+// the thread they are moving to *is* the server's current one. It also stops
+// `vanished` — which refreshes with `adopt` — from calling itself forever.
+export function threadVanished(list, shown, adopt = false) {
+  return !adopt && shown !== null && !list.some((t) => t.id === shown)
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')
@@ -302,6 +315,17 @@ function start() {
     // A refresh started after this one has already answered: its list is
     // the newer truth, and painting this one over it would undo it.
     if (seq !== refreshSeq) return
+    // The thread on screen is no longer in the list. Handing the composer to
+    // the server's current thread and stopping there would leave the old
+    // transcript up with nothing said, and the next message would go to a
+    // conversation the reader never opened. `vanished` says it, adopts, and
+    // redraws the transcript — and its own refresh passes `adopt`, so this
+    // branch cannot be taken a second time.
+    if (threadVanished(list, currentThread, adopt)) {
+      renderThreads(list)
+      await vanished()
+      return
+    }
     currentThread = resolveCurrent(list, currentThread, adopt)
     renderThreads(list)
   }
@@ -434,6 +458,9 @@ function start() {
     // would paint its transcript over the thread actually asked for.
     if (seq !== openSeq) return
     showTurns(turns)
+    // Whatever a run in the thread just left is that thread's reasoning, and
+    // it does not describe the one now on screen.
+    hideStatus()
     // Set here rather than left to the refresh below, which never moves it:
     // the composer's target is the transcript now on screen.
     currentThread = id
@@ -475,12 +502,18 @@ function start() {
           // name made only of invisible characters is not a name.
           if (res.status === 400) showNotice('That name has nothing in it.')
           else if (!res.ok) showNotice('Could not rename that thread. Try again.')
-          else thread.title = title
+          // A success writes nothing back into `thread`. What core stored is
+          // not what was sent — it strips invisible characters, cuts to its
+          // own length and trims — so echoing the typed name would show a
+          // title the server does not have, and the next refresh would
+          // silently correct it. The refresh below is what shows the name.
         }
       } finally {
-        // Rebuilt from the thread already in hand, and before the list is
-        // asked for: a fetch that fails or never answers must not leave the
-        // row as a bare input with no way back out of it.
+        // Rebuilt from the thread as it was before the rename, and before
+        // the list is asked for: a fetch that fails or never answers must
+        // not leave the row as a bare input with no way back out of it. The
+        // old name for a moment, and the stored one once the list lands —
+        // stale rather than a name that was never saved.
         li.replaceWith(threadRow(thread, thread.id === currentThread))
       }
       await refreshThreads()
@@ -542,7 +575,9 @@ function start() {
     }
     currentThread = (await res.json()).id
     turnsEl.replaceChildren()
-    closeDrawer()
+    // An empty thread is an invitation to type into it, so focus lands on
+    // the composer rather than back on the menu button.
+    closeDrawer(textEl)
     await refreshThreads()
     return true
   }
@@ -581,6 +616,12 @@ function start() {
     // painted into the one they moved to. The run carries on server-side
     // and its answer is saved to history, so switching back shows it.
     const runThread = currentThread
+    // Whether this run's thread is still the one on screen. The run keeps
+    // going server-side either way; the page only draws what belongs to the
+    // thread in front of the reader. The status line and the notice are as
+    // much this run's output as the bubble is, and a reader who moved to
+    // another conversation should see neither its reasoning nor its verdict.
+    const mine = () => runThread === currentThread
     let answer = ''
     let thinking = ''
     let answerLi = null
@@ -597,6 +638,11 @@ function start() {
       if (answerLi && !answerLi.isConnected) answerLi = null
       // Not the thread on screen any more. Neither the bubble nor the
       // scroll belongs to this reader's view.
+      //
+      // Switching back while the run is still going picks the answer up
+      // again from here, but without the question above it: the transcript
+      // was redrawn from history, and history does not hold the in-flight
+      // turn until the run finishes and writes it. The next open shows both.
       if (runThread !== currentThread) return
       const wasFollowing = following()
       if (!answerLi) {
@@ -611,7 +657,7 @@ function start() {
       const res = await fetch('/chat/messages', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
-        body: sendBody(text, currentThread),
+        body: sendBody(text, runThread),
       })
       // Both of these are plain refusals, not streams: the thread went
       // between the page loading and this send, or the page predates the
@@ -652,12 +698,14 @@ function start() {
         if (frame.event === 'agent') {
           const evt = JSON.parse(frame.data)
           if ('Tool' in evt) {
-            showStatus(evt.Tool)
+            if (mine()) showStatus(evt.Tool)
           } else if ('Notice' in evt) {
-            showStatus(evt.Notice)
+            if (mine()) showStatus(evt.Notice)
           } else if ('Thinking' in evt) {
+            // Accumulated whether or not it is shown: a reader who switches
+            // back mid-run should find the reasoning whole, not from here on.
             thinking = applyUpdate(thinking, evt.Thinking)
-            showStatus(thinking)
+            if (mine()) showStatus(thinking)
           } else if ('Answer' in evt) {
             answer = applyUpdate(answer, evt.Answer)
             renderAnswer()
@@ -666,9 +714,9 @@ function start() {
           sawEnd = true
           const end = JSON.parse(frame.data)
           if (end.status === 'busy') {
-            showNotice('Scout is already answering something else. Try again in a moment.')
+            if (mine()) showNotice('Scout is already answering something else. Try again in a moment.')
           } else if (end.status === 'error') {
-            showNotice(end.message)
+            if (mine()) showNotice(end.message)
           }
           const finished = finalAnswer(end, answer)
           if (finished !== answer) {
@@ -710,10 +758,12 @@ function start() {
       // reading. And not left to reject on its own: a dropped connection
       // here is already reported below.
       refreshThreads().catch(() => {})
-      if (!sawEnd && !refused) {
+      if (!sawEnd && !refused && mine()) {
         // The run continues server-side even though our connection did
         // not, and history is written when it finishes — so this is not
-        // an error to apologise for, it's a status to report.
+        // an error to apologise for, it's a status to report. And only to
+        // the reader still on that thread: to anyone else it is a report
+        // about a conversation they are no longer looking at.
         showNotice(
           'The connection dropped before Scout finished. The answer is still being ' +
             'written and will be saved to history — reload to see it once it lands.',

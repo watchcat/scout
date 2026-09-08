@@ -201,6 +201,38 @@ mod tests {
     }
 
     #[test]
+    fn the_page_tells_a_crawler_what_it_is() {
+        // The head had a title and nothing else, so Google wrote its own
+        // snippet from whatever prose it picked and a link pasted into a
+        // chat unfurled to nothing. The description is bounded the way a
+        // search result is: too short and the engine ignores it, too long
+        // and it is cut mid-sentence.
+        let attr = |tag_start: &str| -> String {
+            let i = TEMPLATE.find(tag_start).unwrap_or_else(|| panic!("no `{tag_start}`"));
+            let tag = &TEMPLATE[i..];
+            let tag = &tag[..tag.find('>').expect("the tag closes")];
+            let c = tag.find("content=\"").expect("no content attribute") + 9;
+            tag[c..c + tag[c..].find('"').expect("content closes")].to_string()
+        };
+        let description = attr(r#"<meta name="description""#);
+        assert!(
+            (50..=160).contains(&description.chars().count()),
+            "description is {} characters: {description}",
+            description.chars().count()
+        );
+
+        // The title in the tab and the title on a shared link are the same
+        // thing said in two places, and nothing but this test keeps them
+        // from drifting apart.
+        let t = TEMPLATE.find("<title>").expect("no title") + 7;
+        let title = &TEMPLATE[t..t + TEMPLATE[t..].find("</title>").expect("title closes")];
+        assert_eq!(attr(r#"<meta property="og:title""#), title);
+        assert!(TEMPLATE.contains(r#"<meta property="og:description""#));
+        assert!(TEMPLATE.contains(r#"<meta property="og:type" content="website""#));
+        assert!(TEMPLATE.contains(r#"<meta name="twitter:card""#));
+    }
+
+    #[test]
     fn the_page_never_says_how_many_seats_are_left() {
         // The design says state, not numbers. This is the test that keeps
         // someone from "helpfully" adding a count later.

@@ -73,8 +73,11 @@ fares, airport codes, booking a flight, or a trip being planned - never a \
 web search, and never compare_prices, whose per-unit arithmetic means \
 nothing for a flight. It sees nothing of this conversation, so write a \
 self-contained brief: route, dates, passengers, cabin, whether the dates \
-are flexible, and any offer id the user is pointing at. If the user has \
-not given something a search needs, ask them before calling it. Its \
+are flexible, and any offer id the user is pointing at, together with its \
+source (duffel or ignav) as the findings state it, so the desk knows which \
+booking tool it belongs to. A route and a date are all a search needs - \
+passengers default to one adult - so do not question the user for the rest; \
+when the desk reports something missing, ask for that. Its \
 result carries a summary, findings and guidance: present the findings \
 following that guidance, take every number, time and link from the \
 findings verbatim - never from the summary and never from memory - and \
@@ -465,11 +468,7 @@ pub(crate) fn rules_for_available_tools(preamble: &str, available: &[&str]) -> S
         .join("\n- ")
 }
 
-pub fn preamble_with_profile(
-    facts: &[(String, String)],
-    _markup_rate: f64,
-    available: &[&str],
-) -> String {
+pub fn preamble_with_profile(facts: &[(String, String)], available: &[&str]) -> String {
     let mut p = rules_for_available_tools(PREAMBLE, available);
     if !facts.is_empty() {
         p.push_str("\n\nKnown about this user (long-term profile):\n");
@@ -519,7 +518,7 @@ pub fn wrap_up_agent(
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     d.llm
         .agent(MODEL)
-        .preamble(&preamble_with_profile(facts, markup_rate(d), &available_tools(d)))
+        .preamble(&preamble_with_profile(facts, &available_tools(d)))
         .default_max_turns(1)
         .build()
 }
@@ -562,7 +561,9 @@ pub(crate) fn markup_rate(d: &AgentDeps) -> f64 {
 }
 
 /// Built per incoming message: tools capture the requesting account's
-/// identity, so the LLM never sees or chooses ids.
+/// identity, so the LLM never sees or chooses ids. `events` carries the
+/// nested flight desk's progress to the chat, and `pulse` its liveness to
+/// the stall guard.
 pub fn build_agent(
     d: &AgentDeps,
     run: &scout_api::RunContext,
@@ -579,7 +580,7 @@ pub fn build_agent(
     let mut builder = d
         .llm
         .agent(MODEL)
-        .preamble(&preamble_with_profile(facts, markup_rate(d), &available_tools(d)))
+        .preamble(&preamble_with_profile(facts, &available_tools(d)))
         .tool(WebSearchTool {
             kagi: d.kagi.clone(),
             perplexity: d.perplexity.clone(),
@@ -661,13 +662,13 @@ mod tests {
         // something only the code can know.
         let without_bol: Vec<&str> =
             ALL_TOOLS.iter().copied().filter(|t| *t != "search_bol").collect();
-        let p = preamble_with_profile(&[], 0.0, &without_bol);
+        let p = preamble_with_profile(&[], &without_bol);
         assert!(!p.contains("search_bol"), "an absent tool is not mentioned at all");
         assert!(p.contains("ask_flights"), "the ones it does have stay");
         assert!(p.contains("compare_prices"), "and so do the unconditional rules");
 
         // With everything, nothing is lost.
-        let all = preamble_with_profile(&[], 0.0, ALL_TOOLS);
+        let all = preamble_with_profile(&[], ALL_TOOLS);
         assert!(all.contains("search_bol") && all.contains("ask_flights"));
 
         // The rule really is dropped whole, not just its first line.
@@ -682,13 +683,18 @@ mod tests {
     fn the_main_prompt_carries_no_flight_rules_and_no_fee() {
         // The point of the split. The fee now arrives with the findings
         // (flights::guidance) and in search_flights' own notes.
-        let p = preamble_with_profile(&[], 0.03, ALL_TOOLS);
+        let p = preamble_with_profile(&[], ALL_TOOLS);
         assert!(!p.contains("Booking fee"), "got: {p}");
         for word in ["search_flights", "flex_days", "itinerary", "add_trip_segment", "price_status"] {
             assert!(!p.contains(word), "{word:?} belongs to the flight agent now");
         }
         assert!(p.contains("When ask_flights is available"), "got: {p}");
         assert!(p.contains("self-contained brief"), "got: {p}");
+        // The brief must not be bought with an interrogation: passengers
+        // default, and the desk names what is really missing.
+        assert!(p.contains("one adult"), "got: {p}");
+        // And the offer id alone is ambiguous between two booking tools.
+        assert!(p.contains("its source"), "got: {p}");
     }
 
     #[test]
@@ -697,7 +703,27 @@ mod tests {
         // it a flight question is a silent minute.
         let src = include_str!("run.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
-        assert!(src.contains("build_agent(&core.deps, run, &facts, events.clone(), pulse.clone())"), "the sink and the pulse must reach build_agent");
+        let call = &src[src.find("build_agent(").expect("the agent build must exist")..];
+        // Up to the parenthesis matching the call's own, not the first one
+        // closing an argument's `.clone()`.
+        let mut depth = 0usize;
+        let end = call
+            .char_indices()
+            .find_map(|(i, c)| match c {
+                '(' => {
+                    depth += 1;
+                    None
+                }
+                ')' => {
+                    depth -= 1;
+                    (depth == 0).then_some(i)
+                }
+                _ => None,
+            })
+            .expect("the call must close");
+        let call = &call[..end];
+        assert!(call.contains("events.clone()"), "the sink must reach build_agent: {call}");
+        assert!(call.contains("pulse.clone()"), "the pulse must reach build_agent: {call}");
     }
 
     #[test]
@@ -720,7 +746,7 @@ mod tests {
 
     #[test]
     fn profile_is_appended_when_present() {
-        let plain = preamble_with_profile(&[], 0.0, ALL_TOOLS);
+        let plain = preamble_with_profile(&[], ALL_TOOLS);
         assert!(plain.starts_with(PREAMBLE));
         // with nothing known, the only search language is English
         assert!(plain.contains("Search languages for this user: English."));
@@ -730,7 +756,7 @@ mod tests {
             ("delivery_country".to_string(), "NL".to_string()),
             ("shoe_size".to_string(), "44".to_string()),
         ];
-        let with = preamble_with_profile(&facts, 0.0, ALL_TOOLS);
+        let with = preamble_with_profile(&facts, ALL_TOOLS);
         assert!(with.starts_with(PREAMBLE));
         assert!(with.contains("- delivery_country: NL"));
         assert!(with.contains("- shoe_size: 44"));
@@ -809,19 +835,19 @@ mod tests {
         let p = preamble_with_profile(&facts(&[(
             "favourite_shops",
             "123schoon.nl:cleaning products, bol.com",
-        )]), 0.0, ALL_TOOLS);
+        )]), ALL_TOOLS);
         assert!(p.contains("- 123schoon.nl: cleaning products"), "got: {p}");
         assert!(p.contains("- bol.com: any product"), "got: {p}");
 
         // Nothing listed, nothing said: the rule must not invite a site:
         // query at a shop the user never named.
-        let none = preamble_with_profile(&[], 0.0, ALL_TOOLS);
+        let none = preamble_with_profile(&[], ALL_TOOLS);
         assert!(!none.contains("Shops this user wants searched"));
     }
 
     #[test]
     fn profile_block_states_the_search_languages() {
-        let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]), 0.0, ALL_TOOLS);
+        let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]), ALL_TOOLS);
         assert!(p.contains("Search languages for this user: English, Dutch."), "got: {p}");
     }
 

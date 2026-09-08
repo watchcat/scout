@@ -30,7 +30,10 @@ pub enum RunOutcome {
 ///
 /// `events` is taken by value: returning drops it, which closes the channel
 /// and ends whoever is rendering. That is the only shutdown signal the
-/// renderer gets, so it must not be held anywhere else.
+/// renderer gets, so nothing outside this function may keep a sender. The
+/// agent built for the run holds a clone (the specialist reports progress
+/// through it), but that clone lives and dies with the agent inside this
+/// function, so the channel still closes on return.
 /// The event a streamed chunk should produce, if anything changed.
 ///
 /// A function rather than three lines inline, because `run_agent` needs a

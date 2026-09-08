@@ -377,7 +377,7 @@ trip builder, a hotel agent and an experience agent will be added.
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **778 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **781 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,
@@ -483,7 +483,7 @@ Roughly 38,000 lines of Rust across 60 focused modules.
 ## Development
 
 ```bash
-cargo test --workspace      # 778 tests across four crates, no network
+cargo test --workspace      # 781 tests across four crates, no network
 node --test 'crates/scout-web/src/*.test.mjs'  # the chat client's own tests
 cargo clippy --workspace --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs

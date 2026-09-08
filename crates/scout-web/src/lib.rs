@@ -169,30 +169,39 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
     // been running without it; serving it from here means it does not
     // depend on which proxy is in front.
     .layer(axum::middleware::from_fn(hsts))
-    // Outermost, so a plain-HTTP request is turned around before any other
-    // layer has an opinion about it — `only_from_our_own_pages` compares
-    // schemes, so without this a form served over HTTP posts back an
-    // `Origin` that cannot match and the visitor is told their form is out
-    // of date. Measured on an iPhone: Opera in a private window has no HSTS
-    // memory, went to HTTP, and got exactly that.
-    .layer(axum::middleware::from_fn_with_state(https_origin, force_https))
+    // Outermost, so a request at the wrong address is turned around before
+    // any other layer has an opinion about it — `only_from_our_own_pages`
+    // compares schemes, so without this a form served over HTTP posts back
+    // an `Origin` that cannot match and the visitor is told their form is
+    // out of date. Measured on an iPhone: Opera in a private window has no
+    // HSTS memory, went to HTTP, and got exactly that.
+    .layer(axum::middleware::from_fn_with_state(https_origin, canonical_address))
 }
 
-/// Sends a plain-HTTP request to the same address over HTTPS.
+/// Sends a request that arrived at the wrong address to the right one:
+/// plain HTTP to HTTPS, and `www.` to the apex.
 ///
-/// HSTS alone cannot do this. It is only honoured on a connection that was
-/// already secure, so it protects the second visit and every one after —
-/// never the first, which is the one that carries the password field.
+/// HSTS alone cannot do the first. It is only honoured on a connection that
+/// was already secure, so it protects the second visit and every one after
+/// — never the first, which is the one that carries the password field.
+///
+/// The second is for the index rather than the visitor. Google treated
+/// `www.goodscout.fyi` and the apex as two sites and the ingress served
+/// neither on www, so the links that spelled it that way led nowhere. Both
+/// conditions are checked before either redirect is written, so a visitor
+/// arriving over http on www is sent to the final address once rather
+/// than bounced twice.
 ///
 /// Absent `x-forwarded-proto` means nothing is in front of us: the
 /// kubelet's probe on `/healthz`, or a local run. Both must pass through,
 /// so the check is "the proxy said http", not "the proxy did not say
-/// https".
+/// https". The host is `public_host`'s reading, and only our own `www.` is
+/// turned around: a stranger's host in the header is not ours to redirect.
 ///
 /// 308 rather than 301: it preserves the method, so a form posted over
 /// HTTP is re-posted over HTTPS instead of being silently downgraded to a
 /// GET and losing its body.
-async fn force_https(
+async fn canonical_address(
     axum::extract::State(https_origin): axum::extract::State<Option<String>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -200,15 +209,21 @@ async fn force_https(
     let Some(origin) = https_origin.as_deref() else {
         return next.run(request).await;
     };
+    let origin = origin.trim_end_matches('/');
     let forwarded = request
         .headers()
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         // A chain of proxies appends, so the client's scheme is the first.
         .map(|v| v.split(',').next().unwrap_or_default().trim().to_string());
-    if forwarded.is_some_and(|p| !p.eq_ignore_ascii_case("https")) {
+    let plain_http = forwarded.is_some_and(|p| !p.eq_ignore_ascii_case("https"));
+    // The origin's own host, so `www.` + it is the one alias that is ours.
+    let apex = origin.trim_start_matches("https://");
+    let on_www = public_host(request.headers())
+        .is_some_and(|h| h.strip_prefix("www.").is_some_and(|rest| rest.eq_ignore_ascii_case(apex)));
+    if plain_http || on_www {
         let path = request.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        let to = format!("{}{}", origin.trim_end_matches('/'), path);
+        let to = format!("{origin}{path}");
         return (
             axum::http::StatusCode::PERMANENT_REDIRECT,
             [(header::LOCATION, to)],
@@ -702,6 +717,63 @@ mod tests {
             over(&app, Some("https, http"), "GET", "/healthz").await.status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn www_is_sent_to_the_apex_in_one_hop() {
+        // Google indexed `www.` and the apex as two sites, and the
+        // ingress served neither on www, so half the links out there led
+        // to nothing. One redirect straight to the final address, so a
+        // visitor arriving over http on www is not bounced twice.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = get_with_headers(
+            &app,
+            "/sign-in?x=1",
+            &[("x-forwarded-proto", "https"), ("x-forwarded-host", "www.example.com")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(res.headers()["location"], "https://example.com/sign-in?x=1");
+
+        let both = get_with_headers(
+            &app,
+            "/sign-in?x=1",
+            &[("x-forwarded-proto", "http"), ("x-forwarded-host", "www.example.com")],
+        )
+        .await;
+        assert_eq!(both.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(both.headers()["location"], "https://example.com/sign-in?x=1");
+    }
+
+    #[tokio::test]
+    async fn the_apex_and_any_other_host_are_left_alone() {
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let apex = get_with_headers(
+            &app,
+            "/healthz",
+            &[("x-forwarded-proto", "https"), ("x-forwarded-host", "example.com")],
+        )
+        .await;
+        assert_eq!(apex.status(), StatusCode::OK);
+        // Only our own www. A stranger's host in the header is not ours to
+        // redirect, and a local run has no https origin at all.
+        let other = get_with_headers(
+            &app,
+            "/healthz",
+            &[("x-forwarded-proto", "https"), ("x-forwarded-host", "www.elsewhere.example")],
+        )
+        .await;
+        assert_eq!(other.status(), StatusCode::OK);
+
+        let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
+        let local = router(cache, None);
+        let res = get_with_headers(
+            &local,
+            "/healthz",
+            &[("x-forwarded-proto", "http"), ("x-forwarded-host", "www.example.com")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK, "nothing to redirect to, so nothing redirects");
     }
 
     pub(crate) async fn get(app: &axum::Router, uri: &str) -> Response {

@@ -673,7 +673,7 @@ pub fn fare_market(facts: &[(String, String)]) -> Option<String> {
 }
 
 /// The booking fee in force, or nothing when flights are not configured.
-fn markup_rate(d: &AgentDeps) -> f64 {
+pub(crate) fn markup_rate(d: &AgentDeps) -> f64 {
     d.duffel.as_ref().map_or(0.0, |c| c.markup_rate())
 }
 

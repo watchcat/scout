@@ -6,6 +6,14 @@
 //! presentation half: how to write the answer, returned with the findings
 //! so that only a flight turn ever pays for it.
 
+use crate::agent::{fare_market, rules_for_available_tools, AgentDeps};
+use crate::specialist::{Finding, Specialist, SPECIALIST_BUDGET};
+use crate::tools::trips::{
+    AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
+    DropTripSegmentTool, FinaliseTripTool, ShowTripTool, UpdateTripSegmentTool,
+};
+use rig::client::CompletionClient;
+
 /// Model calls one flight question may take. A flexible return with a
 /// booking link is search, links, answer: three. Twelve leaves room for a
 /// multi-city plan built segment by segment.
@@ -61,6 +69,120 @@ once at the end.
 and any caveat - nothing flew that day, the window that was covered, a \
 fare that moved. Give no prices, times or links in those sentences: the \
 tool results travel back with your report and are read from there.";
+
+/// The booking tools this install actually has, for the prompt filter.
+fn available_tools(d: &AgentDeps) -> Vec<&'static str> {
+    FLIGHT_TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| match *tool {
+            "flight_booking_links" => d.ignav.is_some(),
+            "create_booking_link" => d.duffel.is_some() && d.links_enabled && d.return_url.is_some(),
+            _ => false,
+        })
+        .collect()
+}
+
+/// The nested agent: the flight prompt and every flight-shaped tool, wired
+/// exactly as the main agent wired them before the split. Built per
+/// request, like the main agent, because the tools capture the account.
+pub fn build_flight_agent(
+    d: &AgentDeps,
+    run: &scout_api::RunContext,
+    facts: &[(String, String)],
+    budget: std::sync::Arc<crate::tools::budget::FlightBudget>,
+) -> rig::agent::Agent<rig::providers::openai::completion::CompletionModel> {
+    let (account_id, conversation_id) = (run.account_id, run.conversation_id);
+    // Priced in the traveller's own currency, or Duffel's euros and
+    // Ignav's dollars never get compared. Shared by search and finalise:
+    // finalising re-prices through IgnavClient::search, which reads the
+    // market; booking_links ignores it, since the id carries its own.
+    let ignav = d.ignav.clone().map(|c| match fare_market(facts) {
+        Some(market) => c.with_market(&market),
+        None => c,
+    });
+    let mut builder = d
+        .llm
+        .agent(&d.flight_model)
+        .preamble(&rules_for_available_tools(FLIGHT_PREAMBLE, &available_tools(d)))
+        .tool(crate::tools::duffel::FlightSearchTool {
+            duffel: d.duffel.clone(),
+            store: d.store.clone(),
+            account_id,
+            budget: budget.clone(),
+            shown: d.shown.clone(),
+            conversation_id,
+            ignav: ignav.clone(),
+        })
+        .tool(FinaliseTripTool {
+            store: d.store.clone(),
+            account_id,
+            duffel: d.duffel.clone(),
+            ignav,
+            budget,
+        })
+        // Trip planning needs no provider, but a trip is a flight plan, so
+        // it lives with the flights.
+        .tool(AddTripSegmentTool { store: d.store.clone(), account_id })
+        .tool(AddTripOptionTool {
+            store: d.store.clone(),
+            account_id,
+            shown: d.shown.clone(),
+            conversation_id,
+        })
+        .tool(ChooseTripOptionTool { store: d.store.clone(), account_id })
+        .tool(ShowTripTool { store: d.store.clone(), account_id })
+        .tool(UpdateTripSegmentTool { store: d.store.clone(), account_id })
+        .tool(DropTripSegmentTool { store: d.store.clone(), account_id })
+        .tool(DeleteTripTool { store: d.store.clone(), account_id });
+    // Where an Ignav row can actually be bought.
+    if let Some(ignav) = &d.ignav {
+        builder = builder.tool(crate::tools::ignav::BookingLinksTool {
+            client: ignav.clone(),
+            shown: d.shown.clone(),
+            conversation_id,
+        });
+    }
+    // Duffel's hosted checkout: needs Duffel, Links enabled, and somewhere
+    // to send people back to.
+    if let (Some(duffel), Some(return_url)) =
+        (&d.duffel, d.return_url.as_ref().filter(|_| d.links_enabled))
+    {
+        builder = builder.tool(crate::tools::duffel::BookingLinkTool {
+            client: duffel.clone(),
+            account_id,
+            return_url: return_url.clone(),
+        });
+    }
+    builder.default_max_turns(FLIGHT_TURNS).build()
+}
+
+/// The flight agent as the one tool the main agent sees.
+pub fn ask_flights(
+    d: &AgentDeps,
+    run: &scout_api::RunContext,
+    facts: &[(String, String)],
+    budget: std::sync::Arc<crate::tools::budget::FlightBudget>,
+    events: scout_api::EventSink,
+    pulse: std::sync::Arc<crate::run::Pulse>,
+) -> Specialist<rig::providers::openai::completion::CompletionModel> {
+    let markup = crate::agent::markup_rate(d);
+    Specialist {
+        name: "ask_flights",
+        description: "Scout's flight desk. Send it every question about flights, fares, \
+                      airports, booking a flight, or a trip being planned. It sees nothing \
+                      of the conversation, so the brief must be self-contained: route, \
+                      dates, passengers, cabin, whether the dates are flexible, and any \
+                      offer id the user is pointing at. It returns findings - the real \
+                      search and booking results - plus guidance on presenting them."
+            .to_string(),
+        agent: build_flight_agent(d, run, facts, budget),
+        events,
+        pulse,
+        guidance: Box::new(move |findings: &[Finding]| guidance(findings, markup)),
+        budget: SPECIALIST_BUDGET,
+    }
+}
 
 /// The presentation rules that apply to what the specialist did, one
 /// block per section, each included only when its trigger is present.
@@ -277,5 +399,33 @@ mod tests {
                 assert!(FLIGHT_TOOLS.contains(&tool), "{tool:?} is offered conditionally but nothing gates it");
             }
         }
+    }
+
+    #[test]
+    fn the_flight_desk_is_named_ask_flights_and_asks_for_a_brief() {
+        // No provider is needed to build it: the tool is built from the
+        // deps, and the model is only reached when it is called.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let core = crate::core::Core::start(crate::config::Config::for_test(path.to_str().unwrap()), None).unwrap();
+        let run = scout_api::RunContext {
+            account_id: 1,
+            conversation_id: 1,
+            reply_to: Some(scout_api::ReplyTo::telegram(1)),
+            title_source: None,
+        };
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let budget = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
+        let pulse = std::sync::Arc::new(crate::run::Pulse::default());
+
+        let tool = ask_flights(&core.deps, &run, &[], budget, events, pulse);
+
+        assert_eq!(rig::tool::Tool::name(&tool), "ask_flights");
+        let d = rig::tool::Tool::description(&tool);
+        for word in ["route", "dates", "passengers", "offer id"] {
+            assert!(d.contains(word), "the parent must be told to put {word:?} in the brief: {d}");
+        }
+        let p = rig::tool::Tool::parameters(&tool);
+        assert_eq!(p["required"], serde_json::json!(["brief"]));
     }
 }

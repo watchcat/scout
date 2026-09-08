@@ -224,22 +224,35 @@ pub fn guidance(findings: &[crate::specialist::Finding], markup_rate: f64) -> Ve
     });
     let planned = ok().any(|f| TRIP_TOOLS.contains(&f.tool.as_str()));
     let mut out = Vec::new();
+    // Whether any section with prices in it was pushed: the fee line
+    // applies to prices, so it keys on these and not on the failed block.
+    let mut priced = false;
     if searched {
         out.push(SEARCH_GUIDANCE.to_string());
+        priced = true;
     }
     if windowed {
         out.push(WINDOW_GUIDANCE.to_string());
+        priced = true;
     }
     if ran("flight_booking_links") {
         out.push(IGNAV_LINKS_GUIDANCE.to_string());
+        priced = true;
     }
     if ran("create_booking_link") {
         out.push(DUFFEL_LINK_GUIDANCE.to_string());
+        priced = true;
     }
     if planned {
         out.push(TRIP_GUIDANCE.to_string());
+        priced = true;
     }
-    if !out.is_empty() && markup_rate > 0.0 {
+    // A failed finding travels back too, and without this the parent has
+    // an error string and no word on what `failed` means.
+    if findings.iter().any(|f| f.failed) {
+        out.push(FAILED_GUIDANCE.to_string());
+    }
+    if priced && markup_rate > 0.0 {
         out.push(format!(
             "Every flight price in these findings ALREADY includes a {} booking fee, which is \
              what the checkout charges. Quote the numbers unchanged and say once, in plain \
@@ -294,6 +307,11 @@ separated by a blank line. These prices expire within minutes: in a later \
 message, ask ask_flights again rather than repeating a fare from earlier in \
 the conversation.";
 
+const FAILED_GUIDANCE: &str = "\
+A finding with failed: true is the error the tool returned, not a result: \
+say plainly that that lookup failed and what the error says in a few words, \
+and do not present anything from it as a price, a time or a link.";
+
 const WINDOW_GUIDANCE: &str = "\
 Presenting by_date: the search covered a window and by_date is the cheapest \
 fare per day. Present it as a short list, cheapest day marked, and say which \
@@ -340,8 +358,26 @@ mod tests {
 
     #[test]
     fn a_failed_search_brings_no_search_rules() {
+        // Only the block that says what failed: true means, and no fee
+        // line, since there is no price for a fee to apply to.
         let failed = Finding { failed: true, ..ran("search_flights", json!("duffel api error (status 429)")) };
-        assert!(guidance(&[failed], 0.03).is_empty());
+        let g = guidance(&[failed], 0.03);
+        assert_eq!(g.len(), 1, "got: {g:?}");
+        assert!(g[0].contains("failed: true"), "got: {}", g[0]);
+        assert!(!g[0].contains("Cheapest, Fastest"), "got: {}", g[0]);
+        assert!(!g[0].contains("booking fee"), "got: {}", g[0]);
+    }
+
+    #[test]
+    fn a_failed_search_beside_a_good_one_brings_both_rules_and_the_fee() {
+        let failed = Finding { failed: true, ..ran("search_flights", json!("duffel api error (status 429)")) };
+        let g = guidance(&[ran("search_flights", json!({"route": "AMS-LIS"})), failed], 0.03);
+        let text = g.join("\n");
+        assert!(text.contains("Cheapest, Fastest"), "got: {text}");
+        assert_eq!(g.iter().filter(|s| s.contains("failed: true")).count(), 1, "got: {g:?}");
+        assert!(text.contains("3% booking fee"), "got: {text}");
+        // The fee line closes the guidance; the failed block comes before it.
+        assert!(g.last().unwrap().contains("booking fee"), "got: {g:?}");
     }
 
     #[test]

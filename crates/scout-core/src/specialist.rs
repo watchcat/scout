@@ -93,6 +93,21 @@ impl Collector {
         cut_short: Option<&str>,
         guidance: &dyn Fn(&[Finding]) -> Vec<String>,
     ) -> Result<Report, SpecialistError> {
+        // A summary that is itself a tool call is not an answer. The nested
+        // model sometimes writes the call out as prose instead of making
+        // one (minimax-m3, measured in production; see the repair turn in
+        // run.rs). Here nothing repairs it: rig sees no structured call,
+        // ends the stream as a FinalResponse, and the markup lands in the
+        // summary with no finding behind it, which would otherwise pass
+        // as a clean, empty report. Only when nothing succeeded: a real
+        // finding is still worth handing over, whatever the prose says.
+        let nothing_succeeded = self.findings.iter().all(|f| f.failed);
+        let cut_short = match cut_short {
+            None if nothing_succeeded && crate::toolcall::looks_like_tool_call(&self.summary) => {
+                Some("it wrote a tool call as text instead of making one")
+            }
+            other => other,
+        };
         let summary = match cut_short {
             None => self.summary,
             Some(reason) if self.findings.iter().all(|f| f.failed) => {
@@ -317,6 +332,29 @@ mod tests {
             "the parent must be told what went wrong: {}",
             report.summary
         );
+    }
+
+    #[test]
+    fn a_tool_call_written_as_prose_is_not_an_answer() {
+        // The nested model wrote the call out as text; rig took that for
+        // the answer, so the stream ended cleanly with nothing searched.
+        let mut c = Collector::default();
+        c.finished(
+            "<tool_call>\n<invoke name=\"search_flights\"><origin>AMS</origin><destination>LIS</destination></invoke>\n</tool_call>",
+        );
+        let err = c.report(None, &no_guidance).unwrap_err();
+        assert!(err.to_string().contains("tool call as text"), "got: {err}");
+    }
+
+    #[test]
+    fn a_plain_answer_with_nothing_searched_is_still_an_answer() {
+        // The desk may legitimately answer from the brief alone: "nothing
+        // to search, the date is missing".
+        let mut c = Collector::default();
+        c.finished("The brief gives no date, so nothing was searched.");
+        let report = c.report(None, &no_guidance).unwrap();
+        assert_eq!(report.summary, "The brief gives no date, so nothing was searched.");
+        assert!(report.findings.is_empty());
     }
 
     #[test]

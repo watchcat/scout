@@ -374,9 +374,21 @@ async fn security_headers(
 /// proxies appends, so the client's host is the first in the list.
 ///
 /// The value is about to be written into a URL and handed to a crawler, so
-/// anything that could end the host early or smuggle a path or userinfo
-/// into it is refused outright rather than escaped. A header is a string
-/// a stranger typed.
+/// the rule is what a host may contain rather than what it may not: a name
+/// of `[A-Za-z0-9.-]`, then at most a `:` and a port. A denylist of `/`,
+/// `@` and whitespace let `evil.example?goodscout.fyi` through — a host
+/// with a query on it — and that is the shape of every character it did
+/// not think of. Anything else is refused outright rather than escaped. A
+/// header is a string a stranger typed.
+///
+/// The port is kept because it is legitimate: a local run is
+/// `localhost:8080`, and the kubelet's probe carries `:8080` in `Host`.
+/// An IPv6 literal (`[::1]`) is refused on purpose; nothing public is
+/// addressed that way and the brackets would need their own rule.
+///
+/// Lower-cased on the way out. DNS names are case-insensitive and Traefik
+/// forwards the client's spelling, so `WWW.Goodscout.FYI` is the same host
+/// as `www.goodscout.fyi` and a `<loc>` built from it should say so.
 fn public_host(headers: &HeaderMap) -> Option<String> {
     let host = headers
         .get("x-forwarded-host")
@@ -387,10 +399,19 @@ fn public_host(headers: &HeaderMap) -> Option<String> {
         .next()
         .unwrap_or_default()
         .trim();
-    if host.is_empty() || host.contains(['/', '@']) || host.contains(char::is_whitespace) {
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    let name_ok = !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    let port_ok = port.is_none_or(|p| {
+        (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit())
+    });
+    if !name_ok || !port_ok {
         return None;
     }
-    Some(host.to_string())
+    Some(host.to_ascii_lowercase())
 }
 
 /// What a crawler may index, and where the sitemap is.
@@ -743,6 +764,22 @@ mod tests {
         .await;
         assert_eq!(both.status(), StatusCode::PERMANENT_REDIRECT);
         assert_eq!(both.headers()["location"], "https://example.com/sign-in?x=1");
+    }
+
+    #[tokio::test]
+    async fn www_is_redirected_however_the_client_spelled_it() {
+        // Traefik's Host matcher is case-insensitive and forwards the
+        // client's spelling, so `WWW.` reached the handlers as a host
+        // that was not `www.` and was served rather than turned around.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = get_with_headers(
+            &app,
+            "/",
+            &[("x-forwarded-proto", "https"), ("x-forwarded-host", "WWW.Example.COM")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(res.headers()["location"], "https://example.com/");
     }
 
     #[tokio::test]
@@ -1164,10 +1201,32 @@ mod tests {
         assert_eq!(public_host(&headers(&[])), None);
         assert_eq!(public_host(&headers(&[("host", "")])), None);
         // The host goes into a URL we then hand to a crawler. Anything
-        // that could end the host part early, or smuggle a path or
-        // userinfo in, is refused rather than escaped.
-        for hostile in ["evil.example/goodscout.fyi", "a b", "evil.example@goodscout.fyi"] {
+        // that could end the host part early, or smuggle a path, query,
+        // fragment or userinfo in, is refused rather than escaped — the
+        // rule is what a host may contain, not a list of what it may not,
+        // because the list was missing `?` and `#` the first time.
+        for hostile in [
+            "evil.example/goodscout.fyi",
+            "a b",
+            "evil.example@goodscout.fyi",
+            "evil.example?x",
+            "evil.example#x",
+            "a<b",
+            "evil.example\\x",
+            "goodscout.fyi:",
+            "goodscout.fyi:8080x",
+            "[::1]:8080",
+        ] {
             assert_eq!(public_host(&headers(&[("host", hostile)])), None, "{hostile}");
         }
+        // A port is legitimate: a local run is `localhost:8080`, and so is
+        // the kubelet's probe.
+        assert_eq!(public_host(&headers(&[("host", "localhost:8080")])).as_deref(), Some("localhost:8080"));
+        // DNS names are case-insensitive, and a `<loc>` should be
+        // canonical, so the spelling is ours rather than the client's.
+        assert_eq!(
+            public_host(&headers(&[("x-forwarded-host", "WWW.Goodscout.FYI")])).as_deref(),
+            Some("www.goodscout.fyi")
+        );
     }
 }

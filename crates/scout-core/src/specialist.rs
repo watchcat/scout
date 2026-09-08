@@ -96,6 +96,116 @@ impl Collector {
     }
 }
 
+/// How long one nested run may take. Inside the outer run's own budget,
+/// and long enough for a flexible-window search that fans out over a week.
+pub const SPECIALIST_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// What the parent sends: everything the specialist needs, in one string,
+/// because the specialist sees no history.
+#[derive(Debug, serde::Deserialize)]
+pub struct Brief {
+    pub brief: String,
+}
+
+/// A nested agent offered to its parent as one tool.
+pub struct Specialist {
+    /// The tool name the parent calls.
+    pub name: &'static str,
+    /// Tells the parent when to call it and what a brief must contain.
+    pub description: String,
+    pub agent: rig::agent::Agent<rig::providers::openai::completion::CompletionModel>,
+    /// The run's sink, so nested tool calls show in the chat as progress.
+    pub events: scout_api::EventSink,
+    /// The presentation rules that apply to a set of findings.
+    pub guidance: Box<dyn Fn(&[Finding]) -> Vec<String> + Send + Sync>,
+    pub budget: std::time::Duration,
+}
+
+impl rig::tool::Tool for Specialist {
+    const NAME: &'static str = "specialist";
+    type Error = SpecialistError;
+    type Args = Brief;
+    type Output = Report;
+
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "brief": {"type": "string", "description": "a self-contained request: everything the specialist needs, since it sees nothing else of the conversation"}
+            },
+            "required": ["brief"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        use futures::StreamExt;
+        use rig::agent::MultiTurnStreamItem;
+        use rig::completion::message::ToolResultContent;
+        use rig::streaming::{StreamedUserContent, StreamingPrompt};
+
+        let mut collector = Collector::default();
+        // No history on purpose: the brief is the whole conversation.
+        let outcome: Result<Option<&'static str>, tokio::time::error::Elapsed> =
+            tokio::time::timeout(self.budget, async {
+                let mut stream = self.agent.stream_prompt(args.brief.as_str()).await;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(MultiTurnStreamItem::ToolExecutionStart { tool_call, internal_call_id }) => {
+                            collector.tool_started(
+                                &internal_call_id,
+                                &tool_call.function.name,
+                                tool_call.function.arguments.clone(),
+                                &self.events,
+                            );
+                        }
+                        Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+                            tool_result,
+                            internal_call_id,
+                        })) => {
+                            let text = tool_result
+                                .content
+                                .iter()
+                                .filter_map(|c| match c {
+                                    ToolResultContent::Text(t) => Some(t.text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+                            collector.tool_finished(&internal_call_id, &text);
+                        }
+                        Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                            collector.finished(res.output());
+                            return None;
+                        }
+                        Ok(_) => {}
+                        Err(e) if crate::run::is_max_turns(&e) => {
+                            return Some("it ran out of research steps");
+                        }
+                        Err(e) => {
+                            tracing::warn!(specialist = self.name, error = %e, "the nested run failed");
+                            return Some("the model call failed");
+                        }
+                    }
+                }
+                Some("the model stopped responding")
+            })
+            .await;
+        let cut_short = match outcome {
+            Ok(reason) => reason,
+            Err(_) => Some("it took too long"),
+        };
+        collector.report(cut_short, &*self.guidance)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +290,31 @@ mod tests {
         let c = Collector::default();
         let err = c.report(Some("this took too long"), &no_guidance).unwrap_err();
         assert_eq!(err.to_string(), "the specialist could not answer: this took too long");
+    }
+
+    #[tokio::test]
+    async fn a_nested_run_that_cannot_reach_the_model_fails_with_a_sentence() {
+        // The model endpoint is a closed port, so the nested run dies on
+        // its first call with nothing collected. That is the one case
+        // where the tool errors instead of reporting.
+        use rig::client::CompletionClient;
+        let llm = crate::agent::llm_client("k", "http://127.0.0.1:1").unwrap();
+        let agent = llm.agent(crate::agent::MODEL).preamble("test").default_max_turns(2).build();
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let tool = Specialist {
+            name: "ask_nothing",
+            description: "a test specialist".to_string(),
+            agent,
+            events,
+            guidance: Box::new(no_guidance),
+            budget: std::time::Duration::from_secs(5),
+        };
+
+        let err = rig::tool::Tool::call(&tool, Brief { brief: "anything".to_string() }).await.unwrap_err();
+        assert!(
+            err.to_string().starts_with("the specialist could not answer:"),
+            "got: {err}"
+        );
+        assert_eq!(rig::tool::Tool::name(&tool), "ask_nothing");
     }
 }

@@ -480,7 +480,7 @@ const WRAP_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// rig wraps the turn-limit failure in its own error types; the message is
 /// the stable part across them.
-fn is_max_turns(e: &impl std::fmt::Display) -> bool {
+pub(crate) fn is_max_turns(e: &impl std::fmt::Display) -> bool {
     let text = e.to_string();
     text.contains("MaxTurnsError") || text.contains("max turns")
 }

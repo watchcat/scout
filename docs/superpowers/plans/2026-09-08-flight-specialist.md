@@ -1468,8 +1468,11 @@ fares, airport codes, booking a flight, or a trip being planned - never a \
 web search, and never compare_prices, whose per-unit arithmetic means \
 nothing for a flight. It sees nothing of this conversation, so write a \
 self-contained brief: route, dates, passengers, cabin, whether the dates \
-are flexible, and any offer id the user is pointing at. If the user has \
-not given something a search needs, ask them before calling it. Its \
+are flexible, and any offer id the user is pointing at, together with \
+its source (duffel or ignav) as the findings state it, so the desk knows \
+which booking tool it belongs to. A route and a date are all a search \
+needs - passengers default to one adult - so do not question the user \
+for the rest; when the desk reports something missing, ask for that. Its \
 result carries a summary, findings and guidance: present the findings \
 following that guidance, take every number, time and link from the \
 findings verbatim - never from the summary and never from memory - and \
@@ -1494,7 +1497,7 @@ pub const ALL_TOOLS: &[&str] = &["search_bol", "ask_flights"];
             "ask_flights" => d.duffel.is_some() || d.ignav.is_some(),
 ```
 
-In `preamble_with_profile`, delete the `if markup_rate > 0.0 { ... }` block and its comment. Keep the `markup_rate` parameter (callers pass it) but rename it `_markup_rate`; the fee now travels in the guidance.
+In `preamble_with_profile`, delete the `if markup_rate > 0.0 { ... }` block and its comment, and drop the `markup_rate` parameter (its only callers are in this file); the fee now travels in the guidance.
 
 Remove the `use crate::tools::trips::{...}` import at the top of the file.
 

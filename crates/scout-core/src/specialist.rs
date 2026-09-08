@@ -16,6 +16,10 @@ pub struct Finding {
     pub args: serde_json::Value,
     /// The tool's own JSON, or its text when it did not return JSON.
     pub output: serde_json::Value,
+    /// True when the tool returned an error, which rig hands to the model
+    /// as text; `output` is then that text. Every Scout tool returns a
+    /// serialised struct, so "not JSON" is the signal.
+    pub failed: bool,
 }
 
 /// What the parent agent receives.
@@ -65,8 +69,11 @@ impl Collector {
         let Some((tool, args)) = self.pending.remove(call_id) else {
             return;
         };
-        let output = serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_string()));
-        self.findings.push(Finding { tool, args, output });
+        let (output, failed) = match serde_json::from_str(text) {
+            Ok(v) => (v, false),
+            Err(_) => (serde_json::Value::String(text.to_string()), true),
+        };
+        self.findings.push(Finding { tool, args, output, failed });
     }
 
     /// The nested model's final text.
@@ -77,6 +84,10 @@ impl Collector {
     /// The report, or an error when the run was cut short with nothing to
     /// show. `cut_short` is the reason when the run did not finish on its
     /// own; it is written into the summary so the parent knows.
+    ///
+    /// Failed findings are handed over too, so the parent can say what
+    /// went wrong; guidance functions should count only findings with
+    /// `failed == false`.
     pub(crate) fn report(
         self,
         cut_short: Option<&str>,
@@ -84,7 +95,7 @@ impl Collector {
     ) -> Result<Report, SpecialistError> {
         let summary = match cut_short {
             None => self.summary,
-            Some(reason) if self.findings.is_empty() => {
+            Some(reason) if self.findings.iter().all(|f| f.failed) => {
                 return Err(SpecialistError::Failed(reason.to_string()))
             }
             Some(reason) => format!(
@@ -107,21 +118,32 @@ pub struct Brief {
     pub brief: String,
 }
 
+/// The presentation rules that apply to a set of findings.
+pub type Guidance = Box<dyn Fn(&[Finding]) -> Vec<String> + Send + Sync>;
+
 /// A nested agent offered to its parent as one tool.
-pub struct Specialist {
+pub struct Specialist<M: rig::completion::CompletionModel> {
     /// The tool name the parent calls.
     pub name: &'static str,
     /// Tells the parent when to call it and what a brief must contain.
     pub description: String,
-    pub agent: rig::agent::Agent<rig::providers::openai::completion::CompletionModel>,
+    pub agent: rig::agent::Agent<M>,
     /// The run's sink, so nested tool calls show in the chat as progress.
     pub events: scout_api::EventSink,
+    /// The outer run's pulse: touched on every nested stream item, so the
+    /// outer stall guard sees this run as alive while its own stream is
+    /// silent.
+    pub pulse: std::sync::Arc<crate::run::Pulse>,
     /// The presentation rules that apply to a set of findings.
-    pub guidance: Box<dyn Fn(&[Finding]) -> Vec<String> + Send + Sync>,
+    pub guidance: Guidance,
     pub budget: std::time::Duration,
 }
 
-impl rig::tool::Tool for Specialist {
+impl<M> rig::tool::Tool for Specialist<M>
+where
+    M: rig::completion::CompletionModel + 'static,
+    M::StreamingResponse: rig::completion::GetTokenUsage,
+{
     const NAME: &'static str = "specialist";
     type Error = SpecialistError;
     type Args = Brief;
@@ -157,12 +179,13 @@ impl rig::tool::Tool for Specialist {
             tokio::time::timeout(self.budget, async {
                 let mut stream = self.agent.stream_prompt(args.brief.as_str()).await;
                 while let Some(item) = stream.next().await {
+                    self.pulse.touch();
                     match item {
                         Ok(MultiTurnStreamItem::ToolExecutionStart { tool_call, internal_call_id }) => {
                             collector.tool_started(
                                 &internal_call_id,
                                 &tool_call.function.name,
-                                tool_call.function.arguments.clone(),
+                                tool_call.function.arguments,
                                 &self.events,
                             );
                         }
@@ -195,7 +218,7 @@ impl rig::tool::Tool for Specialist {
                         }
                     }
                 }
-                Some("the model stopped responding")
+                Some("the specialist ended without answering")
             })
             .await;
         let cut_short = match outcome {
@@ -233,17 +256,28 @@ mod tests {
                 tool: "search_flights".to_string(),
                 args: json!({"origin": "AMS", "destination": "LIS", "departure_date": "2026-10-12"}),
                 output: json!({"route": "AMS-LIS", "found": 3}),
+                failed: false,
             }]
         );
     }
 
     #[test]
-    fn a_result_that_is_not_json_is_kept_as_text() {
+    fn a_result_that_is_not_json_is_a_failed_finding() {
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
         let mut c = Collector::default();
         c.tool_started("c1", "show_trip", json!({}), &events);
         c.tool_finished("c1", "no trip called Lisbon");
+        assert!(c.findings[0].failed);
         assert_eq!(c.findings[0].output, json!("no trip called Lisbon"));
+    }
+
+    #[test]
+    fn a_run_whose_only_call_failed_has_collected_nothing() {
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let mut c = Collector::default();
+        c.tool_started("c1", "search_flights", json!({}), &events);
+        c.tool_finished("c1", "duffel api error (status 429): slow down");
+        assert!(c.report(Some("the model call failed"), &no_guidance).is_err());
     }
 
     #[test]
@@ -292,6 +326,96 @@ mod tests {
         assert_eq!(err.to_string(), "the specialist could not answer: this took too long");
     }
 
+    /// A stand-in for any Scout tool: returns a struct, so JSON.
+    struct Probe;
+    #[derive(serde::Deserialize)]
+    struct ProbeArgs { q: i64 }
+    #[derive(serde::Serialize)]
+    struct ProbeOut { ok: bool, q: i64 }
+    #[derive(Debug, thiserror::Error)]
+    #[error("probe broke")]
+    struct ProbeError;
+    impl rig::tool::Tool for Probe {
+        const NAME: &'static str = "probe";
+        type Error = ProbeError;
+        type Args = ProbeArgs;
+        type Output = ProbeOut;
+        fn description(&self) -> String { "a probe".to_string() }
+        fn parameters(&self) -> serde_json::Value { json!({"type": "object", "properties": {"q": {"type": "integer"}}}) }
+        async fn call(&self, a: ProbeArgs) -> Result<ProbeOut, ProbeError> {
+            if a.q < 0 { Err(ProbeError) } else { Ok(ProbeOut { ok: true, q: a.q }) }
+        }
+    }
+
+    /// A scripted model: one turn calling `probe` with `q`, then a text turn.
+    fn scripted(q: i64, turns: usize) -> rig::agent::Agent<rig::test_utils::MockCompletionModel> {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let call = vec![
+            MockStreamEvent::tool_call("t1", "probe", json!({"q": q})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ];
+        let answer = vec![
+            MockStreamEvent::text("<think>ok</think>Probed once."),
+            MockStreamEvent::final_response_with_default_usage(),
+        ];
+        let model = MockCompletionModel::from_stream_turns([call, answer]);
+        rig::agent::AgentBuilder::new(model).preamble("test").tool(Probe).default_max_turns(turns).build()
+    }
+
+    fn specialist<M: rig::completion::CompletionModel>(
+        agent: rig::agent::Agent<M>,
+        events: scout_api::EventSink,
+    ) -> Specialist<M> {
+        Specialist {
+            name: "ask_probe",
+            description: "test".to_string(),
+            agent,
+            events,
+            pulse: std::sync::Arc::new(crate::run::Pulse::default()),
+            guidance: Box::new(|f: &[Finding]| vec![format!("{} ok", f.iter().filter(|x| !x.failed).count())]),
+            budget: std::time::Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_nested_run_becomes_a_report_of_what_its_tools_returned() {
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let tool = specialist(scripted(7, 5), events);
+
+        let report = rig::tool::Tool::call(&tool, Brief { brief: "probe seven".to_string() }).await.unwrap();
+
+        assert_eq!(report.summary, "Probed once.");
+        assert_eq!(
+            report.findings,
+            vec![Finding { tool: "probe".to_string(), args: json!({"q": 7}), output: json!({"ok": true, "q": 7}), failed: false }]
+        );
+        assert_eq!(report.guidance, vec!["1 ok"]);
+        match seen.try_recv() {
+            Ok(scout_api::AgentEvent::Tool(text)) => assert_eq!(text, "⚙️ probe"),
+            other => panic!("the chat must see the nested call: {other:?}"),
+        }
+        assert!(tool.pulse.since() < std::time::Duration::from_secs(1), "the pulse was touched");
+    }
+
+    #[tokio::test]
+    async fn a_nested_tool_error_is_a_failed_finding_not_a_result() {
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let tool = specialist(scripted(-1, 5), events);
+        let report = rig::tool::Tool::call(&tool, Brief { brief: "break".to_string() }).await.unwrap();
+        assert!(report.findings[0].failed);
+        assert_eq!(report.findings[0].output, json!("probe broke"));
+        assert_eq!(report.guidance, vec!["0 ok"]);
+    }
+
+    #[tokio::test]
+    async fn running_out_of_turns_after_a_finding_still_reports_it() {
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let tool = specialist(scripted(1, 1), events);
+        let report = rig::tool::Tool::call(&tool, Brief { brief: "one turn".to_string() }).await.unwrap();
+        assert_eq!(report.findings.len(), 1);
+        assert!(report.summary.contains("ran out of research steps"), "got: {}", report.summary);
+    }
+
     #[tokio::test]
     async fn a_nested_run_that_cannot_reach_the_model_fails_with_a_sentence() {
         // The model endpoint is a closed port, so the nested run dies on
@@ -301,20 +425,13 @@ mod tests {
         let llm = crate::agent::llm_client("k", "http://127.0.0.1:1").unwrap();
         let agent = llm.agent(crate::agent::MODEL).preamble("test").default_max_turns(2).build();
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
-        let tool = Specialist {
-            name: "ask_nothing",
-            description: "a test specialist".to_string(),
-            agent,
-            events,
-            guidance: Box::new(no_guidance),
-            budget: std::time::Duration::from_secs(5),
-        };
+        let tool = specialist(agent, events);
 
         let err = rig::tool::Tool::call(&tool, Brief { brief: "anything".to_string() }).await.unwrap_err();
         assert!(
             err.to_string().starts_with("the specialist could not answer:"),
             "got: {err}"
         );
-        assert_eq!(rig::tool::Tool::name(&tool), "ask_nothing");
+        assert_eq!(rig::tool::Tool::name(&tool), "ask_probe");
     }
 }

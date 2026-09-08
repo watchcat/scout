@@ -50,9 +50,12 @@ pub fn describe(tool: &str, args: &serde_json::Value) -> String {
                 return "✈️ searching flights".to_string();
             }
             let flex = args.get("flex_days").and_then(|v| v.as_u64()).filter(|n| *n > 0);
+            // The date is optional; without it there is nothing to put
+            // after the route, so no trailing space either.
+            let day = if day.is_empty() { String::new() } else { format!(" {day}") };
             match flex {
-                Some(n) => format!("✈️ searching {from}→{to} {day} ±{n}"),
-                None => format!("✈️ searching {from}→{to} {day}"),
+                Some(n) => format!("✈️ searching {from}→{to}{day} ±{n}"),
+                None => format!("✈️ searching {from}→{to}{day}"),
             }
         }
         "flight_booking_links" | "create_booking_link" => "🔗 fetching booking links".to_string(),
@@ -127,6 +130,11 @@ mod tests {
         assert_eq!(
             describe("search_flights", &json!({"origin": "AMS", "destination": "LIS", "departure_date": "2026-10-12", "flex_days": 2})),
             "✈️ searching AMS→LIS 2026-10-12 ±2"
+        );
+        assert_eq!(
+            describe("search_flights", &json!({"origin": "AMS", "destination": "LIS"})),
+            "✈️ searching AMS→LIS",
+            "no date, no trailing space"
         );
         assert_eq!(describe("search_flights", &json!({})), "✈️ searching flights");
         assert_eq!(describe("flight_booking_links", &json!({"ignav_id": "x"})), "🔗 fetching booking links");

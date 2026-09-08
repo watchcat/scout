@@ -66,7 +66,7 @@ pub async fn run_agent(
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
     let pulse = std::sync::Arc::new(Pulse::default());
-    let agent = build_agent(&core.deps, run, &facts);
+    let agent = build_agent(&core.deps, run, &facts, events.clone(), pulse.clone());
     // History comes from the conversation the caller opened, so an
     // in-flight run always reads and writes that thread and never anyone
     // else's — the isolation the (chat, user) map used to provide.

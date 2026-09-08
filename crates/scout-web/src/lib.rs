@@ -142,6 +142,8 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         // down for a reason the site does not have.
         .route("/healthz", get(|| async { "ok" }))
         .route("/icon.svg", get(icon))
+        .route("/robots.txt", get(robots))
+        .route("/sitemap.xml", get(sitemap))
         .with_state(Public { cache, session_key });
 
     match auth {
@@ -347,6 +349,84 @@ async fn security_headers(
     // anyway. `/icon.svg` is on the public router and keeps its day.
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+/// The host this request was addressed to, as the public would spell it.
+///
+/// The proxy's word first: behind Traefik `Host` is whatever the client
+/// sent to the proxy and `x-forwarded-host` is what the proxy matched, and
+/// only the second is a statement about the public address. A chain of
+/// proxies appends, so the client's host is the first in the list.
+///
+/// The value is about to be written into a URL and handed to a crawler, so
+/// anything that could end the host early or smuggle a path or userinfo
+/// into it is refused outright rather than escaped. A header is a string
+/// a stranger typed.
+fn public_host(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if host.is_empty() || host.contains(['/', '@']) || host.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+/// What a crawler may index, and where the sitemap is.
+///
+/// Google's entry for the site was the registrar's parking page for months
+/// after launch; a site that answers 404 to this is one a crawler has no
+/// reason to revisit. The signed-in half is kept out because those pages
+/// carry cookies, tokens and forms, none of which belongs in an index.
+///
+/// The Sitemap line has to be an absolute URL, so it is built from the
+/// request's host and left out when there is none — a wrong address would
+/// send the crawler to somebody else's sitemap.
+async fn robots(headers: HeaderMap) -> impl IntoResponse {
+    let mut body = String::from(
+        "User-agent: *\nAllow: /\nDisallow: /chat\nDisallow: /account\nDisallow: /sign-in\nDisallow: /auth/\n",
+    );
+    if let Some(host) = public_host(&headers) {
+        body.push_str(&format!("Sitemap: https://{host}/sitemap.xml\n"));
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+}
+
+/// The one public page, as a sitemap.
+///
+/// Its whole content is a URL, so with no host to build one from there is
+/// nothing true to say: a 404 is retried later, an address that is not
+/// ours would be indexed.
+async fn sitemap(headers: HeaderMap) -> axum::response::Response {
+    let Some(host) = public_host(&headers) else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n\
+         <url><loc>https://{host}/</loc></url>\n\
+         </urlset>\n"
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "application/xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// The mark, as the browser tab's icon.
@@ -629,6 +709,21 @@ mod tests {
             .await.unwrap()
     }
 
+    /// A `GET` carrying the headers a proxy would have set. Sent as real
+    /// headers rather than handed to a function, so whatever reads them is
+    /// on the path these tests exercise.
+    pub(crate) async fn get_with_headers(
+        app: &axum::Router,
+        uri: &str,
+        extra: &[(&str, &str)],
+    ) -> Response {
+        let mut req = Request::builder().uri(uri);
+        for (name, value) in extra {
+            req = req.header(*name, *value);
+        }
+        app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
     pub(crate) async fn post_form(app: &axum::Router, uri: &str, form: &str) -> Response {
         app.clone().oneshot(
             Request::builder().method("POST").uri(uri)
@@ -906,5 +1001,101 @@ mod tests {
         .await;
         assert!(page.contains(r#"href="/sign-in""#));
         assert!(!page.contains(r#"href="/chat""#), "a forged cookie opened the chat");
+    }
+
+    #[tokio::test]
+    async fn robots_allows_the_front_page_and_names_the_private_paths() {
+        // Google's entry for the site was still the registrar's parking
+        // page months after launch. A crawler that finds no robots.txt
+        // proceeds anyway, but the sign-in and chat pages carry cookies
+        // and tokens and are worth keeping out of an index, and the
+        // Sitemap line is the one place a crawler is told where to look.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = get_with_headers(&app, "/robots.txt", &[("x-forwarded-host", "goodscout.fyi")]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "text/plain; charset=utf-8");
+        assert_eq!(res.headers()["cache-control"], "public, max-age=86400");
+        let body = body_of(res).await;
+        assert!(body.contains("User-agent: *\n"), "{body}");
+        assert!(body.contains("\nAllow: /\n"), "{body}");
+        let disallowed: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("Disallow: "))
+            .collect();
+        assert_eq!(disallowed, ["/chat", "/account", "/sign-in", "/auth/"]);
+        assert!(
+            body.contains("Sitemap: https://goodscout.fyi/sitemap.xml"),
+            "the sitemap line does not name the host the request came in on: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn robots_without_a_known_host_names_no_sitemap() {
+        // A Sitemap line has to be an absolute URL, and a wrong one is
+        // worse than none: the crawler would fetch somebody else's sitemap
+        // or give up on ours.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let body = body_of(get(&app, "/robots.txt").await).await;
+        assert!(!body.contains("Sitemap:"), "{body}");
+        assert!(body.contains("Disallow: /chat"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_sitemap_lists_the_front_page_on_the_host_asked_for() {
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = get_with_headers(&app, "/sitemap.xml", &[("host", "goodscout.fyi")]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "application/xml; charset=utf-8");
+        assert_eq!(res.headers()["cache-control"], "public, max-age=86400");
+        let body = body_of(res).await;
+        assert!(body.starts_with("<?xml"), "{body}");
+        assert!(body.contains("<urlset"), "{body}");
+        assert!(body.contains("<loc>https://goodscout.fyi/</loc>"), "{body}");
+        assert_eq!(body.matches("<url>").count(), 1, "one page, one entry: {body}");
+    }
+
+    #[tokio::test]
+    async fn the_sitemap_is_absent_rather_than_wrong_when_the_host_is_unknown() {
+        // The sitemap's whole content is a URL. With no host to build it
+        // from there is nothing true to say, and a crawler told 404 tries
+        // again later rather than indexing an address that is not ours.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        assert_eq!(get(&app, "/sitemap.xml").await.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn the_public_host_is_the_first_forwarded_one_and_never_a_url() {
+        let headers = |pairs: &[(&str, &str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    axum::http::HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            h
+        };
+        // The proxy's word over the connection's: behind Traefik the Host
+        // header is what the client sent and the forwarded one is what
+        // the proxy matched, and both are the same in practice — but only
+        // the forwarded one is a statement about the public address.
+        assert_eq!(
+            public_host(&headers(&[("host", "scout.svc"), ("x-forwarded-host", "goodscout.fyi")])).as_deref(),
+            Some("goodscout.fyi")
+        );
+        assert_eq!(public_host(&headers(&[("host", "goodscout.fyi")])).as_deref(), Some("goodscout.fyi"));
+        // A chain of proxies appends, so the client's host is the first.
+        assert_eq!(
+            public_host(&headers(&[("x-forwarded-host", "goodscout.fyi, scout.svc")])).as_deref(),
+            Some("goodscout.fyi")
+        );
+        assert_eq!(public_host(&headers(&[])), None);
+        assert_eq!(public_host(&headers(&[("host", "")])), None);
+        // The host goes into a URL we then hand to a crawler. Anything
+        // that could end the host part early, or smuggle a path or
+        // userinfo in, is refused rather than escaped.
+        for hostile in ["evil.example/goodscout.fyi", "a b", "evil.example@goodscout.fyi"] {
+            assert_eq!(public_host(&headers(&[("host", hostile)])), None, "{hostile}");
+        }
     }
 }

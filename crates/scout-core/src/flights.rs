@@ -22,6 +22,19 @@ pub const FLIGHT_TURNS: usize = 12;
 /// The tools whose rules the flight prompt may describe conditionally.
 pub const FLIGHT_TOOLS: &[&str] = &["flight_booking_links", "create_booking_link"];
 
+/// The trip-planning tools: a finding from any of them brings the trip
+/// presentation rules.
+const TRIP_TOOLS: &[&str] = &[
+    "add_trip_segment",
+    "add_trip_option",
+    "choose_trip_option",
+    "show_trip",
+    "update_trip_segment",
+    "drop_trip_segment",
+    "delete_trip",
+    "finalise_trip",
+];
+
 pub const FLIGHT_PREAMBLE: &str = "\
 You are Scout's flight desk. Another agent hands you a brief - a route, \
 dates, passengers, sometimes an offer id - and you search, book or plan \
@@ -31,21 +44,25 @@ traveller and you never buy anything.
 Rules:
 - Use search_flights for every fare question - never guess a price and \
 never answer from memory. It asks the airlines directly, so its prices, \
-times and flight numbers are current. Work out the airport codes yourself \
-rather than asking: Amsterdam is AMS, Lisbon LIS, London LHR (or LON for \
-all its airports), IATA codes, and dates go in as YYYY-MM-DD.
+times and flight numbers are current. Airports go in as IATA codes - work \
+them out yourself rather than asking: Amsterdam is AMS, Lisbon LIS, London \
+LHR (or LON for all its airports) - and dates as YYYY-MM-DD.
+- If the brief lacks something a search needs - a destination, a date, the \
+number of passengers - do not guess it and do not search: say in your \
+report exactly what is missing, so it can be asked for.
 - When the brief says the dates are flexible, or asks whether another day \
 is cheaper, pass flex_days (max 3) instead of searching each date \
 yourself: it prices the whole window in one call. Do NOT pass flex_days \
 otherwise - each day in the window is a separate paid search. Nobody can \
 price a whole month; a week either side is the most that can be checked.
-- A fare expires within minutes, so never reuse a price from an earlier \
-brief; search again.
 - When flight_booking_links is available, and the brief names an ignav \
 offer_id to book, call it with that offer_id. It re-checks the fare and \
 returns the airline's page and any resellers.
 - When create_booking_link is available, and the brief asks to book a \
-Duffel row, call it. Without it, nothing can be booked through Scout.
+Duffel row, call it.
+- If the brief asks to book and you have no booking tool, do not search \
+again: say in your report that Scout cannot book, and that the traveller \
+buys from the airline with the numbers already found.
 - When the brief is about more than one flight - a multi-city route, or a \
 trip being assembled over several messages - build it with the trip tools \
 rather than holding it in your head: add_trip_segment for each leg the \
@@ -84,7 +101,9 @@ fn available_tools(d: &AgentDeps) -> Vec<&'static str> {
 }
 
 /// The nested agent: the flight prompt and every flight-shaped tool, wired
-/// exactly as the main agent wired them before the split. Built per
+/// as the main agent wired them before the split, with one difference: the
+/// provider gate (`duffel || ignav`) now lives on `ask_flights` in the
+/// parent, so search and finalise are unconditional here. Built per
 /// request, like the main agent, because the tools capture the account.
 pub fn build_flight_agent(
     d: &AgentDeps,
@@ -122,7 +141,10 @@ pub fn build_flight_agent(
             budget,
         })
         // Trip planning needs no provider, but a trip is a flight plan, so
-        // it lives with the flights.
+        // it lives with the flights. That is a deliberate change: before
+        // the split the trip tools were registered even with no provider;
+        // now an install with neither provider has no trip planning, by
+        // design (spec decision: everything flight-shaped moves).
         .tool(AddTripSegmentTool { store: d.store.clone(), account_id })
         .tool(AddTripOptionTool {
             store: d.store.clone(),
@@ -170,7 +192,7 @@ pub fn ask_flights(
     Specialist {
         name: "ask_flights",
         description: "Scout's flight desk. Send it every question about flights, fares, \
-                      airports, booking a flight, or a trip being planned. It sees nothing \
+                      airport codes, booking a flight, or a trip being planned. It sees nothing \
                       of the conversation, so the brief must be self-contained: route, \
                       dates, passengers, cabin, whether the dates are flexible, and any \
                       offer id the user is pointing at. It returns findings - the real \
@@ -200,7 +222,7 @@ pub fn guidance(findings: &[crate::specialist::Finding], markup_rate: f64) -> Ve
         f.tool == "search_flights"
             && f.output.get("by_date").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
     });
-    let planned = ok().any(|f| f.tool.contains("trip"));
+    let planned = ok().any(|f| TRIP_TOOLS.contains(&f.tool.as_str()));
     let mut out = Vec::new();
     if searched {
         out.push(SEARCH_GUIDANCE.to_string());
@@ -237,7 +259,9 @@ Present the picks under their own headings - Cheapest, Fastest, Best balance \
 given: they are already chosen from hundreds and no option appears under \
 two headings, so anything you drop is a choice removed for no reason. When \
 a group is empty, leave the heading out, and when one option is both \
-cheapest and quickest say so. Every option carries price_status: 'bookable' \
+cheapest and quickest say so. Best balance is the option closest to being \
+both the cheapest and the quickest, worked out in Rust; do not recompute \
+it or argue with it. Every option carries price_status: 'bookable' \
 is a live offer, quote it as a price; 'approximate' and 'unconfirmed' are \
 fares seen elsewhere that still have to be checked on the seller's page - \
 quote those as 'from EUR 180', say where they came from, and NEVER present \
@@ -246,23 +270,29 @@ When self_transfer is true the trip is two separate tickets: the traveller \
 re-checks their bags and carries the risk if the first flight is late, so \
 say that every time it appears. departing_at_local and arriving_at_local are \
 each in the local time of their own airport, so NEVER subtract them to work \
-out how long a flight takes; give journey length from the duration field. \
-For any flight with a change of plane, name the connection airport and the \
-wait from the connections list - 'changes at PVG, 3h 20m'; never work a \
-layover out from flight numbers or your own knowledge. When changes_airport \
-is true, say so loudly: the traveller lands at one airport and departs from \
-another. A connection whose layover is null means the offer did not state \
-the times - say that rather than guessing. Every leg carries an itinerary \
-line already drawn for you - 'AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 \
-16.09'. Put it on its own line under the option it belongs to, copied \
-EXACTLY as given: do not retype, reorder, translate or rebuild it. A return \
+out how long a flight takes: LHR 10:03 to JFK 13:01 is a 7h58m flight, not \
+a 2h58m one. Give journey length from the duration field. For any flight \
+with a change of plane, name the connection airport and the wait from the \
+connections list - 'changes at PVG, 3h 20m'; never work a layover out from \
+flight numbers or your own knowledge. When changes_airport is true, say so \
+loudly: the traveller lands at one airport and departs from another. A \
+connection whose layover is null means the offer did not state the times - \
+say that rather than guessing, and do not offer to go and look it up \
+elsewhere. Every leg carries an itinerary line already drawn for you - \
+'AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09'. Put it on its own line \
+under the option it belongs to, copied EXACTLY as given: do not retype, \
+reorder, translate or rebuild it. A return \
 trip has one such line per leg, outbound first. Say the price, the airline \
-and what matters about the option, then the line. Prices are the whole trip \
-for all passengers. Say what the notes say when they matter. found: 0 means \
-nothing flies that route that day - say so plainly rather than guessing at \
-alternatives. Flights have no product page to link; their count is set by \
-the rows the search returned. Each option is its own block, separated by a \
-blank line.";
+and what matters about the option, then the line. The line replaces listing \
+the times in prose. Prices are the whole trip for all passengers. Say what \
+the notes say when they matter: a cheapest option that takes hours longer, \
+bags that are not included, offers left out for being in another currency. \
+found: 0 means nothing flies that route that day - say so plainly rather \
+than guessing at alternatives. Flights have no product page to link; their \
+count is set by the rows the search returned. Each option is its own block, \
+separated by a blank line. These prices expire within minutes: in a later \
+message, ask ask_flights again rather than repeating a fare from earlier in \
+the conversation.";
 
 const WINDOW_GUIDANCE: &str = "\
 Presenting by_date: the search covered a window and by_date is the cheapest \
@@ -327,6 +357,11 @@ mod tests {
         assert!(text.contains("itinerary"), "got: {text}");
         assert!(text.contains("price_status"), "got: {text}");
         assert!(text.contains("self_transfer"), "got: {text}");
+        // Expiry is the parent's problem: it is the one with a conversation
+        // to repeat a fare from. And the details the move dropped.
+        assert!(text.contains("expire within minutes"), "got: {text}");
+        assert!(text.contains("7h58m"), "got: {text}");
+        assert!(text.contains("do not recompute"), "got: {text}");
         assert!(!text.contains("by_date"), "no window, no window rules: {text}");
 
         let window = guidance(
@@ -353,6 +388,17 @@ mod tests {
     }
 
     #[test]
+    fn every_trip_tool_brings_the_trip_rules_and_a_lookalike_does_not() {
+        for tool in TRIP_TOOLS {
+            let text = guidance(&[ran(tool, json!({}))], 0.0).join("\n");
+            assert!(text.contains("not_ready"), "{tool}: {text}");
+        }
+        // A name with 'trip' in it is not a trip tool.
+        let text = guidance(&[ran("round_trip_helper", json!({}))], 0.0).join("\n");
+        assert!(!text.contains("not_ready"), "got: {text}");
+    }
+
+    #[test]
     fn the_fee_is_stated_only_when_charged() {
         let free = guidance(&[ran("search_flights", json!({}))], 0.0).join("\n");
         assert!(!free.contains("booking fee"), "got: {free}");
@@ -376,9 +422,12 @@ mod tests {
         for word in ["itinerary", "Cheapest, Fastest", "price_status", "self_transfer"] {
             assert!(!FLIGHT_PREAMBLE.contains(word), "{word:?} is presentation, it belongs in guidance");
         }
-        for word in ["flex_days", "add_trip_segment", "IATA", "no prices"] {
+        for word in ["flex_days", "add_trip_segment", "IATA", "no prices", "what is missing", "cannot book"] {
             assert!(FLIGHT_PREAMBLE.contains(word), "{word:?} is missing from the flight prompt");
         }
+        // The desk has no earlier brief to reuse a fare from; expiry is a
+        // rule for the agent with a conversation.
+        assert!(!FLIGHT_PREAMBLE.contains("expires"), "expiry belongs in the guidance, not the flight prompt");
     }
 
     #[test]

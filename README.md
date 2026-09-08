@@ -304,6 +304,12 @@ rather than by the bot:
 | `SCOUT_ACME_EMAIL` | where Let's Encrypt sends expiry warnings |
 | `SCOUT_SSH` | the node to build on and ship to, e.g. `root@203.0.113.4` |
 
+The ingress also answers on `www.<SCOUT_DOMAIN>`, and that name needs an A
+record at the DNS provider **before** the first deploy that carries it:
+cert-manager proves ownership by serving an HTTP-01 challenge on the name,
+so a `www` that does not resolve fails the `scout-www-tls` certificate and
+each retry counts against Let's Encrypt's rate limit.
+
 The script runs here and **builds there**, because this repository is
 developed on arm64 and the server is x86_64 — emulating the DuckDB C++
 compile locally takes hours rather than minutes. The source crosses as

@@ -185,6 +185,7 @@ impl Core {
         let http_for_ignav = http.clone();
         let deps = AgentDeps {
             llm,
+            flight_model: cfg.flight_model.clone(),
             kagi,
             renderer,
             bol,

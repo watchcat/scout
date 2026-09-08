@@ -17,6 +17,10 @@ pub struct Config {
     /// `for_test` points it at a closed port so no packet leaves the
     /// machine. Defaults to MiniMax itself.
     pub minimax_base_url: String,
+    /// The model the flight specialist runs on. Defaults to the main
+    /// model; a separate name is how a cheaper or sharper model gets tried
+    /// on flights alone.
+    pub flight_model: String,
     pub kagi_api_key: String,
     /// Perplexity Search API key; without it search runs on Kagi alone.
     pub perplexity_api_key: Option<String>,
@@ -171,6 +175,7 @@ impl Config {
             minimax_api_key: required("MINIMAX_API_KEY")?,
             minimax_base_url: non_empty("MINIMAX_BASE_URL")
                 .unwrap_or_else(|| crate::agent::MINIMAX_BASE_URL.to_string()),
+            flight_model: non_empty("FLIGHT_MODEL").unwrap_or_else(|| crate::agent::MODEL.to_string()),
             kagi_api_key: required("KAGI_API_KEY")?,
             perplexity_api_key: non_empty("PERPLEXITY_API_KEY"),
             db_path: get("SCOUT_DB_PATH").unwrap_or_else(|| "scout.duckdb".to_string()),
@@ -226,6 +231,18 @@ mod tests {
 
     fn load(env: &HashMap<&str, &str>) -> Result<Config> {
         Config::from_lookup(|k| env.get(k).map(|v| v.to_string()))
+    }
+
+    #[test]
+    fn the_flight_agent_runs_on_the_main_model_unless_told_otherwise() {
+        assert_eq!(load(&base_env()).unwrap().flight_model, crate::agent::MODEL);
+
+        let mut env = base_env();
+        env.insert("FLIGHT_MODEL", "some-other-model");
+        assert_eq!(load(&env).unwrap().flight_model, "some-other-model");
+
+        env.insert("FLIGHT_MODEL", " ");
+        assert_eq!(load(&env).unwrap().flight_model, crate::agent::MODEL);
     }
 
     #[test]

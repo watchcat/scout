@@ -308,6 +308,8 @@ pub fn llm_client(api_key: &str, base_url: &str) -> Result<LlmClient> {
 /// Everything needed to assemble a per-request agent.
 pub struct AgentDeps {
     pub llm: LlmClient,
+    /// See `Config::flight_model`.
+    pub flight_model: String,
     pub kagi: KagiClient,
     /// Headless-Chrome fallback for pages plain HTTP cannot read.
     pub renderer: Option<crate::tools::browser::Renderer>,

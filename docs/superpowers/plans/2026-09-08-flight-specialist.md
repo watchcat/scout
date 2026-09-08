@@ -539,6 +539,272 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
+### Task 3b: Review fixes for the specialist
+
+Findings from the code review of Tasks 1-3. Three real gaps and some polish.
+
+**Files:**
+- Modify: `crates/scout-core/src/specialist.rs`
+- Modify: `crates/scout-core/src/run.rs`
+- Modify: `crates/scout-core/src/describe.rs`
+- Modify: `crates/scout-core/Cargo.toml` (dev-dependency feature)
+
+#### 3b.1 The outer stall guard must see nested activity (`Pulse`)
+
+rig yields nothing to the outer stream until a tool returns, so while `ask_flights` runs the outer `timeout(STREAM_STALL, stream.next())` in `run.rs` sees silence, and a nested run over 90 s gets killed as a stall. Progress events go to the sink, not through the stream, so they do not help.
+
+- [ ] **Step 1: Write the failing tests** in `run.rs` `mod tests`:
+
+```rust
+    #[tokio::test(start_paused = true)]
+    async fn the_pulse_ages_until_something_touches_it() {
+        let pulse = Pulse::default();
+        tokio::time::advance(std::time::Duration::from_secs(100)).await;
+        assert!(pulse.since() >= std::time::Duration::from_secs(100));
+        pulse.touch();
+        assert!(pulse.since() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_stall_guard_reads_the_pulse_not_the_stream_alone() {
+        // A specialist's nested run is silent on the outer stream for its
+        // whole length; only the pulse knows it is alive.
+        let src = include_str!("run.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        assert!(src.contains("timeout(STALL_CHECK, stream.next())"), "the stream is polled in short checks");
+        assert!(src.contains("pulse.since() < STREAM_STALL"), "and a stall is judged by the pulse");
+    }
+```
+
+- [ ] **Step 2: Run** `cargo test -p scout-core run::the_pulse run::the_stall_guard` — compile error, `Pulse` not found.
+
+- [ ] **Step 3: Implement** in `run.rs`, next to `STREAM_STALL`:
+
+```rust
+/// How often the outer loop looks up from a silent stream to ask the
+/// pulse whether the run is alive. Short, so a real stall is still caught
+/// within `STREAM_STALL` plus one check.
+const STALL_CHECK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The last moment anything in this run was seen doing something.
+///
+/// The outer stream goes quiet for the whole of a specialist's nested run
+/// — rig yields a tool's start and result together, after it returns —
+/// so a stall guard on the stream alone would kill every flight question
+/// that takes longer than `STREAM_STALL`. The outer loop touches this on
+/// every stream item and the specialist on every nested one; the guard
+/// asks how long ago that was.
+#[derive(Debug)]
+pub(crate) struct Pulse(std::sync::Mutex<tokio::time::Instant>);
+
+impl Default for Pulse {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(tokio::time::Instant::now()))
+    }
+}
+
+impl Pulse {
+    pub(crate) fn touch(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = tokio::time::Instant::now();
+    }
+
+    pub(crate) fn since(&self) -> std::time::Duration {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).elapsed()
+    }
+}
+```
+
+In `run_agent`, before `let agent = build_agent(...)`:
+
+```rust
+    let pulse = std::sync::Arc::new(Pulse::default());
+```
+
+Replace the stall guard block
+
+```rust
+                let next = match tokio::time::timeout(STREAM_STALL, stream.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => return Ok(None),
+                    Err(_) => return Ok(Some("the model stopped responding")),
+                };
+```
+
+with
+
+```rust
+                // A silent stream is a stall only when nothing else in the
+                // run is alive either: a specialist's nested run is silent
+                // here for its whole length and reports through the pulse.
+                let next = loop {
+                    match tokio::time::timeout(STALL_CHECK, stream.next()).await {
+                        Ok(Some(item)) => {
+                            pulse.touch();
+                            break item;
+                        }
+                        Ok(None) => return Ok(None),
+                        Err(_) if pulse.since() < STREAM_STALL => continue,
+                        Err(_) => return Ok(Some("the model stopped responding")),
+                    }
+                };
+```
+
+Update the `STREAM_STALL` doc comment: it now bounds the age of the pulse, not the gap between stream items. (`build_agent` does not take the pulse yet; Task 7 passes `pulse.clone()`.)
+
+- [ ] **Step 4: Run** `cargo test -p scout-core run::` — all pass.
+
+#### 3b.2 A failed nested tool is a failed finding
+
+rig hands a tool's `Err` to the model as the error's text (`rig-core-0.40.0/src/agent/runner.rs`, test `handled_failure_delivers_model_output_and_error_outcome`). Every Scout tool returns a serialised struct, so a result that is not JSON is a failure. Today it becomes an indistinguishable `Finding` and guidance would attach search rules to an error string.
+
+- [ ] **Step 5: Change the tests** in `specialist.rs`: rename `a_result_that_is_not_json_is_kept_as_text` to `a_result_that_is_not_json_is_a_failed_finding` and assert `c.findings[0].failed` and `c.findings[0].output == json!("no trip called Lisbon")`; add `failed: false` to the expected `Finding` in `a_tool_start_is_told_to_the_chat_and_its_result_becomes_a_finding`; add:
+
+```rust
+    #[test]
+    fn a_run_whose_only_call_failed_has_collected_nothing() {
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let mut c = Collector::default();
+        c.tool_started("c1", "search_flights", json!({}), &events);
+        c.tool_finished("c1", "duffel api error (status 429): slow down");
+        assert!(c.report(Some("the model call failed"), &no_guidance).is_err());
+    }
+```
+
+- [ ] **Step 6: Implement**: `Finding` gains `pub failed: bool` with the doc comment "True when the tool returned an error, which rig hands to the model as text; `output` is then that text. Every Scout tool returns a serialised struct, so 'not JSON' is the signal." In `tool_finished`:
+
+```rust
+        let (output, failed) = match serde_json::from_str(text) {
+            Ok(v) => (v, false),
+            Err(_) => (serde_json::Value::String(text.to_string()), true),
+        };
+        self.findings.push(Finding { tool, args, output, failed });
+```
+
+In `report`, the guard becomes `Some(reason) if self.findings.iter().all(|f| f.failed) =>` (an empty list is `all`, so the old case is covered). Add a doc line: guidance functions should count only findings with `failed == false`.
+
+- [ ] **Step 7: Run** `cargo test -p scout-core specialist::` — all pass.
+
+#### 3b.3 Generic over the model, and the stream loop tested end to end
+
+- [ ] **Step 8: Dev-dependency.** In `crates/scout-core/Cargo.toml` under `[dev-dependencies]` add `rig = { version = "0.40", features = ["test-utils"] }`.
+
+- [ ] **Step 9: Write the failing tests** in `specialist.rs`:
+
+```rust
+    /// A stand-in for any Scout tool: returns a struct, so JSON.
+    struct Probe;
+    #[derive(serde::Deserialize)]
+    struct ProbeArgs { q: i64 }
+    #[derive(serde::Serialize)]
+    struct ProbeOut { ok: bool, q: i64 }
+    #[derive(Debug, thiserror::Error)]
+    #[error("probe broke")]
+    struct ProbeError;
+    impl rig::tool::Tool for Probe {
+        const NAME: &'static str = "probe";
+        type Error = ProbeError;
+        type Args = ProbeArgs;
+        type Output = ProbeOut;
+        fn description(&self) -> String { "a probe".to_string() }
+        fn parameters(&self) -> serde_json::Value { json!({"type": "object", "properties": {"q": {"type": "integer"}}}) }
+        async fn call(&self, a: ProbeArgs) -> Result<ProbeOut, ProbeError> {
+            if a.q < 0 { Err(ProbeError) } else { Ok(ProbeOut { ok: true, q: a.q }) }
+        }
+    }
+
+    /// A scripted model: one turn calling `probe` with `q`, then a text turn.
+    fn scripted(q: i64, turns: usize) -> rig::agent::Agent<rig::test_utils::MockCompletionModel> {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let call = vec![
+            MockStreamEvent::tool_call("t1", "probe", json!({"q": q})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ];
+        let answer = vec![
+            MockStreamEvent::text("<think>ok</think>Probed once."),
+            MockStreamEvent::final_response_with_default_usage(),
+        ];
+        let model = MockCompletionModel::from_stream_turns([call, answer]);
+        rig::agent::AgentBuilder::new(model).preamble("test").tool(Probe).default_max_turns(turns).build()
+    }
+
+    fn specialist<M: rig::completion::CompletionModel>(
+        agent: rig::agent::Agent<M>,
+        events: scout_api::EventSink,
+    ) -> Specialist<M> {
+        Specialist {
+            name: "ask_probe",
+            description: "test".to_string(),
+            agent,
+            events,
+            pulse: std::sync::Arc::new(crate::run::Pulse::default()),
+            guidance: Box::new(|f: &[Finding]| vec![format!("{} ok", f.iter().filter(|x| !x.failed).count())]),
+            budget: std::time::Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_nested_run_becomes_a_report_of_what_its_tools_returned() {
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let tool = specialist(scripted(7, 5), events);
+
+        let report = rig::tool::Tool::call(&tool, Brief { brief: "probe seven".to_string() }).await.unwrap();
+
+        assert_eq!(report.summary, "Probed once.");
+        assert_eq!(
+            report.findings,
+            vec![Finding { tool: "probe".to_string(), args: json!({"q": 7}), output: json!({"ok": true, "q": 7}), failed: false }]
+        );
+        assert_eq!(report.guidance, vec!["1 ok"]);
+        match seen.try_recv() {
+            Ok(scout_api::AgentEvent::Tool(text)) => assert_eq!(text, "⚙️ probe"),
+            other => panic!("the chat must see the nested call: {other:?}"),
+        }
+        assert!(tool.pulse.since() < std::time::Duration::from_secs(1), "the pulse was touched");
+    }
+
+    #[tokio::test]
+    async fn a_nested_tool_error_is_a_failed_finding_not_a_result() {
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let tool = specialist(scripted(-1, 5), events);
+        let report = rig::tool::Tool::call(&tool, Brief { brief: "break".to_string() }).await.unwrap();
+        assert!(report.findings[0].failed);
+        assert_eq!(report.findings[0].output, json!("probe broke"));
+        assert_eq!(report.guidance, vec!["0 ok"]);
+    }
+
+    #[tokio::test]
+    async fn running_out_of_turns_after_a_finding_still_reports_it() {
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let tool = specialist(scripted(1, 1), events);
+        let report = rig::tool::Tool::call(&tool, Brief { brief: "one turn".to_string() }).await.unwrap();
+        assert_eq!(report.findings.len(), 1);
+        assert!(report.summary.contains("ran out of research steps"), "got: {}", report.summary);
+    }
+```
+
+If the mock's error text for a failed tool is not exactly `probe broke` (rig may prefix it), read the actual text from the failing assertion and assert with `contains("probe broke")`. If `max_turns(1)` lets the answer turn through, use whatever count makes the tool run and the answer not; the assertion is on the reason.
+
+- [ ] **Step 10: Run** `cargo test -p scout-core specialist::` — compile error: `Specialist` is not generic and has no `pulse`.
+
+- [ ] **Step 11: Implement.** `Specialist<M: rig::completion::CompletionModel>` with `pub agent: rig::agent::Agent<M>` and `pub pulse: std::sync::Arc<crate::run::Pulse>`; the `Tool` impl becomes `impl<M> rig::tool::Tool for Specialist<M> where M: rig::completion::CompletionModel + 'static, M::StreamingResponse: rig::completion::GetTokenUsage` (copy the exact bounds rig's `StreamingPrompt` impl uses in `rig-core-0.40.0/src/agent/completion.rs`). In the stream loop, `self.pulse.touch()` on every item before matching it. Add `pub type Guidance = Box<dyn Fn(&[Finding]) -> Vec<String> + Send + Sync>;` and use it for the field and in `report`'s parameter (`&dyn Fn(...)` stays fine for `report`). Move `tool_call.function.arguments` instead of cloning. Change the end-of-stream reason to `"the specialist ended without answering"`. Update the closed-port test to construct through the `specialist()` helper (it stays a real `openai` model on the closed port).
+
+- [ ] **Step 12: Run** `cargo test -p scout-core specialist::` and `cargo test -p scout-core run::` — all pass; `cargo clippy -p scout-core --all-targets` shows no `type_complexity`.
+
+#### 3b.4 Polish
+
+- [ ] **Step 13:** `describe.rs`: when `departure_date` is empty, omit the trailing space (`"✈️ searching AMS→LIS"`); add that case to the describe test.
+
+- [ ] **Step 14: Commit**
+
+```bash
+git add crates/scout-core/src/specialist.rs crates/scout-core/src/run.rs crates/scout-core/src/describe.rs crates/scout-core/Cargo.toml
+git commit -m "fix(specialist): a pulse the stall guard reads, failed findings, and the loop under test
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
 ### Task 4: The flight prompt and the guidance (`flights.rs`, pure half)
 
 **Files:**
@@ -566,7 +832,13 @@ mod tests {
     use serde_json::json;
 
     fn ran(tool: &str, output: serde_json::Value) -> Finding {
-        Finding { tool: tool.to_string(), args: json!({}), output }
+        Finding { tool: tool.to_string(), args: json!({}), output, failed: false }
+    }
+
+    #[test]
+    fn a_failed_search_brings_no_search_rules() {
+        let failed = Finding { failed: true, ..ran("search_flights", json!("duffel api error (status 429)")) };
+        assert!(guidance(&[failed], 0.03).is_empty());
     }
 
     #[test]
@@ -737,13 +1009,16 @@ tool results travel back with your report and are read from there.";
 /// shopping turn never pays for a word of it. Written for the agent that
 /// talks to the traveller.
 pub fn guidance(findings: &[crate::specialist::Finding], markup_rate: f64) -> Vec<String> {
-    let ran = |tool: &str| findings.iter().any(|f| f.tool == tool);
+    // A failed finding is an error string, not a result; nothing below
+    // applies to it.
+    let ok = || findings.iter().filter(|f| !f.failed);
+    let ran = |tool: &str| ok().any(|f| f.tool == tool);
     let searched = ran("search_flights");
-    let windowed = findings.iter().any(|f| {
+    let windowed = ok().any(|f| {
         f.tool == "search_flights"
             && f.output.get("by_date").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
     });
-    let planned = findings.iter().any(|f| f.tool.contains("trip"));
+    let planned = ok().any(|f| f.tool.contains("trip"));
     let mut out = Vec::new();
     if searched {
         out.push(SEARCH_GUIDANCE.to_string());
@@ -963,8 +1238,9 @@ Add inside `mod tests` in `crates/scout-core/src/flights.rs`:
         let run = scout_api::RunContext::telegram(1);
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
         let budget = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
+        let pulse = std::sync::Arc::new(crate::run::Pulse::default());
 
-        let tool = ask_flights(&core.deps, &run, &[], budget, events);
+        let tool = ask_flights(&core.deps, &run, &[], budget, events, pulse);
 
         assert_eq!(rig::tool::Tool::name(&tool), "ask_flights");
         let d = rig::tool::Tool::description(&tool);
@@ -1092,7 +1368,8 @@ pub fn ask_flights(
     facts: &[(String, String)],
     budget: std::sync::Arc<crate::tools::budget::FlightBudget>,
     events: scout_api::EventSink,
-) -> Specialist {
+    pulse: std::sync::Arc<crate::run::Pulse>,
+) -> Specialist<rig::providers::openai::completion::CompletionModel> {
     let markup = crate::agent::markup_rate(d);
     Specialist {
         name: "ask_flights",
@@ -1105,6 +1382,7 @@ pub fn ask_flights(
             .to_string(),
         agent: build_flight_agent(d, run, facts, budget),
         events,
+        pulse,
         guidance: Box::new(move |findings: &[Finding]| guidance(findings, markup)),
         budget: SPECIALIST_BUDGET,
     }
@@ -1165,7 +1443,7 @@ Add:
         // it a flight question is a silent minute.
         let src = include_str!("run.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
-        assert!(src.contains("build_agent(&core.deps, run, &facts, events.clone())"), "the sink must reach build_agent");
+        assert!(src.contains("build_agent(&core.deps, run, &facts, events.clone(), pulse.clone())"), "the sink and the pulse must reach build_agent");
     }
 ```
 
@@ -1224,6 +1502,7 @@ pub fn build_agent(
     run: &scout_api::RunContext,
     facts: &[(String, String)],
     events: scout_api::EventSink,
+    pulse: std::sync::Arc<crate::run::Pulse>,
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
 ```
 
@@ -1234,13 +1513,13 @@ Delete the seven `.tool(AddTripSegmentTool ...)` through `.tool(DeleteTripTool .
     // a flight question. Every flight-shaped tool lives inside it; the
     // main agent sees one tool and a report.
     if d.duffel.is_some() || d.ignav.is_some() {
-        builder = builder.tool(crate::flights::ask_flights(d, run, facts, flights, events));
+        builder = builder.tool(crate::flights::ask_flights(d, run, facts, flights, events, pulse));
     }
 ```
 
 The `flights` binding (the `FlightBudget`) stays where it is created at the top of `build_agent`.
 
-In `crates/scout-core/src/run.rs` line 68: `let agent = build_agent(&core.deps, run, &facts, events.clone());`
+In `crates/scout-core/src/run.rs`: `let agent = build_agent(&core.deps, run, &facts, events.clone(), pulse.clone());` (the `pulse` binding was created just above it in Task 3b).
 
 - [ ] **Step 5: Build and run the whole crate's tests**
 

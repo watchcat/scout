@@ -70,15 +70,28 @@ call and its output today.
   history. For every `ToolExecutionStart` it emits
   `AgentEvent::Tool(describe(name, args))` on the sink, so nested searches
   show in the chat as progress. For every `ToolResult` it records a
-  `Finding { tool, args, output }`, where `output` is the tool's own JSON,
-  parsed back from the result text.
+  `Finding { tool, args, output, failed }`, where `output` is the tool's
+  own JSON, parsed back from the result text. rig hands a tool's `Err` to
+  the model as the error's text, and every Scout tool returns a serialised
+  struct, so a result that is not JSON is a tool that failed: `failed` is
+  true and `output` holds the text. Guidance and the "nothing collected"
+  rule count only findings that did not fail.
+- `Specialist<M: CompletionModel>` is generic over the model so a test can
+  drive the whole stream loop with rig's `MockCompletionModel` (feature
+  `test-utils`, dev-dependency only); production uses the OpenAI-shaped
+  model.
 - Output: `Report { summary, findings, guidance }`. `summary` is the nested
   agent's final text with thinking stripped. `guidance` comes from a
   closure the instance supplies, `Fn(&[Finding]) -> Vec<String>`, so the
   wrapper knows nothing about flights.
 - The nested run has its own deadline, `SPECIALIST_BUDGET = 3 min`, inside
-  the outer `RUN_BUDGET`. The outer stall guard is not tripped by a long
-  nested run because progress events keep flowing.
+  the outer `RUN_BUDGET`. That is longer than the outer stall guard
+  (`STREAM_STALL`, 90 s), and rig yields nothing to the outer stream until
+  a tool returns, so the guard cannot watch the outer stream alone. The
+  run owns a `Pulse` (a last-activity instant): the outer loop touches it
+  on every stream item, the specialist touches it on every nested item,
+  and the stall guard checks the stream every `STALL_CHECK` (15 s) and
+  declares a stall only when the pulse is older than `STREAM_STALL`.
 - Failure: if the nested run errors, times out or hits its turn cap, the
   report is still returned with the findings collected so far and a summary
   that says what went wrong. Only when no finding was collected does `call`
@@ -159,13 +172,14 @@ call and its output today.
 New arms so nested calls read as progress rather than "⚙️ search_flights":
 `ask_flights` shows the brief, `search_flights` the route and date and the
 window when `flex_days` is set, `flight_booking_links` and
-`create_booking_link` as "🔗 booking link", `finalise_trip` as "✈️ pricing
+`create_booking_link` as "🔗 fetching booking links", `finalise_trip` as "✈️ pricing
 the trip", the other trip tools as "🗺️ updating the trip".
 
 ### `run.rs`
 
-Passes `events.clone()` into `build_agent`. Nothing else changes: the
-report lands in history through rig as any tool result does.
+Owns the `Pulse`, passes `events.clone()` and the pulse into
+`build_agent`, and consults the pulse in the stall guard. The report lands
+in history through rig as any tool result does.
 
 ## Data flow for one flight question
 
@@ -204,10 +218,13 @@ nothing reaches a provider.
 
 - `specialist.rs`: a report is assembled from collected findings; guidance
   is whatever the supplied function returns for those findings; an error
-  only when nothing was collected; progress events arrive on the sink in
-  call order; a nested failure after a finding still returns the finding.
-  Driven by a stub tool set and a stub model where rig allows it, and by
-  the closed port for the failure path.
+  only when nothing was collected; a non-JSON result is a failed finding;
+  progress events arrive on the sink in call order; a nested failure after
+  a finding still returns the finding. The stream loop is driven end to
+  end by rig's `MockCompletionModel` with a stub tool (happy path and the
+  turn-cap path), and by the closed port for the connection-failure path.
+- `run.rs`: the pulse ages when nothing touches it, and the stall guard
+  reads it (source assertion).
 - `flights.rs`: each guidance section appears exactly when its trigger is
   present; the `by_date` section keys on the output, not the args; the two
   booking rules drop with their tool; `FLIGHT_PREAMBLE` contains no

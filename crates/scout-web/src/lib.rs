@@ -422,14 +422,20 @@ fn public_host(headers: &HeaderMap) -> Option<String> {
 /// Google's entry for the site was the registrar's parking page for months
 /// after launch; a site that answers 404 to this is one a crawler has no
 /// reason to revisit. The signed-in half is kept out because those pages
-/// carry cookies, tokens and forms, none of which belongs in an index.
+/// carry cookies, tokens and forms, none of which belongs in an index,
+/// and `/healthz` because a GET that answers `ok` would be kept as a
+/// thin page.
+///
+/// `Allow: /` comes last. A first-match crawler stops at the first rule
+/// that fits, and `/` fits everything, so ahead of the Disallow lines it
+/// would have cancelled them; the longest-match ones do not care.
 ///
 /// The Sitemap line has to be an absolute URL, so it is built from the
 /// request's host and left out when there is none — a wrong address would
 /// send the crawler to somebody else's sitemap.
 async fn robots(headers: HeaderMap) -> impl IntoResponse {
     let mut body = String::from(
-        "User-agent: *\nAllow: /\nDisallow: /chat\nDisallow: /account\nDisallow: /sign-in\nDisallow: /auth/\n",
+        "User-agent: *\nDisallow: /chat\nDisallow: /account\nDisallow: /sign-in\nDisallow: /auth/\nDisallow: /healthz\nAllow: /\n",
     );
     if let Some(host) = public_host(&headers) {
         body.push_str(&format!("Sitemap: https://{host}/sitemap.xml\n"));
@@ -1158,12 +1164,19 @@ mod tests {
         assert_eq!(res.headers()["cache-control"], "public, max-age=86400");
         let body = body_of(res).await;
         assert!(body.contains("User-agent: *\n"), "{body}");
-        assert!(body.contains("\nAllow: /\n"), "{body}");
         let disallowed: Vec<&str> = body
             .lines()
             .filter_map(|l| l.strip_prefix("Disallow: "))
             .collect();
-        assert_eq!(disallowed, ["/chat", "/account", "/sign-in", "/auth/"]);
+        // `/healthz` too: a GET that answers `ok` is a thin page an index
+        // would otherwise keep.
+        assert_eq!(disallowed, ["/chat", "/account", "/sign-in", "/auth/", "/healthz"]);
+        // `Allow: /` after every Disallow. A first-match crawler stops at
+        // the first rule that fits, and `/` fits everything; the
+        // longest-match ones do not care either way.
+        let rules: Vec<&str> = body.lines().filter(|l| l.starts_with("Allow: ") || l.starts_with("Disallow: ")).collect();
+        assert_eq!(rules.last(), Some(&"Allow: /"), "{body}");
+        assert_eq!(rules.iter().filter(|l| l.starts_with("Allow: ")).count(), 1, "{body}");
         assert!(
             body.contains("Sitemap: https://goodscout.fyi/sitemap.xml"),
             "the sitemap line does not name the host the request came in on: {body}"

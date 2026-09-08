@@ -130,10 +130,12 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
     let session_key = auth.as_ref().map(|a| a.cfg.session_key.clone());
     // Only when we know an https address to send people to. A deployment
     // configured with an http base URL is a local one, and redirecting it
-    // would make it unusable.
+    // would make it unusable. Read by the same parser that checks
+    // `Origin`, so a trailing slash or a path on `SCOUT_BASE_URL` is
+    // dropped here and the value is exactly `https://host`.
     let https_origin = auth
         .as_ref()
-        .map(|a| a.cfg.base_url.clone())
+        .and_then(|a| routes::origin_of(&a.cfg.base_url))
         .filter(|u| u.starts_with("https://"));
     let public = Router::new()
         .route("/", get(index))
@@ -209,7 +211,6 @@ async fn canonical_address(
     let Some(origin) = https_origin.as_deref() else {
         return next.run(request).await;
     };
-    let origin = origin.trim_end_matches('/');
     let forwarded = request
         .headers()
         .get("x-forwarded-proto")
@@ -218,9 +219,11 @@ async fn canonical_address(
         .map(|v| v.split(',').next().unwrap_or_default().trim().to_string());
     let plain_http = forwarded.is_some_and(|p| !p.eq_ignore_ascii_case("https"));
     // The origin's own host, so `www.` + it is the one alias that is ours.
-    let apex = origin.trim_start_matches("https://");
+    // `router` built the origin with `origin_of`, so it is `https://host`
+    // and nothing after it, lower-cased — as is `public_host`'s reading.
+    let apex = origin.strip_prefix("https://").unwrap_or(origin);
     let on_www = public_host(request.headers())
-        .is_some_and(|h| h.strip_prefix("www.").is_some_and(|rest| rest.eq_ignore_ascii_case(apex)));
+        .is_some_and(|h| h.strip_prefix("www.") == Some(apex));
     if plain_http || on_www {
         let path = request.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
         let to = format!("{origin}{path}");
@@ -631,6 +634,16 @@ mod tests {
         return_url: Option<&str>,
         mailer: crate::email::Mailer,
     ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        build_app_at("https://example.com", return_url, mailer).await
+    }
+
+    /// `build_app` with the `SCOUT_BASE_URL` spelled out, for the tests
+    /// that are about how that value is read.
+    async fn build_app_at(
+        base_url: &str,
+        return_url: Option<&str>,
+        mailer: crate::email::Mailer,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("test.duckdb");
         // Not `Config::for_test`: that is `#[cfg(test)]`, which means it
@@ -661,7 +674,7 @@ mod tests {
             bot_token: "123456:test-bot-token".to_string(),
             resend_api_key: "test-key".to_string(),
             mail_from: "Scout <hello@example.com>".to_string(),
-            base_url: "https://example.com".to_string(),
+            base_url: base_url.to_string(),
         };
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
         // Never Resend: with the real mailer the sign-in tests fire an
@@ -780,6 +793,25 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
         assert_eq!(res.headers()["location"], "https://example.com/");
+    }
+
+    #[tokio::test]
+    async fn www_is_redirected_however_the_base_url_was_spelled() {
+        // The apex is the base URL's authority, read by the same parser
+        // that checks `Origin` — not the string with `https://` cut off
+        // the front, which left a trailing slash or a path on it and
+        // matched nothing.
+        for base in ["https://goodscout.fyi/", "https://goodscout.fyi/some/path", "https://GoodScout.fyi"] {
+            let (app, _core, _dir) = build_app_at(base, None, crate::email::Mailer::Discard).await;
+            let res = get_with_headers(
+                &app,
+                "/sign-in?x=1",
+                &[("x-forwarded-proto", "https"), ("x-forwarded-host", "www.goodscout.fyi")],
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{base}");
+            assert_eq!(res.headers()["location"], "https://goodscout.fyi/sign-in?x=1", "{base}");
+        }
     }
 
     #[tokio::test]

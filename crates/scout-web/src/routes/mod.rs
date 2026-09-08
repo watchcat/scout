@@ -38,7 +38,7 @@ pub(crate) fn signed_in_as(auth: &AuthState, headers: &HeaderMap) -> Option<i64>
 /// `None` for anything that is not an absolute URL — which includes
 /// `null`, the value a browser sends for an opaque origin. That is the
 /// honest answer: it names no site, so it cannot be compared to ours.
-fn origin_of(url: &str) -> Option<String> {
+pub(crate) fn origin_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next()?;
     if scheme.is_empty() || authority.is_empty() {

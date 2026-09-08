@@ -40,6 +40,29 @@ pub fn describe(tool: &str, args: &serde_json::Value) -> String {
         "record_purchase" => "💾 saving the purchase".to_string(),
         "remember_fact" | "forget_fact" => "💾 updating your profile".to_string(),
         "create_reminder" | "cancel_reminder" | "list_reminders" => "⏰ reminders".to_string(),
+        "ask_flights" => match s("brief") {
+            b if b.is_empty() => "✈️ asking the flight desk".to_string(),
+            b => format!("✈️ asking the flight desk: {b}"),
+        },
+        "search_flights" => {
+            let (from, to, day) = (s("origin"), s("destination"), s("departure_date"));
+            if from.is_empty() || to.is_empty() {
+                return "✈️ searching flights".to_string();
+            }
+            let flex = args.get("flex_days").and_then(|v| v.as_u64()).filter(|n| *n > 0);
+            // The date is optional; without it there is nothing to put
+            // after the route, so no trailing space either.
+            let day = if day.is_empty() { String::new() } else { format!(" {day}") };
+            match flex {
+                Some(n) => format!("✈️ searching {from}→{to}{day} ±{n}"),
+                None => format!("✈️ searching {from}→{to}{day}"),
+            }
+        }
+        "flight_booking_links" | "create_booking_link" => "🔗 fetching booking links".to_string(),
+        "finalise_trip" => "✈️ pricing the trip".to_string(),
+        "show_trip" => "🗺️ reading the trip".to_string(),
+        "add_trip_segment" | "add_trip_option" | "choose_trip_option" | "update_trip_segment"
+        | "drop_trip_segment" | "delete_trip" => "🗺️ updating the trip".to_string(),
         other => format!("⚙️ {other}"),
     }
 }
@@ -88,5 +111,38 @@ mod tests {
         assert_eq!(describe("fetch_page", &json!({"url": "not a url"})), "📄 opening a page");
         assert_eq!(describe("compare_prices", &json!({})), "🧮 comparing prices");
         assert_eq!(describe("brand_new_tool", &json!(null)), "⚙️ brand_new_tool");
+    }
+
+    #[test]
+    fn flight_and_trip_calls_read_as_progress_not_as_tool_names() {
+        // These used to fall through to "⚙️ <name>". Now that they run
+        // inside the flight specialist, they are the only progress the
+        // chat sees during a flight question.
+        assert_eq!(
+            describe("ask_flights", &json!({"brief": "return AMS-LIS 12-19 Oct, 2 adults"})),
+            "✈️ asking the flight desk: return AMS-LIS 12-19 Oct, 2 adults"
+        );
+        assert_eq!(describe("ask_flights", &json!({})), "✈️ asking the flight desk");
+        assert_eq!(
+            describe("search_flights", &json!({"origin": "AMS", "destination": "LIS", "departure_date": "2026-10-12"})),
+            "✈️ searching AMS→LIS 2026-10-12"
+        );
+        assert_eq!(
+            describe("search_flights", &json!({"origin": "AMS", "destination": "LIS", "departure_date": "2026-10-12", "flex_days": 2})),
+            "✈️ searching AMS→LIS 2026-10-12 ±2"
+        );
+        assert_eq!(
+            describe("search_flights", &json!({"origin": "AMS", "destination": "LIS"})),
+            "✈️ searching AMS→LIS",
+            "no date, no trailing space"
+        );
+        assert_eq!(describe("search_flights", &json!({})), "✈️ searching flights");
+        assert_eq!(describe("flight_booking_links", &json!({"ignav_id": "x"})), "🔗 fetching booking links");
+        assert_eq!(describe("create_booking_link", &json!({})), "🔗 fetching booking links");
+        assert_eq!(describe("finalise_trip", &json!({"trip": "Lisbon"})), "✈️ pricing the trip");
+        assert_eq!(describe("show_trip", &json!({})), "🗺️ reading the trip");
+        for tool in ["add_trip_segment", "add_trip_option", "choose_trip_option", "update_trip_segment", "drop_trip_segment", "delete_trip"] {
+            assert_eq!(describe(tool, &json!({})), "🗺️ updating the trip", "{tool}");
+        }
     }
 }

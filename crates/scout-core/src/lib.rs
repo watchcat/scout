@@ -5,6 +5,8 @@
 //! What a channel may reach is what `Core` hands it.
 
 mod agent;
+mod flights;
+mod specialist;
 mod store;
 mod tools;
 

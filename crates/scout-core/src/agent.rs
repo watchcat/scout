@@ -8,10 +8,6 @@ use crate::tools::prices::ComparePricesTool;
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
 use crate::tools::secondhand::{effective_sites, SecondhandSearchTool};
-use crate::tools::trips::{
-    AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
-    DropTripSegmentTool, ShowTripTool, UpdateTripSegmentTool,
-};
 use anyhow::Result;
 use rig::client::CompletionClient;
 use rig::providers::openai;
@@ -29,7 +25,7 @@ pub const MAX_TURNS: usize = 20;
 pub const HISTORY_CAP: usize = 20;
 
 pub const PREAMBLE: &str = "\
-You are Scout, a product-research assistant living in a Telegram chat. You help \
+You are Scout, a product and travel research assistant living in a chat. You help \
 the user find products online, compare options, and remember their purchases. \
 You never buy anything yourself.
 
@@ -72,119 +68,22 @@ furniture, bikes, tools...).
 directly, so the title, price and product URL are current and need no \
 fetch_page. Search it in Dutch. Its delivery text is timing, not shipping \
 cost, so shipping stays unknown for compare_prices unless a page states it.
-- When search_flights is available, use it for every flight question - never \
-a web search, and never compare_prices, whose per-unit arithmetic means \
-nothing for a flight. It asks the airlines directly, so its prices, times \
-and flight numbers are current. Work out the airport codes yourself rather \
-than asking: Amsterdam is AMS, Lisbon LIS, London LHR (or LON for all its \
-airports), and dates go in as YYYY-MM-DD. Take every number from its output \
-verbatim - cheapest and fastest are ranked in Rust and are not yours to \
-recompute - and quote its route field so the reply cannot drift onto a \
-route nobody searched. Present the picks under their own headings - Cheapest, Fastest, Best \
-balance - one to two options each, in that order, and offer every one you \
-are given. They are already chosen from hundreds and no option appears \
-under two headings, so anything you drop is a choice removed for no reason. \
-Best balance is the option closest to being both the cheapest and the \
-quickest, worked out in Rust; do not recompute it or argue with it. When a \
-group is empty, leave the heading out rather than explaining its absence, \
-and when one option is both cheapest and quickest say so - it is the best \
-fact in the answer. Options can come from two providers and \
-every one carries price_status, which changes how you are allowed to quote \
-it. 'bookable' is a live offer someone can pay right now: quote it as a \
-price. 'approximate' and 'unconfirmed' are fares seen elsewhere that still \
-have to be checked on the seller's page: quote those as 'from EUR 180' and \
-say where they came from - NEVER present one as a plain price and never as \
-'the cheapest' without saying it is not bookable. When self_transfer is \
-true the trip is two separate tickets: the traveller re-checks their bags \
-and carries the risk if the first flight is late, so say that every time it \
-appears, however cheap it looks. departing_at_local and arriving_at_local are each in \
-the local time of their own airport with no offset, so NEVER subtract them \
-to work out how long a flight takes: LHR 10:03 to JFK 13:01 is a 7h58m \
-flight, not a 2h58m one. Give journey length from the duration field, which \
-is already written out for you. For any flight with a change of plane, name \
-the connection airport and the wait from the connections list - 'changes at \
-PVG, 3h 20m' - because that is what makes one itinerary better than another \
-at the same price; never work a layover out from flight numbers or from your \
-own knowledge of an airline's network. When changes_airport is true, say so \
-loudly: the traveller lands at one airport and departs from another, with \
-their own bags and no protection if the first flight is late. A connection \
-whose layover is null means the offer did not state the times - say that \
-rather than guessing, and do not offer to go and look it up elsewhere. \
-Every leg carries an itinerary line already drawn for you - 'AMS 20:15 \
-15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09'. Put it on its own line under the \
-option it belongs to, copied EXACTLY as given: do not retype the times, \
-reorder it, translate it, add or remove the plane symbols, or rebuild it \
-from the other fields. A return trip has one such line per leg, outbound \
-first. It replaces listing the times in prose - say the price, the airline \
-and what matters about the option, then the line. Prices are the whole trip for all passengers. Say \
-what its notes say when they matter: a cheapest option that takes hours \
-longer, bags that are not included, offers left out for being in another \
-currency. found: 0 means nothing flies that route that day - say so plainly \
-rather than apologising or guessing at alternatives. When the traveller says their dates are flexible, or asks whether \
-another day is cheaper, pass flex_days (max 3) instead of searching each \
-date yourself: it prices the whole window in one call and returns by_date, \
-the cheapest fare per day. Present that as a short list, cheapest day \
-marked, and say which days were covered - the route field ends in ±N. Do \
-NOT ask for flex_days on an ordinary search: each day in the window is a \
-separate paid search. Nobody can price a whole month; if that is what is \
-wanted, say a week either side is the most that can be checked and pick the \
-part that matters. A flight price expires \
-within minutes, so never repeat one from earlier in the conversation; search \
-again. When the user picks an ignav row to book, call \
-flight_booking_links with that row's offer_id. It returns the airline's own \
-page and any resellers, each with a price, and they open with the flight \
-already selected - so unlike the Duffel link, there is nothing for the user \
-to re-enter. Give the airline's link first and name any reseller that is \
-cheaper, with both prices, rather than choosing for them. The fare is \
-re-checked at that moment: if a note says it has risen or fallen, tell them \
-the new price before they open anything and never repeat the old one. \
-When create_booking_link is available and the user says they want to \
-book a Duffel row, call it and give them the link on its own line. Say plainly what it \
-is: Duffel's own checkout, where they pick the flight and pay; Scout never \
-sees passenger or card details. It CANNOT be pre-filled - it opens on its \
-own search box - so repeat the route, date and price for them to enter, and \
-say the link is single-use and short-lived. Never re-send an old one; ask \
-for a fresh link each time. Without that tool, Scout cannot book at all: \
-give the numbers and let the user buy from the airline.
-- When someone is planning more than one flight — a multi-city route, or a trip \
-they are assembling over several messages — build it with the trip tools \
-rather than holding it in your head. Write it down as you go, in the same \
-reply you propose it in: call add_trip_segment for each leg the moment you \
-have a route and a date, and add_trip_option for each flight you found, \
-before you ask them to confirm anything. Do not wait for approval to record \
-a plan — approval is what finalise_trip is for, and a plan you are still \
-holding in your head is one that is gone by the next message. When they \
-change a date or a leg afterwards, call update_trip_segment on that one \
-segment. NEVER delete the trip and build it again, and never drop and re-add \
-a segment to change it: both throw away every option parked on every other \
-segment, and dropping renumbers everything after it so your next call lands \
-on the wrong leg. Never describe a trip from memory. Every trip tool hands back the whole \
-trip, including not_ready: when that is present the trip cannot be priced \
-and the reason says which segment is missing what, and when it is absent \
-the trip is complete. Say what it says. If a call failed, the trip did NOT \
-change - do not report a leg as parked because you meant to park it, and do \
-not summarise a trip you have not seen this turn; call show_trip and read it \
-back. When you make several edits in one turn, trust each call's own \
-'changed' line over the trip snapshot beside it: a snapshot is from the \
-moment that call ran, so an earlier one does not show a later edit and that \
-is not a failure. Believe the last snapshot, or call show_trip once at the \
-end. A segment is one direction on one date, \
-so a return is two segments. If they are undecided between flights, park each \
-with add_trip_option and decided=false rather than picking for them; several \
-options may sit on one segment and cost nothing extra. Quote a trip's prices \
-as of when each option was parked, never as a current total: they are stale \
-by construction and only finalising re-prices them. Finalising is the only \
-thing that produces current prices, and it costs a search per segment, so \
-call it when the trip is settled rather than to check on it. Present both \
-totals it returns and never drop the note about separate tickets: a link \
-per segment is a ticket per segment, and the traveller is carrying the risk \
-at every join. If the single-ticket total is missing, say that it is \
-missing — it is not evidence that separate booking is better.
-- If a booking fee is listed below, every flight price you are given \
-ALREADY includes it, and it is what the checkout will charge - quote the \
-numbers unchanged. Say once, in plain words, that prices include that \
-booking fee. Never hide it, never add it on yourself, and never quote a \
-price without it.
+- When ask_flights is available, send it every question about flights, \
+fares, airport codes, booking a flight, or a trip being planned - never a \
+web search, and never compare_prices, whose per-unit arithmetic means \
+nothing for a flight. It sees nothing of this conversation, so write a \
+self-contained brief: route, dates, passengers, cabin, whether the dates \
+are flexible, and any offer id the user is pointing at, together with its \
+source (duffel or ignav) as the findings state it, so the desk knows which \
+booking tool it belongs to. A route and a date are all a search needs - \
+passengers default to one adult - so do not question the user for the rest; \
+when the desk reports something missing, ask for that. Its \
+result carries a summary, findings and guidance: present the findings \
+following that guidance, take every number, time and link from the \
+findings verbatim - never from the summary and never from memory - and \
+relay the summary's caveats in plain words (what could not be searched, \
+what is missing, that Scout cannot book). A fare expires within minutes: \
+for a later question, ask ask_flights again rather than repeating one.
 - Some users list favourite shops below, each with the kind of product it \
 is for. When what you are searching for falls in that kind - judge it \
 sensibly, a stain remover is a cleaning product - spend one of search_web's \
@@ -252,9 +151,7 @@ the words in the path. Copy links verbatim from search results, fetch_page \
 output or the live eBay/Marktplaats results. With no verified link for an \
 option, drop it or name the shop and price without a link.
 - Always include the price (with currency) and a direct link for every option \
-you present. At most 5 options, best first - this is about products; flights \
-have no product page to link and their count is set by the rows the flight \
-search returns. If you genuinely could not reach a \
+you present. At most 5 options, best first. If you genuinely could not reach a \
 direct product page, say so explicitly rather than passing off a listing URL.
 - If key criteria are missing (budget, country for shipping, size, must-have \
 features), ask before searching — but NEVER ask for something already listed \
@@ -308,6 +205,8 @@ pub fn llm_client(api_key: &str, base_url: &str) -> Result<LlmClient> {
 /// Everything needed to assemble a per-request agent.
 pub struct AgentDeps {
     pub llm: LlmClient,
+    /// See `Config::flight_model`.
+    pub flight_model: String,
     pub kagi: KagiClient,
     /// Headless-Chrome fallback for pages plain HTTP cannot read.
     pub renderer: Option<crate::tools::browser::Renderer>,
@@ -528,7 +427,7 @@ fn available_tools(d: &AgentDeps) -> Vec<&'static str> {
         .copied()
         .filter(|tool| match *tool {
             "search_bol" => d.bol.is_some(),
-            "search_flights" | "finalise_trip" => d.duffel.is_some() || d.ignav.is_some(),
+            "ask_flights" => d.duffel.is_some() || d.ignav.is_some(),
             // A name in ALL_TOOLS with no arm here is a rule that would
             // never be shown; `every_conditional_rule_is_wired_up` catches
             // the reverse, a rule with no name.
@@ -538,7 +437,7 @@ fn available_tools(d: &AgentDeps) -> Vec<&'static str> {
 }
 
 /// Every tool the preamble may describe, for callers that have them all.
-pub const ALL_TOOLS: &[&str] = &["search_bol", "search_flights", "finalise_trip"];
+pub const ALL_TOOLS: &[&str] = &["search_bol", "ask_flights"];
 
 /// Drops the rules for tools this agent was not given.
 ///
@@ -552,7 +451,7 @@ pub const ALL_TOOLS: &[&str] = &["search_bol", "search_flights", "finalise_trip"
 ///
 /// The conditional phrasing was already there. It was addressed to the
 /// model, which cannot check, rather than to the code, which can.
-fn rules_for_available_tools(preamble: &str, available: &[&str]) -> String {
+pub(crate) fn rules_for_available_tools(preamble: &str, available: &[&str]) -> String {
     preamble
         .split("\n- ")
         .enumerate()
@@ -569,11 +468,7 @@ fn rules_for_available_tools(preamble: &str, available: &[&str]) -> String {
         .join("\n- ")
 }
 
-pub fn preamble_with_profile(
-    facts: &[(String, String)],
-    markup_rate: f64,
-    available: &[&str],
-) -> String {
+pub fn preamble_with_profile(facts: &[(String, String)], available: &[&str]) -> String {
     let mut p = rules_for_available_tools(PREAMBLE, available);
     if !facts.is_empty() {
         p.push_str("\n\nKnown about this user (long-term profile):\n");
@@ -595,22 +490,12 @@ pub fn preamble_with_profile(
             }
         }
     }
-    // Named here because the flight rules above tell the model that quoted
-    // prices already include it; without the number that instruction has
-    // nothing to point at.
-    if markup_rate > 0.0 {
-        p.push_str(&format!(
-            "\nBooking fee: flight prices you are shown already include a \
-             {} booking fee, which is what the checkout charges.\n",
-            percentage(markup_rate)
-        ));
-    }
     p
 }
 
 /// A rate as a percentage a person would say aloud: 0.03 -> "3%",
 /// 0.035 -> "3.5%". Trailing zeros make it read like a spec, not a fee.
-fn percentage(rate: f64) -> String {
+pub(crate) fn percentage(rate: f64) -> String {
     let pct = format!("{:.2}", rate * 100.0);
     let pct = pct.trim_end_matches('0').trim_end_matches('.');
     format!("{pct}%")
@@ -633,7 +518,7 @@ pub fn wrap_up_agent(
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     d.llm
         .agent(MODEL)
-        .preamble(&preamble_with_profile(facts, markup_rate(d), &available_tools(d)))
+        .preamble(&preamble_with_profile(facts, &available_tools(d)))
         .default_max_turns(1)
         .build()
 }
@@ -671,18 +556,22 @@ pub fn fare_market(facts: &[(String, String)]) -> Option<String> {
 }
 
 /// The booking fee in force, or nothing when flights are not configured.
-fn markup_rate(d: &AgentDeps) -> f64 {
+pub(crate) fn markup_rate(d: &AgentDeps) -> f64 {
     d.duffel.as_ref().map_or(0.0, |c| c.markup_rate())
 }
 
 /// Built per incoming message: tools capture the requesting account's
-/// identity, so the LLM never sees or chooses ids.
+/// identity, so the LLM never sees or chooses ids. `events` carries the
+/// nested flight desk's progress to the chat, and `pulse` its liveness to
+/// the stall guard.
 pub fn build_agent(
     d: &AgentDeps,
     run: &scout_api::RunContext,
     facts: &[(String, String)],
+    events: scout_api::EventSink,
+    pulse: std::sync::Arc<crate::run::Pulse>,
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
-    let (account_id, conversation_id) = (run.account_id, run.conversation_id);
+    let account_id = run.account_id;
     // One allowance per request, shared by both searching tools.
     let budget = std::sync::Arc::new(crate::tools::budget::SearchBudget::default());
     // One memo per request: a route asked for twice in one question is
@@ -691,7 +580,7 @@ pub fn build_agent(
     let mut builder = d
         .llm
         .agent(MODEL)
-        .preamble(&preamble_with_profile(facts, markup_rate(d), &available_tools(d)))
+        .preamble(&preamble_with_profile(facts, &available_tools(d)))
         .tool(WebSearchTool {
             kagi: d.kagi.clone(),
             perplexity: d.perplexity.clone(),
@@ -712,21 +601,7 @@ pub fn build_agent(
         .tool(ListRemindersTool { store: d.store.clone(), account_id })
         .tool(CancelReminderTool { store: d.store.clone(), account_id })
         .tool(RememberFactTool { store: d.store.clone(), account_id })
-        .tool(ForgetFactTool { store: d.store.clone(), account_id })
-        // Trip planning. Registered unconditionally: a trip is a plan, and
-        // planning one needs no provider at all. Only finalising does.
-        .tool(AddTripSegmentTool { store: d.store.clone(), account_id })
-        .tool(AddTripOptionTool {
-            store: d.store.clone(),
-            account_id,
-            shown: d.shown.clone(),
-            conversation_id,
-        })
-        .tool(ChooseTripOptionTool { store: d.store.clone(), account_id })
-        .tool(ShowTripTool { store: d.store.clone(), account_id })
-        .tool(UpdateTripSegmentTool { store: d.store.clone(), account_id })
-        .tool(DropTripSegmentTool { store: d.store.clone(), account_id })
-        .tool(DeleteTripTool { store: d.store.clone(), account_id });
+        .tool(ForgetFactTool { store: d.store.clone(), account_id });
     // Offered only when configured, so the model never sees a tool that
     // cannot work.
     // Offered only when the run has somewhere to deliver to. A reminder is
@@ -744,80 +619,11 @@ pub fn build_agent(
     if let Some(bol) = &d.bol {
         builder = builder.tool(crate::tools::bol::BolSearchTool { client: bol.clone() });
     }
-    // Either provider can answer a flight question, so the tool is offered
-    // whenever at least one is configured. Gating it on Duffel alone left
-    // the model calling a tool that was not there.
+    // The flight desk, offered whenever at least one provider can answer
+    // a flight question. Every flight-shaped tool lives inside it; the
+    // main agent sees one tool and a report.
     if d.duffel.is_some() || d.ignav.is_some() {
-        builder = builder.tool(crate::tools::duffel::FlightSearchTool {
-            duffel: d.duffel.clone(),
-            store: d.store.clone(),
-            account_id,
-            // One allowance and one memo per user request, like the search
-            // budget above. Cloned, not moved: finalise_trip below shares
-            // this same allowance, so a request that searches and then
-            // finalises draws on one cap rather than two.
-            budget: flights.clone(),
-            // Outlives the request: booking happens a turn later, when the
-            // memo above is gone.
-            shown: d.shown.clone(),
-            conversation_id,
-            // Priced in the traveller's own currency, or Duffel's euros
-            // and Ignav's dollars never get compared.
-            ignav: d
-                .ignav
-                .clone()
-                .map(|c| match fare_market(facts) {
-                    Some(market) => c.with_market(&market),
-                    None => c,
-                }),
-        });
-        // Where an Ignav row can actually be bought. Unlike Duffel's
-        // hosted checkout these open with the flight already selected.
-        if let Some(ignav) = &d.ignav {
-            builder = builder.tool(crate::tools::ignav::BookingLinksTool {
-                // No market here: an ignav_id lookup rejects one, because
-                // the id already carries the market of the search that
-                // produced it.
-                client: ignav.clone(),
-                shown: d.shown.clone(),
-                conversation_id,
-            });
-        }
-        builder = builder.tool(crate::tools::trips::FinaliseTripTool {
-            store: d.store.clone(),
-            account_id,
-            duffel: d.duffel.clone(),
-            // Same wrapper as FlightSearchTool above, and for the same
-            // reason: finalising re-prices every segment through
-            // IgnavClient::search, which reads self.market, so an
-            // unwrapped client would silently re-price a Dutch traveller's
-            // trip in Ignav's default US market. Safe to reuse for booking
-            // links too — IgnavClient::booking_links hardcodes its request
-            // to {"ignav_id": ...} and never reads the market, since the id
-            // already carries it.
-            ignav: d
-                .ignav
-                .clone()
-                .map(|c| match fare_market(facts) {
-                    Some(market) => c.with_market(&market),
-                    None => c,
-                }),
-            // The same allowance the search tool got: one request, one cap.
-            budget: flights.clone(),
-        });
-    }
-    // Duffel's hosted checkout: needs Duffel itself, Links enabled on the
-    // account, and somewhere to send people back to. Registering it
-    // without all three means the model promises a booking it cannot make.
-    if let (Some(duffel), Some(return_url)) = (
-        &d.duffel,
-        d.return_url.as_ref().filter(|_| d.links_enabled),
-    ) {
-        builder = builder.tool(crate::tools::duffel::BookingLinkTool {
-            client: duffel.clone(),
-            account_id,
-            return_url: return_url.clone(),
-        });
+        builder = builder.tool(crate::flights::ask_flights(d, run, facts, flights, events, pulse));
     }
     builder.default_max_turns(MAX_TURNS).build()
 }
@@ -856,14 +662,14 @@ mod tests {
         // something only the code can know.
         let without_bol: Vec<&str> =
             ALL_TOOLS.iter().copied().filter(|t| *t != "search_bol").collect();
-        let p = preamble_with_profile(&[], 0.0, &without_bol);
+        let p = preamble_with_profile(&[], &without_bol);
         assert!(!p.contains("search_bol"), "an absent tool is not mentioned at all");
-        assert!(p.contains("search_flights"), "the ones it does have stay");
+        assert!(p.contains("ask_flights"), "the ones it does have stay");
         assert!(p.contains("compare_prices"), "and so do the unconditional rules");
 
         // With everything, nothing is lost.
-        let all = preamble_with_profile(&[], 0.0, ALL_TOOLS);
-        assert!(all.contains("search_bol") && all.contains("search_flights"));
+        let all = preamble_with_profile(&[], ALL_TOOLS);
+        assert!(all.contains("search_bol") && all.contains("ask_flights"));
 
         // The rule really is dropped whole, not just its first line.
         // The whole rule goes, not just the sentence naming the tool.
@@ -874,15 +680,50 @@ mod tests {
     }
 
     #[test]
-    fn the_booking_fee_is_stated_in_the_preamble_when_one_is_charged() {
-        // The rule above tells the model prices "already include it", which
-        // is only actionable if the preamble says what it is.
-        let free = preamble_with_profile(&[], 0.0, ALL_TOOLS);
-        assert!(!free.contains("Booking fee"), "no fee, no line");
+    fn the_main_prompt_carries_no_flight_rules_and_no_fee() {
+        // The point of the split. The fee now arrives with the findings
+        // (flights::guidance) and in search_flights' own notes.
+        let p = preamble_with_profile(&[], ALL_TOOLS);
+        assert!(!p.contains("Booking fee"), "got: {p}");
+        for word in ["search_flights", "flex_days", "itinerary", "add_trip_segment", "price_status"] {
+            assert!(!p.contains(word), "{word:?} belongs to the flight agent now");
+        }
+        assert!(p.contains("When ask_flights is available"), "got: {p}");
+        assert!(p.contains("self-contained brief"), "got: {p}");
+        // The brief must not be bought with an interrogation: passengers
+        // default, and the desk names what is really missing.
+        assert!(p.contains("one adult"), "got: {p}");
+        // And the offer id alone is ambiguous between two booking tools.
+        assert!(p.contains("its source"), "got: {p}");
+    }
 
-        let charged = preamble_with_profile(&[], 0.03, ALL_TOOLS);
-        assert!(charged.contains("Booking fee"), "got: {charged}");
-        assert!(charged.contains("3%"), "stated as a percentage, got: {charged}");
+    #[test]
+    fn the_run_loop_hands_the_sink_to_the_agent_build() {
+        // The specialist reports progress through the run's sink; without
+        // it a flight question is a silent minute.
+        let src = include_str!("run.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let call = &src[src.find("build_agent(").expect("the agent build must exist")..];
+        // Up to the parenthesis matching the call's own, not the first one
+        // closing an argument's `.clone()`.
+        let mut depth = 0usize;
+        let end = call
+            .char_indices()
+            .find_map(|(i, c)| match c {
+                '(' => {
+                    depth += 1;
+                    None
+                }
+                ')' => {
+                    depth -= 1;
+                    (depth == 0).then_some(i)
+                }
+                _ => None,
+            })
+            .expect("the call must close");
+        let call = &call[..end];
+        assert!(call.contains("events.clone()"), "the sink must reach build_agent: {call}");
+        assert!(call.contains("pulse.clone()"), "the pulse must reach build_agent: {call}");
     }
 
     #[test]
@@ -905,7 +746,7 @@ mod tests {
 
     #[test]
     fn profile_is_appended_when_present() {
-        let plain = preamble_with_profile(&[], 0.0, ALL_TOOLS);
+        let plain = preamble_with_profile(&[], ALL_TOOLS);
         assert!(plain.starts_with(PREAMBLE));
         // with nothing known, the only search language is English
         assert!(plain.contains("Search languages for this user: English."));
@@ -915,7 +756,7 @@ mod tests {
             ("delivery_country".to_string(), "NL".to_string()),
             ("shoe_size".to_string(), "44".to_string()),
         ];
-        let with = preamble_with_profile(&facts, 0.0, ALL_TOOLS);
+        let with = preamble_with_profile(&facts, ALL_TOOLS);
         assert!(with.starts_with(PREAMBLE));
         assert!(with.contains("- delivery_country: NL"));
         assert!(with.contains("- shoe_size: 44"));
@@ -994,19 +835,19 @@ mod tests {
         let p = preamble_with_profile(&facts(&[(
             "favourite_shops",
             "123schoon.nl:cleaning products, bol.com",
-        )]), 0.0, ALL_TOOLS);
+        )]), ALL_TOOLS);
         assert!(p.contains("- 123schoon.nl: cleaning products"), "got: {p}");
         assert!(p.contains("- bol.com: any product"), "got: {p}");
 
         // Nothing listed, nothing said: the rule must not invite a site:
         // query at a shop the user never named.
-        let none = preamble_with_profile(&[], 0.0, ALL_TOOLS);
+        let none = preamble_with_profile(&[], ALL_TOOLS);
         assert!(!none.contains("Shops this user wants searched"));
     }
 
     #[test]
     fn profile_block_states_the_search_languages() {
-        let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]), 0.0, ALL_TOOLS);
+        let p = preamble_with_profile(&facts(&[("delivery_country", "NL")]), ALL_TOOLS);
         assert!(p.contains("Search languages for this user: English, Dutch."), "got: {p}");
     }
 

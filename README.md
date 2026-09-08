@@ -267,6 +267,7 @@ compiles from source.
 | `INVITE_DAILY_REQUESTS` | no | `20` | messages per day for someone admitted through `/invite`. Founders are exempt |
 | `MINIMAX_API_KEY` | **yes** | — | the LLM |
 | `MINIMAX_BASE_URL` | no | `https://api.minimax.io/v1` | where the OpenAI-shaped model API lives; point it at a proxy of your own |
+| `FLIGHT_MODEL` | no | the main model | the model the flight agent runs on |
 | `KAGI_API_KEY` | **yes** | — | search: small-retailer coverage, `site:` scoping |
 | `PERPLEXITY_API_KEY` | no | — | second engine, merged with Kagi; carries the multi-language fan-out cheaply |
 | `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` | no | — | eBay Browse API: live prices, condition, shipping |
@@ -339,29 +340,26 @@ data.
 
 ```
 Telegram ──► bot.rs ─────┐
-Browser  ──► scout-web ──┴► core ──► rig agent ──────► 23 tools
+Browser  ──► scout-web ──┴► core ──► rig agent ──────► 12 tools + the flight desk
                 │                                    │
                 │  streams progress + answer         ├─ search_web        Kagi + Perplexity, merged
                 │  back into one edited message      ├─ search_secondhand eBay / Marktplaats / Vinted
                 │                                    ├─ search_bol        bol.com catalogue *
-                ▼                                    ├─ search_flights    Duffel + Ignav, merged *
-        link verification                            ├─ flight_booking_links  airline pages, pre-filled *
-        (nothing dead ships)                         ├─ create_booking_link   Duffel hosted checkout *
-                                                     ├─ fetch_page        + headless-Chrome fallback
-                                                     ├─ compare_prices    deterministic, in Rust
-                                                     ├─ add_trip_segment  ─┐
-                                                     ├─ add_trip_option    │
-                                                     ├─ choose_trip_option │  a named multi-city
-                                                     ├─ show_trip          ├─ plan, built over many
-                                                     ├─ update_trip_segment│  messages
-                                                     ├─ drop_trip_segment  │
-                                                     ├─ delete_trip        │
-                                                     ├─ finalise_trip     ─┘  re-prices it all *
-                                                     ├─ query_purchases   ─┐
+                ▼                                    ├─ fetch_page        + headless-Chrome fallback
+        link verification                            ├─ compare_prices    deterministic, in Rust
+        (nothing dead ships)                         ├─ query_purchases   ─┐
                                                      ├─ record_purchase    ├─ DuckDB
                                                      ├─ remember_fact      │
                                                      ├─ forget_fact       ─┘
-                                                     └─ reminders (create/list/cancel)
+                                                     ├─ reminders (create/list/cancel)
+                                                     └─ ask_flights *  ──► flight agent ──► 11 tools
+                                                                             ├─ search_flights    Duffel + Ignav, merged
+                                                                             ├─ flight_booking_links  airline pages, pre-filled
+                                                                             ├─ create_booking_link   Duffel hosted checkout
+                                                                             ├─ add / update / drop segment,
+                                                                             │  add / choose option, show, delete
+                                                                             │  a named multi-city plan
+                                                                             └─ finalise_trip     re-prices it all
 
         * registered only when its credentials are set — bol.com needs an
           approved affiliate account, and they do reject applications;
@@ -369,9 +367,17 @@ Browser  ──► scout-web ──┴► core ──► rig agent ────�
           hosted checkout until they enable it for you
 ```
 
+The flight agent is a second rig agent with its own prompt, called by the
+first as one tool. It sees only the brief the main agent writes, and it
+answers with findings — the real tool outputs — plus the rules for
+presenting them, generated in Rust from what it actually did. A shopping
+question never carries a word about flights; a flight question carries only
+the rules its findings need. The same wrapper (`specialist.rs`) is how a
+trip builder, a hotel agent and an experience agent will be added.
+
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **747 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **781 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,
@@ -477,7 +483,7 @@ Roughly 38,000 lines of Rust across 60 focused modules.
 ## Development
 
 ```bash
-cargo test --workspace      # 747 tests across four crates, no network
+cargo test --workspace      # 781 tests across four crates, no network
 node --test 'crates/scout-web/src/*.test.mjs'  # the chat client's own tests
 cargo clippy --workspace --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs

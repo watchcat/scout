@@ -24,5 +24,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 wiremock = "0.6"
+rig = { version = "0.40", features = ["test-utils"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

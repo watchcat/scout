@@ -6,7 +6,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## In progress
 
-_(nothing)_
+- [ ] **Flight agent as a tool** — `ask_flights`: a specialist rig agent with the flight prompt and every flight and trip tool, called by the main agent with a brief; findings plus Rust-generated guidance come back. Spec: `docs/superpowers/specs/2026-09-08-flight-specialist-design.md`
 
 ## Next
 

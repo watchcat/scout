@@ -30,7 +30,10 @@ pub enum RunOutcome {
 ///
 /// `events` is taken by value: returning drops it, which closes the channel
 /// and ends whoever is rendering. That is the only shutdown signal the
-/// renderer gets, so it must not be held anywhere else.
+/// renderer gets, so nothing outside this function may keep a sender. The
+/// agent built for the run holds a clone (the specialist reports progress
+/// through it), but that clone lives and dies with the agent inside this
+/// function, so the channel still closes on return.
 /// The event a streamed chunk should produce, if anything changed.
 ///
 /// A function rather than three lines inline, because `run_agent` needs a
@@ -65,7 +68,8 @@ pub async fn run_agent(
         let store = core.deps.store.clone();
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
-    let agent = build_agent(&core.deps, run, &facts);
+    let pulse = std::sync::Arc::new(Pulse::default());
+    let agent = build_agent(&core.deps, run, &facts, events.clone(), pulse.clone());
     // History comes from the conversation the caller opened, so an
     // in-flight run always reads and writes that thread and never anyone
     // else's — the isolation the (chat, user) map used to provide.
@@ -100,12 +104,19 @@ pub async fn run_agent(
         tokio::time::timeout(RUN_BUDGET, async {
             let mut stream = agent.stream_chat(prompt, history.clone()).await;
             loop {
-                // A silent stream is a stall even while the run as a whole
-                // still has time left.
-                let next = match tokio::time::timeout(STREAM_STALL, stream.next()).await {
-                    Ok(Some(item)) => item,
-                    Ok(None) => return Ok(None),
-                    Err(_) => return Ok(Some("the model stopped responding")),
+                // A silent stream is a stall only when nothing else in the
+                // run is alive either: a specialist's nested run is silent
+                // here for its whole length and reports through the pulse.
+                let next = loop {
+                    match tokio::time::timeout(STALL_CHECK, stream.next()).await {
+                        Ok(Some(item)) => {
+                            pulse.touch();
+                            break item;
+                        }
+                        Ok(None) => return Ok(None),
+                        Err(_) if pulse.since() < STREAM_STALL => continue,
+                        Err(_) => return Ok(Some("the model stopped responding")),
+                    }
                 };
                 let item = match next {
                     Ok(item) => item,
@@ -463,13 +474,53 @@ fn is_plain_user_text(msg: &LlmMessage) -> bool {
 /// How much of the model's own notes to hand the wrap-up agent.
 const WRAP_UP_CONTEXT: usize = 6000;
 
-/// No stream item for this long means the run is stuck. Generous, because a
-/// tool call (three site searches, a page fetch and its dead-link probes)
-/// runs between items — but all of those carry their own timeouts well
-/// under this. rig's client has no timeout of its own, so this is the only
-/// thing standing between a stalled connection and a chat that waits
-/// forever.
+/// A pulse this old means the run is stuck: nothing in it — not the outer
+/// stream, not a specialist's nested run — has done anything for this long.
+/// Generous, because a tool call (three site searches, a page fetch and its
+/// dead-link probes) runs between items — but all of those carry their own
+/// timeouts well under this. rig's client has no timeout of its own, so this
+/// is the only thing standing between a stalled connection and a chat that
+/// waits forever.
 const STREAM_STALL: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How often the outer loop looks up from a silent stream to ask the
+/// pulse whether the run is alive. Short, so a real stall is still caught
+/// within `STREAM_STALL` plus one check.
+const STALL_CHECK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The last moment anything in this run was seen doing something.
+///
+/// The outer stream goes quiet for the whole of a specialist's nested run
+/// — rig yields a tool's start and result together, after it returns —
+/// so a stall guard on the stream alone would kill every flight question
+/// that takes longer than `STREAM_STALL`. The outer loop touches this on
+/// every stream item and the specialist on every nested one; the guard
+/// asks how long ago that was.
+#[derive(Debug)]
+pub(crate) struct Pulse(std::sync::Mutex<tokio::time::Instant>);
+
+impl Default for Pulse {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(tokio::time::Instant::now()))
+    }
+}
+
+impl Pulse {
+    /// A pulse that was last touched `by` ago, so a test can tell a real
+    /// touch apart from the freshness a just-built pulse has anyway.
+    #[cfg(test)]
+    pub(crate) fn aged(by: std::time::Duration) -> Self {
+        Self(std::sync::Mutex::new(tokio::time::Instant::now() - by))
+    }
+
+    pub(crate) fn touch(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = tokio::time::Instant::now();
+    }
+
+    pub(crate) fn since(&self) -> std::time::Duration {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).elapsed()
+    }
+}
 
 /// Hard ceiling on one request. A thorough price comparison takes ~60-90s;
 /// past this the user is better served by an answer built from the notes.
@@ -480,7 +531,7 @@ const WRAP_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// rig wraps the turn-limit failure in its own error types; the message is
 /// the stable part across them.
-fn is_max_turns(e: &impl std::fmt::Display) -> bool {
+pub(crate) fn is_max_turns(e: &impl std::fmt::Display) -> bool {
     let text = e.to_string();
     text.contains("MaxTurnsError") || text.contains("max turns")
 }
@@ -841,5 +892,24 @@ mod tests {
             begin_run(&running, 7).is_some(),
             "the conversation stayed locked after its run ended"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pulse_ages_until_something_touches_it() {
+        let pulse = Pulse::default();
+        tokio::time::advance(std::time::Duration::from_secs(100)).await;
+        assert!(pulse.since() >= std::time::Duration::from_secs(100));
+        pulse.touch();
+        assert!(pulse.since() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_stall_guard_reads_the_pulse_not_the_stream_alone() {
+        // A specialist's nested run is silent on the outer stream for its
+        // whole length; only the pulse knows it is alive.
+        let src = include_str!("run.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        assert!(src.contains("timeout(STALL_CHECK, stream.next())"), "the stream is polled in short checks");
+        assert!(src.contains("pulse.since() < STREAM_STALL"), "and a stall is judged by the pulse");
     }
 }

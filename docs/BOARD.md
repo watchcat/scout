@@ -6,7 +6,8 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## In progress
 
-- [ ] **Flight agent as a tool** — `ask_flights`: a specialist rig agent with the flight prompt and every flight and trip tool, called by the main agent with a brief; findings plus Rust-generated guidance come back. Spec: `docs/superpowers/specs/2026-09-08-flight-specialist-design.md`
+_(nothing)_
+
 
 ## Next
 
@@ -14,6 +15,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 - [ ] **Retention for the rest** — `outbox` never deletes sent rows, `request_log` never prunes; two DELETEs in `run_maintenance` next to the thread expiry
 - [ ] **CI** — `.github/workflows`: `cargo test`, `cargo clippy -D warnings`, `cargo audit`, `node --test 'crates/scout-web/src/*.test.mjs'`, cached with `Swatinem/rust-cache`
 - [ ] **Timeout on `continues_previous`** — same shape as `TITLE_BUDGET` on `title_for`; this one runs on every Telegram message after a 10-minute gap and has no bound
+- [ ] **Specialist deadline from the remaining run budget** — `SPECIALIST_BUDGET` is a fixed 180 s; two `ask_flights` calls in one request can outlast `RUN_BUDGET` (300 s), and the wrap-up builds its notes from streamed text only, so a report already paid for reaches neither the wrap-up nor history. Compute the deadline from what is left, and feed the last report into the wrap-up notes
 
 ## Backlog
 
@@ -31,6 +33,8 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 - [ ] **GPT-5.6 Luna trial** — postponed 2026-09-05. Roughly 30% cheaper than MiniMax M3 on list price, but reasoning tokens may eat it, and Luna needs the Responses API for tools + reasoning. Try it on the tool-less side calls first, once usage logging exists
 - [ ] **Search fan-out** — Kagi at up to 15 queries per run is the dominant cost, an order of magnitude above the model; measure how often the later queries add a result
 
+- [ ] **Repair turn inside the flight desk** — a tool call written as prose in the nested run is now reported as a failure (`7356fa7`); one `REPAIR_NOTE` turn inside the nested run, as `run.rs` does for the main agent, would keep the research instead
+
 ### Hygiene
 - [ ] **Duplicate dependency trees** — reqwest 0.12 + 0.13, rand 0.8/0.9/0.10, sha2 0.10/0.11; bumping reqwest to 0.13 (what rig uses) drops one TLS stack
 - [ ] **`proc-macro-error2` future-incompat** — transitive; check for an updated upstream
@@ -43,6 +47,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## Done
 
+- [x] 2026-09-08 — **Flight agent as a tool** (`39e5d78`): `ask_flights`, a specialist rig agent with the flight prompt and every flight and trip tool, called by the main agent with a brief; findings plus Rust-generated guidance come back, the main prompt lost its flight half, `FLIGHT_MODEL` picks its model, and the stall guard reads a pulse the nested run keeps alive
 - [x] 2026-09-05 — **Two things a web-only user ran into** (`de08a65`): the page's form token now lives as long as the session, so a phone left on the chat keeps sending instead of failing every POST after 15 minutes; `/stat` names an account by its email when it has no Telegram name
 - [x] 2026-09-05 — **Web messages count in `/stat` and toward the daily cap** (`0157c4f`): one `log_request` in the web send path after the ownership check; a refused message still counts for nothing
 - [x] 2026-09-05 — **The whole thread on the page, and titles you can read** (`3a6a74e`): the message table is the full log and only the model's window is trimmed from it; rig's final response excludes the input history, so every save had been dropping earlier turns — follow-ups now really have context; pinned threads' logs are bounded at 2000 rows; sidebar titles are the biggest thing on their row, two lines, tools beneath on the current row

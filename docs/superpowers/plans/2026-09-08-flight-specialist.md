@@ -1521,6 +1521,14 @@ The `flights` binding (the `FlightBudget`) stays where it is created at the top 
 
 In `crates/scout-core/src/run.rs`: `let agent = build_agent(&core.deps, run, &facts, events.clone(), pulse.clone());` (the `pulse` binding was created just above it in Task 3b).
 
+Note from the Task 3b review: the pulse is touched per stream item, and a
+nested stream is silent during a nested tool call, so one nested tool call
+longer than `STREAM_STALL` (90 s) still trips the outer guard. That is the
+pre-existing invariant (`STREAM_STALL`'s comment: every tool carries its own
+timeout well under it) and `search_flights` runs its window in parallel, so
+no change is needed; do not raise `SPECIALIST_BUDGET` above what a single
+tool call can take without also touching the pulse from inside the tool.
+
 - [ ] **Step 5: Build and run the whole crate's tests**
 
 Run: `cargo test -p scout-core`

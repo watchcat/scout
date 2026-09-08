@@ -183,6 +183,9 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - **Your phone follows along.** A toggle sends the browser thread to your
   Telegram chat as it happens, so a question asked at a desk is answered on
   the train
+- **Findable.** The site serves a robots.txt and a sitemap, the landing
+  page carries a description and Open Graph tags, and `www.` is redirected
+  to the apex, so a search engine sees one site and a pasted link unfurls
 
 **Lets people in without a redeploy**
 - **Invite rounds.** `/invite new autumn 100` opens a named round and hands

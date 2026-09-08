@@ -8,7 +8,6 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 _(nothing)_
 
-
 ## Next
 
 - [ ] **Poller liveness** — record the last successful `getUpdates`; fail `/healthz` when it is stale so k8s restarts a bot Telegram has gone quiet on (24 restarts in 20 minutes happened once with nothing to catch it)

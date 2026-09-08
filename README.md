@@ -183,6 +183,9 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - **Your phone follows along.** A toggle sends the browser thread to your
   Telegram chat as it happens, so a question asked at a desk is answered on
   the train
+- **Findable.** The site serves a robots.txt and a sitemap, the landing
+  page carries a description and Open Graph tags, and `www.` is redirected
+  to the apex, so a search engine sees one site and a pasted link unfurls
 
 **Lets people in without a redeploy**
 - **Invite rounds.** `/invite new autumn 100` opens a named round and hands
@@ -300,6 +303,12 @@ rather than by the bot:
 | `SCOUT_DOMAIN` | the hostname the ingress and its certificate are issued for |
 | `SCOUT_ACME_EMAIL` | where Let's Encrypt sends expiry warnings |
 | `SCOUT_SSH` | the node to build on and ship to, e.g. `root@203.0.113.4` |
+
+The ingress also answers on `www.<SCOUT_DOMAIN>`, and that name needs an A
+record at the DNS provider **before** the first deploy that carries it:
+cert-manager proves ownership by serving an HTTP-01 challenge on the name,
+so a `www` that does not resolve fails the `scout-www-tls` certificate and
+each retry counts against Let's Encrypt's rate limit.
 
 The script runs here and **builds there**, because this repository is
 developed on arm64 and the server is x86_64 — emulating the DuckDB C++

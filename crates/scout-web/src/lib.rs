@@ -130,10 +130,12 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
     let session_key = auth.as_ref().map(|a| a.cfg.session_key.clone());
     // Only when we know an https address to send people to. A deployment
     // configured with an http base URL is a local one, and redirecting it
-    // would make it unusable.
+    // would make it unusable. Read by the same parser that checks
+    // `Origin`, so a trailing slash or a path on `SCOUT_BASE_URL` is
+    // dropped here and the value is exactly `https://host`.
     let https_origin = auth
         .as_ref()
-        .map(|a| a.cfg.base_url.clone())
+        .and_then(|a| routes::origin_of(&a.cfg.base_url))
         .filter(|u| u.starts_with("https://"));
     let public = Router::new()
         .route("/", get(index))
@@ -142,6 +144,8 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         // down for a reason the site does not have.
         .route("/healthz", get(|| async { "ok" }))
         .route("/icon.svg", get(icon))
+        .route("/robots.txt", get(robots))
+        .route("/sitemap.xml", get(sitemap))
         .with_state(Public { cache, session_key });
 
     match auth {
@@ -167,30 +171,39 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
     // been running without it; serving it from here means it does not
     // depend on which proxy is in front.
     .layer(axum::middleware::from_fn(hsts))
-    // Outermost, so a plain-HTTP request is turned around before any other
-    // layer has an opinion about it — `only_from_our_own_pages` compares
-    // schemes, so without this a form served over HTTP posts back an
-    // `Origin` that cannot match and the visitor is told their form is out
-    // of date. Measured on an iPhone: Opera in a private window has no HSTS
-    // memory, went to HTTP, and got exactly that.
-    .layer(axum::middleware::from_fn_with_state(https_origin, force_https))
+    // Outermost, so a request at the wrong address is turned around before
+    // any other layer has an opinion about it — `only_from_our_own_pages`
+    // compares schemes, so without this a form served over HTTP posts back
+    // an `Origin` that cannot match and the visitor is told their form is
+    // out of date. Measured on an iPhone: Opera in a private window has no
+    // HSTS memory, went to HTTP, and got exactly that.
+    .layer(axum::middleware::from_fn_with_state(https_origin, canonical_address))
 }
 
-/// Sends a plain-HTTP request to the same address over HTTPS.
+/// Sends a request that arrived at the wrong address to the right one:
+/// plain HTTP to HTTPS, and `www.` to the apex.
 ///
-/// HSTS alone cannot do this. It is only honoured on a connection that was
-/// already secure, so it protects the second visit and every one after —
-/// never the first, which is the one that carries the password field.
+/// HSTS alone cannot do the first. It is only honoured on a connection that
+/// was already secure, so it protects the second visit and every one after
+/// — never the first, which is the one that carries the password field.
+///
+/// The second is for the index rather than the visitor. Google treated
+/// `www.goodscout.fyi` and the apex as two sites and the ingress served
+/// neither on www, so the links that spelled it that way led nowhere. Both
+/// conditions are checked before either redirect is written, so a visitor
+/// arriving over http on www is sent to the final address once rather
+/// than bounced twice.
 ///
 /// Absent `x-forwarded-proto` means nothing is in front of us: the
 /// kubelet's probe on `/healthz`, or a local run. Both must pass through,
 /// so the check is "the proxy said http", not "the proxy did not say
-/// https".
+/// https". The host is `public_host`'s reading, and only our own `www.` is
+/// turned around: a stranger's host in the header is not ours to redirect.
 ///
 /// 308 rather than 301: it preserves the method, so a form posted over
 /// HTTP is re-posted over HTTPS instead of being silently downgraded to a
 /// GET and losing its body.
-async fn force_https(
+async fn canonical_address(
     axum::extract::State(https_origin): axum::extract::State<Option<String>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -204,9 +217,16 @@ async fn force_https(
         .and_then(|v| v.to_str().ok())
         // A chain of proxies appends, so the client's scheme is the first.
         .map(|v| v.split(',').next().unwrap_or_default().trim().to_string());
-    if forwarded.is_some_and(|p| !p.eq_ignore_ascii_case("https")) {
+    let plain_http = forwarded.is_some_and(|p| !p.eq_ignore_ascii_case("https"));
+    // The origin's own host, so `www.` + it is the one alias that is ours.
+    // `router` built the origin with `origin_of`, so it is `https://host`
+    // and nothing after it, lower-cased — as is `public_host`'s reading.
+    let apex = origin.strip_prefix("https://").unwrap_or(origin);
+    let on_www = public_host(request.headers())
+        .is_some_and(|h| h.strip_prefix("www.") == Some(apex));
+    if plain_http || on_www {
         let path = request.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        let to = format!("{}{}", origin.trim_end_matches('/'), path);
+        let to = format!("{origin}{path}");
         return (
             axum::http::StatusCode::PERMANENT_REDIRECT,
             [(header::LOCATION, to)],
@@ -347,6 +367,111 @@ async fn security_headers(
     // anyway. `/icon.svg` is on the public router and keeps its day.
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+/// The host this request was addressed to, as the public would spell it.
+///
+/// The proxy's word first: behind Traefik `Host` is whatever the client
+/// sent to the proxy and `x-forwarded-host` is what the proxy matched, and
+/// only the second is a statement about the public address. A chain of
+/// proxies appends, so the client's host is the first in the list.
+///
+/// The value is about to be written into a URL and handed to a crawler, so
+/// the rule is what a host may contain rather than what it may not: a name
+/// of `[A-Za-z0-9.-]`, then at most a `:` and a port. A denylist of `/`,
+/// `@` and whitespace let `evil.example?goodscout.fyi` through — a host
+/// with a query on it — and that is the shape of every character it did
+/// not think of. Anything else is refused outright rather than escaped. A
+/// header is a string a stranger typed.
+///
+/// The port is kept because it is legitimate: a local run is
+/// `localhost:8080`, and the kubelet's probe carries `:8080` in `Host`.
+/// An IPv6 literal (`[::1]`) is refused on purpose; nothing public is
+/// addressed that way and the brackets would need their own rule.
+///
+/// Lower-cased on the way out. DNS names are case-insensitive and Traefik
+/// forwards the client's spelling, so `WWW.Goodscout.FYI` is the same host
+/// as `www.goodscout.fyi` and a `<loc>` built from it should say so.
+fn public_host(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    let name_ok = !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    let port_ok = port.is_none_or(|p| {
+        (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit())
+    });
+    if !name_ok || !port_ok {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// What a crawler may index, and where the sitemap is.
+///
+/// Google's entry for the site was the registrar's parking page for months
+/// after launch; a site that answers 404 to this is one a crawler has no
+/// reason to revisit. The signed-in half is kept out because those pages
+/// carry cookies, tokens and forms, none of which belongs in an index,
+/// and `/healthz` because a GET that answers `ok` would be kept as a
+/// thin page.
+///
+/// `Allow: /` comes last. A first-match crawler stops at the first rule
+/// that fits, and `/` fits everything, so ahead of the Disallow lines it
+/// would have cancelled them; the longest-match ones do not care.
+///
+/// The Sitemap line has to be an absolute URL, so it is built from the
+/// request's host and left out when there is none — a wrong address would
+/// send the crawler to somebody else's sitemap.
+async fn robots(headers: HeaderMap) -> impl IntoResponse {
+    let mut body = String::from(
+        "User-agent: *\nDisallow: /chat\nDisallow: /account\nDisallow: /sign-in\nDisallow: /auth/\nDisallow: /healthz\nAllow: /\n",
+    );
+    if let Some(host) = public_host(&headers) {
+        body.push_str(&format!("Sitemap: https://{host}/sitemap.xml\n"));
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+}
+
+/// The one public page, as a sitemap.
+///
+/// Its whole content is a URL, so with no host to build one from there is
+/// nothing true to say: a 404 is retried later, an address that is not
+/// ours would be indexed.
+async fn sitemap(headers: HeaderMap) -> axum::response::Response {
+    let Some(host) = public_host(&headers) else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n\
+         <url><loc>https://{host}/</loc></url>\n\
+         </urlset>\n"
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "application/xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// The mark, as the browser tab's icon.
@@ -515,6 +640,16 @@ mod tests {
         return_url: Option<&str>,
         mailer: crate::email::Mailer,
     ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        build_app_at("https://example.com", return_url, mailer).await
+    }
+
+    /// `build_app` with the `SCOUT_BASE_URL` spelled out, for the tests
+    /// that are about how that value is read.
+    async fn build_app_at(
+        base_url: &str,
+        return_url: Option<&str>,
+        mailer: crate::email::Mailer,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("test.duckdb");
         // Not `Config::for_test`: that is `#[cfg(test)]`, which means it
@@ -545,7 +680,7 @@ mod tests {
             bot_token: "123456:test-bot-token".to_string(),
             resend_api_key: "test-key".to_string(),
             mail_from: "Scout <hello@example.com>".to_string(),
-            base_url: "https://example.com".to_string(),
+            base_url: base_url.to_string(),
         };
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
         // Never Resend: with the real mailer the sign-in tests fire an
@@ -624,9 +759,116 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn www_is_sent_to_the_apex_in_one_hop() {
+        // Google indexed `www.` and the apex as two sites, and the
+        // ingress served neither on www, so half the links out there led
+        // to nothing. One redirect straight to the final address, so a
+        // visitor arriving over http on www is not bounced twice.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = get_with_headers(
+            &app,
+            "/sign-in?x=1",
+            &[("x-forwarded-proto", "https"), ("x-forwarded-host", "www.example.com")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(res.headers()["location"], "https://example.com/sign-in?x=1");
+
+        let both = get_with_headers(
+            &app,
+            "/sign-in?x=1",
+            &[("x-forwarded-proto", "http"), ("x-forwarded-host", "www.example.com")],
+        )
+        .await;
+        assert_eq!(both.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(both.headers()["location"], "https://example.com/sign-in?x=1");
+    }
+
+    #[tokio::test]
+    async fn www_is_redirected_however_the_client_spelled_it() {
+        // Traefik's Host matcher is case-insensitive and forwards the
+        // client's spelling, so `WWW.` reached the handlers as a host
+        // that was not `www.` and was served rather than turned around.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = get_with_headers(
+            &app,
+            "/",
+            &[("x-forwarded-proto", "https"), ("x-forwarded-host", "WWW.Example.COM")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(res.headers()["location"], "https://example.com/");
+    }
+
+    #[tokio::test]
+    async fn www_is_redirected_however_the_base_url_was_spelled() {
+        // The apex is the base URL's authority, read by the same parser
+        // that checks `Origin` — not the string with `https://` cut off
+        // the front, which left a trailing slash or a path on it and
+        // matched nothing.
+        for base in ["https://goodscout.fyi/", "https://goodscout.fyi/some/path", "https://GoodScout.fyi"] {
+            let (app, _core, _dir) = build_app_at(base, None, crate::email::Mailer::Discard).await;
+            let res = get_with_headers(
+                &app,
+                "/sign-in?x=1",
+                &[("x-forwarded-proto", "https"), ("x-forwarded-host", "www.goodscout.fyi")],
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{base}");
+            assert_eq!(res.headers()["location"], "https://goodscout.fyi/sign-in?x=1", "{base}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_apex_and_any_other_host_are_left_alone() {
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let apex = get_with_headers(
+            &app,
+            "/healthz",
+            &[("x-forwarded-proto", "https"), ("x-forwarded-host", "example.com")],
+        )
+        .await;
+        assert_eq!(apex.status(), StatusCode::OK);
+        // Only our own www. A stranger's host in the header is not ours to
+        // redirect, and a local run has no https origin at all.
+        let other = get_with_headers(
+            &app,
+            "/healthz",
+            &[("x-forwarded-proto", "https"), ("x-forwarded-host", "www.elsewhere.example")],
+        )
+        .await;
+        assert_eq!(other.status(), StatusCode::OK);
+
+        let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
+        let local = router(cache, None);
+        let res = get_with_headers(
+            &local,
+            "/healthz",
+            &[("x-forwarded-proto", "http"), ("x-forwarded-host", "www.example.com")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK, "nothing to redirect to, so nothing redirects");
+    }
+
     pub(crate) async fn get(app: &axum::Router, uri: &str) -> Response {
         app.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await.unwrap()
+    }
+
+    /// A `GET` carrying the headers a proxy would have set. Sent as real
+    /// headers rather than handed to a function, so whatever reads them is
+    /// on the path these tests exercise.
+    pub(crate) async fn get_with_headers(
+        app: &axum::Router,
+        uri: &str,
+        extra: &[(&str, &str)],
+    ) -> Response {
+        let mut req = Request::builder().uri(uri);
+        for (name, value) in extra {
+            req = req.header(*name, *value);
+        }
+        app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
     }
 
     pub(crate) async fn post_form(app: &axum::Router, uri: &str, form: &str) -> Response {
@@ -906,5 +1148,130 @@ mod tests {
         .await;
         assert!(page.contains(r#"href="/sign-in""#));
         assert!(!page.contains(r#"href="/chat""#), "a forged cookie opened the chat");
+    }
+
+    #[tokio::test]
+    async fn robots_allows_the_front_page_and_names_the_private_paths() {
+        // Google's entry for the site was still the registrar's parking
+        // page months after launch. A crawler that finds no robots.txt
+        // proceeds anyway, but the sign-in and chat pages carry cookies
+        // and tokens and are worth keeping out of an index, and the
+        // Sitemap line is the one place a crawler is told where to look.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = get_with_headers(&app, "/robots.txt", &[("x-forwarded-host", "goodscout.fyi")]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "text/plain; charset=utf-8");
+        assert_eq!(res.headers()["cache-control"], "public, max-age=86400");
+        let body = body_of(res).await;
+        assert!(body.contains("User-agent: *\n"), "{body}");
+        let disallowed: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("Disallow: "))
+            .collect();
+        // `/healthz` too: a GET that answers `ok` is a thin page an index
+        // would otherwise keep.
+        assert_eq!(disallowed, ["/chat", "/account", "/sign-in", "/auth/", "/healthz"]);
+        // `Allow: /` after every Disallow. A first-match crawler stops at
+        // the first rule that fits, and `/` fits everything; the
+        // longest-match ones do not care either way.
+        let rules: Vec<&str> = body.lines().filter(|l| l.starts_with("Allow: ") || l.starts_with("Disallow: ")).collect();
+        assert_eq!(rules.last(), Some(&"Allow: /"), "{body}");
+        assert_eq!(rules.iter().filter(|l| l.starts_with("Allow: ")).count(), 1, "{body}");
+        assert!(
+            body.contains("Sitemap: https://goodscout.fyi/sitemap.xml"),
+            "the sitemap line does not name the host the request came in on: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn robots_without_a_known_host_names_no_sitemap() {
+        // A Sitemap line has to be an absolute URL, and a wrong one is
+        // worse than none: the crawler would fetch somebody else's sitemap
+        // or give up on ours.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let body = body_of(get(&app, "/robots.txt").await).await;
+        assert!(!body.contains("Sitemap:"), "{body}");
+        assert!(body.contains("Disallow: /chat"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_sitemap_lists_the_front_page_on_the_host_asked_for() {
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        let res = get_with_headers(&app, "/sitemap.xml", &[("host", "goodscout.fyi")]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "application/xml; charset=utf-8");
+        assert_eq!(res.headers()["cache-control"], "public, max-age=86400");
+        let body = body_of(res).await;
+        assert!(body.starts_with("<?xml"), "{body}");
+        assert!(body.contains("<urlset"), "{body}");
+        assert!(body.contains("<loc>https://goodscout.fyi/</loc>"), "{body}");
+        assert_eq!(body.matches("<url>").count(), 1, "one page, one entry: {body}");
+    }
+
+    #[tokio::test]
+    async fn the_sitemap_is_absent_rather_than_wrong_when_the_host_is_unknown() {
+        // The sitemap's whole content is a URL. With no host to build it
+        // from there is nothing true to say, and a crawler told 404 tries
+        // again later rather than indexing an address that is not ours.
+        let (app, _core, _dir) = build_app(None, crate::email::Mailer::Discard).await;
+        assert_eq!(get(&app, "/sitemap.xml").await.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn the_public_host_is_the_first_forwarded_one_and_never_a_url() {
+        let headers = |pairs: &[(&str, &str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    axum::http::HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            h
+        };
+        // The proxy's word over the connection's: behind Traefik the Host
+        // header is what the client sent and the forwarded one is what
+        // the proxy matched, and both are the same in practice — but only
+        // the forwarded one is a statement about the public address.
+        assert_eq!(
+            public_host(&headers(&[("host", "scout.svc"), ("x-forwarded-host", "goodscout.fyi")])).as_deref(),
+            Some("goodscout.fyi")
+        );
+        assert_eq!(public_host(&headers(&[("host", "goodscout.fyi")])).as_deref(), Some("goodscout.fyi"));
+        // A chain of proxies appends, so the client's host is the first.
+        assert_eq!(
+            public_host(&headers(&[("x-forwarded-host", "goodscout.fyi, scout.svc")])).as_deref(),
+            Some("goodscout.fyi")
+        );
+        assert_eq!(public_host(&headers(&[])), None);
+        assert_eq!(public_host(&headers(&[("host", "")])), None);
+        // The host goes into a URL we then hand to a crawler. Anything
+        // that could end the host part early, or smuggle a path, query,
+        // fragment or userinfo in, is refused rather than escaped — the
+        // rule is what a host may contain, not a list of what it may not,
+        // because the list was missing `?` and `#` the first time.
+        for hostile in [
+            "evil.example/goodscout.fyi",
+            "a b",
+            "evil.example@goodscout.fyi",
+            "evil.example?x",
+            "evil.example#x",
+            "a<b",
+            "evil.example\\x",
+            "goodscout.fyi:",
+            "goodscout.fyi:8080x",
+            "[::1]:8080",
+        ] {
+            assert_eq!(public_host(&headers(&[("host", hostile)])), None, "{hostile}");
+        }
+        // A port is legitimate: a local run is `localhost:8080`, and so is
+        // the kubelet's probe.
+        assert_eq!(public_host(&headers(&[("host", "localhost:8080")])).as_deref(), Some("localhost:8080"));
+        // DNS names are case-insensitive, and a `<loc>` should be
+        // canonical, so the spelling is ours rather than the client's.
+        assert_eq!(
+            public_host(&headers(&[("x-forwarded-host", "WWW.Goodscout.FYI")])).as_deref(),
+            Some("www.goodscout.fyi")
+        );
     }
 }

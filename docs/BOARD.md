@@ -6,7 +6,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## In progress
 
-_(nothing)_
+- [ ] **Crawlable front door** — robots.txt, sitemap.xml, meta description and Open Graph tags on the landing page, www redirected to the apex. Google still showed Porkbun's parking page; www needs an A record at the DNS provider first.
 
 ## Next
 

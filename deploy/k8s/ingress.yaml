@@ -10,10 +10,29 @@ spec:
   tls:
     - hosts: ["${SCOUT_DOMAIN}"]
       secretName: scout-tls
+    # Its own secret, not a second name on the one above. cert-manager
+    # issues one certificate per entry, so a www challenge that fails —
+    # a missing DNS record, a rate limit — leaves the apex certificate
+    # untouched instead of taking the whole site's TLS down with it.
+    - hosts: ["www.${SCOUT_DOMAIN}"]
+      secretName: scout-www-tls
   rules:
     # Substituted by scripts/deploy-k3s.sh. A hostname cannot be templated by
     # kubectl alone, and hardcoding it would put the domain in git for no gain.
     - host: "${SCOUT_DOMAIN}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: scout
+                port: { name: http }
+    # Served by the same process, which answers with a 308 to the apex
+    # (`canonical_address` in scout-web). The ingress only has to get the
+    # request there with a valid certificate; without this rule www was
+    # a connection refused, and Google indexed it as a separate site.
+    - host: "www.${SCOUT_DOMAIN}"
       http:
         paths:
           - path: /

@@ -23,6 +23,9 @@ Settled in conversation; the rest of the document follows from them.
 - **Everything flight-shaped moves**: `search_flights`,
   `flight_booking_links`, `create_booking_link` and all seven trip tools live
   in the flight agent. The main agent knows only that `ask_flights` exists.
+  A consequence, accepted: an install with neither flight provider has no
+  trip planning either, where before the trip tools were registered
+  unconditionally.
 - **The specialist sees only a brief.** The main agent writes a
   self-contained request; the flight agent has no history and keeps none.
   Its report carries offer ids, so "book the second one" becomes a new brief
@@ -94,7 +97,9 @@ call and its output today.
   declares a stall only when the pulse is older than `STREAM_STALL`.
 - Failure: if the nested run errors, times out or hits its turn cap, the
   report is still returned with the findings collected so far and a summary
-  that says what went wrong. Only when no finding was collected does `call`
+  that says what went wrong. A final text that is a tool call written as
+  prose (the model's known slip, see `run.rs`) with nothing collected is a
+  failure too, not an empty success. Only when no finding was collected does `call`
   return an error, whose text is a plain sentence for the model to relay.
   Two routes paid for before a failure on the third still come back.
 
@@ -114,9 +119,10 @@ call and its output today.
   with the tool name `ask_flights` and `guidance` below.
 - `FLIGHT_PREAMBLE` is the working half of today's flight rules: it asks
   the airlines rather than the web, works out airport codes itself, passes
-  `flex_days` only when dates are flexible and never more than 3, never
-  repeats a price from earlier, uses the trip tools when a plan spans more
-  than one leg, writes the plan down as it goes, never deletes and rebuilds
+  `flex_days` only when dates are flexible and never more than 3, reports
+  what is missing from a brief rather than guessing or searching, says
+  when it cannot book, uses the trip tools when a plan spans more than one
+  leg, writes the plan down as it goes, never deletes and rebuilds
   a trip, trusts each call's `changed` line and the last snapshot, and
   finalises only when the trip is settled. It ends with: finish with one or
   two sentences saying what was searched and any caveat, and no prices,
@@ -141,7 +147,13 @@ call and its output today.
   - any trip tool ran: quote parked prices as of when they were parked,
     `not_ready` means the trip cannot be priced, present both totals from
     `finalise_trip` and never drop the separate-tickets note.
-  - `markup_rate > 0`: prices already include the fee, say so once.
+  - any finding failed: it is the tool's error, not a result; say the
+    lookup failed and present nothing from it.
+  - `markup_rate > 0` and a priced section is present: prices already
+    include the fee, say so once.
+  - fare expiry ("ask again in a later message rather than repeating a
+    fare") lives in the search section, addressed to the parent, which is
+    the agent that has a memory.
 
 ### `agent.rs`
 

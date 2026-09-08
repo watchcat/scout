@@ -46,7 +46,7 @@ _(nothing)_
 
 ## Done
 
-- [x] **Crawlable front door** — robots.txt, sitemap.xml, meta description and Open Graph tags on the landing page, www redirected to the apex. Google still showed Porkbun's parking page; www needs an A record at the DNS provider first. — `532f30e`, 2026-09-08
+- [x] 2026-09-08 — **Crawlable front door** (`532f30e`): robots.txt, sitemap.xml, meta description and Open Graph tags on the landing page, www redirected to the apex. Google still showed Porkbun's parking page; www needs an A record at the DNS provider first.
 - [x] 2026-09-08 — **Flight agent as a tool** (`39e5d78`): `ask_flights`, a specialist rig agent with the flight prompt and every flight and trip tool, called by the main agent with a brief; findings plus Rust-generated guidance come back, the main prompt lost its flight half, `FLIGHT_MODEL` picks its model, and the stall guard reads a pulse the nested run keeps alive
 - [x] 2026-09-05 — **Two things a web-only user ran into** (`de08a65`): the page's form token now lives as long as the session, so a phone left on the chat keeps sending instead of failing every POST after 15 minutes; `/stat` names an account by its email when it has no Telegram name
 - [x] 2026-09-05 — **Web messages count in `/stat` and toward the daily cap** (`0157c4f`): one `log_request` in the web send path after the ownership check; a refused message still counts for nothing

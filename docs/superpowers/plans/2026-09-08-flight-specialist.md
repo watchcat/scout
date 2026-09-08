@@ -1464,14 +1464,18 @@ In `PREAMBLE` in `crates/scout-core/src/agent.rs`:
 
 ```
 - When ask_flights is available, send it every question about flights, \
-fares, airports, booking a flight, or a trip being planned - never a web \
-search, and never compare_prices, whose per-unit arithmetic means nothing \
-for a flight. It sees nothing of this conversation, so write a \
+fares, airport codes, booking a flight, or a trip being planned - never a \
+web search, and never compare_prices, whose per-unit arithmetic means \
+nothing for a flight. It sees nothing of this conversation, so write a \
 self-contained brief: route, dates, passengers, cabin, whether the dates \
-are flexible, and any offer id the user is pointing at. Its result \
-carries findings and guidance: present the findings following that \
-guidance, and take every number, time and link from the findings \
-verbatim - never from its summary sentence and never from memory.
+are flexible, and any offer id the user is pointing at. If the user has \
+not given something a search needs, ask them before calling it. Its \
+result carries a summary, findings and guidance: present the findings \
+following that guidance, take every number, time and link from the \
+findings verbatim - never from the summary and never from memory - and \
+relay the summary's caveats in plain words (what could not be searched, \
+what is missing, that Scout cannot book). A fare expires within minutes: \
+for a later question, ask ask_flights again rather than repeating one.
 ```
 
 Also fix the opening line so the prompt no longer claims to be only a product assistant: `You are Scout, a product-research assistant living in a Telegram chat.` → `You are Scout, a product and travel research assistant living in a chat.`

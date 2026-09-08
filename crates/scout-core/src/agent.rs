@@ -552,7 +552,7 @@ pub const ALL_TOOLS: &[&str] = &["search_bol", "search_flights", "finalise_trip"
 ///
 /// The conditional phrasing was already there. It was addressed to the
 /// model, which cannot check, rather than to the code, which can.
-fn rules_for_available_tools(preamble: &str, available: &[&str]) -> String {
+pub(crate) fn rules_for_available_tools(preamble: &str, available: &[&str]) -> String {
     preamble
         .split("\n- ")
         .enumerate()
@@ -610,7 +610,7 @@ pub fn preamble_with_profile(
 
 /// A rate as a percentage a person would say aloud: 0.03 -> "3%",
 /// 0.035 -> "3.5%". Trailing zeros make it read like a spec, not a fee.
-fn percentage(rate: f64) -> String {
+pub(crate) fn percentage(rate: f64) -> String {
     let pct = format!("{:.2}", rate * 100.0);
     let pct = pct.trim_end_matches('0').trim_end_matches('.');
     format!("{pct}%")

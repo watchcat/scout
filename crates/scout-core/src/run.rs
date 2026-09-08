@@ -503,6 +503,13 @@ impl Default for Pulse {
 }
 
 impl Pulse {
+    /// A pulse that was last touched `by` ago, so a test can tell a real
+    /// touch apart from the freshness a just-built pulse has anyway.
+    #[cfg(test)]
+    pub(crate) fn aged(by: std::time::Duration) -> Self {
+        Self(std::sync::Mutex::new(tokio::time::Instant::now() - by))
+    }
+
     pub(crate) fn touch(&self) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = tokio::time::Instant::now();
     }

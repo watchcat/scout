@@ -366,12 +366,20 @@ mod tests {
         agent: rig::agent::Agent<M>,
         events: scout_api::EventSink,
     ) -> Specialist<M> {
+        specialist_with_pulse(agent, events, crate::run::Pulse::default())
+    }
+
+    fn specialist_with_pulse<M: rig::completion::CompletionModel>(
+        agent: rig::agent::Agent<M>,
+        events: scout_api::EventSink,
+        pulse: crate::run::Pulse,
+    ) -> Specialist<M> {
         Specialist {
             name: "ask_probe",
             description: "test".to_string(),
             agent,
             events,
-            pulse: std::sync::Arc::new(crate::run::Pulse::default()),
+            pulse: std::sync::Arc::new(pulse),
             guidance: Box::new(|f: &[Finding]| vec![format!("{} ok", f.iter().filter(|x| !x.failed).count())]),
             budget: std::time::Duration::from_secs(5),
         }
@@ -380,7 +388,8 @@ mod tests {
     #[tokio::test]
     async fn a_nested_run_becomes_a_report_of_what_its_tools_returned() {
         let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
-        let tool = specialist(scripted(7, 5), events);
+        let stale = crate::run::Pulse::aged(std::time::Duration::from_secs(60));
+        let tool = specialist_with_pulse(scripted(7, 5), events, stale);
 
         let report = rig::tool::Tool::call(&tool, Brief { brief: "probe seven".to_string() }).await.unwrap();
 

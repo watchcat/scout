@@ -1536,6 +1536,15 @@ impl Store {
         let mut args = Vec::with_capacity(except.len() + 1);
         args.push(older_than_secs);
         args.extend_from_slice(except);
+        // Written once and pasted into all three statements, because they
+        // have to agree exactly. The SELECT below must name the rows the
+        // DELETE removes — no more, no less — or trips get released whose
+        // thread survives, or a thread dies leaving a trip pointed at an id
+        // that is gone. Two copies of a predicate drift; one cannot.
+        let doomed = format!(
+            "WHERE NOT pinned
+               AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?){not_running}"
+        );
 
         let conn = self.conn();
         conn.execute_batch("BEGIN")?;
@@ -1550,18 +1559,27 @@ impl Store {
             conn.execute(
                 &format!(
                     "DELETE FROM messages WHERE conversation_id IN (
-                         SELECT id FROM conversations
-                         WHERE NOT pinned
-                           AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?){not_running})"
+                         SELECT id FROM conversations {doomed})"
                 ),
                 duckdb::params_from_iter(args.iter()),
             )?;
+            // Which threads are about to go, read before the DELETE because
+            // afterwards there is nothing left to join against.
+            let mut stmt = conn.prepare(&format!("SELECT id FROM conversations {doomed}"))?;
+            let doomed_ids: Vec<i64> = stmt
+                .query_map(duckdb::params_from_iter(args.iter()), |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(stmt);
+            // Released, not deleted. `delete_conversation` cascades because
+            // somebody pressed Delete; this is a timer, and a timer must not
+            // destroy a plan the traveller is still building.
+            //
+            // `doomed_ids` is empty on every sweep that expires nothing,
+            // which is the normal hourly case — `detach_trips_within` guards
+            // that, since `IN ()` is a parser error rather than an empty set.
+            detach_trips_within(&conn, &doomed_ids)?;
             let gone = conn.execute(
-                &format!(
-                    "DELETE FROM conversations
-                     WHERE NOT pinned
-                       AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?){not_running}"
-                ),
+                &format!("DELETE FROM conversations {doomed}"),
                 duckdb::params_from_iter(args.iter()),
             )?;
             conn.execute(
@@ -2544,10 +2562,12 @@ impl Store {
     /// Releases the trips owned by these conversations without touching the
     /// trips themselves.
     ///
-    /// Expiry (a later task) will use this, and the distinction it draws is
-    /// the whole point of the feature: a thread that a *timer* removed must
-    /// not take a travel plan with it. Only `delete_conversation` — someone
-    /// pressed Delete — will cascade, once that task lands.
+    /// The distinction this draws is the whole point of the feature: a
+    /// thread that a *timer* removed must not take a travel plan with it.
+    /// Only `delete_conversation` — someone pressed Delete — cascades.
+    /// `expire_conversations` reaches `detach_trips_within` directly, being
+    /// already inside its own transaction; this is the entry point for a
+    /// caller that is not.
     pub fn detach_trips_of(&self, conversation_ids: &[i64]) -> Result<usize> {
         if conversation_ids.is_empty() {
             return Ok(0);
@@ -5819,6 +5839,77 @@ CREATE TABLE conversations (
         assert_eq!(s.expire_conversations(48 * 3600, &[]).unwrap(), 0, "no conversation expired");
 
         assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "orphaned messages were not swept");
+    }
+
+    #[test]
+    fn an_expired_thread_releases_its_trip_instead_of_destroying_it() {
+        // The single most important test in this feature. Threads expire on
+        // a 48-hour timer; trips are built over weeks. If expiry ever
+        // cascades the way `delete_conversation` does, every travel plan
+        // disappears two days after its chat goes quiet — silently, with
+        // nothing to undo. This test is what stands in the way.
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let stale = s.start_conversation(a, "direct").unwrap();
+        let trip = s.upsert_trip(a, "Japan in spring", None, None, Some(stale)).unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(72 * 3600) WHERE id = {stale};"
+            ))
+            .unwrap();
+
+        let gone = s.expire_conversations(48 * 3600, &[]).unwrap();
+
+        assert_eq!(gone, 1, "the stale thread expired");
+        assert!(s.find_trip(a, "Japan in spring").unwrap().is_some(), "a timer must never destroy a travel plan");
+        assert_eq!(s.trip_owner(trip.id).unwrap(), None, "and the dead link is released");
+    }
+
+    #[test]
+    fn a_pinned_thread_past_the_idle_window_keeps_its_trip() {
+        // The release only applies to threads that actually die. A `SELECT`
+        // "simplified" by dropping `NOT pinned` would still name this thread
+        // — the DELETE would spare it, and its trip would be cut loose from
+        // a conversation that is very much alive.
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let pinned = s.start_conversation(a, "direct").unwrap();
+        let trip = s.upsert_trip(a, "Japan in spring", None, None, Some(pinned)).unwrap();
+        s.set_thread_pinned(a, pinned, true).unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(72 * 3600) WHERE id = {pinned};"
+            ))
+            .unwrap();
+
+        assert_eq!(s.expire_conversations(48 * 3600, &[]).unwrap(), 0, "a pinned thread does not expire");
+
+        assert_eq!(s.trip_owner(trip.id).unwrap(), Some(pinned), "a thread that is still alive kept its trip");
+    }
+
+    #[test]
+    fn a_thread_with_a_run_in_flight_keeps_its_trip() {
+        // Same trap from the other side: a `SELECT` that ignores `except`
+        // names a thread the DELETE spares, and the trip of a conversation
+        // that is mid-answer is orphaned under it.
+        //
+        // Two ids in `except` for the reason
+        // `expiry_leaves_alone_a_thread_named_as_still_running` gives: one id
+        // never exercises the placeholder join.
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let running = s.start_conversation(a, "direct").unwrap();
+        let also_running = s.start_conversation(a, "direct").unwrap();
+        let trip = s.upsert_trip(a, "Japan in spring", None, None, Some(running)).unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(72 * 3600) WHERE id IN ({running}, {also_running});"
+            ))
+            .unwrap();
+
+        assert_eq!(s.expire_conversations(48 * 3600, &[running, also_running]).unwrap(), 0, "both threads were named as running");
+
+        assert_eq!(s.trip_owner(trip.id).unwrap(), Some(running), "a thread still writing its answer kept its trip");
     }
 
     #[test]

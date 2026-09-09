@@ -505,6 +505,10 @@ In `expire_conversations`, inside the transaction closure and **before** the `DE
             // Released, not deleted. `delete_conversation` cascades because
             // somebody pressed Delete; this is a timer, and a timer must not
             // destroy a plan the traveller is still building.
+            //
+            // `doomed` is empty on every sweep that expires nothing, which is
+            // the normal hourly case. `detach_trips_within` guards that —
+            // an `IN ()` is a parser error, not an empty set.
             detach_trips_within(&conn, &doomed)?;
 ```
 

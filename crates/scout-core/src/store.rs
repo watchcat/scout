@@ -2438,9 +2438,11 @@ impl Store {
     }
 
     /// Creates the trip if the name is new, otherwise updates only what was
-    /// supplied. Two statements rather than one `ON CONFLICT DO UPDATE`: with
-    /// upsert, an unsupplied `adults` would arrive as the insert's default and
-    /// overwrite a value already set.
+    /// supplied. Separate statements rather than one `ON CONFLICT DO UPDATE`:
+    /// with upsert, an unsupplied `adults` would arrive as the insert's
+    /// default and overwrite a value already set. `conversation_id` fills the
+    /// owner only if there isn't one: the creating chat keeps a trip, an
+    /// orphan is adopted.
     pub fn upsert_trip(
         &self,
         account_id: i64,
@@ -2462,7 +2464,10 @@ impl Store {
         )?;
         // Only ever fills a hole. `IS NULL` is what makes the creator keep
         // the trip while an orphan gets adopted, in one statement and with
-        // no second code path.
+        // no second code path. No `updated_at` bump here, unlike the
+        // updates below: adoption is bookkeeping, not an edit, and bumping
+        // it would reorder the traveller's trip list just because a
+        // different chat mentioned the trip.
         if let Some(conversation_id) = conversation_id {
             conn.execute(
                 "UPDATE trips SET conversation_id = ?
@@ -2505,7 +2510,8 @@ impl Store {
     }
 
     /// Which conversation owns this trip, if any. Test and diagnostic
-    /// support: production reads it through `Plan`.
+    /// support today; a later task has `Plan` carry it so production reads
+    /// ownership through there instead.
     pub fn trip_owner(&self, trip_id: i64) -> Result<Option<i64>> {
         let conn = self.conn();
         Ok(conn.query_row(
@@ -2518,10 +2524,10 @@ impl Store {
     /// Releases the trips owned by these conversations without touching the
     /// trips themselves.
     ///
-    /// This is what expiry uses, and the distinction it draws is the whole
-    /// point of the feature: a thread that a *timer* removed must not take a
-    /// travel plan with it. Only `delete_conversation` — someone pressed
-    /// Delete — cascades.
+    /// Expiry (a later task) will use this, and the distinction it draws is
+    /// the whole point of the feature: a thread that a *timer* removed must
+    /// not take a travel plan with it. Only `delete_conversation` — someone
+    /// pressed Delete — will cascade, once that task lands.
     pub fn detach_trips_of(&self, conversation_ids: &[i64]) -> Result<usize> {
         if conversation_ids.is_empty() {
             return Ok(0);
@@ -2952,6 +2958,12 @@ fn touch(conn: &Connection, trip_id: i64) -> Result<()> {
 /// `detach_trips_of`'s body, taking a connection so a caller already inside
 /// a transaction can use it.
 fn detach_trips_within(conn: &Connection, conversation_ids: &[i64]) -> Result<usize> {
+    // `IN ()` is a parser error, not an empty set — the same trap
+    // `expire_conversations` documents. The transactional caller passes a
+    // SELECT result that is empty on every sweep that expires nothing.
+    if conversation_ids.is_empty() {
+        return Ok(0);
+    }
     let holes = ["?"].repeat(conversation_ids.len()).join(", ");
     Ok(conn.execute(
         &format!("UPDATE trips SET conversation_id = NULL WHERE conversation_id IN ({holes})"),
@@ -4298,13 +4310,32 @@ CREATE TABLE segment_candidates (
     }
 
     #[test]
-    fn a_trip_made_with_no_conversation_stays_unowned() {
-        // Telegram group flows and tests both create trips without a
-        // conversation. That must be a plain None, not a panic or a zero.
+    fn detach_trips_within_an_empty_slice_is_a_no_op_not_a_syntax_error() {
+        // `expire_conversations` (a later task) will call this inside its own
+        // transaction with a SELECT result that is empty on every sweep that
+        // expired nothing — the ordinary hourly case, not an edge case.
+        // `IN ()` is a parser error in DuckDB, so the guard has to live here,
+        // not only in `detach_trips_of`'s early return, which a transactional
+        // caller bypasses entirely.
+        let (store, _dir) = test_store();
+        let conn = store.conn();
+        assert_eq!(detach_trips_within(&conn, &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_upsert_that_names_no_conversation_leaves_an_existing_owner_alone() {
+        // Every current caller passes None here — no tool threads a real
+        // conversation id yet, so this path runs on essentially every
+        // upsert in production. If it unconditionally wrote NULL, it would
+        // silently orphan a live trip on the very first edit after it was
+        // created.
         let (store, _dir) = test_store();
         let account = store.account_for_telegram(1).unwrap();
-        let trip = store.upsert_trip(account, "Japan in spring", None, None, None).unwrap();
-        assert_eq!(store.trip_owner(trip.id).unwrap(), None);
+        let trip = store.upsert_trip(account, "Japan in spring", None, None, Some(11)).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(11));
+
+        store.upsert_trip(account, "Japan in spring", Some(2), None, None).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(11), "an upsert naming no chat must not clear the owner");
     }
 
     /// `trips` exactly as it stood at schema version 8, before

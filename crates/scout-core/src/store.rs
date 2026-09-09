@@ -1463,6 +1463,26 @@ impl Store {
                 return Ok(false);
             }
             conn.execute("DELETE FROM messages WHERE conversation_id = ?", params![conversation_id])?;
+            // The trips this thread owns go with it. Inside this same
+            // transaction: a cascade that can half-happen would leave a trip
+            // pointing at a conversation that no longer exists.
+            //
+            // Only here. `expire_conversations` detaches instead — see
+            // `detach_trips_within`. That difference is the feature.
+            conn.execute(
+                "DELETE FROM segment_candidates WHERE trip_id IN
+                     (SELECT id FROM trips WHERE conversation_id = ?)",
+                params![conversation_id],
+            )?;
+            conn.execute(
+                "DELETE FROM trip_segments WHERE trip_id IN
+                     (SELECT id FROM trips WHERE conversation_id = ?)",
+                params![conversation_id],
+            )?;
+            conn.execute(
+                "DELETE FROM trips WHERE conversation_id = ?",
+                params![conversation_id],
+            )?;
             Ok(true)
         })();
         match result {
@@ -5657,6 +5677,46 @@ CREATE TABLE conversations (
         assert!(s.delete_conversation(a, id).unwrap());
         assert!(s.threads_of(a).unwrap().is_empty());
         assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "messages outlived their thread");
+    }
+
+    #[test]
+    fn deleting_a_thread_deletes_the_trip_it_owns_and_nothing_else() {
+        // Pressing Delete is a decision, so it takes the plan with it. The
+        // trip owned by another thread is the control: a cascade that is
+        // too wide is worse than none.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let doomed = store.start_conversation(account, "direct").unwrap();
+        let spared = store.start_conversation(account, "direct").unwrap();
+
+        let a = store.upsert_trip(account, "Atlantic loop", None, None, Some(doomed)).unwrap();
+        store.upsert_trip(account, "Japan in spring", None, None, Some(spared)).unwrap();
+        store.add_segment(a.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+
+        assert!(store.delete_conversation(account, doomed).unwrap());
+
+        assert!(store.find_trip(account, "Atlantic loop").unwrap().is_none(), "its trip goes with it");
+        assert!(store.find_trip(account, "Japan in spring").unwrap().is_some(), "another thread's trip stays");
+        let orphans: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM trip_segments WHERE trip_id = ?", params![a.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "a deleted trip leaves no segments behind");
+    }
+
+    #[test]
+    fn deleting_a_thread_leaves_an_unowned_trip_alone() {
+        // `conversation_id IS NULL` is not what `= ?` matches — a trip
+        // nobody owns must not vanish just because some other thread on the
+        // same account got deleted.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let id = store.start_conversation(account, "direct").unwrap();
+        store.upsert_trip(account, "Orphaned already", None, None, None).unwrap();
+
+        assert!(store.delete_conversation(account, id).unwrap());
+
+        assert!(store.find_trip(account, "Orphaned already").unwrap().is_some(), "an unowned trip was swept up");
     }
 
     #[test]

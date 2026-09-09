@@ -822,6 +822,7 @@ impl Tool for AddTripSegmentTool {
                 &args.trip,
                 args.adults,
                 args.cabin_class.as_deref(),
+                None,
             )?;
             store
                 .add_segment(trip.id, args.position, &origin, &destination, &date)

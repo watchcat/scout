@@ -2447,6 +2447,7 @@ impl Store {
         name: &str,
         adults: Option<i64>,
         cabin_class: Option<&str>,
+        conversation_id: Option<i64>,
     ) -> Result<Trip> {
         let name = name.trim();
         if name.is_empty() {
@@ -2459,6 +2460,16 @@ impl Store {
              ON CONFLICT (account_id, name_key) DO NOTHING",
             params![account_id, name, key],
         )?;
+        // Only ever fills a hole. `IS NULL` is what makes the creator keep
+        // the trip while an orphan gets adopted, in one statement and with
+        // no second code path.
+        if let Some(conversation_id) = conversation_id {
+            conn.execute(
+                "UPDATE trips SET conversation_id = ?
+                 WHERE account_id = ? AND name_key = ? AND conversation_id IS NULL",
+                params![conversation_id, account_id, key],
+            )?;
+        }
         // A freshly created trip already starts in `planning`, and a call
         // that supplies neither field is how find-or-create works — it must
         // stay inert. Only an edit to an *existing* trip's price-relevant
@@ -2491,6 +2502,32 @@ impl Store {
             |row| row.get(0),
         )?;
         load_trip(&conn, id)
+    }
+
+    /// Which conversation owns this trip, if any. Test and diagnostic
+    /// support: production reads it through `Plan`.
+    pub fn trip_owner(&self, trip_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn();
+        Ok(conn.query_row(
+            "SELECT conversation_id FROM trips WHERE id = ?",
+            params![trip_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Releases the trips owned by these conversations without touching the
+    /// trips themselves.
+    ///
+    /// This is what expiry uses, and the distinction it draws is the whole
+    /// point of the feature: a thread that a *timer* removed must not take a
+    /// travel plan with it. Only `delete_conversation` — someone pressed
+    /// Delete — cascades.
+    pub fn detach_trips_of(&self, conversation_ids: &[i64]) -> Result<usize> {
+        if conversation_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn();
+        detach_trips_within(&conn, conversation_ids)
     }
 
     /// Used by finalisation to record that a trip has been priced.
@@ -2910,6 +2947,16 @@ fn touch(conn: &Connection, trip_id: i64) -> Result<()> {
         params![trip_id],
     )?;
     Ok(())
+}
+
+/// `detach_trips_of`'s body, taking a connection so a caller already inside
+/// a transaction can use it.
+fn detach_trips_within(conn: &Connection, conversation_ids: &[i64]) -> Result<usize> {
+    let holes = ["?"].repeat(conversation_ids.len()).join(", ");
+    Ok(conn.execute(
+        &format!("UPDATE trips SET conversation_id = NULL WHERE conversation_id IN ({holes})"),
+        duckdb::params_from_iter(conversation_ids.iter()),
+    )?)
 }
 
 /// Reads one whole trip. Takes `&Connection` rather than `&Store` so it can
@@ -4191,7 +4238,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_trip_is_found_by_name_case_insensitively_and_scoped_to_its_owner() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         assert_eq!(trip.name, "September");
         assert_eq!(trip.adults, 1, "one adult unless said otherwise");
         assert_eq!(trip.status, "planning");
@@ -4201,7 +4248,7 @@ CREATE TABLE segment_candidates (
         assert!(store.find_trip(8, "September").unwrap().is_none(), "another user has no such trip");
 
         // Same name twice is the same trip, not a second one.
-        store.upsert_trip(7, "SEPTEMBER", Some(2), Some("business")).unwrap();
+        store.upsert_trip(7, "SEPTEMBER", Some(2), Some("business"), None).unwrap();
         assert_eq!(store.list_trips(7).unwrap().len(), 1);
         let trip = store.find_trip(7, "September").unwrap().unwrap();
         assert_eq!(trip.adults, 2);
@@ -4209,7 +4256,7 @@ CREATE TABLE segment_candidates (
         assert_eq!(trip.name, "September", "the original spelling is kept");
 
         // Two users may each have a "September".
-        store.upsert_trip(8, "September", None, None).unwrap();
+        store.upsert_trip(8, "September", None, None, None).unwrap();
         assert_eq!(store.list_trips(8).unwrap().len(), 1);
     }
 
@@ -4219,12 +4266,45 @@ CREATE TABLE segment_candidates (
         // state a trip reaches by outliving its chat, not an error.
         let (store, _d) = test_store();
         let account = store.account_for_telegram(1).unwrap();
-        let trip = store.upsert_trip(account, "Atlantic loop", None, None).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
         let owner: Option<i64> = store
             .conn()
             .query_row("SELECT conversation_id FROM trips WHERE id = ?", params![trip.id], |r| r.get(0))
             .unwrap();
         assert_eq!(owner, None, "a trip made outside a conversation has no owner");
+    }
+
+    #[test]
+    fn the_chat_that_made_a_trip_keeps_it_and_an_orphan_is_adopted() {
+        // Ownership is single because the composer needs exactly one place
+        // to send to. A live owner is never displaced: otherwise deleting
+        // your most recent chat would destroy a trip whose original
+        // planning thread is still sitting there.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, Some(11)).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(11));
+
+        // A second chat extending the same trip must NOT take it.
+        store.upsert_trip(account, "atlantic loop", None, None, Some(22)).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(11), "a live owner is never displaced");
+
+        // Orphaned, then touched again: adopted.
+        store.detach_trips_of(&[11]).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), None);
+        store.upsert_trip(account, "Atlantic loop", None, None, Some(33)).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(33), "an orphan is adopted");
+    }
+
+    #[test]
+    fn a_trip_made_with_no_conversation_stays_unowned() {
+        // Telegram group flows and tests both create trips without a
+        // conversation. That must be a plain None, not a panic or a zero.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Japan in spring", None, None, None).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), None);
     }
 
     /// `trips` exactly as it stood at schema version 8, before
@@ -4281,9 +4361,9 @@ CREATE TABLE trips (
         // `ON CONFLICT DO UPDATE SET adults = ?, cabin_class = ?` would
         // silently null out whichever field this call didn't mention.
         let (store, _d) = test_store();
-        store.upsert_trip(7, "September", Some(2), Some("business")).unwrap();
+        store.upsert_trip(7, "September", Some(2), Some("business"), None).unwrap();
 
-        let trip = store.upsert_trip(7, "September", Some(3), None).unwrap();
+        let trip = store.upsert_trip(7, "September", Some(3), None, None).unwrap();
         assert_eq!(trip.adults, 3);
         assert_eq!(
             trip.cabin_class.as_deref(),
@@ -4291,7 +4371,7 @@ CREATE TABLE trips (
             "cabin class must survive an upsert that didn't mention it"
         );
 
-        let trip = store.upsert_trip(7, "September", None, Some("economy")).unwrap();
+        let trip = store.upsert_trip(7, "September", None, Some("economy"), None).unwrap();
         assert_eq!(trip.adults, 3, "adults must survive an upsert that didn't mention it");
         assert_eq!(trip.cabin_class.as_deref(), Some("economy"));
     }
@@ -4299,17 +4379,17 @@ CREATE TABLE trips (
     #[test]
     fn changing_adults_or_cabin_class_resets_a_finalised_trip_to_planning() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", Some(2), Some("business")).unwrap();
+        let trip = store.upsert_trip(7, "September", Some(2), Some("business"), None).unwrap();
 
         store.set_trip_status(trip.id, "finalised").unwrap();
-        let trip = store.upsert_trip(7, "September", Some(3), None).unwrap();
+        let trip = store.upsert_trip(7, "September", Some(3), None, None).unwrap();
         assert_eq!(
             trip.status, "planning",
             "changing the passenger count invalidates a finalised trip's prices"
         );
 
         store.set_trip_status(trip.id, "finalised").unwrap();
-        let trip = store.upsert_trip(7, "September", None, Some("economy")).unwrap();
+        let trip = store.upsert_trip(7, "September", None, Some("economy"), None).unwrap();
         assert_eq!(
             trip.status, "planning",
             "changing cabin class invalidates a finalised trip's prices"
@@ -4317,7 +4397,7 @@ CREATE TABLE trips (
 
         // find-or-create — supplying neither field — must stay inert.
         store.set_trip_status(trip.id, "finalised").unwrap();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         assert_eq!(
             trip.status, "finalised",
             "an upsert with nothing to change must not reset status"
@@ -4330,7 +4410,7 @@ CREATE TABLE trips (
         // second leg"), so a hole would make every later instruction target
         // the wrong row.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
             store.add_segment(trip.id, None, o, d, date).unwrap();
         }
@@ -4355,7 +4435,7 @@ CREATE TABLE trips (
     #[test]
     fn editing_a_trip_puts_it_back_to_planning() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
         store.set_trip_status(trip.id, "finalised").unwrap();
         assert_eq!(store.find_trip(7, "September").unwrap().unwrap().status, "finalised");
@@ -4396,7 +4476,7 @@ CREATE TABLE trips (
     #[test]
     fn a_segment_holds_several_options_and_at_most_one_is_chosen() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
 
         // Parked undecided: the traveller is comparing a nonstop against a
@@ -4455,7 +4535,7 @@ CREATE TABLE trips (
         // "option 2", dropped it, and later says "go with option 2" would
         // silently be given a different flight under the same name.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
         store
             .add_candidate(
@@ -4515,7 +4595,7 @@ CREATE TABLE trips (
             .unwrap_err();
         assert_eq!(err.to_string(), "no such trip", "a nonexistent trip must not be reported as a missing segment");
 
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let err = store
             .add_candidate(
                 trip.id,
@@ -4537,7 +4617,7 @@ CREATE TABLE trips (
         // The ordinary path — "book me on this one" — must not need a second
         // call to say what it obviously meant.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
         let trip = store
             .add_candidate(
@@ -4558,7 +4638,7 @@ CREATE TABLE trips (
         // candidates would silently reattach somebody's chosen flight to a
         // different route while the trip still looked perfectly well-formed.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         for (o, d, date) in [
             ("AMS", "NRT", "2026-09-03"),
             ("NRT", "OSA", "2026-09-10"),
@@ -4648,7 +4728,7 @@ CREATE TABLE trips (
     #[test]
     fn the_bounds_error_reads_correctly_with_exactly_one_segment() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
 
         let err = store.add_segment(trip.id, Some(5), "LIS", "FCO", "2026-09-07").unwrap_err();
@@ -4669,7 +4749,7 @@ CREATE TABLE trips (
         // caller says it validated rather than trusting the earlier read
         // to still be true.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
 
         let err = store
@@ -4729,7 +4809,7 @@ CREATE TABLE trips (
         // a numbering mistake on a trip that still exists. choose_candidate
         // has to check the trip itself first so the two are told apart.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
         store
             .add_candidate(
@@ -4752,7 +4832,7 @@ CREATE TABLE trips (
         // the only way to honour one was to delete the trip and rebuild —
         // which is exactly what happened in production.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "HND", "AMS", "2026-09-27").unwrap();
         store
             .add_candidate(
@@ -4785,7 +4865,7 @@ CREATE TABLE trips (
         // Restating the same date must not throw away work, the same way an
         // upsert that supplies nothing leaves a trip alone.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "HND", "AMS", "2026-09-27").unwrap();
         store
             .add_candidate(
@@ -4815,7 +4895,7 @@ CREATE TABLE trips (
     fn deleting_a_trip_takes_its_segments_and_options_with_it() {
         // Creating a trip is a side effect of a typo, so a typo needs an undo.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Setpember", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Setpember", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
         store
             .add_candidate(
@@ -4832,7 +4912,7 @@ CREATE TABLE trips (
         assert!(!store.delete_trip(7, "Setpember").unwrap(), "deleting twice is not an error");
 
         // Another user's trip of the same name is untouched.
-        store.upsert_trip(8, "Setpember", None, None).unwrap();
+        store.upsert_trip(8, "Setpember", None, None, None).unwrap();
         assert!(!store.delete_trip(7, "Setpember").unwrap());
         assert!(store.find_trip(8, "Setpember").unwrap().is_some());
     }

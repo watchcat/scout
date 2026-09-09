@@ -82,7 +82,7 @@ pub async fn seed_trip_for_tests(core: &Core, account_id: i64, name: &str) -> an
     let store = core.store();
     let name = name.to_string();
     blocking(move || {
-        let trip = store.upsert_trip(account_id, &name, Some(2), Some("economy"))?;
+        let trip = store.upsert_trip(account_id, &name, Some(2), Some("economy"), None)?;
         let trip = store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12")?;
         let trip = store.add_candidate(
             trip.id,

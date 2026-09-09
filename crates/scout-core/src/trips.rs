@@ -5,7 +5,7 @@
 //! handle live offers: those remain flight-agent responsibilities.
 
 use crate::core::{blocking, Core};
-use crate::store::{CandidateChoice, ExpectedSegment, NewCandidate, Trip};
+use crate::store::{CandidateChoice, ExpectedSegment, NewCandidate, Trip, TripChat};
 
 /// A trip plus the same readiness and connection warnings the flight agent
 /// sees. One representation keeps chat and the visual client from disagreeing
@@ -16,10 +16,13 @@ pub struct Plan {
     pub trip: Trip,
     pub not_ready: Option<String>,
     pub notes: Vec<String>,
+    /// The chat this trip belongs to. `None` is orphaned — an ordinary
+    /// state, reached by outliving the chat that made it.
+    pub chat: Option<TripChat>,
 }
 
 impl Plan {
-    fn from_trip(trip: Trip) -> Self {
+    fn from_trip(trip: Trip, chat: Option<TripChat>) -> Self {
         let not_ready = crate::tools::trips::ready_to_price(&trip.segments)
             .err()
             .or_else(|| crate::tools::trips::dates_run_forwards(&trip.segments).err());
@@ -28,6 +31,7 @@ impl Plan {
             trip,
             not_ready,
             notes,
+            chat,
         }
     }
 }
@@ -36,7 +40,9 @@ impl Plan {
 /// are ordinary races in a browser tab, not internal errors.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Selection {
-    Chosen(Plan),
+    // Boxed: `Plan` grew a `chat` field and tipped this enum over clippy's
+    // large-enum-variant threshold against the unit variants beside it.
+    Chosen(Box<Plan>),
     TripNotFound,
     CandidateNotFound,
 }
@@ -45,9 +51,18 @@ pub enum Selection {
 pub async fn list(core: &Core, account_id: i64) -> anyhow::Result<Vec<Plan>> {
     let store = core.store();
     blocking(move || {
+        // One `trip_chat` read per trip rather than a second query shape: an
+        // account's trip list is the handful of itineraries a traveller is
+        // actively planning, not a table a client paginates, so the extra
+        // round trips are not worth the JOIN-in-list_trips complexity.
         store
-            .list_trips(account_id)
-            .map(|trips| trips.into_iter().map(Plan::from_trip).collect())
+            .list_trips(account_id)?
+            .into_iter()
+            .map(|trip| {
+                let chat = store.trip_chat(trip.id)?;
+                Ok(Plan::from_trip(trip, chat))
+            })
+            .collect()
     })
     .await
 }
@@ -65,10 +80,13 @@ pub async fn choose(
     blocking(move || {
         store
             .choose_candidate_for_account(account_id, &trip_name, position, candidate)
-            .map(|outcome| match outcome {
-                CandidateChoice::Chosen(trip) => Selection::Chosen(Plan::from_trip(trip)),
-                CandidateChoice::TripNotFound => Selection::TripNotFound,
-                CandidateChoice::CandidateNotFound => Selection::CandidateNotFound,
+            .and_then(|outcome| match outcome {
+                CandidateChoice::Chosen(trip) => {
+                    let chat = store.trip_chat(trip.id)?;
+                    Ok(Selection::Chosen(Box::new(Plan::from_trip(trip, chat))))
+                }
+                CandidateChoice::TripNotFound => Ok(Selection::TripNotFound),
+                CandidateChoice::CandidateNotFound => Ok(Selection::CandidateNotFound),
             })
     })
     .await
@@ -126,7 +144,10 @@ pub async fn seed_trip_for_tests(core: &Core, account_id: i64, name: &str) -> an
             },
             false,
         )?;
-        Ok(Plan::from_trip(trip))
+        // upsert_trip above was called with conversation_id: None, so this
+        // trip is orphaned by construction — no store round trip needed to
+        // know that.
+        Ok(Plan::from_trip(trip, None))
     })
     .await
 }
@@ -178,6 +199,73 @@ mod tests {
         assert_eq!(
             choose(&core, stranger, "October", 1, 1).await.unwrap(),
             Selection::TripNotFound,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_names_the_chat_it_belongs_to() {
+        // The composer has to say where a message will land. An orphan says
+        // so by carrying None, which the client renders as "a new chat".
+        let (core, _dir, account_id) = core().await;
+        let store = core.store();
+        let conversation_id = store.start_conversation(account_id, "direct").unwrap();
+        store
+            .set_thread_title(account_id, conversation_id, "Cheap flights in October")
+            .unwrap();
+        store
+            .upsert_trip(account_id, "October", Some(2), Some("economy"), Some(conversation_id))
+            .unwrap();
+
+        let plans = list(&core, account_id).await.unwrap();
+        let chat = plans[0]
+            .chat
+            .as_ref()
+            .expect("a trip made in a chat must name it on the plan");
+        assert_eq!(chat.id, conversation_id);
+        assert_eq!(chat.title.as_deref(), Some("Cheap flights in October"));
+        assert_eq!(chat.scope, "direct");
+    }
+
+    #[tokio::test]
+    async fn a_trip_that_outlived_its_chat_names_no_chat() {
+        // `conversation_id IS NULL` — and, via the JOIN in `trip_chat`, a
+        // `conversation_id` pointing nowhere — must both read as `None`, not
+        // an error and not a struct with some fields missing.
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+
+        let plans = list(&core, account_id).await.unwrap();
+        assert_eq!(plans[0].chat, None);
+    }
+
+    #[tokio::test]
+    async fn a_plans_chat_serializes_the_way_the_web_client_expects() {
+        let (core, _dir, account_id) = core().await;
+        let store = core.store();
+        let conversation_id = store.start_conversation(account_id, "direct").unwrap();
+        store
+            .set_thread_title(account_id, conversation_id, "Cheap flights in October")
+            .unwrap();
+        store
+            .upsert_trip(account_id, "October", Some(2), Some("economy"), Some(conversation_id))
+            .unwrap();
+        seed_trip_for_tests(&core, account_id, "Orphaned").await.unwrap();
+
+        let plans = list(&core, account_id).await.unwrap();
+        let owned = plans.iter().find(|p| p.trip.name == "October").unwrap();
+        let orphaned = plans.iter().find(|p| p.trip.name == "Orphaned").unwrap();
+
+        assert_eq!(
+            serde_json::to_value(owned).unwrap()["chat"],
+            serde_json::json!({
+                "id": conversation_id,
+                "title": "Cheap flights in October",
+                "scope": "direct",
+            }),
+        );
+        assert_eq!(
+            serde_json::to_value(orphaned).unwrap()["chat"],
+            serde_json::Value::Null,
         );
     }
 }

@@ -336,6 +336,17 @@ pub struct TripCandidate {
     pub source: Option<String>,
 }
 
+/// The conversation a trip belongs to, as much of it as a client needs to
+/// name the place a message will land.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TripChat {
+    pub id: i64,
+    pub title: Option<String>,
+    /// `direct` is the thread web and 1:1 Telegram share. Anything else is
+    /// a room the web client must not post into.
+    pub scope: String,
+}
+
 /// A candidate on its way into the database.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewCandidate {
@@ -2563,6 +2574,25 @@ impl Store {
         )?)
     }
 
+    /// The conversation that owns this trip, if it still exists. A `JOIN`,
+    /// not two reads: a trip whose `conversation_id` points at a row that is
+    /// gone must read as orphaned rather than as a chat with missing fields.
+    pub fn trip_chat(&self, trip_id: i64) -> Result<Option<TripChat>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.title, c.scope FROM trips t
+             JOIN conversations c ON c.id = t.conversation_id
+             WHERE t.id = ?",
+        )?;
+        let chat = stmt
+            .query_map(params![trip_id], |r| {
+                Ok(TripChat { id: r.get(0)?, title: r.get(1)?, scope: r.get(2)? })
+            })?
+            .next()
+            .transpose()?;
+        Ok(chat)
+    }
+
     /// Used by finalisation to record that a trip has been priced.
     pub fn set_trip_status(&self, trip_id: i64, status: &str) -> Result<()> {
         let conn = self.conn();
@@ -4353,6 +4383,50 @@ CREATE TABLE segment_candidates (
         assert_eq!(store.trip_owner(trip.id).unwrap(), None);
         store.upsert_trip(account, "Atlantic loop", None, None, Some(33)).unwrap();
         assert_eq!(store.trip_owner(trip.id).unwrap(), Some(33), "an orphan is adopted");
+    }
+
+    #[test]
+    fn trip_chat_names_the_conversation_that_owns_the_trip() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let conversation_id = store.start_conversation(account, "direct").unwrap();
+        store.set_thread_title(account, conversation_id, "Cheap flights in October").unwrap();
+        let trip = store
+            .upsert_trip(account, "Atlantic loop", None, None, Some(conversation_id))
+            .unwrap();
+
+        assert_eq!(
+            store.trip_chat(trip.id).unwrap(),
+            Some(TripChat {
+                id: conversation_id,
+                title: Some("Cheap flights in October".to_string()),
+                scope: "direct".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn trip_chat_is_none_for_an_orphan_and_for_a_conversation_row_that_is_gone() {
+        // `conversation_id IS NULL` is the ordinary orphan. A `conversation_id`
+        // that points at a row which no longer exists is not supposed to
+        // happen — `delete_conversation` and expiry both clear it first — but
+        // the read must not depend on that holding: a `LEFT JOIN` here would
+        // silently promote the dangling id into a phantom chat in the UI, so
+        // this proves the `JOIN` drops it instead.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let orphan = store.upsert_trip(account, "Orphaned", None, None, None).unwrap();
+        assert_eq!(store.trip_chat(orphan.id).unwrap(), None);
+
+        let conversation_id = store.start_conversation(account, "direct").unwrap();
+        let dangling = store
+            .upsert_trip(account, "Dangling", None, None, Some(conversation_id))
+            .unwrap();
+        store
+            .conn()
+            .execute("DELETE FROM conversations WHERE id = ?", params![conversation_id])
+            .unwrap();
+        assert_eq!(store.trip_chat(dangling.id).unwrap(), None);
     }
 
     #[test]

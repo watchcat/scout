@@ -1,8 +1,10 @@
 //! The visual trip planner's small JSON surface.
 //!
-//! It reads the itinerary Scout already stores and lets the traveller settle
-//! an existing candidate. Searching, adding routes and pricing still happen in
-//! chat, where the flight agent can validate live provider data.
+//! It reads the itinerary Scout already stores, lets the traveller settle an
+//! existing candidate, and lets them add or remove a leg. Searching and
+//! pricing still happen in chat, where the flight agent can validate live
+//! provider data — those spend money against a live provider and stay a
+//! flight-agent responsibility.
 
 use super::chat::{admitted_account, csrf_header_ok};
 use super::sorry;
@@ -16,6 +18,7 @@ pub fn routes(auth: AuthState) -> Router {
     Router::new()
         .route("/chat/trips", get(list))
         .route("/chat/trips/choice", post(choose))
+        .route("/chat/trips/segment", post(add_leg).delete(remove_leg))
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             super::only_from_our_own_pages,
@@ -81,6 +84,101 @@ async fn choose(
     }
 }
 
+/// Turns a leg edit into a response. Shared so add and remove cannot drift
+/// into disagreeing about what a stale tab is told.
+fn leg_response(out: scout_core::trips::LegEdit) -> Response {
+    use scout_core::trips::LegEdit;
+    match out {
+        LegEdit::Done(plan) => axum::Json(plan).into_response(),
+        LegEdit::TripNotFound => StatusCode::NOT_FOUND.into_response(),
+        // Not an error: the reader's copy is simply older than the trip.
+        LegEdit::SegmentChanged => StatusCode::CONFLICT.into_response(),
+        LegEdit::Invalid(message) => (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AddLegIn {
+    trip: String,
+    position: Option<i64>,
+    origin: String,
+    destination: String,
+    departure_date: String,
+}
+
+async fn add_leg(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<AddLegIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    match scout_core::trips::add_leg(
+        &auth.core,
+        account_id,
+        &body.trip,
+        body.position,
+        &body.origin,
+        &body.destination,
+        &body.departure_date,
+    )
+    .await
+    {
+        Ok(out) => leg_response(out),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not add a trip leg");
+            sorry()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RemoveLegIn {
+    trip: String,
+    position: i64,
+    origin: String,
+    destination: String,
+    departure_date: Option<String>,
+}
+
+async fn remove_leg(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<RemoveLegIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    match scout_core::trips::remove_leg(
+        &auth.core,
+        account_id,
+        &body.trip,
+        body.position,
+        &body.origin,
+        &body.destination,
+        body.departure_date.as_deref(),
+    )
+    .await
+    {
+        Ok(out) => leg_response(out),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not remove a trip leg");
+            sorry()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,8 +221,32 @@ mod tests {
         csrf: Option<&str>,
         body: &str,
     ) -> Response {
+        method_json(app, "POST", uri, cookie, csrf, body).await
+    }
+
+    // DELETE carries a body here: `remove_leg`'s guard is checked against the
+    // route and date the caller expects, not decoration, so a bodyless
+    // DELETE has nothing to send it.
+    async fn delete_json(
+        app: &axum::Router,
+        uri: &str,
+        cookie: &str,
+        csrf: Option<&str>,
+        body: &str,
+    ) -> Response {
+        method_json(app, "DELETE", uri, cookie, csrf, body).await
+    }
+
+    async fn method_json(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        cookie: &str,
+        csrf: Option<&str>,
+        body: &str,
+    ) -> Response {
         let mut request = Request::builder()
-            .method("POST")
+            .method(method)
             .uri(uri)
             .header("origin", "https://example.com")
             .header("content-type", "application/json")
@@ -241,5 +363,198 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
         assert!(body.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn adding_a_leg_requires_csrf_and_the_leg_actually_lands_in_the_store() {
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        let uri = "/chat/trips/segment";
+        let body = r#"{"trip":"October","position":null,"origin":"LIS","destination":"FCO","departure_date":"2026-10-20"}"#;
+
+        // Same gate, same status as `choose`: a stolen cookie without the
+        // CSRF header must not be able to edit an itinerary either.
+        let refused = post_json(&app, uri, &cookie, None, body).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+        let res = post_json(&app, uri, &cookie, Some(&csrf), body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(response["segments"][1]["origin"], "LIS");
+        assert_eq!(response["segments"][1]["destination"], "FCO");
+
+        // Asserted against the store, not just the response: the response
+        // is what the route claims happened, the store is what actually did.
+        let trip = scout_core::trips::list(&core, account_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.trip.name == "October")
+            .unwrap();
+        assert_eq!(trip.trip.segments.len(), 2);
+        assert_eq!(trip.trip.segments[1].origin, "LIS");
+    }
+
+    #[tokio::test]
+    async fn a_bad_airport_code_from_the_browser_is_a_message_not_a_five_hundred() {
+        let (app, _core, _dir, _account, cookie, csrf) = setup().await;
+        let res = post_json(
+            &app,
+            "/chat/trips/segment",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":null,"origin":"Amsterdam","destination":"FCO","departure_date":"2026-10-20"}"#,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let text = body_of(res).await;
+        assert!(
+            text.contains("3-letter IATA"),
+            "the reader is told what to fix, got: {text}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_remove_is_a_conflict_and_changes_nothing() {
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        // The trip's only leg is AMS -> LIS. Naming a different destination
+        // for the same position is exactly what a tab that hasn't reloaded
+        // since somebody else edited the trip would send.
+        let res = delete_json(
+            &app,
+            "/chat/trips/segment",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":1,"origin":"AMS","destination":"FCO","departure_date":null}"#,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let trip = scout_core::trips::list(&core, account_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.trip.name == "October")
+            .unwrap();
+        assert_eq!(trip.trip.segments.len(), 1, "the guard refused before touching anything");
+        assert_eq!(trip.trip.segments[0].destination, "LIS");
+    }
+
+    #[tokio::test]
+    async fn a_stale_insert_is_also_a_conflict() {
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        // The trip has one leg, so the only positions it has are 1 (in
+        // front) and 2 (append). Position 5 is a tab that drew a much
+        // longer trip than this one currently is.
+        let res = post_json(
+            &app,
+            "/chat/trips/segment",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":5,"origin":"LIS","destination":"FCO","departure_date":"2026-10-20"}"#,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let trip = scout_core::trips::list(&core, account_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.trip.name == "October")
+            .unwrap();
+        assert_eq!(trip.trip.segments.len(), 1, "the stale insert added nothing");
+    }
+
+    #[tokio::test]
+    async fn one_account_cannot_add_a_leg_to_another_accounts_trip() {
+        let (app, core, _dir, owner, _cookie, _csrf) = setup().await;
+        // Owner also has a trip called "Atlantic loop" so the name alone
+        // cannot be what lets the stranger through: the lookup has to be
+        // scoped by account, not just by name.
+        scout_core::trips::seed_trip_for_tests(&core, owner, "Atlantic loop")
+            .await
+            .unwrap();
+        let scout_core::identity::SignIn::In { account_id: stranger } =
+            scout_core::identity::sign_in(&core, "telegram", "888")
+                .await
+                .unwrap()
+        else {
+            panic!("the round should admit the second account");
+        };
+        let cookie = crate::session::mint(TEST_KEY, stranger, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, stranger);
+
+        let res = post_json(
+            &app,
+            "/chat/trips/segment",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"Atlantic loop","position":null,"origin":"LIS","destination":"FCO","departure_date":"2026-10-20"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let owners = scout_core::trips::list(&core, owner).await.unwrap();
+        let theirs = owners.iter().find(|p| p.trip.name == "Atlantic loop").unwrap();
+        assert_eq!(theirs.trip.segments.len(), 1, "the stranger's request never reached the owner's trip");
+    }
+
+    #[tokio::test]
+    async fn one_account_cannot_remove_a_leg_from_another_accounts_trip() {
+        let (app, core, _dir, owner, _cookie, _csrf) = setup().await;
+        scout_core::trips::seed_trip_for_tests(&core, owner, "Atlantic loop")
+            .await
+            .unwrap();
+        let scout_core::identity::SignIn::In { account_id: stranger } =
+            scout_core::identity::sign_in(&core, "telegram", "888")
+                .await
+                .unwrap()
+        else {
+            panic!("the round should admit the second account");
+        };
+        let cookie = crate::session::mint(TEST_KEY, stranger, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, stranger);
+
+        let res = delete_json(
+            &app,
+            "/chat/trips/segment",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"Atlantic loop","position":1,"origin":"AMS","destination":"LIS","departure_date":"2026-10-12"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let owners = scout_core::trips::list(&core, owner).await.unwrap();
+        let theirs = owners.iter().find(|p| p.trip.name == "Atlantic loop").unwrap();
+        assert_eq!(theirs.trip.segments.len(), 1, "the stranger's request never reached the owner's trip");
+    }
+
+    #[tokio::test]
+    async fn a_removed_leg_is_gone_and_the_response_carries_the_updated_trip_for_a_repaint() {
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        let res = delete_json(
+            &app,
+            "/chat/trips/segment",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":1,"origin":"AMS","destination":"LIS","departure_date":"2026-10-12"}"#,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert!(
+            response["segments"].as_array().unwrap().is_empty(),
+            "the client can repaint from this body without a second fetch",
+        );
+
+        let trip = scout_core::trips::list(&core, account_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.trip.name == "October")
+            .unwrap();
+        assert!(trip.trip.segments.is_empty());
     }
 }

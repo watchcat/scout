@@ -101,6 +101,10 @@ pub enum LegEdit {
     // objects to, and it objected here too.
     Done(Box<Plan>),
     TripNotFound,
+    /// The caller's view of the trip is out of date: the leg it named is no
+    /// longer there, or the position it wanted to insert at no longer
+    /// exists. One variant for both because they are one thing to the
+    /// reader — reload and look again.
     SegmentChanged,
     Invalid(String),
 }
@@ -139,7 +143,16 @@ pub async fn add_leg(
         let Some(trip) = store.find_trip(account_id, &trip_name)? else {
             return Ok(LegEdit::TripNotFound);
         };
-        let trip = store.add_segment(trip.id, position, &origin, &destination, &date)?;
+        // A position this trip has nowhere to put is the same failure as a
+        // stale remove — the caller's copy of the trip is older than the
+        // trip — so it gets the same answer and the reader gets a reload
+        // rather than an apology. `add_segment_checked` reports it as a
+        // value; nothing here reads the text of an error to find out.
+        let Some(trip) =
+            store.add_segment_checked(trip.id, position, &origin, &destination, &date)?
+        else {
+            return Ok(LegEdit::SegmentChanged);
+        };
         // Through `trip_chat` rather than assumed: the composer needs the
         // same answer here that `list` gives, or the client would show a
         // trip changing chats when it only gained a leg.
@@ -454,6 +467,77 @@ mod tests {
         let plans = list(&core, account_id).await.unwrap();
         assert_eq!(plans[0].trip.segments.len(), 1);
         assert_eq!(plans[0].trip.segments[0].destination, "FCO", "the surviving leg is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_leg_inserted_at_a_position_the_trip_no_longer_has_reports_the_change() {
+        // A tab that drew four legs asking to insert at 4 on a trip now two
+        // legs long is the same failure as a stale remove: its copy is older
+        // than the trip. Reload, not an apology and not an ERROR line.
+        let (core, _dir, account_id) = core().await;
+        core.store()
+            .upsert_trip(account_id, "Atlantic loop", None, None, None)
+            .unwrap();
+        add_leg(&core, account_id, "Atlantic loop", None, "AMS", "LIS", "2026-10-12")
+            .await
+            .unwrap();
+        add_leg(&core, account_id, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            add_leg(&core, account_id, "Atlantic loop", Some(4), "BCN", "MAD", "2026-10-13")
+                .await
+                .unwrap(),
+            LegEdit::SegmentChanged,
+        );
+
+        let plans = list(&core, account_id).await.unwrap();
+        assert_eq!(
+            plans[0].trip.segments.iter().map(|s| s.origin.as_str()).collect::<Vec<_>>(),
+            vec!["AMS", "LIS"],
+            "the trip is exactly as it was",
+        );
+        // The last place a leg can go is still open: the refusal is about
+        // position 4 on this trip, not about inserting at all.
+        assert!(matches!(
+            add_leg(&core, account_id, "Atlantic loop", Some(3), "FCO", "AMS", "2026-10-18")
+                .await
+                .unwrap(),
+            LegEdit::Done(_),
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_leg_added_at_a_position_that_exists_goes_in_front_of_it_rather_than_over_it() {
+        // Overwriting would lose a leg the traveller never asked to lose,
+        // and lose it on the path with no confirmation step.
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "Atlantic loop").await.unwrap();
+        add_leg(&core, account_id, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
+            .await
+            .unwrap();
+
+        let LegEdit::Done(plan) =
+            add_leg(&core, account_id, "Atlantic loop", Some(1), "BCN", "MAD", "2026-10-10")
+                .await
+                .unwrap()
+        else {
+            panic!("a valid insert was refused");
+        };
+        assert_eq!(
+            plan.trip
+                .segments
+                .iter()
+                .map(|s| (s.position, s.origin.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "BCN"), (2, "AMS"), (3, "LIS")],
+            "inserting at 1 shifts the rest down; nothing is overwritten",
+        );
+        // The parked options moved with their segment rather than staying
+        // on position 1 and reattaching to a route nobody quoted them for.
+        assert!(plan.trip.segments[0].candidates.is_empty());
+        assert_eq!(plan.trip.segments[1].candidates.len(), 2);
     }
 
     #[tokio::test]

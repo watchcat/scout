@@ -2642,55 +2642,42 @@ impl Store {
         departure_date: &str,
     ) -> Result<Trip> {
         let conn = self.conn();
-        // Checked before anything is written: without this, a bad trip_id
-        // still passed the count query (as 0) and reached the INSERT below,
-        // leaving a segment row for a trip that does not exist — and no read
-        // path can ever find it again, because every read goes through a trip.
-        let known: i64 = conn.query_row(
-            "SELECT count(*) FROM trips WHERE id = ?",
-            params![trip_id],
-            |row| row.get(0),
-        )?;
-        if known == 0 {
-            anyhow::bail!("no such trip");
-        }
-        let count: i64 = conn.query_row(
-            "SELECT count(*) FROM trip_segments WHERE trip_id = ?",
-            params![trip_id],
-            |row| row.get(0),
-        )?;
-        let at = match position {
-            Some(p) if p >= 1 && p <= count => p,
-            Some(p) if p == count + 1 => p,
-            Some(p) => {
+        match add_segment_within(&conn, trip_id, position, origin, destination, departure_date)? {
+            Inserted::Added(trip) => Ok(trip),
+            Inserted::NoSuchPlace { count, wanted } => {
                 let noun = if count == 1 { "segment" } else { "segments" };
                 anyhow::bail!(
-                    "this trip has {count} {noun}, so position {p} is not somewhere to put one"
+                    "this trip has {count} {noun}, so position {wanted} is not somewhere to put one"
                 )
             }
-            None => count + 1,
-        };
-        if at <= count {
-            // Descending is not needed: DuckDB applies this set-wise, so no
-            // intermediate state can collide with the primary key.
-            conn.execute(
-                "UPDATE trip_segments SET position = position + 1
-                 WHERE trip_id = ? AND position >= ?",
-                params![trip_id, at],
-            )?;
-            conn.execute(
-                "UPDATE segment_candidates SET position = position + 1
-                 WHERE trip_id = ? AND position >= ?",
-                params![trip_id, at],
-            )?;
         }
-        conn.execute(
-            "INSERT INTO trip_segments (trip_id, position, origin, destination, departure_date)
-             VALUES (?, ?, ?, ?, ?)",
-            params![trip_id, at, origin, destination, departure_date],
-        )?;
-        touch(&conn, trip_id)?;
-        load_trip(&conn, trip_id)
+    }
+
+    /// `add_segment`, but a position this trip has nowhere to put reads as
+    /// `None` rather than an error.
+    ///
+    /// For a caller drawing from a copy of the trip that may be older than
+    /// the trip — a browser tab — "insert at 4" on a trip now two legs long
+    /// is the same failure as a stale remove: its picture is out of date, and
+    /// the answer is to re-read, not to apologise. It needs to tell that
+    /// apart from a real fault, and matching on the text of an error message
+    /// would break silently the first time somebody rewords it.
+    pub fn add_segment_checked(
+        &self,
+        trip_id: i64,
+        position: Option<i64>,
+        origin: &str,
+        destination: &str,
+        departure_date: &str,
+    ) -> Result<Option<Trip>> {
+        let conn = self.conn();
+        Ok(
+            match add_segment_within(&conn, trip_id, position, origin, destination, departure_date)?
+            {
+                Inserted::Added(trip) => Some(trip),
+                Inserted::NoSuchPlace { .. } => None,
+            },
+        )
     }
 
     /// Changes where or when one segment goes, leaving the rest alone.
@@ -3071,6 +3058,78 @@ fn detach_trips_within(conn: &Connection, conversation_ids: &[i64]) -> Result<us
         &format!("UPDATE trips SET conversation_id = NULL WHERE conversation_id IN ({holes})"),
         duckdb::params_from_iter(conversation_ids.iter()),
     )?)
+}
+
+/// How `add_segment_within` ended up.
+///
+/// `NoSuchPlace` carries the two numbers its explanation needs rather than a
+/// formatted string, so the one caller that turns this into an error owns
+/// the wording and the one that turns it into a status is not tempted to
+/// read that wording back.
+enum Inserted {
+    Added(Trip),
+    NoSuchPlace { count: i64, wanted: i64 },
+}
+
+/// Adds a leg, appending when `position` is None and otherwise inserting
+/// there and shifting the rest down.
+///
+/// A position outside 1..=count+1 comes back as `NoSuchPlace` instead of an
+/// error because its two callers disagree about what it means — see
+/// `add_segment_checked`. Splitting it out here rather than re-deriving the
+/// range at each of them keeps one definition of where a leg may go.
+fn add_segment_within(
+    conn: &Connection,
+    trip_id: i64,
+    position: Option<i64>,
+    origin: &str,
+    destination: &str,
+    departure_date: &str,
+) -> Result<Inserted> {
+    // Checked before anything is written: without this, a bad trip_id
+    // still passed the count query (as 0) and reached the INSERT below,
+    // leaving a segment row for a trip that does not exist — and no read
+    // path can ever find it again, because every read goes through a trip.
+    let known: i64 = conn.query_row(
+        "SELECT count(*) FROM trips WHERE id = ?",
+        params![trip_id],
+        |row| row.get(0),
+    )?;
+    if known == 0 {
+        anyhow::bail!("no such trip");
+    }
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM trip_segments WHERE trip_id = ?",
+        params![trip_id],
+        |row| row.get(0),
+    )?;
+    let at = match position {
+        Some(p) if p >= 1 && p <= count => p,
+        Some(p) if p == count + 1 => p,
+        Some(wanted) => return Ok(Inserted::NoSuchPlace { count, wanted }),
+        None => count + 1,
+    };
+    if at <= count {
+        // Descending is not needed: DuckDB applies this set-wise, so no
+        // intermediate state can collide with the primary key.
+        conn.execute(
+            "UPDATE trip_segments SET position = position + 1
+             WHERE trip_id = ? AND position >= ?",
+            params![trip_id, at],
+        )?;
+        conn.execute(
+            "UPDATE segment_candidates SET position = position + 1
+             WHERE trip_id = ? AND position >= ?",
+            params![trip_id, at],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO trip_segments (trip_id, position, origin, destination, departure_date)
+         VALUES (?, ?, ?, ?, ?)",
+        params![trip_id, at, origin, destination, departure_date],
+    )?;
+    touch(conn, trip_id)?;
+    Ok(Inserted::Added(load_trip(conn, trip_id)?))
 }
 
 /// Removes a segment and closes the gap behind it.

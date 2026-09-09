@@ -2547,9 +2547,13 @@ impl Store {
         load_trip(&conn, id)
     }
 
-    /// Which conversation owns this trip, if any. Test and diagnostic
-    /// support today; a later task has `Plan` carry it so production reads
-    /// ownership through there instead.
+    /// Which conversation owns this trip, if any.
+    ///
+    /// Test-only, and gated so that stays true: production reads ownership
+    /// through `Plan`, which a later task has carry it. Ungated it is dead
+    /// code in a release build, and a build that always warns is a build
+    /// whose warnings nobody reads.
+    #[cfg(test)]
     pub fn trip_owner(&self, trip_id: i64) -> Result<Option<i64>> {
         let conn = self.conn();
         Ok(conn.query_row(
@@ -2557,23 +2561,6 @@ impl Store {
             params![trip_id],
             |row| row.get(0),
         )?)
-    }
-
-    /// Releases the trips owned by these conversations without touching the
-    /// trips themselves.
-    ///
-    /// The distinction this draws is the whole point of the feature: a
-    /// thread that a *timer* removed must not take a travel plan with it.
-    /// Only `delete_conversation` — someone pressed Delete — cascades.
-    /// `expire_conversations` reaches `detach_trips_within` directly, being
-    /// already inside its own transaction; this is the entry point for a
-    /// caller that is not.
-    pub fn detach_trips_of(&self, conversation_ids: &[i64]) -> Result<usize> {
-        if conversation_ids.is_empty() {
-            return Ok(0);
-        }
-        let conn = self.conn();
-        detach_trips_within(&conn, conversation_ids)
     }
 
     /// Used by finalisation to record that a trip has been priced.
@@ -2995,12 +2982,28 @@ fn touch(conn: &Connection, trip_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// `detach_trips_of`'s body, taking a connection so a caller already inside
-/// a transaction can use it.
+/// Releases the trips owned by these conversations without touching the
+/// trips themselves.
+///
+/// The distinction this draws is the whole point of the feature: a thread
+/// that a *timer* removed must not take a travel plan with it. A trip is
+/// built over weeks and a thread expires after two days of quiet, so a
+/// cascade here would delete travel plans on a schedule, with no button
+/// pressed, nothing to undo and nothing in any log. Only
+/// `delete_conversation` cascades, because there somebody pressed Delete.
+/// An orphaned trip is an ordinary state; the next chat to touch it adopts
+/// it.
+///
+/// Takes a `&Connection` rather than `&Store` because its caller,
+/// `expire_conversations`, is already inside its own transaction and
+/// already holds the lock — re-locking would deadlock, and a release that
+/// could commit separately from the delete would leave a trip pointing at
+/// a conversation that is gone.
 fn detach_trips_within(conn: &Connection, conversation_ids: &[i64]) -> Result<usize> {
     // `IN ()` is a parser error, not an empty set — the same trap
-    // `expire_conversations` documents. The transactional caller passes a
-    // SELECT result that is empty on every sweep that expires nothing.
+    // `expire_conversations` documents. The caller passes a SELECT result
+    // that is empty on every sweep that expires nothing, which is the
+    // ordinary hourly case rather than an edge case.
     if conversation_ids.is_empty() {
         return Ok(0);
     }
@@ -4342,8 +4345,11 @@ CREATE TABLE segment_candidates (
         store.upsert_trip(account, "atlantic loop", None, None, Some(22)).unwrap();
         assert_eq!(store.trip_owner(trip.id).unwrap(), Some(11), "a live owner is never displaced");
 
-        // Orphaned, then touched again: adopted.
-        store.detach_trips_of(&[11]).unwrap();
+        // Orphaned, then touched again: adopted. Detached directly rather
+        // than through `expire_conversations` because the owner ids here are
+        // invented — this test is about adoption, and standing up real
+        // conversations to age out would only obscure that.
+        detach_trips_within(&store.conn(), &[11]).unwrap();
         assert_eq!(store.trip_owner(trip.id).unwrap(), None);
         store.upsert_trip(account, "Atlantic loop", None, None, Some(33)).unwrap();
         assert_eq!(store.trip_owner(trip.id).unwrap(), Some(33), "an orphan is adopted");
@@ -4351,12 +4357,11 @@ CREATE TABLE segment_candidates (
 
     #[test]
     fn detach_trips_within_an_empty_slice_is_a_no_op_not_a_syntax_error() {
-        // `expire_conversations` (a later task) will call this inside its own
-        // transaction with a SELECT result that is empty on every sweep that
-        // expired nothing — the ordinary hourly case, not an edge case.
-        // `IN ()` is a parser error in DuckDB, so the guard has to live here,
-        // not only in `detach_trips_of`'s early return, which a transactional
-        // caller bypasses entirely.
+        // `expire_conversations` calls this inside its own transaction with
+        // a SELECT result that is empty on every sweep that expired nothing
+        // — the ordinary hourly case, not an edge case. `IN ()` is a parser
+        // error in DuckDB, so without the guard the routine hourly sweep is
+        // the one that fails.
         let (store, _dir) = test_store();
         let conn = store.conn();
         assert_eq!(detach_trips_within(&conn, &[]).unwrap(), 0);

@@ -1,6 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow, composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent, threadVanished } from './chat.js'
+import {
+  applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow,
+  composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
+  threadVanished, parseItinerary, selectedCandidate, durationLabel,
+  connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
+} from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
   // The browser half of the protocol's security property: reasoning the
@@ -186,4 +191,113 @@ test('an account with no threads at all leaves the composer with none', () => {
   // A list where nothing is marked current — `threads` reads the list and
   // the current id in two statements, so a thread can vanish between them.
   assert.equal(resolveCurrent([{ id: 1 }, { id: 2 }], null), null)
+})
+
+test('a stored itinerary becomes airports, times, and connection waits', () => {
+  assert.deepEqual(
+    parseItinerary('AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09'),
+    [
+      { airport: 'AMS', departsFrom: null, time: '20:15', date: '15.09', wait: null },
+      { airport: 'PVG', departsFrom: null, time: null, date: null, wait: '3h 20m' },
+      { airport: 'HKG', departsFrom: null, time: '20:35', date: '16.09', wait: null },
+    ],
+  )
+  assert.deepEqual(parseItinerary('JFK ✈ LGA 4h'), [
+    { airport: 'JFK', departsFrom: null, time: null, date: null, wait: null },
+    { airport: 'LGA', departsFrom: null, time: null, date: null, wait: null },
+  ])
+})
+
+test('an airport-changing stop keeps both airports visible', () => {
+  assert.deepEqual(parseItinerary('HND 09:00 12.10 ✈ NRT/HND 5h 10m ✈ CTS 18:00 12.10')[1], {
+    airport: 'NRT', departsFrom: 'HND', time: null, date: null, wait: '5h 10m',
+  })
+})
+
+test('one candidate is selected by elimination and several require a choice', () => {
+  const only = { candidate: 1, chosen: false }
+  assert.equal(selectedCandidate({ candidates: [only] }), only)
+  assert.equal(selectedCandidate({ candidates: [{ candidate: 1 }, { candidate: 2 }] }), null)
+  assert.equal(selectedCandidate({ candidates: [{ candidate: 1 }, { candidate: 2, chosen: true }] }).candidate, 2)
+})
+
+test('durations are formatted without dropping minutes', () => {
+  assert.equal(durationLabel(50), '50m')
+  assert.equal(durationLabel(180), '3h')
+  assert.equal(durationLabel(201), '3h 21m')
+  assert.equal(durationLabel(8150), '5d 15h 50m')
+  assert.equal(durationLabel(null), 'Duration unavailable')
+})
+
+test('the join between selected flights is checked on the shared local clock', () => {
+  const candidate = (departure, arrival, chosen = true) => ({
+    chosen,
+    departing_at_local: departure,
+    arriving_at_local: arrival,
+  })
+  const before = {
+    destination: 'LIS',
+    candidates: [candidate('2026-10-12T08:00:00', '2026-10-12T10:00:00')],
+  }
+  const comfortable = {
+    origin: 'LIS',
+    candidates: [candidate('2026-10-12T14:20:00', '2026-10-12T17:00:00')],
+  }
+  const tight = {
+    origin: 'LIS',
+    candidates: [candidate('2026-10-12T11:15:00', '2026-10-12T14:00:00')],
+  }
+  assert.deepEqual(connectionCheck(before, comfortable), {
+    tone: 'ready', text: '4h 20m at LIS between the selected flights.',
+  })
+  assert.deepEqual(connectionCheck(before, tight), {
+    tone: 'danger', text: '1h 15m at LIS — tight connection; allow at least 3 hours between separate tickets.',
+  })
+})
+
+test('a change of airport is reported instead of subtracting unrelated clocks', () => {
+  const before = {
+    destination: 'FCO',
+    candidates: [{ chosen: true, arriving_at_local: '2026-10-12T10:00:00' }],
+  }
+  const after = {
+    origin: 'FLR',
+    candidates: [{ chosen: true, departing_at_local: '2026-10-12T16:00:00' }],
+  }
+  assert.deepEqual(connectionCheck(before, after), {
+    tone: 'warning',
+    text: 'Airport transfer: arrive at FCO, continue from FLR. Travel between them is not included.',
+  })
+})
+
+test('the trip timeline includes layover airports and makes route gaps visible', () => {
+  const points = tripTimelinePoints({ segments: [
+    {
+      origin: 'AMS', destination: 'HKG', departure_date: '2026-10-12',
+      candidates: [{ chosen: true, itinerary: 'AMS 08:00 12.10 ✈ PVG 3h 20m ✈ HKG 20:00 13.10' }],
+    },
+    {
+      origin: 'NRT', destination: 'SFO', departure_date: '2026-10-18',
+      candidates: [{ chosen: true, itinerary: 'NRT 09:00 18.10 ✈ SFO 02:00 18.10' }],
+    },
+  ] })
+
+  assert.deepEqual(points, [
+    { code: 'AMS', date: '2026-10-12', gap: false },
+    { code: 'PVG', date: '3h 20m', gap: false },
+    { code: 'HKG', date: '', gap: true },
+    { code: 'NRT', date: '2026-10-18', gap: false },
+    { code: 'SFO', date: '', gap: false },
+  ])
+})
+
+test('a stale trip read cannot repaint a newer choice', () => {
+  assert.equal(tripLoadIsCurrent(4, 4, false), true)
+  assert.equal(tripLoadIsCurrent(3, 4, false), false, 'an older GET response was accepted')
+  assert.equal(tripLoadIsCurrent(4, 4, true), false, 'a GET raced a pending selection')
+})
+
+test('Ignav saved fares stay visibly approximate', () => {
+  assert.deepEqual(savedFareQualifier('ignav'), { prefix: 'from ', note: 'estimate when saved' })
+  assert.deepEqual(savedFareQualifier('duffel'), { prefix: '', note: 'when saved' })
 })

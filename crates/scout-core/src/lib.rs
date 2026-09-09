@@ -26,4 +26,5 @@ pub mod session;
 pub mod stats;
 pub mod text;
 pub mod toolcall;
+pub mod trips;
 pub mod vision;

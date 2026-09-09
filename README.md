@@ -34,6 +34,22 @@ Multi-city trips get built a message at a time and priced only when you say
 they're done — because an offer expires in minutes and a plan doesn't, so the
 only honest thing to do with a week-old itinerary is search it again.
 
+### Trips in the browser
+
+The web client turns that durable plan into an airport timeline. It shows every
+segment and layover, keeps flight numbers and saved-fare provenance attached to
+each option, and recalculates the next connection as soon as you choose another
+flight. Tight connections, impossible joins, and airport changes are called out
+before you continue.
+
+<p align="center">
+  <img src="crates/scout-web/src/assets/trips-desktop.webp" alt="Scout trip planner on desktop, with an airport timeline, flight choices, saved fares and a tight connection warning" width="900">
+</p>
+
+<p align="center">
+  <img src="crates/scout-web/src/assets/trips-mobile.webp" alt="Scout trip planner on a mobile screen" width="320">
+</p>
+
 Built in Rust with [teloxide](https://github.com/teloxide/teloxide),
 [rig](https://rig.rs), DuckDB, and a deep suspicion of what language models
 say about prices.
@@ -180,6 +196,11 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   for a name), pin, delete. The thread you last used is the one your
   Telegram chat continues, and a thread nobody touches for two days is
   deleted unless pinned
+- **Trips you can see, not just read.** Every saved itinerary has an airport
+  timeline, dated segments, flight numbers, saved fares and layovers. Parked
+  flight options can be selected in place, and the connection time between
+  the chosen flights is recalculated immediately — including airport-change
+  and tight-connection warnings
 - **Your phone follows along.** A toggle sends the browser thread to your
   Telegram chat as it happens, so a question asked at a desk is answered on
   the train

@@ -201,6 +201,16 @@ mod tests {
     }
 
     #[test]
+    fn the_trip_feature_has_a_responsive_screenshot_and_useful_fallback_text() {
+        let page = render(&Admission::Full, Visitor::NoAuth);
+        assert!(page.contains(r#"src="/assets/trips-desktop.webp""#));
+        assert!(page.contains(r#"srcset="/assets/trips-mobile.webp""#));
+        assert!(page.contains(r#"width="1360" height="960""#));
+        assert!(page.contains(r#"width="390" height="844""#));
+        assert!(page.contains("alt=\"Scout trip planner showing Amsterdam"));
+    }
+
+    #[test]
     fn the_page_tells_a_crawler_what_it_is() {
         // The head had a title and nothing else, so Google wrote its own
         // snippet from whatever prose it picked and a link pasted into a

@@ -99,6 +99,10 @@ CREATE TABLE IF NOT EXISTS trips (
     status      TEXT NOT NULL DEFAULT 'planning',
     created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
     updated_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    -- Last, so a fresh database and a migrated one — where this arrives by
+    -- ALTER TABLE in step 9 — have the same column order. NULL means the
+    -- chat that made this trip is gone; the next chat to touch it adopts it.
+    conversation_id BIGINT,
     UNIQUE (account_id, name_key)
 );
 -- Where and when. This is all that gets re-searched.
@@ -744,6 +748,18 @@ const STEP_8_PINNED_NOT_NULL: &str = r#"
 ALTER TABLE conversations ALTER COLUMN pinned SET NOT NULL;
 "#;
 
+/// The chat that made a trip. Nullable: expiry (a later change) detaches
+/// rather than cascades, so a trip outliving its 48-hour-idle chat becomes
+/// orphaned, not deleted.
+///
+/// `IF NOT EXISTS` for the same reason STEP_7_THREADS uses it: a database
+/// created by `MIGRATIONS` after this column shipped, but recorded below 9,
+/// already has the column, and a bare `ADD COLUMN` would fail on it with
+/// "already exists".
+const STEP_9_TRIP_CONVERSATION: &str = r#"
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS conversation_id BIGINT;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -754,6 +770,7 @@ fn steps() -> Vec<(i64, Step)> {
         (6, Step::Sql(STEP_6_LOGIN_TOKENS)),
         (7, Step::Sql(STEP_7_THREADS)),
         (8, Step::Sql(STEP_8_PINNED_NOT_NULL)),
+        (9, Step::Sql(STEP_9_TRIP_CONVERSATION)),
     ]
 }
 
@@ -3345,7 +3362,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 8);
+        assert_eq!(s.schema_version().unwrap(), 9);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -3409,7 +3426,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -4194,6 +4211,58 @@ CREATE TABLE segment_candidates (
         // Two users may each have a "September".
         store.upsert_trip(8, "September", None, None).unwrap();
         assert_eq!(store.list_trips(8).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_trip_carries_the_conversation_that_made_it() {
+        // Nullable on purpose: NULL means orphaned, which is an ordinary
+        // state a trip reaches by outliving its chat, not an error.
+        let (store, _d) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None).unwrap();
+        let owner: Option<i64> = store
+            .conn()
+            .query_row("SELECT conversation_id FROM trips WHERE id = ?", params![trip.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, None, "a trip made outside a conversation has no owner");
+    }
+
+    #[test]
+    fn an_existing_database_gains_the_column_by_migration() {
+        // The fresh-database path and the upgrade path are different code.
+        // A CREATE TABLE IF NOT EXISTS does nothing to a table that already
+        // exists, so without step 9 every deployed database would be missing
+        // this column while every test passed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scout.duckdb");
+        {
+            let conn = duckdb::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE SEQUENCE trips_id_seq;
+                 CREATE TABLE trips (
+                     id BIGINT PRIMARY KEY DEFAULT nextval('trips_id_seq'),
+                     account_id BIGINT NOT NULL, name TEXT NOT NULL,
+                     name_key TEXT NOT NULL, adults BIGINT NOT NULL DEFAULT 1,
+                     cabin_class TEXT, status TEXT NOT NULL DEFAULT 'planning',
+                     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+                     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+                     UNIQUE (account_id, name_key));
+                 CREATE TABLE schema_version (version BIGINT NOT NULL);
+                 INSERT INTO schema_version VALUES (8);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let n: i64 = store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_name = 'trips' AND column_name = 'conversation_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "step 9 must add the column to a database that predates it");
     }
 
     #[test]
@@ -5278,7 +5347,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 8, "the threads steps did not run");
+        assert_eq!(s.schema_version().unwrap(), 9, "the threads steps did not run");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -5319,7 +5388,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 8);
+        assert_eq!(s.schema_version().unwrap(), 9);
         let conn = s.conn();
         assert!(
             conn.execute_batch(

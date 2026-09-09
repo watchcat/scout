@@ -134,6 +134,23 @@
   .cols{display:grid; grid-template-columns:repeat(3,1fr); gap:var(--s-5)}
   .cols p{margin:0; font-size:var(--t-sm); color:var(--base0)}
 
+  .trip-feature{padding-top:var(--s-7)}
+  .feature-head{max-width:43em; margin-bottom:var(--s-5)}
+  .feature-head .kicker{margin:0 0 var(--s-2); color:var(--cyan); font-size:var(--t-xs);
+    font-weight:650; letter-spacing:.14em; text-transform:uppercase}
+  h2.feature-title{margin:0 0 var(--s-3); color:var(--base2); font-size:var(--t-word);
+    line-height:1.2; letter-spacing:-.02em; text-transform:none}
+  .feature-head>p:last-child{margin:0; color:var(--base1); font-size:var(--t-lede)}
+  .trip-shot{display:block; margin:0 0 var(--s-4); overflow:hidden; line-height:0;
+    border:1px solid var(--rule); border-radius:6px; background:var(--base02);
+    box-shadow:0 18px 50px rgba(0,0,0,.24)}
+  .trip-shot img{display:block; width:100%; height:auto}
+  .feature-proof{display:grid; grid-template-columns:repeat(3,1fr); gap:var(--s-5);
+    margin-top:var(--s-5)}
+  .feature-proof strong{display:block; margin-bottom:var(--s-1); color:var(--base1);
+    font-size:var(--t-sm)}
+  .feature-proof p{margin:0; color:var(--base0); font-size:var(--t-sm)}
+
   .chat{background:var(--base02); border-left:3px solid var(--violet);
     padding:var(--s-3) var(--s-4); border-radius:0 4px 4px 0; margin:0 0 var(--s-3);
     font-size:var(--t-sm); color:var(--base1); font-style:italic}
@@ -171,12 +188,12 @@
      support here the content simply appears un-animated, where a fill-mode
      approach that does not run leaves the page blank. A decorative
      flourish must not be able to hide the product. */
-  .cols>div,.src{
+  .cols>div,.feature-proof>div,.src{
     opacity:1; transform:translateY(0);
     transition:opacity 320ms var(--ease-out), transform 320ms var(--ease-out);
   }
   @starting-style{
-    .cols>div,.src{opacity:0; transform:translateY(8px)}
+    .cols>div,.feature-proof>div,.src{opacity:0; transform:translateY(8px)}
   }
   .cols>div:nth-child(2),.src:nth-of-type(2){transition-delay:40ms}
   .cols>div:nth-child(3),.src:nth-of-type(3){transition-delay:80ms}
@@ -187,9 +204,9 @@
      style. Without that second override the content would still travel
      eight pixels, which is the whole thing being asked for. */
   @media (prefers-reduced-motion:reduce){
-    .cols>div,.src{transform:none}
+    .cols>div,.feature-proof>div,.src{transform:none}
     @starting-style{
-      .cols>div,.src{transform:none}
+      .cols>div,.feature-proof>div,.src{transform:none}
     }
     .btn:active{transform:none}
   }
@@ -198,6 +215,7 @@
     .mark{gap:var(--s-3); margin-bottom:var(--s-4)}
     .mark .logo{width:66px; height:66px}
     .cols{grid-template-columns:1fr; gap:var(--s-4)}
+    .feature-proof{grid-template-columns:1fr; gap:var(--s-4)}
     .src{grid-template-columns:1fr; gap:var(--s-2)}
     td.bad,td.good{display:block; width:auto; padding-right:0}
     td.bad{border-top:1px solid var(--base02); padding-bottom:var(--s-1)}
@@ -243,6 +261,43 @@
 
 <!--STATUS-->
 </header>
+
+<section class="trip-feature" aria-labelledby="trip-feature-title">
+  <div class="feature-head">
+    <p class="kicker">Trips in the browser</p>
+    <h2 class="feature-title" id="trip-feature-title">See the whole route. Make the choice.</h2>
+    <p>
+      Every airport, saved flight and connection sits in one timeline. Compare the options
+      Scout found, choose the flight you want, and see the time at the next airport update
+      immediately — before a tight connection becomes a surprise.
+    </p>
+  </div>
+  <picture class="trip-shot">
+    <source media="(max-width:680px)" srcset="/assets/trips-mobile.webp"
+            width="390" height="844">
+    <img src="/assets/trips-desktop.webp" width="1360" height="960" loading="lazy"
+         decoding="async"
+         alt="Scout trip planner showing Amsterdam, Madrid, Lisbon and Rome on a timeline, two flight options, saved fares and a tight connection warning">
+  </picture>
+  <p class="caption">
+    A saved price is labelled by its source and age. Before booking, ask Scout to refresh
+    live fares; the plan stays durable while short-lived offers do not.
+  </p>
+  <div class="feature-proof">
+    <div>
+      <strong>All airports, one line</strong>
+      <p>Departure, arrival and layover airports stay visible across the whole trip.</p>
+    </div>
+    <div>
+      <strong>Options stay comparable</strong>
+      <p>Airline, flight numbers, duration, stops, source and saved fare travel together.</p>
+    </div>
+    <div>
+      <strong>Connections recalculate</strong>
+      <p>Choose another flight and tight, impossible or airport-change joins are flagged.</p>
+    </div>
+  </div>
+</section>
 
 <section>
   <h2>How it finds the cheapest</h2>
@@ -339,12 +394,12 @@
 
 <section>
   <div class="aside">
-    <h3>Flights, honestly: a prototype</h3>
+    <h3>A plan stays a plan</h3>
     <p>
-      Scout can search live fares and draw a multi-city trip on one line
-      (<code>AMS 20:15 15.09 ✈ PVG 3h 20m ✈ HKG 20:35 16.09</code>), with every price
-      labelled by whether you can actually book it. It works, and it is early — thinner
-      and less proven than the shopping side, which is what Scout is really for today.
+      Live offers expire in minutes; an itinerary should not. Scout stores the route and
+      the flight you chose, then searches again when you finalise. It never quietly turns
+      Tuesday's fare into today's promise or substitutes a different flight because yours
+      disappeared.
     </p>
   </div>
 </section>

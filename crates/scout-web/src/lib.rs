@@ -144,6 +144,8 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         // down for a reason the site does not have.
         .route("/healthz", get(|| async { "ok" }))
         .route("/icon.svg", get(icon))
+        .route("/assets/trips-desktop.webp", get(trips_desktop))
+        .route("/assets/trips-mobile.webp", get(trips_mobile))
         .route("/robots.txt", get(robots))
         .route("/sitemap.xml", get(sitemap))
         .with_state(Public { cache, session_key });
@@ -485,6 +487,21 @@ async fn icon() -> impl IntoResponse {
     const ICON: &str = include_str!("icon.svg");
     ([(header::CONTENT_TYPE, "image/svg+xml"),
       (header::CACHE_CONTROL, "public, max-age=86400")], ICON)
+}
+
+/// Product screenshots used by the landing page and README. They are renders
+/// of the real client against deterministic example data, not hand-drawn
+/// mockups, and stay public because the landing page is public.
+async fn trips_desktop() -> impl IntoResponse {
+    const IMAGE: &[u8] = include_bytes!("assets/trips-desktop.webp");
+    ([(header::CONTENT_TYPE, "image/webp"),
+      (header::CACHE_CONTROL, "public, max-age=86400")], IMAGE)
+}
+
+async fn trips_mobile() -> impl IntoResponse {
+    const IMAGE: &[u8] = include_bytes!("assets/trips-mobile.webp");
+    ([(header::CONTENT_TYPE, "image/webp"),
+      (header::CACHE_CONTROL, "public, max-age=86400")], IMAGE)
 }
 
 /// Serves until the process ends.
@@ -988,6 +1005,15 @@ mod tests {
             .await.unwrap();
         assert_eq!(icon.status(), StatusCode::OK);
         assert_eq!(icon.headers()["content-type"], "image/svg+xml");
+
+        for path in ["/assets/trips-desktop.webp", "/assets/trips-mobile.webp"] {
+            let shot = app.clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await.unwrap();
+            assert_eq!(shot.status(), StatusCode::OK, "{path}");
+            assert_eq!(shot.headers()["content-type"], "image/webp", "{path}");
+            assert_eq!(shot.headers()["cache-control"], "public, max-age=86400", "{path}");
+        }
 
         let missing = app
             .oneshot(Request::builder().uri("/wp-login.php").body(Body::empty()).unwrap())

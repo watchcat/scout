@@ -293,11 +293,34 @@ export function savedFareQualifier(source) {
     : { prefix: '', note: 'when saved' }
 }
 
+// Where a message typed on the Trips tab should go, and what the composer
+// says about it. `direct` is the one scope the web client may ever post
+// into — the thread it shares with Telegram 1:1 chat. Anything else is a
+// Telegram group: other people are in it, and a reply typed here must not
+// land there as though the traveller said it in the room. That case and an
+// orphaned trip (its owning chat gone) both resolve to `thread: null` — a
+// fresh thread the composer starts before sending, which is how an orphan
+// gets a chat again without ever taking a group's away from it.
+export function composerTarget(trip) {
+  // No trip on screen — the empty state, or a selection not yet resolved.
+  // Nothing to name, so the line has nothing to say, but the send still
+  // gets a thread of its own rather than reusing whatever the page had
+  // open in Chat before Trips was opened.
+  if (!trip) return { thread: null, label: '' }
+  const chat = trip.chat
+  if (!chat) return { thread: null, label: 'to a new chat' }
+  if (chat.scope !== 'direct') {
+    return { thread: null, label: 'planned in a Telegram group — replies go to a new chat' }
+  }
+  return { thread: chat.id, label: chat.title ? `to "${chat.title}"` : 'to an unnamed thread' }
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')
   const statusEl = document.getElementById('status')
   const noticeEl = document.getElementById('notice')
+  const composeTargetEl = document.getElementById('compose-target')
   const askForm = document.getElementById('ask')
   const textEl = document.getElementById('text')
   const sendButton = document.getElementById('send')
@@ -402,6 +425,26 @@ function start() {
     noticeEl.textContent = ''
   }
 
+  // Redraws the line above the composer from `composerTarget`. Called from
+  // both the places that can change its answer — `switchView`, because the
+  // Chat tab has no trip to name, and `renderTripDetail`, which runs on
+  // every path that changes which trip is selected (a load, a click in the
+  // list, a saved choice). Missing either call would leave the line naming
+  // the trip that was picked before the reader last acted.
+  function updateComposeTarget() {
+    if (tripsView.hidden) {
+      composeTargetEl.hidden = true
+      composeTargetEl.textContent = ''
+      return
+    }
+    const target = composerTarget(trips.find((trip) => trip.name === currentTrip))
+    // An empty label means there is nothing to name yet — no trips loaded,
+    // or a selection not yet resolved — so the line says nothing rather
+    // than something misleading.
+    composeTargetEl.hidden = !target.label
+    composeTargetEl.textContent = target.label ? `↩ ${target.label}` : ''
+  }
+
   function node(tag, className, text) {
     const el = document.createElement(tag)
     if (className) el.className = className
@@ -456,6 +499,10 @@ function start() {
     menuButton.hidden = showingTrips
     if (mirrorButton) mirrorButton.hidden = showingTrips
     if (showingTrips && !tripsLoaded) loadTrips().catch(() => {})
+    // Switching tabs is the other path (besides picking a trip) that
+    // changes what the line above the composer should say — a load
+    // already in flight will say it again once `renderTripDetail` runs.
+    updateComposeTarget()
   }
 
   async function loadTrips() {
@@ -627,6 +674,10 @@ function start() {
 
   function renderTripDetail() {
     const trip = trips.find((item) => item.name === currentTrip)
+    // Every caller of this function just changed which trip is selected —
+    // a load, a click in the list, a saved choice — so this is the one
+    // place that has to run whichever of those happened.
+    updateComposeTarget()
     if (!trip) {
       showTripEmpty(
         trips.length ? 'Choose a trip' : 'No trips yet',
@@ -1130,7 +1181,7 @@ function start() {
   // back off the page. It is called only where the words go back into the
   // composer, so that the message the reader is about to send again is in
   // one place rather than two — see the 422 arm.
-  async function runMessage(text, retract = () => {}) {
+  async function runMessage(text, retract = () => {}, fromTrips = false) {
     // The thread this run belongs to. A reader who switches away mid-stream
     // is no longer looking at this conversation, and its tokens must not be
     // painted into the one they moved to. The run carries on server-side
@@ -1280,6 +1331,11 @@ function start() {
       // visit to Trips must read that durable state rather than reuse the
       // snapshot from before the run.
       tripsLoaded = false
+      // The reply this run just wrote may have priced a segment or parked
+      // a flight against the trip that prompted it. `switchView` already
+      // moved the reader to Chat to watch it stream, so refetch now rather
+      // than making Trips look stale until they switch back to it by hand.
+      if (fromTrips) loadTrips().catch(() => {})
       // Not awaited: the first answer is what names a thread, and the row
       // should pick that name up without holding the composer shut for it.
       // Not adopted either — this run's `save_history` just made its thread
@@ -1311,16 +1367,39 @@ function start() {
     if (!text) return
     hideNotice()
 
+    // Captured before anything below moves the page to Chat — once that
+    // happens `tripsView.hidden` no longer answers honestly whether this
+    // send began on Trips.
+    const fromTrips = !tripsView.hidden
+    const target = fromTrips ? composerTarget(trips.find((trip) => trip.name === currentTrip)) : null
+
     // Held from here rather than from the run, because the thread below is
     // made across an await: two quick Enters would otherwise start two.
     running = true
     sendButton.disabled = true
     try {
-      // An account with no threads at all — a first sign-in — has nothing
-      // to name in the body, and the send would be a 422. Make one before
-      // the box is cleared and before the bubble is appended: `newThread`
-      // empties the transcript, and it would take that bubble with it.
-      if (currentThread === null && !(await newThread())) return
+      if (target) {
+        // The trip's own thread is not always the one already open — and
+        // for an orphan, a Telegram group, or no trip at all, `target`
+        // carries no thread to reuse at all. Either way the transcript on
+        // screen has to become the one this message is about to join
+        // before the bubble below is appended to it.
+        if (target.thread === null) {
+          if (!(await newThread())) return
+        } else if (target.thread !== currentThread) {
+          await openThread(target.thread)
+        }
+        // So the stream lands where answers already live, not behind the
+        // itinerary the reader was just looking at.
+        switchView('chat')
+      } else if (currentThread === null) {
+        // An account with no threads at all — a first sign-in — has
+        // nothing to name in the body, and the send would be a 422. Make
+        // one before the box is cleared and before the bubble is
+        // appended: `newThread` empties the transcript, and it would take
+        // that bubble with it.
+        if (!(await newThread())) return
+      }
       textEl.value = ''
       // A box grown to five lines must shrink back, or it sits tall and
       // empty over the answer it just asked for.
@@ -1336,7 +1415,7 @@ function start() {
       // `remove` on a node already detached — a reader who switched threads
       // mid-send had the transcript replaced under them — is a no-op, so
       // this needs no guard of its own.
-      await runMessage(text, () => youLi.remove())
+      await runMessage(text, () => youLi.remove(), fromTrips)
     } finally {
       running = false
       sendButton.disabled = false

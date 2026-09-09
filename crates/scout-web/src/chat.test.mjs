@@ -5,6 +5,7 @@ import {
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
+  composerTarget,
 } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
@@ -300,4 +301,30 @@ test('a stale trip read cannot repaint a newer choice', () => {
 test('Ignav saved fares stay visibly approximate', () => {
   assert.deepEqual(savedFareQualifier('ignav'), { prefix: 'from ', note: 'estimate when saved' })
   assert.deepEqual(savedFareQualifier('duffel'), { prefix: '', note: 'when saved' })
+})
+
+test('the composer says which thread a trip message lands in', () => {
+  // Three cases, because a trip's owner is not always somewhere the web
+  // can post: an owned direct thread, an orphan, and a Telegram group.
+  assert.deepEqual(composerTarget({ chat: { id: 7, title: 'Cheap flights in October', scope: 'direct' } }),
+    { thread: 7, label: 'to "Cheap flights in October"' })
+
+  assert.deepEqual(composerTarget({ chat: { id: 7, title: null, scope: 'direct' } }),
+    { thread: 7, label: 'to an unnamed thread' })
+
+  // Orphaned: sending starts a thread, which then adopts the trip.
+  assert.deepEqual(composerTarget({ chat: null }),
+    { thread: null, label: 'to a new chat' })
+
+  // A group is a room with other people in it. Offer a new direct thread
+  // instead, and do not take the group's ownership away from it.
+  assert.deepEqual(composerTarget({ chat: { id: 9, title: 'Trip crew', scope: 'telegram:-100' } }),
+    { thread: null, label: 'planned in a Telegram group — replies go to a new chat' })
+
+  // No trip is on screen at all — the empty state, or a selection that
+  // hasn't resolved yet. There is nothing to name, so the line says
+  // nothing (the caller hides it), and a send still gets a thread of its
+  // own rather than reusing whatever thread the page last had open in
+  // Chat, which has nothing to do with whatever gets typed here.
+  assert.deepEqual(composerTarget(undefined), { thread: null, label: '' })
 })

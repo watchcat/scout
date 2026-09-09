@@ -172,6 +172,127 @@ export function threadVanished(list, shown, adopt = false) {
   return !adopt && shown !== null && !list.some((t) => t.id === shown)
 }
 
+// A stored itinerary is deliberately a display string rather than a live
+// offer. Its grammar is owned by `duffel::itinerary`: an airport at either
+// end and zero or more connection airports between ` ✈ ` separators. The
+// middle value is a layover, while the ends carry local clock and date.
+export function parseItinerary(itinerary) {
+  if (typeof itinerary !== 'string' || !itinerary.trim()) return []
+  return itinerary.split(/\s+✈\s+/).map((raw, index, all) => {
+    const match = raw.trim().match(/^([A-Z]{3})(?:\/([A-Z]{3}))?(?:\s+(.+))?$/)
+    if (!match) return { airport: raw.trim(), departsFrom: null, time: null, date: null, wait: null }
+    const detail = match[3] ?? ''
+    const stamped = detail.match(/^(\d{2}:\d{2})\s+(\d{2}\.\d{2})$/)
+    const endpoint = index === 0 || index === all.length - 1
+    return {
+      airport: match[1],
+      departsFrom: match[2] ?? null,
+      time: endpoint && stamped ? stamped[1] : null,
+      date: endpoint && stamped ? stamped[2] : null,
+      wait: !endpoint && detail ? detail : null,
+    }
+  })
+}
+
+// The one option a segment is currently using. A sole candidate is the pick
+// by elimination, matching core's readiness rule even if its `chosen` flag is
+// false.
+export function selectedCandidate(segment) {
+  return segment?.candidates?.find((candidate) => candidate.chosen)
+    ?? (segment?.candidates?.length === 1 ? segment.candidates[0] : null)
+}
+
+function localMinutes(value) {
+  const match = typeof value === 'string'
+    ? value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):\d{2}$/)
+    : null
+  if (!match) return null
+  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5])) / 60000
+}
+
+export function durationLabel(minutes) {
+  if (!Number.isFinite(minutes) || minutes < 0) return 'Duration unavailable'
+  const days = Math.floor(minutes / (24 * 60))
+  const hours = Math.floor((minutes % (24 * 60)) / 60)
+  const rest = minutes % 60
+  if (days > 0) {
+    return [
+      `${days}d`,
+      hours > 0 ? `${hours}h` : '',
+      rest > 0 ? `${String(rest).padStart(2, '0')}m` : '',
+    ].filter(Boolean).join(' ')
+  }
+  if (hours === 0) return `${rest}m`
+  return rest === 0 ? `${hours}h` : `${hours}h ${String(rest).padStart(2, '0')}m`
+}
+
+// Checks the join between two independently stored trip segments. The two
+// timestamps are comparable only when they name the same airport: both clocks
+// are local to that place. This is the same boundary core uses.
+export function connectionCheck(before, after) {
+  const arrival = selectedCandidate(before)
+  const departure = selectedCandidate(after)
+  if (!arrival || !departure) {
+    return { tone: 'warning', text: 'Choose both flights to check this connection.' }
+  }
+  if (before.destination !== after.origin) {
+    return {
+      tone: 'warning',
+      text: `Airport transfer: arrive at ${before.destination}, continue from ${after.origin}. Travel between them is not included.`,
+    }
+  }
+  const landed = localMinutes(arrival.arriving_at_local)
+  const leaves = localMinutes(departure.departing_at_local)
+  if (landed === null || leaves === null) {
+    return { tone: 'warning', text: `Connection at ${before.destination}: timing unavailable.` }
+  }
+  const minutes = leaves - landed
+  if (minutes < 0) {
+    return { tone: 'danger', text: `Impossible connection at ${before.destination}: the next flight leaves before arrival.` }
+  }
+  const wait = durationLabel(minutes)
+  if (minutes < 180) {
+    return { tone: 'danger', text: `${wait} at ${before.destination} — tight connection; allow at least 3 hours between separate tickets.` }
+  }
+  return { tone: 'ready', text: `${wait} at ${before.destination} between the selected flights.` }
+}
+
+export function tripTimelinePoints(trip) {
+  if (!trip?.segments?.length) return []
+  const points = [{ code: trip.segments[0].origin, date: trip.segments[0].departure_date, gap: false }]
+  for (let i = 0; i < trip.segments.length; i++) {
+    const segment = trip.segments[i]
+    const chosen = selectedCandidate(segment)
+    const stops = chosen ? parseItinerary(chosen.itinerary).slice(1, -1) : []
+    for (const stop of stops) {
+      points.push({
+        code: stop.departsFrom ? `${stop.airport}/${stop.departsFrom}` : stop.airport,
+        date: stop.wait ?? 'Connection',
+        gap: false,
+      })
+    }
+    points.push({ code: segment.destination, date: '', gap: false })
+    const next = trip.segments[i + 1]
+    if (next && next.origin !== segment.destination) {
+      points[points.length - 1].gap = true
+      points.push({ code: next.origin, date: next.departure_date, gap: false })
+    } else if (next) {
+      points[points.length - 1].date = next.departure_date
+    }
+  }
+  return points
+}
+
+export function tripLoadIsCurrent(request, current, choicePending) {
+  return request === current && !choicePending
+}
+
+export function savedFareQualifier(source) {
+  return String(source).toLowerCase() === 'ignav'
+    ? { prefix: 'from ', note: 'estimate when saved' }
+    : { prefix: '', note: 'when saved' }
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')
@@ -185,6 +306,13 @@ function start() {
   const sideEl = document.getElementById('side')
   const threadsEl = document.getElementById('threads')
   const menuButton = document.getElementById('menu')
+  const chatWorkspace = document.getElementById('chat-workspace')
+  const tripsView = document.getElementById('trips-view')
+  const chatTab = document.getElementById('view-chat')
+  const tripsTab = document.getElementById('view-trips')
+  const tripCount = document.getElementById('trip-count')
+  const tripList = document.getElementById('trip-list')
+  const tripDetail = document.getElementById('trip-detail')
   // The thread the page is showing. Every message names it, so a thread
   // the phone started meanwhile cannot swallow a message meant for this one.
   //
@@ -201,6 +329,11 @@ function start() {
   // The threads the rows on screen were built from, held so the minute
   // ticker below can re-label them without asking the server again.
   let lastList = []
+  let trips = []
+  let currentTrip = null
+  let tripsLoaded = false
+  let tripLoadSeq = 0
+  let tripChoicePending = false
 
   // Enter sends, Shift+Enter is a newline. `requestSubmit` rather than
   // `submit` because it runs the form's own validation — so Enter on an
@@ -267,6 +400,324 @@ function start() {
   function hideNotice() {
     noticeEl.hidden = true
     noticeEl.textContent = ''
+  }
+
+  function node(tag, className, text) {
+    const el = document.createElement(tag)
+    if (className) el.className = className
+    if (text !== undefined) el.textContent = text
+    return el
+  }
+
+  function dateLabel(value, compact = false) {
+    const match = typeof value === 'string' ? value.match(/^(\d{4})-(\d{2})-(\d{2})$/) : null
+    if (!match) return value || 'Date not set'
+    const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
+    return new Intl.DateTimeFormat(undefined, compact
+      ? { month: 'short', day: 'numeric', timeZone: 'UTC' }
+      : { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+      .format(date)
+  }
+
+  function clockLabel(value) {
+    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)
+      ? value.slice(11, 16)
+      : '—'
+  }
+
+  function moneyLabel(price, currency) {
+    if (!Number.isFinite(price)) return 'Price unavailable'
+    if (!currency) return price.toFixed(2)
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: 'currency', currency, minimumFractionDigits: 0, maximumFractionDigits: 2,
+      }).format(price)
+    } catch {
+      return `${price.toFixed(2)} ${currency}`
+    }
+  }
+
+  function tripRoute(trip) {
+    if (!trip.segments?.length) return 'No route yet'
+    const codes = [trip.segments[0].origin]
+    for (const segment of trip.segments) {
+      if (codes[codes.length - 1] !== segment.origin) codes.push(segment.origin)
+      codes.push(segment.destination)
+    }
+    return codes.join(' → ')
+  }
+
+  function switchView(view) {
+    const showingTrips = view === 'trips'
+    chatWorkspace.hidden = showingTrips
+    tripsView.hidden = !showingTrips
+    chatTab.setAttribute('aria-pressed', String(!showingTrips))
+    tripsTab.setAttribute('aria-pressed', String(showingTrips))
+    menuButton.hidden = showingTrips
+    if (mirrorButton) mirrorButton.hidden = showingTrips
+    if (showingTrips && !tripsLoaded) loadTrips().catch(() => {})
+  }
+
+  async function loadTrips() {
+    // A selection response carries the authoritative post-write trip. Do not
+    // start a read that could race it and repaint an older snapshot.
+    if (tripChoicePending) return
+    const seq = ++tripLoadSeq
+    tripDetail.setAttribute('aria-busy', 'true')
+    try {
+      const res = await fetch('/chat/trips')
+      if (!res.ok) throw new Error('refused')
+      const loaded = await res.json()
+      // Two loads can overlap when a hidden tab wakes as Trips is opened.
+      // Only the latest response may redraw the page.
+      if (!tripLoadIsCurrent(seq, tripLoadSeq, tripChoicePending)) return
+      trips = loaded
+      tripsLoaded = true
+      tripCount.textContent = String(trips.length)
+      tripCount.hidden = trips.length === 0
+      if (!trips.some((trip) => trip.name === currentTrip)) currentTrip = trips[0]?.name ?? null
+      renderTripList()
+      renderTripDetail()
+    } catch {
+      if (!tripLoadIsCurrent(seq, tripLoadSeq, tripChoicePending)) return
+      showTripEmpty(
+        'Could not load your trips',
+        'Return to chat or reload the page to try again.',
+      )
+    } finally {
+      if (seq === tripLoadSeq) tripDetail.removeAttribute('aria-busy')
+    }
+  }
+
+  function showTripEmpty(title, copy) {
+    tripDetail.replaceChildren()
+    const empty = node('div', 'trip-empty')
+    const inner = node('div')
+    inner.innerHTML = '<svg viewBox="0 0 64 64" width="52" height="52" aria-hidden="true"><path d="M10 43h44M16 37l11-20 7 3-3 14 14-9 5 4-18 13z" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    inner.append(node('h2', '', title), node('p', '', copy))
+    empty.append(inner)
+    tripDetail.append(empty)
+  }
+
+  function renderTripList() {
+    tripList.replaceChildren()
+    for (const trip of trips) {
+      const li = node('li')
+      const button = node('button')
+      button.type = 'button'
+      button.setAttribute('aria-current', String(trip.name === currentTrip))
+      button.append(
+        node('span', 'trip-list-name', trip.name),
+        node('span', 'trip-list-route', tripRoute(trip)),
+      )
+      button.addEventListener('click', () => {
+        currentTrip = trip.name
+        renderTripList()
+        renderTripDetail()
+        tripDetail.scrollTop = 0
+      })
+      li.append(button)
+      tripList.append(li)
+    }
+  }
+
+  function renderOverview(trip) {
+    const card = node('section', 'trip-overview')
+    const label = node('div', 'trip-overview-label')
+    label.append(node('span', '', 'Trip timeline'), node('span', '', `${trip.segments.length} ${trip.segments.length === 1 ? 'segment' : 'segments'}`))
+    const timeline = node('div', 'trip-timeline')
+    for (const point of tripTimelinePoints(trip)) {
+      const item = node('div', point.gap ? 'trip-point gap' : 'trip-point')
+      item.append(
+        node('span', 'point-dot'),
+        node('span', 'point-code', point.code),
+        node('span', 'point-date', point.date ? dateLabel(point.date, true) : ''),
+      )
+      timeline.append(item)
+    }
+    card.append(label, timeline)
+    return card
+  }
+
+  function stopLabel(candidate) {
+    const points = parseItinerary(candidate.itinerary)
+    const stops = points.slice(1, -1)
+    if (!stops.length) return { text: 'Direct', direct: true }
+    const detail = stops.map((stop) => {
+      const airport = stop.departsFrom ? `${stop.airport}→${stop.departsFrom}` : stop.airport
+      return stop.wait ? `${stop.wait} at ${airport}` : airport
+    }).join(' · ')
+    return { text: `${stops.length} ${stops.length === 1 ? 'stop' : 'stops'} · ${detail}`, direct: false }
+  }
+
+  function renderOption(trip, segment, candidate) {
+    const chosen = selectedCandidate(segment)?.candidate === candidate.candidate
+    const label = node('label', chosen ? 'flight-option selected' : 'flight-option')
+    const input = document.createElement('input')
+    input.type = 'radio'
+    input.name = `segment-${segment.position}`
+    input.checked = chosen
+    input.dataset.candidate = String(candidate.candidate)
+    input.setAttribute('aria-label', `Choose option ${candidate.candidate}, ${candidate.airline}`)
+    const radio = node('span', 'option-radio')
+
+    const main = node('span', 'option-main')
+    const top = node('span', 'option-top')
+    top.append(
+      node('span', 'airline', candidate.airline),
+      node('span', 'flight-number', candidate.flight_numbers.replaceAll(',', ' · ')),
+    )
+    if (candidate.source) top.append(node('span', 'source-label', candidate.source))
+
+    const line = node('span', 'flight-line')
+    const depart = node('span', 'flight-time')
+    depart.append(node('strong', '', clockLabel(candidate.departing_at_local)), node('span', '', segment.origin))
+    const track = node('span', 'flight-track')
+    const stops = stopLabel(candidate)
+    const meta = node('span', 'flight-meta')
+    meta.append(
+      node('span', '', durationLabel(candidate.duration_minutes)),
+      node('span', stops.direct ? 'stop-pill direct' : 'stop-pill', stops.text),
+    )
+    track.append(node('span', 'track-rule'), meta)
+    const arrive = node('span', 'flight-time')
+    arrive.append(node('strong', '', clockLabel(candidate.arriving_at_local)), node('span', '', segment.destination))
+    line.append(depart, track, arrive)
+    main.append(top, line)
+
+    const price = node('span', 'option-price')
+    const qualifier = savedFareQualifier(candidate.source)
+    price.append(
+      node('strong', '', qualifier.prefix + moneyLabel(candidate.quoted_price, candidate.quoted_currency)),
+      node('span', '', qualifier.note),
+    )
+    label.append(input, radio, main, price)
+    label.addEventListener('click', (event) => {
+      event.preventDefault()
+      if (!chosen) chooseFlight(trip, segment, candidate, label).catch(() => {})
+    })
+    return label
+  }
+
+  function renderSegment(trip, segment) {
+    const card = node('article', 'segment-card')
+    const head = node('header', 'segment-head')
+    const route = node('div')
+    route.append(
+      node('p', 'segment-kicker', `Segment ${segment.position}`),
+      node('h3', 'segment-route'),
+    )
+    route.lastChild.append(
+      document.createTextNode(segment.origin),
+      node('span', 'route-arrow', '→'),
+      document.createTextNode(segment.destination),
+    )
+    head.append(route, node('time', 'segment-date', dateLabel(segment.departure_date)))
+    card.append(head)
+
+    if (!segment.candidates.length) {
+      card.append(node('p', 'no-options', 'No flight saved yet. Ask Scout in chat to search this route.'))
+      return card
+    }
+    const options = node('div', 'option-list')
+    for (const candidate of segment.candidates) options.append(renderOption(trip, segment, candidate))
+    card.append(options)
+    return card
+  }
+
+  function renderTripDetail() {
+    const trip = trips.find((item) => item.name === currentTrip)
+    if (!trip) {
+      showTripEmpty(
+        trips.length ? 'Choose a trip' : 'No trips yet',
+        trips.length
+          ? 'Pick an itinerary to see its route and flights.'
+          : 'Build a trip with Scout in chat, save flight options, then compare them here.',
+      )
+      return
+    }
+
+    tripDetail.replaceChildren()
+    const head = node('div', 'trip-head')
+    const title = node('div')
+    title.append(
+      node('p', 'eyebrow', tripRoute(trip)),
+      node('h2', 'trip-title', trip.name),
+      node('p', 'trip-subtitle', `${trip.adults} ${trip.adults === 1 ? 'traveller' : 'travellers'} · ${trip.cabin_class ?? 'Cabin not set'}`),
+    )
+    head.append(title, node('span', `status-chip ${trip.status}`, trip.status))
+    tripDetail.append(head)
+    if (trip.segments.length) tripDetail.append(renderOverview(trip))
+
+    const readiness = node('div', trip.not_ready ? 'trip-alert' : 'trip-alert ready')
+    readiness.append(
+      node('strong', '', trip.not_ready ? 'Needs a decision.' : 'Ready to price.'),
+      document.createTextNode(` ${trip.not_ready ?? 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.'}`),
+    )
+    tripDetail.append(readiness)
+    for (const note of trip.notes ?? []) {
+      const alert = node('div', 'trip-alert')
+      alert.append(node('strong', '', 'Connection check.'), document.createTextNode(` ${note}`))
+      tripDetail.append(alert)
+    }
+
+    const stack = node('div', 'segment-stack')
+    for (let i = 0; i < trip.segments.length; i++) {
+      stack.append(renderSegment(trip, trip.segments[i]))
+      if (i < trip.segments.length - 1) {
+        const check = connectionCheck(trip.segments[i], trip.segments[i + 1])
+        stack.append(node('div', `join-card ${check.tone}`, check.text))
+      }
+    }
+    tripDetail.append(stack)
+  }
+
+  async function chooseFlight(trip, segment, candidate, optionEl) {
+    // Every response contains a whole-trip snapshot. Serialize choices so
+    // responses for two rapid clicks cannot repaint one another out of order.
+    if (tripChoicePending) return
+    tripChoicePending = true
+    // Invalidates any GET that started before this write.
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    optionEl.classList.add('saving')
+    try {
+      const res = await post('/chat/trips/choice', {
+        trip: trip.name,
+        position: segment.position,
+        candidate: candidate.candidate,
+      })
+      if (res.status === 404) {
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        showTripToast('That option changed. The trip has been refreshed.')
+        return
+      }
+      if (!res.ok) throw new Error('refused')
+      const updated = await res.json()
+      trips = [updated, ...trips.filter((item) => item.name !== updated.name)]
+      currentTrip = updated.name
+      renderTripList()
+      renderTripDetail()
+      showTripToast(`Option ${candidate.candidate} selected for ${segment.origin} → ${segment.destination}.`)
+      tripDetail
+        .querySelector(`input[name="segment-${segment.position}"][data-candidate="${candidate.candidate}"]`)
+        ?.focus()
+    } catch {
+      optionEl.classList.remove('saving')
+      showTripToast('Could not save that choice. Try again.')
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+    }
+  }
+
+  function showTripToast(text) {
+    tripDetail.querySelector('.trip-toast')?.remove()
+    const toast = node('div', 'trip-toast', text)
+    toast.setAttribute('role', 'status')
+    tripDetail.append(toast)
   }
 
   async function loadHistory() {
@@ -663,7 +1114,11 @@ function start() {
     // server's current one, and this reader is still looking at theirs.
     // Not awaited either — a tab woken on a dead network is not an error
     // worth a console entry.
-    if (document.visibilityState === 'visible') refreshThreads().catch(() => {})
+    if (document.visibilityState === 'visible') {
+      refreshThreads().catch(() => {})
+      tripsLoaded = false
+      if (!tripsView.hidden) loadTrips().catch(() => {})
+    }
   })
 
   // Runs one turn: posts the question, streams `agent` events into the
@@ -821,6 +1276,10 @@ function start() {
       // the same situation as one that stopped without an `end` frame.
     } finally {
       hideStatus()
+      // A chat turn may have added a segment or parked a flight. The next
+      // visit to Trips must read that durable state rather than reuse the
+      // snapshot from before the run.
+      tripsLoaded = false
       // Not awaited: the first answer is what names a thread, and the row
       // should pick that name up without holding the composer shut for it.
       // Not adopted either — this run's `save_history` just made its thread
@@ -908,6 +1367,9 @@ function start() {
     })
   }
 
+  chatTab.addEventListener('click', () => switchView('chat'))
+  tripsTab.addEventListener('click', () => switchView('trips'))
+
   // Through `newThread`, which posts `/chat/threads`: the sidebar has to
   // learn the new thread's id, and the threads route is what hands it back.
   resetForm.addEventListener('submit', async (e) => {
@@ -918,6 +1380,10 @@ function start() {
   // Nothing awaits the page's first load, and its own failure already
   // shows as a notice — a rejection on top of that is only console noise.
   loadHistory().catch(() => {})
+  // Loaded in the background so the Trips tab can show a count before it is
+  // opened. A failure is rendered inside that workspace and does not disturb
+  // the chat, which remains the default view.
+  loadTrips().catch(() => {})
 }
 
 // Guarded so `node --test` can import the pure functions above without a

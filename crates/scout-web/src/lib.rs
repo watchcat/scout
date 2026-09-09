@@ -157,7 +157,8 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         Some(auth) => public.merge(
             routes::auth::routes(auth.clone())
                 .merge(routes::account::routes(auth.clone()))
-                .merge(routes::chat::routes(auth))
+                .merge(routes::chat::routes(auth.clone()))
+                .merge(routes::trips::routes(auth))
                 .layer(axum::middleware::from_fn(security_headers)),
         ),
         None => public,

@@ -13,7 +13,8 @@
   :root{color-scheme:dark}
   :root{--base03:#002b36; --base02:#073642; --base01:#586e75; --base00:#657b83;
     --base0:#839496; --base1:#93a1a1; --base2:#eee8d5; --blue:#268bd2;
-    --red:#dc322f; --green:#859900}
+    --cyan:#2aa198; --red:#dc322f; --green:#859900; --yellow:#b58900;
+    --line:#0d4a5a; --panel:#062f3a}
   *{box-sizing:border-box}
   body{margin:0; background:var(--base03); color:var(--base0);
     font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
@@ -120,6 +121,18 @@
      pushes the controls to the far end, which is why the header no longer
      asks for `space-between` at all. */
   .mark{margin-right:auto}
+  .view-tabs{display:flex; padding:3px; gap:2px; border:1px solid var(--line);
+    background:rgba(7,54,66,.68); border-radius:10px}
+  .view-tabs button{border:0; border-radius:7px; padding:6px 12px; background:transparent;
+    color:var(--base0); font:inherit; font-size:13px; font-weight:650; cursor:pointer}
+  .view-tabs button:hover{color:var(--base2)}
+  .view-tabs button[aria-pressed="true"]{background:#124659; color:var(--base2);
+    box-shadow:0 1px 6px rgba(0,0,0,.22)}
+  .view-tabs button:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
+  .tab-count{display:inline-flex; min-width:18px; height:18px; margin-left:5px; padding:0 5px;
+    align-items:center; justify-content:center; border-radius:9px; background:var(--base03);
+    color:var(--base0); font-size:11px; line-height:1}
+  [hidden]{display:none!important}
   .side{min-height:0; overflow-y:auto; padding:4px 12px 16px 0; border-right:1px solid #0d4a5a}
   .side .reset{margin:0 0 10px}
   .side .reset button{width:100%}
@@ -221,15 +234,155 @@
   .threads .title:focus-visible,.threads .tools button:focus-visible,.menu:focus-visible{
     outline:2px solid var(--blue); outline-offset:-2px}
   .menu{display:none; background:transparent; border:0; color:var(--base1); cursor:pointer; padding:8px}
+  .trips-view{flex:1; min-height:0; display:grid; grid-template-columns:260px 1fr; gap:24px;
+    padding:4px 0 20px}
+  .trip-side{min-height:0; overflow-y:auto; padding:0 12px 16px 0; border-right:1px solid var(--line)}
+  .trip-side-head{display:flex; align-items:end; justify-content:space-between; padding:6px 10px 13px}
+  .eyebrow{margin:0 0 2px; color:var(--cyan); font-size:11px; font-weight:800;
+    letter-spacing:.12em; text-transform:uppercase}
+  .trip-side h1{margin:0; color:var(--base2); font-size:20px; line-height:1.2}
+  .trip-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:5px}
+  .trip-list button{width:100%; border:0; border-radius:11px; padding:11px 12px;
+    background:transparent; color:var(--base0); font:inherit; text-align:left; cursor:pointer}
+  .trip-list button:hover{background:var(--base02)}
+  .trip-list button[aria-current="true"]{background:var(--base02); color:var(--base2);
+    box-shadow:inset 3px 0 var(--cyan)}
+  .trip-list button:focus-visible{outline:2px solid var(--blue); outline-offset:-2px}
+  .trip-list-name{display:block; color:inherit; font-size:14.5px; font-weight:700;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .trip-list-route{display:block; margin-top:2px; color:var(--base01); font-size:12px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .trip-detail{min-height:0; overflow-y:auto; padding:0 8px 32px 0;
+    scrollbar-width:thin; scrollbar-color:var(--line) transparent}
+  .trip-empty{min-height:100%; display:grid; place-items:center; text-align:center; padding:44px 24px;
+    border:1px dashed var(--line); border-radius:18px; color:var(--base01)}
+  .trip-empty svg{color:var(--cyan); margin-bottom:14px}
+  .trip-empty h2{margin:0 0 6px; color:var(--base2); font-size:21px}
+  .trip-empty p{margin:0; max-width:440px}
+  .trip-head{display:flex; align-items:flex-start; justify-content:space-between; gap:20px;
+    margin:0 0 18px; padding:2px 2px 0}
+  .trip-title{margin:0; color:var(--base2); font-size:clamp(25px,3vw,34px); line-height:1.12;
+    letter-spacing:-.025em}
+  .trip-subtitle{margin:7px 0 0; color:var(--base0); font-size:14px}
+  .status-chip{display:inline-flex; align-items:center; gap:7px; flex:none; margin-top:5px;
+    padding:6px 10px; border:1px solid var(--line); border-radius:999px; color:var(--base1);
+    font-size:12px; font-weight:750; text-transform:capitalize}
+  .status-chip::before{content:""; width:7px; height:7px; border-radius:50%; background:var(--yellow)}
+  .status-chip.finalised{color:#b8c76a; border-color:#596f2a}
+  .status-chip.finalised::before{background:var(--green)}
+  .trip-overview{margin-bottom:16px; padding:18px; border:1px solid var(--line); border-radius:16px;
+    background:linear-gradient(135deg,rgba(7,54,66,.95),rgba(5,45,55,.7));
+    box-shadow:0 10px 32px rgba(0,0,0,.16)}
+  .trip-overview-label{display:flex; justify-content:space-between; gap:12px; margin-bottom:16px;
+    color:var(--base01); font-size:12px; font-weight:700; text-transform:uppercase;
+    letter-spacing:.08em}
+  .trip-timeline{display:flex; align-items:flex-start; overflow-x:auto; padding:2px 2px 8px;
+    scrollbar-width:thin; scrollbar-color:var(--line) transparent}
+  .trip-point{min-width:92px; position:relative; text-align:center; flex:none}
+  .trip-point::after{content:""; position:absolute; top:10px; left:calc(50% + 8px);
+    width:calc(100% - 16px); height:2px; background:var(--line)}
+  .trip-point:last-child::after{display:none}
+  .trip-point.gap::after{background:repeating-linear-gradient(90deg,var(--yellow) 0 5px,transparent 5px 9px)}
+  .point-dot{position:relative; z-index:1; width:20px; height:20px; margin:0 auto 8px;
+    display:grid; place-items:center; border:2px solid var(--cyan); border-radius:50%;
+    background:var(--base03); color:var(--cyan)}
+  .point-dot::after{content:""; width:6px; height:6px; border-radius:50%; background:currentColor}
+  .trip-point.gap .point-dot{border-color:var(--yellow); color:var(--yellow)}
+  .point-code{display:block; color:var(--base2); font-size:14px; font-weight:800; letter-spacing:.05em}
+  .point-date{display:block; margin-top:1px; color:var(--base01); font-size:11px}
+  .trip-alert{display:block; margin:0 0 14px; padding:11px 13px;
+    border:1px solid #6c5b1d; border-radius:12px; background:rgba(181,137,0,.09);
+    color:#d1c27e; font-size:13px; line-height:1.45}
+  .trip-alert.ready{border-color:#3f682f; background:rgba(133,153,0,.08); color:#b8c76a}
+  .trip-alert strong{color:var(--base2); margin-right:.28em}
+  .segment-stack{display:flex; flex-direction:column; gap:12px}
+  .segment-card{border:1px solid var(--line); border-radius:16px; background:rgba(7,54,66,.62);
+    overflow:hidden}
+  .segment-head{display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+    padding:15px 16px 13px; border-bottom:1px solid rgba(13,74,90,.75)}
+  .segment-kicker{margin:0 0 4px; color:var(--base01); font-size:11px; font-weight:800;
+    letter-spacing:.1em; text-transform:uppercase}
+  .segment-route{margin:0; color:var(--base2); font-size:22px; line-height:1.15}
+  .route-arrow{padding:0 7px; color:var(--cyan); font-weight:400}
+  .segment-date{flex:none; margin-top:2px; color:var(--base1); font-size:13px}
+  .option-list{display:flex; flex-direction:column}
+  .flight-option{position:relative; display:grid; grid-template-columns:28px minmax(0,1fr) auto;
+    gap:12px; align-items:start; padding:15px 16px; cursor:pointer; border-bottom:1px solid rgba(13,74,90,.55)}
+  .flight-option:last-child{border-bottom:0}
+  .flight-option:hover{background:rgba(18,70,89,.5)}
+  .flight-option.selected{background:rgba(42,161,152,.08); box-shadow:inset 3px 0 var(--cyan)}
+  .flight-option.saving{opacity:.58; pointer-events:none}
+  .flight-option input{position:absolute; opacity:0; pointer-events:none}
+  .option-radio{width:20px; height:20px; margin-top:2px; border:2px solid var(--base01);
+    border-radius:50%; display:grid; place-items:center}
+  .flight-option input:focus-visible + .option-radio{outline:2px solid var(--blue); outline-offset:3px}
+  .flight-option:focus-within{outline:2px solid var(--blue); outline-offset:-2px}
+  .selected .option-radio{border-color:var(--cyan)}
+  .selected .option-radio::after{content:""; width:10px; height:10px; border-radius:50%;
+    background:var(--cyan)}
+  .option-main{min-width:0}
+  .option-top{display:flex; align-items:center; flex-wrap:wrap; gap:7px; margin-bottom:8px}
+  .airline{color:var(--base2); font-size:14px; font-weight:750}
+  .flight-number{padding:2px 6px; border-radius:5px; background:var(--base03);
+    color:var(--base0); font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+  .source-label{color:var(--base01); font-size:11px; text-transform:capitalize}
+  .flight-line{display:flex; align-items:stretch; min-width:0}
+  .flight-time{width:58px; flex:none}
+  .flight-time strong{display:block; color:var(--base2); font-size:17px; line-height:1.15}
+  .flight-time span{display:block; margin-top:2px; color:var(--base01); font-size:11px}
+  .flight-track{flex:1; min-width:68px; padding:4px 10px 0; text-align:center}
+  .track-rule{position:relative; display:block; height:2px; margin:6px 0 7px; background:var(--line)}
+  .track-rule::before,.track-rule::after{content:""; position:absolute; top:-3px; width:8px;
+    height:8px; border-radius:50%; background:var(--cyan)}
+  .track-rule::before{left:0}.track-rule::after{right:0}
+  .flight-meta{display:flex; justify-content:center; gap:7px; flex-wrap:wrap;
+    color:var(--base01); font-size:11px; line-height:1.35}
+  .stop-pill{color:#d1c27e}
+  .stop-pill.direct{color:#b8c76a}
+  .option-price{min-width:76px; text-align:right}
+  .option-price strong{display:block; color:var(--base2); font-size:17px; line-height:1.2}
+  .option-price span{display:block; margin-top:4px; color:var(--base01); font-size:10px;
+    text-transform:uppercase; letter-spacing:.06em}
+  .no-options{margin:0; padding:18px 16px; color:var(--base01); font-size:13px}
+  .join-card{display:flex; align-items:center; gap:11px; margin:0 16px; padding:10px 13px;
+    border-left:2px solid var(--green); color:var(--base0); font-size:12.5px}
+  .join-card::before{content:""; width:8px; height:8px; flex:none; border-radius:50%; background:var(--green)}
+  .join-card.warning{border-color:var(--yellow); color:#d1c27e}
+  .join-card.warning::before{background:var(--yellow)}
+  .join-card.danger{border-color:var(--red); color:#ff817a}
+  .join-card.danger::before{background:var(--red)}
+  .trip-toast{position:sticky; bottom:8px; z-index:4; width:max-content; max-width:calc(100% - 16px);
+    margin:12px auto 0; padding:9px 13px; border:1px solid var(--line); border-radius:10px;
+    background:#001f27; color:var(--base1); box-shadow:0 8px 24px rgba(0,0,0,.35); font-size:13px}
   /* Below the two-column threshold the sidebar becomes a drawer: it stacks
      above the transcript rather than beside it, is out of the way until the
      menu button opens it, and is capped so it can never take the screen the
      conversation is on. */
   @media (max-width:720px){
+    header{padding-top:14px; gap:8px}
+    .mark .word{display:none}
+    .view-tabs{margin-right:auto}
+    .mark{margin-right:0}
     .columns{display:flex; flex-direction:column; gap:0}
     .side{display:none; border-right:0; border-bottom:1px solid #0d4a5a; max-height:40dvh; padding:0 0 8px}
     .side.open{display:block}
     .menu{display:block}
+    .trips-view{display:flex; flex-direction:column; gap:12px; overflow:hidden}
+    .trip-side{min-height:auto; overflow:visible; padding:0; border-right:0}
+    .trip-side-head{padding:0 2px 10px}
+    .trip-side h1{font-size:17px}
+    .trip-list{flex-direction:row; overflow-x:auto; padding:0 0 7px; scrollbar-width:thin}
+    .trip-list li{flex:0 0 164px}
+    .trip-list button{background:rgba(7,54,66,.5)}
+    .trip-detail{padding-right:0}
+    .trip-overview{padding:15px 12px}
+    .trip-point{min-width:64px; flex:1}
+    .trip-head{margin-bottom:14px}
+    .trip-title{font-size:26px}
+    .flight-option{grid-template-columns:24px minmax(0,1fr); gap:9px 8px; padding:14px 12px}
+    .option-price{grid-column:2; min-width:0; text-align:left; display:flex; align-items:baseline; gap:5px}
+    .option-price span{display:inline}
+    .flight-track{padding-left:5px; padding-right:5px}
   }
 </style>
 </head>
@@ -255,6 +408,12 @@
     </svg>
     <span class="word">Scout</span>
   </a>
+  <nav class="view-tabs" aria-label="Workspace">
+    <button id="view-chat" type="button" aria-pressed="true"
+            aria-controls="chat-workspace">Chat</button>
+    <button id="view-trips" type="button" aria-pressed="false"
+            aria-controls="trips-view">Trips<span id="trip-count" class="tab-count" hidden></span></button>
+  </nav>
   <div class="controls">
     <button id="mirror" type="button" aria-pressed="<!--MIRROR-->"
             title="Also send this thread to Telegram">
@@ -264,7 +423,7 @@
     </button>
   </div>
 </header>
-<div class="columns">
+<div id="chat-workspace" class="columns">
   <aside id="side" class="side">
     <form id="reset" class="reset">
       <button type="submit">New thread</button>
@@ -287,6 +446,29 @@
     </form>
   </main>
 </div>
+<section id="trips-view" class="trips-view" aria-labelledby="view-trips" hidden>
+  <aside class="trip-side" aria-label="Saved trips">
+    <div class="trip-side-head">
+      <div>
+        <p class="eyebrow">Itineraries</p>
+        <h1>Your trips</h1>
+      </div>
+    </div>
+    <ol id="trip-list" class="trip-list"></ol>
+  </aside>
+  <main id="trip-detail" class="trip-detail" aria-live="polite">
+    <div class="trip-empty">
+      <div>
+        <svg viewBox="0 0 64 64" width="52" height="52" aria-hidden="true">
+          <path d="M10 43h44M16 37l11-20 7 3-3 14 14-9 5 4-18 13z" fill="none"
+                stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <h2>Loading your trips</h2>
+        <p>Scout is gathering the routes and flight options you saved in chat.</p>
+      </div>
+    </div>
+  </main>
+</section>
 </div>
 <script type="module" src="/chat.js"></script>
 </body>

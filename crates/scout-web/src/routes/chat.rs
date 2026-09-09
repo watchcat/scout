@@ -55,7 +55,7 @@ pub fn routes(auth: AuthState) -> Router {
 /// and a queued one identically, and a page that gated one way while its
 /// own history endpoint gated another would be a door with two locks that
 /// disagree.
-async fn admitted_account(auth: &AuthState, headers: &HeaderMap) -> Result<i64, Response> {
+pub(crate) async fn admitted_account(auth: &AuthState, headers: &HeaderMap) -> Result<i64, Response> {
     let Some(account_id) = signed_in_as(auth, headers) else {
         return Err(see_other("/sign-in"));
     };
@@ -163,7 +163,7 @@ async fn history(axum::extract::State(auth): axum::extract::State<AuthState>, he
 /// account. The form token used elsewhere rides in a hidden field because
 /// those pages post a plain HTML form; this one posts JSON, so the same
 /// value travels as a header instead — `csrf_ok_for` does not care which.
-fn csrf_header_ok(auth: &AuthState, headers: &HeaderMap, account_id: i64) -> bool {
+pub(crate) fn csrf_header_ok(auth: &AuthState, headers: &HeaderMap, account_id: i64) -> bool {
     headers
         .get("x-scout-csrf")
         .and_then(|v| v.to_str().ok())

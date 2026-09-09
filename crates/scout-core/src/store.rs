@@ -346,6 +346,17 @@ pub struct NewCandidate {
     pub source: Option<String>,
 }
 
+/// The outcome of choosing a parked flight through an account-facing
+/// interface. Keeping the ownership check and the write under one store lock
+/// prevents a web route from first resolving a trip it owns and then acting
+/// on a row that changed before the selection landed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CandidateChoice {
+    Chosen(Trip),
+    TripNotFound,
+    CandidateNotFound,
+}
+
 /// What a caller has already checked a flight against, for `add_candidate`
 /// to verify again inside the same lock as the write it guards — see that
 /// method's own comment for why the check cannot live only in the caller.
@@ -2774,6 +2785,45 @@ impl Store {
         choose_within(&conn, trip_id, position, candidate)?;
         touch(&conn, trip_id)?;
         load_trip(&conn, trip_id)
+    }
+
+    /// Chooses a candidate by the trip name a traveller knows, scoped to the
+    /// account proved by the caller. Unlike `choose_candidate`, this never
+    /// exposes or accepts the database id that the model-facing trip type
+    /// deliberately hides.
+    pub fn choose_candidate_for_account(
+        &self,
+        account_id: i64,
+        trip_name: &str,
+        position: i64,
+        candidate: i64,
+    ) -> Result<CandidateChoice> {
+        let key = trip_name.trim().to_lowercase();
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT id FROM trips WHERE account_id = ? AND name_key = ?")?;
+        let id: Option<i64> = stmt
+            .query_map(params![account_id, key], |row| row.get(0))?
+            .next()
+            .transpose()?;
+        drop(stmt);
+        let Some(id) = id else {
+            return Ok(CandidateChoice::TripNotFound);
+        };
+
+        let known: i64 = conn.query_row(
+            "SELECT count(*) FROM segment_candidates
+             WHERE trip_id = ? AND position = ? AND candidate = ?",
+            params![id, position, candidate],
+            |row| row.get(0),
+        )?;
+        if known == 0 {
+            return Ok(CandidateChoice::CandidateNotFound);
+        }
+
+        choose_within(&conn, id, position, candidate)?;
+        touch(&conn, id)?;
+        Ok(CandidateChoice::Chosen(load_trip(&conn, id)?))
     }
 
     pub fn drop_candidate(&self, trip_id: i64, position: i64, candidate: i64) -> Result<Trip> {

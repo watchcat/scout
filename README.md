@@ -180,6 +180,11 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   for a name), pin, delete. The thread you last used is the one your
   Telegram chat continues, and a thread nobody touches for two days is
   deleted unless pinned
+- **Trips you can see, not just read.** Every saved itinerary has an airport
+  timeline, dated segments, flight numbers, saved fares and layovers. Parked
+  flight options can be selected in place, and the connection time between
+  the chosen flights is recalculated immediately — including airport-change
+  and tight-connection warnings
 - **Your phone follows along.** A toggle sends the browser thread to your
   Telegram chat as it happens, so a question asked at a desk is answered on
   the train

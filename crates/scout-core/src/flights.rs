@@ -145,7 +145,7 @@ pub fn build_flight_agent(
         // the split the trip tools were registered even with no provider;
         // now an install with neither provider has no trip planning, by
         // design (spec decision: everything flight-shaped moves).
-        .tool(AddTripSegmentTool { store: d.store.clone(), account_id })
+        .tool(AddTripSegmentTool { store: d.store.clone(), account_id, conversation_id })
         .tool(AddTripOptionTool {
             store: d.store.clone(),
             account_id,
@@ -512,5 +512,31 @@ mod tests {
         }
         let p = rig::tool::Tool::parameters(&tool);
         assert_eq!(p["required"], serde_json::json!(["brief"]));
+    }
+
+    #[test]
+    fn the_trip_creating_tool_is_built_with_the_conversation_it_runs_in() {
+        // add_trip_segment is the one call that can create a trip
+        // (upsert_trip), and a trip created without its conversation id is
+        // a trip nothing will ever expire or delete with its chat — the
+        // whole feature is dead on arrival. Scoped to this one `.tool(...)`
+        // call, not the file, so a match on the surrounding comment rather
+        // than the wiring itself cannot keep this green after the wiring
+        // is gone. And the check is for the bare `conversation_id` shorthand,
+        // not merely the word: `conversation_id: 0` would also contain the
+        // word while quietly discarding `run.conversation_id`, and that is
+        // exactly the dead-on-arrival bug this test exists to catch.
+        let src = include_str!("flights.rs");
+        let start = src.find("pub fn build_flight_agent").expect("build_flight_agent must exist");
+        let call_start = src[start..]
+            .find(".tool(AddTripSegmentTool {")
+            .expect("add_trip_segment must be built here")
+            + start;
+        let end = src[call_start..].find('}').expect("the struct literal must close") + call_start;
+        let call = &src[call_start..=end];
+        assert!(
+            call.contains(", conversation_id }") || call.contains(", conversation_id,"),
+            "add_trip_segment must carry the run's own conversation id, not a stand-in value: {call}"
+        );
     }
 }

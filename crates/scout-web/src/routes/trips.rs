@@ -420,6 +420,12 @@ mod tests {
         // The trip's only leg is AMS -> LIS. Naming a different destination
         // for the same position is exactly what a tab that hasn't reloaded
         // since somebody else edited the trip would send.
+        //
+        // This body is exactly what `removeLegBody('October', { position: 1,
+        // origin: 'AMS', destination: 'FCO', departure_date: null })` in
+        // chat.js produces — same keys, same explicit `null` — so a change
+        // to either side that broke the other would show up here rather
+        // than only in production.
         let res = delete_json(
             &app,
             "/chat/trips/segment",

@@ -293,6 +293,25 @@ export function savedFareQualifier(source) {
     : { prefix: '', note: 'when saved' }
 }
 
+// The DELETE body for `/chat/trips/segment`. `drop_segment` renumbers —
+// removing leg 1 shifts leg 2 down to 1, and its parked options with it — so
+// a tab holding a trip it drew a while ago could ask to delete "leg 2" when
+// leg 2 is no longer the flight it drew. `position` alone gives the server
+// nothing to check that against, which is why the route also wants the route
+// and date the client believed were there: `null`, not an omitted key, for a
+// segment this client has no date for, matching `RemoveLegIn.departure_date`
+// on the Rust side, which is `Option<String>` and reads a JSON `null` as
+// "nothing to verify" rather than as a value.
+export function removeLegBody(tripName, segment) {
+  return JSON.stringify({
+    trip: tripName,
+    position: segment.position,
+    origin: segment.origin,
+    destination: segment.destination,
+    departure_date: segment.departure_date ?? null,
+  })
+}
+
 // Where a message typed on the Trips tab should go, and what the composer
 // says about it. `direct` is the one scope the web client may ever post
 // into — the thread it shares with Telegram 1:1 chat. Anything else is a
@@ -646,6 +665,57 @@ function start() {
     return label
   }
 
+  // The plain "Remove" button a segment starts with. Kept as its own
+  // function so `removeConfirmRow`'s Cancel can rebuild exactly this and put
+  // the card back the way it found it.
+  function segmentRemoveButton(trip, segment, slot) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'segment-remove-button'
+    button.textContent = 'Remove'
+    button.setAttribute(
+      'aria-label',
+      `Remove segment ${segment.position}, ${segment.origin} to ${segment.destination}`,
+    )
+    button.addEventListener('click', () => {
+      slot.replaceChildren(removeConfirmRow(trip, segment, slot))
+    })
+    return button
+  }
+
+  // A second click, not `window.confirm`: a dialog blocks the whole page for
+  // one segment on one card, and this is destructive enough to ask about but
+  // not rare enough to justify that. The row swaps in over the button it
+  // replaced and swaps back on Cancel or on a failed request — only a
+  // response that actually rewrote the trip (200, or the reload a 409
+  // triggers) is allowed to leave it gone for good, via the full repaint
+  // those paths already do.
+  function removeConfirmRow(trip, segment, slot) {
+    const row = node('span', 'segment-remove-confirm')
+    row.append(node('span', '', 'Remove this leg?'))
+    const cancel = document.createElement('button')
+    cancel.type = 'button'
+    cancel.textContent = 'Cancel'
+    cancel.addEventListener('click', () => {
+      slot.replaceChildren(segmentRemoveButton(trip, segment, slot))
+    })
+    const confirm = document.createElement('button')
+    confirm.type = 'button'
+    confirm.className = 'danger'
+    confirm.textContent = 'Remove'
+    confirm.addEventListener('click', () => {
+      confirm.disabled = true
+      cancel.disabled = true
+      removeLeg(trip, segment).then((restore) => {
+        if (restore) slot.replaceChildren(segmentRemoveButton(trip, segment, slot))
+      }).catch(() => {
+        slot.replaceChildren(segmentRemoveButton(trip, segment, slot))
+      })
+    })
+    row.append(cancel, confirm)
+    return row
+  }
+
   function renderSegment(trip, segment) {
     const card = node('article', 'segment-card')
     const head = node('header', 'segment-head')
@@ -659,7 +729,12 @@ function start() {
       node('span', 'route-arrow', '→'),
       document.createTextNode(segment.destination),
     )
-    head.append(route, node('time', 'segment-date', dateLabel(segment.departure_date)))
+    const actions = node('div', 'segment-head-actions')
+    actions.append(node('time', 'segment-date', dateLabel(segment.departure_date)))
+    const removeSlot = node('span', 'segment-remove')
+    removeSlot.append(segmentRemoveButton(trip, segment, removeSlot))
+    actions.append(removeSlot)
+    head.append(route, actions)
     card.append(head)
 
     if (!segment.candidates.length) {
@@ -721,6 +796,55 @@ function start() {
       }
     }
     tripDetail.append(stack)
+    tripDetail.append(renderAddLegForm(trip))
+  }
+
+  // Always appends: the markup for choosing where in the itinerary a leg
+  // lands does not exist, and `add_leg`'s `position` only needs a value at
+  // all when the caller wants something other than the end.
+  function renderAddLegForm(trip) {
+    const form = document.createElement('form')
+    form.className = 'leg-add'
+    form.append(node('p', 'leg-add-title', 'Add a leg'))
+    const row = node('div', 'leg-add-row')
+
+    function field(labelText, type, placeholder) {
+      const label = node('label', '', labelText)
+      const input = document.createElement('input')
+      input.type = type
+      input.required = true
+      if (placeholder) input.placeholder = placeholder
+      if (type === 'text') {
+        input.maxLength = 3
+        input.autocomplete = 'off'
+        // The wire format is uppercase IATA; showing it uppercase as it's
+        // typed means what is submitted is what the reader sees, not a
+        // silent rewrite. `.leg-add-code` carries the rule in the
+        // stylesheet rather than setting it here per element.
+        input.classList.add('leg-add-code')
+      }
+      label.append(input)
+      row.append(label)
+      return input
+    }
+
+    const origin = field('From', 'text', 'AMS')
+    const destination = field('To', 'text', 'FCO')
+    const date = field('Depart', 'date')
+    const submit = document.createElement('button')
+    submit.type = 'submit'
+    submit.textContent = 'Add leg'
+    row.append(submit)
+    form.append(row)
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault()
+      if (submit.disabled) return
+      submit.disabled = true
+      addLeg(trip, origin.value.trim().toUpperCase(), destination.value.trim().toUpperCase(), date.value)
+        .finally(() => { submit.disabled = false })
+    })
+    return form
   }
 
   async function chooseFlight(trip, segment, candidate, optionEl) {
@@ -769,6 +893,96 @@ function start() {
     const toast = node('div', 'trip-toast', text)
     toast.setAttribute('role', 'status')
     tripDetail.append(toast)
+  }
+
+  // Appends a leg via `position: null`. Same shape as `chooseFlight`: guard
+  // against an overlapping write, invalidate the load sequence before the
+  // request goes out, and repaint from the response's whole-trip snapshot.
+  async function addLeg(trip, origin, destination, departureDate) {
+    if (tripChoicePending) return
+    tripChoicePending = true
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    try {
+      const res = await post('/chat/trips/segment', {
+        trip: trip.name, position: null, origin, destination, departure_date: departureDate,
+      })
+      if (res.status === 409) {
+        // Not an error: this tab's copy is simply older than the trip. The
+        // position the form would have appended at may not even be the end
+        // any more, so the honest move is to reload rather than retry blind.
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        showTripToast('This trip changed elsewhere. Showing the current itinerary.')
+        return
+      }
+      if (res.status === 422) {
+        // The body is the message to show — it names what to fix (a bad
+        // airport code, a bad date, a route with the same place twice).
+        showTripToast(await res.text())
+        return
+      }
+      if (!res.ok) throw new Error('refused')
+      const updated = await res.json()
+      trips = [updated, ...trips.filter((item) => item.name !== updated.name)]
+      currentTrip = updated.name
+      renderTripList()
+      renderTripDetail()
+      showTripToast(`Added ${origin} → ${destination}.`)
+    } catch {
+      showTripToast('Could not add that leg. Try again.')
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+    }
+  }
+
+  // Returns whether the confirm row that called this should revert to the
+  // plain Remove button. That is only true when nothing redrew the trip —
+  // a 422, or the request never landing. On 200 and on the reload a 409
+  // triggers, `renderTripDetail` already rebuilt this card from scratch,
+  // so the caller has nothing left to put back.
+  async function removeLeg(trip, segment) {
+    if (tripChoicePending) return false
+    tripChoicePending = true
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    try {
+      const res = await fetch('/chat/trips/segment', {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body: removeLegBody(trip.name, segment),
+      })
+      if (res.status === 409) {
+        // Not an error: this tab's copy is simply older than the trip — the
+        // renumbering `drop_segment` does server-side means the position
+        // this click named may no longer be the leg it was clicked on.
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        showTripToast('This trip changed elsewhere. Showing the current itinerary.')
+        return false
+      }
+      if (res.status === 422) {
+        showTripToast(await res.text())
+        return true
+      }
+      if (!res.ok) throw new Error('refused')
+      const updated = await res.json()
+      trips = [updated, ...trips.filter((item) => item.name !== updated.name)]
+      currentTrip = updated.name
+      renderTripList()
+      renderTripDetail()
+      showTripToast(`Removed ${segment.origin} → ${segment.destination}.`)
+      return false
+    } catch {
+      showTripToast('Could not remove that leg. Try again.')
+      return true
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+    }
   }
 
   async function loadHistory() {

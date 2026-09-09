@@ -1893,7 +1893,12 @@ mod tests {
         // page: once back in the composer, once in a turn that was never
         // asked.
         let js = include_str!("../chat.js");
-        let start = js.find("res.status === 422").expect("the 422 arm must exist");
+        // Anchored inside `runMessage`: the trip planner's add/remove leg
+        // handlers also match on `res.status === 422`, and a search that
+        // was not scoped past `runMessage` would find one of those arms
+        // first and fail on code that has nothing to do with this rule.
+        let fn_start = js.find("async function runMessage").expect("runMessage must exist");
+        let start = fn_start + js[fn_start..].find("res.status === 422").expect("the 422 arm must exist");
         let end = js[start..].find('}').expect("the arm must end") + start;
         let body = &js[start..end];
         assert!(body.contains("retract()"), "a refused send leaves its bubble on the screen");

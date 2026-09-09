@@ -749,8 +749,8 @@ ALTER TABLE conversations ALTER COLUMN pinned SET NOT NULL;
 "#;
 
 /// The chat that made a trip. Nullable: expiry (a later change) detaches
-/// rather than cascades, so a trip outliving its 48-hour-idle chat becomes
-/// orphaned, not deleted.
+/// rather than cascades, so a trip outliving its chat — idle past
+/// `Core::THREAD_IDLE_SECS` — becomes orphaned, not deleted.
 ///
 /// `IF NOT EXISTS` for the same reason STEP_7_THREADS uses it: a database
 /// created by `MIGRATIONS` after this column shipped, but recorded below 9,
@@ -4227,42 +4227,52 @@ CREATE TABLE segment_candidates (
         assert_eq!(owner, None, "a trip made outside a conversation has no owner");
     }
 
+    /// `trips` exactly as it stood at schema version 8, before
+    /// `conversation_id`. Frozen, like `LEGACY_SCHEMA`: its value is being
+    /// an honest picture of the table step 9 will actually meet. Do not
+    /// update this when `MIGRATIONS` widens `trips` again — the whole point
+    /// is that this stays behind.
+    const PRE_TRIP_CONVERSATION_TRIPS: &str = r#"
+CREATE SEQUENCE trips_id_seq;
+CREATE TABLE trips (
+    id BIGINT PRIMARY KEY DEFAULT nextval('trips_id_seq'),
+    account_id BIGINT NOT NULL, name TEXT NOT NULL,
+    name_key TEXT NOT NULL, adults BIGINT NOT NULL DEFAULT 1,
+    cabin_class TEXT, status TEXT NOT NULL DEFAULT 'planning',
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (account_id, name_key)
+);
+"#;
+
     #[test]
     fn an_existing_database_gains_the_column_by_migration() {
         // The fresh-database path and the upgrade path are different code.
         // A CREATE TABLE IF NOT EXISTS does nothing to a table that already
         // exists, so without step 9 every deployed database would be missing
         // this column while every test passed.
+        //
+        // The row is what matters: the step is trivially safe on an empty
+        // table, and production will run it against a `trips` table that
+        // already has rows in it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scout.duckdb");
         {
             let conn = duckdb::Connection::open(&path).unwrap();
+            conn.execute_batch(PRE_TRIP_CONVERSATION_TRIPS).unwrap();
             conn.execute_batch(
-                "CREATE SEQUENCE trips_id_seq;
-                 CREATE TABLE trips (
-                     id BIGINT PRIMARY KEY DEFAULT nextval('trips_id_seq'),
-                     account_id BIGINT NOT NULL, name TEXT NOT NULL,
-                     name_key TEXT NOT NULL, adults BIGINT NOT NULL DEFAULT 1,
-                     cabin_class TEXT, status TEXT NOT NULL DEFAULT 'planning',
-                     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
-                     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
-                     UNIQUE (account_id, name_key));
-                 CREATE TABLE schema_version (version BIGINT NOT NULL);
-                 INSERT INTO schema_version VALUES (8);",
+                "CREATE TABLE schema_version (version BIGINT NOT NULL);
+                 INSERT INTO schema_version VALUES (8);
+                 INSERT INTO trips (account_id, name, name_key) VALUES (1, 'Lisbon', 'lisbon');",
             )
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        let n: i64 = store
+        let conversation_id: Option<i64> = store
             .conn()
-            .query_row(
-                "SELECT count(*) FROM information_schema.columns
-                 WHERE table_name = 'trips' AND column_name = 'conversation_id'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT conversation_id FROM trips WHERE name_key = 'lisbon'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1, "step 9 must add the column to a database that predates it");
+        assert_eq!(conversation_id, None, "a trip that predates the column must gain it, unset");
     }
 
     #[test]
@@ -5347,7 +5357,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 9, "the threads steps did not run");
+        assert_eq!(s.schema_version().unwrap(), 9, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -5400,28 +5410,48 @@ CREATE TABLE conversations (
         );
     }
 
+    /// Column name, order, type, nullability and default — the whole of
+    /// what a query can see. `MIGRATIONS` and the steps are two
+    /// descriptions of one table, and nothing else keeps them in step; this
+    /// is how a test proves they still agree.
+    fn shape(conn: &Connection, table: &str) -> Vec<(String, i64, String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name, ordinal_position, data_type, is_nullable, column_default
+                 FROM information_schema.columns
+                 WHERE table_name = ? ORDER BY ordinal_position",
+            )
+            .unwrap();
+        stmt.query_map(params![table], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
     fn a_migrated_conversations_table_has_exactly_the_shape_a_fresh_one_has() {
-        // `MIGRATIONS` and the steps are two descriptions of one table, and
-        // nothing else keeps them in step. Name, order, type, nullability
-        // and default — the whole of what a query can see.
-        fn shape(conn: &Connection) -> Vec<(String, i64, String, String, Option<String>)> {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT column_name, ordinal_position, data_type, is_nullable, column_default
-                     FROM information_schema.columns
-                     WHERE table_name = 'conversations' ORDER BY ordinal_position",
-                )
-                .unwrap();
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        }
         let (fresh, _d1) = test_store();
         let (_d2, db) = version_six_db_with_a_thread();
         let migrated = Store::open(&db).unwrap();
-        assert_eq!(shape(&fresh.conn()), shape(&migrated.conn()));
+        assert_eq!(shape(&fresh.conn(), "conversations"), shape(&migrated.conn(), "conversations"));
+    }
+
+    #[test]
+    fn a_migrated_trips_table_has_exactly_the_shape_a_fresh_one_has() {
+        // `STEP_4_REBUILDS` rewrites `trips` from a fixed column list that
+        // predates `conversation_id`, and step 9 adds the column afterwards
+        // by `ALTER TABLE`. That ordering is what makes today's rebuild
+        // correct, and nothing enforces it — the next constrained change to
+        // `trips` could copy the `STEP_4_REBUILDS` pattern, list the columns
+        // it can see, and quietly drop a later one on every deployed
+        // database while the rest of the suite stayed green. `legacy_db`
+        // rather than `version_six_db_with_a_thread`: it is the fixture
+        // that actually runs step 4 before step 9, which is the ordering
+        // this depends on.
+        let (fresh, _d1) = test_store();
+        let (_d2, db) = legacy_db();
+        let migrated = Store::open(&db).unwrap();
+        assert_eq!(shape(&fresh.conn(), "trips"), shape(&migrated.conn(), "trips"));
     }
 
     #[test]

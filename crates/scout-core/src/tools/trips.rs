@@ -169,7 +169,7 @@ impl TripView {
 
 /// Duffel and Ignav both take IATA codes only; "Amsterdam" is a 422 and a
 /// wasted search fee, so it is rejected at the point it is typed.
-fn iata(label: &str, value: &str) -> Result<String, StoreToolError> {
+pub(crate) fn iata(label: &str, value: &str) -> Result<String, StoreToolError> {
     let code = value.trim();
     match code.len() == 3 && code.chars().all(|c| c.is_ascii_alphabetic()) {
         true => Ok(code.to_ascii_uppercase()),
@@ -180,11 +180,30 @@ fn iata(label: &str, value: &str) -> Result<String, StoreToolError> {
     }
 }
 
+/// The two ends of one leg, as IATA codes. Validated together rather than
+/// by two `iata` calls and a comparison at each call site: a leg from a
+/// place to itself is not a flight, and the client and the model must
+/// refuse it in the same words — a traveller who sees one wording in chat
+/// and another in the browser learns there are two rules.
+pub(crate) fn leg_ends(
+    origin: &str,
+    destination: &str,
+) -> Result<(String, String), StoreToolError> {
+    let origin = iata("origin", origin)?;
+    let destination = iata("destination", destination)?;
+    if origin == destination {
+        return Err(StoreToolError(format!(
+            "origin and destination are both {origin}; a flight needs two different places"
+        )));
+    }
+    Ok((origin, destination))
+}
+
 /// Reformats through the parsed date rather than returning the trimmed
 /// input: `chrono` accepts "2026-9-3", but `dates_run_forwards` compares
 /// `departure_date` as text, which only agrees with date order when every
 /// date is zero-padded. This is the one place that padding is established.
-fn calendar_date(value: &str) -> Result<String, StoreToolError> {
+pub(crate) fn calendar_date(value: &str) -> Result<String, StoreToolError> {
     let date = value.trim();
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map(|d| d.format("%Y-%m-%d").to_string())
@@ -808,13 +827,7 @@ impl Tool for AddTripSegmentTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         // Validated before anything is written, so a mistyped code cannot
         // leave a half-built trip behind.
-        let origin = iata("origin", &args.origin)?;
-        let destination = iata("destination", &args.destination)?;
-        if origin == destination {
-            return Err(StoreToolError(format!(
-                "origin and destination are both {origin}; a flight needs two different places"
-            )));
-        }
+        let (origin, destination) = leg_ends(&args.origin, &args.destination)?;
         let date = calendar_date(&args.departure_date)?;
 
         let store = self.store.clone();

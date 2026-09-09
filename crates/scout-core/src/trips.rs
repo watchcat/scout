@@ -92,6 +92,119 @@ pub async fn choose(
     .await
 }
 
+/// What a leg edit did. A trip that vanished and a leg that moved are
+/// ordinary races in a browser tab, not internal errors.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LegEdit {
+    // Boxed for the same reason as `Selection::Chosen`: one `Plan`-sized
+    // variant beside three small ones is what clippy's large_enum_variant
+    // objects to, and it objected here too.
+    Done(Box<Plan>),
+    TripNotFound,
+    SegmentChanged,
+    Invalid(String),
+}
+
+/// Add one flight leg to a trip this account already has, appending when
+/// `position` is None.
+///
+/// Validated with the same `iata` and `calendar_date` the model's tools
+/// use. Not a second copy of the rules: a client that accepted "Amsterdam"
+/// would park a segment no flight search can ever price, and a traveller
+/// told different things by the chat and the browser learns there are two
+/// products.
+pub async fn add_leg(
+    core: &Core,
+    account_id: i64,
+    trip_name: &str,
+    position: Option<i64>,
+    origin: &str,
+    destination: &str,
+    departure_date: &str,
+) -> anyhow::Result<LegEdit> {
+    let (origin, destination) = match crate::tools::trips::leg_ends(origin, destination) {
+        Ok(ends) => ends,
+        Err(e) => return Ok(LegEdit::Invalid(e.0)),
+    };
+    let date = match crate::tools::trips::calendar_date(departure_date) {
+        Ok(date) => date,
+        Err(e) => return Ok(LegEdit::Invalid(e.0)),
+    };
+    let store = core.store();
+    let trip_name = trip_name.to_string();
+    blocking(move || {
+        // By name and scoped to the account. Trips are addressed by name and
+        // two accounts can both have an "Atlantic loop", so an unscoped
+        // lookup would let one traveller edit the other's plan.
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(LegEdit::TripNotFound);
+        };
+        let trip = store.add_segment(trip.id, position, &origin, &destination, &date)?;
+        // Through `trip_chat` rather than assumed: the composer needs the
+        // same answer here that `list` gives, or the client would show a
+        // trip changing chats when it only gained a leg.
+        let chat = store.trip_chat(trip.id)?;
+        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+    })
+    .await
+}
+
+/// Remove one flight leg, but only if it is still the leg the caller drew.
+///
+/// The route and date are what the client saw, not decoration. Removing a
+/// segment renumbers the ones after it, so `position` on its own cannot say
+/// which leg a click meant — a tab that rendered the trip before somebody
+/// else edited it would name a position that now holds a different flight.
+/// `SegmentChanged` is that answer; the client re-reads and asks again.
+///
+/// `departure_date` is `Option` because a caller may have only a route to
+/// go on; `None` means "nothing to verify", not "verified".
+pub async fn remove_leg(
+    core: &Core,
+    account_id: i64,
+    trip_name: &str,
+    position: i64,
+    origin: &str,
+    destination: &str,
+    departure_date: Option<&str>,
+) -> anyhow::Result<LegEdit> {
+    let (origin, destination) = match crate::tools::trips::leg_ends(origin, destination) {
+        Ok(ends) => ends,
+        Err(e) => return Ok(LegEdit::Invalid(e.0)),
+    };
+    let date = match departure_date.map(crate::tools::trips::calendar_date).transpose() {
+        Ok(date) => date,
+        Err(e) => return Ok(LegEdit::Invalid(e.0)),
+    };
+    let store = core.store();
+    let trip_name = trip_name.to_string();
+    blocking(move || {
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(LegEdit::TripNotFound);
+        };
+        let expected = ExpectedSegment {
+            origin: &origin,
+            destination: &destination,
+            departure_date: date.as_deref(),
+        };
+        // The trip this read against may already be stale by the time the
+        // store takes its lock — which is exactly why the expectation is
+        // passed down and checked there rather than compared here.
+        if !store.remove_segment_checked(trip.id, position, expected)? {
+            return Ok(LegEdit::SegmentChanged);
+        }
+        // Re-read for what to draw. A trip that has gone in the meantime is
+        // only reachable by a concurrent delete; the leg did go, but there
+        // is no longer a plan to show for it.
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(LegEdit::TripNotFound);
+        };
+        let chat = store.trip_chat(trip.id)?;
+        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+    })
+    .await
+}
+
 /// Records a representative trip without a provider call. This is deliberately
 /// named and hidden as test scaffolding: production candidates must come from
 /// a flight search so their route, date and quoted price were verified.
@@ -200,6 +313,181 @@ mod tests {
             choose(&core, stranger, "October", 1, 1).await.unwrap(),
             Selection::TripNotFound,
         );
+    }
+
+    #[tokio::test]
+    async fn one_account_cannot_edit_anothers_trip() {
+        // Trips are addressed by name, and two accounts can both have a
+        // trip called "Atlantic loop". Scoping is what stops one traveller
+        // deleting a leg from the other's plan.
+        let (core, _dir, owner) = core().await;
+        seed_trip_for_tests(&core, owner, "Atlantic loop").await.unwrap();
+        let stranger = core.store().account_for_telegram(22).unwrap();
+        // The stranger has a trip of the same name, so the lookup has
+        // something to find if it ever stops scoping by account.
+        seed_trip_for_tests(&core, stranger, "Atlantic loop").await.unwrap();
+
+        let added = add_leg(&core, stranger, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
+            .await
+            .unwrap();
+        assert!(matches!(added, LegEdit::Done(_)), "got: {added:?}");
+        let removed =
+            remove_leg(&core, stranger, "Atlantic loop", 1, "AMS", "LIS", Some("2026-10-12"))
+                .await
+                .unwrap();
+        assert!(matches!(removed, LegEdit::Done(_)), "got: {removed:?}");
+
+        let theirs = list(&core, stranger).await.unwrap();
+        assert_eq!(
+            theirs[0].trip.segments.iter().map(|s| s.destination.as_str()).collect::<Vec<_>>(),
+            vec!["FCO"],
+            "the stranger's own trip is the one both edits landed on",
+        );
+
+        let owned = list(&core, owner).await.unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(
+            owned[0].trip.segments.iter().map(|s| s.destination.as_str()).collect::<Vec<_>>(),
+            vec!["LIS"],
+            "neither edit reached the other account's trip",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leg_edit_on_a_trip_this_account_does_not_have_finds_no_trip() {
+        let (core, _dir, owner) = core().await;
+        seed_trip_for_tests(&core, owner, "Atlantic loop").await.unwrap();
+        let stranger = core.store().account_for_telegram(22).unwrap();
+
+        assert_eq!(
+            add_leg(&core, stranger, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
+                .await
+                .unwrap(),
+            LegEdit::TripNotFound,
+        );
+        assert_eq!(
+            remove_leg(&core, stranger, "Atlantic loop", 1, "AMS", "LIS", Some("2026-10-12"))
+                .await
+                .unwrap(),
+            LegEdit::TripNotFound,
+        );
+
+        let owned = list(&core, owner).await.unwrap();
+        assert_eq!(owned[0].trip.segments.len(), 1, "the owner's plan is untouched");
+        assert!(!owned[0].trip.segments[0].candidates.is_empty(), "and so are its options");
+    }
+
+    #[tokio::test]
+    async fn adding_a_leg_and_removing_it_again_leaves_the_plan_where_it_started() {
+        let (core, _dir, account_id) = core().await;
+        let store = core.store();
+        let conversation_id = store.start_conversation(account_id, "direct").unwrap();
+        store
+            .upsert_trip(account_id, "Atlantic loop", Some(2), Some("economy"), Some(conversation_id))
+            .unwrap();
+        add_leg(&core, account_id, "Atlantic loop", None, "AMS", "LIS", "2026-10-12")
+            .await
+            .unwrap();
+
+        let LegEdit::Done(added) =
+            add_leg(&core, account_id, "atlantic loop", None, "lis", "fco", "2026-10-14")
+                .await
+                .unwrap()
+        else {
+            panic!("a valid leg was not added");
+        };
+        assert_eq!(
+            added.trip.segments.iter().map(|s| (s.position, s.origin.as_str())).collect::<Vec<_>>(),
+            vec![(1, "AMS"), (2, "LIS")],
+            "codes are upper-cased and the trip is found by a lower-cased name",
+        );
+        assert_eq!(
+            added.chat.as_ref().map(|c| c.id),
+            Some(conversation_id),
+            "an edited plan still names the chat it belongs to",
+        );
+
+        let LegEdit::Done(removed) =
+            remove_leg(&core, account_id, "Atlantic loop", 2, "LIS", "FCO", Some("2026-10-14"))
+                .await
+                .unwrap()
+        else {
+            panic!("a leg that matched what the caller saw was not removed");
+        };
+        assert_eq!(removed.trip.segments.len(), 1);
+        assert_eq!(removed.chat.map(|c| c.id), Some(conversation_id));
+    }
+
+    #[tokio::test]
+    async fn a_leg_removed_at_a_position_that_has_since_moved_reports_the_change() {
+        // The browser drew two legs and someone removed the first, so the
+        // second is now position 1. The stale click must not take it.
+        let (core, _dir, account_id) = core().await;
+        core.store()
+            .upsert_trip(account_id, "Atlantic loop", None, None, None)
+            .unwrap();
+        add_leg(&core, account_id, "Atlantic loop", None, "AMS", "LIS", "2026-10-12")
+            .await
+            .unwrap();
+        add_leg(&core, account_id, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
+            .await
+            .unwrap();
+        remove_leg(&core, account_id, "Atlantic loop", 1, "AMS", "LIS", Some("2026-10-12"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            remove_leg(&core, account_id, "Atlantic loop", 2, "LIS", "FCO", Some("2026-10-14"))
+                .await
+                .unwrap(),
+            LegEdit::SegmentChanged,
+            "a position that no longer exists is a stale tab, not an error",
+        );
+        assert_eq!(
+            remove_leg(&core, account_id, "Atlantic loop", 1, "AMS", "LIS", Some("2026-10-12"))
+                .await
+                .unwrap(),
+            LegEdit::SegmentChanged,
+            "and neither is a position the renumber refilled with something else",
+        );
+
+        let plans = list(&core, account_id).await.unwrap();
+        assert_eq!(plans[0].trip.segments.len(), 1);
+        assert_eq!(plans[0].trip.segments[0].destination, "FCO", "the surviving leg is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_leg_the_flight_search_could_never_price_is_refused_before_the_store() {
+        let (core, _dir, account_id) = core().await;
+        core.store()
+            .upsert_trip(account_id, "Atlantic loop", None, None, None)
+            .unwrap();
+
+        let refusals = [
+            add_leg(&core, account_id, "Atlantic loop", None, "Amsterdam", "FCO", "2026-10-14")
+                .await
+                .unwrap(),
+            add_leg(&core, account_id, "Atlantic loop", None, "LIS", "LIS", "2026-10-14")
+                .await
+                .unwrap(),
+            add_leg(&core, account_id, "Atlantic loop", None, "LIS", "FCO", "14/10/2026")
+                .await
+                .unwrap(),
+            remove_leg(&core, account_id, "Atlantic loop", 1, "Amsterdam", "FCO", None)
+                .await
+                .unwrap(),
+        ];
+        for refusal in &refusals {
+            assert!(matches!(refusal, LegEdit::Invalid(_)), "got: {refusal:?}");
+        }
+        let LegEdit::Invalid(same_place) = &refusals[1] else { unreachable!() };
+        assert!(
+            same_place.contains("a flight needs two different places"),
+            "the client refuses in the same words the model's tools do, got: {same_place}",
+        );
+
+        let plans = list(&core, account_id).await.unwrap();
+        assert!(plans[0].trip.segments.is_empty(), "nothing reached the store");
     }
 
     #[tokio::test]

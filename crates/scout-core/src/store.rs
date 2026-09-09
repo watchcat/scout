@@ -2753,30 +2753,59 @@ impl Store {
 
     pub fn drop_segment(&self, trip_id: i64, position: i64) -> Result<Trip> {
         let conn = self.conn();
-        let removed = conn.execute(
-            "DELETE FROM trip_segments WHERE trip_id = ? AND position = ?",
-            params![trip_id, position],
+        drop_segment_within(&conn, trip_id, position)
+    }
+
+    /// Removes a segment only if it is still the one the caller read.
+    ///
+    /// Returns whether it removed anything: a position that is gone and a
+    /// position now holding a different leg are both `false`, because both
+    /// mean the caller's picture of the trip is stale, and neither is an
+    /// error worth a log line — they are what a second browser tab looks
+    /// like from here.
+    ///
+    /// **The single `self.conn()` is the guard, not the comparison.**
+    /// `drop_segment` renumbers, so between a check and a write under two
+    /// separate acquisitions a concurrent edit can slide a different leg
+    /// into `position` and this method would delete it. That is why the
+    /// check below and `drop_segment_within` share this one `conn`, and why
+    /// `drop_segment` is not called here: calling it would release the lock
+    /// and re-take it. No test in this file can catch that regression —
+    /// they are single-threaded, and every one of them still passes with
+    /// the lock released in between. The structure is the whole protection;
+    /// do not "simplify" it back into a call to `drop_segment`.
+    pub fn remove_segment_checked(
+        &self,
+        trip_id: i64,
+        position: i64,
+        expected: ExpectedSegment<'_>,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT origin, destination, departure_date FROM trip_segments
+             WHERE trip_id = ? AND position = ?",
         )?;
-        if removed == 0 {
-            anyhow::bail!("this trip has no segment {position}");
+        let segment: Option<(String, String, String)> = stmt
+            .query_map(params![trip_id, position], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .next()
+            .transpose()?;
+        drop(stmt);
+        let Some((origin, destination, departure_date)) = segment else {
+            return Ok(false);
+        };
+        if origin != expected.origin || destination != expected.destination {
+            return Ok(false);
         }
-        conn.execute(
-            "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ?",
-            params![trip_id, position],
-        )?;
-        // Closing the gap keeps positions contiguous, which is the invariant
-        // that makes the shift above correct.
-        conn.execute(
-            "UPDATE trip_segments SET position = position - 1 WHERE trip_id = ? AND position > ?",
-            params![trip_id, position],
-        )?;
-        conn.execute(
-            "UPDATE segment_candidates SET position = position - 1
-             WHERE trip_id = ? AND position > ?",
-            params![trip_id, position],
-        )?;
-        touch(&conn, trip_id)?;
-        load_trip(&conn, trip_id)
+        // `None` is "nothing to verify", not "verified" — the same reading
+        // `add_candidate` gives this field, so a caller that has only a
+        // route to go on is not quietly granted a free pass on the date.
+        if let Some(expected_date) = expected.departure_date {
+            if departure_date != expected_date {
+                return Ok(false);
+            }
+        }
+        drop_segment_within(&conn, trip_id, position)?;
+        Ok(true)
     }
 
     /// Parks a flight against a segment. `decided` also marks it chosen, so
@@ -3042,6 +3071,41 @@ fn detach_trips_within(conn: &Connection, conversation_ids: &[i64]) -> Result<us
         &format!("UPDATE trips SET conversation_id = NULL WHERE conversation_id IN ({holes})"),
         duckdb::params_from_iter(conversation_ids.iter()),
     )?)
+}
+
+/// Removes a segment and closes the gap behind it.
+///
+/// Takes `&Connection` rather than `&Store` so a caller that has already
+/// checked something about the segment can do the check and this delete
+/// under one acquisition of the store's non-reentrant mutex — see
+/// `remove_segment_checked`, whose correctness is exactly that. Re-locking
+/// would deadlock; releasing and re-locking would silently reintroduce the
+/// race the check exists to close.
+fn drop_segment_within(conn: &Connection, trip_id: i64, position: i64) -> Result<Trip> {
+    let removed = conn.execute(
+        "DELETE FROM trip_segments WHERE trip_id = ? AND position = ?",
+        params![trip_id, position],
+    )?;
+    if removed == 0 {
+        anyhow::bail!("this trip has no segment {position}");
+    }
+    conn.execute(
+        "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ?",
+        params![trip_id, position],
+    )?;
+    // Closing the gap keeps positions contiguous, which is the invariant
+    // that makes the shift above correct.
+    conn.execute(
+        "UPDATE trip_segments SET position = position - 1 WHERE trip_id = ? AND position > ?",
+        params![trip_id, position],
+    )?;
+    conn.execute(
+        "UPDATE segment_candidates SET position = position - 1
+         WHERE trip_id = ? AND position > ?",
+        params![trip_id, position],
+    )?;
+    touch(conn, trip_id)?;
+    load_trip(conn, trip_id)
 }
 
 /// Reads one whole trip. Takes `&Connection` rather than `&Store` so it can
@@ -4580,6 +4644,101 @@ CREATE TABLE trips (
 
         // A position nobody has is refused rather than silently doing nothing.
         assert!(store.drop_segment(trip.id, 9).is_err());
+    }
+
+    #[test]
+    fn a_stale_remove_refuses_rather_than_deleting_the_wrong_leg() {
+        // `drop_segment` renumbers: removing position 1 shifts position 2
+        // down to 1. A browser tab holding a trip drawn thirty seconds ago
+        // is therefore one concurrent edit away from asking to delete
+        // "leg 2" and destroying a leg that is no longer the one it drew.
+        // `add_candidate` already guards this way and says why; this is the
+        // same guard on the same hazard.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_segment(trip.id, None, "LIS", "FCO", "2026-10-14").unwrap();
+
+        // The browser drew both legs, then someone removed the first.
+        store.drop_segment(trip.id, 1).unwrap();
+
+        // The stale click: "remove leg 2", which the browser believes is
+        // LIS→FCO. After the renumber, position 2 does not exist and
+        // position 1 IS LIS→FCO.
+        let stale = ExpectedSegment {
+            origin: "LIS", destination: "FCO", departure_date: Some("2026-10-14"),
+        };
+        assert!(!store.remove_segment_checked(trip.id, 2, stale).unwrap(),
+            "a position that no longer exists must refuse");
+
+        let after = store.find_trip(account, "Atlantic loop").unwrap().unwrap();
+        assert_eq!(after.segments.len(), 1, "the surviving leg is untouched");
+        assert_eq!(after.segments[0].destination, "FCO");
+    }
+
+    #[test]
+    fn a_stale_remove_refuses_when_the_renumber_left_a_different_leg_at_that_position() {
+        // The other half of the hazard: the position still exists, so an
+        // existence check alone lets the delete through — onto whichever leg
+        // the renumber slid into that slot.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_segment(trip.id, None, "LIS", "FCO", "2026-10-14").unwrap();
+
+        store.drop_segment(trip.id, 1).unwrap();
+
+        // "Remove leg 1", which the browser drew as AMS→LIS. Position 1 is
+        // now LIS→FCO, a leg the traveller never asked to lose.
+        let stale = ExpectedSegment {
+            origin: "AMS", destination: "LIS", departure_date: Some("2026-10-12"),
+        };
+        assert!(!store.remove_segment_checked(trip.id, 1, stale).unwrap(),
+            "a position holding a different route must refuse");
+
+        let after = store.find_trip(account, "Atlantic loop").unwrap().unwrap();
+        assert_eq!(after.segments.len(), 1, "the surviving leg is untouched");
+        assert_eq!(after.segments[0].destination, "FCO");
+    }
+
+    #[test]
+    fn a_remove_that_matches_what_the_reader_saw_goes_through() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_segment(trip.id, None, "LIS", "FCO", "2026-10-14").unwrap();
+
+        let seen = ExpectedSegment {
+            origin: "LIS", destination: "FCO", departure_date: Some("2026-10-14"),
+        };
+        assert!(store.remove_segment_checked(trip.id, 2, seen).unwrap());
+        let after = store.find_trip(account, "Atlantic loop").unwrap().unwrap();
+        assert_eq!(after.segments.len(), 1);
+        assert_eq!(after.segments[0].destination, "LIS");
+    }
+
+    #[test]
+    fn a_remove_with_no_date_to_check_still_checks_the_route() {
+        // `None` is "nothing to verify", exactly as `add_candidate` reads
+        // it — not "verified", and not a way past the route check.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+
+        let wrong_route = ExpectedSegment {
+            origin: "LIS", destination: "FCO", departure_date: None,
+        };
+        assert!(!store.remove_segment_checked(trip.id, 1, wrong_route).unwrap());
+
+        let undated = ExpectedSegment {
+            origin: "AMS", destination: "LIS", departure_date: None,
+        };
+        assert!(store.remove_segment_checked(trip.id, 1, undated).unwrap());
+        assert!(store.find_trip(account, "Atlantic loop").unwrap().unwrap().segments.is_empty());
     }
 
     #[test]

@@ -7,15 +7,25 @@
 use chrono::{NaiveDate, NaiveDateTime, Utc};
 use scout_core::trips::{Plan, TripCandidate, TripSegment};
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::Semaphore;
 
 const PDF_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often to look for a finished PDF.
+///
+/// This is pure added latency on every export, so it wants to be short: a
+/// local render has its PDF on disk about 1.3s in, and 25ms is under a
+/// twentieth of that while costing ~50 `stat` calls for the whole render.
+/// Polling tighter buys nothing anybody can perceive; polling at, say, 250ms
+/// would put a fifth of a second on every download for no saving worth having.
+const PDF_POLL: Duration = Duration::from_millis(25);
 const MAX_CONCURRENT_PDFS: usize = 2;
 const MAX_PDF_BYTES: u64 = 10 * 1024 * 1024;
+/// Below this a `%PDF-` header is a fragment, not a page anybody can read.
+const MIN_PDF_BYTES: u64 = 1024;
 const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 64;
 const MAX_CANDIDATES_PER_SEGMENT: usize = 64;
@@ -102,6 +112,8 @@ pub async fn render(plan: &Plan) -> Result<Vec<u8>, Error> {
     }
     tokio::fs::write(&source, document).await?;
 
+    let log = dir.path().join("chrome.log");
+
     let mut command = Command::new(chrome);
     command
         .arg("--headless=new")
@@ -119,28 +131,91 @@ pub async fn render(plan: &Plan) -> Result<Vec<u8>, Error> {
         ))
         .arg(format!("--print-to-pdf={}", output.display()))
         .arg(format!("file://{}", source.display()))
+        .stdout(std::process::Stdio::null())
+        // Chromium is chatty even on a clean run, and a pipe nobody drains
+        // fills its buffer and blocks the render before the PDF is written.
+        // A file in the temp dir cannot fill, and still keeps the stderr to
+        // quote when the process dies with something worth repeating.
+        .stderr(std::process::Stdio::from(std::fs::File::create(&log)?))
         .kill_on_drop(true);
 
-    let result = tokio::time::timeout(PDF_TIMEOUT, command.output())
-        .await
-        .map_err(|_| Error::Timeout)??;
-    if !result.status.success() {
-        return Err(Error::Chrome(
-            String::from_utf8_lossy(&result.stderr)
-                .trim()
-                .chars()
-                .take(500)
-                .collect(),
-        ));
+    let mut child = command.spawn()?;
+    let result = collect(&mut child, &output, &log).await;
+    // Chromium has to be killed on every path, not just the happy one: by the
+    // time the PDF is readable the process is usually still running, and it is
+    // the wait for it to leave that used to burn the whole timeout.
+    // `kill_on_drop` covers a panic; this covers the returns.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    result
+}
+
+/// Waits for a finished PDF rather than for Chromium to exit.
+///
+/// Chromium writes the whole document and then, with `--user-data-dir` on
+/// macOS, simply stays up: measured here, the PDF is complete and correct
+/// 1.3s in while the process is still alive 25s later. Waiting on the process
+/// therefore meant waiting out `PDF_TIMEOUT` on work that had already
+/// finished. Waiting on the artefact instead makes the render as quick as the
+/// render, and makes it behave the same way on a laptop as in the container.
+/// Do not "simplify" this back to `Command::output` — that waits for the exit
+/// *and* for the stdio pipes to close, which is the bug.
+async fn collect(child: &mut Child, output: &Path, log: &Path) -> Result<Vec<u8>, Error> {
+    let deadline = tokio::time::Instant::now() + PDF_TIMEOUT;
+    let mut settled = None;
+    loop {
+        let size = tokio::fs::metadata(output).await.map(|meta| meta.len()).unwrap_or(0);
+        if size > MAX_PDF_BYTES {
+            return Err(Error::InvalidOutput);
+        }
+        // `complete` is what decides the file is whole; this only avoids
+        // re-reading megabytes on every tick while Chromium is still writing.
+        if size >= MIN_PDF_BYTES && settled == Some(size) {
+            let bytes = tokio::fs::read(output).await?;
+            if complete(&bytes) {
+                return Ok(bytes);
+            }
+        }
+        settled = Some(size);
+
+        if let Some(status) = child.try_wait()? {
+            // A Chromium that died before writing has its reason on stderr,
+            // and "no usable sandbox" is a better answer than a timeout.
+            if !status.success() {
+                let reason = tokio::fs::read(log).await.unwrap_or_default();
+                return Err(Error::Chrome(
+                    String::from_utf8_lossy(&reason)
+                        .trim()
+                        .chars()
+                        .take(500)
+                        .collect(),
+                ));
+            }
+            // It exited cleanly, so whatever is on disk is all there will be.
+            let bytes = tokio::fs::read(output).await.unwrap_or_default();
+            return if complete(&bytes) { Ok(bytes) } else { Err(Error::InvalidOutput) };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Timeout);
+        }
+        tokio::time::sleep(PDF_POLL).await;
     }
-    if tokio::fs::metadata(&output).await?.len() > MAX_PDF_BYTES {
-        return Err(Error::InvalidOutput);
+}
+
+/// Whether `bytes` is a PDF that has been written all the way to its end.
+///
+/// Size and mtime both lie while Chromium is mid-write, and a truncated PDF
+/// still opens with `%PDF-` — hand one to a traveller and they get an
+/// unreadable download. A PDF says so itself: `%%EOF` is the last thing in
+/// the file, so a document carrying the trailer at its end is a whole one.
+fn complete(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"%PDF-") || (bytes.len() as u64) < MIN_PDF_BYTES {
+        return false;
     }
-    let bytes = tokio::fs::read(output).await?;
-    if !bytes.starts_with(b"%PDF-") || bytes.len() < 1024 {
-        return Err(Error::InvalidOutput);
-    }
-    Ok(bytes)
+    // Chromium writes `%%EOF\n`, and the spec lets the trailer be followed by
+    // an end-of-line, so ignore trailing whitespace before looking for it.
+    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(0, |i| i + 1);
+    bytes[..end].ends_with(b"%%EOF")
 }
 
 fn validate_plan(plan: &Plan) -> Result<(), Error> {
@@ -627,6 +702,38 @@ mod tests {
             validate_plan(&oversized),
             Err(Error::InputTooLarge)
         ));
+    }
+
+    /// Shaped like what Chromium writes: a header, a body comfortably over the
+    /// minimum, and the trailer that says the document is finished.
+    fn written_pdf() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        pdf.extend(std::iter::repeat_n(b'x', 2048));
+        pdf.extend_from_slice(b"\nstartxref\n14309\n%%EOF\n");
+        pdf
+    }
+
+    #[test]
+    fn a_pdf_is_only_finished_once_it_carries_its_trailer() {
+        let whole = written_pdf();
+        assert!(complete(&whole));
+        // Chromium's own output ends with a newline; a trailer sitting flush
+        // against the end of the file is just as finished.
+        assert!(complete(whole.trim_ascii_end()));
+
+        // Every prefix of a real PDF is a file we could catch mid-write, and
+        // not one of them may be handed to a reader as a finished download.
+        for cut in [1, 64, 1200, whole.len() - 6, whole.len() - 2] {
+            assert!(
+                !complete(&whole[..cut]),
+                "a PDF truncated to {cut} bytes was accepted as finished"
+            );
+        }
+
+        // The trailer alone is not enough: it has to be a PDF, and it has to
+        // be big enough to be a page rather than a fragment.
+        assert!(!complete(b"not a pdf at all %%EOF"));
+        assert!(!complete(b"%PDF-1.4\n%%EOF\n"));
     }
 
     #[tokio::test]

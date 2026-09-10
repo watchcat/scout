@@ -17,6 +17,7 @@ mod ratelimit;
 mod routes;
 mod session;
 mod telegram_login;
+mod trip_pdf;
 
 pub use cache::{refresh_forever, AdmissionCache, REFRESH};
 
@@ -56,6 +57,9 @@ pub struct AuthState {
     /// signature. It bounds a stuck client or a happy clicker to about a
     /// hundred and twenty model calls an hour.
     pub by_account: Arc<ratelimit::Limiter>,
+    /// PDF rendering starts Chromium and is CPU-heavy even though it makes no
+    /// paid model call, so it has its own smaller per-account budget.
+    pub pdf_by_account: Arc<ratelimit::Limiter>,
     pub mailer: email::Mailer,
 }
 
@@ -76,6 +80,7 @@ impl AuthState {
             by_address: Arc::new(ratelimit::Limiter::new(3, Duration::from_secs(900))),
             by_ip: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(3600))),
             by_account: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(300))),
+            pdf_by_account: Arc::new(ratelimit::Limiter::new(6, Duration::from_secs(60))),
         }
     }
 }

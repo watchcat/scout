@@ -80,6 +80,13 @@ and decided=false; several options may sit on one segment. Finalising is \
 the only thing that produces current prices and it costs a search per \
 segment, so call finalise_trip when the brief says the trip is settled, \
 not to check on it.
+- When the brief asks to keep a named trip, call keep_trip with that name \
+and report that it is kept. Such a brief comes back after the traveller \
+was shown the draft and said yes, so there is nothing left to ask and \
+nothing to search: keep_trip costs nothing and prices nothing. It is also \
+the only thing that makes a trip visible to them - building one does not, \
+and neither does finalising it - so a trip nobody keeps is a trip they \
+never see.
 - Every trip tool hands back the whole trip. If a call failed, the trip \
 did NOT change. When you make several edits, trust each call's own \
 'changed' line over the snapshot beside it - a snapshot is from the \
@@ -529,7 +536,12 @@ mod tests {
         for word in ["itinerary", "Cheapest, Fastest", "price_status", "self_transfer"] {
             assert!(!FLIGHT_PREAMBLE.contains(word), "{word:?} is presentation, it belongs in guidance");
         }
-        for word in ["flex_days", "add_trip_segment", "IATA", "no prices", "what is missing", "cannot book"] {
+        // keep_trip among them: the guidance promises the parent that a
+        // brief saying to keep a named trip will work, and the desk is the
+        // only half that can honour it. Without the rule the traveller is
+        // asked, says yes, and nothing happens - the same shape of bug as
+        // the unbuilt trip this feature exists to fix.
+        for word in ["flex_days", "add_trip_segment", "keep_trip", "IATA", "no prices", "what is missing", "cannot book"] {
             assert!(FLIGHT_PREAMBLE.contains(word), "{word:?} is missing from the flight prompt");
         }
         // The desk has no earlier brief to reuse a fare from; expiry is a

@@ -6,7 +6,7 @@ import {
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
   tripPdfFilename,
-  composerTarget, removeLegBody,
+  composerTarget, removeLegBody, keepBody,
 } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
@@ -365,4 +365,11 @@ test('a remove with no date on file sends null, not an omitted key', () => {
     destination: 'LIS',
     departure_date: null,
   })
+})
+
+test('a keep sends only the name, nothing a stale tab could get wrong', () => {
+  // Unlike removeLegBody, there is no segment state to verify: keeping an
+  // already-kept trip still succeeds server-side, so a second press racing
+  // the first has nothing to disagree with the server about.
+  assert.deepEqual(JSON.parse(keepBody('Atlantic loop')), { trip: 'Atlantic loop' })
 })

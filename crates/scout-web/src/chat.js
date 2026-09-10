@@ -321,6 +321,15 @@ export function removeLegBody(tripName, segment) {
   })
 }
 
+// The body for `/chat/trips/keep`. A name is everything the route needs —
+// unlike `removeLegBody` it carries nothing for the server to check a stale
+// tab against, because keeping is idempotent: `keep_trip` succeeds again on
+// a trip this account already kept, so there is no stale state for a second
+// press to collide with.
+export function keepBody(tripName) {
+  return JSON.stringify({ trip: tripName })
+}
+
 // Where a message typed on the Trips tab should go, and what the composer
 // says about it. `direct` is the one scope the web client may ever post
 // into — the thread it shares with Telegram 1:1 chat. Anything else is a
@@ -508,6 +517,12 @@ function start() {
     }
   }
 
+  // Shown wherever a draft is marked — the list row and the trip's own
+  // header. "Draft" alone was tried in production and told the traveller
+  // nothing about what would happen to it; this says the actual
+  // consequence, which is the only thing worth a glance answering.
+  const DRAFT_NOTE = 'Clears with its chat unless kept'
+
   function tripRoute(trip) {
     if (!trip.segments?.length) return 'No route yet'
     const codes = [trip.segments[0].origin]
@@ -585,6 +600,11 @@ function start() {
         node('span', 'trip-list-name', trip.name),
         node('span', 'trip-list-route', tripRoute(trip)),
       )
+      // Drafts were hidden here for a day and it read as the feature not
+      // working — see `scout_core::trips::list`. Shown again, but marked:
+      // an empty tab and a tab full of trips nobody asked to keep look the
+      // same at a glance without this.
+      if (!trip.kept) button.append(node('span', 'trip-list-draft', DRAFT_NOTE))
       button.addEventListener('click', () => {
         currentTrip = trip.name
         renderTripList()
@@ -781,6 +801,16 @@ function start() {
       node('p', 'trip-subtitle', `${trip.adults} ${trip.adults === 1 ? 'traveller' : 'travellers'} · ${trip.cabin_class ?? 'Cabin not set'}`),
     )
     const actions = node('div', 'trip-head-actions')
+    // Same warning as the list row, plus the one control that resolves it.
+    // Omitted entirely once `trip.kept` — a kept trip has nothing left for
+    // either of these to say or do.
+    if (!trip.kept) {
+      actions.append(node('span', 'status-chip draft', DRAFT_NOTE))
+      const keep = node('button', 'trip-keep', 'Keep')
+      keep.type = 'button'
+      keep.addEventListener('click', () => keepTrip(trip, keep).catch(() => {}))
+      actions.append(keep)
+    }
     const download = node('button', 'trip-download', 'Download PDF')
     download.type = 'button'
     download.addEventListener('click', () => downloadTripPdf(trip, download))
@@ -896,6 +926,49 @@ function start() {
     } catch {
       optionEl.classList.remove('saving')
       showTripToast('Could not save that choice. Try again.')
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+    }
+  }
+
+  // The one-press answer to "Save this trip" — see `KeepIn` in
+  // `routes/trips.rs` for why this exists as its own route rather than a
+  // chat turn: a model call is slower than a press, and asking one to
+  // interpret "save this trip" is how it became `record_purchase` in
+  // production instead. Same shape as `chooseFlight`: guarded against an
+  // overlapping write, the load sequence invalidated before the request
+  // goes out, and the response's whole-trip snapshot — never a local flip
+  // of `kept` — is what redraws the page.
+  async function keepTrip(trip, button) {
+    if (tripChoicePending) return
+    tripChoicePending = true
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    button.disabled = true
+    try {
+      const res = await fetch('/chat/trips/keep', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body: keepBody(trip.name),
+      })
+      if (res.status === 404) {
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        showTripToast('That trip is gone. The list has been refreshed.')
+        return
+      }
+      if (!res.ok) throw new Error('refused')
+      const updated = await res.json()
+      trips = [updated, ...trips.filter((item) => item.name !== updated.name)]
+      currentTrip = updated.name
+      renderTripList()
+      renderTripDetail()
+      showTripToast(`${updated.name} is kept — it will not clear with its chat.`)
+    } catch {
+      button.disabled = false
+      showTripToast('Could not keep that trip. Try again.')
     } finally {
       tripChoicePending = false
       tripDetail.removeAttribute('aria-busy')

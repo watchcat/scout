@@ -2666,6 +2666,50 @@ impl Store {
         ids.into_iter().map(|id| load_trip(&conn, id)).collect()
     }
 
+    /// The trips the traveller asked to keep, newest activity first.
+    ///
+    /// The channel-facing read. `list_trips` is the model's and includes
+    /// drafts on purpose: a specialist that could not see the trip it just
+    /// built would build a second one on the next message.
+    pub fn list_kept_trips(&self, account_id: i64) -> Result<Vec<Trip>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM trips WHERE account_id = ? AND kept
+             ORDER BY updated_at DESC, id DESC",
+        )?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![account_id], |row| row.get(0))?
+            .collect::<duckdb::Result<_>>()?;
+        ids.into_iter().map(|id| load_trip(&conn, id)).collect()
+    }
+
+    /// Marks a trip the traveller asked to keep, so it appears in their
+    /// list. Idempotent: keeping a kept trip is a no-op that still reports
+    /// the trip was found, because "keep this" said twice is a traveller
+    /// repeating themselves, not an error.
+    ///
+    /// This does bump `updated_at`, unlike adoption: keeping is something
+    /// the traveller did, and the list is ordered by it, so a trip they
+    /// just kept belongs at the top.
+    pub fn keep_trip(&self, account_id: i64, name: &str) -> Result<bool> {
+        let key = name.trim().to_lowercase();
+        let conn = self.conn();
+        let found: i64 = conn.query_row(
+            "SELECT count(*) FROM trips WHERE account_id = ? AND name_key = ?",
+            params![account_id, key],
+            |row| row.get(0),
+        )?;
+        if found == 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "UPDATE trips SET kept = true, updated_at = current_timestamp
+             WHERE account_id = ? AND name_key = ?",
+            params![account_id, key],
+        )?;
+        Ok(true)
+    }
+
     /// Appends when `position` is None, otherwise inserts there and shifts the
     /// rest down. Candidates move with their segment: they are keyed by
     /// position, so a shift that forgot them would reattach somebody's chosen
@@ -4694,6 +4738,54 @@ CREATE TABLE trips (
         let account = store.account_for_telegram(1).unwrap();
         let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
         assert!(!trip.kept, "a newly built trip is a draft until the traveller keeps it");
+    }
+
+    #[test]
+    fn the_model_still_sees_the_draft_it_just_built() {
+        // `trip_names` and `show_trip` feed the model. A specialist that
+        // cannot find the trip it just built builds another one, and the
+        // traveller ends up with two half-itineraries.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        store.upsert_trip(account, "Draft loop", None, None, None).unwrap();
+        let names: Vec<String> =
+            store.list_trips(account).unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["Draft loop".to_string()]);
+        assert!(store.list_kept_trips(account).unwrap().is_empty());
+    }
+
+    #[test]
+    fn keeping_a_trip_moves_it_from_the_draft_list_to_the_kept_one() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        store.upsert_trip(account, "Draft loop", None, None, None).unwrap();
+
+        assert!(store.keep_trip(account, "Draft loop").unwrap());
+
+        let kept: Vec<String> =
+            store.list_kept_trips(account).unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(kept, vec!["Draft loop".to_string()]);
+    }
+
+    #[test]
+    fn keeping_an_already_kept_trip_is_a_no_op_that_still_reports_success() {
+        // "keep this" said twice is a traveller repeating themselves, not
+        // an error — the tool should not surface a failure for it.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        store.upsert_trip(account, "Draft loop", None, None, None).unwrap();
+
+        assert!(store.keep_trip(account, "Draft loop").unwrap());
+        assert!(store.keep_trip(account, "Draft loop").unwrap());
+
+        assert_eq!(store.list_kept_trips(account).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn keeping_a_trip_that_does_not_exist_reports_it_was_not_found() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        assert!(!store.keep_trip(account, "Nonexistent loop").unwrap());
     }
 
     #[test]

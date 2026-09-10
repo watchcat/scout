@@ -47,16 +47,17 @@ pub enum Selection {
     CandidateNotFound,
 }
 
-/// Every durable trip for this account, newest activity first.
+/// Every kept trip for this account, newest activity first. Drafts built
+/// while searching are deliberately absent — see `Store::list_kept_trips`.
 pub async fn list(core: &Core, account_id: i64) -> anyhow::Result<Vec<Plan>> {
     let store = core.store();
     blocking(move || {
         // One `trip_chat` read per trip rather than a second query shape: an
         // account's trip list is the handful of itineraries a traveller is
         // actively planning, not a table a client paginates, so the extra
-        // round trips are not worth the JOIN-in-list_trips complexity.
+        // round trips are not worth the JOIN-in-list_kept_trips complexity.
         store
-            .list_trips(account_id)?
+            .list_kept_trips(account_id)?
             .into_iter()
             .map(|trip| {
                 let chat = store.trip_chat(trip.id)?;
@@ -270,6 +271,15 @@ pub async fn seed_trip_for_tests(core: &Core, account_id: i64, name: &str) -> an
             },
             false,
         )?;
+        // A trip built by upsert_trip alone is a draft, invisible to
+        // `list`. Every caller of this helper — here and in scout-web —
+        // uses it to stand up a trip the channel is expected to show, so
+        // the scaffolding keeps it rather than making every call site
+        // remember to. Set on the in-hand copy too, rather than a reload,
+        // so the returned `Plan` agrees with what the store now holds.
+        store.keep_trip(account_id, &name)?;
+        let mut trip = trip;
+        trip.kept = true;
         // upsert_trip above was called with conversation_id: None, so this
         // trip is orphaned by construction — no store round trip needed to
         // know that.
@@ -314,6 +324,26 @@ mod tests {
         };
         assert!(after.trip.segments[0].candidates[1].chosen);
         assert!(after.not_ready.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_trips_tab_shows_kept_trips_and_not_the_drafts_built_while_searching() {
+        // The regression test for the reported bug, from both ends: a draft
+        // exists in the store and does not reach the traveller. Without the
+        // second half, every casual price check litters the Trips tab, which
+        // is the reason drafts exist at all.
+        let (core, _dir, account_id) = core().await;
+        core.store()
+            .upsert_trip(account_id, "Just browsing", None, None, None)
+            .unwrap();
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+
+        let plans = list(&core, account_id).await.unwrap();
+        assert_eq!(
+            plans.iter().map(|p| p.trip.name.as_str()).collect::<Vec<_>>(),
+            vec!["October"],
+            "the draft built while searching must not reach the traveller's list",
+        );
     }
 
     #[tokio::test]
@@ -439,6 +469,9 @@ mod tests {
         core.store()
             .upsert_trip(account_id, "Atlantic loop", None, None, None)
             .unwrap();
+        // This test is about a stale position, not about keeping — kept
+        // explicitly so the `list` read at the bottom can see it.
+        core.store().keep_trip(account_id, "Atlantic loop").unwrap();
         add_leg(&core, account_id, "Atlantic loop", None, "AMS", "LIS", "2026-10-12")
             .await
             .unwrap();
@@ -478,6 +511,9 @@ mod tests {
         core.store()
             .upsert_trip(account_id, "Atlantic loop", None, None, None)
             .unwrap();
+        // This test is about a stale position, not about keeping — kept
+        // explicitly so the `list` read at the bottom can see it.
+        core.store().keep_trip(account_id, "Atlantic loop").unwrap();
         add_leg(&core, account_id, "Atlantic loop", None, "AMS", "LIS", "2026-10-12")
             .await
             .unwrap();
@@ -546,6 +582,9 @@ mod tests {
         core.store()
             .upsert_trip(account_id, "Atlantic loop", None, None, None)
             .unwrap();
+        // This test is about refused edits, not about keeping — kept
+        // explicitly so the `list` read at the bottom can see it.
+        core.store().keep_trip(account_id, "Atlantic loop").unwrap();
 
         let refusals = [
             add_leg(&core, account_id, "Atlantic loop", None, "Amsterdam", "FCO", "2026-10-14")
@@ -587,6 +626,9 @@ mod tests {
         store
             .upsert_trip(account_id, "October", Some(2), Some("economy"), Some(conversation_id))
             .unwrap();
+        // This test is about the chat a trip names, not about keeping —
+        // kept explicitly so the `list` read below can see it.
+        store.keep_trip(account_id, "October").unwrap();
 
         let plans = list(&core, account_id).await.unwrap();
         let chat = plans[0]
@@ -621,6 +663,9 @@ mod tests {
         store
             .upsert_trip(account_id, "October", Some(2), Some("economy"), Some(conversation_id))
             .unwrap();
+        // This test is about chat serialization, not about keeping — kept
+        // explicitly so the `list` read below can see it.
+        store.keep_trip(account_id, "October").unwrap();
         seed_trip_for_tests(&core, account_id, "Orphaned").await.unwrap();
 
         let plans = list(&core, account_id).await.unwrap();

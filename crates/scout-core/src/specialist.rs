@@ -40,6 +40,14 @@ pub enum SpecialistError {
     Failed(String),
 }
 
+/// What the chat is told once no nested call is outstanding any more.
+///
+/// True whichever way the run goes from there — another tool call, or the
+/// answer being written — because whatever comes next replaces this line,
+/// and a line promising the answer is nearly here would be a lie half the
+/// time.
+const WORKING: &str = "🧠 working through what came back";
+
 /// Gathers a nested run as it streams.
 #[derive(Debug, Default)]
 pub(crate) struct Collector {
@@ -65,7 +73,20 @@ impl Collector {
     /// A nested tool answered. Its text is parsed back into the JSON the
     /// tool produced, so the parent reads the same shape it would have
     /// read from calling the tool itself.
-    pub(crate) fn tool_finished(&mut self, call_id: &str, text: &str) {
+    ///
+    /// Answering the last outstanding call is also the moment this file
+    /// goes quiet: nothing else here speaks until the next tool starts, and
+    /// once the flight-search cap was reached there was no next tool. The
+    /// chat sat on "✈️ searching HKG→FUK" for the two minutes the model
+    /// spent writing its answer (production, 08:19:45 to 08:21:45), so the
+    /// reader was told the search was still running long after it had
+    /// stopped.
+    pub(crate) fn tool_finished(
+        &mut self,
+        call_id: &str,
+        text: &str,
+        events: &scout_api::EventSink,
+    ) {
         let Some((tool, args)) = self.pending.remove(call_id) else {
             return;
         };
@@ -74,6 +95,11 @@ impl Collector {
             Err(_) => (serde_json::Value::String(text.to_string()), true),
         };
         self.findings.push(Finding { tool, args, output, failed });
+        // Only when nothing is left running: a call still in flight has its
+        // own line, which names what it is doing and so says more.
+        if self.pending.is_empty() {
+            scout_api::emit(events, scout_api::AgentEvent::Tool(WORKING.to_string()));
+        }
     }
 
     /// The nested model's final text.
@@ -217,7 +243,7 @@ where
                                 })
                                 .collect::<Vec<_>>()
                                 .join("");
-                            collector.tool_finished(&internal_call_id, &text);
+                            collector.tool_finished(&internal_call_id, &text, &self.events);
                         }
                         Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                             collector.finished(res.output());
@@ -253,13 +279,51 @@ mod tests {
         Vec::new()
     }
 
+    /// Every progress line the chat has been given since the last look, in
+    /// the order it would show them - which is what a reader watching one
+    /// status line actually experiences.
+    fn lines(
+        seen: &mut tokio::sync::mpsc::UnboundedReceiver<scout_api::AgentEvent>,
+    ) -> Vec<String> {
+        let mut shown = Vec::new();
+        while let Ok(event) = seen.try_recv() {
+            match event {
+                scout_api::AgentEvent::Tool(text) => shown.push(text),
+                other => panic!("this file emits progress and nothing else, got {other:?}"),
+            }
+        }
+        shown
+    }
+
+    #[test]
+    fn the_chat_hears_the_model_is_working_only_once_no_call_is_left_running() {
+        // Two calls out at once: the first result leaves a line that is
+        // still true, so the working line has to wait for the second.
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let mut c = Collector::default();
+
+        c.tool_started("c1", "search_flights", json!({"origin": "AMS", "destination": "LIS"}), &events);
+        c.tool_started("c2", "search_flights", json!({"origin": "AMS", "destination": "OPO"}), &events);
+        c.tool_finished("c1", r#"{"found":1}"#, &events);
+
+        assert_eq!(
+            lines(&mut seen),
+            vec!["✈️ searching AMS→LIS", "✈️ searching AMS→OPO"],
+            "a search still running says more than a line about working"
+        );
+
+        c.tool_finished("c2", r#"{"found":2}"#, &events);
+
+        assert_eq!(lines(&mut seen), vec![WORKING], "and only then, once");
+    }
+
     #[test]
     fn a_tool_start_is_told_to_the_chat_and_its_result_becomes_a_finding() {
         let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
         let mut c = Collector::default();
 
         c.tool_started("c1", "search_flights", json!({"origin": "AMS", "destination": "LIS", "departure_date": "2026-10-12"}), &events);
-        c.tool_finished("c1", r#"{"route":"AMS-LIS","found":3}"#);
+        c.tool_finished("c1", r#"{"route":"AMS-LIS","found":3}"#, &events);
 
         match seen.try_recv() {
             Ok(scout_api::AgentEvent::Tool(text)) => assert_eq!(text, "✈️ searching AMS→LIS 2026-10-12"),
@@ -281,7 +345,7 @@ mod tests {
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
         let mut c = Collector::default();
         c.tool_started("c1", "show_trip", json!({}), &events);
-        c.tool_finished("c1", "no trip called Lisbon");
+        c.tool_finished("c1", "no trip called Lisbon", &events);
         assert!(c.findings[0].failed);
         assert_eq!(c.findings[0].output, json!("no trip called Lisbon"));
     }
@@ -291,15 +355,17 @@ mod tests {
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
         let mut c = Collector::default();
         c.tool_started("c1", "search_flights", json!({}), &events);
-        c.tool_finished("c1", "duffel api error (status 429): slow down");
+        c.tool_finished("c1", "duffel api error (status 429): slow down", &events);
         assert!(c.report(Some("the model call failed"), &no_guidance).is_err());
     }
 
     #[test]
     fn a_result_for_a_call_never_started_is_ignored() {
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
         let mut c = Collector::default();
-        c.tool_finished("ghost", "{}");
+        c.tool_finished("ghost", "{}", &events);
         assert!(c.findings.is_empty());
+        assert!(seen.try_recv().is_err(), "a result nobody was waiting for is not progress");
     }
 
     #[test]
@@ -307,7 +373,7 @@ mod tests {
         let mut c = Collector::default();
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
         c.tool_started("c1", "search_flights", json!({}), &events);
-        c.tool_finished("c1", r#"{"found":0}"#);
+        c.tool_finished("c1", r#"{"found":0}"#, &events);
         c.finished("<think>hmm</think>Searched AMS to LIS on the 12th.");
 
         let report = c.report(None, &|f: &[Finding]| vec![format!("{} findings", f.len())]).unwrap();
@@ -323,7 +389,7 @@ mod tests {
         let mut c = Collector::default();
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
         c.tool_started("c1", "search_flights", json!({}), &events);
-        c.tool_finished("c1", r#"{"found":2}"#);
+        c.tool_finished("c1", r#"{"found":2}"#, &events);
 
         let report = c.report(Some("the model stopped responding"), &no_guidance).unwrap();
         assert_eq!(report.findings.len(), 1);
@@ -400,6 +466,34 @@ mod tests {
         rig::agent::AgentBuilder::new(model).preamble("test").tool(Probe).default_max_turns(turns).build()
     }
 
+    /// A scripted model calling `probe` once per entry in `qs`, each call in
+    /// its own turn, then answering - so a test can watch what the chat is
+    /// told between one round of tools and the next.
+    fn scripted_rounds(qs: &[i64]) -> rig::agent::Agent<rig::test_utils::MockCompletionModel> {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let mut turns: Vec<Vec<MockStreamEvent>> = qs
+            .iter()
+            .enumerate()
+            .map(|(n, q)| {
+                vec![
+                    MockStreamEvent::tool_call(format!("t{n}"), "probe", json!({"q": q})),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ]
+            })
+            .collect();
+        turns.push(vec![
+            MockStreamEvent::text("Probed a few times."),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]);
+        let turns_allowed = turns.len() + 1;
+        let model = MockCompletionModel::from_stream_turns(turns);
+        rig::agent::AgentBuilder::new(model)
+            .preamble("test")
+            .tool(Probe)
+            .default_max_turns(turns_allowed)
+            .build()
+    }
+
     fn specialist<M: rig::completion::CompletionModel>(
         agent: rig::agent::Agent<M>,
         events: scout_api::EventSink,
@@ -442,6 +536,20 @@ mod tests {
             other => panic!("the chat must see the nested call: {other:?}"),
         }
         assert!(tool.pulse.since() < std::time::Duration::from_secs(1), "the pulse was touched");
+    }
+
+    #[tokio::test]
+    async fn every_round_of_nested_calls_hands_the_chat_back_a_true_line() {
+        // Two rounds, so the sequence shows what the reader sees: a tool
+        // line while the tool runs, the working line the moment it is
+        // answered, and the next tool line taking that one's place.
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let tool = specialist(scripted_rounds(&[1, 2]), events);
+
+        let report = rig::tool::Tool::call(&tool, Brief { brief: "probe twice".to_string() }).await.unwrap();
+
+        assert_eq!(report.findings.len(), 2);
+        assert_eq!(lines(&mut seen), vec!["⚙️ probe", WORKING, "⚙️ probe", WORKING]);
     }
 
     #[tokio::test]

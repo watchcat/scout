@@ -84,6 +84,16 @@ findings verbatim - never from the summary and never from memory - and \
 relay the summary's caveats in plain words (what could not be searched, \
 what is missing, that Scout cannot book). A fare expires within minutes: \
 for a later question, ask ask_flights again rather than repeating one.
+- When ask_flights is available, keeping or saving a trip is an errand for \
+that same desk. 'Save this trip', 'keep it', 'сохрани эту поездку' and \
+anything else asking to hold on to a plan go to ask_flights with a brief \
+saying to keep the trip by name, and it is kept only once the desk says so. \
+record_purchase records something the traveller BOUGHT and cannot touch a \
+trip at all: asked to save a trip it answered 'already saved as purchase id \
+11' in production - the wrong tool and a false confirmation in one reply. \
+This ask usually lands the turn AFTER the flight report, with no guidance \
+in front of you, so nothing will remind you then: the trip meant is the one \
+that report named.
 - Some users list favourite shops below, each with the kind of product it \
 is for. When what you are searching for falls in that kind - judge it \
 sensibly, a stain remover is a cleaning product - spend one of search_web's \
@@ -677,6 +687,16 @@ mod tests {
         // But an unconditional rule that merely mentions the shop stays —
         // bol.com pages still arrive through ordinary web search.
         assert!(p.contains("the page text is not"), "the stock rule is untouched");
+
+        // ask_flights owns more than one rule now, and every one of them
+        // has to go with the tool: an install with no flight provider being
+        // told to send "save this trip" to ask_flights is the same
+        // UnknownToolCall by another name.
+        let without_flights: Vec<&str> =
+            ALL_TOOLS.iter().copied().filter(|t| *t != "ask_flights").collect();
+        let f = preamble_with_profile(&[], &without_flights);
+        assert!(!f.contains("ask_flights"), "an absent desk is not mentioned at all: {f}");
+        assert!(!f.contains("keep the trip by name"), "the keep rule went with it: {f}");
     }
 
     #[test]
@@ -695,6 +715,13 @@ mod tests {
         assert!(p.contains("one adult"), "got: {p}");
         // And the offer id alone is ambiguous between two booking tools.
         assert!(p.contains("its source"), "got: {p}");
+        // Keeping a trip is the desk's errand too. Measured in production:
+        // the traveller typed "Save this trip" the turn after the findings,
+        // where guidance no longer reaches the parent, so it called
+        // record_purchase and then claimed the trip was saved as purchase
+        // id 11. The routing has to be durable, not carried by a report.
+        assert!(p.contains("keep the trip by name"), "got: {p}");
+        assert!(p.contains("record_purchase records something the traveller BOUGHT"), "got: {p}");
     }
 
     #[test]

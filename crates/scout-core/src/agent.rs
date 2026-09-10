@@ -68,6 +68,14 @@ furniture, bikes, tools...).
 directly, so the title, price and product URL are current and need no \
 fetch_page. Search it in Dutch. Its delivery text is timing, not shipping \
 cost, so shipping stays unknown for compare_prices unless a page states it.
+- Today's date is stated at the end of this prompt. A date the user gives \
+without a year - '23 September', 'next Tuesday' - means its NEXT occurrence \
+from that date; never read one into the past, and never ask which year they \
+meant when the answer is simply the next one. Write the year out in full \
+whenever you pass a date on to a tool or to another agent: a traveller who \
+asked for 23-27 September, thirteen days before those days, had 2025 \
+searched for them eight times and every one of those searches was thrown \
+away for being in the past.
 - When ask_flights is available, send it every question about flights, \
 fares, airport codes, booking a flight, or a trip being planned - never a \
 web search, and never compare_prices, whose per-unit arithmetic means \
@@ -500,7 +508,25 @@ pub fn preamble_with_profile(facts: &[(String, String)], available: &[&str]) -> 
             }
         }
     }
+    // Last, because the date rule above points at the end of the prompt.
+    p.push_str(&format!("\nToday's date is {} (UTC).\n", today()));
     p
+}
+
+/// Today, as every prompt is told it.
+///
+/// Until this existed no preamble, brief or prompt carried a date at all,
+/// so a bare "23 September" was a guess and the guesses disagreed: one
+/// production run sent 2025-09-25 to the flight providers eight times,
+/// thirteen days before the September the traveller actually meant, and
+/// got departure_date_in_past back for every one of them. Scout's reply
+/// then had to ask which year they had meant, because it could not tell.
+///
+/// A date and not a timestamp on purpose: the preamble is part of the
+/// prompt cache key on some providers, so this changes once a day rather
+/// than once a request.
+pub(crate) fn today() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
 /// A rate as a percentage a person would say aloud: 0.03 -> "3%",
@@ -870,6 +896,39 @@ mod tests {
         // query at a shop the user never named.
         let none = preamble_with_profile(&[], ALL_TOOLS);
         assert!(!none.contains("Shops this user wants searched"));
+    }
+
+    #[test]
+    fn the_preamble_states_today_and_says_a_bare_date_means_the_next_one() {
+        // Until this line existed, "23 September" was whatever year the
+        // model felt like: one run sent 2025-09-25 to the providers eight
+        // times, thirteen days before the September that was meant.
+        // Expected the way the code works it out, never written down - a
+        // date typed into a test passes today and fails tomorrow.
+        let p = preamble_with_profile(&[], ALL_TOOLS);
+        let date = p
+            .lines()
+            .find_map(|l| l.strip_prefix("Today's date is ")?.strip_suffix(" (UTC)."))
+            .unwrap_or_else(|| panic!("the preamble must state today's date: {p}"));
+        assert_eq!(date, chrono::Utc::now().format("%Y-%m-%d").to_string(), "got: {date}");
+        // And in a shape nobody has to guess at: 2026-09-10 says which
+        // number is the month, 10/09 does not.
+        assert!(
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
+            "the date must be YYYY-MM-DD: {date}"
+        );
+
+        // Knowing the day is not the rule; a model will still write a past
+        // year out of habit unless told what a bare date means.
+        assert!(p.contains("means its NEXT occurrence"), "got: {p}");
+        assert!(p.contains("Write the year out in full"), "got: {p}");
+        // The rule points at the end of the prompt, so the date has to be
+        // there even for a user with shops and facts appended after it.
+        let full = preamble_with_profile(
+            &facts(&[("delivery_country", "NL"), ("favourite_shops", "bol.com")]),
+            ALL_TOOLS,
+        );
+        assert!(full.trim_end().ends_with(&format!("Today's date is {date} (UTC).")), "got: {full}");
     }
 
     #[test]

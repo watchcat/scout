@@ -51,6 +51,13 @@ LHR (or LON for all its airports) - and dates as YYYY-MM-DD.
 - If the brief lacks something a search needs - a destination, a date, the \
 number of passengers - do not guess it and do not search: say in your \
 report exactly what is missing, so it can be asked for.
+- A date in the brief with no year is NOT one of those missing things: it \
+means its next occurrence from today's date, given at the end of this \
+prompt. Asked on 2026-09-10, '23 September' is 2026-09-23 and never \
+2025-09-23. Fill the year in yourself and search. Never send a date that \
+has already gone: the providers refuse it - departure_date_in_past - and \
+the search is spent either way. That is measured, not hypothetical: eight \
+of one traveller's searches went out for a September that was already over.
 - When the brief says the dates are flexible, or asks whether another day \
 is cheaper, pass flex_days (max 3) instead of searching each date \
 yourself: it prices the whole window in one call. Do NOT pass flex_days \
@@ -97,6 +104,23 @@ and any caveat - nothing flew that day, the window that was covered, a \
 fare that moved. Give no prices, times or links in those sentences: the \
 tool results travel back with your report and are read from there.";
 
+/// The flight prompt as the desk is actually given it: the rules for the
+/// tools this install has, plus today's date.
+///
+/// The date cannot live in the const, and no agent needs it more than this
+/// one: it sees nothing of the conversation, only a self-contained brief,
+/// so a brief reading "23-27 September" is a year it has to invent out of
+/// nothing. It invented 2025 eight times in one production run, thirteen
+/// days before the September that was meant, and every one of those
+/// searches came back departure_date_in_past.
+pub(crate) fn flight_preamble(available: &[&str]) -> String {
+    format!(
+        "{}\n\nToday's date is {} (UTC).",
+        rules_for_available_tools(FLIGHT_PREAMBLE, available),
+        crate::agent::today()
+    )
+}
+
 /// The booking tools this install actually has, for the prompt filter.
 fn available_tools(d: &AgentDeps) -> Vec<&'static str> {
     FLIGHT_TOOLS
@@ -133,7 +157,7 @@ pub fn build_flight_agent(
     let mut builder = d
         .llm
         .agent(&d.flight_model)
-        .preamble(&rules_for_available_tools(FLIGHT_PREAMBLE, &available_tools(d)))
+        .preamble(&flight_preamble(&available_tools(d)))
         .tool(crate::tools::duffel::FlightSearchTool {
             duffel: d.duffel.clone(),
             store: d.store.clone(),
@@ -548,6 +572,38 @@ mod tests {
         // The desk has no earlier brief to reuse a fare from; expiry is a
         // rule for the agent with a conversation.
         assert!(!FLIGHT_PREAMBLE.contains("expires"), "expiry belongs in the guidance, not the flight prompt");
+    }
+
+    #[test]
+    fn the_desk_is_told_today_and_that_a_bare_date_is_the_next_one() {
+        // The desk is handed a brief and nothing else, so a brief saying
+        // "23-27 September" is a year it has to invent. It invented 2025
+        // eight times in one production run and every one of those
+        // searches came back departure_date_in_past. Expected the way the
+        // code works it out, never written down: a date typed into a test
+        // passes today and fails tomorrow.
+        for available in [&[][..], FLIGHT_TOOLS] {
+            let p = flight_preamble(available);
+            let date = p
+                .lines()
+                .find_map(|l| l.strip_prefix("Today's date is ")?.strip_suffix(" (UTC)."))
+                .unwrap_or_else(|| panic!("the flight prompt must state today's date: {p}"));
+            assert_eq!(date, chrono::Utc::now().format("%Y-%m-%d").to_string(), "got: {date}");
+            // 2026-09-10 says which number is the month; 10/09 does not.
+            assert!(
+                chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
+                "the date must be YYYY-MM-DD: {date}"
+            );
+            // The rule that makes the date do something, and it is not one
+            // of the conditional rules: a desk with no booking tool still
+            // searches, so it still needs the year.
+            assert!(p.contains("means its next occurrence from today's date"), "got: {p}");
+            assert!(p.contains("Never send a date that has already gone"), "got: {p}");
+            // Without this clause the rule above it - do not guess what the
+            // brief lacks, report it as missing - reads a yearless date as
+            // a missing date and refuses to search at all.
+            assert!(p.contains("is NOT one of those missing things"), "got: {p}");
+        }
     }
 
     #[test]

@@ -48,17 +48,23 @@ pub enum Selection {
     CandidateNotFound,
 }
 
-/// Every kept trip for this account, newest activity first. Drafts built
-/// while searching are deliberately absent — see `Store::list_kept_trips`.
+/// Every trip for this account, newest activity first — drafts included.
+///
+/// Drafts were hidden here for a day, so that a casual price check would not
+/// litter the Trips tab. It cost more than it saved: having watched the
+/// specialist build a trip, the traveller could not tell "built but
+/// invisible" from "not built at all", which is the complaint this whole
+/// feature came from. A draft is shown and marked instead — `trip.kept`
+/// rides along on the plan for the client to mark it with.
 pub async fn list(core: &Core, account_id: i64) -> anyhow::Result<Vec<Plan>> {
     let store = core.store();
     blocking(move || {
         // One `trip_chat` read per trip rather than a second query shape: an
         // account's trip list is the handful of itineraries a traveller is
         // actively planning, not a table a client paginates, so the extra
-        // round trips are not worth the JOIN-in-list_kept_trips complexity.
+        // round trips are not worth the JOIN-in-list_trips complexity.
         store
-            .list_kept_trips(account_id)?
+            .list_trips(account_id)?
             .into_iter()
             .map(|trip| {
                 let chat = store.trip_chat(trip.id)?;
@@ -72,10 +78,10 @@ pub async fn list(core: &Core, account_id: i64) -> anyhow::Result<Vec<Plan>> {
 /// One durable trip by the name the traveller gave it, scoped to their
 /// account. The store performs the same case-insensitive lookup as chat.
 ///
-/// A draft answers `None`, the same as a name that was never used. This is
-/// channel-facing, so it must agree with `list`: a trip absent from the
-/// traveller's list cannot be fetched by guessing what it is called, or the
-/// PDF route would render a trip the Trips tab refuses to show.
+/// A draft answers like any other trip. It briefly did not, while `list`
+/// hid drafts and this had to agree with it; now that the Trips tab shows a
+/// draft, refusing it here would offer the traveller a PDF of a trip and
+/// then decline to render it.
 pub async fn find(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Option<Plan>> {
     let store = core.store();
     let name = name.to_string();
@@ -83,11 +89,11 @@ pub async fn find(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Op
         store
             .find_trip(account_id, &name)
             .and_then(|trip| match trip {
-                Some(trip) if trip.kept => {
+                Some(trip) => {
                     let chat = store.trip_chat(trip.id)?;
                     Ok(Some(Plan::from_trip(trip, chat)))
                 }
-                _ => Ok(None),
+                None => Ok(None),
             })
     })
     .await
@@ -299,15 +305,11 @@ pub async fn seed_trip_for_tests(core: &Core, account_id: i64, name: &str) -> an
             },
             false,
         )?;
-        // A trip built by upsert_trip alone is a draft, invisible to
-        // `list`. Every caller of this helper — here and in scout-web —
-        // uses it to stand up a trip the channel is expected to show, so
-        // the scaffolding keeps it rather than making every call site
-        // remember to. Set on the in-hand copy too, rather than a reload,
-        // so the returned `Plan` agrees with what the store now holds.
-        store.keep_trip(account_id, &name)?;
-        let mut trip = trip;
-        trip.kept = true;
+        // Left a draft, which is what a flight search actually produces.
+        // This used to keep the trip on every caller's behalf, because
+        // `list` then hid drafts and no fixture would have been visible;
+        // `list` shows them again, and keeping here would hide the one
+        // state the keep route has to be tested against.
         // upsert_trip above was called with conversation_id: None, so this
         // trip is orphaned by construction — no store round trip needed to
         // know that.
@@ -355,22 +357,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_trips_tab_shows_kept_trips_and_not_the_drafts_built_while_searching() {
-        // The regression test for the reported bug, from both ends: a draft
-        // exists in the store and does not reach the traveller. Without the
-        // second half, every casual price check litters the Trips tab, which
-        // is the reason drafts exist at all.
+    async fn the_trips_tab_shows_the_drafts_built_while_searching_and_marks_them() {
+        // Hiding drafts here was tried for a day and reversed. It stopped
+        // casual price checks littering the tab, but it also meant a
+        // traveller who had just watched the specialist build a trip could
+        // not tell "built but invisible" from "not built at all" — the
+        // complaint the Trips tab exists to answer.
         let (core, _dir, account_id) = core().await;
         core.store()
             .upsert_trip(account_id, "Just browsing", None, None, None)
             .unwrap();
         seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+        core.store().keep_trip(account_id, "October").unwrap();
 
         let plans = list(&core, account_id).await.unwrap();
         assert_eq!(
-            plans.iter().map(|p| p.trip.name.as_str()).collect::<Vec<_>>(),
-            vec!["October"],
-            "the draft built while searching must not reach the traveller's list",
+            plans.iter().map(|p| (p.trip.name.as_str(), p.trip.kept)).collect::<Vec<_>>(),
+            vec![("October", true), ("Just browsing", false)],
+            "the draft reaches the traveller, saying it is a draft",
+        );
+        // The mark has to survive serialization or the browser cannot draw
+        // the difference, and a draft becomes indistinguishable again.
+        let draft = serde_json::to_value(&plans[1]).unwrap();
+        assert_eq!(draft["kept"], serde_json::json!(false));
+        assert_eq!(
+            serde_json::to_value(&plans[0]).unwrap()["kept"],
+            serde_json::json!(true),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draft_is_fetched_by_name_like_any_other_trip() {
+        // `find` is what the PDF route goes through. While drafts were
+        // hidden it refused them, which now would mean a trip the tab shows
+        // and an export that declines to render it.
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October")
+            .await
+            .unwrap();
+
+        let plan = find(&core, account_id, "october").await.unwrap().unwrap();
+        assert!(!plan.trip.kept, "the trip a flight search builds is a draft");
+        assert_eq!(plan.trip.segments.len(), 1);
+        assert_eq!(
+            find(&core, account_id, "a trip nobody made").await.unwrap(),
+            None,
+            "a name that was never used is still nothing",
         );
     }
 

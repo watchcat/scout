@@ -67,9 +67,9 @@ buys from the airline with the numbers already found.
 - Build the trip with the trip tools every time you search, not only for a \
 multi-city route or a trip assembled over several messages: \
 add_trip_segment for each leg the moment you have a route and a date, \
-add_trip_option for each flight found. It costs nothing and the traveller \
-does not see it - a trip you build is a draft until they ask to keep it - \
-so there is no such thing as building one needlessly. A segment is one \
+add_trip_option for each flight found. It costs nothing and a trip you \
+build is a draft, marked as one wherever it is shown, until they ask to \
+keep it - so there is no such thing as building one needlessly. A segment is one \
 direction on one date, so a return is two segments. When a date or a leg \
 changes, call update_trip_segment on that one segment. NEVER delete the \
 trip and build it again, and never drop and \
@@ -84,9 +84,9 @@ not to check on it.
 and report that it is kept. Such a brief comes back after the traveller \
 was shown the draft and said yes, so there is nothing left to ask and \
 nothing to search: keep_trip costs nothing and prices nothing. It is also \
-the only thing that makes a trip visible to them - building one does not, \
-and neither does finalising it - so a trip nobody keeps is a trip they \
-never see.
+the only thing that makes a trip outlive the chat it was built in - \
+building one does not, and neither does finalising it - so a draft nobody \
+keeps is deleted with that chat.
 - Every trip tool hands back the whole trip. If a call failed, the trip \
 did NOT change. When you make several edits, trust each call's own \
 'changed' line over the snapshot beside it - a snapshot is from the \
@@ -268,8 +268,9 @@ pub fn guidance(findings: &[crate::specialist::Finding], markup_rate: f64) -> Ve
     }
     if let Some(name) = draft {
         out.push(format!(
-            "The trip called {name:?} is a draft: it was built while searching and the \
-             traveller cannot see it among their trips yet. Show them the itinerary and ask \
+            "The trip called {name:?} is a draft: it was built while searching, so the \
+             traveller sees it among their trips marked as a draft and it is deleted when \
+             this chat expires. Show them the itinerary and ask \
              whether to keep it. You cannot keep it yourself - you have no trip tools - so if \
              they say yes, ask ask_flights again with a brief saying to keep the trip called \
              {name:?}, and tell them it is kept only once that comes back."

@@ -2674,9 +2674,20 @@ impl Store {
 
     /// The trips the traveller asked to keep, newest activity first.
     ///
-    /// The channel-facing read. `list_trips` is the model's and includes
-    /// drafts on purpose: a specialist that could not see the trip it just
-    /// built would build a second one on the next message.
+    /// Nothing outside this file's tests calls this today. It was the
+    /// channel-facing read for the one day the Trips tab hid drafts; that
+    /// was reversed, and `trips::list` records why. Left here rather than
+    /// deleted because `kept` is still a real distinction — expiry takes an
+    /// unkept draft and spares a kept trip — so this is the query any
+    /// "kept only" view would ask for.
+    ///
+    /// `#[cfg(test)]` and not `#[allow(dead_code)]`: with `mod store`
+    /// private, an unused method here is dead in earnest, and this says so
+    /// in the type system instead of silencing the compiler. Its tests
+    /// still run, so it cannot rot before something wants it back. Drop the
+    /// attribute the moment a caller appears — or drop the method, if none
+    /// ever does.
+    #[cfg(test)]
     pub fn list_kept_trips(&self, account_id: i64) -> Result<Vec<Trip>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(

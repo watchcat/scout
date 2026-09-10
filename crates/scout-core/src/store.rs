@@ -103,6 +103,11 @@ CREATE TABLE IF NOT EXISTS trips (
     -- ALTER TABLE in step 9 — have the same column order. NULL means the
     -- chat that made this trip is gone; the next chat to touch it adopts it.
     conversation_id BIGINT,
+    -- Last, so a fresh database and a migrated one — where this arrives by
+    -- ALTER TABLE in step 10 — have the same column order. False means a
+    -- draft: built automatically while searching, invisible to the
+    -- traveller until they ask to keep it.
+    kept        BOOLEAN NOT NULL DEFAULT false,
     UNIQUE (account_id, name_key)
 );
 -- Where and when. This is all that gets re-searched.
@@ -306,6 +311,9 @@ pub struct Trip {
     /// describing the trip when the trip stopped being that trip.
     pub status: String,
     pub segments: Vec<TripSegment>,
+    /// False while this is a draft the specialist built as it searched.
+    /// The model sees this — it needs to know whether to offer to keep it.
+    pub kept: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -771,6 +779,33 @@ const STEP_9_TRIP_CONVERSATION: &str = r#"
 ALTER TABLE trips ADD COLUMN IF NOT EXISTS conversation_id BIGINT;
 "#;
 
+/// `kept` marks a trip the traveller asked to keep. It defaults false —
+/// new trips are drafts — but every trip already in the database was made
+/// when creating one *was* the act of keeping it, so they are all kept.
+/// Without that UPDATE this step hides every trip a traveller already has.
+///
+/// Split from its `NOT NULL` the same way `STEP_7_THREADS` splits from
+/// `STEP_8_PINNED_NOT_NULL`, and for the same reason: DuckDB refuses to
+/// `ADD COLUMN` with a constraint on it, so `NOT NULL` cannot ride along
+/// on the statement that creates the column.
+///
+/// `IF NOT EXISTS` for the same reason step 7 has it: a fixture can build
+/// the finished shape from `MIGRATIONS` and then record an older version,
+/// so this step can meet a column that is already there. Note the UPDATE
+/// still runs in that case, which is correct — such a database has no
+/// drafts in it to protect.
+const STEP_10_KEPT_TRIPS: &str = r#"
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS kept BOOLEAN;
+UPDATE trips SET kept = true WHERE kept IS NULL;
+ALTER TABLE trips ALTER COLUMN kept SET DEFAULT false;
+"#;
+
+/// See `STEP_8_PINNED_NOT_NULL`. Dying between 10 and 11 leaves a nullable
+/// column that holds no nulls, and this runs alone on the next boot.
+const STEP_11_KEPT_TRIPS_NOT_NULL: &str = r#"
+ALTER TABLE trips ALTER COLUMN kept SET NOT NULL;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -782,6 +817,8 @@ fn steps() -> Vec<(i64, Step)> {
         (7, Step::Sql(STEP_7_THREADS)),
         (8, Step::Sql(STEP_8_PINNED_NOT_NULL)),
         (9, Step::Sql(STEP_9_TRIP_CONVERSATION)),
+        (10, Step::Sql(STEP_10_KEPT_TRIPS)),
+        (11, Step::Sql(STEP_11_KEPT_TRIPS_NOT_NULL)),
     ]
 }
 
@@ -3171,8 +3208,8 @@ fn drop_segment_within(conn: &Connection, trip_id: i64, position: i64) -> Result
 /// be called by a method that already holds the lock — every trip-mutating
 /// method returns the trip it just changed, and re-locking would deadlock.
 fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
-    let (name, adults, cabin_class, status) = conn.query_row(
-        "SELECT name, adults, cabin_class, status FROM trips WHERE id = ?",
+    let (name, adults, cabin_class, status, kept) = conn.query_row(
+        "SELECT name, adults, cabin_class, status, kept FROM trips WHERE id = ?",
         params![id],
         |row| {
             Ok((
@@ -3180,6 +3217,7 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
             ))
         },
     )?;
@@ -3234,7 +3272,7 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
         })
         .collect();
 
-    Ok(Trip { id, name, adults, cabin_class, status, segments })
+    Ok(Trip { id, name, adults, cabin_class, status, segments, kept })
 }
 
 fn row_to_purchase(row: &Row) -> duckdb::Result<Purchase> {
@@ -3617,7 +3655,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 9);
+        assert_eq!(s.schema_version().unwrap(), 11);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -3681,7 +3719,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 11);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -4626,6 +4664,63 @@ CREATE TABLE trips (
             .query_row("SELECT conversation_id FROM trips WHERE name_key = 'lisbon'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(conversation_id, None, "a trip that predates the column must gain it, unset");
+    }
+
+    /// The `trips` table as it stood at schema 9, before `kept`. Do NOT update
+    /// this when `MIGRATIONS` changes — its value is being an honest picture of
+    /// the database step 10 will actually meet.
+    const PRE_KEPT_TRIPS: &str = r#"
+CREATE SEQUENCE IF NOT EXISTS trips_id_seq;
+CREATE TABLE trips (
+    id          BIGINT PRIMARY KEY DEFAULT nextval('trips_id_seq'),
+    account_id     BIGINT NOT NULL,
+    name        TEXT NOT NULL,
+    name_key    TEXT NOT NULL,
+    adults      BIGINT NOT NULL DEFAULT 1,
+    cabin_class TEXT,
+    status      TEXT NOT NULL DEFAULT 'planning',
+    created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    conversation_id BIGINT,
+    UNIQUE (account_id, name_key)
+);
+"#;
+
+    #[test]
+    fn a_trip_the_model_builds_starts_as_a_draft() {
+        // Building a trip is now free and automatic, so creating one is no
+        // longer the act of intent it used to be. Keeping it is.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        assert!(!trip.kept, "a newly built trip is a draft until the traveller keeps it");
+    }
+
+    #[test]
+    fn every_trip_that_already_existed_is_kept_by_the_migration() {
+        // Every trip in a database written before this column existed was
+        // created under rules where making one *was* keeping it. Without the
+        // backfill, this migration hides every trip a traveller already has
+        // — which is the exact complaint the feature exists to answer,
+        // inflicted on all their existing data.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scout.duckdb");
+        {
+            let conn = duckdb::Connection::open(&path).unwrap();
+            conn.execute_batch(PRE_KEPT_TRIPS).unwrap();
+            conn.execute_batch(
+                "INSERT INTO trips (account_id, name, name_key) VALUES (1, 'Japan in spring', 'japan in spring');
+                 CREATE TABLE schema_version (version BIGINT NOT NULL);
+                 INSERT INTO schema_version VALUES (9);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let kept: bool = store
+            .conn()
+            .query_row("SELECT kept FROM trips WHERE name_key = 'japan in spring'", [], |r| r.get(0))
+            .unwrap();
+        assert!(kept, "a trip that predates the column must survive as kept, not vanish");
     }
 
     #[test]
@@ -5805,7 +5900,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 9, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 11, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -5846,7 +5941,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 9);
+        assert_eq!(s.schema_version().unwrap(), 11);
         let conn = s.conn();
         assert!(
             conn.execute_batch(

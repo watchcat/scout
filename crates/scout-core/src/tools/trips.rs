@@ -1435,6 +1435,65 @@ impl Tool for DeleteTripTool {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct KeepTripArgs {
+    pub trip: String,
+}
+
+pub struct KeepTripTool {
+    pub store: Store,
+    pub account_id: i64,
+}
+
+impl Tool for KeepTripTool {
+    const NAME: &'static str = "keep_trip";
+    type Error = StoreToolError;
+    type Args = KeepTripArgs;
+    type Output = TripView;
+
+    fn description(&self) -> String {
+        "Keep a trip, so it appears in the traveller's saved trips. Trips you build \
+         while searching are drafts they cannot see; call this only when the \
+         traveller has said they want this one kept. Costs nothing and searches \
+         nothing."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {"trip": {"type": "string", "description": "the trip's name"}},
+            "required": ["trip"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let store = self.store.clone();
+        let account_id = self.account_id;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
+            let kept = store.keep_trip(account_id, &args.trip)?;
+            if !kept {
+                // Same treatment as delete_trip: a mistyped name is
+                // indistinguishable here from one that was never created,
+                // so both get the real names to correct against.
+                anyhow::bail!(
+                    "no trip called {:?} to keep. This traveller has: {}",
+                    args.trip,
+                    trip_names(&store, account_id)?
+                );
+            }
+            find_trip_or_list(&store, account_id, &args.trip)
+        })
+        .await
+        .map_err(internal)?
+        .map(|trip| {
+            let said = format!("{:?} is kept", trip.name);
+            TripView::after(trip, said)
+        })
+        .map_err(internal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2732,6 +2791,58 @@ mod tests {
             "unknown names list the real ones: {:?}",
             result.notes
         );
+    }
+
+    #[tokio::test]
+    async fn keeping_a_trip_makes_it_the_travellers_and_saying_it_twice_is_fine() {
+        // "Keep this" twice is a traveller repeating themselves, not an
+        // error worth a sentence.
+        let (store, _d) = setup();
+        AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 }
+            .call(AddSegmentArgs {
+                trip: "September".into(),
+                origin: "AMS".into(),
+                destination: "LIS".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let keep = KeepTripTool { store: store.clone(), account_id: 7 };
+        let view = keep.call(KeepTripArgs { trip: "September".into() }).await.unwrap();
+        assert!(view.trip.kept, "the trip the traveller asked to keep must be kept");
+
+        // Differently cased: trips are addressed by a lowercased name_key,
+        // so this also proves the case-insensitive path.
+        let view = keep.call(KeepTripArgs { trip: "SEPTEMBER".into() }).await.unwrap();
+        assert!(view.trip.kept, "keeping an already-kept trip is still Ok, not an error");
+    }
+
+    #[tokio::test]
+    async fn keeping_a_trip_that_is_not_there_names_the_ones_that_are() {
+        // A mistyped name is indistinguishable from one never created, so
+        // both get the real names to correct against — the same treatment
+        // `delete_trip` gives.
+        let (store, _d) = setup();
+        AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                position: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+
+        let keep = KeepTripTool { store, account_id: 7 };
+        let err = keep.call(KeepTripArgs { trip: "Japen".into() }).await.unwrap_err();
+        assert!(err.to_string().contains("Japan"), "got: {err}");
     }
 
     // finalise_trip: a re-pricing pass, never a checkout. Every segment is

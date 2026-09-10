@@ -10,7 +10,7 @@ use crate::agent::{fare_market, rules_for_available_tools, AgentDeps};
 use crate::specialist::{Finding, Specialist, SPECIALIST_BUDGET};
 use crate::tools::trips::{
     AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
-    DropTripSegmentTool, FinaliseTripTool, ShowTripTool, UpdateTripSegmentTool,
+    DropTripSegmentTool, FinaliseTripTool, KeepTripTool, ShowTripTool, UpdateTripSegmentTool,
 };
 use rig::client::CompletionClient;
 
@@ -33,6 +33,7 @@ const TRIP_TOOLS: &[&str] = &[
     "drop_trip_segment",
     "delete_trip",
     "finalise_trip",
+    "keep_trip",
 ];
 
 pub const FLIGHT_PREAMBLE: &str = "\
@@ -156,7 +157,8 @@ pub fn build_flight_agent(
         .tool(ShowTripTool { store: d.store.clone(), account_id })
         .tool(UpdateTripSegmentTool { store: d.store.clone(), account_id })
         .tool(DropTripSegmentTool { store: d.store.clone(), account_id })
-        .tool(DeleteTripTool { store: d.store.clone(), account_id });
+        .tool(DeleteTripTool { store: d.store.clone(), account_id })
+        .tool(KeepTripTool { store: d.store.clone(), account_id });
     // Where an Ignav row can actually be bought.
     if let Some(ignav) = &d.ignav {
         builder = builder.tool(crate::tools::ignav::BookingLinksTool {
@@ -538,5 +540,29 @@ mod tests {
             call.contains(", conversation_id }") || call.contains(", conversation_id,"),
             "add_trip_segment must carry the run's own conversation id, not a stand-in value: {call}"
         );
+    }
+
+    #[test]
+    fn keep_trip_is_registered_on_the_flight_specialist() {
+        // A tool that exists in trips.rs but is never registered here is
+        // dead: the specialist only ever sees what build_flight_agent
+        // wires with `.tool(...)`. Scoped to that function's own body,
+        // ending before the next `pub fn` — not just from its start
+        // onward — because an unbounded search would also match this very
+        // assertion's string literal, further down this same file, and
+        // stay green even after the real `.tool(KeepTripTool {` call above
+        // is deleted.
+        let src = include_str!("flights.rs");
+        let start = src.find("pub fn build_flight_agent").expect("build_flight_agent must exist");
+        let end = start
+            + src[start..].find("\npub fn ask_flights").expect("ask_flights must follow it");
+        let body = &src[start..end];
+        assert!(
+            body.contains(".tool(KeepTripTool {"),
+            "keep_trip must be registered in build_flight_agent"
+        );
+        // Also counted as trip work, so a keep brings the same
+        // presentation guidance any other trip edit does.
+        assert!(TRIP_TOOLS.contains(&"keep_trip"), "keep_trip must be in TRIP_TOOLS for guidance");
     }
 }

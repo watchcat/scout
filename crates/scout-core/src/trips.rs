@@ -5,7 +5,8 @@
 //! handle live offers: those remain flight-agent responsibilities.
 
 use crate::core::{blocking, Core};
-use crate::store::{CandidateChoice, ExpectedSegment, NewCandidate, Trip, TripChat};
+use crate::store::{CandidateChoice, ExpectedSegment, NewCandidate, TripChat};
+pub use crate::store::{Trip, TripCandidate, TripSegment};
 
 /// A trip plus the same readiness and connection warnings the flight agent
 /// sees. One representation keeps chat and the visual client from disagreeing
@@ -63,6 +64,25 @@ pub async fn list(core: &Core, account_id: i64) -> anyhow::Result<Vec<Plan>> {
                 Ok(Plan::from_trip(trip, chat))
             })
             .collect()
+    })
+    .await
+}
+
+/// One durable trip by the name the traveller gave it, scoped to their
+/// account. The store performs the same case-insensitive lookup as chat.
+pub async fn find(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Option<Plan>> {
+    let store = core.store();
+    let name = name.to_string();
+    blocking(move || {
+        store
+            .find_trip(account_id, &name)
+            .and_then(|trip| match trip {
+                Some(trip) => {
+                    let chat = store.trip_chat(trip.id)?;
+                    Ok(Some(Plan::from_trip(trip, chat)))
+                }
+                None => Ok(None),
+            })
     })
     .await
 }
@@ -185,7 +205,10 @@ pub async fn remove_leg(
         Ok(ends) => ends,
         Err(e) => return Ok(LegEdit::Invalid(e.0)),
     };
-    let date = match departure_date.map(crate::tools::trips::calendar_date).transpose() {
+    let date = match departure_date
+        .map(crate::tools::trips::calendar_date)
+        .transpose()
+    {
         Ok(date) => date,
         Err(e) => return Ok(LegEdit::Invalid(e.0)),
     };
@@ -334,25 +357,49 @@ mod tests {
         // trip called "Atlantic loop". Scoping is what stops one traveller
         // deleting a leg from the other's plan.
         let (core, _dir, owner) = core().await;
-        seed_trip_for_tests(&core, owner, "Atlantic loop").await.unwrap();
+        seed_trip_for_tests(&core, owner, "Atlantic loop")
+            .await
+            .unwrap();
         let stranger = core.store().account_for_telegram(22).unwrap();
         // The stranger has a trip of the same name, so the lookup has
         // something to find if it ever stops scoping by account.
-        seed_trip_for_tests(&core, stranger, "Atlantic loop").await.unwrap();
-
-        let added = add_leg(&core, stranger, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
+        seed_trip_for_tests(&core, stranger, "Atlantic loop")
             .await
             .unwrap();
+
+        let added = add_leg(
+            &core,
+            stranger,
+            "Atlantic loop",
+            None,
+            "LIS",
+            "FCO",
+            "2026-10-14",
+        )
+        .await
+        .unwrap();
         assert!(matches!(added, LegEdit::Done(_)), "got: {added:?}");
-        let removed =
-            remove_leg(&core, stranger, "Atlantic loop", 1, "AMS", "LIS", Some("2026-10-12"))
-                .await
-                .unwrap();
+        let removed = remove_leg(
+            &core,
+            stranger,
+            "Atlantic loop",
+            1,
+            "AMS",
+            "LIS",
+            Some("2026-10-12"),
+        )
+        .await
+        .unwrap();
         assert!(matches!(removed, LegEdit::Done(_)), "got: {removed:?}");
 
         let theirs = list(&core, stranger).await.unwrap();
         assert_eq!(
-            theirs[0].trip.segments.iter().map(|s| s.destination.as_str()).collect::<Vec<_>>(),
+            theirs[0]
+                .trip
+                .segments
+                .iter()
+                .map(|s| s.destination.as_str())
+                .collect::<Vec<_>>(),
             vec!["FCO"],
             "the stranger's own trip is the one both edits landed on",
         );
@@ -360,7 +407,12 @@ mod tests {
         let owned = list(&core, owner).await.unwrap();
         assert_eq!(owned.len(), 1);
         assert_eq!(
-            owned[0].trip.segments.iter().map(|s| s.destination.as_str()).collect::<Vec<_>>(),
+            owned[0]
+                .trip
+                .segments
+                .iter()
+                .map(|s| s.destination.as_str())
+                .collect::<Vec<_>>(),
             vec!["LIS"],
             "neither edit reached the other account's trip",
         );
@@ -369,25 +421,50 @@ mod tests {
     #[tokio::test]
     async fn a_leg_edit_on_a_trip_this_account_does_not_have_finds_no_trip() {
         let (core, _dir, owner) = core().await;
-        seed_trip_for_tests(&core, owner, "Atlantic loop").await.unwrap();
+        seed_trip_for_tests(&core, owner, "Atlantic loop")
+            .await
+            .unwrap();
         let stranger = core.store().account_for_telegram(22).unwrap();
 
         assert_eq!(
-            add_leg(&core, stranger, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
-                .await
-                .unwrap(),
+            add_leg(
+                &core,
+                stranger,
+                "Atlantic loop",
+                None,
+                "LIS",
+                "FCO",
+                "2026-10-14"
+            )
+            .await
+            .unwrap(),
             LegEdit::TripNotFound,
         );
         assert_eq!(
-            remove_leg(&core, stranger, "Atlantic loop", 1, "AMS", "LIS", Some("2026-10-12"))
-                .await
-                .unwrap(),
+            remove_leg(
+                &core,
+                stranger,
+                "Atlantic loop",
+                1,
+                "AMS",
+                "LIS",
+                Some("2026-10-12")
+            )
+            .await
+            .unwrap(),
             LegEdit::TripNotFound,
         );
 
         let owned = list(&core, owner).await.unwrap();
-        assert_eq!(owned[0].trip.segments.len(), 1, "the owner's plan is untouched");
-        assert!(!owned[0].trip.segments[0].candidates.is_empty(), "and so are its options");
+        assert_eq!(
+            owned[0].trip.segments.len(),
+            1,
+            "the owner's plan is untouched"
+        );
+        assert!(
+            !owned[0].trip.segments[0].candidates.is_empty(),
+            "and so are its options"
+        );
     }
 
     #[tokio::test]
@@ -396,21 +473,46 @@ mod tests {
         let store = core.store();
         let conversation_id = store.start_conversation(account_id, "direct").unwrap();
         store
-            .upsert_trip(account_id, "Atlantic loop", Some(2), Some("economy"), Some(conversation_id))
+            .upsert_trip(
+                account_id,
+                "Atlantic loop",
+                Some(2),
+                Some("economy"),
+                Some(conversation_id),
+            )
             .unwrap();
-        add_leg(&core, account_id, "Atlantic loop", None, "AMS", "LIS", "2026-10-12")
-            .await
-            .unwrap();
+        add_leg(
+            &core,
+            account_id,
+            "Atlantic loop",
+            None,
+            "AMS",
+            "LIS",
+            "2026-10-12",
+        )
+        .await
+        .unwrap();
 
-        let LegEdit::Done(added) =
-            add_leg(&core, account_id, "atlantic loop", None, "lis", "fco", "2026-10-14")
-                .await
-                .unwrap()
-        else {
+        let LegEdit::Done(added) = add_leg(
+            &core,
+            account_id,
+            "atlantic loop",
+            None,
+            "lis",
+            "fco",
+            "2026-10-14",
+        )
+        .await
+        .unwrap() else {
             panic!("a valid leg was not added");
         };
         assert_eq!(
-            added.trip.segments.iter().map(|s| (s.position, s.origin.as_str())).collect::<Vec<_>>(),
+            added
+                .trip
+                .segments
+                .iter()
+                .map(|s| (s.position, s.origin.as_str()))
+                .collect::<Vec<_>>(),
             vec![(1, "AMS"), (2, "LIS")],
             "codes are upper-cased and the trip is found by a lower-cased name",
         );
@@ -420,11 +522,17 @@ mod tests {
             "an edited plan still names the chat it belongs to",
         );
 
-        let LegEdit::Done(removed) =
-            remove_leg(&core, account_id, "Atlantic loop", 2, "LIS", "FCO", Some("2026-10-14"))
-                .await
-                .unwrap()
-        else {
+        let LegEdit::Done(removed) = remove_leg(
+            &core,
+            account_id,
+            "Atlantic loop",
+            2,
+            "LIS",
+            "FCO",
+            Some("2026-10-14"),
+        )
+        .await
+        .unwrap() else {
             panic!("a leg that matched what the caller saw was not removed");
         };
         assert_eq!(removed.trip.segments.len(), 1);
@@ -439,34 +547,77 @@ mod tests {
         core.store()
             .upsert_trip(account_id, "Atlantic loop", None, None, None)
             .unwrap();
-        add_leg(&core, account_id, "Atlantic loop", None, "AMS", "LIS", "2026-10-12")
-            .await
-            .unwrap();
-        add_leg(&core, account_id, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
-            .await
-            .unwrap();
-        remove_leg(&core, account_id, "Atlantic loop", 1, "AMS", "LIS", Some("2026-10-12"))
-            .await
-            .unwrap();
+        add_leg(
+            &core,
+            account_id,
+            "Atlantic loop",
+            None,
+            "AMS",
+            "LIS",
+            "2026-10-12",
+        )
+        .await
+        .unwrap();
+        add_leg(
+            &core,
+            account_id,
+            "Atlantic loop",
+            None,
+            "LIS",
+            "FCO",
+            "2026-10-14",
+        )
+        .await
+        .unwrap();
+        remove_leg(
+            &core,
+            account_id,
+            "Atlantic loop",
+            1,
+            "AMS",
+            "LIS",
+            Some("2026-10-12"),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
-            remove_leg(&core, account_id, "Atlantic loop", 2, "LIS", "FCO", Some("2026-10-14"))
-                .await
-                .unwrap(),
+            remove_leg(
+                &core,
+                account_id,
+                "Atlantic loop",
+                2,
+                "LIS",
+                "FCO",
+                Some("2026-10-14")
+            )
+            .await
+            .unwrap(),
             LegEdit::SegmentChanged,
             "a position that no longer exists is a stale tab, not an error",
         );
         assert_eq!(
-            remove_leg(&core, account_id, "Atlantic loop", 1, "AMS", "LIS", Some("2026-10-12"))
-                .await
-                .unwrap(),
+            remove_leg(
+                &core,
+                account_id,
+                "Atlantic loop",
+                1,
+                "AMS",
+                "LIS",
+                Some("2026-10-12")
+            )
+            .await
+            .unwrap(),
             LegEdit::SegmentChanged,
             "and neither is a position the renumber refilled with something else",
         );
 
         let plans = list(&core, account_id).await.unwrap();
         assert_eq!(plans[0].trip.segments.len(), 1);
-        assert_eq!(plans[0].trip.segments[0].destination, "FCO", "the surviving leg is untouched");
+        assert_eq!(
+            plans[0].trip.segments[0].destination, "FCO",
+            "the surviving leg is untouched"
+        );
     }
 
     #[tokio::test]
@@ -478,32 +629,69 @@ mod tests {
         core.store()
             .upsert_trip(account_id, "Atlantic loop", None, None, None)
             .unwrap();
-        add_leg(&core, account_id, "Atlantic loop", None, "AMS", "LIS", "2026-10-12")
-            .await
-            .unwrap();
-        add_leg(&core, account_id, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
-            .await
-            .unwrap();
+        add_leg(
+            &core,
+            account_id,
+            "Atlantic loop",
+            None,
+            "AMS",
+            "LIS",
+            "2026-10-12",
+        )
+        .await
+        .unwrap();
+        add_leg(
+            &core,
+            account_id,
+            "Atlantic loop",
+            None,
+            "LIS",
+            "FCO",
+            "2026-10-14",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
-            add_leg(&core, account_id, "Atlantic loop", Some(4), "BCN", "MAD", "2026-10-13")
-                .await
-                .unwrap(),
+            add_leg(
+                &core,
+                account_id,
+                "Atlantic loop",
+                Some(4),
+                "BCN",
+                "MAD",
+                "2026-10-13"
+            )
+            .await
+            .unwrap(),
             LegEdit::SegmentChanged,
         );
 
         let plans = list(&core, account_id).await.unwrap();
         assert_eq!(
-            plans[0].trip.segments.iter().map(|s| s.origin.as_str()).collect::<Vec<_>>(),
+            plans[0]
+                .trip
+                .segments
+                .iter()
+                .map(|s| s.origin.as_str())
+                .collect::<Vec<_>>(),
             vec!["AMS", "LIS"],
             "the trip is exactly as it was",
         );
         // The last place a leg can go is still open: the refusal is about
         // position 4 on this trip, not about inserting at all.
         assert!(matches!(
-            add_leg(&core, account_id, "Atlantic loop", Some(3), "FCO", "AMS", "2026-10-18")
-                .await
-                .unwrap(),
+            add_leg(
+                &core,
+                account_id,
+                "Atlantic loop",
+                Some(3),
+                "FCO",
+                "AMS",
+                "2026-10-18"
+            )
+            .await
+            .unwrap(),
             LegEdit::Done(_),
         ));
     }
@@ -513,16 +701,32 @@ mod tests {
         // Overwriting would lose a leg the traveller never asked to lose,
         // and lose it on the path with no confirmation step.
         let (core, _dir, account_id) = core().await;
-        seed_trip_for_tests(&core, account_id, "Atlantic loop").await.unwrap();
-        add_leg(&core, account_id, "Atlantic loop", None, "LIS", "FCO", "2026-10-14")
+        seed_trip_for_tests(&core, account_id, "Atlantic loop")
             .await
             .unwrap();
+        add_leg(
+            &core,
+            account_id,
+            "Atlantic loop",
+            None,
+            "LIS",
+            "FCO",
+            "2026-10-14",
+        )
+        .await
+        .unwrap();
 
-        let LegEdit::Done(plan) =
-            add_leg(&core, account_id, "Atlantic loop", Some(1), "BCN", "MAD", "2026-10-10")
-                .await
-                .unwrap()
-        else {
+        let LegEdit::Done(plan) = add_leg(
+            &core,
+            account_id,
+            "Atlantic loop",
+            Some(1),
+            "BCN",
+            "MAD",
+            "2026-10-10",
+        )
+        .await
+        .unwrap() else {
             panic!("a valid insert was refused");
         };
         assert_eq!(
@@ -548,30 +752,67 @@ mod tests {
             .unwrap();
 
         let refusals = [
-            add_leg(&core, account_id, "Atlantic loop", None, "Amsterdam", "FCO", "2026-10-14")
-                .await
-                .unwrap(),
-            add_leg(&core, account_id, "Atlantic loop", None, "LIS", "LIS", "2026-10-14")
-                .await
-                .unwrap(),
-            add_leg(&core, account_id, "Atlantic loop", None, "LIS", "FCO", "14/10/2026")
-                .await
-                .unwrap(),
-            remove_leg(&core, account_id, "Atlantic loop", 1, "Amsterdam", "FCO", None)
-                .await
-                .unwrap(),
+            add_leg(
+                &core,
+                account_id,
+                "Atlantic loop",
+                None,
+                "Amsterdam",
+                "FCO",
+                "2026-10-14",
+            )
+            .await
+            .unwrap(),
+            add_leg(
+                &core,
+                account_id,
+                "Atlantic loop",
+                None,
+                "LIS",
+                "LIS",
+                "2026-10-14",
+            )
+            .await
+            .unwrap(),
+            add_leg(
+                &core,
+                account_id,
+                "Atlantic loop",
+                None,
+                "LIS",
+                "FCO",
+                "14/10/2026",
+            )
+            .await
+            .unwrap(),
+            remove_leg(
+                &core,
+                account_id,
+                "Atlantic loop",
+                1,
+                "Amsterdam",
+                "FCO",
+                None,
+            )
+            .await
+            .unwrap(),
         ];
         for refusal in &refusals {
             assert!(matches!(refusal, LegEdit::Invalid(_)), "got: {refusal:?}");
         }
-        let LegEdit::Invalid(same_place) = &refusals[1] else { unreachable!() };
+        let LegEdit::Invalid(same_place) = &refusals[1] else {
+            unreachable!()
+        };
         assert!(
             same_place.contains("a flight needs two different places"),
             "the client refuses in the same words the model's tools do, got: {same_place}",
         );
 
         let plans = list(&core, account_id).await.unwrap();
-        assert!(plans[0].trip.segments.is_empty(), "nothing reached the store");
+        assert!(
+            plans[0].trip.segments.is_empty(),
+            "nothing reached the store"
+        );
     }
 
     #[tokio::test]
@@ -585,7 +826,13 @@ mod tests {
             .set_thread_title(account_id, conversation_id, "Cheap flights in October")
             .unwrap();
         store
-            .upsert_trip(account_id, "October", Some(2), Some("economy"), Some(conversation_id))
+            .upsert_trip(
+                account_id,
+                "October",
+                Some(2),
+                Some("economy"),
+                Some(conversation_id),
+            )
             .unwrap();
 
         let plans = list(&core, account_id).await.unwrap();
@@ -604,7 +851,9 @@ mod tests {
         // `conversation_id` pointing nowhere — must both read as `None`, not
         // an error and not a struct with some fields missing.
         let (core, _dir, account_id) = core().await;
-        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+        seed_trip_for_tests(&core, account_id, "October")
+            .await
+            .unwrap();
 
         let plans = list(&core, account_id).await.unwrap();
         assert_eq!(plans[0].chat, None);
@@ -619,9 +868,17 @@ mod tests {
             .set_thread_title(account_id, conversation_id, "Cheap flights in October")
             .unwrap();
         store
-            .upsert_trip(account_id, "October", Some(2), Some("economy"), Some(conversation_id))
+            .upsert_trip(
+                account_id,
+                "October",
+                Some(2),
+                Some("economy"),
+                Some(conversation_id),
+            )
             .unwrap();
-        seed_trip_for_tests(&core, account_id, "Orphaned").await.unwrap();
+        seed_trip_for_tests(&core, account_id, "Orphaned")
+            .await
+            .unwrap();
 
         let plans = list(&core, account_id).await.unwrap();
         let owned = plans.iter().find(|p| p.trip.name == "October").unwrap();

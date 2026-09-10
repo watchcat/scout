@@ -40,7 +40,9 @@ The web client turns that durable plan into an airport timeline. It shows every
 segment and layover, keeps flight numbers and saved-fare provenance attached to
 each option, and recalculates the next connection as soon as you choose another
 flight. Tight connections, impossible joins, and airport changes are called out
-before you continue.
+before you continue. Download the current plan as a print-ready PDF with every
+segment, saved alternative, selected flight, local time, connection check, and
+fare caveat in one hand-off document.
 
 <p align="center">
   <img src="crates/scout-web/src/assets/trips-desktop.webp" alt="Scout trip planner on desktop, with an airport timeline, flight choices, saved fares and a tight connection warning" width="900">

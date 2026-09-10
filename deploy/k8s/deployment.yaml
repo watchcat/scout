@@ -59,10 +59,9 @@ spec:
             # no benefit on a box running one workload.
             limits: { memory: 3Gi }
           securityContext:
-            # Nothing here needs privileges: the image already runs as `scout`,
-            # and Chromium is invoked with --no-sandbox, which is why it works
-            # unprivileged today. Adding SYS_ADMIN to "fix" a browser problem
-            # would be undoing that.
+            # Nothing here needs application privileges: the image runs as
+            # `scout`, while Chromium uses its packaged user-namespace sandbox.
+            # Adding SYS_ADMIN to "fix" a browser problem would be undoing that.
             allowPrivilegeEscalation: false
             capabilities: { drop: [ALL] }
           volumeMounts:

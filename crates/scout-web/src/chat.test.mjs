@@ -5,6 +5,7 @@ import {
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
+  tripPdfFilename,
   composerTarget, removeLegBody,
 } from './chat.js'
 
@@ -301,6 +302,12 @@ test('a stale trip read cannot repaint a newer choice', () => {
 test('Ignav saved fares stay visibly approximate', () => {
   assert.deepEqual(savedFareQualifier('ignav'), { prefix: 'from ', note: 'estimate when saved' })
   assert.deepEqual(savedFareQualifier('duffel'), { prefix: '', note: 'when saved' })
+})
+
+test('a trip PDF filename is bounded and safe for local download', () => {
+  assert.equal(tripPdfFilename('Tokyo / spring & friends'), 'tokyo-spring-friends-itinerary.pdf')
+  assert.equal(tripPdfFilename('東京'), 'trip-itinerary.pdf')
+  assert.ok(tripPdfFilename('a'.repeat(200)).length < 80)
 })
 
 test('the composer says which thread a trip message lands in', () => {

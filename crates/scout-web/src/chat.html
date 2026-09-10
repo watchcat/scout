@@ -78,6 +78,7 @@
   .turns,.status,.side,.ask textarea{scrollbar-width:thin;
     scrollbar-color:#0d4a5a transparent}
   .notice{font-size:13.5px; color:var(--red); margin:0 0 10px; flex:none}
+  .compose-target{font-size:12.5px; color:var(--base01); margin:0 0 6px; flex:none}
   .ask{flex:none; display:flex; align-items:flex-end; gap:8px;
     margin:0 0 20px; padding:8px 8px 8px 16px;
     background:var(--base02); border:1px solid #0d4a5a; border-radius:16px;
@@ -305,6 +306,27 @@
   .trip-alert.ready{border-color:#3f682f; background:rgba(133,153,0,.08); color:#b8c76a}
   .trip-alert strong{color:var(--base2); margin-right:.28em}
   .segment-stack{display:flex; flex-direction:column; gap:12px}
+  /* Dashed, like `.trip-empty`: this card is an invitation to add to the
+     itinerary, not part of it yet. Sits after the stack rather than inside
+     it — appending is the only insert this form offers, so it belongs where
+     an appended leg would actually land. */
+  .leg-add{margin-top:12px; padding:14px 16px; border:1px dashed var(--line); border-radius:16px;
+    background:rgba(7,54,66,.4)}
+  .leg-add-title{margin:0 0 10px; color:var(--base01); font-size:11px; font-weight:800;
+    letter-spacing:.1em; text-transform:uppercase}
+  .leg-add-row{display:flex; flex-wrap:wrap; align-items:flex-end; gap:10px}
+  .leg-add-row label{display:flex; flex-direction:column; gap:4px; flex:1; min-width:100px;
+    color:var(--base01); font-size:12px}
+  .leg-add-row input{font:inherit; font-size:14px; padding:8px 10px; border:1px solid var(--line);
+    border-radius:9px; background:var(--base03); color:var(--base2)}
+  /* The wire format is uppercase IATA; showing it uppercase as it is typed
+     means what gets submitted is what the reader already saw. */
+  .leg-add-row input.leg-add-code{text-transform:uppercase}
+  .leg-add-row input:focus{outline:2px solid var(--blue); outline-offset:-1px}
+  .leg-add-row button{flex:none; background:var(--blue); color:var(--base03); border:0;
+    border-radius:9px; font:inherit; font-size:13px; font-weight:700; padding:9px 16px; cursor:pointer}
+  .leg-add-row button:hover{background:#3196d8}
+  .leg-add-row button:disabled{opacity:.6; cursor:default}
   .segment-card{border:1px solid var(--line); border-radius:16px; background:rgba(7,54,66,.62);
     overflow:hidden}
   .segment-head{display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
@@ -314,6 +336,24 @@
   .segment-route{margin:0; color:var(--base2); font-size:22px; line-height:1.15}
   .route-arrow{padding:0 7px; color:var(--cyan); font-weight:400}
   .segment-date{flex:none; margin-top:2px; color:var(--base1); font-size:13px}
+  .segment-head-actions{flex:none; display:flex; align-items:center; gap:10px}
+  .segment-remove-button{background:transparent; border:1px solid var(--line); border-radius:8px;
+    color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
+  .segment-remove-button:hover{color:#ff817a; border-color:var(--red)}
+  .segment-remove-button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  /* The second click of the confirm-in-place flow described where
+     `removeConfirmRow` is built: `window.confirm` blocks the whole page for
+     one card's worth of destructive action, so the ask lives here instead,
+     inline where the button it replaced was. */
+  .segment-remove-confirm{display:flex; align-items:center; gap:6px; color:#d1c27e; font-size:12px}
+  .segment-remove-confirm button{background:transparent; border:1px solid var(--line); border-radius:8px;
+    color:var(--base1); font:inherit; font-size:12px; font-weight:650; padding:5px 9px; cursor:pointer}
+  .segment-remove-confirm button:hover{color:var(--base2)}
+  /* `#ff817a`, not `--red`: the same lighter shade `.join-card.danger` and
+     `.threads .when.expiring` already use, because `--red` on this
+     background is 2.8:1 and fails at this text size. */
+  .segment-remove-confirm button.danger{border-color:var(--red); color:#ff817a}
+  .segment-remove-confirm button:disabled{opacity:.6; cursor:default}
   .option-list{display:flex; flex-direction:column}
   .flight-option{position:relative; display:grid; grid-template-columns:28px minmax(0,1fr) auto;
     gap:12px; align-items:start; padding:15px 16px; cursor:pointer; border-bottom:1px solid rgba(13,74,90,.55)}
@@ -442,18 +482,6 @@
   </aside>
   <main class="main">
     <ol id="turns" class="turns"></ol>
-    <p id="status" class="status" hidden></p>
-    <p id="notice" class="notice" hidden></p>
-    <form id="ask" class="ask">
-      <textarea id="text" name="text" rows="1"
-                placeholder="Ask Scout something" required></textarea>
-      <button id="send" type="submit" aria-label="Send">
-        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-          <path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor"
-                stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-      </button>
-    </form>
   </main>
 </div>
 <section id="trips-view" class="trips-view" aria-labelledby="view-trips" hidden>
@@ -479,6 +507,22 @@
     </div>
   </main>
 </section>
+<!-- Shared by both tabs, pinned below whichever is showing: a trip picked
+     on the Trips tab is answered in the same box that asks a question in
+     Chat, not a second composer duplicated per view. -->
+<p id="status" class="status" hidden></p>
+<p id="notice" class="notice" hidden></p>
+<p id="compose-target" class="compose-target" hidden></p>
+<form id="ask" class="ask">
+  <textarea id="text" name="text" rows="1"
+            placeholder="Ask Scout something" required></textarea>
+  <button id="send" type="submit" aria-label="Send">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+      <path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor"
+            stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </button>
+</form>
 </div>
 <script type="module" src="/chat.js"></script>
 </body>

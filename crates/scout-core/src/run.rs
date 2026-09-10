@@ -483,10 +483,12 @@ const WRAP_UP_CONTEXT: usize = 6000;
 /// waits forever.
 const STREAM_STALL: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// How often the outer loop looks up from a silent stream to ask the
-/// pulse whether the run is alive. Short, so a real stall is still caught
-/// within `STREAM_STALL` plus one check.
-const STALL_CHECK: std::time::Duration = std::time::Duration::from_secs(15);
+/// How often a loop looks up from a silent stream to ask whether the run is
+/// alive. Short, so a real stall is still caught within its stall window
+/// plus one check. Shared with the specialist's own guard: the cadence is
+/// the same question asked of a different stream, and two numbers for it
+/// would only drift apart.
+pub(crate) const STALL_CHECK: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The last moment anything in this run was seen doing something.
 ///

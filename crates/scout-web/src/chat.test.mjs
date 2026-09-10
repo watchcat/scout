@@ -6,6 +6,7 @@ import {
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
   tripPdfFilename,
+  composerTarget, removeLegBody,
 } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
@@ -307,4 +308,61 @@ test('a trip PDF filename is bounded and safe for local download', () => {
   assert.equal(tripPdfFilename('Tokyo / spring & friends'), 'tokyo-spring-friends-itinerary.pdf')
   assert.equal(tripPdfFilename('東京'), 'trip-itinerary.pdf')
   assert.ok(tripPdfFilename('a'.repeat(200)).length < 80)
+})
+
+test('the composer says which thread a trip message lands in', () => {
+  // Three cases, because a trip's owner is not always somewhere the web
+  // can post: an owned direct thread, an orphan, and a Telegram group.
+  assert.deepEqual(composerTarget({ chat: { id: 7, title: 'Cheap flights in October', scope: 'direct' } }),
+    { thread: 7, label: 'to "Cheap flights in October"' })
+
+  assert.deepEqual(composerTarget({ chat: { id: 7, title: null, scope: 'direct' } }),
+    { thread: 7, label: 'to an unnamed thread' })
+
+  // Orphaned: sending starts a thread, which then adopts the trip.
+  assert.deepEqual(composerTarget({ chat: null }),
+    { thread: null, label: 'to a new chat' })
+
+  // A group is a room with other people in it. Offer a new direct thread
+  // instead, and do not take the group's ownership away from it.
+  assert.deepEqual(composerTarget({ chat: { id: 9, title: 'Trip crew', scope: 'telegram:-100' } }),
+    { thread: null, label: 'planned in a Telegram group — replies go to a new chat' })
+
+  // No trip is on screen at all — the empty state, or a selection that
+  // hasn't resolved yet. There is nothing to name, so the line says
+  // nothing (the caller hides it), and a send still gets a thread of its
+  // own rather than reusing whatever thread the page last had open in
+  // Chat, which has nothing to do with whatever gets typed here.
+  assert.deepEqual(composerTarget(undefined), { thread: null, label: '' })
+})
+
+test('a remove sends what the reader actually saw', () => {
+  // Positions renumber server-side, so the request carries the leg's
+  // identity and not just its index. Without this the server cannot tell a
+  // stale click from a current one.
+  const segment = { position: 2, origin: 'LIS', destination: 'FCO', departure_date: '2026-10-14' }
+  assert.deepEqual(JSON.parse(removeLegBody('Atlantic loop', segment)), {
+    trip: 'Atlantic loop',
+    position: 2,
+    origin: 'LIS',
+    destination: 'FCO',
+    departure_date: '2026-10-14',
+  })
+})
+
+test('a remove with no date on file sends null, not an omitted key', () => {
+  // `RemoveLegIn.departure_date` is `Option<String>` on the Rust side, where
+  // `null` reads as "nothing to verify" — the same thing a missing key would
+  // mean there. Sending `null` explicitly rather than dropping the key keeps
+  // the wire shape stable regardless of which of those the server actually
+  // requires, and matches the route test that already asserts this exact
+  // body for a stale remove.
+  const segment = { position: 1, origin: 'AMS', destination: 'LIS', departure_date: null }
+  assert.deepEqual(JSON.parse(removeLegBody('October', segment)), {
+    trip: 'October',
+    position: 1,
+    origin: 'AMS',
+    destination: 'LIS',
+    departure_date: null,
+  })
 })

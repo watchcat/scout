@@ -582,6 +582,7 @@ mod tests {
             },
             not_ready: None,
             notes: vec!["Separate tickets need extra care.".to_string()],
+            chat: None,
         }
     }
 

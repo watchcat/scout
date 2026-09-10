@@ -99,6 +99,10 @@ CREATE TABLE IF NOT EXISTS trips (
     status      TEXT NOT NULL DEFAULT 'planning',
     created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
     updated_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    -- Last, so a fresh database and a migrated one — where this arrives by
+    -- ALTER TABLE in step 9 — have the same column order. NULL means the
+    -- chat that made this trip is gone; the next chat to touch it adopts it.
+    conversation_id BIGINT,
     UNIQUE (account_id, name_key)
 );
 -- Where and when. This is all that gets re-searched.
@@ -330,6 +334,17 @@ pub struct TripCandidate {
     pub quoted_price: Option<f64>,
     pub quoted_currency: Option<String>,
     pub source: Option<String>,
+}
+
+/// The conversation a trip belongs to, as much of it as a client needs to
+/// name the place a message will land.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TripChat {
+    pub id: i64,
+    pub title: Option<String>,
+    /// `direct` is the thread web and 1:1 Telegram share. Anything else is
+    /// a room the web client must not post into.
+    pub scope: String,
 }
 
 /// A candidate on its way into the database.
@@ -744,6 +759,18 @@ const STEP_8_PINNED_NOT_NULL: &str = r#"
 ALTER TABLE conversations ALTER COLUMN pinned SET NOT NULL;
 "#;
 
+/// The chat that made a trip. Nullable: expiry (a later change) detaches
+/// rather than cascades, so a trip outliving its chat — idle past
+/// `Core::THREAD_IDLE_SECS` — becomes orphaned, not deleted.
+///
+/// `IF NOT EXISTS` for the same reason STEP_7_THREADS uses it: a database
+/// created by `MIGRATIONS` after this column shipped, but recorded below 9,
+/// already has the column, and a bare `ADD COLUMN` would fail on it with
+/// "already exists".
+const STEP_9_TRIP_CONVERSATION: &str = r#"
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS conversation_id BIGINT;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -754,6 +781,7 @@ fn steps() -> Vec<(i64, Step)> {
         (6, Step::Sql(STEP_6_LOGIN_TOKENS)),
         (7, Step::Sql(STEP_7_THREADS)),
         (8, Step::Sql(STEP_8_PINNED_NOT_NULL)),
+        (9, Step::Sql(STEP_9_TRIP_CONVERSATION)),
     ]
 }
 
@@ -1446,6 +1474,26 @@ impl Store {
                 return Ok(false);
             }
             conn.execute("DELETE FROM messages WHERE conversation_id = ?", params![conversation_id])?;
+            // The trips this thread owns go with it. Inside this same
+            // transaction: a cascade that can half-happen would leave a trip
+            // pointing at a conversation that no longer exists.
+            //
+            // Only here. `expire_conversations` detaches instead — see
+            // `detach_trips_within`. That difference is the feature.
+            conn.execute(
+                "DELETE FROM segment_candidates WHERE trip_id IN
+                     (SELECT id FROM trips WHERE conversation_id = ?)",
+                params![conversation_id],
+            )?;
+            conn.execute(
+                "DELETE FROM trip_segments WHERE trip_id IN
+                     (SELECT id FROM trips WHERE conversation_id = ?)",
+                params![conversation_id],
+            )?;
+            conn.execute(
+                "DELETE FROM trips WHERE conversation_id = ?",
+                params![conversation_id],
+            )?;
             Ok(true)
         })();
         match result {
@@ -1499,6 +1547,15 @@ impl Store {
         let mut args = Vec::with_capacity(except.len() + 1);
         args.push(older_than_secs);
         args.extend_from_slice(except);
+        // Written once and pasted into all three statements, because they
+        // have to agree exactly. The SELECT below must name the rows the
+        // DELETE removes — no more, no less — or trips get released whose
+        // thread survives, or a thread dies leaving a trip pointed at an id
+        // that is gone. Two copies of a predicate drift; one cannot.
+        let doomed = format!(
+            "WHERE NOT pinned
+               AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?){not_running}"
+        );
 
         let conn = self.conn();
         conn.execute_batch("BEGIN")?;
@@ -1513,18 +1570,27 @@ impl Store {
             conn.execute(
                 &format!(
                     "DELETE FROM messages WHERE conversation_id IN (
-                         SELECT id FROM conversations
-                         WHERE NOT pinned
-                           AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?){not_running})"
+                         SELECT id FROM conversations {doomed})"
                 ),
                 duckdb::params_from_iter(args.iter()),
             )?;
+            // Which threads are about to go, read before the DELETE because
+            // afterwards there is nothing left to join against.
+            let mut stmt = conn.prepare(&format!("SELECT id FROM conversations {doomed}"))?;
+            let doomed_ids: Vec<i64> = stmt
+                .query_map(duckdb::params_from_iter(args.iter()), |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(stmt);
+            // Released, not deleted. `delete_conversation` cascades because
+            // somebody pressed Delete; this is a timer, and a timer must not
+            // destroy a plan the traveller is still building.
+            //
+            // `doomed_ids` is empty on every sweep that expires nothing,
+            // which is the normal hourly case — `detach_trips_within` guards
+            // that, since `IN ()` is a parser error rather than an empty set.
+            detach_trips_within(&conn, &doomed_ids)?;
             let gone = conn.execute(
-                &format!(
-                    "DELETE FROM conversations
-                     WHERE NOT pinned
-                       AND updated_at < CAST(current_timestamp AS TIMESTAMP) - to_seconds(?){not_running}"
-                ),
+                &format!("DELETE FROM conversations {doomed}"),
                 duckdb::params_from_iter(args.iter()),
             )?;
             conn.execute(
@@ -2421,15 +2487,18 @@ impl Store {
     }
 
     /// Creates the trip if the name is new, otherwise updates only what was
-    /// supplied. Two statements rather than one `ON CONFLICT DO UPDATE`: with
-    /// upsert, an unsupplied `adults` would arrive as the insert's default and
-    /// overwrite a value already set.
+    /// supplied. Separate statements rather than one `ON CONFLICT DO UPDATE`:
+    /// with upsert, an unsupplied `adults` would arrive as the insert's
+    /// default and overwrite a value already set. `conversation_id` fills the
+    /// owner only if there isn't one: the creating chat keeps a trip, an
+    /// orphan is adopted.
     pub fn upsert_trip(
         &self,
         account_id: i64,
         name: &str,
         adults: Option<i64>,
         cabin_class: Option<&str>,
+        conversation_id: Option<i64>,
     ) -> Result<Trip> {
         let name = name.trim();
         if name.is_empty() {
@@ -2442,6 +2511,19 @@ impl Store {
              ON CONFLICT (account_id, name_key) DO NOTHING",
             params![account_id, name, key],
         )?;
+        // Only ever fills a hole. `IS NULL` is what makes the creator keep
+        // the trip while an orphan gets adopted, in one statement and with
+        // no second code path. No `updated_at` bump here, unlike the
+        // updates below: adoption is bookkeeping, not an edit, and bumping
+        // it would reorder the traveller's trip list just because a
+        // different chat mentioned the trip.
+        if let Some(conversation_id) = conversation_id {
+            conn.execute(
+                "UPDATE trips SET conversation_id = ?
+                 WHERE account_id = ? AND name_key = ? AND conversation_id IS NULL",
+                params![conversation_id, account_id, key],
+            )?;
+        }
         // A freshly created trip already starts in `planning`, and a call
         // that supplies neither field is how find-or-create works — it must
         // stay inert. Only an edit to an *existing* trip's price-relevant
@@ -2474,6 +2556,41 @@ impl Store {
             |row| row.get(0),
         )?;
         load_trip(&conn, id)
+    }
+
+    /// Which conversation owns this trip, if any.
+    ///
+    /// Test-only, and gated so that stays true: production reads ownership
+    /// through `Plan`, which a later task has carry it. Ungated it is dead
+    /// code in a release build, and a build that always warns is a build
+    /// whose warnings nobody reads.
+    #[cfg(test)]
+    pub fn trip_owner(&self, trip_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn();
+        Ok(conn.query_row(
+            "SELECT conversation_id FROM trips WHERE id = ?",
+            params![trip_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The conversation that owns this trip, if it still exists. A `JOIN`,
+    /// not two reads: a trip whose `conversation_id` points at a row that is
+    /// gone must read as orphaned rather than as a chat with missing fields.
+    pub fn trip_chat(&self, trip_id: i64) -> Result<Option<TripChat>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.title, c.scope FROM trips t
+             JOIN conversations c ON c.id = t.conversation_id
+             WHERE t.id = ?",
+        )?;
+        let chat = stmt
+            .query_map(params![trip_id], |r| {
+                Ok(TripChat { id: r.get(0)?, title: r.get(1)?, scope: r.get(2)? })
+            })?
+            .next()
+            .transpose()?;
+        Ok(chat)
     }
 
     /// Used by finalisation to record that a trip has been priced.
@@ -2525,55 +2642,42 @@ impl Store {
         departure_date: &str,
     ) -> Result<Trip> {
         let conn = self.conn();
-        // Checked before anything is written: without this, a bad trip_id
-        // still passed the count query (as 0) and reached the INSERT below,
-        // leaving a segment row for a trip that does not exist — and no read
-        // path can ever find it again, because every read goes through a trip.
-        let known: i64 = conn.query_row(
-            "SELECT count(*) FROM trips WHERE id = ?",
-            params![trip_id],
-            |row| row.get(0),
-        )?;
-        if known == 0 {
-            anyhow::bail!("no such trip");
-        }
-        let count: i64 = conn.query_row(
-            "SELECT count(*) FROM trip_segments WHERE trip_id = ?",
-            params![trip_id],
-            |row| row.get(0),
-        )?;
-        let at = match position {
-            Some(p) if p >= 1 && p <= count => p,
-            Some(p) if p == count + 1 => p,
-            Some(p) => {
+        match add_segment_within(&conn, trip_id, position, origin, destination, departure_date)? {
+            Inserted::Added(trip) => Ok(trip),
+            Inserted::NoSuchPlace { count, wanted } => {
                 let noun = if count == 1 { "segment" } else { "segments" };
                 anyhow::bail!(
-                    "this trip has {count} {noun}, so position {p} is not somewhere to put one"
+                    "this trip has {count} {noun}, so position {wanted} is not somewhere to put one"
                 )
             }
-            None => count + 1,
-        };
-        if at <= count {
-            // Descending is not needed: DuckDB applies this set-wise, so no
-            // intermediate state can collide with the primary key.
-            conn.execute(
-                "UPDATE trip_segments SET position = position + 1
-                 WHERE trip_id = ? AND position >= ?",
-                params![trip_id, at],
-            )?;
-            conn.execute(
-                "UPDATE segment_candidates SET position = position + 1
-                 WHERE trip_id = ? AND position >= ?",
-                params![trip_id, at],
-            )?;
         }
-        conn.execute(
-            "INSERT INTO trip_segments (trip_id, position, origin, destination, departure_date)
-             VALUES (?, ?, ?, ?, ?)",
-            params![trip_id, at, origin, destination, departure_date],
-        )?;
-        touch(&conn, trip_id)?;
-        load_trip(&conn, trip_id)
+    }
+
+    /// `add_segment`, but a position this trip has nowhere to put reads as
+    /// `None` rather than an error.
+    ///
+    /// For a caller drawing from a copy of the trip that may be older than
+    /// the trip — a browser tab — "insert at 4" on a trip now two legs long
+    /// is the same failure as a stale remove: its picture is out of date, and
+    /// the answer is to re-read, not to apologise. It needs to tell that
+    /// apart from a real fault, and matching on the text of an error message
+    /// would break silently the first time somebody rewords it.
+    pub fn add_segment_checked(
+        &self,
+        trip_id: i64,
+        position: Option<i64>,
+        origin: &str,
+        destination: &str,
+        departure_date: &str,
+    ) -> Result<Option<Trip>> {
+        let conn = self.conn();
+        Ok(
+            match add_segment_within(&conn, trip_id, position, origin, destination, departure_date)?
+            {
+                Inserted::Added(trip) => Some(trip),
+                Inserted::NoSuchPlace { .. } => None,
+            },
+        )
     }
 
     /// Changes where or when one segment goes, leaving the rest alone.
@@ -2636,30 +2740,59 @@ impl Store {
 
     pub fn drop_segment(&self, trip_id: i64, position: i64) -> Result<Trip> {
         let conn = self.conn();
-        let removed = conn.execute(
-            "DELETE FROM trip_segments WHERE trip_id = ? AND position = ?",
-            params![trip_id, position],
+        drop_segment_within(&conn, trip_id, position)
+    }
+
+    /// Removes a segment only if it is still the one the caller read.
+    ///
+    /// Returns whether it removed anything: a position that is gone and a
+    /// position now holding a different leg are both `false`, because both
+    /// mean the caller's picture of the trip is stale, and neither is an
+    /// error worth a log line — they are what a second browser tab looks
+    /// like from here.
+    ///
+    /// **The single `self.conn()` is the guard, not the comparison.**
+    /// `drop_segment` renumbers, so between a check and a write under two
+    /// separate acquisitions a concurrent edit can slide a different leg
+    /// into `position` and this method would delete it. That is why the
+    /// check below and `drop_segment_within` share this one `conn`, and why
+    /// `drop_segment` is not called here: calling it would release the lock
+    /// and re-take it. No test in this file can catch that regression —
+    /// they are single-threaded, and every one of them still passes with
+    /// the lock released in between. The structure is the whole protection;
+    /// do not "simplify" it back into a call to `drop_segment`.
+    pub fn remove_segment_checked(
+        &self,
+        trip_id: i64,
+        position: i64,
+        expected: ExpectedSegment<'_>,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT origin, destination, departure_date FROM trip_segments
+             WHERE trip_id = ? AND position = ?",
         )?;
-        if removed == 0 {
-            anyhow::bail!("this trip has no segment {position}");
+        let segment: Option<(String, String, String)> = stmt
+            .query_map(params![trip_id, position], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .next()
+            .transpose()?;
+        drop(stmt);
+        let Some((origin, destination, departure_date)) = segment else {
+            return Ok(false);
+        };
+        if origin != expected.origin || destination != expected.destination {
+            return Ok(false);
         }
-        conn.execute(
-            "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ?",
-            params![trip_id, position],
-        )?;
-        // Closing the gap keeps positions contiguous, which is the invariant
-        // that makes the shift above correct.
-        conn.execute(
-            "UPDATE trip_segments SET position = position - 1 WHERE trip_id = ? AND position > ?",
-            params![trip_id, position],
-        )?;
-        conn.execute(
-            "UPDATE segment_candidates SET position = position - 1
-             WHERE trip_id = ? AND position > ?",
-            params![trip_id, position],
-        )?;
-        touch(&conn, trip_id)?;
-        load_trip(&conn, trip_id)
+        // `None` is "nothing to verify", not "verified" — the same reading
+        // `add_candidate` gives this field, so a caller that has only a
+        // route to go on is not quietly granted a free pass on the date.
+        if let Some(expected_date) = expected.departure_date {
+            if departure_date != expected_date {
+                return Ok(false);
+            }
+        }
+        drop_segment_within(&conn, trip_id, position)?;
+        Ok(true)
     }
 
     /// Parks a flight against a segment. `decided` also marks it chosen, so
@@ -2893,6 +3026,145 @@ fn touch(conn: &Connection, trip_id: i64) -> Result<()> {
         params![trip_id],
     )?;
     Ok(())
+}
+
+/// Releases the trips owned by these conversations without touching the
+/// trips themselves.
+///
+/// The distinction this draws is the whole point of the feature: a thread
+/// that a *timer* removed must not take a travel plan with it. A trip is
+/// built over weeks and a thread expires after two days of quiet, so a
+/// cascade here would delete travel plans on a schedule, with no button
+/// pressed, nothing to undo and nothing in any log. Only
+/// `delete_conversation` cascades, because there somebody pressed Delete.
+/// An orphaned trip is an ordinary state; the next chat to touch it adopts
+/// it.
+///
+/// Takes a `&Connection` rather than `&Store` because its caller,
+/// `expire_conversations`, is already inside its own transaction and
+/// already holds the lock — re-locking would deadlock, and a release that
+/// could commit separately from the delete would leave a trip pointing at
+/// a conversation that is gone.
+fn detach_trips_within(conn: &Connection, conversation_ids: &[i64]) -> Result<usize> {
+    // `IN ()` is a parser error, not an empty set — the same trap
+    // `expire_conversations` documents. The caller passes a SELECT result
+    // that is empty on every sweep that expires nothing, which is the
+    // ordinary hourly case rather than an edge case.
+    if conversation_ids.is_empty() {
+        return Ok(0);
+    }
+    let holes = ["?"].repeat(conversation_ids.len()).join(", ");
+    Ok(conn.execute(
+        &format!("UPDATE trips SET conversation_id = NULL WHERE conversation_id IN ({holes})"),
+        duckdb::params_from_iter(conversation_ids.iter()),
+    )?)
+}
+
+/// How `add_segment_within` ended up.
+///
+/// `NoSuchPlace` carries the two numbers its explanation needs rather than a
+/// formatted string, so the one caller that turns this into an error owns
+/// the wording and the one that turns it into a status is not tempted to
+/// read that wording back.
+enum Inserted {
+    Added(Trip),
+    NoSuchPlace { count: i64, wanted: i64 },
+}
+
+/// Adds a leg, appending when `position` is None and otherwise inserting
+/// there and shifting the rest down.
+///
+/// A position outside 1..=count+1 comes back as `NoSuchPlace` instead of an
+/// error because its two callers disagree about what it means — see
+/// `add_segment_checked`. Splitting it out here rather than re-deriving the
+/// range at each of them keeps one definition of where a leg may go.
+fn add_segment_within(
+    conn: &Connection,
+    trip_id: i64,
+    position: Option<i64>,
+    origin: &str,
+    destination: &str,
+    departure_date: &str,
+) -> Result<Inserted> {
+    // Checked before anything is written: without this, a bad trip_id
+    // still passed the count query (as 0) and reached the INSERT below,
+    // leaving a segment row for a trip that does not exist — and no read
+    // path can ever find it again, because every read goes through a trip.
+    let known: i64 = conn.query_row(
+        "SELECT count(*) FROM trips WHERE id = ?",
+        params![trip_id],
+        |row| row.get(0),
+    )?;
+    if known == 0 {
+        anyhow::bail!("no such trip");
+    }
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM trip_segments WHERE trip_id = ?",
+        params![trip_id],
+        |row| row.get(0),
+    )?;
+    let at = match position {
+        Some(p) if p >= 1 && p <= count => p,
+        Some(p) if p == count + 1 => p,
+        Some(wanted) => return Ok(Inserted::NoSuchPlace { count, wanted }),
+        None => count + 1,
+    };
+    if at <= count {
+        // Descending is not needed: DuckDB applies this set-wise, so no
+        // intermediate state can collide with the primary key.
+        conn.execute(
+            "UPDATE trip_segments SET position = position + 1
+             WHERE trip_id = ? AND position >= ?",
+            params![trip_id, at],
+        )?;
+        conn.execute(
+            "UPDATE segment_candidates SET position = position + 1
+             WHERE trip_id = ? AND position >= ?",
+            params![trip_id, at],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO trip_segments (trip_id, position, origin, destination, departure_date)
+         VALUES (?, ?, ?, ?, ?)",
+        params![trip_id, at, origin, destination, departure_date],
+    )?;
+    touch(conn, trip_id)?;
+    Ok(Inserted::Added(load_trip(conn, trip_id)?))
+}
+
+/// Removes a segment and closes the gap behind it.
+///
+/// Takes `&Connection` rather than `&Store` so a caller that has already
+/// checked something about the segment can do the check and this delete
+/// under one acquisition of the store's non-reentrant mutex — see
+/// `remove_segment_checked`, whose correctness is exactly that. Re-locking
+/// would deadlock; releasing and re-locking would silently reintroduce the
+/// race the check exists to close.
+fn drop_segment_within(conn: &Connection, trip_id: i64, position: i64) -> Result<Trip> {
+    let removed = conn.execute(
+        "DELETE FROM trip_segments WHERE trip_id = ? AND position = ?",
+        params![trip_id, position],
+    )?;
+    if removed == 0 {
+        anyhow::bail!("this trip has no segment {position}");
+    }
+    conn.execute(
+        "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ?",
+        params![trip_id, position],
+    )?;
+    // Closing the gap keeps positions contiguous, which is the invariant
+    // that makes the shift above correct.
+    conn.execute(
+        "UPDATE trip_segments SET position = position - 1 WHERE trip_id = ? AND position > ?",
+        params![trip_id, position],
+    )?;
+    conn.execute(
+        "UPDATE segment_candidates SET position = position - 1
+         WHERE trip_id = ? AND position > ?",
+        params![trip_id, position],
+    )?;
+    touch(conn, trip_id)?;
+    load_trip(conn, trip_id)
 }
 
 /// Reads one whole trip. Takes `&Connection` rather than `&Store` so it can
@@ -3345,7 +3617,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 8);
+        assert_eq!(s.schema_version().unwrap(), 9);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -3409,7 +3681,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -4174,7 +4446,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_trip_is_found_by_name_case_insensitively_and_scoped_to_its_owner() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         assert_eq!(trip.name, "September");
         assert_eq!(trip.adults, 1, "one adult unless said otherwise");
         assert_eq!(trip.status, "planning");
@@ -4184,7 +4456,7 @@ CREATE TABLE segment_candidates (
         assert!(store.find_trip(8, "September").unwrap().is_none(), "another user has no such trip");
 
         // Same name twice is the same trip, not a second one.
-        store.upsert_trip(7, "SEPTEMBER", Some(2), Some("business")).unwrap();
+        store.upsert_trip(7, "SEPTEMBER", Some(2), Some("business"), None).unwrap();
         assert_eq!(store.list_trips(7).unwrap().len(), 1);
         let trip = store.find_trip(7, "September").unwrap().unwrap();
         assert_eq!(trip.adults, 2);
@@ -4192,8 +4464,168 @@ CREATE TABLE segment_candidates (
         assert_eq!(trip.name, "September", "the original spelling is kept");
 
         // Two users may each have a "September".
-        store.upsert_trip(8, "September", None, None).unwrap();
+        store.upsert_trip(8, "September", None, None, None).unwrap();
         assert_eq!(store.list_trips(8).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_trip_carries_the_conversation_that_made_it() {
+        // Nullable on purpose: NULL means orphaned, which is an ordinary
+        // state a trip reaches by outliving its chat, not an error.
+        let (store, _d) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        let owner: Option<i64> = store
+            .conn()
+            .query_row("SELECT conversation_id FROM trips WHERE id = ?", params![trip.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, None, "a trip made outside a conversation has no owner");
+    }
+
+    #[test]
+    fn the_chat_that_made_a_trip_keeps_it_and_an_orphan_is_adopted() {
+        // Ownership is single because the composer needs exactly one place
+        // to send to. A live owner is never displaced: otherwise deleting
+        // your most recent chat would destroy a trip whose original
+        // planning thread is still sitting there.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, Some(11)).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(11));
+
+        // A second chat extending the same trip must NOT take it.
+        store.upsert_trip(account, "atlantic loop", None, None, Some(22)).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(11), "a live owner is never displaced");
+
+        // Orphaned, then touched again: adopted. Detached directly rather
+        // than through `expire_conversations` because the owner ids here are
+        // invented — this test is about adoption, and standing up real
+        // conversations to age out would only obscure that.
+        detach_trips_within(&store.conn(), &[11]).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), None);
+        store.upsert_trip(account, "Atlantic loop", None, None, Some(33)).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(33), "an orphan is adopted");
+    }
+
+    #[test]
+    fn trip_chat_names_the_conversation_that_owns_the_trip() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let conversation_id = store.start_conversation(account, "direct").unwrap();
+        store.set_thread_title(account, conversation_id, "Cheap flights in October").unwrap();
+        let trip = store
+            .upsert_trip(account, "Atlantic loop", None, None, Some(conversation_id))
+            .unwrap();
+
+        assert_eq!(
+            store.trip_chat(trip.id).unwrap(),
+            Some(TripChat {
+                id: conversation_id,
+                title: Some("Cheap flights in October".to_string()),
+                scope: "direct".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn trip_chat_is_none_for_an_orphan_and_for_a_conversation_row_that_is_gone() {
+        // `conversation_id IS NULL` is the ordinary orphan. A `conversation_id`
+        // that points at a row which no longer exists is not supposed to
+        // happen — `delete_conversation` and expiry both clear it first — but
+        // the read must not depend on that holding: a `LEFT JOIN` here would
+        // silently promote the dangling id into a phantom chat in the UI, so
+        // this proves the `JOIN` drops it instead.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let orphan = store.upsert_trip(account, "Orphaned", None, None, None).unwrap();
+        assert_eq!(store.trip_chat(orphan.id).unwrap(), None);
+
+        let conversation_id = store.start_conversation(account, "direct").unwrap();
+        let dangling = store
+            .upsert_trip(account, "Dangling", None, None, Some(conversation_id))
+            .unwrap();
+        store
+            .conn()
+            .execute("DELETE FROM conversations WHERE id = ?", params![conversation_id])
+            .unwrap();
+        assert_eq!(store.trip_chat(dangling.id).unwrap(), None);
+    }
+
+    #[test]
+    fn detach_trips_within_an_empty_slice_is_a_no_op_not_a_syntax_error() {
+        // `expire_conversations` calls this inside its own transaction with
+        // a SELECT result that is empty on every sweep that expired nothing
+        // — the ordinary hourly case, not an edge case. `IN ()` is a parser
+        // error in DuckDB, so without the guard the routine hourly sweep is
+        // the one that fails.
+        let (store, _dir) = test_store();
+        let conn = store.conn();
+        assert_eq!(detach_trips_within(&conn, &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_upsert_that_names_no_conversation_leaves_an_existing_owner_alone() {
+        // Every current caller passes None here — no tool threads a real
+        // conversation id yet, so this path runs on essentially every
+        // upsert in production. If it unconditionally wrote NULL, it would
+        // silently orphan a live trip on the very first edit after it was
+        // created.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Japan in spring", None, None, Some(11)).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(11));
+
+        store.upsert_trip(account, "Japan in spring", Some(2), None, None).unwrap();
+        assert_eq!(store.trip_owner(trip.id).unwrap(), Some(11), "an upsert naming no chat must not clear the owner");
+    }
+
+    /// `trips` exactly as it stood at schema version 8, before
+    /// `conversation_id`. Frozen, like `LEGACY_SCHEMA`: its value is being
+    /// an honest picture of the table step 9 will actually meet. Do not
+    /// update this when `MIGRATIONS` widens `trips` again — the whole point
+    /// is that this stays behind.
+    const PRE_TRIP_CONVERSATION_TRIPS: &str = r#"
+CREATE SEQUENCE trips_id_seq;
+CREATE TABLE trips (
+    id BIGINT PRIMARY KEY DEFAULT nextval('trips_id_seq'),
+    account_id BIGINT NOT NULL, name TEXT NOT NULL,
+    name_key TEXT NOT NULL, adults BIGINT NOT NULL DEFAULT 1,
+    cabin_class TEXT, status TEXT NOT NULL DEFAULT 'planning',
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (account_id, name_key)
+);
+"#;
+
+    #[test]
+    fn an_existing_database_gains_the_column_by_migration() {
+        // The fresh-database path and the upgrade path are different code.
+        // A CREATE TABLE IF NOT EXISTS does nothing to a table that already
+        // exists, so without step 9 every deployed database would be missing
+        // this column while every test passed.
+        //
+        // The row is what matters: the step is trivially safe on an empty
+        // table, and production will run it against a `trips` table that
+        // already has rows in it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scout.duckdb");
+        {
+            let conn = duckdb::Connection::open(&path).unwrap();
+            conn.execute_batch(PRE_TRIP_CONVERSATION_TRIPS).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version BIGINT NOT NULL);
+                 INSERT INTO schema_version VALUES (8);
+                 INSERT INTO trips (account_id, name, name_key) VALUES (1, 'Lisbon', 'lisbon');",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let conversation_id: Option<i64> = store
+            .conn()
+            .query_row("SELECT conversation_id FROM trips WHERE name_key = 'lisbon'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(conversation_id, None, "a trip that predates the column must gain it, unset");
     }
 
     #[test]
@@ -4202,9 +4634,9 @@ CREATE TABLE segment_candidates (
         // `ON CONFLICT DO UPDATE SET adults = ?, cabin_class = ?` would
         // silently null out whichever field this call didn't mention.
         let (store, _d) = test_store();
-        store.upsert_trip(7, "September", Some(2), Some("business")).unwrap();
+        store.upsert_trip(7, "September", Some(2), Some("business"), None).unwrap();
 
-        let trip = store.upsert_trip(7, "September", Some(3), None).unwrap();
+        let trip = store.upsert_trip(7, "September", Some(3), None, None).unwrap();
         assert_eq!(trip.adults, 3);
         assert_eq!(
             trip.cabin_class.as_deref(),
@@ -4212,7 +4644,7 @@ CREATE TABLE segment_candidates (
             "cabin class must survive an upsert that didn't mention it"
         );
 
-        let trip = store.upsert_trip(7, "September", None, Some("economy")).unwrap();
+        let trip = store.upsert_trip(7, "September", None, Some("economy"), None).unwrap();
         assert_eq!(trip.adults, 3, "adults must survive an upsert that didn't mention it");
         assert_eq!(trip.cabin_class.as_deref(), Some("economy"));
     }
@@ -4220,17 +4652,17 @@ CREATE TABLE segment_candidates (
     #[test]
     fn changing_adults_or_cabin_class_resets_a_finalised_trip_to_planning() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", Some(2), Some("business")).unwrap();
+        let trip = store.upsert_trip(7, "September", Some(2), Some("business"), None).unwrap();
 
         store.set_trip_status(trip.id, "finalised").unwrap();
-        let trip = store.upsert_trip(7, "September", Some(3), None).unwrap();
+        let trip = store.upsert_trip(7, "September", Some(3), None, None).unwrap();
         assert_eq!(
             trip.status, "planning",
             "changing the passenger count invalidates a finalised trip's prices"
         );
 
         store.set_trip_status(trip.id, "finalised").unwrap();
-        let trip = store.upsert_trip(7, "September", None, Some("economy")).unwrap();
+        let trip = store.upsert_trip(7, "September", None, Some("economy"), None).unwrap();
         assert_eq!(
             trip.status, "planning",
             "changing cabin class invalidates a finalised trip's prices"
@@ -4238,7 +4670,7 @@ CREATE TABLE segment_candidates (
 
         // find-or-create — supplying neither field — must stay inert.
         store.set_trip_status(trip.id, "finalised").unwrap();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         assert_eq!(
             trip.status, "finalised",
             "an upsert with nothing to change must not reset status"
@@ -4251,7 +4683,7 @@ CREATE TABLE segment_candidates (
         // second leg"), so a hole would make every later instruction target
         // the wrong row.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
             store.add_segment(trip.id, None, o, d, date).unwrap();
         }
@@ -4274,9 +4706,104 @@ CREATE TABLE segment_candidates (
     }
 
     #[test]
+    fn a_stale_remove_refuses_rather_than_deleting_the_wrong_leg() {
+        // `drop_segment` renumbers: removing position 1 shifts position 2
+        // down to 1. A browser tab holding a trip drawn thirty seconds ago
+        // is therefore one concurrent edit away from asking to delete
+        // "leg 2" and destroying a leg that is no longer the one it drew.
+        // `add_candidate` already guards this way and says why; this is the
+        // same guard on the same hazard.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_segment(trip.id, None, "LIS", "FCO", "2026-10-14").unwrap();
+
+        // The browser drew both legs, then someone removed the first.
+        store.drop_segment(trip.id, 1).unwrap();
+
+        // The stale click: "remove leg 2", which the browser believes is
+        // LIS→FCO. After the renumber, position 2 does not exist and
+        // position 1 IS LIS→FCO.
+        let stale = ExpectedSegment {
+            origin: "LIS", destination: "FCO", departure_date: Some("2026-10-14"),
+        };
+        assert!(!store.remove_segment_checked(trip.id, 2, stale).unwrap(),
+            "a position that no longer exists must refuse");
+
+        let after = store.find_trip(account, "Atlantic loop").unwrap().unwrap();
+        assert_eq!(after.segments.len(), 1, "the surviving leg is untouched");
+        assert_eq!(after.segments[0].destination, "FCO");
+    }
+
+    #[test]
+    fn a_stale_remove_refuses_when_the_renumber_left_a_different_leg_at_that_position() {
+        // The other half of the hazard: the position still exists, so an
+        // existence check alone lets the delete through — onto whichever leg
+        // the renumber slid into that slot.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_segment(trip.id, None, "LIS", "FCO", "2026-10-14").unwrap();
+
+        store.drop_segment(trip.id, 1).unwrap();
+
+        // "Remove leg 1", which the browser drew as AMS→LIS. Position 1 is
+        // now LIS→FCO, a leg the traveller never asked to lose.
+        let stale = ExpectedSegment {
+            origin: "AMS", destination: "LIS", departure_date: Some("2026-10-12"),
+        };
+        assert!(!store.remove_segment_checked(trip.id, 1, stale).unwrap(),
+            "a position holding a different route must refuse");
+
+        let after = store.find_trip(account, "Atlantic loop").unwrap().unwrap();
+        assert_eq!(after.segments.len(), 1, "the surviving leg is untouched");
+        assert_eq!(after.segments[0].destination, "FCO");
+    }
+
+    #[test]
+    fn a_remove_that_matches_what_the_reader_saw_goes_through() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_segment(trip.id, None, "LIS", "FCO", "2026-10-14").unwrap();
+
+        let seen = ExpectedSegment {
+            origin: "LIS", destination: "FCO", departure_date: Some("2026-10-14"),
+        };
+        assert!(store.remove_segment_checked(trip.id, 2, seen).unwrap());
+        let after = store.find_trip(account, "Atlantic loop").unwrap().unwrap();
+        assert_eq!(after.segments.len(), 1);
+        assert_eq!(after.segments[0].destination, "LIS");
+    }
+
+    #[test]
+    fn a_remove_with_no_date_to_check_still_checks_the_route() {
+        // `None` is "nothing to verify", exactly as `add_candidate` reads
+        // it — not "verified", and not a way past the route check.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
+        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+
+        let wrong_route = ExpectedSegment {
+            origin: "LIS", destination: "FCO", departure_date: None,
+        };
+        assert!(!store.remove_segment_checked(trip.id, 1, wrong_route).unwrap());
+
+        let undated = ExpectedSegment {
+            origin: "AMS", destination: "LIS", departure_date: None,
+        };
+        assert!(store.remove_segment_checked(trip.id, 1, undated).unwrap());
+        assert!(store.find_trip(account, "Atlantic loop").unwrap().unwrap().segments.is_empty());
+    }
+
+    #[test]
     fn editing_a_trip_puts_it_back_to_planning() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
         store.set_trip_status(trip.id, "finalised").unwrap();
         assert_eq!(store.find_trip(7, "September").unwrap().unwrap().status, "finalised");
@@ -4317,7 +4844,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_segment_holds_several_options_and_at_most_one_is_chosen() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
 
         // Parked undecided: the traveller is comparing a nonstop against a
@@ -4376,7 +4903,7 @@ CREATE TABLE segment_candidates (
         // "option 2", dropped it, and later says "go with option 2" would
         // silently be given a different flight under the same name.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
         store
             .add_candidate(
@@ -4436,7 +4963,7 @@ CREATE TABLE segment_candidates (
             .unwrap_err();
         assert_eq!(err.to_string(), "no such trip", "a nonexistent trip must not be reported as a missing segment");
 
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let err = store
             .add_candidate(
                 trip.id,
@@ -4458,7 +4985,7 @@ CREATE TABLE segment_candidates (
         // The ordinary path — "book me on this one" — must not need a second
         // call to say what it obviously meant.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
         let trip = store
             .add_candidate(
@@ -4479,7 +5006,7 @@ CREATE TABLE segment_candidates (
         // candidates would silently reattach somebody's chosen flight to a
         // different route while the trip still looked perfectly well-formed.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         for (o, d, date) in [
             ("AMS", "NRT", "2026-09-03"),
             ("NRT", "OSA", "2026-09-10"),
@@ -4569,7 +5096,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn the_bounds_error_reads_correctly_with_exactly_one_segment() {
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None).unwrap();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
 
         let err = store.add_segment(trip.id, Some(5), "LIS", "FCO", "2026-09-07").unwrap_err();
@@ -4590,7 +5117,7 @@ CREATE TABLE segment_candidates (
         // caller says it validated rather than trusting the earlier read
         // to still be true.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
 
         let err = store
@@ -4650,7 +5177,7 @@ CREATE TABLE segment_candidates (
         // a numbering mistake on a trip that still exists. choose_candidate
         // has to check the trip itself first so the two are told apart.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
         store
             .add_candidate(
@@ -4673,7 +5200,7 @@ CREATE TABLE segment_candidates (
         // the only way to honour one was to delete the trip and rebuild —
         // which is exactly what happened in production.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "HND", "AMS", "2026-09-27").unwrap();
         store
             .add_candidate(
@@ -4706,7 +5233,7 @@ CREATE TABLE segment_candidates (
         // Restating the same date must not throw away work, the same way an
         // upsert that supplies nothing leaves a trip alone.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Japan", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "HND", "AMS", "2026-09-27").unwrap();
         store
             .add_candidate(
@@ -4736,7 +5263,7 @@ CREATE TABLE segment_candidates (
     fn deleting_a_trip_takes_its_segments_and_options_with_it() {
         // Creating a trip is a side effect of a typo, so a typo needs an undo.
         let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "Setpember", None, None).unwrap();
+        let trip = store.upsert_trip(7, "Setpember", None, None, None).unwrap();
         let trip = store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
         store
             .add_candidate(
@@ -4753,7 +5280,7 @@ CREATE TABLE segment_candidates (
         assert!(!store.delete_trip(7, "Setpember").unwrap(), "deleting twice is not an error");
 
         // Another user's trip of the same name is untouched.
-        store.upsert_trip(8, "Setpember", None, None).unwrap();
+        store.upsert_trip(8, "Setpember", None, None, None).unwrap();
         assert!(!store.delete_trip(7, "Setpember").unwrap());
         assert!(store.find_trip(8, "Setpember").unwrap().is_some());
     }
@@ -5278,7 +5805,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 8, "the threads steps did not run");
+        assert_eq!(s.schema_version().unwrap(), 9, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -5319,7 +5846,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 8);
+        assert_eq!(s.schema_version().unwrap(), 9);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -5331,28 +5858,48 @@ CREATE TABLE conversations (
         );
     }
 
+    /// Column name, order, type, nullability and default — the whole of
+    /// what a query can see. `MIGRATIONS` and the steps are two
+    /// descriptions of one table, and nothing else keeps them in step; this
+    /// is how a test proves they still agree.
+    fn shape(conn: &Connection, table: &str) -> Vec<(String, i64, String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name, ordinal_position, data_type, is_nullable, column_default
+                 FROM information_schema.columns
+                 WHERE table_name = ? ORDER BY ordinal_position",
+            )
+            .unwrap();
+        stmt.query_map(params![table], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
     fn a_migrated_conversations_table_has_exactly_the_shape_a_fresh_one_has() {
-        // `MIGRATIONS` and the steps are two descriptions of one table, and
-        // nothing else keeps them in step. Name, order, type, nullability
-        // and default — the whole of what a query can see.
-        fn shape(conn: &Connection) -> Vec<(String, i64, String, String, Option<String>)> {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT column_name, ordinal_position, data_type, is_nullable, column_default
-                     FROM information_schema.columns
-                     WHERE table_name = 'conversations' ORDER BY ordinal_position",
-                )
-                .unwrap();
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        }
         let (fresh, _d1) = test_store();
         let (_d2, db) = version_six_db_with_a_thread();
         let migrated = Store::open(&db).unwrap();
-        assert_eq!(shape(&fresh.conn()), shape(&migrated.conn()));
+        assert_eq!(shape(&fresh.conn(), "conversations"), shape(&migrated.conn(), "conversations"));
+    }
+
+    #[test]
+    fn a_migrated_trips_table_has_exactly_the_shape_a_fresh_one_has() {
+        // `STEP_4_REBUILDS` rewrites `trips` from a fixed column list that
+        // predates `conversation_id`, and step 9 adds the column afterwards
+        // by `ALTER TABLE`. That ordering is what makes today's rebuild
+        // correct, and nothing enforces it — the next constrained change to
+        // `trips` could copy the `STEP_4_REBUILDS` pattern, list the columns
+        // it can see, and quietly drop a later one on every deployed
+        // database while the rest of the suite stayed green. `legacy_db`
+        // rather than `version_six_db_with_a_thread`: it is the fixture
+        // that actually runs step 4 before step 9, which is the ordering
+        // this depends on.
+        let (fresh, _d1) = test_store();
+        let (_d2, db) = legacy_db();
+        let migrated = Store::open(&db).unwrap();
+        assert_eq!(shape(&fresh.conn(), "trips"), shape(&migrated.conn(), "trips"));
     }
 
     #[test]
@@ -5447,6 +5994,46 @@ CREATE TABLE conversations (
         assert!(s.delete_conversation(a, id).unwrap());
         assert!(s.threads_of(a).unwrap().is_empty());
         assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "messages outlived their thread");
+    }
+
+    #[test]
+    fn deleting_a_thread_deletes_the_trip_it_owns_and_nothing_else() {
+        // Pressing Delete is a decision, so it takes the plan with it. The
+        // trip owned by another thread is the control: a cascade that is
+        // too wide is worse than none.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let doomed = store.start_conversation(account, "direct").unwrap();
+        let spared = store.start_conversation(account, "direct").unwrap();
+
+        let a = store.upsert_trip(account, "Atlantic loop", None, None, Some(doomed)).unwrap();
+        store.upsert_trip(account, "Japan in spring", None, None, Some(spared)).unwrap();
+        store.add_segment(a.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+
+        assert!(store.delete_conversation(account, doomed).unwrap());
+
+        assert!(store.find_trip(account, "Atlantic loop").unwrap().is_none(), "its trip goes with it");
+        assert!(store.find_trip(account, "Japan in spring").unwrap().is_some(), "another thread's trip stays");
+        let orphans: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM trip_segments WHERE trip_id = ?", params![a.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "a deleted trip leaves no segments behind");
+    }
+
+    #[test]
+    fn deleting_a_thread_leaves_an_unowned_trip_alone() {
+        // `conversation_id IS NULL` is not what `= ?` matches — a trip
+        // nobody owns must not vanish just because some other thread on the
+        // same account got deleted.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let id = store.start_conversation(account, "direct").unwrap();
+        store.upsert_trip(account, "Orphaned already", None, None, None).unwrap();
+
+        assert!(store.delete_conversation(account, id).unwrap());
+
+        assert!(store.find_trip(account, "Orphaned already").unwrap().is_some(), "an unowned trip was swept up");
     }
 
     #[test]
@@ -5549,6 +6136,77 @@ CREATE TABLE conversations (
         assert_eq!(s.expire_conversations(48 * 3600, &[]).unwrap(), 0, "no conversation expired");
 
         assert!(s.conversation_messages(id, 10).unwrap().is_empty(), "orphaned messages were not swept");
+    }
+
+    #[test]
+    fn an_expired_thread_releases_its_trip_instead_of_destroying_it() {
+        // The single most important test in this feature. Threads expire on
+        // a 48-hour timer; trips are built over weeks. If expiry ever
+        // cascades the way `delete_conversation` does, every travel plan
+        // disappears two days after its chat goes quiet — silently, with
+        // nothing to undo. This test is what stands in the way.
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let stale = s.start_conversation(a, "direct").unwrap();
+        let trip = s.upsert_trip(a, "Japan in spring", None, None, Some(stale)).unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(72 * 3600) WHERE id = {stale};"
+            ))
+            .unwrap();
+
+        let gone = s.expire_conversations(48 * 3600, &[]).unwrap();
+
+        assert_eq!(gone, 1, "the stale thread expired");
+        assert!(s.find_trip(a, "Japan in spring").unwrap().is_some(), "a timer must never destroy a travel plan");
+        assert_eq!(s.trip_owner(trip.id).unwrap(), None, "and the dead link is released");
+    }
+
+    #[test]
+    fn a_pinned_thread_past_the_idle_window_keeps_its_trip() {
+        // The release only applies to threads that actually die. A `SELECT`
+        // "simplified" by dropping `NOT pinned` would still name this thread
+        // — the DELETE would spare it, and its trip would be cut loose from
+        // a conversation that is very much alive.
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let pinned = s.start_conversation(a, "direct").unwrap();
+        let trip = s.upsert_trip(a, "Japan in spring", None, None, Some(pinned)).unwrap();
+        s.set_thread_pinned(a, pinned, true).unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(72 * 3600) WHERE id = {pinned};"
+            ))
+            .unwrap();
+
+        assert_eq!(s.expire_conversations(48 * 3600, &[]).unwrap(), 0, "a pinned thread does not expire");
+
+        assert_eq!(s.trip_owner(trip.id).unwrap(), Some(pinned), "a thread that is still alive kept its trip");
+    }
+
+    #[test]
+    fn a_thread_with_a_run_in_flight_keeps_its_trip() {
+        // Same trap from the other side: a `SELECT` that ignores `except`
+        // names a thread the DELETE spares, and the trip of a conversation
+        // that is mid-answer is orphaned under it.
+        //
+        // Two ids in `except` for the reason
+        // `expiry_leaves_alone_a_thread_named_as_still_running` gives: one id
+        // never exercises the placeholder join.
+        let (s, _dir) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        let running = s.start_conversation(a, "direct").unwrap();
+        let also_running = s.start_conversation(a, "direct").unwrap();
+        let trip = s.upsert_trip(a, "Japan in spring", None, None, Some(running)).unwrap();
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(72 * 3600) WHERE id IN ({running}, {also_running});"
+            ))
+            .unwrap();
+
+        assert_eq!(s.expire_conversations(48 * 3600, &[running, also_running]).unwrap(), 0, "both threads were named as running");
+
+        assert_eq!(s.trip_owner(trip.id).unwrap(), Some(running), "a thread still writing its answer kept its trip");
     }
 
     #[test]

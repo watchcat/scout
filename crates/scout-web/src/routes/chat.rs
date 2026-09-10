@@ -1893,7 +1893,12 @@ mod tests {
         // page: once back in the composer, once in a turn that was never
         // asked.
         let js = include_str!("../chat.js");
-        let start = js.find("res.status === 422").expect("the 422 arm must exist");
+        // Anchored inside `runMessage`: the trip planner's add/remove leg
+        // handlers also match on `res.status === 422`, and a search that
+        // was not scoped past `runMessage` would find one of those arms
+        // first and fail on code that has nothing to do with this rule.
+        let fn_start = js.find("async function runMessage").expect("runMessage must exist");
+        let start = fn_start + js[fn_start..].find("res.status === 422").expect("the 422 arm must exist");
         let end = js[start..].find('}').expect("the arm must end") + start;
         let body = &js[start..end];
         assert!(body.contains("retract()"), "a refused send leaves its bubble on the screen");
@@ -1925,5 +1930,31 @@ mod tests {
 
         let res = post_json_with_cookie(&app, "/chat/reset", &cookie, Some(&csrf), "").await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "the reset route answered {}", res.status());
+    }
+
+    #[test]
+    fn a_trip_reply_goes_to_the_trip_s_thread_not_whatever_chat_had_open() {
+        // The composer is shared by both tabs. Sent from Trips, the thread
+        // it must post into is the one `composerTarget` names for the
+        // selected trip — an orphan or a Telegram group's trip must not
+        // inherit `currentThread`, which is whichever thread Chat happened
+        // to have open before Trips was visited, and could be any other
+        // conversation. `composerTarget` itself is pure and has its own
+        // tests in chat.test.mjs; this is the assertion that the submit
+        // handler actually asks it, rather than sending straight to
+        // whatever `currentThread` already was.
+        let js = include_str!("../chat.js");
+        let start = js.find("askForm.addEventListener('submit'").expect("the composer must submit");
+        let end = js[start..].find("\n  })\n").expect("the handler must end") + start;
+        let body = &js[start..end];
+        assert!(body.contains("composerTarget("), "the submit handler never asks composerTarget for a target");
+        assert!(
+            body.contains("openThread(target.thread)"),
+            "a trip's own thread is never opened before the message is sent into it"
+        );
+        assert!(
+            body.contains("switchView('chat')"),
+            "a trip reply never switches the page to where the answer streams"
+        );
     }
 }

@@ -64,13 +64,15 @@ Duffel row, call it.
 - If the brief asks to book and you have no booking tool, do not search \
 again: say in your report that Scout cannot book, and that the traveller \
 buys from the airline with the numbers already found.
-- When the brief is about more than one flight - a multi-city route, or a \
-trip being assembled over several messages - build it with the trip tools \
-rather than holding it in your head: add_trip_segment for each leg the \
-moment you have a route and a date, add_trip_option for each flight \
-found. A segment is one direction on one date, so a return is two \
-segments. When a date or a leg changes, call update_trip_segment on that \
-one segment. NEVER delete the trip and build it again, and never drop and \
+- Build the trip with the trip tools every time you search, not only for a \
+multi-city route or a trip assembled over several messages: \
+add_trip_segment for each leg the moment you have a route and a date, \
+add_trip_option for each flight found. It costs nothing and the traveller \
+does not see it - a trip you build is a draft until they ask to keep it - \
+so there is no such thing as building one needlessly. A segment is one \
+direction on one date, so a return is two segments. When a date or a leg \
+changes, call update_trip_segment on that one segment. NEVER delete the \
+trip and build it again, and never drop and \
 re-add a segment to change it: both throw away every option parked on \
 every other segment, and dropping renumbers everything after it. If the \
 traveller is undecided between flights, park each with add_trip_option \
@@ -225,6 +227,14 @@ pub fn guidance(findings: &[crate::specialist::Finding], markup_rate: f64) -> Ve
             && f.output.get("by_date").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
     });
     let planned = ok().any(|f| TRIP_TOOLS.contains(&f.tool.as_str()));
+    // The name of a trip that was built but not kept, if there is one.
+    // Worked out here rather than asked of the model, because the bug this
+    // fixes was a preamble sentence it did not act on; and the name has to
+    // travel because the parent has no other way to learn it - it never
+    // sees the trip tools, only what they returned.
+    let draft = ok()
+        .filter(|f| TRIP_TOOLS.contains(&f.tool.as_str()))
+        .find_map(|f| unkept_trip(&f.output));
     let mut out = Vec::new();
     // Whether any section with prices in it was pushed: the fee line
     // applies to prices, so it keys on these and not on the failed block.
@@ -249,6 +259,15 @@ pub fn guidance(findings: &[crate::specialist::Finding], markup_rate: f64) -> Ve
         out.push(TRIP_GUIDANCE.to_string());
         priced = true;
     }
+    if let Some(name) = draft {
+        out.push(format!(
+            "The trip called {name:?} is a draft: it was built while searching and the \
+             traveller cannot see it among their trips yet. Show them the itinerary and ask \
+             whether to keep it. You cannot keep it yourself - you have no trip tools - so if \
+             they say yes, ask ask_flights again with a brief saying to keep the trip called \
+             {name:?}, and tell them it is kept only once that comes back."
+        ));
+    }
     // A failed finding travels back too, and without this the parent has
     // an error string and no word on what `failed` means.
     if findings.iter().any(|f| f.failed) {
@@ -263,6 +282,28 @@ pub fn guidance(findings: &[crate::specialist::Finding], markup_rate: f64) -> Ve
         ));
     }
     out
+}
+
+/// The name of an unkept trip in one trip tool's output, if it holds one.
+///
+/// Two shapes to look in, because the tools do not all return the same
+/// thing: every trip tool but show_trip returns one `TripView`, whose trip
+/// is under `trip`, and show_trip returns a `TripList`, a `trips` array of
+/// them. finalise_trip and delete_trip have a `trip` field too, but theirs
+/// is the name as a plain string, so it carries no `kept` and falls
+/// through here - which is the right answer for both: a finalised trip is
+/// not a draft to offer, and a deleted one is not there to keep.
+fn unkept_trip(output: &serde_json::Value) -> Option<&str> {
+    let views: &[serde_json::Value] = match output.get("trips").and_then(|v| v.as_array()) {
+        Some(list) => list,
+        None => std::slice::from_ref(output),
+    };
+    views.iter().filter_map(|view| view.get("trip")).find_map(|trip| {
+        match trip.get("kept").and_then(|kept| kept.as_bool()) {
+            Some(false) => trip.get("name").and_then(|name| name.as_str()),
+            _ => None,
+        }
+    })
 }
 
 const SEARCH_GUIDANCE: &str = "\
@@ -434,6 +475,34 @@ mod tests {
         // A name with 'trip' in it is not a trip tool.
         let text = guidance(&[ran("round_trip_helper", json!({}))], 0.0).join("\n");
         assert!(!text.contains("not_ready"), "got: {text}");
+    }
+
+    #[test]
+    fn a_draft_is_offered_and_a_kept_trip_is_not() {
+        // The offer is computed here rather than left to the model, because
+        // the bug this fixes was a preamble sentence it did not act on:
+        // nine searches, eleven hours, not one add_trip_segment.
+        let view = |kept: bool| {
+            json!({
+                "trip": {"name": "Lisbon in May", "adults": 1, "status": "planning", "segments": [], "kept": kept},
+                "not_ready": null,
+                "changed": "segment 1 added",
+                "notes": [],
+            })
+        };
+        let text = guidance(&[ran("add_trip_segment", view(false))], 0.0).join("\n");
+        // The name, because the parent never sees the trip tools and cannot
+        // offer to keep something it cannot name.
+        assert!(text.contains("\"Lisbon in May\""), "got: {text}");
+        assert!(text.contains("draft"), "got: {text}");
+
+        let text = guidance(&[ran("keep_trip", view(true))], 0.0).join("\n");
+        assert!(!text.contains("Lisbon in May"), "a kept trip needs no offer: {text}");
+        assert!(!text.contains("draft"), "a kept trip needs no offer: {text}");
+
+        // No trip at all: nothing to offer, and nothing to name.
+        let text = guidance(&[ran("search_flights", json!({"route": "AMS-LIS"}))], 0.0).join("\n");
+        assert!(!text.contains("draft"), "got: {text}");
     }
 
     #[test]

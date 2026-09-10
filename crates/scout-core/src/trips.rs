@@ -99,6 +99,40 @@ pub async fn find(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Op
     .await
 }
 
+/// Keep one of this account's trips, so it outlives the chat that built it.
+///
+/// `Option<Plan>` rather than an enum of its own, because keeping has the
+/// same two outcomes `find` has: the trip is there or the name is not this
+/// account's. Keeping an already-kept trip is one of the successes — a
+/// traveller pressing Keep twice is repeating themselves, not erring.
+///
+/// The plan comes back so a browser can repaint from the answer rather than
+/// fetching the list again, like every other trip write here.
+pub async fn keep(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Option<Plan>> {
+    let store = core.store();
+    let name = name.to_string();
+    blocking(move || {
+        if !store.keep_trip(account_id, &name)? {
+            return Ok(None);
+        }
+        // Re-read rather than flipping `kept` on a copy: keeping bumps
+        // `updated_at`, and this plan is what the client redraws from.
+        store
+            .find_trip(account_id, &name)
+            .and_then(|trip| match trip {
+                Some(trip) => {
+                    let chat = store.trip_chat(trip.id)?;
+                    Ok(Some(Plan::from_trip(trip, chat)))
+                }
+                // Only reachable by a concurrent delete between the two
+                // statements: it really was kept, there is just no longer a
+                // plan to show for it.
+                None => Ok(None),
+            })
+    })
+    .await
+}
+
 /// Select one of the already parked candidate flights on a segment.
 pub async fn choose(
     core: &Core,

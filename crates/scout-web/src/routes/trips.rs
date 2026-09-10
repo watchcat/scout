@@ -1,7 +1,7 @@
 //! The visual trip planner's small authenticated web surface.
 //!
-//! It reads the itinerary Scout already stores, lets the traveller settle an
-//! existing candidate, and lets them add or remove a leg. Searching and
+//! It reads the itinerary Scout already stores, lets the traveller keep it,
+//! settle an existing candidate, and add or remove a leg. Searching and
 //! pricing still happen in chat, where the flight agent can validate live
 //! provider data — those spend money against a live provider and stay a
 //! flight-agent responsibility.
@@ -18,6 +18,7 @@ pub fn routes(auth: AuthState) -> Router {
     Router::new()
         .route("/chat/trips", get(list))
         .route("/chat/trips/pdf", post(pdf))
+        .route("/chat/trips/keep", post(keep))
         .route("/chat/trips/choice", post(choose))
         .route("/chat/trips/segment", post(add_leg).delete(remove_leg))
         .layer(axum::middleware::from_fn_with_state(
@@ -92,6 +93,43 @@ async fn list(
         Ok(trips) => axum::Json(trips).into_response(),
         Err(e) => {
             tracing::error!(error = %e, account_id, "could not list trips");
+            sorry()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct KeepIn {
+    trip: String,
+}
+
+/// Keeps a trip without a conversation.
+///
+/// The chat path for this is a brief to the flight desk, which needs a
+/// model call and a turn to come back. A Keep button is the traveller
+/// saying exactly one thing, and asking a language model to interpret it is
+/// how "Save this trip" became `record_purchase` in production.
+async fn keep(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<KeepIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    match scout_core::trips::keep(&auth.core, account_id, &body.trip).await {
+        Ok(Some(plan)) => axum::Json(plan).into_response(),
+        // Somebody else's trip and a name nobody used are the same answer,
+        // as everywhere else here: the account scoping is in the store, and
+        // a 403 would confirm that the trip exists.
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not keep a trip");
             sorry()
         }
     }
@@ -392,6 +430,118 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn keeping_a_trip_needs_a_session_and_a_csrf_token() {
+        let (app, _core, _dir, _account, cookie, csrf) = setup().await;
+        let uri = "/chat/trips/keep";
+        let body = r#"{"trip":"October"}"#;
+
+        // Nothing that is a session at all: a Keep button is behind sign-in
+        // like every other write on this router.
+        let anonymous = post_json(&app, uri, "not-a-session", Some(&csrf), body).await;
+        assert_eq!(anonymous.status(), StatusCode::SEE_OTHER);
+
+        // And a stolen cookie without the header gets the same refusal it
+        // gets on `choose`.
+        let refused = post_json(&app, uri, &cookie, None, body).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn keeping_a_draft_makes_it_kept_and_the_response_carries_the_trip() {
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        let before = scout_core::trips::find(&core, account_id, "October")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !before.trip.kept,
+            "the fixture is the draft a flight search leaves behind"
+        );
+
+        let res = post_json(
+            &app,
+            "/chat/trips/keep",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October"}"#,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(response["name"], "October");
+        assert_eq!(
+            response["kept"], true,
+            "the client can repaint from this body without a second fetch",
+        );
+
+        // Asserted against the store, not just the response: the response
+        // is what the route claims happened, the store is what actually did.
+        let trip = scout_core::trips::list(&core, account_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.trip.name == "October")
+            .unwrap();
+        assert!(trip.trip.kept);
+    }
+
+    #[tokio::test]
+    async fn one_account_cannot_keep_another_accounts_trip() {
+        let (app, core, _dir, owner, _cookie, _csrf) = setup().await;
+        let scout_core::identity::SignIn::In {
+            account_id: stranger,
+        } = scout_core::identity::sign_in(&core, "telegram", "888")
+            .await
+            .unwrap()
+        else {
+            panic!("the round should admit the second account");
+        };
+        let cookie = crate::session::mint(TEST_KEY, stranger, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, stranger);
+
+        let res = post_json(
+            &app,
+            "/chat/trips/keep",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let theirs = scout_core::trips::find(&core, owner, "October")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !theirs.trip.kept,
+            "keeping the owner's trip is still the owner's to do",
+        );
+    }
+
+    #[tokio::test]
+    async fn keeping_a_trip_twice_is_fine() {
+        // A traveller pressing Keep again — on a tab that had not
+        // repainted, or because nothing obvious happened the first time —
+        // is repeating themselves, not making a mistake.
+        let (app, _core, _dir, _account, cookie, csrf) = setup().await;
+        for _ in 0..2 {
+            let res = post_json(
+                &app,
+                "/chat/trips/keep",
+                &cookie,
+                Some(&csrf),
+                r#"{"trip":"October"}"#,
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let plan: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+            assert_eq!(plan["kept"], true);
+        }
     }
 
     #[tokio::test]

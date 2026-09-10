@@ -26,11 +26,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # reqwest and serves the product page to a real browser). Chromium is the
 # bulk of this image; drop it and the bot still runs, minus that fallback.
 FROM debian:bookworm-slim
+# No `chmod 4755` on a setuid sandbox here: Debian's chromium ships none —
+# there is no `chrome-sandbox` binary in /usr/lib/chromium at all, so the
+# chmod fails the build outright. It isolates renderers with user
+# namespaces instead, which this container has. Measured in the running
+# pod as uid 1000: `chromium --headless=new --print-to-pdf` writes a real
+# PDF with no sandbox binary and no --no-sandbox flag.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 chromium fonts-liberation tini \
-    && chmod 4755 /usr/lib/chromium/chrome-sandbox \
-    && test -u /usr/lib/chromium/chrome-sandbox \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m scout \
     && mkdir -p /data \

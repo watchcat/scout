@@ -299,6 +299,18 @@ where
             Ok(reason) => reason,
             Err(_) => Some("it took too long"),
         };
+        // The line that answers "where did the three minutes go?" without a
+        // log dig. Nothing recorded how a specialist spent its budget, so
+        // the frozen screen took a walk through eleven hours of production
+        // logs to explain. Once per run, never per stream item: this loop
+        // is hot.
+        tracing::info!(
+            specialist = self.name,
+            secs = started.elapsed().as_secs_f32(),
+            calls = collector.findings.len() + collector.pending.len(),
+            cut_short = cut_short.unwrap_or("no"),
+            "the specialist finished"
+        );
         collector.report(cut_short, &*self.guidance)
     }
 }

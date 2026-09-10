@@ -1625,6 +1625,12 @@ impl Store {
             // `doomed_ids` is empty on every sweep that expires nothing,
             // which is the normal hourly case — `detach_trips_within` guards
             // that, since `IN ()` is a parser error rather than an empty set.
+            //
+            // A draft is not a plan: nobody kept it, and the thread it was
+            // built in is gone. This is the one place a timer may remove a
+            // trip, and it is why the detach below still exists — what the
+            // traveller kept is released, not destroyed.
+            delete_drafts_within(&conn, &doomed_ids)?;
             detach_trips_within(&conn, &doomed_ids)?;
             let gone = conn.execute(
                 &format!("DELETE FROM conversations {doomed}"),
@@ -3137,6 +3143,33 @@ fn detach_trips_within(conn: &Connection, conversation_ids: &[i64]) -> Result<us
     let holes = ["?"].repeat(conversation_ids.len()).join(", ");
     Ok(conn.execute(
         &format!("UPDATE trips SET conversation_id = NULL WHERE conversation_id IN ({holes})"),
+        duckdb::params_from_iter(conversation_ids.iter()),
+    )?)
+}
+
+/// Removes the unkept drafts owned by these conversations, with their
+/// segments and parked options.
+///
+/// Children before parents, or the subquery finds nothing. Guards the empty
+/// slice for the same reason `detach_trips_within` does: `IN ()` is a parser
+/// error, and the ordinary hourly sweep expires nothing.
+fn delete_drafts_within(conn: &Connection, conversation_ids: &[i64]) -> Result<usize> {
+    if conversation_ids.is_empty() {
+        return Ok(0);
+    }
+    let holes = ["?"].repeat(conversation_ids.len()).join(", ");
+    let doomed =
+        format!("(SELECT id FROM trips WHERE NOT kept AND conversation_id IN ({holes}))");
+    conn.execute(
+        &format!("DELETE FROM segment_candidates WHERE trip_id IN {doomed}"),
+        duckdb::params_from_iter(conversation_ids.iter()),
+    )?;
+    conn.execute(
+        &format!("DELETE FROM trip_segments WHERE trip_id IN {doomed}"),
+        duckdb::params_from_iter(conversation_ids.iter()),
+    )?;
+    Ok(conn.execute(
+        &format!("DELETE FROM trips WHERE NOT kept AND conversation_id IN ({holes})"),
         duckdb::params_from_iter(conversation_ids.iter()),
     )?)
 }
@@ -6336,6 +6369,13 @@ CREATE TABLE conversations (
         let a = s.account_for_telegram(11).unwrap();
         let stale = s.start_conversation(a, "direct").unwrap();
         let trip = s.upsert_trip(a, "Japan in spring", None, None, Some(stale)).unwrap();
+        // Kept, because that is now what makes a trip a plan. When this test
+        // was written every trip was one; since drafts arrived, a trip
+        // nobody kept is scratch work the timer is *supposed* to clear — see
+        // `expiry_deletes_the_draft_and_lets_the_kept_trip_go_free`. Drop
+        // this line and the test fails for the right reason: it would be
+        // asking the timer to spare scratch work, not a plan.
+        s.keep_trip(a, "Japan in spring").unwrap();
         s.conn()
             .execute_batch(&format!(
                 "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(72 * 3600) WHERE id = {stale};"
@@ -6347,6 +6387,65 @@ CREATE TABLE conversations (
         assert_eq!(gone, 1, "the stale thread expired");
         assert!(s.find_trip(a, "Japan in spring").unwrap().is_some(), "a timer must never destroy a travel plan");
         assert_eq!(s.trip_owner(trip.id).unwrap(), None, "and the dead link is released");
+    }
+
+    #[test]
+    fn expiry_deletes_the_draft_and_lets_the_kept_trip_go_free() {
+        // Both outcomes in one test on purpose: split into two, either can
+        // be satisfied by treating every trip alike, which is precisely the
+        // mistake this distinction exists to prevent. A timer must never
+        // destroy a plan — and a draft nobody kept is exactly what a timer
+        // should clean up.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let stale = store.start_conversation(account, "direct").unwrap();
+
+        let draft = store.upsert_trip(account, "Draft loop", None, None, Some(stale)).unwrap();
+        let plan = store.upsert_trip(account, "Japan in spring", None, None, Some(stale)).unwrap();
+        store.keep_trip(account, "Japan in spring").unwrap();
+        // The draft gets a leg with an option parked on it, because a delete
+        // that takes the `trips` row and leaves its children behind is a leak
+        // no read path can ever reach — `find_trip` alone would not notice.
+        store.add_segment(draft.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        store
+            .add_candidate(
+                draft.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL861", 940.0),
+                false,
+            )
+            .unwrap();
+        // A formatted literal interval rather than a bound one: a
+        // parameterised `to_seconds(CAST(? AS INTEGER))` fails to bind on a
+        // cold connection — the failure `issue_login_token` documents.
+        store
+            .conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(72 * 3600) WHERE id = {stale};"
+            ))
+            .unwrap();
+
+        assert_eq!(store.expire_conversations(48 * 3600, &[]).unwrap(), 1);
+
+        assert!(
+            store.find_trip(account, "Draft loop").unwrap().is_none(),
+            "an unkept draft goes with the thread that made it"
+        );
+        let kept = store.find_trip(account, "Japan in spring").unwrap();
+        assert!(kept.is_some(), "a timer must never destroy a plan the traveller kept");
+        assert_eq!(store.trip_owner(plan.id).unwrap(), None, "and its dead link is released");
+
+        let conn = store.conn();
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM trip_segments WHERE trip_id = ?)
+                      + (SELECT count(*) FROM segment_candidates WHERE trip_id = ?)",
+                params![draft.id, draft.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "the draft's segments and parked options went with it");
     }
 
     #[test]

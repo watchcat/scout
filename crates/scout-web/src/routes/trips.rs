@@ -1,4 +1,4 @@
-//! The visual trip planner's small JSON surface.
+//! The visual trip planner's small authenticated web surface.
 //!
 //! It reads the itinerary Scout already stores and lets the traveller settle
 //! an existing candidate. Searching, adding routes and pricing still happen in
@@ -6,8 +6,8 @@
 
 use super::chat::{admitted_account, csrf_header_ok};
 use super::sorry;
-use crate::AuthState;
-use axum::http::{HeaderMap, StatusCode};
+use crate::{trip_pdf, AuthState};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -15,12 +15,66 @@ use axum::Router;
 pub fn routes(auth: AuthState) -> Router {
     Router::new()
         .route("/chat/trips", get(list))
+        .route("/chat/trips/pdf", post(pdf))
         .route("/chat/trips/choice", post(choose))
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             super::only_from_our_own_pages,
         ))
         .with_state(auth)
+}
+
+#[derive(serde::Deserialize)]
+struct PdfIn {
+    trip: String,
+}
+
+async fn pdf(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<PdfIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if !auth.pdf_by_account.allow(&account_id.to_string()) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let plan = match scout_core::trips::find(&auth.core, account_id, &body.trip).await {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not read trip for PDF");
+            return sorry();
+        }
+    };
+    let filename = trip_pdf::filename(&plan.trip.name);
+    match trip_pdf::render(&plan).await {
+        Ok(bytes) => {
+            let mut response = bytes.into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/pdf"),
+            );
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+                    .expect("the PDF filename is ASCII and header-safe"),
+            );
+            response
+        }
+        Err(trip_pdf::Error::Busy) => StatusCode::TOO_MANY_REQUESTS.into_response(),
+        Err(trip_pdf::Error::Timeout) => StatusCode::GATEWAY_TIMEOUT.into_response(),
+        Err(trip_pdf::Error::InputTooLarge) => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, trip = %plan.trip.name, "could not render trip PDF");
+            sorry()
+        }
+    }
 }
 
 async fn list(
@@ -155,6 +209,67 @@ mod tests {
             2
         );
         assert!(body[0]["not_ready"].as_str().unwrap().contains("2 options"));
+    }
+
+    #[tokio::test]
+    async fn a_trip_pdf_is_a_named_private_download() {
+        let (app, _core, _dir, _account, cookie, csrf) = setup().await;
+        let refused = post_json(
+            &app,
+            "/chat/trips/pdf",
+            &cookie,
+            None,
+            r#"{"trip":"October"}"#,
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        if !crate::trip_pdf::available() {
+            return;
+        }
+        let res = post_json(
+            &app,
+            "/chat/trips/pdf",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October"}"#,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "application/pdf");
+        assert_eq!(
+            res.headers()["content-disposition"],
+            "attachment; filename=\"october-itinerary.pdf\""
+        );
+        assert_eq!(res.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(res.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+    }
+
+    #[tokio::test]
+    async fn one_account_cannot_export_another_accounts_trip() {
+        let (app, core, _dir, _owner, _cookie, _csrf) = setup().await;
+        let scout_core::identity::SignIn::In { account_id } =
+            scout_core::identity::sign_in(&core, "telegram", "888")
+                .await
+                .unwrap()
+        else {
+            panic!("the round should admit the second account");
+        };
+        let cookie = crate::session::mint(TEST_KEY, account_id, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, account_id);
+
+        let res = post_json(
+            &app,
+            "/chat/trips/pdf",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

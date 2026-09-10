@@ -293,6 +293,15 @@ export function savedFareQualifier(source) {
     : { prefix: '', note: 'when saved' }
 }
 
+export function tripPdfFilename(name) {
+  const stem = String(name).toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 60)
+    .replace(/-$/, '')
+  return `${stem || 'trip'}-itinerary.pdf`
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')
@@ -645,7 +654,12 @@ function start() {
       node('h2', 'trip-title', trip.name),
       node('p', 'trip-subtitle', `${trip.adults} ${trip.adults === 1 ? 'traveller' : 'travellers'} · ${trip.cabin_class ?? 'Cabin not set'}`),
     )
-    head.append(title, node('span', `status-chip ${trip.status}`, trip.status))
+    const actions = node('div', 'trip-head-actions')
+    const download = node('button', 'trip-download', 'Download PDF')
+    download.type = 'button'
+    download.addEventListener('click', () => downloadTripPdf(trip, download))
+    actions.append(node('span', `status-chip ${trip.status}`, trip.status), download)
+    head.append(title, actions)
     tripDetail.append(head)
     if (trip.segments.length) tripDetail.append(renderOverview(trip))
 
@@ -710,6 +724,34 @@ function start() {
     } finally {
       tripChoicePending = false
       tripDetail.removeAttribute('aria-busy')
+    }
+  }
+
+  async function downloadTripPdf(trip, button) {
+    if (button.disabled) return
+    const label = button.textContent
+    button.disabled = true
+    button.setAttribute('aria-busy', 'true')
+    button.textContent = 'Preparing…'
+    try {
+      const res = await post('/chat/trips/pdf', { trip: trip.name })
+      if (!res.ok) throw new Error('PDF request failed')
+      const url = URL.createObjectURL(await res.blob())
+      const link = document.createElement('a')
+      link.href = url
+      link.download = tripPdfFilename(trip.name)
+      document.body.append(link)
+      link.click()
+      link.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      showTripToast('Trip PDF downloaded.')
+    } catch {
+      showTripToast('Could not create the PDF. Try again in a moment.')
+    } finally {
+      button.disabled = false
+      button.removeAttribute('aria-busy')
+      button.textContent = label
+      button.focus()
     }
   }
 

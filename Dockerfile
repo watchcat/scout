@@ -29,6 +29,8 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 chromium fonts-liberation tini \
+    && chmod 4755 /usr/lib/chromium/chrome-sandbox \
+    && test -u /usr/lib/chromium/chrome-sandbox \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m scout \
     && mkdir -p /data \

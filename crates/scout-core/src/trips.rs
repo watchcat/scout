@@ -5,7 +5,8 @@
 //! handle live offers: those remain flight-agent responsibilities.
 
 use crate::core::{blocking, Core};
-use crate::store::{CandidateChoice, ExpectedSegment, NewCandidate, Trip};
+use crate::store::{CandidateChoice, ExpectedSegment, NewCandidate};
+pub use crate::store::{Trip, TripCandidate, TripSegment};
 
 /// A trip plus the same readiness and connection warnings the flight agent
 /// sees. One representation keeps chat and the visual client from disagreeing
@@ -48,6 +49,19 @@ pub async fn list(core: &Core, account_id: i64) -> anyhow::Result<Vec<Plan>> {
         store
             .list_trips(account_id)
             .map(|trips| trips.into_iter().map(Plan::from_trip).collect())
+    })
+    .await
+}
+
+/// One durable trip by the name the traveller gave it, scoped to their
+/// account. The store performs the same case-insensitive lookup as chat.
+pub async fn find(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Option<Plan>> {
+    let store = core.store();
+    let name = name.to_string();
+    blocking(move || {
+        store
+            .find_trip(account_id, &name)
+            .map(|trip| trip.map(Plan::from_trip))
     })
     .await
 }
@@ -179,5 +193,23 @@ mod tests {
             choose(&core, stranger, "October", 1, 1).await.unwrap(),
             Selection::TripNotFound,
         );
+    }
+
+    #[tokio::test]
+    async fn one_trip_lookup_is_case_insensitive_and_account_scoped() {
+        let (core, _dir, owner) = core().await;
+        seed_trip_for_tests(&core, owner, "October").await.unwrap();
+        let stranger = core.store().account_for_telegram(22).unwrap();
+
+        assert_eq!(
+            find(&core, owner, "october")
+                .await
+                .unwrap()
+                .unwrap()
+                .trip
+                .name,
+            "October"
+        );
+        assert!(find(&core, stranger, "October").await.unwrap().is_none());
     }
 }

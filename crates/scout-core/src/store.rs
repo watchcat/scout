@@ -2727,10 +2727,10 @@ impl Store {
         Ok(true)
     }
 
-    /// Appends when `position` is None, otherwise inserts there and shifts the
-    /// rest down. Candidates move with their segment: they are keyed by
-    /// position, so a shift that forgot them would reattach somebody's chosen
-    /// flight to a different route.
+    /// Inserts at `position` and shifts the rest down; without one the leg
+    /// goes where its date belongs. Candidates move with their segment: they
+    /// are keyed by position, so a shift that forgot them would reattach
+    /// somebody's chosen flight to a different route.
     pub fn add_segment(
         &self,
         trip_id: i64,
@@ -3196,8 +3196,9 @@ enum Inserted {
     NoSuchPlace { count: i64, wanted: i64 },
 }
 
-/// Adds a leg, appending when `position` is None and otherwise inserting
-/// there and shifting the rest down.
+/// Adds a leg, inserting at `position` and shifting the rest down. Without
+/// a position the leg goes where its date belongs, which for a trip built
+/// front to back is the end and is the same answer appending gave.
 ///
 /// A position outside 1..=count+1 comes back as `NoSuchPlace` instead of an
 /// error because its two callers disagree about what it means — see
@@ -3232,7 +3233,31 @@ fn add_segment_within(
         Some(p) if p >= 1 && p <= count => p,
         Some(p) if p == count + 1 => p,
         Some(wanted) => return Ok(Inserted::NoSuchPlace { count, wanted }),
-        None => count + 1,
+        // Where the date belongs, not the end. Appending regardless of date
+        // is how a traveller who added a leg dated before their first one
+        // ended up with it last: dates_run_forwards then saw the disorder
+        // and refused to price the trip at all, so the system knew the order
+        // was wrong and would not fix it.
+        //
+        // The place is ahead of the first leg that leaves after this one, or
+        // the end when none does. Comparing the dates as text is comparing
+        // them as dates for as long as every one is zero-padded YYYY-MM-DD,
+        // which `calendar_date` establishes at the tool boundary and
+        // `dates_run_forwards` already relies on.
+        //
+        // Strictly after, so a leg sharing its date with legs already here
+        // lands behind them. There is nothing better to break that tie with:
+        // the obvious answer, departure time, does not exist yet — a
+        // brand-new leg carries no candidates, and a candidate is the only
+        // thing that ever gives a leg a time of day.
+        None => conn
+            .query_row(
+                "SELECT min(position) FROM trip_segments
+                 WHERE trip_id = ? AND departure_date > ?",
+                params![trip_id, departure_date],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .unwrap_or(count + 1),
     };
     if at <= count {
         // Descending is not needed: DuckDB applies this set-wise, so no
@@ -4934,6 +4959,210 @@ CREATE TABLE trips (
 
         // A position nobody has is refused rather than silently doing nothing.
         assert!(store.drop_segment(trip.id, 9).is_err());
+    }
+
+    /// Every leg of a trip as (position, origin, date), for reading an
+    /// assertion failure without decoding a struct.
+    fn legs(trip: &Trip) -> Vec<(i64, &str, &str)> {
+        trip.segments
+            .iter()
+            .map(|s| (s.position, s.origin.as_str(), s.departure_date.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_leg_added_with_no_position_lands_where_its_date_belongs() {
+        // The traveller who has already planned September 3rd and 7th and
+        // then remembers the hop that gets them to AMS on the 1st. Appending
+        // put it last, and dates_run_forwards then refused to price the trip
+        // at all: the system could see the order was wrong and would not fix
+        // it.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
+        for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
+            store.add_segment(trip.id, None, o, d, date).unwrap();
+        }
+
+        let trip = store.add_segment(trip.id, None, "BER", "AMS", "2026-09-01").unwrap();
+        assert_eq!(
+            legs(&trip),
+            vec![
+                (1, "BER", "2026-09-01"),
+                (2, "AMS", "2026-09-03"),
+                (3, "LIS", "2026-09-07"),
+            ],
+            "a leg dated before the first one belongs first, not last"
+        );
+
+        // And in the middle, ahead of the first leg that leaves after it.
+        let trip = store.add_segment(trip.id, None, "FCO", "MAD", "2026-09-05").unwrap();
+        assert_eq!(
+            legs(&trip),
+            vec![
+                (1, "BER", "2026-09-01"),
+                (2, "AMS", "2026-09-03"),
+                (3, "FCO", "2026-09-05"),
+                (4, "LIS", "2026-09-07"),
+            ],
+            "a leg dated between two others belongs between them"
+        );
+    }
+
+    #[test]
+    fn a_leg_dated_after_every_other_one_still_goes_last() {
+        // The ordinary case, and the reason this change is safe: a trip
+        // built front to back gets exactly the positions appending gave it.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
+        for (o, d, date) in [
+            ("AMS", "LIS", "2026-09-03"),
+            ("LIS", "FCO", "2026-09-07"),
+            ("FCO", "AMS", "2026-09-11"),
+        ] {
+            store.add_segment(trip.id, None, o, d, date).unwrap();
+        }
+        assert_eq!(
+            legs(&store.find_trip(7, "September").unwrap().unwrap()),
+            vec![
+                (1, "AMS", "2026-09-03"),
+                (2, "LIS", "2026-09-07"),
+                (3, "FCO", "2026-09-11"),
+            ],
+            "building a trip in date order must be untouched by this"
+        );
+    }
+
+    #[test]
+    fn a_leg_sharing_a_date_goes_behind_the_legs_already_on_it() {
+        // A same-day connection is an ordinary thing, and the tie cannot be
+        // broken by time of day: a leg that has just been added carries no
+        // candidates, so nothing about it says when it leaves. Last on its
+        // date is the only answer available, and it is also the one the
+        // traveller typing legs in order expects.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
+        for (o, d, date) in [
+            ("AMS", "LIS", "2026-09-03"),
+            ("LIS", "FCO", "2026-09-03"),
+            ("FCO", "AMS", "2026-09-09"),
+        ] {
+            store.add_segment(trip.id, None, o, d, date).unwrap();
+        }
+
+        let trip = store.add_segment(trip.id, None, "FCO", "MAD", "2026-09-03").unwrap();
+        assert_eq!(
+            legs(&trip),
+            vec![
+                (1, "AMS", "2026-09-03"),
+                (2, "LIS", "2026-09-03"),
+                (3, "FCO", "2026-09-03"),
+                (4, "FCO", "2026-09-09"),
+            ],
+            "the new leg goes after the legs already on its date, and before the later one"
+        );
+    }
+
+    #[test]
+    fn an_explicit_position_still_means_that_position_whatever_the_date_says() {
+        // Callers that know where a leg goes keep saying so — the browser's
+        // stale-tab guard is built on a position meaning exactly one row.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
+        for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
+            store.add_segment(trip.id, None, o, d, date).unwrap();
+        }
+
+        let trip = store.add_segment(trip.id, Some(3), "BER", "AMS", "2026-09-01").unwrap();
+        assert_eq!(
+            legs(&trip),
+            vec![
+                (1, "AMS", "2026-09-03"),
+                (2, "LIS", "2026-09-07"),
+                (3, "BER", "2026-09-01"),
+            ],
+            "an explicit position is an instruction, not a hint"
+        );
+    }
+
+    #[test]
+    fn a_trip_built_in_any_order_never_reads_as_running_backwards() {
+        // The failure this fixes, stated as the check that reported it:
+        // dates_run_forwards is what made such a trip un-priceable, so the
+        // legs arriving in the worst possible order must leave it silent.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
+        for (o, d, date) in [
+            ("FCO", "AMS", "2026-09-11"),
+            ("AMS", "LIS", "2026-09-03"),
+            ("LIS", "FCO", "2026-09-07"),
+            ("BER", "AMS", "2026-09-01"),
+        ] {
+            store.add_segment(trip.id, None, o, d, date).unwrap();
+        }
+        let trip = store.find_trip(7, "September").unwrap().unwrap();
+        assert_eq!(
+            crate::tools::trips::dates_run_forwards(&trip.segments),
+            Ok(()),
+            "legs added in any order must still read as one journey: {:?}",
+            legs(&trip)
+        );
+    }
+
+    #[test]
+    fn a_leg_inserted_by_its_date_carries_every_parked_option_with_its_segment() {
+        // The hazard the date-ordered insert inherits from the explicit one:
+        // segment_candidates is keyed by (trip_id, position), so a shift that
+        // moved segments and not their candidates would hand somebody's
+        // chosen flight to a different city pair while the trip still looked
+        // perfectly well-formed. The traveller does not have to ask for an
+        // insert to be exposed to it any more — a date does it for them.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
+        for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
+            store.add_segment(trip.id, None, o, d, date).unwrap();
+        }
+        store
+            .add_candidate(
+                trip.id,
+                1,
+                ExpectedSegment { origin: "AMS", destination: "LIS", departure_date: Some("2026-09-03") },
+                candidate("KLM", "KL1693", 180.0),
+                true,
+            )
+            .unwrap();
+        store
+            .add_candidate(
+                trip.id,
+                2,
+                ExpectedSegment { origin: "LIS", destination: "FCO", departure_date: Some("2026-09-07") },
+                candidate("TAP", "TP830", 120.0),
+                true,
+            )
+            .unwrap();
+
+        // No position given: the date puts this at the front, and both
+        // existing legs shift down.
+        let trip = store.add_segment(trip.id, None, "BER", "AMS", "2026-09-01").unwrap();
+        let by_route: Vec<(&str, &str, Vec<&str>)> = trip
+            .segments
+            .iter()
+            .map(|s| {
+                (
+                    s.origin.as_str(),
+                    s.destination.as_str(),
+                    s.candidates.iter().map(|c| c.flight_numbers.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_route,
+            vec![
+                ("BER", "AMS", vec![]),
+                ("AMS", "LIS", vec!["KL1693"]),
+                ("LIS", "FCO", vec!["TP830"]),
+            ],
+            "each parked option must move with its own route, not stay pinned to its old position"
+        );
     }
 
     #[test]

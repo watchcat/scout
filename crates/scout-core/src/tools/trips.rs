@@ -803,8 +803,9 @@ impl Tool for AddTripSegmentTool {
          new. Use this to build a multi-city itinerary the traveller is \
          planning across several messages. A segment is one direction on one \
          date: a return is two segments. Airports are 3-letter IATA codes, \
-         dates are YYYY-MM-DD. Segments are numbered from 1 in travel order; \
-         pass position to insert rather than append."
+         dates are YYYY-MM-DD. Segments are numbered from 1 in travel order, \
+         and a leg with no position lands where its date puts it; pass \
+         position only to override that."
             .to_string()
     }
 
@@ -816,7 +817,7 @@ impl Tool for AddTripSegmentTool {
                 "origin": {"type": "string", "description": "3-letter IATA code"},
                 "destination": {"type": "string", "description": "3-letter IATA code"},
                 "departure_date": {"type": "string", "description": "YYYY-MM-DD"},
-                "position": {"type": "integer", "description": "insert at this 1-based position; omit to append"},
+                "position": {"type": "integer", "description": "insert at this 1-based position; omit to let the departure date decide"},
                 "adults": {"type": "integer", "description": "passengers for the whole trip; 1 on a new trip, otherwise left as it was unless given"},
                 "cabin_class": {"type": "string", "description": "economy, premium_economy, business or first, for the whole trip"}
             },
@@ -2132,6 +2133,13 @@ mod tests {
         let add = AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 };
         let park = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 };
         // Both legs decided, so the only thing left wrong is their order.
+        //
+        // The positions are stated because a leg added without one now goes
+        // where its date belongs, which would sort these two as they were
+        // added and leave nothing for not_ready to report. A backwards trip
+        // is still reachable — by asking for one here, or by moving a date
+        // with update_segment afterwards — so the check still has work to
+        // do, and this is the shortest way to hand it that work.
         for (position, o, d, date, offer) in [
             (1, "AMS", "HKG", "2026-09-19", "out"),
             (2, "HKG", "NRT", "2026-09-15", "on"),
@@ -2141,7 +2149,7 @@ mod tests {
                 origin: o.into(),
                 destination: d.into(),
                 departure_date: date.into(),
-                position: None,
+                position: Some(position),
                 adults: None,
                 cabin_class: None,
             })

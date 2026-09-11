@@ -298,6 +298,31 @@
   .trip-download:hover{background:rgba(42,161,152,.1); color:var(--base2); text-decoration:none}
   .trip-download:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
   .trip-download:disabled{cursor:wait; opacity:.72}
+  /* Round and icon-only, unlike the two text pills beside it — see where
+     this is built in `renderTripDetail` for why the shape, not just the
+     colour, has to be different. */
+  .trip-delete-button{display:inline-grid; place-items:center; width:28px; height:28px;
+    margin-top:5px; border:1px solid var(--line); border-radius:50%; background:transparent;
+    color:var(--base01); font-size:17px; line-height:1; cursor:pointer}
+  .trip-delete-button:hover{color:#ff817a; border-color:var(--red)}
+  .trip-delete-button:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
+  /* `.trip-alert`'s shape with `.join-card.danger`'s red border: this is a
+     warning, not routine trip info, and needs to keep reading as one even
+     though it sits in the same slot a routine alert could occupy. */
+  .trip-delete-confirm{margin:0 0 18px; padding:12px 15px; border:1px solid var(--red);
+    border-radius:12px; background:rgba(220,50,47,.09)}
+  .trip-delete-confirm p{margin:0 0 11px; color:#ff817a; font-size:13.5px; line-height:1.5}
+  .trip-delete-confirm-row{display:flex; gap:8px}
+  .trip-delete-confirm-row button{background:transparent; border:1px solid var(--line);
+    border-radius:8px; color:var(--base1); font:inherit; font-size:12.5px; font-weight:650;
+    padding:7px 12px; cursor:pointer}
+  .trip-delete-confirm-row button:hover{color:var(--base2)}
+  .trip-delete-confirm-row button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  /* `#ff817a`, not `--red`: the same shade `.segment-remove-confirm
+     button.danger` and `.join-card.danger` already use because `--red` on
+     this background fails contrast at this text size. */
+  .trip-delete-confirm-row button.danger{border-color:var(--red); color:#ff817a}
+  .trip-delete-confirm-row button:disabled{opacity:.6; cursor:default}
   .trip-overview{margin-bottom:16px; padding:18px; border:1px solid var(--line); border-radius:16px;
     background:linear-gradient(135deg,rgba(7,54,66,.95),rgba(5,45,55,.7));
     box-shadow:0 10px 32px rgba(0,0,0,.16)}

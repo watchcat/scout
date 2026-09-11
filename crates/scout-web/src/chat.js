@@ -841,8 +841,25 @@ function start() {
     download.type = 'button'
     download.addEventListener('click', () => downloadTripPdf(trip, download))
     actions.append(node('span', `status-chip ${trip.status}`, trip.status), download)
+    // Round and icon-only where `.trip-keep`/`.trip-download` are text
+    // pills, and last in the row: a third pill reading "Delete" among them
+    // is exactly the "destructive control beside a similar one" the
+    // kept-trips spec declined this feature over, so the shape has to be
+    // the thing that tells them apart, not just a colour. It opens
+    // `deleteSlot` below rather than swapping itself out in place, the way
+    // `segmentRemoveButton` does — the confirm needs room for a full
+    // sentence, and a header pill's worth of space is not that.
+    const deleteButton = node('button', 'trip-delete-button', '×')
+    deleteButton.type = 'button'
+    deleteButton.setAttribute('aria-label', `Delete ${trip.name}`)
+    actions.append(deleteButton)
     head.append(title, actions)
     tripDetail.append(head)
+    const deleteSlot = node('div', 'trip-delete-slot')
+    tripDetail.append(deleteSlot)
+    deleteButton.addEventListener('click', () => {
+      deleteSlot.replaceChildren(tripDeleteConfirm(trip, deleteSlot))
+    })
     if (trip.segments.length) tripDetail.append(renderOverview(trip))
 
     const readiness = node('div', trip.not_ready ? 'trip-alert' : 'trip-alert ready')
@@ -867,6 +884,39 @@ function start() {
     }
     tripDetail.append(stack)
     tripDetail.append(renderAddLegForm(trip))
+  }
+
+  // A second press, not `window.confirm`, for the reason `removeConfirmRow`
+  // gives — but built as its own block below the header rather than in
+  // place of the × that opened it: `tripDeleteConsequence` can run to a full
+  // sentence ("Its 2 legs and 5 saved flight options go with it."), and that
+  // needs a paragraph, not the width of one header pill. Styled like
+  // `.trip-alert` with the border `.join-card.danger` uses, so it reads as a
+  // warning rather than routine trip info sitting under the title.
+  function tripDeleteConfirm(trip, slot) {
+    const box = node('div', 'trip-delete-confirm')
+    box.append(node('p', '', `Delete this trip? ${tripDeleteConsequence(trip)}`))
+    const row = node('div', 'trip-delete-confirm-row')
+    const cancel = document.createElement('button')
+    cancel.type = 'button'
+    cancel.textContent = 'Cancel'
+    cancel.addEventListener('click', () => slot.replaceChildren())
+    const confirm = document.createElement('button')
+    confirm.type = 'button'
+    confirm.className = 'danger'
+    confirm.textContent = 'Delete trip'
+    confirm.addEventListener('click', () => {
+      confirm.disabled = true
+      cancel.disabled = true
+      deleteTrip(trip).then((restore) => {
+        if (restore) slot.replaceChildren(tripDeleteConfirm(trip, slot))
+      }).catch(() => {
+        slot.replaceChildren(tripDeleteConfirm(trip, slot))
+      })
+    })
+    row.append(cancel, confirm)
+    box.append(row)
+    return box
   }
 
   // Always appends: the markup for choosing where in the itinerary a leg
@@ -995,6 +1045,57 @@ function start() {
     } catch {
       button.disabled = false
       showTripToast('Could not keep that trip. Try again.')
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+    }
+  }
+
+  // Returns whether `tripDeleteConfirm` should be rebuilt in the slot it
+  // came from — the same convention `removeLeg` uses, and true for the same
+  // reason: only a response that actually rewrote the account's trips (200,
+  // or the reload a 404 triggers) is allowed to leave the confirm gone for
+  // good. `trip` here is always `currentTrip` — the × that opens the
+  // confirm lives in this trip's own header, not the list — so the response
+  // naming what is left can never describe a trip other than the one just
+  // shown, which is what decides where the selection lands below.
+  async function deleteTrip(trip) {
+    if (tripChoicePending) return true
+    tripChoicePending = true
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    try {
+      const res = await fetch('/chat/trips', {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body: deleteTripBody(trip.name),
+      })
+      if (res.status === 404) {
+        // Already gone — a second tab, or a second press racing the first.
+        // Same move `keepTrip` makes for the same status: there is nothing
+        // left to argue with the server about, so ask it what remains.
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        showTripToast('That trip is already gone.')
+        return false
+      }
+      if (!res.ok) throw new Error('refused')
+      trips = await res.json()
+      tripCount.textContent = String(trips.length)
+      tripCount.hidden = trips.length === 0
+      // The deleted trip cannot still be in `trips` — see above — so this
+      // is the same fallback `loadTrips` uses for a selection that isn't
+      // there any more: first trip in the list, or the empty state
+      // `renderTripDetail` already draws when `trips` is empty.
+      currentTrip = trips[0]?.name ?? null
+      renderTripList()
+      renderTripDetail()
+      showTripToast(`${trip.name} deleted.`)
+      return false
+    } catch {
+      showTripToast('Could not delete that trip. Try again.')
+      return true
     } finally {
       tripChoicePending = false
       tripDetail.removeAttribute('aria-busy')

@@ -6,7 +6,7 @@ import {
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
   tripPdfFilename,
-  composerTarget, removeLegBody, keepBody,
+  composerTarget, removeLegBody, keepBody, deleteTripBody, tripDeleteConsequence,
 } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
@@ -372,4 +372,58 @@ test('a keep sends only the name, nothing a stale tab could get wrong', () => {
   // already-kept trip still succeeds server-side, so a second press racing
   // the first has nothing to disagree with the server about.
   assert.deepEqual(JSON.parse(keepBody('Atlantic loop')), { trip: 'Atlantic loop' })
+})
+
+test('a trip delete sends only the name, like keepBody and unlike removeLegBody', () => {
+  // Same shape as `keepBody` and the same reason: `DeleteTripIn` is
+  // `deny_unknown_fields`, so this must carry nothing that overlaps
+  // `removeLegBody`'s `position` for the server's refusal of that to mean
+  // anything.
+  assert.deepEqual(JSON.parse(deleteTripBody('Atlantic loop')), { trip: 'Atlantic loop' })
+})
+
+test('an empty draft says there is nothing to lose', () => {
+  assert.equal(tripDeleteConsequence({ segments: [] }), 'Nothing is saved on it yet.')
+  // No `segments` key at all — the shape a trip with none can arrive in.
+  assert.equal(tripDeleteConsequence({}), 'Nothing is saved on it yet.')
+  // Nothing on screen yet at all, not just an empty trip.
+  assert.equal(tripDeleteConsequence(null), 'Nothing is saved on it yet.')
+})
+
+test('one leg with nothing saved on it is singular, not "1 legs"', () => {
+  const trip = { segments: [{ candidates: [] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 1 leg goes with it.')
+})
+
+test('several legs with nothing saved use the plural and "go", not "goes"', () => {
+  const trip = { segments: [{ candidates: [] }, { candidates: [] }, { candidates: [] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 3 legs go with it.')
+})
+
+test('one leg and its one saved option are both singular', () => {
+  const trip = { segments: [{ candidates: [{ candidate: 1 }] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 1 leg and 1 saved flight option go with it.')
+})
+
+test('one leg with several saved options pluralizes only the options', () => {
+  const trip = { segments: [{ candidates: [{ candidate: 1 }, { candidate: 2 }, { candidate: 3 }] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 1 leg and 3 saved flight options go with it.')
+})
+
+test('several legs and their several saved options are both plural', () => {
+  // The afternoon-of-price-research case this confirm exists to name.
+  const trip = {
+    segments: [
+      { candidates: [{ candidate: 1 }, { candidate: 2 }] },
+      { candidates: [{ candidate: 1 }, { candidate: 2 }, { candidate: 3 }] },
+    ],
+  }
+  assert.equal(tripDeleteConsequence(trip), 'Its 2 legs and 5 saved flight options go with it.')
+})
+
+test('a segment with no candidates array at all counts as zero options, not a crash', () => {
+  // `renderSegment` always sets `candidates`, but the consequence helper
+  // reads trips straight from the wire and should not assume that.
+  const trip = { segments: [{}, { candidates: [{ candidate: 1 }] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 2 legs and 1 saved flight option go with it.')
 })

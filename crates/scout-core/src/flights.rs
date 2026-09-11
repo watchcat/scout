@@ -58,6 +58,14 @@ prompt. Asked on 2026-09-10, '23 September' is 2026-09-23 and never \
 has already gone: the providers refuse it - departure_date_in_past - and \
 the search is spent either way. That is measured, not hypothetical: eight \
 of one traveller's searches went out for a September that was already over.
+- When the brief names a trip, call show_trip with that name first and \
+work from what it returns. The legs, their dates, the passengers and the \
+cabin are all stored on it and reading them costs nothing, so a route \
+that is on a trip is NOT one of those missing things either: never \
+report it missing, and never ask for a leg that is already stored to be \
+described back to you. Asked to check the flights for the legs already \
+added, the desk asked for the whole route instead of reading the trip \
+that held it.
 - When the brief says the dates are flexible, or asks whether another day \
 is cheaper, pass flex_days (max 3) instead of searching each date \
 yourself: it prices the whole window in one call. Do NOT pass flex_days \
@@ -230,7 +238,10 @@ pub fn ask_flights(
                       airport codes, booking a flight, or a trip being planned. It sees nothing \
                       of the conversation, so the brief must be self-contained: route, \
                       dates, passengers, cabin, whether the dates are flexible, and any \
-                      offer id the user is pointing at. It returns findings - the real \
+                      offer id the user is pointing at. Naming a trip is itself a \
+                      complete brief - the desk reads the trip and has every leg, date \
+                      and passenger count from it - so never ask the user to repeat \
+                      something a trip already holds. It returns findings - the real \
                       search and booking results - plus guidance on presenting them."
             .to_string(),
         agent: build_flight_agent(d, run, facts, budget),
@@ -566,7 +577,13 @@ mod tests {
         // only half that can honour it. Without the rule the traveller is
         // asked, says yes, and nothing happens - the same shape of bug as
         // the unbuilt trip this feature exists to fix.
-        for word in ["flex_days", "add_trip_segment", "keep_trip", "IATA", "no prices", "what is missing", "cannot book"] {
+        // The phrase rather than the bare tool name for the trip-reading
+        // rule: show_trip is named twice in this prompt, so a scan for the
+        // word alone stays green after the rule that makes the desk READ a
+        // named trip is gone. That rule is the fix for a production turn in
+        // which the desk, asked about the legs already added, asked for the
+        // whole route to be typed out again rather than looking it up.
+        for word in ["flex_days", "add_trip_segment", "keep_trip", "IATA", "no prices", "what is missing", "cannot book", "call show_trip with that name first"] {
             assert!(FLIGHT_PREAMBLE.contains(word), "{word:?} is missing from the flight prompt");
         }
         // The desk has no earlier brief to reuse a fare from; expiry is a
@@ -650,6 +667,10 @@ mod tests {
         for word in ["route", "dates", "passengers", "offer id"] {
             assert!(d.contains(word), "the parent must be told to put {word:?} in the brief: {d}");
         }
+        // And that a trip name is one, or the list above reads as a demand
+        // for a route the parent does not have: in production it went and
+        // asked the traveller to recite legs that were already on the trip.
+        assert!(d.contains("Naming a trip is itself a complete brief"), "got: {d}");
         let p = rig::tool::Tool::parameters(&tool);
         assert_eq!(p["required"], serde_json::json!(["brief"]));
     }

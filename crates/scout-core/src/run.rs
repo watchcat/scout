@@ -189,7 +189,7 @@ pub async fn run_agent(
 
     // Partial text survives a dropped future: whatever the run wrote before
     // the deadline is still in `streamed`/`thinking` for the wrap-up.
-    let salvage = match outcome {
+    let mut salvage = match outcome {
         Ok(Ok(reason)) => reason,
         // Logged here rather than left to the channel: this is where the
         // conversation is known, and a channel that forgot would be silent
@@ -214,12 +214,39 @@ pub async fn run_agent(
     // input history*" — so assigning it here dropped the loaded prefix on
     // the floor, and the repair turns below then ran against a history that
     // had lost everything said before this question.
+    let history_returned = new_history.is_some();
     if let Some(h) = new_history {
         history.extend(h);
     }
     let mut reply = strip_thinking(&text);
     if reply.is_empty() {
         reply = strip_thinking(&streamed);
+    }
+    // A reply that was reasoning from its first character to its last.
+    // MiniMax wrapped a whole answer — Scout asking a traveller which
+    // segments they meant — in one `<think>` block; `strip_thinking` took
+    // all of it, and the empty string it left was handed to the channel as
+    // the answer. The reader got a blank message and the log got nothing at
+    // all, because an empty answer is not an error anywhere below here. One
+    // run in fifteen, and total when it happens.
+    //
+    // The text existed and was only misfiled as reasoning, so this is the
+    // interrupted run's situation — material but no write-up — and takes
+    // the interrupted run's path. `strip_thinking` is left exactly as it
+    // is: it is ruthless because a whole chain of thought, system prompt
+    // and all, once reached a chat, and that is the worse failure.
+    if reply.is_empty() && salvage.is_none() && has_notes(&thinking, &streamed) {
+        salvage = Some("that reply came back as reasoning instead of an answer");
+    }
+    // And when there is nothing to write up either, the model produced
+    // nothing at all: no answer, no reasoning, no text. The wrap-up is not
+    // called, because it would be a model call with a blank page in front
+    // of it and it is billed the same. An error rather than the empty
+    // string, because every channel has a sentence for a run that failed
+    // and none of them has one for a run that answered with nothing — the
+    // browser renders the blank as Scout's reply.
+    if reply.is_empty() && salvage.is_none() {
+        anyhow::bail!("the model produced no answer and no notes to write one from");
     }
 
     if let Some(reason) = salvage {
@@ -251,8 +278,20 @@ pub async fn run_agent(
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => anyhow::bail!("wrap-up timed out after the run was interrupted"),
         };
-        // Keep the exchange in context; the interrupted turns are lost.
-        history.push(LlmMessage::user(prompt));
+        // A write-up that is itself all reasoning, or empty, is a second
+        // blank — the thing this path exists to stop. An error is a message
+        // the reader sees; the empty string is silence.
+        if reply.is_empty() {
+            anyhow::bail!("the wrap-up came back with no answer in it either");
+        }
+        // Keep the exchange in context; the interrupted turns are lost. A
+        // run that reached its final response and is written up anyway —
+        // the all-reasoning reply above — already has its prompt in
+        // `history`, and pushing it again would show the question twice on
+        // a page that renders the thread back.
+        if !history_returned {
+            history.push(LlmMessage::user(prompt));
+        }
         history.push(LlmMessage::assistant(&reply));
     }
 
@@ -386,6 +425,21 @@ pub fn agent_error_message(e: &anyhow::Error) -> &'static str {
     } else {
         "Sorry, something went wrong on my side. Please try again."
     }
+}
+
+/// Whether the run left anything a write-up could be built from.
+///
+/// The model's own notes are its reasoning plus whatever text it streamed.
+/// With neither, the wrap-up agent would be handed a blank page and asked
+/// to answer from it — a model call that is billed like any other and can
+/// only invent. So a run that produced genuinely nothing fails instead,
+/// and only a run that produced *something* is written up.
+///
+/// A function rather than a condition inline, for the reason `new_since` is
+/// one: `run_agent` cannot be entered without a model, and this is the part
+/// of the decision that can be wrong.
+fn has_notes(thinking: &str, streamed: &str) -> bool {
+    !thinking.trim().is_empty() || !streamed.trim().is_empty()
 }
 
 /// The last `max` characters — the newest notes are the ones carrying
@@ -723,6 +777,162 @@ mod tests {
             "the run did not retract reasoning it had already sent"
         );
     }
+
+    /// The wire MiniMax speaks: one `data:` line per delta, the last of them
+    /// carrying the stop, then a usage-only chunk and `[DONE]`. Written out
+    /// rather than built with a helper from `rig`, because the shape of the
+    /// bytes is half of what these tests are pinning.
+    fn streamed_text(chunks: &[&str]) -> String {
+        let mut body = String::new();
+        for (i, text) in chunks.iter().enumerate() {
+            let stop = if i + 1 == chunks.len() { Some("stop") } else { None };
+            let delta = serde_json::json!({
+                "id": "c1",
+                "model": "m",
+                "choices": [{"delta": {"content": text, "tool_calls": []}, "finish_reason": stop}],
+                "usage": null,
+            });
+            body.push_str(&format!("data: {delta}\n\n"));
+        }
+        body.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n");
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    /// A stand-in MiniMax: a streamed turn for the run itself, and a
+    /// non-streaming turn for the wrap-up, told apart by the `stream` flag
+    /// `rig` merges into the body. `wrap_up` of `None` mounts the second as
+    /// a call that must never be made — wiremock checks the count when the
+    /// server drops, so a run that pays for a write-up it was not owed
+    /// fails the test rather than passing it quietly.
+    async fn minimax(streamed: String, wrap_up: Option<&str>) -> wiremock::MockServer {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Mounted first, so it wins the tie on insertion order.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("\"stream\":true"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(streamed, "text/event-stream"))
+            .mount(&server)
+            .await;
+        let answer = wrap_up.unwrap_or("a write-up nobody should have asked for");
+        let mount = Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "w1",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": answer},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })));
+        match wrap_up {
+            Some(_) => mount.mount(&server).await,
+            None => mount.expect(0).mount(&server).await,
+        }
+        server
+    }
+
+    /// One whole run against that stand-in, with a real database under it.
+    ///
+    /// `run_agent` builds its own agent out of `Core`, so the only seam a
+    /// test has is the address the model client is pointed at — which is
+    /// `Config`'s, and which production already moves for a self-hoster
+    /// fronting MiniMax with a proxy of their own.
+    async fn a_run_against(
+        llm: &wiremock::MockServer,
+    ) -> (anyhow::Result<RunOutcome>, Vec<scout_api::AgentEvent>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::for_test(
+            dir.path().join("run.duckdb").to_str().unwrap(),
+        );
+        cfg.minimax_base_url = llm.uri();
+        let core = Core::start(cfg, None).unwrap();
+        let store = core.store();
+        let account_id = store.account_for_telegram(4242).unwrap();
+        let conversation_id = store.start_conversation(account_id, "direct").unwrap();
+        let run = scout_api::RunContext {
+            account_id,
+            conversation_id,
+            reply_to: None,
+            title_source: None,
+        };
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = run_agent(&core, events, &run, "which flights did you price?").await;
+        // The run drops its sink on return, so what is left in the channel
+        // is the whole of what the reader was shown.
+        let mut shown = Vec::new();
+        while let Ok(event) = seen.try_recv() {
+            shown.push(event);
+        }
+        (outcome, shown)
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_was_all_reasoning_is_written_up_instead_of_delivered_as_silence() {
+        // Production: MiniMax wrapped a complete reply — Scout asking a
+        // traveller which segments they meant — in a single <think> block.
+        // `strip_thinking` took all of it, the empty string went out as the
+        // answer, and the log held no error to say why the chat had gone
+        // quiet. The content was there the whole time.
+        let llm = minimax(
+            streamed_text(&[
+                "<think>They gave me Fukuoka to HKG but never the dates. ",
+                "Ask which segments they meant.</think>",
+            ]),
+            Some("Which segments did you mean? Give me the dates and I'll price them."),
+        )
+        .await;
+
+        let (outcome, shown) = a_run_against(&llm).await;
+
+        match outcome.expect("a run with an answer in it must not fail") {
+            RunOutcome::Answered(reply) => {
+                assert!(reply.contains("Which segments"), "the answer was lost: {reply:?}")
+            }
+            _ => panic!("a run that produced text must answer"),
+        }
+        assert!(
+            shown.iter().any(|e| matches!(e, scout_api::AgentEvent::Notice(n) if n.contains("wrapping up"))),
+            "the reader was not told the answer was being written up: {shown:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_produced_nothing_at_all_is_not_written_up() {
+        // The other half of the same decision. No text and no reasoning
+        // means no notes, and the wrap-up agent would be handed a blank
+        // page and asked to answer from it — billed like any other call,
+        // and able only to invent. So the run fails instead, which every
+        // channel has a sentence for; an empty answer is what the browser
+        // renders as Scout's reply.
+        let llm = minimax(streamed_text(&[""]), None).await;
+
+        let (outcome, _shown) = a_run_against(&llm).await;
+
+        let Err(err) = outcome else {
+            panic!("an answer of nothing is not an answer");
+        };
+        assert!(err.to_string().contains("no answer and no notes"), "got: {err}");
+        // That no wrap-up was bought is checked by the mount above when the
+        // server drops at the end of this test.
+    }
+
+    #[test]
+    fn notes_are_whatever_the_model_wrote_down_in_either_channel() {
+        // Reasoning arrives on its own channel and text on another, and a
+        // write-up can be built from either. Whitespace is not material:
+        // `<think>\n</think>` leaves a newline behind and would otherwise
+        // buy a wrap-up with nothing in front of it.
+        assert!(has_notes("weighing the two fares", ""));
+        assert!(has_notes("", "EUR 369.94 on Etihad"));
+        assert!(!has_notes("", ""));
+        assert!(!has_notes(" \n", "\t"));
+    }
+
     use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
     use rig::message::ToolCall;
     use rig::one_or_many::OneOrMany;

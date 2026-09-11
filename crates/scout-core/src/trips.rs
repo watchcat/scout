@@ -133,6 +133,39 @@ pub async fn keep(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Op
     .await
 }
 
+/// Delete one of this account's trips, and everything parked on it.
+///
+/// `Option` rather than an enum of its own for the same reason `keep` uses
+/// one: there are two outcomes, and "the name is not this account's" is the
+/// second. `None` covers both a name nobody used and another account's
+/// trip, which is what keeps a caller from learning that someone else's
+/// "Atlantic loop" exists.
+///
+/// `Some` carries the trips that are *left*, not the trip that went. Every
+/// other write here answers with the plan to repaint; a deleted trip has no
+/// plan, and what a client needs next is which trips remain and which of
+/// them to show — the same list a reload would have given it, so the two
+/// paths cannot disagree about what an account has.
+///
+/// `delete_trip` takes the trip's segments and its parked candidates with
+/// it. That cascade is the point rather than a detail: both tables are
+/// reached only by `trip_id`, so a row left behind after the trip is gone
+/// is unreachable by every read path there is and stays in the database
+/// forever.
+pub async fn delete(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Option<Vec<Plan>>> {
+    let store = core.store();
+    let owned = name.to_string();
+    // Scoped to the account in the store, like every other lookup by name
+    // here: two accounts can both have an "Atlantic loop", and this is the
+    // one write where reaching the wrong one destroys it.
+    if !blocking(move || store.delete_trip(account_id, &owned)).await? {
+        return Ok(None);
+    }
+    // Through `list` rather than a second query shape, so a client that
+    // repaints from this answer sees exactly what reloading would show.
+    list(core, account_id).await.map(Some)
+}
+
 /// Select one of the already parked candidate flights on a segment.
 pub async fn choose(
     core: &Core,
@@ -517,6 +550,71 @@ mod tests {
             vec!["LIS"],
             "neither edit reached the other account's trip",
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_trip_takes_it_off_the_list_and_answers_with_what_is_left() {
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+        seed_trip_for_tests(&core, account_id, "Atlantic loop").await.unwrap();
+
+        let left = delete(&core, account_id, "october")
+            .await
+            .unwrap()
+            .expect("a trip this account has is deleted, found by a lower-cased name");
+        assert_eq!(
+            left.iter().map(|p| p.trip.name.as_str()).collect::<Vec<_>>(),
+            vec!["Atlantic loop"],
+            "the answer is what the tab should now show, not the trip that went",
+        );
+        assert_eq!(
+            list(&core, account_id).await.unwrap().len(),
+            1,
+            "and it agrees with what a reload would have given",
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_trip_this_account_does_not_have_deletes_nothing() {
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+
+        assert_eq!(
+            delete(&core, account_id, "a trip nobody made").await.unwrap(),
+            None,
+            "a name nobody used is nothing to delete, not an error",
+        );
+        assert_eq!(list(&core, account_id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_account_cannot_delete_anothers_trip_of_the_same_name() {
+        // The whole-trip delete is the one write where reaching across
+        // accounts destroys rather than edits: the owner would lose every
+        // leg and every parked option with no press of their own.
+        let (core, _dir, owner) = core().await;
+        seed_trip_for_tests(&core, owner, "Atlantic loop").await.unwrap();
+        let stranger = core.store().account_for_telegram(22).unwrap();
+        // The stranger has one of the same name, so the lookup has something
+        // to find if it ever stops scoping by account — and deleting theirs
+        // must not be what deletes the owner's.
+        seed_trip_for_tests(&core, stranger, "Atlantic loop").await.unwrap();
+
+        let left = delete(&core, stranger, "Atlantic loop").await.unwrap().unwrap();
+        assert!(left.is_empty(), "the stranger deleted their own and has none left");
+
+        let owned = list(&core, owner).await.unwrap();
+        assert_eq!(owned.len(), 1, "the owner's trip of the same name is untouched");
+        assert_eq!(owned[0].trip.segments.len(), 1);
+        assert_eq!(
+            owned[0].trip.segments[0].candidates.len(),
+            2,
+            "and so are the options parked on it",
+        );
+
+        // Now that the stranger has none, the name is not theirs to delete.
+        assert_eq!(delete(&core, stranger, "Atlantic loop").await.unwrap(), None);
+        assert_eq!(list(&core, owner).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

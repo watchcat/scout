@@ -5510,6 +5510,21 @@ CREATE TABLE trips (
         assert!(store.find_trip(7, "Setpember").unwrap().is_none());
         assert!(!store.delete_trip(7, "Setpember").unwrap(), "deleting twice is not an error");
 
+        // The name said this and only `find_trip` was checked, which cannot
+        // see either child table: both are reached by `trip_id` alone, so a
+        // segment or a parked option left behind after its trip is gone is
+        // unreachable by every read path there is and stays for good.
+        let orphans: i64 = store
+            .conn()
+            .query_row(
+                "SELECT (SELECT count(*) FROM trip_segments WHERE trip_id = ?)
+                      + (SELECT count(*) FROM segment_candidates WHERE trip_id = ?)",
+                params![trip.id, trip.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "the trip's segments and parked options went with it");
+
         // Another user's trip of the same name is untouched.
         store.upsert_trip(8, "Setpember", None, None, None).unwrap();
         assert!(!store.delete_trip(7, "Setpember").unwrap());

@@ -16,7 +16,12 @@ use axum::Router;
 
 pub fn routes(auth: AuthState) -> Router {
     Router::new()
-        .route("/chat/trips", get(list))
+        // DELETE on the collection, addressed by the name in the body,
+        // because that is how every trip on this router is addressed —
+        // there are no per-trip URLs, and a traveller's name for a trip is
+        // not a path segment. `delete_trip` says what stops that from being
+        // the same request as removing a leg.
+        .route("/chat/trips", get(list).delete(delete_trip))
         .route("/chat/trips/pdf", post(pdf))
         .route("/chat/trips/keep", post(keep))
         .route("/chat/trips/choice", post(choose))
@@ -130,6 +135,52 @@ async fn keep(
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(error = %e, account_id, "could not keep a trip");
+            sorry()
+        }
+    }
+}
+
+/// `deny_unknown_fields` is a guard, not tidiness. `/chat/trips` is one
+/// path segment short of `/chat/trips/segment`, and both take a DELETE with
+/// a JSON body naming a trip — so a client that lost the suffix would send
+/// a leg removal here, and serde would happily read the `trip` out of it
+/// and destroy the whole itinerary instead of one flight. A body carrying
+/// `position` is refused rather than obeyed.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteTripIn {
+    trip: String,
+}
+
+/// Deletes a trip, its legs, and every flight option parked on them.
+///
+/// Answers with the account's remaining trips rather than `204`. The client
+/// has to repaint a list it can no longer derive — the trip it was showing
+/// may be the one that went — and every other write on this router already
+/// answers with what to draw, so a second GET here would be the one write
+/// whose result could be raced by a load in flight.
+async fn delete_trip(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<DeleteTripIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    match scout_core::trips::delete(&auth.core, account_id, &body.trip).await {
+        Ok(Some(remaining)) => axum::Json(remaining).into_response(),
+        // Somebody else's trip and a name nobody used are the same answer,
+        // for the reason `keep` gives: a 403 would confirm the trip exists.
+        // A second press on a tab that has not repainted lands here too,
+        // and "already gone" is the state that press wanted.
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not delete a trip");
             sorry()
         }
     }
@@ -542,6 +593,162 @@ mod tests {
             let plan: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
             assert_eq!(plan["kept"], true);
         }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_trip_needs_a_session_and_a_csrf_token() {
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        let uri = "/chat/trips";
+        let body = r#"{"trip":"October"}"#;
+
+        // The most destructive write on this router is behind the same two
+        // gates as the least.
+        let anonymous = delete_json(&app, uri, "not-a-session", Some(&csrf), body).await;
+        assert_eq!(anonymous.status(), StatusCode::SEE_OTHER);
+
+        let refused = delete_json(&app, uri, &cookie, None, body).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+        // And the trip survived both refusals.
+        let trip = scout_core::trips::find(&core, account_id, "October").await.unwrap();
+        assert!(trip.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_trip_is_gone_and_the_response_carries_the_trips_that_are_left() {
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        scout_core::trips::seed_trip_for_tests(&core, account_id, "Atlantic loop")
+            .await
+            .unwrap();
+
+        let res = delete_json(
+            &app,
+            "/chat/trips",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October"}"#,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        let names: Vec<&str> = response
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|plan| plan["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Atlantic loop"],
+            "the client repaints the list from this body, selection and all",
+        );
+
+        // Asserted against the store, not just the response: the response
+        // is what the route claims happened, the store is what actually did.
+        let left = scout_core::trips::list(&core, account_id).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].trip.name, "Atlantic loop");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_trip_this_account_does_not_have_is_a_not_found() {
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        let res = delete_json(
+            &app,
+            "/chat/trips",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"a trip nobody made"}"#,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            scout_core::trips::list(&core, account_id).await.unwrap().len(),
+            1,
+            "a miss deletes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_account_cannot_delete_another_accounts_trip_of_the_same_name() {
+        let (app, core, _dir, owner, _cookie, _csrf) = setup().await;
+        // The owner has an "Atlantic loop" too, so the name alone cannot be
+        // what the delete finds: only the account scoping decides whose trip
+        // this destroys, and here it destroys every leg and option on it.
+        scout_core::trips::seed_trip_for_tests(&core, owner, "Atlantic loop")
+            .await
+            .unwrap();
+        let scout_core::identity::SignIn::In {
+            account_id: stranger,
+        } = scout_core::identity::sign_in(&core, "telegram", "888")
+            .await
+            .unwrap()
+        else {
+            panic!("the round should admit the second account");
+        };
+        scout_core::trips::seed_trip_for_tests(&core, stranger, "Atlantic loop")
+            .await
+            .unwrap();
+        let cookie = crate::session::mint(TEST_KEY, stranger, DAY);
+        let csrf = crate::session::csrf_for(TEST_KEY, stranger);
+
+        let res = delete_json(
+            &app,
+            "/chat/trips",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"Atlantic loop"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert!(
+            response.as_array().unwrap().is_empty(),
+            "the stranger deleted their own trip and has none left",
+        );
+
+        let theirs = scout_core::trips::find(&core, owner, "Atlantic loop")
+            .await
+            .unwrap()
+            .expect("the owner's trip of the same name is untouched");
+        assert_eq!(theirs.trip.segments.len(), 1);
+        assert_eq!(
+            theirs.trip.segments[0].candidates.len(),
+            2,
+            "and so are the options parked on it",
+        );
+        assert_eq!(
+            scout_core::trips::list(&core, owner).await.unwrap().len(),
+            2,
+            "the owner still has both trips",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leg_removal_sent_to_the_trip_delete_route_is_refused_rather_than_obeyed() {
+        // `/chat/trips` is one path segment short of `/chat/trips/segment`
+        // and takes the same method. Without `deny_unknown_fields` on
+        // `DeleteTripIn`, a client that lost the suffix would read as "delete
+        // the whole trip" — the exact body `removeLegBody` sends, silently
+        // destroying an itinerary instead of one leg.
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        let res = delete_json(
+            &app,
+            "/chat/trips",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":1,"origin":"AMS","destination":"LIS","departure_date":"2026-10-12"}"#,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let trip = scout_core::trips::find(&core, account_id, "October")
+            .await
+            .unwrap()
+            .expect("the trip is still there");
+        assert_eq!(trip.trip.segments.len(), 1, "and so is the leg it was about");
     }
 
     #[tokio::test]

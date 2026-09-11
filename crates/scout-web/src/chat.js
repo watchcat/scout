@@ -330,6 +330,32 @@ export function keepBody(tripName) {
   return JSON.stringify({ trip: tripName })
 }
 
+// The DELETE body for `/chat/trips` — the name and nothing else, on
+// purpose. That route is one path segment short of `/chat/trips/segment`
+// and takes the same method, so the two bodies are the thing keeping "drop
+// this leg" and "drop the whole itinerary" apart on the wire. `DeleteTripIn`
+// is `deny_unknown_fields` on the Rust side: a body with `position` in it —
+// which is to say anything `removeLegBody` built — is refused there rather
+// than read as a whole-trip delete. This carries no `position` for that
+// refusal to be about.
+export function deleteTripBody(tripName) {
+  return JSON.stringify({ trip: tripName })
+}
+
+// What the traveller is about to lose, counted, for the confirm to say out
+// loud. A trip delete takes every leg and every parked flight option with
+// it — see `Store::delete_trip` — and "Delete this trip?" on its own gives
+// the reader no way to tell a stray press on an empty draft from one that
+// throws away an afternoon of price research.
+export function tripDeleteConsequence(trip) {
+  const segments = trip?.segments ?? []
+  const options = segments.reduce((total, segment) => total + (segment.candidates?.length ?? 0), 0)
+  if (!segments.length) return 'Nothing is saved on it yet.'
+  const legs = `${segments.length} ${segments.length === 1 ? 'leg' : 'legs'}`
+  if (!options) return `Its ${legs} go${segments.length === 1 ? 'es' : ''} with it.`
+  return `Its ${legs} and ${options} saved flight ${options === 1 ? 'option' : 'options'} go with it.`
+}
+
 // Where a message typed on the Trips tab should go, and what the composer
 // says about it. `direct` is the one scope the web client may ever post
 // into — the thread it shares with Telegram 1:1 chat. Anything else is a

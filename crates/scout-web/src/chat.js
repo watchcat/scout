@@ -919,9 +919,10 @@ function start() {
     return box
   }
 
-  // Always appends: the markup for choosing where in the itinerary a leg
-  // lands does not exist, and `add_leg`'s `position` only needs a value at
-  // all when the caller wants something other than the end.
+  // No position: the store puts the leg where its departure date belongs.
+  // The markup for choosing a place in the itinerary does not exist, and
+  // does not need to — a dated leg has exactly one place it goes, and
+  // sending a position would be this form overriding that with a guess.
   function renderAddLegForm(trip) {
     const form = document.createElement('form')
     form.className = 'leg-add'
@@ -1150,9 +1151,9 @@ function start() {
         trip: trip.name, position: null, origin, destination, departure_date: departureDate,
       })
       if (res.status === 409) {
-        // Not an error: this tab's copy is simply older than the trip. The
-        // position the form would have appended at may not even be the end
-        // any more, so the honest move is to reload rather than retry blind.
+        // Not an error: this tab's copy is simply older than the trip, and
+        // the itinerary a leg was being placed into has moved since it was
+        // drawn — so the honest move is to reload rather than retry blind.
         tripChoicePending = false
         tripsLoaded = false
         await loadTrips()

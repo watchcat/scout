@@ -38,7 +38,6 @@ CREATE TABLE IF NOT EXISTS runs (
     id              BIGINT PRIMARY KEY DEFAULT nextval('runs_id_seq'),
     account_id      BIGINT NOT NULL,
     conversation_id BIGINT NOT NULL,
-    channel         TEXT NOT NULL,
     started_at      TIMESTAMP NOT NULL DEFAULT current_timestamp,
     ended_at        TIMESTAMP,
     outcome         TEXT,          -- answered | cut_short | failed
@@ -99,12 +98,19 @@ pub struct Observer {
     pub pulse: Pulse,
     pub run_id: i64,
     rows: Mutex<Vec<TraceRow>>,
-    open: Mutex<HashMap<String, usize>>,   // call_id -> row index
+    called: Mutex<HashMap<String, Instant>>,          // call_id -> when the model asked
+    open: Mutex<HashMap<String, (usize, Instant)>>,   // call_id -> row index, start
 }
 ```
 
+- `tool_called(call_id)` notes the instant the model's streamed tool call
+  arrived. rig surfaces a tool's `ToolExecutionStart` and its `ToolResult`
+  together, after the tool returns, so a duration measured between those
+  two is always near zero; the streamed `ToolCall` item is the one thing
+  that arrives before execution.
 - `tool_started(call_id, tool, args, nested)` pushes a `TraceRow` with
-  `started_at = now`, remembers its index by `call_id`, and emits
+  `started_at` from `tool_called` when it was seen (else now), remembers
+  its index by `call_id`, and emits
   `AgentEvent::Trace(TraceFrame::Started { seq, tool, args, nested })`.
 - `tool_finished(call_id, result_text)` fills `duration_ms`, `status`
   (`ok` when the text parses as JSON, `failed` otherwise — the rule the
@@ -123,7 +129,7 @@ any tool.
 
 ### `run.rs`
 
-- `Store::open_run(account_id, conversation_id, channel) -> run_id` right
+- `Store::open_run(account_id, conversation_id) -> run_id` right
   after the slot is taken, before the agent is built. Busy and overloaded
   runs never reach it and leave no row.
 - The outer loop already handles `ToolExecutionStart`; it also handles
@@ -136,12 +142,18 @@ any tool.
 - `append_history` takes the run id and writes it on every message it
   inserts. Then `append_traces(run_id, rows)` and
   `close_run(run_id, outcome, detail)`. Order: messages, traces, run.
-- `RunOutcome::Answered` carries the run id alongside the answer so the
-  web end frame can name it.
+- Everything after `open_run` lives in an inner `run_with`; its `Err` is
+  the one failure path, which saves the rows and closes the run as
+  `failed`. A run that panics leaves its row open (`outcome` null); the
+  page shows such a run as "unfinished" and the hourly trim removes it in
+  time.
+- The run id reaches the page as the first trace frame, `TraceFrame::Run
+  { run_id }`, sent by `Observer::announce` before anything else, so
+  `RunOutcome` and the Telegram code stay untouched.
 
 ### `AgentEvent::Trace`
 
-A new variant carrying `TraceFrame` (`Started`, `Finished`, `Event`), all
+A new variant carrying `TraceFrame` (`Run`, `Started`, `Finished`, `Event`), all
 plain data. The web route serialises it under `event: agent` as it does
 every event; the Telegram renderer's `match` ignores it. Frames go out
 regardless of the flag; a page with debug off drops them.
@@ -167,7 +179,8 @@ they run out, the tool's final error is the row's `detail`.
   `seq` order with results. 404 when the run is not the caller's or no
   longer kept; 403 when the account's debug is off. `Store::trace_of(run_id,
   account_id)` does the ownership check in SQL.
-- **The end frame** `End::Ok` gains `run_id: Option<i64>`.
+- **The run id** arrives as the first `Trace` frame of the stream; the end
+  frame is unchanged.
 
 ## The page
 

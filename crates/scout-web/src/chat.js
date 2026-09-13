@@ -378,6 +378,83 @@ export function composerTarget(trip) {
   return { thread: chat.id, label: chat.title ? `to "${chat.title}"` : 'to an unnamed thread' }
 }
 
+// The trace panel's model. Pure so it can be tested without a DOM, and
+// shared by the saved trace (rows from the server) and the live one (rows
+// built from frames), which must read identically.
+const ARGS_LINE_CAP = 120
+
+export function traceDuration(ms) {
+  if (typeof ms !== 'number') return ''
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
+  const m = Math.floor(ms / 60000)
+  const s = Math.round((ms % 60000) / 1000)
+  return `${m}m ${String(s).padStart(2, '0')}s`
+}
+
+function argsLine(args) {
+  const text = args === undefined || args === null ? '' : JSON.stringify(args)
+  return text.length > ARGS_LINE_CAP ? text.slice(0, ARGS_LINE_CAP) + '…' : text
+}
+
+export function traceLines(run, rows) {
+  let head = ''
+  if (run && run.outcome) {
+    head = [run.outcome, run.ended_at && run.started_at ? traceDuration(Date.parse(run.ended_at) - Date.parse(run.started_at)) : '', run.detail]
+      .filter(Boolean).join(' · ')
+  } else if (run && run.id && !run.outcome && run.started_at) {
+    // A saved run that never closed its row: the process died mid-run.
+    head = 'unfinished'
+  }
+  return {
+    head,
+    rows: rows.map(r => ({
+      seq: r.seq,
+      kind: r.kind,
+      nested: Boolean(r.nested),
+      status: r.status,
+      label: r.kind === 'tool' ? `${r.tool} ${argsLine(r.args)}`.trimEnd() : (r.detail || ''),
+      duration: r.kind === 'tool' ? traceDuration(r.duration_ms) : '',
+      detail: r.detail || '',
+      result: r.result,
+      truncated: Boolean(r.truncated),
+      args: r.args,
+    })),
+  }
+}
+
+// Folds a live frame into the rows a saved trace would have had.
+export function applyTraceFrame(rows, frame) {
+  if (frame.kind === 'started') {
+    return [...rows, { seq: frame.seq, kind: 'tool', tool: frame.tool, args: frame.args, nested: frame.nested }]
+  }
+  if (frame.kind === 'finished') {
+    return rows.map(r => r.seq === frame.seq
+      ? { ...r, duration_ms: frame.duration_ms, status: frame.status, detail: frame.detail || undefined }
+      : r)
+  }
+  if (frame.kind === 'event') {
+    return [...rows, { seq: frame.seq, kind: 'event', detail: frame.detail, status: frame.error ? 'failed' : 'ok' }]
+  }
+  return rows
+}
+
+// The server's `debug_command`, mirrored: the word alone, or with `on` or
+// `off`, and nothing else. Case-sensitive like Telegram's slash commands,
+// so `/Debug` in prose is prose.
+export function isDebugCommand(text) {
+  const words = text.split(/\s+/).filter(Boolean)
+  if (words[0] !== '/debug') return false
+  return words.length === 1 || (words.length === 2 && (words[1] === 'on' || words[1] === 'off'))
+}
+
+// Whether a run that produced no answer keeps its bubble anyway. A failed
+// run writes no history turn, so with debug on the live trace under the
+// bubble is that trace's only copy — and an empty bubble is what keeps it
+// on the page. Nothing traced, or debug off, and the bubble goes as ever.
+export function keepFailedTurn(end, debugOn, rowCount) {
+  return (end.status === 'error' || end.status === 'busy') && debugOn && rowCount > 0
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')
@@ -450,11 +527,168 @@ function start() {
     if (wasFollowing) turnsEl.scrollTop = turnsEl.scrollHeight
   }
 
-  function turnElement(role, text) {
+  // The words go into a child of their own rather than the `li` itself:
+  // `renderAnswer` redraws them on every token, and a trace panel drawn
+  // under a live answer has to survive that. Saved turns take the same
+  // shape so the two paths cannot drift apart.
+  function turnElement(role, text, runId) {
     const li = document.createElement('li')
     li.className = role === 'You' ? 'you' : 'scout'
-    li.innerHTML = render(text)
+    const words = node('div', 'text')
+    words.innerHTML = render(text)
+    li.append(words)
+    // The run is remembered on the element, not only acted on, so a turn
+    // already on screen can get its button when `/debug on` arrives.
+    if (role !== 'You' && typeof runId === 'number') {
+      li.dataset.runId = String(runId)
+      if (debugOn) li.append(traceButton(li, runId))
+    }
     return li
+  }
+
+  // Whether this reader has `/debug on`. Asked of the server rather than
+  // remembered here: the switch is per account and outlives the page.
+  let debugOn = false
+
+  async function refreshDebug() {
+    try {
+      const res = await fetch('/chat/debug')
+      if (res.ok) debugOn = Boolean((await res.json()).on)
+    } catch {
+      // A dead network leaves the switch as it was; the next send asks again.
+    }
+    syncTraceButtons()
+  }
+
+  // Gives every Scout turn on screen the button the flag now calls for,
+  // and takes it — and any open panel — away when the flag went off. In
+  // place rather than by redrawing from history: the `/debug on` exchange
+  // that flipped the flag is never written to history, and a redraw would
+  // take the confirmation off the screen the moment it appeared.
+  function syncTraceButtons() {
+    for (const li of turnsEl.querySelectorAll('li[data-run-id]')) {
+      const btn = li.querySelector('.trace-btn')
+      if (debugOn && !btn) {
+        // Before the panel, if one is open, so the order matches a saved
+        // turn's: words, button, trace.
+        li.insertBefore(traceButton(li, Number(li.dataset.runId)), li.querySelector('.trace'))
+      } else if (!debugOn && btn) {
+        btn.remove()
+        li.querySelector('.trace')?.remove()
+      }
+    }
+  }
+
+  function traceButton(li, runId) {
+    const btn = node('button', 'trace-btn', 'Trace')
+    btn.type = 'button'
+    btn.dataset.runId = String(runId)
+    btn.addEventListener('click', () => { openTrace(li, runId).catch(() => {}) })
+    return btn
+  }
+
+  // Draws the trace under a turn from `traceLines`, replacing whatever
+  // panel was there. Everything goes through `textContent`: arguments and
+  // results are the tools' own text — a shop's page title, a provider's
+  // error body — and none of it is to be trusted as markup.
+  function renderTracePanel(li, run, rows) {
+    // Redrawn wholesale on every live frame, so what the reader did to the
+    // panel already there — scrolled, opened a row — is carried over by
+    // hand, the way `showStatus` keeps its place in the status box.
+    const old = li.querySelector('.trace')
+    const wasFollowing = old ? shouldFollow(old.scrollTop, old.clientHeight, old.scrollHeight) : true
+    const scrollTop = old ? old.scrollTop : 0
+    const opened = new Set([...(old ? old.querySelectorAll('.row.open') : [])].map((row) => Number(row.dataset.seq)))
+    const lines = traceLines(run, rows)
+    const panel = node('div', 'trace')
+    if (lines.head) panel.append(node('div', 'head', lines.head))
+    for (const line of lines.rows) {
+      const row = node('div', `row ${line.kind}`)
+      if (line.nested) row.classList.add('nested')
+      if (line.status === 'failed') row.classList.add('failed')
+      row.append(node('span', 'label', line.label))
+      panel.append(row)
+      // An event is one sentence and carries its status in its colour; a
+      // tool call has a duration, a chip, and something to open.
+      if (line.kind !== 'tool') continue
+      row.append(node('span', 'dur', line.duration))
+      const status = line.status === undefined ? 'running' : line.status
+      row.append(node('span', `chip ${status}`, status))
+      row.dataset.seq = String(line.seq)
+      row.tabIndex = 0
+      row.setAttribute('role', 'button')
+      const toggle = () => {
+        if (row.classList.toggle('open')) row.after(node('pre', '', traceDetail(line)))
+        else row.nextElementSibling?.remove()
+      }
+      row.addEventListener('click', toggle)
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          toggle()
+        }
+      })
+      if (opened.has(line.seq)) toggle()
+    }
+    old?.remove()
+    li.append(panel)
+    // After the append: a panel not yet laid out has no height to scroll.
+    panel.scrollTop = wasFollowing ? panel.scrollHeight : scrollTop
+  }
+
+  // What a tool row opens to: the arguments, a blank line, then the result
+  // — pretty-printed when it is JSON, as it came otherwise. A live row has
+  // no result yet, so a failed one shows the error it was closed with.
+  function traceDetail(line) {
+    let text = JSON.stringify(line.args === undefined ? null : line.args, null, 2)
+    const result = line.result === undefined || line.result === null ? line.detail : line.result
+    if (result) {
+      let shown = result
+      try {
+        shown = JSON.stringify(JSON.parse(result), null, 2)
+      } catch {
+        // Not JSON: the raw text is the result.
+      }
+      text += `\n\n${shown}`
+    }
+    if (line.truncated) text += "\n… (cut at the store's cap)"
+    return text
+  }
+
+  // Toggles the saved trace under a turn. Debug off is a notice rather
+  // than a panel — the button should not have been there, and the reader
+  // is told how to get one; a run the store no longer keeps is a panel
+  // that says so, because the reader asked and silence would read as a
+  // broken button.
+  async function openTrace(li, runId) {
+    const open = li.querySelector('.trace')
+    if (open) {
+      open.remove()
+      return
+    }
+    let res
+    try {
+      res = await fetch(`/chat/runs/${runId}/trace`)
+    } catch {
+      showNotice('Could not load the trace. Try again.')
+      return
+    }
+    if (res.status === 403) {
+      showNotice('Turn debug on with /debug on to see traces.')
+      return
+    }
+    if (res.status === 404) {
+      const panel = node('div', 'trace')
+      panel.append(node('div', 'head', 'trace no longer kept'))
+      li.append(panel)
+      return
+    }
+    if (!res.ok) {
+      showNotice('Could not load the trace. Try again.')
+      return
+    }
+    const { run, rows } = await res.json()
+    renderTracePanel(li, run, rows)
   }
 
   // The status box is capped at a quarter of the viewport, so on a long
@@ -1244,7 +1478,7 @@ function start() {
   // is switching what the page is showing, not adding to it.
   function showTurns(turns) {
     turnsEl.replaceChildren()
-    for (const turn of turns) turnsEl.append(turnElement(turn.role, turn.text))
+    for (const turn of turns) turnsEl.append(turnElement(turn.role, turn.text, turn.run_id))
     turnsEl.scrollTop = turnsEl.scrollHeight
   }
 
@@ -1654,6 +1888,10 @@ function start() {
     let thinking = ''
     let answerLi = null
     let sawEnd = false
+    // The run behind this answer, named by the first trace frame, and its
+    // rows so far — the live panel is redrawn from all of them each time.
+    let liveRunId = null
+    let liveRows = []
     // A request the server refused outright never opened a stream, so the
     // "connection dropped" report below — which promises the answer is
     // still being written — would be a lie.
@@ -1677,7 +1915,7 @@ function start() {
         answerLi = turnElement('Scout', '')
         turnsEl.append(answerLi)
       }
-      answerLi.innerHTML = render(answer)
+      answerLi.querySelector('.text').innerHTML = render(answer)
       follow(wasFollowing)
     }
 
@@ -1743,6 +1981,21 @@ function start() {
           } else if ('Answer' in evt) {
             answer = applyUpdate(answer, evt.Answer)
             renderAnswer()
+          } else if ('Trace' in evt) {
+            const f = evt.Trace
+            if (f.kind === 'run') {
+              liveRunId = f.run_id
+            } else {
+              // Folded whether or not it is shown, like `thinking`: a
+              // reader who switches back mid-run gets the whole trace.
+              liveRows = applyTraceFrame(liveRows, f)
+              if (debugOn && mine()) {
+                const wasFollowing = following()
+                renderAnswer()
+                renderTracePanel(answerLi, null, liveRows)
+                follow(wasFollowing)
+              }
+            }
           }
         } else if (frame.event === 'end') {
           sawEnd = true
@@ -1755,13 +2008,29 @@ function start() {
           const finished = finalAnswer(end, answer)
           if (finished !== answer) {
             answer = finished
-            if (answer === '' && answerLi) {
-              // An empty bubble is not a cleared one. Take the turn off the
-              // page rather than leave a blank one behind the notice.
+            if (answer !== '' || !answerLi) renderAnswer()
+          }
+          // An empty bubble is not a cleared one: the turn comes off the
+          // page rather than sit blank behind the notice — unless a trace
+          // hangs under it, which no history turn will ever carry again.
+          // Then the bubble stays to hold it, and says why it is empty.
+          if (answer === '' && answerLi) {
+            if (keepFailedTurn(end, debugOn, liveRows.length)) {
+              answerLi.classList.add('failed')
+              answerLi.querySelector('.text').textContent = '(no answer)'
+            } else {
               answerLi.remove()
               answerLi = null
-            } else {
-              renderAnswer()
+            }
+          }
+          // The answer is written and its trace is saved with results, so
+          // the turn takes the button a saved one has — over the live
+          // panel, which stays. The run id is kept either way, so a later
+          // `/debug on` can give this turn its button too.
+          if (typeof liveRunId === 'number' && answerLi && answerLi.isConnected && mine()) {
+            answerLi.dataset.runId = String(liveRunId)
+            if (debugOn && !answerLi.querySelector('.trace-btn')) {
+              answerLi.insertBefore(traceButton(answerLi, liveRunId), answerLi.querySelector('.trace'))
             }
           }
         }
@@ -1873,6 +2142,9 @@ function start() {
       // mid-send had the transcript replaced under them — is a no-op, so
       // this needs no guard of its own.
       await runMessage(text, () => youLi.remove(), fromTrips)
+      // The switch may have just flipped, and the turns on screen should
+      // show it without a reload.
+      if (isDebugCommand(text)) await refreshDebug()
     } finally {
       running = false
       sendButton.disabled = false
@@ -1916,6 +2188,11 @@ function start() {
   // Nothing awaits the page's first load, and its own failure already
   // shows as a notice — a rejection on top of that is only console noise.
   loadHistory().catch(() => {})
+  // Not awaited, and safe either way round: history landing second draws
+  // its turns from `debugOn` as it stands, and the switch landing second
+  // gives the turns already drawn their buttons through `syncTraceButtons`.
+  // `refreshDebug` never rejects.
+  refreshDebug()
   // Loaded in the background so the Trips tab can show a count before it is
   // opened. A failure is rendered inside that workspace and does not disturb
   // the chat, which remains the default view.

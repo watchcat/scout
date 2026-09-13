@@ -183,12 +183,11 @@ pub struct Specialist<M: rig::completion::CompletionModel> {
     /// Tells the parent when to call it and what a brief must contain.
     pub description: String,
     pub agent: rig::agent::Agent<M>,
-    /// The run's sink, so nested tool calls show in the chat as progress.
-    pub events: scout_api::EventSink,
-    /// The outer run's pulse: touched on every nested stream item, so the
-    /// outer stall guard sees this run as alive while its own stream is
-    /// silent.
-    pub pulse: std::sync::Arc<crate::run::Pulse>,
+    /// The outer run's observer: its sink, so nested tool calls show in
+    /// the chat as progress; its pulse, touched on every nested stream
+    /// item, so the outer stall guard sees this run as alive while its own
+    /// stream is silent; and its trace, where nested calls are recorded.
+    pub observer: std::sync::Arc<crate::observer::Observer>,
     /// The presentation rules that apply to a set of findings.
     pub guidance: Guidance,
     pub budget: std::time::Duration,
@@ -234,8 +233,8 @@ where
         let outcome: Result<Option<&'static str>, tokio::time::error::Elapsed> =
             tokio::time::timeout(self.budget, async {
                 let mut stream = self.agent.stream_prompt(args.brief.as_str()).await;
-                // When *this* stream last produced anything. `self.pulse`
-                // cannot answer that and must not be asked: it is the outer
+                // When *this* stream last produced anything. The observer's
+                // pulse cannot answer that and must not be asked: it is the outer
                 // run's, touched below precisely so the parent counts this
                 // run as alive, so a nested stream that has died keeps it
                 // fresh while it burns the whole budget in silence. That is
@@ -246,7 +245,7 @@ where
                     let next = loop {
                         match tokio::time::timeout(crate::run::STALL_CHECK, stream.next()).await {
                             Ok(Some(item)) => {
-                                self.pulse.touch();
+                                self.observer.pulse.touch();
                                 last_item = tokio::time::Instant::now();
                                 break item;
                             }
@@ -256,12 +255,25 @@ where
                         }
                     };
                     match next {
+                        // The model's call, streamed before the tool runs:
+                        // where its clock starts.
+                        Ok(MultiTurnStreamItem::StreamAssistantItem(
+                            rig::streaming::StreamedAssistantContent::ToolCall { internal_call_id, .. },
+                        )) => {
+                            self.observer.tool_called(&internal_call_id);
+                        }
                         Ok(MultiTurnStreamItem::ToolExecutionStart { tool_call, internal_call_id }) => {
                             collector.tool_started(
                                 &internal_call_id,
                                 &tool_call.function.name,
+                                tool_call.function.arguments.clone(),
+                                &self.observer.events,
+                            );
+                            self.observer.tool_started(
+                                &internal_call_id,
+                                &tool_call.function.name,
                                 tool_call.function.arguments,
-                                &self.events,
+                                true,
                             );
                         }
                         Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
@@ -277,7 +289,8 @@ where
                                 })
                                 .collect::<Vec<_>>()
                                 .join("");
-                            collector.tool_finished(&internal_call_id, &text, &self.events);
+                            collector.tool_finished(&internal_call_id, &text, &self.observer.events);
+                            self.observer.tool_finished(&internal_call_id, &text);
                         }
                         Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                             collector.finished(res.output());
@@ -326,7 +339,8 @@ mod tests {
 
     /// Every progress line the chat has been given since the last look, in
     /// the order it would show them - which is what a reader watching one
-    /// status line actually experiences.
+    /// status line actually experiences. Trace frames ride the same channel
+    /// and are the observer's business, so they are skipped here.
     fn lines(
         seen: &mut tokio::sync::mpsc::UnboundedReceiver<scout_api::AgentEvent>,
     ) -> Vec<String> {
@@ -334,7 +348,8 @@ mod tests {
         while let Ok(event) = seen.try_recv() {
             match event {
                 scout_api::AgentEvent::Tool(text) => shown.push(text),
-                other => panic!("this file emits progress and nothing else, got {other:?}"),
+                scout_api::AgentEvent::Trace(_) => {}
+                other => panic!("this file emits progress and trace frames and nothing else, got {other:?}"),
             }
         }
         shown
@@ -592,20 +607,18 @@ mod tests {
         agent: rig::agent::Agent<M>,
         events: scout_api::EventSink,
     ) -> Specialist<M> {
-        specialist_with_pulse(agent, events, crate::run::Pulse::default())
+        specialist_with(agent, std::sync::Arc::new(crate::observer::Observer::new(events, 1)))
     }
 
-    fn specialist_with_pulse<M: rig::completion::CompletionModel>(
+    fn specialist_with<M: rig::completion::CompletionModel>(
         agent: rig::agent::Agent<M>,
-        events: scout_api::EventSink,
-        pulse: crate::run::Pulse,
+        observer: std::sync::Arc<crate::observer::Observer>,
     ) -> Specialist<M> {
         Specialist {
             name: "ask_probe",
             description: "test".to_string(),
             agent,
-            events,
-            pulse: std::sync::Arc::new(pulse),
+            observer,
             guidance: Box::new(|f: &[Finding]| vec![format!("{} ok", f.iter().filter(|x| !x.failed).count())]),
             budget: std::time::Duration::from_secs(5),
         }
@@ -614,8 +627,9 @@ mod tests {
     #[tokio::test]
     async fn a_nested_run_becomes_a_report_of_what_its_tools_returned() {
         let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
-        let stale = crate::run::Pulse::aged(std::time::Duration::from_secs(60));
-        let tool = specialist_with_pulse(scripted(7, 5), events, stale);
+        let mut stale = crate::observer::Observer::new(events, 1);
+        stale.pulse = crate::run::Pulse::aged(std::time::Duration::from_secs(60));
+        let tool = specialist_with(scripted(7, 5), std::sync::Arc::new(stale));
 
         let report = rig::tool::Tool::call(&tool, Brief { brief: "probe seven".to_string() }).await.unwrap();
 
@@ -629,7 +643,26 @@ mod tests {
             Ok(scout_api::AgentEvent::Tool(text)) => assert_eq!(text, "⚙️ probe"),
             other => panic!("the chat must see the nested call: {other:?}"),
         }
-        assert!(tool.pulse.since() < std::time::Duration::from_secs(1), "the pulse was touched");
+        assert!(tool.observer.pulse.since() < std::time::Duration::from_secs(1), "the pulse was touched");
+    }
+
+    #[tokio::test]
+    async fn nested_calls_are_recorded_on_the_observer_as_nested() {
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let observer = std::sync::Arc::new(crate::observer::Observer::new(events, 7));
+        let tool = specialist_with(scripted(7, 5), observer.clone());
+        rig::tool::Tool::call(&tool, Brief { brief: "probe".to_string() }).await.unwrap();
+        let rows = observer.take_rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].nested);
+        assert_eq!(rows[0].tool.as_deref(), Some("probe"));
+        assert_eq!(rows[0].status.as_deref(), Some("ok"));
+        assert!(rows[0].duration_ms.is_some());
+        // The mock stream emits the model's ToolCall item before the start,
+        // as rig does, so the clock has to be started from it here too.
+        let src = include_str!("specialist.rs");
+        let src = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(src.contains("self.observer.tool_called(&internal_call_id)"), "the nested clock starts at the model's call");
     }
 
     #[tokio::test]

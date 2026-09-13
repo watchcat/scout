@@ -151,8 +151,11 @@ pub(crate) fn save_history(store: &crate::store::Store, conversation_id: i64, hi
 /// How a run writes what it produced. The stored log is not the model's
 /// window and does not have to agree with it: the window is cut on the way
 /// out, by `load_history`.
-pub(crate) fn append_history(store: &crate::store::Store, conversation_id: i64, messages: &[LlmMessage]) -> anyhow::Result<()> {
-    store.append_messages(conversation_id, &bodies_of(messages)?)
+///
+/// `run_id` is the run that produced them, so a page can find the trace
+/// behind an answer; `None` for messages nobody's run wrote.
+pub(crate) fn append_history(store: &crate::store::Store, conversation_id: i64, run_id: Option<i64>, messages: &[LlmMessage]) -> anyhow::Result<()> {
+    store.append_messages(conversation_id, run_id, &bodies_of(messages)?)
 }
 
 fn bodies_of(messages: &[LlmMessage]) -> anyhow::Result<Vec<String>> {
@@ -172,15 +175,20 @@ fn bodies_of(messages: &[LlmMessage]) -> anyhow::Result<Vec<String>> {
 /// transcript, where tool traffic is not rendered at all, and fatal for the
 /// model. `load_history` is the one that makes it safe to send.
 pub(crate) fn load_history_raw(store: &crate::store::Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
-    let bodies = store.conversation_messages(conversation_id, cap)?;
-    let mut out = Vec::with_capacity(bodies.len());
-    for body in bodies {
+    Ok(load_history_with_runs(store, conversation_id, cap)?.0)
+}
+
+/// The transcript with the run each message came from, for the page.
+pub(crate) fn load_history_with_runs(store: &crate::store::Store, conversation_id: i64, cap: usize) -> anyhow::Result<(Vec<LlmMessage>, Vec<Option<i64>>)> {
+    let mut messages = Vec::new();
+    let mut runs = Vec::new();
+    for (run_id, body) in store.conversation_messages(conversation_id, cap)? {
         match serde_json::from_str::<LlmMessage>(&body) {
-            Ok(m) => out.push(m),
+            Ok(m) => { messages.push(m); runs.push(run_id); }
             Err(e) => tracing::warn!(error = %e, "dropping an unreadable stored message"),
         }
     }
-    Ok(out)
+    Ok((messages, runs))
 }
 
 /// The last `cap` messages, shaped so a provider will accept them.
@@ -277,7 +285,8 @@ pub(crate) fn latest_direct(store: &crate::store::Store, account_id: i64) -> any
 /// conversation joined late — correct, and far better than one that starts
 /// at the last exchange because everything above it was deleted.
 pub(crate) fn transcript_of(store: &crate::store::Store, conversation_id: i64) -> anyhow::Result<Vec<scout_api::Turn>> {
-    Ok(turns_of(&load_history_raw(store, conversation_id, TRANSCRIPT_CAP)?))
+    let (history, runs) = load_history_with_runs(store, conversation_id, TRANSCRIPT_CAP)?;
+    Ok(turns_of(&history, &runs))
 }
 
 /// Whether an assistant message is an answer rather than a step of one.
@@ -316,7 +325,10 @@ fn superseded(history: &[LlmMessage], i: usize) -> bool {
 /// Split out of `transcript_of` because the store half needs a database and
 /// this half is the part that can be wrong: which messages count as things
 /// that were said, and what is stripped from them before they are shown.
-fn turns_of(history: &[LlmMessage]) -> Vec<scout_api::Turn> {
+///
+/// `runs` is parallel to `history`: the run each message was written by.
+/// Only a Scout turn names one — a question has no trace, its answer does.
+fn turns_of(history: &[LlmMessage], runs: &[Option<i64>]) -> Vec<scout_api::Turn> {
     history
         .iter()
         .enumerate()
@@ -328,6 +340,7 @@ fn turns_of(history: &[LlmMessage]) -> Vec<scout_api::Turn> {
             LlmMessage::User { content } => text_of_user(content).map(|text| scout_api::Turn {
                 role: scout_api::Role::You,
                 text: crate::text::said_by_person(&text).to_string(),
+                run_id: None,
             }),
             // Stripped, because what is *stored* is the model's raw message:
             // `run_agent` saves `res.messages()`, tags and all, and only the
@@ -342,6 +355,7 @@ fn turns_of(history: &[LlmMessage]) -> Vec<scout_api::Turn> {
                 text_of_assistant(content).map(|text| scout_api::Turn {
                     role: scout_api::Role::Scout,
                     text: crate::text::strip_thinking(&text),
+                    run_id: runs.get(i).copied().flatten(),
                 })
             }
             _ => None,
@@ -788,7 +802,7 @@ mod tests {
             LlmMessage::user(crate::links::repair_prompt(&["https://bol.com/404".to_string()])),
             LlmMessage::assistant("EUR 40.44 delivered"),
         ];
-        let turns = turns_of(&history);
+        let turns = turns_of(&history, &vec![None; history.len()]);
         assert_eq!(turns.len(), 2, "got: {:?}", turns.iter().map(|t| &t.text).collect::<Vec<_>>());
         assert_eq!(turns[0].text, "find me cheapest gillette");
         assert_eq!(turns[1].text, "EUR 40.44 delivered");
@@ -811,7 +825,7 @@ mod tests {
             narrating_tool_call("The 8-pack is out of stock. Let me check delivery.", "fetch_page"),
             LlmMessage::assistant("EUR 40.44 delivered — 16-pack, shavesavings.com"),
         ];
-        let turns = turns_of(&history);
+        let turns = turns_of(&history, &vec![None; history.len()]);
         assert_eq!(turns.len(), 2, "got: {:?}", turns.iter().map(|t| &t.text).collect::<Vec<_>>());
         assert_eq!(turns[0].text, "find me cheapest gillette cartridges");
         assert_eq!(turns[1].text, "EUR 40.44 delivered — 16-pack, shavesavings.com");
@@ -830,7 +844,7 @@ mod tests {
             LlmMessage::user(crate::links::repair_prompt(&["https://dead.example/404".to_string()])),
             LlmMessage::assistant("EUR 3 at bol.com"),
         ];
-        let turns = turns_of(&history);
+        let turns = turns_of(&history, &vec![None; history.len()]);
         assert_eq!(turns.len(), 2, "got: {:?}", turns.iter().map(|t| &t.text).collect::<Vec<_>>());
         assert_eq!(turns[1].text, "EUR 3 at bol.com");
     }
@@ -845,7 +859,7 @@ mod tests {
             LlmMessage::user("[system note] The user reacted with a thumbs-up to this earlier reply."),
             LlmMessage::assistant("Want me to save that one?"),
         ];
-        let turns = turns_of(&history);
+        let turns = turns_of(&history, &vec![None; history.len()]);
         assert_eq!(turns.len(), 2, "got: {:?}", turns.iter().map(|t| &t.text).collect::<Vec<_>>());
         assert_eq!(turns[0].text, "EUR 3 at bol.com");
     }
@@ -856,7 +870,19 @@ mod tests {
         // model's raw message, tags and all, so the answer turn is stripped
         // at render time — including the namespaced spelling.
         let history = vec![LlmMessage::assistant("my reasoning</mm:think>The answer")];
-        assert_eq!(turns_of(&history)[0].text, "The answer");
+        assert_eq!(turns_of(&history, &vec![None; history.len()])[0].text, "The answer");
+    }
+
+    #[test]
+    fn a_scout_turn_carries_its_run_and_a_you_turn_does_not() {
+        let history = vec![LlmMessage::user("beans?"), LlmMessage::assistant("three brands")];
+        let runs = vec![None, Some(9)];
+        let turns = turns_of(&history, &runs);
+        assert_eq!(turns[0].run_id, None);
+        assert_eq!(turns[1].run_id, Some(9));
+        // A message saved before runs existed.
+        let turns = turns_of(&history, &[None, None]);
+        assert_eq!(turns[1].run_id, None);
     }
 
     #[test]
@@ -920,6 +946,7 @@ mod tests {
             append_history(
                 s,
                 c,
+                None,
                 &[LlmMessage::user(format!("question {i}")), LlmMessage::assistant(format!("answer {i}"))],
             )
             .unwrap();
@@ -983,7 +1010,7 @@ mod tests {
             });
         }
         written.push(LlmMessage::assistant("here are three"));
-        append_history(&s, c, &written).unwrap();
+        append_history(&s, c, None, &written).unwrap();
 
         let window = load_history(&s, c, HISTORY_CAP).unwrap();
 
@@ -1056,7 +1083,7 @@ mod tests {
                 written.push(a_tool_result(&id));
             }
             written.push(LlmMessage::assistant(format!("answer {exchange}")));
-            append_history(&s, c, &written).unwrap();
+            append_history(&s, c, None, &written).unwrap();
         }
 
         let window = load_history(&s, c, HISTORY_CAP).unwrap();
@@ -1126,8 +1153,8 @@ mod tests {
         assert_eq!(
             transcript_of(&s, c).unwrap(),
             vec![
-                Turn { role: Role::You, text: "cheapest beans".into() },
-                Turn { role: Role::Scout, text: "here are three".into() },
+                Turn { role: Role::You, text: "cheapest beans".into(), run_id: None },
+                Turn { role: Role::Scout, text: "here are three".into(), run_id: None },
             ]
         );
     }

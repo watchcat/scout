@@ -20,20 +20,6 @@ pub enum RunOutcome {
     Overloaded,
 }
 
-/// Runs the agent against a snapshot of this chat's history, then writes the
-/// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
-/// from being held across awaits.
-///
-/// The run reports progress as events rather than drawing them, because the
-/// tool calls alone take most of a minute and an idle chat looks broken —
-/// but who draws them is not this function's business.
-///
-/// `events` is taken by value: returning drops it, which closes the channel
-/// and ends whoever is rendering. That is the only shutdown signal the
-/// renderer gets, so nothing outside this function may keep a sender. The
-/// agent built for the run holds a clone (the specialist reports progress
-/// through it), but that clone lives and dies with the agent inside this
-/// function, so the channel still closes on return.
 /// The event a streamed chunk should produce, if anything changed.
 ///
 /// A function rather than three lines inline, because `run_agent` needs a
@@ -48,6 +34,20 @@ fn answer_event(
     shown.update(&strip_thinking(streamed)).map(scout_api::AgentEvent::Answer)
 }
 
+/// Runs the agent against a snapshot of this chat's history, then writes the
+/// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
+/// from being held across awaits.
+///
+/// The run reports progress as events rather than drawing them, because the
+/// tool calls alone take most of a minute and an idle chat looks broken —
+/// but who draws them is not this function's business.
+///
+/// `events` is taken by value: returning drops it, which closes the channel
+/// and ends whoever is rendering. That is the only shutdown signal the
+/// renderer gets, so nothing outside this function may keep a sender. The
+/// run's observer holds a clone — the loop below, the flight desk and its
+/// specialist all report through it — but the observer is dropped with the
+/// agent before this function returns, so the channel still closes then.
 pub async fn run_agent(
     core: &Core,
     events: scout_api::EventSink,
@@ -64,12 +64,40 @@ pub async fn run_agent(
     let Some(_slot) = take_slot(&core.deps.runs, &events).await else {
         return Ok(RunOutcome::Overloaded);
     };
+    let run_id = {
+        let store = core.deps.store.clone();
+        crate::core::blocking(move || store.open_run(account_id, conversation_id)).await?
+    };
+    let observer = std::sync::Arc::new(crate::observer::Observer::new(events.clone(), run_id));
+    observer.announce();
+    // From here on the run has a row, and every way out must close it. The
+    // body is a separate function so that closing happens in one place
+    // below rather than beside each bail and each early return — one added
+    // to the body later is covered without anyone remembering to.
+    match run_with(core, run, prompt, &observer).await {
+        Ok(outcome) => Ok(outcome),
+        Err(e) => {
+            finish_run(&core.deps.store, &observer, "failed", Some(&e.to_string())).await;
+            Err(e)
+        }
+    }
+}
+
+/// The run itself, once it has a row to be recorded under. An answered or
+/// cut-short run closes its own row on the way out; an error of any kind
+/// is closed by the caller.
+async fn run_with(
+    core: &Core,
+    run: &scout_api::RunContext,
+    prompt: &str,
+    observer: &std::sync::Arc<crate::observer::Observer>,
+) -> anyhow::Result<RunOutcome> {
+    let (account_id, conversation_id) = (run.account_id, run.conversation_id);
     let facts = {
         let store = core.deps.store.clone();
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
-    let pulse = std::sync::Arc::new(Pulse::default());
-    let agent = build_agent(&core.deps, run, &facts, events.clone(), pulse.clone());
+    let agent = build_agent(&core.deps, run, &facts, observer.clone());
     // History comes from the conversation the caller opened, so an
     // in-flight run always reads and writes that thread and never anyone
     // else's — the isolation the (chat, user) map used to provide.
@@ -110,11 +138,11 @@ pub async fn run_agent(
                 let next = loop {
                     match tokio::time::timeout(STALL_CHECK, stream.next()).await {
                         Ok(Some(item)) => {
-                            pulse.touch();
+                            observer.pulse.touch();
                             break item;
                         }
                         Ok(None) => return Ok(None),
-                        Err(_) if pulse.since() < STREAM_STALL => continue,
+                        Err(_) if observer.pulse.since() < STREAM_STALL => continue,
                         Err(_) => return Ok(Some("the model stopped responding")),
                     }
                 };
@@ -128,15 +156,39 @@ pub async fn run_agent(
                     Err(e) => return Err(anyhow::Error::from(e)),
                 };
                 match item {
-                MultiTurnStreamItem::ToolExecutionStart { tool_call, .. } => {
+                // The model's call, streamed before the tool runs: where its
+                // clock starts. The start item comes only once it has returned.
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                    internal_call_id,
+                    ..
+                }) => {
+                    observer.tool_called(&internal_call_id);
+                }
+                MultiTurnStreamItem::ToolExecutionStart { tool_call, internal_call_id } => {
                     let args = &tool_call.function.arguments;
                     scout_api::emit(
-                        &events,
+                        &observer.events,
                         scout_api::AgentEvent::Tool(crate::describe::describe(
                             &tool_call.function.name,
                             args,
                         )),
                     );
+                    observer.tool_started(&internal_call_id, &tool_call.function.name, args.clone(), false);
+                }
+                MultiTurnStreamItem::StreamUserItem(rig::streaming::StreamedUserContent::ToolResult {
+                    tool_result,
+                    internal_call_id,
+                }) => {
+                    let text = tool_result
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            rig::completion::message::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    observer.tool_finished(&internal_call_id, &text);
                 }
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
                     streamed.push_str(&t.text);
@@ -147,7 +199,7 @@ pub async fn run_agent(
                     // The old `if !answer.is_empty()` guard suppressed
                     // exactly that event, which is why it is gone.
                     if let Some(event) = answer_event(&mut answer_shown, &streamed) {
-                        scout_api::emit(&events, event);
+                        scout_api::emit(&observer.events, event);
                     }
                 }
                 // MiniMax streams its reasoning on a separate channel. Shown
@@ -158,7 +210,7 @@ pub async fn run_agent(
                     thinking.push_str(&reasoning);
                     if strip_thinking(&streamed).is_empty() {
                         if let Some(update) = thinking_shown.update(&thinking) {
-                            scout_api::emit(&events, scout_api::AgentEvent::Thinking(update));
+                            scout_api::emit(&observer.events, scout_api::AgentEvent::Thinking(update));
                         }
                     }
                 }
@@ -173,7 +225,7 @@ pub async fn run_agent(
                     }
                     if strip_thinking(&streamed).is_empty() {
                         if let Some(update) = thinking_shown.update(&thinking) {
-                            scout_api::emit(&events, scout_api::AgentEvent::Thinking(update));
+                            scout_api::emit(&observer.events, scout_api::AgentEvent::Thinking(update));
                         }
                     }
                 }
@@ -198,6 +250,7 @@ pub async fn run_agent(
         // single WARN or ERROR in it, so there was nothing to diagnose.
         Ok(Err(e)) => {
             tracing::error!(error = %e, account_id, conversation_id, "the run failed");
+            observer.event("the model call failed", true);
             return Err(e);
         }
         Err(_) => Some("this took too long"),
@@ -246,13 +299,19 @@ pub async fn run_agent(
     // and none of them has one for a run that answered with nothing — the
     // browser renders the blank as Scout's reply.
     if reply.is_empty() && salvage.is_none() {
-        anyhow::bail!("the model produced no answer and no notes to write one from");
+        let why = "the model produced no answer and no notes to write one from";
+        observer.event(why, true);
+        anyhow::bail!(why);
     }
+    // What the wrap-up below is about to consume, kept for the run's row:
+    // a written-up run is still one that was cut short.
+    let cut_short: Option<&'static str> = salvage;
 
     if let Some(reason) = salvage {
         tracing::warn!(conversation_id, reason, "run interrupted; writing up from notes");
+        observer.event("run interrupted; writing up from notes", false);
         scout_api::emit(
-            &events,
+            &observer.events,
             scout_api::AgentEvent::Notice(
                 "✍️ wrapping up with what I found so far".to_string(),
             ),
@@ -275,14 +334,23 @@ pub async fn run_agent(
         .await
         {
             Ok(Ok(text)) => strip_thinking(&text),
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => anyhow::bail!("wrap-up timed out after the run was interrupted"),
+            Ok(Err(e)) => {
+                observer.event("the model call failed", true);
+                return Err(e.into());
+            }
+            Err(_) => {
+                let why = "wrap-up timed out after the run was interrupted";
+                observer.event(why, true);
+                anyhow::bail!(why);
+            }
         };
         // A write-up that is itself all reasoning, or empty, is a second
         // blank — the thing this path exists to stop. An error is a message
         // the reader sees; the empty string is silence.
         if reply.is_empty() {
-            anyhow::bail!("the wrap-up came back with no answer in it either");
+            let why = "the wrap-up came back with no answer in it either";
+            observer.event(why, true);
+            anyhow::bail!(why);
         }
         // Keep the exchange in context; the interrupted turns are lost. A
         // run that reached its final response and is written up anyway —
@@ -308,11 +376,14 @@ pub async fn run_agent(
     // checked.
     if crate::toolcall::looks_like_tool_call(&reply) {
         tracing::warn!(conversation_id, "the model wrote a tool call as text; asking it to answer");
+        observer.event("the model wrote a tool call as text; asking it to answer", false);
         reply = strip_thinking(&agent.chat(crate::toolcall::REPAIR_NOTE, &mut history).await?);
         if crate::toolcall::looks_like_tool_call(&reply) {
             // Twice is not a slip. The run has not answered, and an apology
             // the reader understands beats markup they cannot.
-            anyhow::bail!("the model wrote a tool call as text instead of answering, twice");
+            let why = "the model wrote a tool call as text instead of answering, twice";
+            observer.event(why, true);
+            anyhow::bail!(why);
         }
     }
 
@@ -322,18 +393,20 @@ pub async fn run_agent(
     let dead = crate::links::dead_links_in(&core.deps.http, &reply).await;
     if !dead.is_empty() {
         tracing::warn!(?dead, conversation_id, "dead links in reply; asking the agent to correct it");
+        observer.event("dead links in reply; asking the agent to correct it", false);
         let note = crate::links::repair_prompt(&dead);
         reply = strip_thinking(&agent.chat(note, &mut history).await?);
         let still_dead = crate::links::dead_links_in(&core.deps.http, &reply).await;
         if !still_dead.is_empty() {
             tracing::warn!(?still_dead, conversation_id, "dead links survived the correction; stripping");
+            observer.event("dead links survived the correction; stripping", true);
             reply = crate::links::strike_dead(&reply, &still_dead);
         }
     }
 
     let added = new_since(&history, loaded_len);
-    let store = core.deps.store.clone();
-    match crate::core::blocking(move || crate::session::append_history(&store, conversation_id, &added)).await {
+    let (store, run_id) = (core.deps.store.clone(), observer.run_id);
+    match crate::core::blocking(move || crate::session::append_history(&store, conversation_id, Some(run_id), &added)).await {
         // The answer is already on its way to the user; losing the thread is
         // worse than not saving it, but it is not worth failing the reply.
         Err(e) => tracing::warn!(error = %e, conversation_id, "could not save the conversation"),
@@ -346,7 +419,29 @@ pub async fn run_agent(
             }
         }
     }
+    finish_run(
+        &core.deps.store,
+        observer,
+        if cut_short.is_some() { "cut_short" } else { "answered" },
+        cut_short,
+    )
+    .await;
     Ok(RunOutcome::Answered(reply))
+}
+
+/// Writes the trace and closes the run, on every exit that has one. Never
+/// fails the reply over it: the answer is already on its way.
+async fn finish_run(store: &crate::store::Store, observer: &crate::observer::Observer, outcome: &str, detail: Option<&str>) {
+    let rows = observer.take_rows();
+    let (store, run_id, outcome, detail) = (store.clone(), observer.run_id, outcome.to_string(), detail.map(str::to_string));
+    if let Err(e) = crate::core::blocking(move || {
+        store.append_traces(run_id, &rows)?;
+        store.close_run(run_id, &outcome, detail.as_deref())
+    })
+    .await
+    {
+        tracing::warn!(error = %e, run_id, "could not save the trace");
+    }
 }
 
 /// Runs allowed at once across every conversation and channel.
@@ -842,9 +937,26 @@ mod tests {
     /// test has is the address the model client is pointed at — which is
     /// `Config`'s, and which production already moves for a self-hoster
     /// fronting MiniMax with a proxy of their own.
-    async fn a_run_against(
-        llm: &wiremock::MockServer,
-    ) -> (anyhow::Result<RunOutcome>, Vec<scout_api::AgentEvent>) {
+    struct Ran {
+        outcome: anyhow::Result<RunOutcome>,
+        shown: Vec<scout_api::AgentEvent>,
+        core: Core,
+        account_id: i64,
+        conversation_id: i64,
+        /// Held so the database outlives the run it is read back from.
+        _dir: tempfile::TempDir,
+    }
+
+    impl Ran {
+        /// The run as the store kept it: its row and its trace.
+        fn saved(&self) -> (scout_api::RunRow, Vec<scout_api::TraceRow>) {
+            let store = self.core.store();
+            let run_id = store.latest_run_id(self.conversation_id).unwrap().expect("the run opened a row");
+            store.trace_of(run_id, self.account_id).unwrap().expect("the row is this account's")
+        }
+    }
+
+    async fn a_run_against(llm: &wiremock::MockServer) -> Ran {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::config::Config::for_test(
             dir.path().join("run.duckdb").to_str().unwrap(),
@@ -868,7 +980,7 @@ mod tests {
         while let Ok(event) = seen.try_recv() {
             shown.push(event);
         }
-        (outcome, shown)
+        Ran { outcome, shown, core, account_id, conversation_id, _dir: dir }
     }
 
     #[tokio::test]
@@ -887,17 +999,28 @@ mod tests {
         )
         .await;
 
-        let (outcome, shown) = a_run_against(&llm).await;
+        let ran = a_run_against(&llm).await;
 
-        match outcome.expect("a run with an answer in it must not fail") {
+        // The run's row says it was cut short and why, and the trace holds
+        // the event beside the warning that was logged.
+        let (run, rows) = ran.saved();
+        assert_eq!(run.outcome.as_deref(), Some("cut_short"));
+        assert_eq!(run.detail.as_deref(), Some("that reply came back as reasoning instead of an answer"));
+        assert!(run.ended_at.is_some(), "the row was closed");
+        assert!(
+            rows.iter().any(|r| r.kind == "event" && r.detail.as_deref() == Some("run interrupted; writing up from notes")),
+            "the write-up is not in the trace: {rows:?}"
+        );
+        match ran.outcome.expect("a run with an answer in it must not fail") {
             RunOutcome::Answered(reply) => {
                 assert!(reply.contains("Which segments"), "the answer was lost: {reply:?}")
             }
             _ => panic!("a run that produced text must answer"),
         }
         assert!(
-            shown.iter().any(|e| matches!(e, scout_api::AgentEvent::Notice(n) if n.contains("wrapping up"))),
-            "the reader was not told the answer was being written up: {shown:?}"
+            ran.shown.iter().any(|e| matches!(e, scout_api::AgentEvent::Notice(n) if n.contains("wrapping up"))),
+            "the reader was not told the answer was being written up: {:?}",
+            ran.shown
         );
     }
 
@@ -911,9 +1034,19 @@ mod tests {
         // renders as Scout's reply.
         let llm = minimax(streamed_text(&[""]), None).await;
 
-        let (outcome, _shown) = a_run_against(&llm).await;
+        let ran = a_run_against(&llm).await;
 
-        let Err(err) = outcome else {
+        // A failed run is closed as one, with the failure in its trace —
+        // and the event's millisecond `Z` timestamp came back through the
+        // store's TIMESTAMP cast in one piece.
+        let (run, rows) = ran.saved();
+        assert_eq!(run.outcome.as_deref(), Some("failed"));
+        assert!(run.detail.as_deref().unwrap_or("").contains("no answer and no notes"), "got: {run:?}");
+        let event = rows.iter().find(|r| r.kind == "event").expect("the failure is in the trace");
+        assert_eq!(event.status.as_deref(), Some("failed"));
+        assert!(event.detail.as_deref().unwrap_or("").contains("no answer and no notes"), "got: {event:?}");
+        assert!(event.started_at.starts_with("20") && event.started_at.contains(':'), "got: {:?}", event.started_at);
+        let Err(err) = ran.outcome else {
             panic!("an answer of nothing is not an answer");
         };
         assert!(err.to_string().contains("no answer and no notes"), "got: {err}");
@@ -1122,6 +1255,79 @@ mod tests {
         let src = include_str!("run.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         assert!(src.contains("timeout(STALL_CHECK, stream.next())"), "the stream is polled in short checks");
-        assert!(src.contains("pulse.since() < STREAM_STALL"), "and a stall is judged by the pulse");
+        assert!(src.contains("observer.pulse.since() < STREAM_STALL"), "and a stall is judged by the pulse");
+    }
+
+    #[test]
+    fn every_warning_about_the_run_is_also_a_trace_event() {
+        // The log on the node and the trace under the answer must tell the
+        // same story; a warning with no event is a failure the admin
+        // cannot see from the browser.
+        let src = include_str!("run.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        for wording in [
+            "run interrupted; writing up from notes",
+            "the model wrote a tool call as text; asking it to answer",
+            "dead links in reply; asking the agent to correct it",
+            "dead links survived the correction; stripping",
+        ] {
+            let at = body.find(wording).unwrap_or_else(|| panic!("{wording:?} is no longer logged"));
+            let after = &body[at..];
+            let end = after.len().min(after.find('\n').unwrap_or(after.len()) + 400);
+            let end = (end..=after.len()).find(|&n| after.is_char_boundary(n)).unwrap_or(after.len());
+            assert!(after[..end].contains("observer.event("), "{wording:?} is logged but not traced");
+        }
+        assert!(body.contains(r#"finish_run(&core.deps.store, &observer, "failed""#), "a failed run closes its row");
+    }
+
+    #[test]
+    fn the_run_is_opened_before_the_agent_and_traces_are_saved_after_the_messages() {
+        let src = include_str!("run.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let open = body.find("open_run(").expect("the run must be opened");
+        let build = body.find("build_agent(").expect("the agent build must exist");
+        let append = body.find("append_history(").expect("messages are appended");
+        let save = body.rfind("finish_run(").expect("traces are saved");
+        assert!(open < build, "the run id must exist before the observer is built");
+        assert!(append < save, "traces are saved after the messages that point at the run");
+    }
+
+    #[test]
+    fn a_tools_clock_starts_at_the_models_call() {
+        // rig surfaces a tool's start together with its result, after the
+        // tool returned; a clock started there reads zero for every tool.
+        let src = include_str!("run.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let called = body.find("observer.tool_called(&internal_call_id)").expect("the clock starts at the model's call");
+        let started = body.find("observer.tool_started(").expect("the start is recorded");
+        assert!(called < started, "the call arm comes before the start arm, as the items do");
+    }
+
+    #[test]
+    fn once_a_run_has_a_row_there_is_no_way_out_that_leaves_it_open() {
+        // A `?` between opening the run and the inner call would return
+        // past the one place that closes the row. The two repair turns and
+        // the history load all end in one, so the body lives in `run_with`
+        // and the outer function has exactly one exit for its errors.
+        let src = include_str!("run.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let outer = &src[src.find("pub async fn run_agent").expect("the run must exist")..];
+        let outer = &outer[..outer.find("\nasync fn run_with(").expect("the body must be its own function")];
+        let after_open = &outer[outer.find("Observer::new(").expect("the observer is built in the outer function")..];
+        assert_eq!(after_open.matches("run_with(").count(), 1, "the body is called exactly once");
+        // Code only: a question asked in a comment is not an early return.
+        let code: Vec<&str> = after_open.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        let code = code.join("\n");
+        assert!(!code.contains('?'), "a `?` after the run is opened skips closing it: {code}");
+        assert!(
+            after_open.contains(r#"finish_run(&core.deps.store, &observer, "failed""#),
+            "the outer function is where a failed run is closed"
+        );
+        let inner = &src[src.find("\nasync fn run_with(").unwrap()..];
+        assert_eq!(
+            inner.matches(r#""failed""#).count(),
+            0,
+            "the body must not close failed runs itself; that is the caller's one job"
+        );
     }
 }

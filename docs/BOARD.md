@@ -6,7 +6,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## In progress
 
-_(nothing)_
+- [ ] **Debug trace behind every answer** — `/debug on|off` in the web chat (admins only, per account). Every run records a trace: each tool call with args, duration, status and result, nested flight-desk calls, run-level events. A Trace button under each Scout turn opens the panel; live rows stream during a run. Spec: `docs/superpowers/specs/2026-09-13-debug-trace-design.md`
 
 ## Next
 

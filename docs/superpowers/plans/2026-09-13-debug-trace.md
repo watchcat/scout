@@ -1236,6 +1236,12 @@ test('a saved trace becomes one line per row, nested rows marked, events full wi
   assert.equal(lines.rows[1].detail, 'duffel 429')
 })
 
+test('a saved run that never closed reads as unfinished', () => {
+  const lines = traceLines({ id: 3, started_at: '2026-09-13T10:00:00Z', ended_at: null, outcome: null, detail: null }, [])
+  assert.equal(lines.head, 'unfinished')
+  assert.equal(traceLines(null, []).head, '', 'a live panel has no head')
+})
+
 test('arguments on a line are cut at 120 characters', () => {
   const rows = [{ seq: 0, kind: 'tool', tool: 't', args: { q: 'x'.repeat(200) }, nested: false, status: 'ok' }]
   const line = traceLines({ id: 1 }, rows).rows[0].label
@@ -1287,10 +1293,14 @@ function argsLine(args) {
 }
 
 export function traceLines(run, rows) {
-  const head = run && run.outcome
-    ? [run.outcome, run.ended_at && run.started_at ? traceDuration(Date.parse(run.ended_at) - Date.parse(run.started_at)) : '', run.detail]
-        .filter(Boolean).join(' · ')
-    : ''
+  let head = ''
+  if (run && run.outcome) {
+    head = [run.outcome, run.ended_at && run.started_at ? traceDuration(Date.parse(run.ended_at) - Date.parse(run.started_at)) : '', run.detail]
+      .filter(Boolean).join(' · ')
+  } else if (run && run.id && !run.outcome && run.started_at) {
+    // A saved run that never closed its row: the process died mid-run.
+    head = 'unfinished'
+  }
   return {
     head,
     rows: rows.map(r => ({
@@ -1356,7 +1366,7 @@ export function applyTraceFrame(rows, frame) {
 
   - State: `let debugOn = false`. `async function refreshDebug() { try { const r = await fetch('/chat/debug'); if (r.ok) debugOn = (await r.json()).on } catch {} ; document.body.classList.toggle('debug', debugOn) }`. Called from the page's initial load (next to `loadHistory()`), and after a send whose text starts with `/debug`.
   - `turnElement(role, text, runId)`: when `role !== 'You'` and `runId` is a number and `debugOn`, append a `button.trace-btn` with text `Trace` and `dataset.runId = runId`; the button toggles `openTrace(li, runId)`. `showTurns` passes `turn.run_id`.
-  - `renderTracePanel(li, run, rows)`: builds `div.trace` from `traceLines(run, rows)`: a `.head` div when `head` is non-empty, then per row a `div.row` with classes `tool|event`, `nested`, and `failed` when status is `failed`; children: `span.label` (textContent = label), `span.dur` (duration), `span.chip` (status or `running` when undefined). Clicking a tool row toggles a `pre` after it with `JSON.stringify(args, null, 2)` then a blank line then the result pretty-printed when it parses as JSON, else the raw text; append `\n… (cut at the store's cap)` when truncated. Use `textContent` everywhere; never `innerHTML` for trace content. Replaces any existing `.trace` in the `li`.
+  - `renderTracePanel(li, run, rows)`: builds `div.trace` from `traceLines(run, rows)`: a `.head` div when `head` is non-empty (a saved run with no `outcome` heads with `unfinished`, since a run that panicked never closed its row), then per row a `div.row` with classes `tool|event`, `nested`, and `failed` when status is `failed`; children: `span.label` (textContent = label), `span.dur` (duration), `span.chip` (status or `running` when undefined). Clicking a tool row toggles a `pre` after it with `JSON.stringify(args, null, 2)` then a blank line then the result pretty-printed when it parses as JSON, else the raw text; append `\n… (cut at the store's cap)` when truncated. Use `textContent` everywhere; never `innerHTML` for trace content. Replaces any existing `.trace` in the `li`.
   - `openTrace(li, runId)`: if a `.trace` exists, remove it and return; else `fetch('/chat/runs/'+runId+'/trace')`: 403 → `showNotice('Turn debug on with /debug on to see traces.')`; 404 → render a panel whose head is `trace no longer kept`; ok → `renderTracePanel`.
   - Live: in the run's frame handler, `else if ('Trace' in evt)`: `const f = evt.Trace; if (f.kind === 'run') { liveRunId = f.run_id } else { liveRows = applyTraceFrame(liveRows, f); if (debugOn && mine()) { renderAnswer(); renderTracePanel(answerLi, null, liveRows) } }`. `liveRunId`/`liveRows` are per-send locals next to `answer`/`thinking`. When the end frame arrives and `answerLi` survives, if `debugOn` append the Trace button with `liveRunId` (so a click re-fetches the saved trace with results) and leave the live panel in place.
   - `renderAnswer` sets `answerLi.innerHTML = render(answer)`, which would wipe a live panel; change it to render the answer into a child `div.text` and keep the panel: `if (!answerLi.querySelector('.text')) answerLi.append(node('div','text'))` then set that div's innerHTML. `turnElement` renders into the same `div.text` so both paths share one structure. Check the CSS for `.turns li` does not depend on direct text children (it does not; it styles the `li`).

@@ -279,8 +279,8 @@ mod tests {
             .await
             .unwrap();
         let turns = vec![
-            scout_api::Turn { role: Role::You, text: "cheapest beans".to_string() },
-            scout_api::Turn { role: Role::Scout, text: "here are three".to_string() },
+            scout_api::Turn { role: Role::You, text: "cheapest beans".to_string(), run_id: None },
+            scout_api::Turn { role: Role::Scout, text: "here are three".to_string(), run_id: None },
         ];
         let queued = enqueue(&core, account_id, "4242", 1, &turns, false).await.unwrap();
         assert_eq!(queued, 2);
@@ -295,7 +295,7 @@ mod tests {
         let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
             .await
             .unwrap();
-        let turns = vec![scout_api::Turn { role: Role::Scout, text: "here are three".to_string() }];
+        let turns = vec![scout_api::Turn { role: Role::Scout, text: "here are three".to_string(), run_id: None }];
         enqueue(&core, account_id, "4242", 1, &turns, true).await.unwrap();
         assert!(pending(&core, 10).await.unwrap().is_empty());
         enqueue(&core, account_id, "4242", 1, &turns, false).await.unwrap();
@@ -314,7 +314,7 @@ mod tests {
         let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
             .await
             .unwrap();
-        let turns = vec![scout_api::Turn { role: Role::Scout, text: "here are three".to_string() }];
+        let turns = vec![scout_api::Turn { role: Role::Scout, text: "here are three".to_string(), run_id: None }];
         enqueue(&core, account_id, "4242", 1, &turns, false).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_millis(50), core.mirror_waiting())
             .await
@@ -330,7 +330,7 @@ mod tests {
         let account_id = crate::session::account_of(&core, crate::ids::TelegramId(4242))
             .await
             .unwrap();
-        let turns = vec![scout_api::Turn { role: Role::Scout, text: "here are three".to_string() }];
+        let turns = vec![scout_api::Turn { role: Role::Scout, text: "here are three".to_string(), run_id: None }];
         enqueue(&core, account_id, "4242", 1, &turns, true).await.unwrap();
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), core.mirror_waiting())
@@ -359,9 +359,9 @@ mod tests {
         // A literal `>`, not a MarkdownV2 blockquote: the bot sends plain
         // text everywhere but two admin paths, and an unescaped `*` in an
         // answer would be a parse error rather than a price.
-        let you = scout_api::Turn { role: Role::You, text: "find me\ntwo things".to_string() };
+        let you = scout_api::Turn { role: Role::You, text: "find me\ntwo things".to_string(), run_id: None };
         assert_eq!(body_of(&you), "> find me\n> two things");
-        let scout = scout_api::Turn { role: Role::Scout, text: "EUR 24.24 *delivered*".to_string() };
+        let scout = scout_api::Turn { role: Role::Scout, text: "EUR 24.24 *delivered*".to_string(), run_id: None };
         assert_eq!(body_of(&scout), "EUR 24.24 *delivered*", "an answer must go out untouched");
     }
 
@@ -434,7 +434,7 @@ mod tests {
             .await
             .unwrap();
         let turns: Vec<scout_api::Turn> = (0..30)
-            .map(|i| scout_api::Turn { role: Role::Scout, text: format!("answer {i}") })
+            .map(|i| scout_api::Turn { role: Role::Scout, text: format!("answer {i}"), run_id: None })
             .collect();
 
         let queued = enqueue(&core, account_id, "4242", 7, &turns, false).await.unwrap();

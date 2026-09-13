@@ -369,6 +369,9 @@ pub async fn render_events<R: Renderer>(
                 update.apply(&mut thinking);
                 renderer.render_thinking(&thinking).await;
             }
+            // Traces are for the browser's debug panel; a chat has nowhere
+            // to put a table.
+            AgentEvent::Trace(_) => {}
         }
     }
     renderer

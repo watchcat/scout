@@ -1,5 +1,5 @@
 use anyhow::Result;
-use duckdb::{params, Connection, Row};
+use duckdb::{params, Connection, OptionalExt, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,6 +11,11 @@ use std::sync::{Arc, Mutex};
 /// bounds it. An outbox row has no such bound: a reader who blocks the bot
 /// would otherwise be retried against forever.
 pub const MIRROR_ATTEMPTS: i64 = 5;
+
+/// Bytes of a tool result kept on a trace row. A flight search is a few
+/// thousand characters; a fetched page can be far more, and the page is
+/// not what anyone reads a trace for.
+pub const TRACE_RESULT_CAP: usize = 64 * 1024;
 
 const MIGRATIONS: &str = r#"
 CREATE SEQUENCE IF NOT EXISTS purchases_id_seq;
@@ -149,7 +154,11 @@ CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
 -- their data, not here.
 CREATE TABLE IF NOT EXISTS accounts (
     id         BIGINT PRIMARY KEY DEFAULT nextval('accounts_id_seq'),
-    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    -- Whether this person sees a Trace under each answer in the browser.
+    -- Only an admin can turn it on; the flag lives here so it survives a
+    -- restart and a new tab alike.
+    debug      BOOLEAN NOT NULL DEFAULT false
 );
 -- One row per way of proving you are that account. `kind` is 'telegram'
 -- today; a web login is a second kind. The primary key is what stops one
@@ -251,7 +260,38 @@ CREATE TABLE IF NOT EXISTS messages (
     conversation_id BIGINT NOT NULL,
     position        BIGINT NOT NULL,
     body            TEXT NOT NULL,
-    created_at      TIMESTAMP NOT NULL DEFAULT current_timestamp
+    created_at      TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    -- The run that wrote this message, so an answer can find its trace.
+    -- Null on rows written before runs were recorded.
+    run_id          BIGINT
+);
+CREATE SEQUENCE IF NOT EXISTS runs_id_seq;
+-- One row per agent run. The trace under a browser answer hangs off it,
+-- and messages point at it so an answer can find its trace.
+CREATE TABLE IF NOT EXISTS runs (
+    id              BIGINT PRIMARY KEY DEFAULT nextval('runs_id_seq'),
+    account_id      BIGINT NOT NULL,
+    conversation_id BIGINT NOT NULL,
+    started_at      TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    ended_at        TIMESTAMP,
+    outcome         TEXT,
+    detail          TEXT
+);
+CREATE SEQUENCE IF NOT EXISTS run_traces_id_seq;
+CREATE TABLE IF NOT EXISTS run_traces (
+    id          BIGINT PRIMARY KEY DEFAULT nextval('run_traces_id_seq'),
+    run_id      BIGINT NOT NULL,
+    seq         BIGINT NOT NULL,
+    kind        TEXT NOT NULL,
+    tool        TEXT,
+    args        TEXT,
+    nested      BOOLEAN NOT NULL DEFAULT false,
+    started_at  TIMESTAMP NOT NULL,
+    duration_ms BIGINT,
+    status      TEXT,
+    detail      TEXT,
+    result      TEXT,
+    truncated   BOOLEAN NOT NULL DEFAULT false
 );
 "#;
 
@@ -806,6 +846,38 @@ const STEP_11_KEPT_TRIPS_NOT_NULL: &str = r#"
 ALTER TABLE trips ALTER COLUMN kept SET NOT NULL;
 "#;
 
+/// Runs and their traces, the run id on messages, and the debug switch on
+/// accounts. Same shape as steps 7/8 and 10/11, for the same DuckDB
+/// reasons: `ADD COLUMN` cannot carry a constraint, and `SET NOT NULL`
+/// refuses to share a transaction with the rows it just touched.
+const STEP_12_RUN_TRACES: &str = r#"
+CREATE SEQUENCE IF NOT EXISTS runs_id_seq;
+CREATE TABLE IF NOT EXISTS runs (
+    id BIGINT PRIMARY KEY DEFAULT nextval('runs_id_seq'),
+    account_id BIGINT NOT NULL, conversation_id BIGINT NOT NULL,
+    started_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    ended_at TIMESTAMP, outcome TEXT, detail TEXT
+);
+CREATE SEQUENCE IF NOT EXISTS run_traces_id_seq;
+CREATE TABLE IF NOT EXISTS run_traces (
+    id BIGINT PRIMARY KEY DEFAULT nextval('run_traces_id_seq'),
+    run_id BIGINT NOT NULL, seq BIGINT NOT NULL, kind TEXT NOT NULL,
+    tool TEXT, args TEXT, nested BOOLEAN NOT NULL DEFAULT false,
+    started_at TIMESTAMP NOT NULL, duration_ms BIGINT, status TEXT,
+    detail TEXT, result TEXT, truncated BOOLEAN NOT NULL DEFAULT false
+);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS run_id BIGINT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS debug BOOLEAN;
+UPDATE accounts SET debug = false WHERE debug IS NULL;
+ALTER TABLE accounts ALTER COLUMN debug SET DEFAULT false;
+"#;
+
+/// See `STEP_8_PINNED_NOT_NULL`. Dying between 12 and 13 leaves a nullable
+/// column that holds no nulls, and this runs alone on the next boot.
+const STEP_13_DEBUG_NOT_NULL: &str = r#"
+ALTER TABLE accounts ALTER COLUMN debug SET NOT NULL;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -819,6 +891,8 @@ fn steps() -> Vec<(i64, Step)> {
         (9, Step::Sql(STEP_9_TRIP_CONVERSATION)),
         (10, Step::Sql(STEP_10_KEPT_TRIPS)),
         (11, Step::Sql(STEP_11_KEPT_TRIPS_NOT_NULL)),
+        (12, Step::Sql(STEP_12_RUN_TRACES)),
+        (13, Step::Sql(STEP_13_DEBUG_NOT_NULL)),
     ]
 }
 
@@ -1683,16 +1757,153 @@ impl Store {
         )?)
     }
 
-    /// The last `limit` messages, oldest first — the order a provider wants.
-    pub fn conversation_messages(&self, conversation_id: i64, limit: usize) -> Result<Vec<String>> {
+    /// Opens a run: one row that the run's trace and its messages hang
+    /// off. Returns the new id.
+    pub fn open_run(&self, account_id: i64, conversation_id: i64) -> Result<i64> {
+        let conn = self.conn();
+        Ok(conn.query_row(
+            "INSERT INTO runs (account_id, conversation_id) VALUES (?, ?) RETURNING id",
+            params![account_id, conversation_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn close_run(&self, run_id: i64, outcome: &str, detail: Option<&str>) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE runs SET ended_at = now(), outcome = ?, detail = ? WHERE id = ?",
+            params![outcome, detail, run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Writes a run's rows in one transaction, results cut at the cap.
+    pub fn append_traces(&self, run_id: i64, rows: &[scout_api::TraceRow]) -> Result<()> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<()> {
+            for row in rows {
+                let (result, truncated) = match &row.result {
+                    Some(text) if text.len() > TRACE_RESULT_CAP => {
+                        let mut cut = TRACE_RESULT_CAP;
+                        while !text.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        (Some(&text[..cut]), true)
+                    }
+                    Some(text) => (Some(text.as_str()), row.truncated),
+                    None => (None, false),
+                };
+                conn.execute(
+                    "INSERT INTO run_traces (run_id, seq, kind, tool, args, nested, started_at, duration_ms, status, detail, result, truncated)
+                     VALUES (?, ?, ?, ?, ?, ?, ?::TIMESTAMP, ?, ?, ?, ?, ?)",
+                    params![
+                        run_id, row.seq, row.kind, row.tool,
+                        row.args.as_ref().map(|a| a.to_string()),
+                        row.nested, row.started_at, row.duration_ms, row.status, row.detail,
+                        result, truncated,
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// The run and its rows, or `None` when it is not this account's or
+    /// no longer kept. Ownership is in the query so there is no way to read
+    /// a trace without asking whose it is.
+    pub fn trace_of(&self, run_id: i64, account_id: i64) -> Result<Option<(scout_api::RunRow, Vec<scout_api::TraceRow>)>> {
+        let conn = self.conn();
+        let run = conn
+            .query_row(
+                "SELECT id, started_at::TEXT, ended_at::TEXT, outcome, detail FROM runs WHERE id = ? AND account_id = ?",
+                params![run_id, account_id],
+                |r| Ok(scout_api::RunRow {
+                    id: r.get(0)?, started_at: r.get(1)?, ended_at: r.get(2)?, outcome: r.get(3)?, detail: r.get(4)?,
+                }),
+            )
+            .optional()?;
+        let Some(run) = run else { return Ok(None) };
+        let mut stmt = conn.prepare(
+            "SELECT seq, kind, tool, args, nested, started_at::TEXT, duration_ms, status, detail, result, truncated
+             FROM run_traces WHERE run_id = ? ORDER BY seq ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| {
+                let args: Option<String> = r.get(3)?;
+                Ok(scout_api::TraceRow {
+                    seq: r.get(0)?, kind: r.get(1)?, tool: r.get(2)?,
+                    args: args.and_then(|a| serde_json::from_str(&a).ok()),
+                    nested: r.get(4)?, started_at: r.get(5)?, duration_ms: r.get(6)?,
+                    status: r.get(7)?, detail: r.get(8)?, result: r.get(9)?, truncated: r.get(10)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Some((run, rows)))
+    }
+
+    /// The newest run opened for a conversation. Test-only: production
+    /// reaches a run from the message that names it, never by searching.
+    #[cfg(test)]
+    pub(crate) fn latest_run_id(&self, conversation_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM runs WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
+                params![conversation_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Deletes everything but the newest `keep_runs` runs, rows included.
+    /// Returns how many runs went.
+    pub fn trim_traces(&self, keep_runs: usize) -> Result<usize> {
+        let conn = self.conn();
+        // Rows first, on purpose: a crash between the two leaves only
+        // trace-less runs behind, which the next hourly trim removes.
+        conn.execute(
+            "DELETE FROM run_traces WHERE run_id NOT IN (SELECT id FROM runs ORDER BY id DESC LIMIT ?)",
+            params![keep_runs as i64],
+        )?;
+        Ok(conn.execute(
+            "DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY id DESC LIMIT ?)",
+            params![keep_runs as i64],
+        )?)
+    }
+
+    pub fn set_debug(&self, account_id: i64, on: bool) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE accounts SET debug = ? WHERE id = ?", params![on, account_id])?;
+        Ok(())
+    }
+
+    pub fn debug_of(&self, account_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row("SELECT debug FROM accounts WHERE id = ?", params![account_id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// The last `limit` messages, oldest first — the order a provider
+    /// wants — each with the run that wrote it, so a Scout turn can be
+    /// paired with its trace.
+    pub fn conversation_messages(&self, conversation_id: i64, limit: usize) -> Result<Vec<(Option<i64>, String)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT body FROM (
-                 SELECT body, position FROM messages WHERE conversation_id = ?
+            "SELECT run_id, body FROM (
+                 SELECT run_id, body, position FROM messages WHERE conversation_id = ?
                  ORDER BY position DESC LIMIT ?
              ) ORDER BY position ASC",
         )?;
-        let rows = stmt.query_map(params![conversation_id, limit as i64], |r| r.get(0))?;
+        let rows = stmt.query_map(params![conversation_id, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
@@ -1711,7 +1922,7 @@ impl Store {
     /// `updated_at` moves even for an empty append, because a run that
     /// produced nothing still happened: the sidebar orders by that column
     /// and the 48-hour sweep deletes by it.
-    pub fn append_messages(&self, conversation_id: i64, bodies: &[String]) -> Result<()> {
+    pub fn append_messages(&self, conversation_id: i64, run_id: Option<i64>, bodies: &[String]) -> Result<()> {
         let conn = self.conn();
         conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<()> {
@@ -1724,9 +1935,9 @@ impl Store {
             )?;
             for (i, body) in bodies.iter().enumerate() {
                 conn.execute(
-                    "INSERT INTO messages (id, conversation_id, position, body)
-                     VALUES (nextval('messages_id_seq'), ?, ?, ?)",
-                    params![conversation_id, next + i as i64, body],
+                    "INSERT INTO messages (id, conversation_id, position, body, run_id)
+                     VALUES (nextval('messages_id_seq'), ?, ?, ?, ?)",
+                    params![conversation_id, next + i as i64, body, run_id],
                 )?;
             }
             conn.execute(
@@ -3768,7 +3979,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 11);
+        assert_eq!(s.schema_version().unwrap(), 13);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -3832,7 +4043,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), 13);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -3955,7 +4166,7 @@ CREATE TABLE segment_candidates (
 
         let bodies = s.conversation_messages(direct, 20).unwrap();
         assert_eq!(bodies.len(), 2);
-        assert!(bodies[0].contains("hi"), "oldest first");
+        assert!(bodies[0].1.contains("hi"), "oldest first");
 
         assert!(s.conversation_messages(group, 20).unwrap().is_empty());
         // Each scope reports its own newest thread, never the other's.
@@ -3973,8 +4184,8 @@ CREATE TABLE segment_candidates (
 
         let got = s.conversation_messages(c, 20).unwrap();
         assert_eq!(got.len(), 20);
-        assert!(got[0].contains(r#""n":5"#), "should drop the oldest five");
-        assert!(got[19].contains(r#""n":24"#), "and end at the newest");
+        assert!(got[0].1.contains(r#""n":5"#), "should drop the oldest five");
+        assert!(got[19].1.contains(r#""n":24"#), "and end at the newest");
     }
 
     #[test]
@@ -3987,24 +4198,25 @@ CREATE TABLE segment_candidates (
         let a = s.account_for_telegram(11).unwrap();
         let c = s.start_conversation(a, "direct").unwrap();
 
-        s.append_messages(c, &[r#"{"n":0}"#.to_string(), r#"{"n":1}"#.to_string()]).unwrap();
+        s.append_messages(c, None, &[r#"{"n":0}"#.to_string(), r#"{"n":1}"#.to_string()]).unwrap();
         s.append_messages(
             c,
+            None,
             &[r#"{"n":2}"#.to_string(), r#"{"n":3}"#.to_string(), r#"{"n":4}"#.to_string()],
         )
         .unwrap();
 
         let all = s.conversation_messages(c, 20).unwrap();
         assert_eq!(all.len(), 5, "the first append was overwritten");
-        for (i, body) in all.iter().enumerate() {
+        for (i, (_, body)) in all.iter().enumerate() {
             assert!(body.contains(&format!(r#""n":{i}"#)), "out of order at {i}: {all:?}");
         }
 
         // And the window a reader asks for is still the newest end of it.
         let last_three = s.conversation_messages(c, 3).unwrap();
         assert_eq!(last_three.len(), 3);
-        assert!(last_three[0].contains(r#""n":2"#), "the window is not the newest three: {last_three:?}");
-        assert!(last_three[2].contains(r#""n":4"#));
+        assert!(last_three[0].1.contains(r#""n":2"#), "the window is not the newest three: {last_three:?}");
+        assert!(last_three[2].1.contains(r#""n":4"#));
     }
 
     #[test]
@@ -4018,8 +4230,8 @@ CREATE TABLE segment_candidates (
         let short = s.start_conversation(a, "telegram:-100").unwrap();
 
         let bodies: Vec<String> = (0..2005).map(|i| format!(r#"{{"n":{i}}}"#)).collect();
-        s.append_messages(long, &bodies).unwrap();
-        s.append_messages(short, &bodies[..10]).unwrap();
+        s.append_messages(long, None, &bodies).unwrap();
+        s.append_messages(short, None, &bodies[..10]).unwrap();
 
         assert_eq!(s.trim_message_logs(2000).unwrap(), 5, "the cut is not the overflow");
 
@@ -4027,8 +4239,8 @@ CREATE TABLE segment_candidates (
         // thread reads from `n:5` onward rather than coming back shuffled.
         let kept = s.conversation_messages(long, 5000).unwrap();
         assert_eq!(kept.len(), 2000);
-        assert!(kept[0].contains(r#""n":5"#), "the wrong end was cut: {:?}", &kept[..3]);
-        assert!(kept[1999].contains(r#""n":2004"#), "the newest row went");
+        assert!(kept[0].1.contains(r#""n":5"#), "the wrong end was cut: {:?}", &kept[..3]);
+        assert!(kept[1999].1.contains(r#""n":2004"#), "the newest row went");
 
         // Per conversation: the quiet thread is not touched by the busy
         // one's overflow.
@@ -4058,7 +4270,7 @@ CREATE TABLE segment_candidates (
         }
         assert_eq!(s.latest_conversation(a, "direct", 600).unwrap(), Some((c, true)));
 
-        s.append_messages(c, &["{}".to_string()]).unwrap();
+        s.append_messages(c, None, &["{}".to_string()]).unwrap();
 
         assert!(
             s.latest_conversation(a, "direct", 600).unwrap().is_some_and(|(id, aged)| id == c && !aged),
@@ -6280,7 +6492,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 11, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 13, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -6321,7 +6533,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 11);
+        assert_eq!(s.schema_version().unwrap(), 13);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -6768,5 +6980,135 @@ CREATE TABLE conversations (
         assert_eq!(names.get(&by_email).map(String::as_str), Some("ada@example.com"));
         assert_eq!(names.get(&by_telegram).map(String::as_str), Some("Grace"));
         assert_eq!(names.get(&both).map(String::as_str), Some("Ada L"));
+    }
+
+    /// `accounts` and `messages` exactly as they stood at schema 11, before
+    /// `debug` and `run_id`. Do NOT update when `MIGRATIONS` changes.
+    const PRE_TRACE_TABLES: &str = r#"
+CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
+CREATE TABLE accounts (
+    id         BIGINT PRIMARY KEY DEFAULT nextval('accounts_id_seq'),
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE SEQUENCE IF NOT EXISTS messages_id_seq;
+CREATE TABLE messages (
+    id              BIGINT PRIMARY KEY DEFAULT nextval('messages_id_seq'),
+    conversation_id BIGINT NOT NULL,
+    position        BIGINT NOT NULL,
+    body            TEXT NOT NULL,
+    created_at      TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+"#;
+
+    #[test]
+    fn a_version_11_database_gains_runs_traces_and_the_debug_flag() {
+        // Both columns land on tables that already hold rows in production,
+        // and `debug` must be NOT NULL at the end without DuckDB refusing
+        // the constraint in the transaction that backfilled it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scout.duckdb");
+        {
+            let conn = duckdb::Connection::open(&path).unwrap();
+            conn.execute_batch(PRE_TRACE_TABLES).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version BIGINT NOT NULL);
+                 INSERT INTO schema_version VALUES (11);
+                 INSERT INTO accounts (id) VALUES (1);
+                 INSERT INTO messages (conversation_id, position, body) VALUES (1, 0, '{}');",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 13);
+        assert!(!store.debug_of(1).unwrap(), "backfilled to off");
+        let run_id: Option<i64> = store
+            .conn()
+            .query_row("SELECT run_id FROM messages WHERE position = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(run_id, None);
+        let nullable: bool = store
+            .conn()
+            .query_row("SELECT is_nullable = 'YES' FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = 'debug'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!nullable, "debug must end up NOT NULL");
+    }
+
+    fn a_row(seq: i64, tool: &str, result: Option<&str>) -> scout_api::TraceRow {
+        scout_api::TraceRow {
+            seq, kind: "tool".into(), tool: Some(tool.into()), args: Some(serde_json::json!({"q": seq})),
+            nested: false, started_at: "2026-09-13T10:00:00Z".into(), duration_ms: Some(120),
+            status: Some("ok".into()), detail: None, result: result.map(str::to_string), truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_run_is_opened_traced_closed_and_read_back_by_its_owner_only() {
+        let (store, _dir) = test_store();
+        let me = store.account_for_telegram(1).unwrap();
+        let other = store.account_for_telegram(2).unwrap();
+        let conv = store.start_conversation(me, "direct").unwrap();
+
+        let run_id = store.open_run(me, conv).unwrap();
+        store.append_traces(run_id, &[a_row(0, "search_web", Some(r#"{"hits":3}"#)), a_row(1, "fetch_page", None)]).unwrap();
+        store.close_run(run_id, "answered", None).unwrap();
+
+        let (run, rows) = store.trace_of(run_id, me).unwrap().expect("the owner reads it");
+        assert_eq!(run.outcome.as_deref(), Some("answered"));
+        assert!(run.ended_at.is_some());
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(rows[0].result.as_deref(), Some(r#"{"hits":3}"#));
+        assert!(store.trace_of(run_id, other).unwrap().is_none(), "someone else's run is not found");
+        assert!(store.trace_of(run_id + 100, me).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_result_past_the_cap_is_cut_and_says_so() {
+        let (store, _dir) = test_store();
+        let me = store.account_for_telegram(1).unwrap();
+        let conv = store.start_conversation(me, "direct").unwrap();
+        let run_id = store.open_run(me, conv).unwrap();
+        // 3 bytes each: over the cap, and since the cap is even the cut
+        // lands mid-character, so the boundary loop has to move it.
+        let long = "€".repeat(TRACE_RESULT_CAP);
+        store.append_traces(run_id, &[a_row(0, "search_web", Some(&long))]).unwrap();
+        let (_, rows) = store.trace_of(run_id, me).unwrap().unwrap();
+        let kept = rows[0].result.as_deref().unwrap();
+        assert!(rows[0].truncated);
+        assert!(kept.len() <= TRACE_RESULT_CAP && kept.chars().all(|c| c == '€'), "cut on a character boundary");
+    }
+
+    #[test]
+    fn messages_remember_their_run_and_the_debug_flag_flips() {
+        let (store, _dir) = test_store();
+        let me = store.account_for_telegram(1).unwrap();
+        let conv = store.start_conversation(me, "direct").unwrap();
+        let run_id = store.open_run(me, conv).unwrap();
+        store.append_messages(conv, None, &["{\"a\":1}".into()]).unwrap();
+        store.append_messages(conv, Some(run_id), &["{\"b\":2}".into()]).unwrap();
+        let got = store.conversation_messages(conv, 10).unwrap();
+        assert_eq!(got, vec![(None, "{\"a\":1}".to_string()), (Some(run_id), "{\"b\":2}".to_string())]);
+
+        assert!(!store.debug_of(me).unwrap());
+        store.set_debug(me, true).unwrap();
+        assert!(store.debug_of(me).unwrap());
+        store.set_debug(me, false).unwrap();
+        assert!(!store.debug_of(me).unwrap());
+    }
+
+    #[test]
+    fn trimming_keeps_the_newest_runs_and_their_rows() {
+        let (store, _dir) = test_store();
+        let me = store.account_for_telegram(1).unwrap();
+        let conv = store.start_conversation(me, "direct").unwrap();
+        let ids: Vec<i64> = (0..5).map(|_| store.open_run(me, conv).unwrap()).collect();
+        for id in &ids {
+            store.append_traces(*id, &[a_row(0, "search_web", None)]).unwrap();
+        }
+        let gone = store.trim_traces(2).unwrap();
+        assert_eq!(gone, 3);
+        assert!(store.trace_of(ids[0], me).unwrap().is_none());
+        assert!(store.trace_of(ids[4], me).unwrap().is_some());
+        let rows: i64 = store.conn().query_row("SELECT count(*) FROM run_traces", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 2, "rows go with their runs");
     }
 }

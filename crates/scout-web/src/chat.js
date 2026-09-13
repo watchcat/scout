@@ -438,6 +438,23 @@ export function applyTraceFrame(rows, frame) {
   return rows
 }
 
+// The server's `debug_command`, mirrored: the word alone, or with `on` or
+// `off`, and nothing else. Case-sensitive like Telegram's slash commands,
+// so `/Debug` in prose is prose.
+export function isDebugCommand(text) {
+  const words = text.split(/\s+/).filter(Boolean)
+  if (words[0] !== '/debug') return false
+  return words.length === 1 || (words.length === 2 && (words[1] === 'on' || words[1] === 'off'))
+}
+
+// Whether a run that produced no answer keeps its bubble anyway. A failed
+// run writes no history turn, so with debug on the live trace under the
+// bubble is that trace's only copy — and an empty bubble is what keeps it
+// on the page. Nothing traced, or debug off, and the bubble goes as ever.
+export function keepFailedTurn(end, debugOn, rowCount) {
+  return (end.status === 'error' || end.status === 'busy') && debugOn && rowCount > 0
+}
+
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
   const turnsEl = document.getElementById('turns')
@@ -540,7 +557,6 @@ function start() {
     } catch {
       // A dead network leaves the switch as it was; the next send asks again.
     }
-    document.body.classList.toggle('debug', debugOn)
     syncTraceButtons()
   }
 
@@ -576,6 +592,13 @@ function start() {
   // results are the tools' own text — a shop's page title, a provider's
   // error body — and none of it is to be trusted as markup.
   function renderTracePanel(li, run, rows) {
+    // Redrawn wholesale on every live frame, so what the reader did to the
+    // panel already there — scrolled, opened a row — is carried over by
+    // hand, the way `showStatus` keeps its place in the status box.
+    const old = li.querySelector('.trace')
+    const wasFollowing = old ? shouldFollow(old.scrollTop, old.clientHeight, old.scrollHeight) : true
+    const scrollTop = old ? old.scrollTop : 0
+    const opened = new Set([...(old ? old.querySelectorAll('.row.open') : [])].map((row) => Number(row.dataset.seq)))
     const lines = traceLines(run, rows)
     const panel = node('div', 'trace')
     if (lines.head) panel.append(node('div', 'head', lines.head))
@@ -584,22 +607,33 @@ function start() {
       if (line.nested) row.classList.add('nested')
       if (line.status === 'failed') row.classList.add('failed')
       row.append(node('span', 'label', line.label))
+      panel.append(row)
       // An event is one sentence and carries its status in its colour; a
       // tool call has a duration, a chip, and something to open.
-      if (line.kind === 'tool') {
-        row.append(node('span', 'dur', line.duration))
-        const status = line.status === undefined ? 'running' : line.status
-        row.append(node('span', `chip ${status}`, status))
-        row.addEventListener('click', () => {
-          const open = row.nextElementSibling
-          if (open && open.tagName === 'PRE') open.remove()
-          else row.after(node('pre', '', traceDetail(line)))
-        })
+      if (line.kind !== 'tool') continue
+      row.append(node('span', 'dur', line.duration))
+      const status = line.status === undefined ? 'running' : line.status
+      row.append(node('span', `chip ${status}`, status))
+      row.dataset.seq = String(line.seq)
+      row.tabIndex = 0
+      row.setAttribute('role', 'button')
+      const toggle = () => {
+        if (row.classList.toggle('open')) row.after(node('pre', '', traceDetail(line)))
+        else row.nextElementSibling?.remove()
       }
-      panel.append(row)
+      row.addEventListener('click', toggle)
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          toggle()
+        }
+      })
+      if (opened.has(line.seq)) toggle()
     }
-    li.querySelector('.trace')?.remove()
+    old?.remove()
     li.append(panel)
+    // After the append: a panel not yet laid out has no height to scroll.
+    panel.scrollTop = wasFollowing ? panel.scrollHeight : scrollTop
   }
 
   // What a tool row opens to: the arguments, a blank line, then the result
@@ -1974,13 +2008,19 @@ function start() {
           const finished = finalAnswer(end, answer)
           if (finished !== answer) {
             answer = finished
-            if (answer === '' && answerLi) {
-              // An empty bubble is not a cleared one. Take the turn off the
-              // page rather than leave a blank one behind the notice.
+            if (answer !== '' || !answerLi) renderAnswer()
+          }
+          // An empty bubble is not a cleared one: the turn comes off the
+          // page rather than sit blank behind the notice — unless a trace
+          // hangs under it, which no history turn will ever carry again.
+          // Then the bubble stays to hold it, and says why it is empty.
+          if (answer === '' && answerLi) {
+            if (keepFailedTurn(end, debugOn, liveRows.length)) {
+              answerLi.classList.add('failed')
+              answerLi.querySelector('.text').textContent = '(no answer)'
+            } else {
               answerLi.remove()
               answerLi = null
-            } else {
-              renderAnswer()
             }
           }
           // The answer is written and its trace is saved with results, so
@@ -2104,7 +2144,7 @@ function start() {
       await runMessage(text, () => youLi.remove(), fromTrips)
       // The switch may have just flipped, and the turns on screen should
       // show it without a reload.
-      if (text.startsWith('/debug')) await refreshDebug()
+      if (isDebugCommand(text)) await refreshDebug()
     } finally {
       running = false
       sendButton.disabled = false
@@ -2148,9 +2188,10 @@ function start() {
   // Nothing awaits the page's first load, and its own failure already
   // shows as a notice — a rejection on top of that is only console noise.
   loadHistory().catch(() => {})
-  // Not awaited: whichever of this and the history lands second still
-  // ends with the right buttons, since both go through `syncTraceButtons`
-  // one way or the other. `refreshDebug` never rejects.
+  // Not awaited, and safe either way round: history landing second draws
+  // its turns from `debugOn` as it stands, and the switch landing second
+  // gives the turns already drawn their buttons through `syncTraceButtons`.
+  // `refreshDebug` never rejects.
   refreshDebug()
   // Loaded in the background so the Trips tab can show a count before it is
   // opened. A failure is rendered inside that workspace and does not disturb

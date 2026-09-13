@@ -7,7 +7,7 @@ import {
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
   tripPdfFilename,
   composerTarget, removeLegBody, keepBody, deleteTripBody, tripDeleteConsequence,
-  traceLines, applyTraceFrame, traceDuration,
+  traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
 } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
@@ -470,6 +470,26 @@ test('live frames build the same rows a saved trace would', () => {
   assert.deepEqual(lines.rows.map(r => [r.kind, r.status, r.duration]), [['tool', 'ok', '0.3s'], ['event', 'failed', '']])
   // A finish for a row that never started is ignored, as on the server.
   assert.equal(applyTraceFrame(rows, { kind: 'finished', seq: 9, duration_ms: 1, status: 'ok' }).length, 2)
+  // So is a frame kind this page does not know.
+  assert.equal(applyTraceFrame(rows, { kind: 'mystery' }), rows)
+})
+
+test('the debug command is the exact word, case-sensitive, as on the server', () => {
+  assert.deepEqual(['/debug', '/debug on', '/debug  off '].map(isDebugCommand), [true, true, true])
+  assert.deepEqual(['/Debug on', '/debugger', 'debug on', '/debug on please'].map(isDebugCommand), [false, false, false, false])
+})
+
+test('a failed run keeps its turn only when there is a trace to keep under it', () => {
+  // With debug on, the trace is the whole point of the turn, and no
+  // history turn will ever carry it — so the bubble stays, empty.
+  assert.equal(keepFailedTurn({ status: 'error' }, true, 3), true)
+  assert.equal(keepFailedTurn({ status: 'busy' }, true, 1), true)
+  // Nothing was traced: nothing to keep a bubble for.
+  assert.equal(keepFailedTurn({ status: 'error' }, true, 0), false)
+  // With debug off the bubble goes, as it always did.
+  assert.equal(keepFailedTurn({ status: 'error' }, false, 3), false)
+  // An answered run is not the question this asks.
+  assert.equal(keepFailedTurn({ status: 'ok', answer: '' }, true, 3), false)
 })
 
 test('durations read as seconds under a minute and minutes above', () => {

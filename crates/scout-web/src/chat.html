@@ -66,7 +66,13 @@
   .trace .row.event{cursor:default; color:var(--base01)}
   .trace .row .label{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
   .trace .row .dur{flex:none; color:var(--base01)}
-  .trace .chip{flex:none; font-size:11px; padding:0 6px; border-radius:8px; background:#0d4a5a}
+  /* No ground under the chip: `--base1` on `--line` is short of 4.5:1 at
+     11px, and the word carries the status on its own. */
+  .trace .chip{flex:none; font-size:11px}
+  .trace .row:focus-visible{outline:1px solid var(--blue); outline-offset:-1px; border-radius:4px}
+  /* A run that failed with debug on keeps its bubble for the trace's
+     sake; the words say why the bubble is otherwise empty. */
+  .turns li.scout.failed .text{color:var(--base01); font-style:italic}
   /* `#ff6e67` rather than `--red`, for the reason `.when.expiring` gives:
      the palette's red fails at this size on a dark ground. */
   .trace .chip.failed,.trace .row.event.failed{color:#ff6e67}

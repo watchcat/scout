@@ -6,7 +6,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## In progress
 
-- [ ] **Debug trace behind every answer** — `/debug on|off` in the web chat (admins only, per account). Every run records a trace: each tool call with args, duration, status and result, nested flight-desk calls, run-level events. A Trace button under each Scout turn opens the panel; live rows stream during a run. Spec: `docs/superpowers/specs/2026-09-13-debug-trace-design.md`
+_(nothing)_
 
 ## Next
 
@@ -46,6 +46,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## Done
 
+- [x] 2026-09-14 — **Debug trace behind every answer** (`b3708e0`): `/debug on|off` in the web chat (admins only, per account). Every run records a trace: each tool call with args, duration, status and result, nested flight-desk calls, run-level events. A Trace button under each Scout turn opens the panel; live rows stream during a run. Spec: `docs/superpowers/specs/2026-09-13-debug-trace-design.md`
 - [x] 2026-09-08 — **Crawlable front door** (`532f30e`): robots.txt, sitemap.xml, meta description and Open Graph tags on the landing page, www redirected to the apex. Google still showed Porkbun's parking page; www needs an A record at the DNS provider first.
 - [x] 2026-09-08 — **Flight agent as a tool** (`39e5d78`): `ask_flights`, a specialist rig agent with the flight prompt and every flight and trip tool, called by the main agent with a brief; findings plus Rust-generated guidance come back, the main prompt lost its flight half, `FLIGHT_MODEL` picks its model, and the stall guard reads a pulse the nested run keeps alive
 - [x] 2026-09-05 — **Two things a web-only user ran into** (`de08a65`): the page's form token now lives as long as the session, so a phone left on the chat keeps sending instead of failing every POST after 15 minutes; `/stat` names an account by its email when it has no Telegram name

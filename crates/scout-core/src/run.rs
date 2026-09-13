@@ -64,16 +64,40 @@ pub async fn run_agent(
     let Some(_slot) = take_slot(&core.deps.runs, &events).await else {
         return Ok(RunOutcome::Overloaded);
     };
-    let facts = {
-        let store = core.deps.store.clone();
-        tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
-    };
     let run_id = {
         let store = core.deps.store.clone();
         crate::core::blocking(move || store.open_run(account_id, conversation_id)).await?
     };
     let observer = std::sync::Arc::new(crate::observer::Observer::new(events.clone(), run_id));
     observer.announce();
+    // From here on the run has a row, and every way out must close it. The
+    // body is a separate function so that closing happens in one place
+    // below rather than beside each bail and each early return — one added
+    // to the body later is covered without anyone remembering to.
+    match run_with(core, &events, run, prompt, &observer).await {
+        Ok(outcome) => Ok(outcome),
+        Err(e) => {
+            finish_run(&core.deps.store, &observer, "failed", Some(&e.to_string())).await;
+            Err(e)
+        }
+    }
+}
+
+/// The run itself, once it has a row to be recorded under. An answered or
+/// cut-short run closes its own row on the way out; an error of any kind
+/// is closed by the caller.
+async fn run_with(
+    core: &Core,
+    events: &scout_api::EventSink,
+    run: &scout_api::RunContext,
+    prompt: &str,
+    observer: &std::sync::Arc<crate::observer::Observer>,
+) -> anyhow::Result<RunOutcome> {
+    let (account_id, conversation_id) = (run.account_id, run.conversation_id);
+    let facts = {
+        let store = core.deps.store.clone();
+        tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
+    };
     let agent = build_agent(&core.deps, run, &facts, observer.clone());
     // History comes from the conversation the caller opened, so an
     // in-flight run always reads and writes that thread and never anyone
@@ -136,7 +160,7 @@ pub async fn run_agent(
                 MultiTurnStreamItem::ToolExecutionStart { tool_call, internal_call_id } => {
                     let args = &tool_call.function.arguments;
                     scout_api::emit(
-                        &events,
+                        events,
                         scout_api::AgentEvent::Tool(crate::describe::describe(
                             &tool_call.function.name,
                             args,
@@ -168,7 +192,7 @@ pub async fn run_agent(
                     // The old `if !answer.is_empty()` guard suppressed
                     // exactly that event, which is why it is gone.
                     if let Some(event) = answer_event(&mut answer_shown, &streamed) {
-                        scout_api::emit(&events, event);
+                        scout_api::emit(events, event);
                     }
                 }
                 // MiniMax streams its reasoning on a separate channel. Shown
@@ -179,7 +203,7 @@ pub async fn run_agent(
                     thinking.push_str(&reasoning);
                     if strip_thinking(&streamed).is_empty() {
                         if let Some(update) = thinking_shown.update(&thinking) {
-                            scout_api::emit(&events, scout_api::AgentEvent::Thinking(update));
+                            scout_api::emit(events, scout_api::AgentEvent::Thinking(update));
                         }
                     }
                 }
@@ -194,7 +218,7 @@ pub async fn run_agent(
                     }
                     if strip_thinking(&streamed).is_empty() {
                         if let Some(update) = thinking_shown.update(&thinking) {
-                            scout_api::emit(&events, scout_api::AgentEvent::Thinking(update));
+                            scout_api::emit(events, scout_api::AgentEvent::Thinking(update));
                         }
                     }
                 }
@@ -220,7 +244,6 @@ pub async fn run_agent(
         Ok(Err(e)) => {
             tracing::error!(error = %e, account_id, conversation_id, "the run failed");
             observer.event("the model call failed", true);
-            finish_run(&core.deps.store, &observer, "failed", Some(&e.to_string())).await;
             return Err(e);
         }
         Err(_) => Some("this took too long"),
@@ -271,7 +294,6 @@ pub async fn run_agent(
     if reply.is_empty() && salvage.is_none() {
         let why = "the model produced no answer and no notes to write one from";
         observer.event(why, true);
-        finish_run(&core.deps.store, &observer, "failed", Some(why)).await;
         anyhow::bail!(why);
     }
     // What the wrap-up below is about to consume, kept for the run's row:
@@ -282,7 +304,7 @@ pub async fn run_agent(
         tracing::warn!(conversation_id, reason, "run interrupted; writing up from notes");
         observer.event("run interrupted; writing up from notes", false);
         scout_api::emit(
-            &events,
+            events,
             scout_api::AgentEvent::Notice(
                 "✍️ wrapping up with what I found so far".to_string(),
             ),
@@ -307,13 +329,11 @@ pub async fn run_agent(
             Ok(Ok(text)) => strip_thinking(&text),
             Ok(Err(e)) => {
                 observer.event("the model call failed", true);
-                finish_run(&core.deps.store, &observer, "failed", Some(&e.to_string())).await;
                 return Err(e.into());
             }
             Err(_) => {
                 let why = "wrap-up timed out after the run was interrupted";
                 observer.event(why, true);
-                finish_run(&core.deps.store, &observer, "failed", Some(why)).await;
                 anyhow::bail!(why);
             }
         };
@@ -323,7 +343,6 @@ pub async fn run_agent(
         if reply.is_empty() {
             let why = "the wrap-up came back with no answer in it either";
             observer.event(why, true);
-            finish_run(&core.deps.store, &observer, "failed", Some(why)).await;
             anyhow::bail!(why);
         }
         // Keep the exchange in context; the interrupted turns are lost. A
@@ -357,7 +376,6 @@ pub async fn run_agent(
             // the reader understands beats markup they cannot.
             let why = "the model wrote a tool call as text instead of answering, twice";
             observer.event(why, true);
-            finish_run(&core.deps.store, &observer, "failed", Some(why)).await;
             anyhow::bail!(why);
         }
     }
@@ -396,7 +414,7 @@ pub async fn run_agent(
     }
     finish_run(
         &core.deps.store,
-        &observer,
+        observer,
         if cut_short.is_some() { "cut_short" } else { "answered" },
         cut_short,
     )
@@ -1228,5 +1246,30 @@ mod tests {
         let save = body.rfind("finish_run(").expect("traces are saved");
         assert!(open < build, "the run id must exist before the observer is built");
         assert!(append < save, "traces are saved after the messages that point at the run");
+    }
+
+    #[test]
+    fn once_a_run_has_a_row_there_is_no_way_out_that_leaves_it_open() {
+        // A `?` between opening the run and the inner call would return
+        // past the one place that closes the row. The two repair turns and
+        // the history load all end in one, so the body lives in `run_with`
+        // and the outer function has exactly one exit for its errors.
+        let src = include_str!("run.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let outer = &src[src.find("pub async fn run_agent").expect("the run must exist")..];
+        let outer = &outer[..outer.find("\nasync fn run_with(").expect("the body must be its own function")];
+        let after_open = &outer[outer.find("Observer::new(").expect("the observer is built in the outer function")..];
+        assert_eq!(after_open.matches("run_with(").count(), 1, "the body is called exactly once");
+        assert!(!after_open.contains('?'), "a `?` after the run is opened skips closing it: {after_open}");
+        assert!(
+            after_open.contains(r#"finish_run(&core.deps.store, &observer, "failed""#),
+            "the outer function is where a failed run is closed"
+        );
+        let inner = &src[src.find("\nasync fn run_with(").unwrap()..];
+        assert_eq!(
+            inner.matches(r#""failed""#).count(),
+            0,
+            "the body must not close failed runs itself; that is the caller's one job"
+        );
     }
 }

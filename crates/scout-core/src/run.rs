@@ -405,8 +405,8 @@ async fn run_with(
     }
 
     let added = new_since(&history, loaded_len);
-    let store = core.deps.store.clone();
-    match crate::core::blocking(move || crate::session::append_history(&store, conversation_id, &added)).await {
+    let (store, run_id) = (core.deps.store.clone(), observer.run_id);
+    match crate::core::blocking(move || crate::session::append_history(&store, conversation_id, Some(run_id), &added)).await {
         // The answer is already on its way to the user; losing the thread is
         // worse than not saving it, but it is not worth failing the reply.
         Err(e) => tracing::warn!(error = %e, conversation_id, "could not save the conversation"),

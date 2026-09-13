@@ -275,6 +275,15 @@ impl Core {
         is_admin_id(&self.cfg.admin_user_ids, id.0)
     }
 
+    /// Whether any Telegram identity on this account is an admin. The web
+    /// has accounts, not Telegram ids, and this is the one place the two
+    /// are joined for the purpose.
+    pub async fn is_admin_account(&self, account_id: i64) -> anyhow::Result<bool> {
+        let store = self.store();
+        let ids = blocking(move || store.telegram_ids(account_id)).await?;
+        Ok(ids.into_iter().any(|id| self.is_admin(crate::ids::TelegramId(id))))
+    }
+
     /// A handle on the database, for this crate only. `store` is private, so
     /// a return type of `Store` is itself what keeps this in here.
     pub(crate) fn store(&self) -> crate::store::Store {
@@ -499,6 +508,15 @@ impl Core {
                 Err(e) => tracing::warn!(error = %e, "could not trim the message logs"),
             }
 
+            // Traces grow with every run, whichever thread it was in, and
+            // nothing else deletes them: a trace is read for a while after
+            // its answer and never again.
+            match self.trim_traces().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(trimmed = n, "runs beyond the cap dropped with their traces"),
+                Err(e) => tracing::warn!(error = %e, "could not trim the traces"),
+            }
+
             match crate::backup::is_due(&dir) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -568,6 +586,19 @@ impl Core {
     async fn trim_message_logs(&self) -> anyhow::Result<usize> {
         let store = self.store();
         blocking(move || store.trim_message_logs(Self::MESSAGE_LOG_KEEP)).await
+    }
+
+    /// How many runs keep their trace. Enough to open the trace behind any
+    /// answer of the last few days; a bound, not a window, like
+    /// `MESSAGE_LOG_KEEP`.
+    const TRACE_RUNS_KEEP: usize = 300;
+
+    /// Drops every run but the newest `TRACE_RUNS_KEEP`, rows included.
+    /// Returns how many runs went. Private for the same reason
+    /// `expire_threads` is.
+    async fn trim_traces(&self) -> anyhow::Result<usize> {
+        let store = self.store();
+        blocking(move || store.trim_traces(Self::TRACE_RUNS_KEEP)).await
     }
 
     /// Turns a photo into a search description.
@@ -851,6 +882,25 @@ mod tests {
             .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "partial"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn an_account_is_an_admin_when_one_of_its_telegram_ids_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.duckdb").to_str().unwrap().to_string();
+        // `Config::for_test`: 111 is allowed and, being first, the admin.
+        let core = Core::start(crate::config::Config::for_test(&p), None).unwrap();
+        let store = core.store();
+        let admin = store.account_for_telegram(111).unwrap();
+        let member = store.account_for_telegram(222).unwrap();
+        assert!(core.is_admin_account(admin).await.unwrap());
+        assert!(!core.is_admin_account(member).await.unwrap());
+    }
+
+    #[test]
+    fn maintenance_trims_traces_beside_the_message_logs() {
+        let src = include_str!("core.rs");
+        assert!(src.contains("trim_traces(Self::TRACE_RUNS_KEEP)"), "traces must be trimmed in maintenance");
     }
 
     #[test]

@@ -736,6 +736,7 @@ async fn mirror_divider(auth: &AuthState, account_id: i64) {
     let seam = vec![scout_api::Turn {
         role: scout_api::Role::Scout,
         text: "── New thread ──".to_string(),
+        run_id: None,
     }];
     if let Err(e) = scout_core::mirror::enqueue(
         &auth.core,

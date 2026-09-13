@@ -68,6 +68,53 @@ pub enum AgentEvent {
     /// A line from the run itself rather than from the model — today only
     /// the wrap-up notice when a run is salvaged.
     Notice(String),
+    /// One row of the run's trace, as it happens: a tool starting, a tool
+    /// finishing, or something the run itself did. Recorded for every run
+    /// and shown only to an admin with debug on; Telegram ignores it.
+    Trace(TraceFrame),
+}
+
+/// A trace row on the wire. `seq` orders rows within a run and joins a
+/// `Finished` to its `Started`.
+///
+/// `Eq` as well as `PartialEq` because `AgentEvent` derives `Eq` and this
+/// sits inside it; `serde_json::Value` is `Eq`, so it costs nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum TraceFrame {
+    /// Sent once, first, so the page can fetch the saved trace later.
+    Run { run_id: i64 },
+    Started { seq: i64, tool: String, args: serde_json::Value, nested: bool },
+    Finished { seq: i64, duration_ms: i64, status: String, detail: Option<String> },
+    Event { seq: i64, detail: String, error: bool },
+}
+
+/// A run as saved: what the trace panel heads with.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RunRow {
+    pub id: i64,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    /// `answered`, `cut_short` or `failed`; `None` while running.
+    pub outcome: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// A trace row as saved. `kind` is `tool` or `event`. `result` is the
+/// tool's result text, cut at the store's cap when `truncated`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TraceRow {
+    pub seq: i64,
+    pub kind: String,
+    pub tool: Option<String>,
+    pub args: Option<serde_json::Value>,
+    pub nested: bool,
+    pub started_at: String,
+    pub duration_ms: Option<i64>,
+    pub status: Option<String>,
+    pub detail: Option<String>,
+    pub result: Option<String>,
+    pub truncated: bool,
 }
 
 /// The sending half. `run_agent` takes one by value so that returning drops
@@ -175,6 +222,10 @@ pub enum Role {
 pub struct Turn {
     pub role: Role,
     pub text: String,
+    /// The run that produced a Scout turn, for its trace. `None` on You
+    /// turns and on turns saved before runs were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<i64>,
 }
 
 /// One thread in the browser's list. `current` is the one a Telegram
@@ -320,5 +371,24 @@ mod tests {
         assert_eq!(json["pinned"], true);
         assert_eq!(json["updated_at"], "2026-09-05T10:00:00Z");
         assert_eq!(json["current"], false);
+    }
+
+    #[test]
+    fn a_trace_frame_serialises_under_its_own_tag() {
+        let f = AgentEvent::Trace(TraceFrame::Started {
+            seq: 3, tool: "search_web".into(), args: serde_json::json!({"query": "beans"}), nested: false,
+        });
+        let json = serde_json::to_value(&f).unwrap();
+        assert_eq!(json["Trace"]["kind"], "started");
+        assert_eq!(json["Trace"]["seq"], 3);
+        let back: AgentEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, AgentEvent::Trace(TraceFrame::Started { seq: 3, .. })));
+    }
+
+    #[test]
+    fn a_turn_without_a_run_still_parses() {
+        // Turns saved before run ids existed, and every You turn.
+        let t: Turn = serde_json::from_str(r#"{"role":"You","text":"hi"}"#).unwrap();
+        assert_eq!(t.run_id, None);
     }
 }

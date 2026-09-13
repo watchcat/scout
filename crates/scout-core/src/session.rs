@@ -328,6 +328,7 @@ fn turns_of(history: &[LlmMessage]) -> Vec<scout_api::Turn> {
             LlmMessage::User { content } => text_of_user(content).map(|text| scout_api::Turn {
                 role: scout_api::Role::You,
                 text: crate::text::said_by_person(&text).to_string(),
+                run_id: None,
             }),
             // Stripped, because what is *stored* is the model's raw message:
             // `run_agent` saves `res.messages()`, tags and all, and only the
@@ -342,6 +343,7 @@ fn turns_of(history: &[LlmMessage]) -> Vec<scout_api::Turn> {
                 text_of_assistant(content).map(|text| scout_api::Turn {
                     role: scout_api::Role::Scout,
                     text: crate::text::strip_thinking(&text),
+                    run_id: None,
                 })
             }
             _ => None,
@@ -1126,8 +1128,8 @@ mod tests {
         assert_eq!(
             transcript_of(&s, c).unwrap(),
             vec![
-                Turn { role: Role::You, text: "cheapest beans".into() },
-                Turn { role: Role::Scout, text: "here are three".into() },
+                Turn { role: Role::You, text: "cheapest beans".into(), run_id: None },
+                Turn { role: Role::Scout, text: "here are three".into(), run_id: None },
             ]
         );
     }

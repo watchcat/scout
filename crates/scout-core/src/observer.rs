@@ -14,13 +14,23 @@ pub struct Observer {
     pub pulse: crate::run::Pulse,
     pub run_id: i64,
     rows: Mutex<Vec<TraceRow>>,
+    /// Calls the model has made and rig has not yet started, by rig's
+    /// internal call id, to the instant the call was seen.
+    called: Mutex<HashMap<String, std::time::Instant>>,
     /// Calls started and not yet finished, by rig's internal call id, to
     /// the row they opened and the instant they started.
     open: Mutex<HashMap<String, (usize, std::time::Instant)>>,
 }
 
 fn now_iso() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    iso_at(std::time::Instant::now())
+}
+
+/// The wall-clock time an instant already in the past corresponds to,
+/// so a row's `started_at` agrees with the duration measured from it.
+fn iso_at(instant: std::time::Instant) -> String {
+    let ago = chrono::Duration::from_std(instant.elapsed()).unwrap_or_default();
+    (chrono::Utc::now() - ago).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 impl Observer {
@@ -30,6 +40,7 @@ impl Observer {
             pulse: crate::run::Pulse::default(),
             run_id,
             rows: Mutex::new(Vec::new()),
+            called: Mutex::new(HashMap::new()),
             open: Mutex::new(HashMap::new()),
         }
     }
@@ -48,13 +59,33 @@ impl Observer {
         self.emit(TraceFrame::Run { run_id: self.run_id });
     }
 
+    /// The model asked for a tool. This is the moment a tool's time starts,
+    /// not `tool_started`: rig runs a whole batch of calls and surfaces
+    /// each start together with its result once the batch settles, so
+    /// measured from the start item every tool takes microseconds. The
+    /// model's call is streamed before any of them runs.
+    pub fn tool_called(&self, call_id: &str) {
+        self.called
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(call_id.to_string(), std::time::Instant::now());
+    }
+
     pub fn tool_started(&self, call_id: &str, tool: &str, args: serde_json::Value, nested: bool) {
+        // From the call when it was seen; now when it was not, so a tool
+        // whose call went by unobserved still gets a row and a duration.
+        let started = self
+            .called
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(call_id)
+            .unwrap_or_else(std::time::Instant::now);
         let seq = {
             let mut rows = self.rows();
             let seq = rows.len() as i64;
             rows.push(TraceRow {
                 seq, kind: "tool".into(), tool: Some(tool.to_string()), args: Some(args.clone()),
-                nested, started_at: now_iso(), duration_ms: None, status: None, detail: None,
+                nested, started_at: iso_at(started), duration_ms: None, status: None, detail: None,
                 result: None, truncated: false,
             });
             seq
@@ -62,7 +93,7 @@ impl Observer {
         self.open
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(call_id.to_string(), (seq as usize, std::time::Instant::now()));
+            .insert(call_id.to_string(), (seq as usize, started));
         self.emit(TraceFrame::Started { seq, tool: tool.to_string(), args, nested });
     }
 
@@ -184,6 +215,29 @@ mod tests {
         assert_eq!(rows[2].status.as_deref(), Some("failed"), "an error event says so");
         let f = frames(&mut seen);
         assert!(matches!(f[2], TraceFrame::Event { error: true, .. }));
+    }
+
+    #[test]
+    fn a_tools_duration_is_counted_from_the_models_call_not_from_its_batched_start() {
+        // rig surfaces a tool's start and its result together, after the
+        // tool has returned, so measured from the start item every tool
+        // takes nothing. The model's call is streamed before execution and
+        // is the honest anchor.
+        let (o, _seen) = observer();
+        o.tool_called("c1");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        o.tool_started("c1", "search_web", json!({}), false);
+        o.tool_finished("c1", "{}");
+        let rows = o.take_rows();
+        assert!(rows[0].duration_ms.unwrap() >= 20, "got {:?}", rows[0].duration_ms);
+    }
+
+    #[test]
+    fn a_tool_whose_call_was_never_seen_still_has_a_duration() {
+        let (o, _seen) = observer();
+        o.tool_started("c1", "search_web", json!({}), false);
+        o.tool_finished("c1", "{}");
+        assert!(o.take_rows()[0].duration_ms.is_some());
     }
 
     #[test]

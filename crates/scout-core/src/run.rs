@@ -20,20 +20,6 @@ pub enum RunOutcome {
     Overloaded,
 }
 
-/// Runs the agent against a snapshot of this chat's history, then writes the
-/// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
-/// from being held across awaits.
-///
-/// The run reports progress as events rather than drawing them, because the
-/// tool calls alone take most of a minute and an idle chat looks broken —
-/// but who draws them is not this function's business.
-///
-/// `events` is taken by value: returning drops it, which closes the channel
-/// and ends whoever is rendering. That is the only shutdown signal the
-/// renderer gets, so nothing outside this function may keep a sender. The
-/// agent built for the run holds a clone (the specialist reports progress
-/// through it), but that clone lives and dies with the agent inside this
-/// function, so the channel still closes on return.
 /// The event a streamed chunk should produce, if anything changed.
 ///
 /// A function rather than three lines inline, because `run_agent` needs a
@@ -48,6 +34,20 @@ fn answer_event(
     shown.update(&strip_thinking(streamed)).map(scout_api::AgentEvent::Answer)
 }
 
+/// Runs the agent against a snapshot of this chat's history, then writes the
+/// updated history back (capped). Snapshot-then-writeback keeps DashMap locks
+/// from being held across awaits.
+///
+/// The run reports progress as events rather than drawing them, because the
+/// tool calls alone take most of a minute and an idle chat looks broken —
+/// but who draws them is not this function's business.
+///
+/// `events` is taken by value: returning drops it, which closes the channel
+/// and ends whoever is rendering. That is the only shutdown signal the
+/// renderer gets, so nothing outside this function may keep a sender. The
+/// run's observer holds a clone — the loop below, the flight desk and its
+/// specialist all report through it — but the observer is dropped with the
+/// agent before this function returns, so the channel still closes then.
 pub async fn run_agent(
     core: &Core,
     events: scout_api::EventSink,
@@ -74,7 +74,7 @@ pub async fn run_agent(
     // body is a separate function so that closing happens in one place
     // below rather than beside each bail and each early return — one added
     // to the body later is covered without anyone remembering to.
-    match run_with(core, &events, run, prompt, &observer).await {
+    match run_with(core, run, prompt, &observer).await {
         Ok(outcome) => Ok(outcome),
         Err(e) => {
             finish_run(&core.deps.store, &observer, "failed", Some(&e.to_string())).await;
@@ -88,7 +88,6 @@ pub async fn run_agent(
 /// is closed by the caller.
 async fn run_with(
     core: &Core,
-    events: &scout_api::EventSink,
     run: &scout_api::RunContext,
     prompt: &str,
     observer: &std::sync::Arc<crate::observer::Observer>,
@@ -157,10 +156,18 @@ async fn run_with(
                     Err(e) => return Err(anyhow::Error::from(e)),
                 };
                 match item {
+                // The model's call, streamed before the tool runs: where its
+                // clock starts. The start item comes only once it has returned.
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                    internal_call_id,
+                    ..
+                }) => {
+                    observer.tool_called(&internal_call_id);
+                }
                 MultiTurnStreamItem::ToolExecutionStart { tool_call, internal_call_id } => {
                     let args = &tool_call.function.arguments;
                     scout_api::emit(
-                        events,
+                        &observer.events,
                         scout_api::AgentEvent::Tool(crate::describe::describe(
                             &tool_call.function.name,
                             args,
@@ -192,7 +199,7 @@ async fn run_with(
                     // The old `if !answer.is_empty()` guard suppressed
                     // exactly that event, which is why it is gone.
                     if let Some(event) = answer_event(&mut answer_shown, &streamed) {
-                        scout_api::emit(events, event);
+                        scout_api::emit(&observer.events, event);
                     }
                 }
                 // MiniMax streams its reasoning on a separate channel. Shown
@@ -203,7 +210,7 @@ async fn run_with(
                     thinking.push_str(&reasoning);
                     if strip_thinking(&streamed).is_empty() {
                         if let Some(update) = thinking_shown.update(&thinking) {
-                            scout_api::emit(events, scout_api::AgentEvent::Thinking(update));
+                            scout_api::emit(&observer.events, scout_api::AgentEvent::Thinking(update));
                         }
                     }
                 }
@@ -218,7 +225,7 @@ async fn run_with(
                     }
                     if strip_thinking(&streamed).is_empty() {
                         if let Some(update) = thinking_shown.update(&thinking) {
-                            scout_api::emit(events, scout_api::AgentEvent::Thinking(update));
+                            scout_api::emit(&observer.events, scout_api::AgentEvent::Thinking(update));
                         }
                     }
                 }
@@ -304,7 +311,7 @@ async fn run_with(
         tracing::warn!(conversation_id, reason, "run interrupted; writing up from notes");
         observer.event("run interrupted; writing up from notes", false);
         scout_api::emit(
-            events,
+            &observer.events,
             scout_api::AgentEvent::Notice(
                 "✍️ wrapping up with what I found so far".to_string(),
             ),
@@ -930,9 +937,26 @@ mod tests {
     /// test has is the address the model client is pointed at — which is
     /// `Config`'s, and which production already moves for a self-hoster
     /// fronting MiniMax with a proxy of their own.
-    async fn a_run_against(
-        llm: &wiremock::MockServer,
-    ) -> (anyhow::Result<RunOutcome>, Vec<scout_api::AgentEvent>) {
+    struct Ran {
+        outcome: anyhow::Result<RunOutcome>,
+        shown: Vec<scout_api::AgentEvent>,
+        core: Core,
+        account_id: i64,
+        conversation_id: i64,
+        /// Held so the database outlives the run it is read back from.
+        _dir: tempfile::TempDir,
+    }
+
+    impl Ran {
+        /// The run as the store kept it: its row and its trace.
+        fn saved(&self) -> (scout_api::RunRow, Vec<scout_api::TraceRow>) {
+            let store = self.core.store();
+            let run_id = store.latest_run_id(self.conversation_id).unwrap().expect("the run opened a row");
+            store.trace_of(run_id, self.account_id).unwrap().expect("the row is this account's")
+        }
+    }
+
+    async fn a_run_against(llm: &wiremock::MockServer) -> Ran {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::config::Config::for_test(
             dir.path().join("run.duckdb").to_str().unwrap(),
@@ -956,7 +980,7 @@ mod tests {
         while let Ok(event) = seen.try_recv() {
             shown.push(event);
         }
-        (outcome, shown)
+        Ran { outcome, shown, core, account_id, conversation_id, _dir: dir }
     }
 
     #[tokio::test]
@@ -975,17 +999,28 @@ mod tests {
         )
         .await;
 
-        let (outcome, shown) = a_run_against(&llm).await;
+        let ran = a_run_against(&llm).await;
 
-        match outcome.expect("a run with an answer in it must not fail") {
+        // The run's row says it was cut short and why, and the trace holds
+        // the event beside the warning that was logged.
+        let (run, rows) = ran.saved();
+        assert_eq!(run.outcome.as_deref(), Some("cut_short"));
+        assert_eq!(run.detail.as_deref(), Some("that reply came back as reasoning instead of an answer"));
+        assert!(run.ended_at.is_some(), "the row was closed");
+        assert!(
+            rows.iter().any(|r| r.kind == "event" && r.detail.as_deref() == Some("run interrupted; writing up from notes")),
+            "the write-up is not in the trace: {rows:?}"
+        );
+        match ran.outcome.expect("a run with an answer in it must not fail") {
             RunOutcome::Answered(reply) => {
                 assert!(reply.contains("Which segments"), "the answer was lost: {reply:?}")
             }
             _ => panic!("a run that produced text must answer"),
         }
         assert!(
-            shown.iter().any(|e| matches!(e, scout_api::AgentEvent::Notice(n) if n.contains("wrapping up"))),
-            "the reader was not told the answer was being written up: {shown:?}"
+            ran.shown.iter().any(|e| matches!(e, scout_api::AgentEvent::Notice(n) if n.contains("wrapping up"))),
+            "the reader was not told the answer was being written up: {:?}",
+            ran.shown
         );
     }
 
@@ -999,9 +1034,19 @@ mod tests {
         // renders as Scout's reply.
         let llm = minimax(streamed_text(&[""]), None).await;
 
-        let (outcome, _shown) = a_run_against(&llm).await;
+        let ran = a_run_against(&llm).await;
 
-        let Err(err) = outcome else {
+        // A failed run is closed as one, with the failure in its trace —
+        // and the event's millisecond `Z` timestamp came back through the
+        // store's TIMESTAMP cast in one piece.
+        let (run, rows) = ran.saved();
+        assert_eq!(run.outcome.as_deref(), Some("failed"));
+        assert!(run.detail.as_deref().unwrap_or("").contains("no answer and no notes"), "got: {run:?}");
+        let event = rows.iter().find(|r| r.kind == "event").expect("the failure is in the trace");
+        assert_eq!(event.status.as_deref(), Some("failed"));
+        assert!(event.detail.as_deref().unwrap_or("").contains("no answer and no notes"), "got: {event:?}");
+        assert!(event.started_at.starts_with("20") && event.started_at.contains(':'), "got: {:?}", event.started_at);
+        let Err(err) = ran.outcome else {
             panic!("an answer of nothing is not an answer");
         };
         assert!(err.to_string().contains("no answer and no notes"), "got: {err}");
@@ -1228,10 +1273,9 @@ mod tests {
         ] {
             let at = body.find(wording).unwrap_or_else(|| panic!("{wording:?} is no longer logged"));
             let after = &body[at..];
-            assert!(
-                after[..after.find('\n').unwrap_or(after.len()) + 400].contains("observer.event("),
-                "{wording:?} is logged but not traced"
-            );
+            let end = after.len().min(after.find('\n').unwrap_or(after.len()) + 400);
+            let end = (end..=after.len()).find(|&n| after.is_char_boundary(n)).unwrap_or(after.len());
+            assert!(after[..end].contains("observer.event("), "{wording:?} is logged but not traced");
         }
         assert!(body.contains(r#"finish_run(&core.deps.store, &observer, "failed""#), "a failed run closes its row");
     }
@@ -1249,6 +1293,17 @@ mod tests {
     }
 
     #[test]
+    fn a_tools_clock_starts_at_the_models_call() {
+        // rig surfaces a tool's start together with its result, after the
+        // tool returned; a clock started there reads zero for every tool.
+        let src = include_str!("run.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let called = body.find("observer.tool_called(&internal_call_id)").expect("the clock starts at the model's call");
+        let started = body.find("observer.tool_started(").expect("the start is recorded");
+        assert!(called < started, "the call arm comes before the start arm, as the items do");
+    }
+
+    #[test]
     fn once_a_run_has_a_row_there_is_no_way_out_that_leaves_it_open() {
         // A `?` between opening the run and the inner call would return
         // past the one place that closes the row. The two repair turns and
@@ -1260,7 +1315,10 @@ mod tests {
         let outer = &outer[..outer.find("\nasync fn run_with(").expect("the body must be its own function")];
         let after_open = &outer[outer.find("Observer::new(").expect("the observer is built in the outer function")..];
         assert_eq!(after_open.matches("run_with(").count(), 1, "the body is called exactly once");
-        assert!(!after_open.contains('?'), "a `?` after the run is opened skips closing it: {after_open}");
+        // Code only: a question asked in a comment is not an early return.
+        let code: Vec<&str> = after_open.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        let code = code.join("\n");
+        assert!(!code.contains('?'), "a `?` after the run is opened skips closing it: {code}");
         assert!(
             after_open.contains(r#"finish_run(&core.deps.store, &observer, "failed""#),
             "the outer function is where a failed run is closed"

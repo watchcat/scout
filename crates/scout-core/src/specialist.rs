@@ -255,6 +255,13 @@ where
                         }
                     };
                     match next {
+                        // The model's call, streamed before the tool runs:
+                        // where its clock starts.
+                        Ok(MultiTurnStreamItem::StreamAssistantItem(
+                            rig::streaming::StreamedAssistantContent::ToolCall { internal_call_id, .. },
+                        )) => {
+                            self.observer.tool_called(&internal_call_id);
+                        }
                         Ok(MultiTurnStreamItem::ToolExecutionStart { tool_call, internal_call_id }) => {
                             collector.tool_started(
                                 &internal_call_id,
@@ -650,6 +657,12 @@ mod tests {
         assert!(rows[0].nested);
         assert_eq!(rows[0].tool.as_deref(), Some("probe"));
         assert_eq!(rows[0].status.as_deref(), Some("ok"));
+        assert!(rows[0].duration_ms.is_some());
+        // The mock stream emits the model's ToolCall item before the start,
+        // as rig does, so the clock has to be started from it here too.
+        let src = include_str!("specialist.rs");
+        let src = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(src.contains("self.observer.tool_called(&internal_call_id)"), "the nested clock starts at the model's call");
     }
 
     #[tokio::test]

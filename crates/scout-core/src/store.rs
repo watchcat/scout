@@ -1848,6 +1848,20 @@ impl Store {
         Ok(Some((run, rows)))
     }
 
+    /// The newest run opened for a conversation. Test-only: production
+    /// reaches a run from the message that names it, never by searching.
+    #[cfg(test)]
+    pub(crate) fn latest_run_id(&self, conversation_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM runs WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
+                params![conversation_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Deletes everything but the newest `keep_runs` runs, rows included.
     /// Returns how many runs went.
     pub fn trim_traces(&self, keep_runs: usize) -> Result<usize> {

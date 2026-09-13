@@ -38,6 +38,8 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/threads/{id}/pin", post(pin_thread))
         .route("/chat/threads/{id}/delete", post(delete_thread))
         .route("/chat/threads/{id}/title", post(suggest_title))
+        .route("/chat/debug", get(debug_state))
+        .route("/chat/runs/{id}/trace", get(run_trace))
         // On the router rather than threaded through individual handlers —
         // the same reason it is on `account::routes` — so a handler that
         // forgot to check it is not the one that matters.
@@ -303,6 +305,41 @@ async fn send_message(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // The debug switch is a command to the server, not a message to the
+    // model: nothing is spent, logged or stored, and the reply is one
+    // sentence in an otherwise empty stream. Admins only, because a trace
+    // carries tool arguments and provider error text.
+    if let Some(word) = debug_command(&body.text) {
+        let sentence = match auth.core.is_admin_account(account_id).await {
+            Ok(false) => "That's an admin switch.".to_string(),
+            Ok(true) => match word {
+                Some(on) => match scout_core::debug::set(&auth.core, account_id, on).await {
+                    Ok(()) if on => "Debug is on. Each answer now shows its trace.".to_string(),
+                    Ok(()) => "Debug is off.".to_string(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "could not set the debug switch");
+                        return sorry();
+                    }
+                },
+                None => match scout_core::debug::is_on(&auth.core, account_id).await {
+                    Ok(true) => "Debug is on.".to_string(),
+                    Ok(false) => "Debug is off.".to_string(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "could not read the debug switch");
+                        return sorry();
+                    }
+                },
+            },
+            Err(e) => {
+                tracing::error!(error = %e, "could not tell whether an account is an admin");
+                return sorry();
+            }
+        };
+        let (frames, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = frames.send(Frame::End(End::Ok { answer: sentence }));
+        return sse_response(rx);
+    }
+
     // Before `open_thread`, on purpose: opening bumps a thread to current,
     // so checking the cap afterwards would let somebody who is capped
     // reorder their own sidebar by pressing send.
@@ -375,6 +412,66 @@ async fn send_message(
     });
 
     sse_response(rx)
+}
+
+/// `Some(Some(true))` for `/debug on`, `Some(Some(false))` for `/debug
+/// off`, `Some(None)` for bare `/debug`, `None` for anything else — a
+/// message that merely starts with the word is a message.
+fn debug_command(text: &str) -> Option<Option<bool>> {
+    let mut words = text.split_whitespace();
+    if words.next()? != "/debug" {
+        return None;
+    }
+    match (words.next(), words.next()) {
+        (None, _) => Some(None),
+        (Some("on"), None) => Some(Some(true)),
+        (Some("off"), None) => Some(Some(false)),
+        _ => None,
+    }
+}
+
+async fn debug_state(axum::extract::State(auth): axum::extract::State<AuthState>, headers: HeaderMap) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match scout_core::debug::is_on(&auth.core, account_id).await {
+        Ok(on) => axum::Json(serde_json::json!({"on": on})).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "could not read the debug switch");
+            sorry()
+        }
+    }
+}
+
+/// The trace behind one answer. 403 with debug off so the page can say
+/// "turn debug on"; 404 for a run that is not this account's or is no
+/// longer kept, which look the same on purpose.
+async fn run_trace(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Path(run_id): axum::extract::Path<i64>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match scout_core::debug::is_on(&auth.core, account_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "could not read the debug switch");
+            return sorry();
+        }
+    }
+    match scout_core::debug::trace(&auth.core, run_id, account_id).await {
+        Ok(Some((run, rows))) => axum::Json(serde_json::json!({"run": run, "rows": rows})).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "could not read a trace");
+            sorry()
+        }
+    }
 }
 
 /// The account and the CSRF check every thread route starts with.
@@ -1204,6 +1301,105 @@ mod tests {
         }
         let req: Request<Body> = req.body(Body::from(body.to_string())).unwrap();
         app.clone().oneshot(req).await.unwrap()
+    }
+
+    /// The session cookie and CSRF token a signed-in page would carry.
+    fn signed_in(_core: &scout_core::core::Core, account_id: i64) -> (String, String) {
+        (
+            crate::session::mint(TEST_KEY, account_id, DAY),
+            crate::session::csrf_for(TEST_KEY, account_id),
+        )
+    }
+
+    /// A fresh, empty thread under the `"direct"` scope — what pressing
+    /// "new thread" makes — and its id.
+    async fn new_thread_for(core: &scout_core::core::Core, account_id: i64) -> i64 {
+        scout_core::session::reset(core, account_id, "direct").await.unwrap()
+    }
+
+    /// Sends one chat message as `session` and returns the whole SSE body.
+    async fn chat_body(app: &axum::Router, session: &str, csrf: &str, thread: i64, text: &str) -> String {
+        let res = post_json_with_cookie(app, "/chat/messages", session, Some(csrf),
+            &format!(r#"{{"text":{},"thread":{thread}}}"#, serde_json::to_string(text).unwrap())).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        crate::tests::body_of(res).await
+    }
+
+    #[test]
+    fn the_debug_command_is_the_whole_message() {
+        use super::debug_command;
+        assert_eq!(debug_command("/debug on"), Some(Some(true)));
+        assert_eq!(debug_command("/debug  off "), Some(Some(false)));
+        assert_eq!(debug_command("/debug"), Some(None));
+        assert_eq!(debug_command("/debugger"), None);
+        assert_eq!(debug_command("/debug on please"), None);
+        assert_eq!(debug_command("debug on"), None);
+    }
+
+    #[tokio::test]
+    async fn debug_is_an_admin_switch_that_spends_nothing() {
+        // `Config::for_test` makes telegram 111 the admin; 777 is a member.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let member = admitted(&core, "777").await;
+        let (session, csrf) = signed_in(&core, member);
+        let thread = new_thread_for(&core, member).await;
+
+        let body = chat_body(&app, &session, &csrf, thread, "/debug on").await;
+        assert!(body.contains("admin switch"), "{body}");
+        assert!(!scout_core::debug::is_on(&core, member).await.unwrap());
+        assert_eq!(core.requests_today(member).await.unwrap(), 0, "a refused switch is not a request");
+
+        let admin = admitted(&core, "111").await;
+        let (session, csrf) = signed_in(&core, admin);
+        let thread = new_thread_for(&core, admin).await;
+        let body = chat_body(&app, &session, &csrf, thread, "/debug on").await;
+        assert!(body.contains("Debug is on"), "{body}");
+        assert!(scout_core::debug::is_on(&core, admin).await.unwrap());
+        assert_eq!(core.requests_today(admin).await.unwrap(), 0, "a switch is not a request");
+
+        let res = get_with_cookie(&app, "/chat/debug", &session).await;
+        assert_eq!(crate::tests::body_of(res).await, r#"{"on":true}"#);
+
+        let body = chat_body(&app, &session, &csrf, thread, "/debug").await;
+        assert!(body.contains("Debug is on"), "bare /debug reports: {body}");
+        let body = chat_body(&app, &session, &csrf, thread, "/debug off").await;
+        assert!(body.contains("Debug is off"), "{body}");
+        assert!(!scout_core::debug::is_on(&core, admin).await.unwrap());
+        // Nothing entered the conversation.
+        let res = get_with_cookie(&app, "/chat/history", &session).await;
+        assert_eq!(crate::tests::body_of(res).await, "[]");
+    }
+
+    #[tokio::test]
+    async fn a_trace_is_read_by_its_owner_with_debug_on_and_by_nobody_else() {
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let owner = admitted(&core, "111").await;
+        let stranger = admitted(&core, "777").await;
+        let row = scout_api::TraceRow {
+            seq: 0, kind: "tool".into(), tool: Some("search_web".into()), args: Some(serde_json::json!({"query": "beans"})),
+            nested: false, started_at: "2026-09-13T10:00:00Z".into(), duration_ms: Some(80),
+            status: Some("ok".into()), detail: None, result: Some(r#"{"hits":1}"#.into()), truncated: false,
+        };
+        let run_id = scout_core::debug::seed_run_for_tests(&core, owner, vec![row]).await.unwrap();
+
+        let (session, _) = signed_in(&core, owner);
+        let res = get_with_cookie(&app, &format!("/chat/runs/{run_id}/trace"), &session).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "debug is off");
+
+        scout_core::debug::set(&core, owner, true).await.unwrap();
+        let res = get_with_cookie(&app, &format!("/chat/runs/{run_id}/trace"), &session).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&crate::tests::body_of(res).await).unwrap();
+        assert_eq!(body["run"]["outcome"], "answered");
+        assert_eq!(body["rows"][0]["tool"], "search_web");
+        assert_eq!(body["rows"][0]["result"], r#"{"hits":1}"#);
+
+        let (session, _) = signed_in(&core, stranger);
+        scout_core::debug::set(&core, stranger, true).await.unwrap();
+        let res = get_with_cookie(&app, &format!("/chat/runs/{run_id}/trace"), &session).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "someone else's run does not exist for them");
+        let res = get_with_cookie(&app, "/chat/runs/999999/trace", &session).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

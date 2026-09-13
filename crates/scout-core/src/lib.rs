@@ -14,6 +14,7 @@ mod tools;
 pub mod backup;
 pub mod config;
 pub mod core;
+pub mod debug;
 pub mod describe;
 pub mod identity;
 pub mod ids;

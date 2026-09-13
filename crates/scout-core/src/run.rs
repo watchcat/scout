@@ -68,8 +68,13 @@ pub async fn run_agent(
         let store = core.deps.store.clone();
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
-    let pulse = std::sync::Arc::new(Pulse::default());
-    let agent = build_agent(&core.deps, run, &facts, events.clone(), pulse.clone());
+    let run_id = {
+        let store = core.deps.store.clone();
+        crate::core::blocking(move || store.open_run(account_id, conversation_id)).await?
+    };
+    let observer = std::sync::Arc::new(crate::observer::Observer::new(events.clone(), run_id));
+    observer.announce();
+    let agent = build_agent(&core.deps, run, &facts, observer.clone());
     // History comes from the conversation the caller opened, so an
     // in-flight run always reads and writes that thread and never anyone
     // else's — the isolation the (chat, user) map used to provide.
@@ -110,11 +115,11 @@ pub async fn run_agent(
                 let next = loop {
                     match tokio::time::timeout(STALL_CHECK, stream.next()).await {
                         Ok(Some(item)) => {
-                            pulse.touch();
+                            observer.pulse.touch();
                             break item;
                         }
                         Ok(None) => return Ok(None),
-                        Err(_) if pulse.since() < STREAM_STALL => continue,
+                        Err(_) if observer.pulse.since() < STREAM_STALL => continue,
                         Err(_) => return Ok(Some("the model stopped responding")),
                     }
                 };
@@ -128,7 +133,7 @@ pub async fn run_agent(
                     Err(e) => return Err(anyhow::Error::from(e)),
                 };
                 match item {
-                MultiTurnStreamItem::ToolExecutionStart { tool_call, .. } => {
+                MultiTurnStreamItem::ToolExecutionStart { tool_call, internal_call_id } => {
                     let args = &tool_call.function.arguments;
                     scout_api::emit(
                         &events,
@@ -137,6 +142,22 @@ pub async fn run_agent(
                             args,
                         )),
                     );
+                    observer.tool_started(&internal_call_id, &tool_call.function.name, args.clone(), false);
+                }
+                MultiTurnStreamItem::StreamUserItem(rig::streaming::StreamedUserContent::ToolResult {
+                    tool_result,
+                    internal_call_id,
+                }) => {
+                    let text = tool_result
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            rig::completion::message::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    observer.tool_finished(&internal_call_id, &text);
                 }
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t)) => {
                     streamed.push_str(&t.text);
@@ -198,6 +219,8 @@ pub async fn run_agent(
         // single WARN or ERROR in it, so there was nothing to diagnose.
         Ok(Err(e)) => {
             tracing::error!(error = %e, account_id, conversation_id, "the run failed");
+            observer.event("the model call failed", true);
+            finish_run(&core.deps.store, &observer, "failed", Some(&e.to_string())).await;
             return Err(e);
         }
         Err(_) => Some("this took too long"),
@@ -246,11 +269,18 @@ pub async fn run_agent(
     // and none of them has one for a run that answered with nothing — the
     // browser renders the blank as Scout's reply.
     if reply.is_empty() && salvage.is_none() {
-        anyhow::bail!("the model produced no answer and no notes to write one from");
+        let why = "the model produced no answer and no notes to write one from";
+        observer.event(why, true);
+        finish_run(&core.deps.store, &observer, "failed", Some(why)).await;
+        anyhow::bail!(why);
     }
+    // What the wrap-up below is about to consume, kept for the run's row:
+    // a written-up run is still one that was cut short.
+    let cut_short: Option<&'static str> = salvage;
 
     if let Some(reason) = salvage {
         tracing::warn!(conversation_id, reason, "run interrupted; writing up from notes");
+        observer.event("run interrupted; writing up from notes", false);
         scout_api::emit(
             &events,
             scout_api::AgentEvent::Notice(
@@ -275,14 +305,26 @@ pub async fn run_agent(
         .await
         {
             Ok(Ok(text)) => strip_thinking(&text),
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => anyhow::bail!("wrap-up timed out after the run was interrupted"),
+            Ok(Err(e)) => {
+                observer.event("the model call failed", true);
+                finish_run(&core.deps.store, &observer, "failed", Some(&e.to_string())).await;
+                return Err(e.into());
+            }
+            Err(_) => {
+                let why = "wrap-up timed out after the run was interrupted";
+                observer.event(why, true);
+                finish_run(&core.deps.store, &observer, "failed", Some(why)).await;
+                anyhow::bail!(why);
+            }
         };
         // A write-up that is itself all reasoning, or empty, is a second
         // blank — the thing this path exists to stop. An error is a message
         // the reader sees; the empty string is silence.
         if reply.is_empty() {
-            anyhow::bail!("the wrap-up came back with no answer in it either");
+            let why = "the wrap-up came back with no answer in it either";
+            observer.event(why, true);
+            finish_run(&core.deps.store, &observer, "failed", Some(why)).await;
+            anyhow::bail!(why);
         }
         // Keep the exchange in context; the interrupted turns are lost. A
         // run that reached its final response and is written up anyway —
@@ -308,11 +350,15 @@ pub async fn run_agent(
     // checked.
     if crate::toolcall::looks_like_tool_call(&reply) {
         tracing::warn!(conversation_id, "the model wrote a tool call as text; asking it to answer");
+        observer.event("the model wrote a tool call as text; asking it to answer", false);
         reply = strip_thinking(&agent.chat(crate::toolcall::REPAIR_NOTE, &mut history).await?);
         if crate::toolcall::looks_like_tool_call(&reply) {
             // Twice is not a slip. The run has not answered, and an apology
             // the reader understands beats markup they cannot.
-            anyhow::bail!("the model wrote a tool call as text instead of answering, twice");
+            let why = "the model wrote a tool call as text instead of answering, twice";
+            observer.event(why, true);
+            finish_run(&core.deps.store, &observer, "failed", Some(why)).await;
+            anyhow::bail!(why);
         }
     }
 
@@ -322,11 +368,13 @@ pub async fn run_agent(
     let dead = crate::links::dead_links_in(&core.deps.http, &reply).await;
     if !dead.is_empty() {
         tracing::warn!(?dead, conversation_id, "dead links in reply; asking the agent to correct it");
+        observer.event("dead links in reply; asking the agent to correct it", false);
         let note = crate::links::repair_prompt(&dead);
         reply = strip_thinking(&agent.chat(note, &mut history).await?);
         let still_dead = crate::links::dead_links_in(&core.deps.http, &reply).await;
         if !still_dead.is_empty() {
             tracing::warn!(?still_dead, conversation_id, "dead links survived the correction; stripping");
+            observer.event("dead links survived the correction; stripping", true);
             reply = crate::links::strike_dead(&reply, &still_dead);
         }
     }
@@ -346,7 +394,29 @@ pub async fn run_agent(
             }
         }
     }
+    finish_run(
+        &core.deps.store,
+        &observer,
+        if cut_short.is_some() { "cut_short" } else { "answered" },
+        cut_short,
+    )
+    .await;
     Ok(RunOutcome::Answered(reply))
+}
+
+/// Writes the trace and closes the run, on every exit that has one. Never
+/// fails the reply over it: the answer is already on its way.
+async fn finish_run(store: &crate::store::Store, observer: &crate::observer::Observer, outcome: &str, detail: Option<&str>) {
+    let rows = observer.take_rows();
+    let (store, run_id, outcome, detail) = (store.clone(), observer.run_id, outcome.to_string(), detail.map(str::to_string));
+    if let Err(e) = crate::core::blocking(move || {
+        store.append_traces(run_id, &rows)?;
+        store.close_run(run_id, &outcome, detail.as_deref())
+    })
+    .await
+    {
+        tracing::warn!(error = %e, run_id, "could not save the trace");
+    }
 }
 
 /// Runs allowed at once across every conversation and channel.
@@ -1122,6 +1192,41 @@ mod tests {
         let src = include_str!("run.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         assert!(src.contains("timeout(STALL_CHECK, stream.next())"), "the stream is polled in short checks");
-        assert!(src.contains("pulse.since() < STREAM_STALL"), "and a stall is judged by the pulse");
+        assert!(src.contains("observer.pulse.since() < STREAM_STALL"), "and a stall is judged by the pulse");
+    }
+
+    #[test]
+    fn every_warning_about_the_run_is_also_a_trace_event() {
+        // The log on the node and the trace under the answer must tell the
+        // same story; a warning with no event is a failure the admin
+        // cannot see from the browser.
+        let src = include_str!("run.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        for wording in [
+            "run interrupted; writing up from notes",
+            "the model wrote a tool call as text; asking it to answer",
+            "dead links in reply; asking the agent to correct it",
+            "dead links survived the correction; stripping",
+        ] {
+            let at = body.find(wording).unwrap_or_else(|| panic!("{wording:?} is no longer logged"));
+            let after = &body[at..];
+            assert!(
+                after[..after.find('\n').unwrap_or(after.len()) + 400].contains("observer.event("),
+                "{wording:?} is logged but not traced"
+            );
+        }
+        assert!(body.contains(r#"finish_run(&core.deps.store, &observer, "failed""#), "a failed run closes its row");
+    }
+
+    #[test]
+    fn the_run_is_opened_before_the_agent_and_traces_are_saved_after_the_messages() {
+        let src = include_str!("run.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let open = body.find("open_run(").expect("the run must be opened");
+        let build = body.find("build_agent(").expect("the agent build must exist");
+        let append = body.find("append_history(").expect("messages are appended");
+        let save = body.rfind("finish_run(").expect("traces are saved");
+        assert!(open < build, "the run id must exist before the observer is built");
+        assert!(append < save, "traces are saved after the messages that point at the run");
     }
 }

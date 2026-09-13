@@ -597,15 +597,14 @@ pub(crate) fn markup_rate(d: &AgentDeps) -> f64 {
 }
 
 /// Built per incoming message: tools capture the requesting account's
-/// identity, so the LLM never sees or chooses ids. `events` carries the
-/// nested flight desk's progress to the chat, and `pulse` its liveness to
-/// the stall guard.
+/// identity, so the LLM never sees or chooses ids. `observer` carries the
+/// nested flight desk's progress to the chat, its liveness to the stall
+/// guard, and its calls to the trace.
 pub fn build_agent(
     d: &AgentDeps,
     run: &scout_api::RunContext,
     facts: &[(String, String)],
-    events: scout_api::EventSink,
-    pulse: std::sync::Arc<crate::run::Pulse>,
+    observer: std::sync::Arc<crate::observer::Observer>,
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     let account_id = run.account_id;
     // One allowance per request, shared by both searching tools.
@@ -659,7 +658,7 @@ pub fn build_agent(
     // a flight question. Every flight-shaped tool lives inside it; the
     // main agent sees one tool and a report.
     if d.duffel.is_some() || d.ignav.is_some() {
-        builder = builder.tool(crate::flights::ask_flights(d, run, facts, flights, events, pulse));
+        builder = builder.tool(crate::flights::ask_flights(d, run, facts, flights, observer));
     }
     builder.default_max_turns(MAX_TURNS).build()
 }
@@ -751,32 +750,10 @@ mod tests {
     }
 
     #[test]
-    fn the_run_loop_hands_the_sink_to_the_agent_build() {
-        // The specialist reports progress through the run's sink; without
-        // it a flight question is a silent minute.
+    fn the_run_loop_hands_one_observer_to_the_agent_build() {
         let src = include_str!("run.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
-        let call = &src[src.find("build_agent(").expect("the agent build must exist")..];
-        // Up to the parenthesis matching the call's own, not the first one
-        // closing an argument's `.clone()`.
-        let mut depth = 0usize;
-        let end = call
-            .char_indices()
-            .find_map(|(i, c)| match c {
-                '(' => {
-                    depth += 1;
-                    None
-                }
-                ')' => {
-                    depth -= 1;
-                    (depth == 0).then_some(i)
-                }
-                _ => None,
-            })
-            .expect("the call must close");
-        let call = &call[..end];
-        assert!(call.contains("events.clone()"), "the sink must reach build_agent: {call}");
-        assert!(call.contains("pulse.clone()"), "the pulse must reach build_agent: {call}");
+        assert!(src.contains("build_agent(&core.deps, run, &facts, observer.clone())"), "the observer must reach build_agent");
     }
 
     #[test]

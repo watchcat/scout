@@ -228,8 +228,7 @@ pub fn ask_flights(
     run: &scout_api::RunContext,
     facts: &[(String, String)],
     budget: std::sync::Arc<crate::tools::budget::FlightBudget>,
-    events: scout_api::EventSink,
-    pulse: std::sync::Arc<crate::run::Pulse>,
+    observer: std::sync::Arc<crate::observer::Observer>,
 ) -> Specialist<rig::providers::openai::completion::CompletionModel> {
     let markup = crate::agent::markup_rate(d);
     Specialist {
@@ -245,8 +244,7 @@ pub fn ask_flights(
                       search and booking results - plus guidance on presenting them."
             .to_string(),
         agent: build_flight_agent(d, run, facts, budget),
-        events,
-        pulse,
+        observer,
         guidance: Box::new(move |findings: &[Finding]| guidance(findings, markup)),
         budget: SPECIALIST_BUDGET,
     }
@@ -658,9 +656,9 @@ mod tests {
         };
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
         let budget = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
-        let pulse = std::sync::Arc::new(crate::run::Pulse::default());
+        let observer = std::sync::Arc::new(crate::observer::Observer::new(events, 1));
 
-        let tool = ask_flights(&core.deps, &run, &[], budget, events, pulse);
+        let tool = ask_flights(&core.deps, &run, &[], budget, observer);
 
         assert_eq!(rig::tool::Tool::name(&tool), "ask_flights");
         let d = rig::tool::Tool::description(&tool);

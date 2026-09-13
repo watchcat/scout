@@ -1852,6 +1852,8 @@ impl Store {
     /// Returns how many runs went.
     pub fn trim_traces(&self, keep_runs: usize) -> Result<usize> {
         let conn = self.conn();
+        // Rows first, on purpose: a crash between the two leaves only
+        // trace-less runs behind, which the next hourly trim removes.
         conn.execute(
             "DELETE FROM run_traces WHERE run_id NOT IN (SELECT id FROM runs ORDER BY id DESC LIMIT ?)",
             params![keep_runs as i64],
@@ -7051,12 +7053,14 @@ CREATE TABLE messages (
         let me = store.account_for_telegram(1).unwrap();
         let conv = store.start_conversation(me, "direct").unwrap();
         let run_id = store.open_run(me, conv).unwrap();
-        let long = "é".repeat(TRACE_RESULT_CAP);  // 2 bytes each: over the cap, and a boundary to respect
+        // 3 bytes each: over the cap, and since the cap is even the cut
+        // lands mid-character, so the boundary loop has to move it.
+        let long = "€".repeat(TRACE_RESULT_CAP);
         store.append_traces(run_id, &[a_row(0, "search_web", Some(&long))]).unwrap();
         let (_, rows) = store.trace_of(run_id, me).unwrap().unwrap();
         let kept = rows[0].result.as_deref().unwrap();
         assert!(rows[0].truncated);
-        assert!(kept.len() <= TRACE_RESULT_CAP && kept.chars().all(|c| c == 'é'), "cut on a character boundary");
+        assert!(kept.len() <= TRACE_RESULT_CAP && kept.chars().all(|c| c == '€'), "cut on a character boundary");
     }
 
     #[test]

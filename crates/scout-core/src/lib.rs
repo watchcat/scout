@@ -6,6 +6,7 @@
 
 mod agent;
 mod flights;
+mod observer;
 mod specialist;
 mod store;
 mod tools;

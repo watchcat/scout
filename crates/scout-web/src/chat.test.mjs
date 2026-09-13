@@ -7,6 +7,7 @@ import {
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
   tripPdfFilename,
   composerTarget, removeLegBody, keepBody, deleteTripBody, tripDeleteConsequence,
+  traceLines, applyTraceFrame, traceDuration,
 } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
@@ -426,4 +427,54 @@ test('a segment with no candidates array at all counts as zero options, not a cr
   // reads trips straight from the wire and should not assume that.
   const trip = { segments: [{}, { candidates: [{ candidate: 1 }] }] }
   assert.equal(tripDeleteConsequence(trip), 'Its 2 legs and 1 saved flight option go with it.')
+})
+
+test('a saved trace becomes one line per row, nested rows marked, events full width', () => {
+  const run = { id: 5, outcome: 'cut_short', detail: 'it took too long', started_at: '2026-09-13T10:00:00Z', ended_at: '2026-09-13T10:01:30Z' }
+  const rows = [
+    { seq: 0, kind: 'tool', tool: 'ask_flights', args: { brief: 'AMS-LIS' }, nested: false, duration_ms: 42000, status: 'ok', result: '{"summary":"x"}', truncated: false },
+    { seq: 1, kind: 'tool', tool: 'search_flights', args: { origin: 'AMS' }, nested: true, duration_ms: 8000, status: 'failed', detail: 'duffel 429', result: 'duffel 429', truncated: false },
+    { seq: 2, kind: 'event', detail: 'run interrupted; writing up from notes', status: 'ok' },
+  ]
+  const lines = traceLines(run, rows)
+  assert.equal(lines.head, 'cut_short · 1m 30s · it took too long')
+  assert.deepEqual(lines.rows.map(r => [r.kind, r.nested, r.status, r.label]), [
+    ['tool', false, 'ok', 'ask_flights {"brief":"AMS-LIS"}'],
+    ['tool', true, 'failed', 'search_flights {"origin":"AMS"}'],
+    ['event', false, 'ok', 'run interrupted; writing up from notes'],
+  ])
+  assert.equal(lines.rows[0].duration, '42.0s')
+  assert.equal(lines.rows[1].detail, 'duffel 429')
+})
+
+test('a saved run that never closed reads as unfinished', () => {
+  const lines = traceLines({ id: 3, started_at: '2026-09-13T10:00:00Z', ended_at: null, outcome: null, detail: null }, [])
+  assert.equal(lines.head, 'unfinished')
+  assert.equal(traceLines(null, []).head, '', 'a live panel has no head')
+})
+
+test('arguments on a line are cut at 120 characters', () => {
+  const rows = [{ seq: 0, kind: 'tool', tool: 't', args: { q: 'x'.repeat(200) }, nested: false, status: 'ok' }]
+  const line = traceLines({ id: 1 }, rows).rows[0].label
+  // 't', a space, 120 characters, the ellipsis.
+  assert.ok(line.length <= 123 && line.endsWith('…'), line)
+})
+
+test('live frames build the same rows a saved trace would', () => {
+  let rows = []
+  rows = applyTraceFrame(rows, { kind: 'started', seq: 0, tool: 'search_web', args: { query: 'beans' }, nested: false })
+  assert.equal(rows[0].status, undefined, 'still running')
+  rows = applyTraceFrame(rows, { kind: 'finished', seq: 0, duration_ms: 300, status: 'ok', detail: null })
+  rows = applyTraceFrame(rows, { kind: 'event', seq: 1, detail: 'dead links survived the correction; stripping', error: true })
+  const lines = traceLines(null, rows)
+  assert.deepEqual(lines.rows.map(r => [r.kind, r.status, r.duration]), [['tool', 'ok', '0.3s'], ['event', 'failed', '']])
+  // A finish for a row that never started is ignored, as on the server.
+  assert.equal(applyTraceFrame(rows, { kind: 'finished', seq: 9, duration_ms: 1, status: 'ok' }).length, 2)
+})
+
+test('durations read as seconds under a minute and minutes above', () => {
+  assert.equal(traceDuration(900), '0.9s')
+  assert.equal(traceDuration(42000), '42.0s')
+  assert.equal(traceDuration(90000), '1m 30s')
+  assert.equal(traceDuration(undefined), '')
 })

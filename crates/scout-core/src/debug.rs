@@ -3,11 +3,15 @@
 
 use crate::core::{blocking, Core};
 
+/// Turns the account's debug switch on or off. Whether the account may is
+/// the caller's question (`Core::is_admin_account`), not this one's.
 pub async fn set(core: &Core, account_id: i64, on: bool) -> anyhow::Result<()> {
     let store = core.store();
     blocking(move || store.set_debug(account_id, on)).await
 }
 
+/// Whether the account's debug switch is on. Off for an account that has
+/// never touched it.
 pub async fn is_on(core: &Core, account_id: i64) -> anyhow::Result<bool> {
     let store = core.store();
     blocking(move || store.debug_of(account_id)).await

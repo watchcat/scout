@@ -52,6 +52,26 @@
     font-size:15px; white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.6}
   .turns li.you{align-self:flex-end; background:#1c4f66; color:var(--base2)}
   .turns li.scout{align-self:flex-start; background:var(--base02); color:var(--base1)}
+  /* The trace under an answer: an admin's table, kept to the palette and
+     to the bubble's width. Capped like the status box, for the same
+     reason — a flight run has dozens of rows. */
+  .turns li .trace-btn{display:block; margin-top:6px; font-size:12px; color:var(--base01);
+    background:none; border:0; padding:0; cursor:pointer; text-decoration:underline dotted}
+  .trace{margin-top:8px; font-size:12.5px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    color:var(--base1); background:var(--panel); border-radius:8px; padding:8px 10px;
+    max-height:40dvh; overflow:auto}
+  .trace .head{color:var(--base01); margin-bottom:6px}
+  .trace .row{display:flex; gap:8px; align-items:baseline; padding:2px 0; cursor:pointer}
+  .trace .row.nested{padding-left:18px}
+  .trace .row.event{cursor:default; color:var(--base01)}
+  .trace .row .label{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .trace .row .dur{flex:none; color:var(--base01)}
+  .trace .chip{flex:none; font-size:11px; padding:0 6px; border-radius:8px; background:#0d4a5a}
+  /* `#ff6e67` rather than `--red`, for the reason `.when.expiring` gives:
+     the palette's red fails at this size on a dark ground. */
+  .trace .chip.failed,.trace .row.event.failed{color:#ff6e67}
+  .trace .chip.running{color:var(--cyan)}
+  .trace pre{margin:4px 0 8px 18px; white-space:pre-wrap; word-break:break-word; color:var(--base1)}
   /* The narration the model writes between tool calls, and it can run to
      several thousand words. With `flex:none` and no ceiling it took the
      whole column: the transcript collapsed to nothing and the answer was

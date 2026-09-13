@@ -416,7 +416,8 @@ async fn send_message(
 
 /// `Some(Some(true))` for `/debug on`, `Some(Some(false))` for `/debug
 /// off`, `Some(None)` for bare `/debug`, `None` for anything else — a
-/// message that merely starts with the word is a message.
+/// message that merely starts with the word is a message. Case-sensitive
+/// on purpose, like Telegram's slash commands: `/Debug` in prose is prose.
 fn debug_command(text: &str) -> Option<Option<bool>> {
     let mut words = text.split_whitespace();
     if words.next()? != "/debug" {
@@ -1304,7 +1305,7 @@ mod tests {
     }
 
     /// The session cookie and CSRF token a signed-in page would carry.
-    fn signed_in(_core: &scout_core::core::Core, account_id: i64) -> (String, String) {
+    fn signed_in(account_id: i64) -> (String, String) {
         (
             crate::session::mint(TEST_KEY, account_id, DAY),
             crate::session::csrf_for(TEST_KEY, account_id),
@@ -1341,7 +1342,7 @@ mod tests {
         // `Config::for_test` makes telegram 111 the admin; 777 is a member.
         let (app, core, _dir) = test_app_with_a_round().await;
         let member = admitted(&core, "777").await;
-        let (session, csrf) = signed_in(&core, member);
+        let (session, csrf) = signed_in(member);
         let thread = new_thread_for(&core, member).await;
 
         let body = chat_body(&app, &session, &csrf, thread, "/debug on").await;
@@ -1350,7 +1351,7 @@ mod tests {
         assert_eq!(core.requests_today(member).await.unwrap(), 0, "a refused switch is not a request");
 
         let admin = admitted(&core, "111").await;
-        let (session, csrf) = signed_in(&core, admin);
+        let (session, csrf) = signed_in(admin);
         let thread = new_thread_for(&core, admin).await;
         let body = chat_body(&app, &session, &csrf, thread, "/debug on").await;
         assert!(body.contains("Debug is on"), "{body}");
@@ -1382,7 +1383,7 @@ mod tests {
         };
         let run_id = scout_core::debug::seed_run_for_tests(&core, owner, vec![row]).await.unwrap();
 
-        let (session, _) = signed_in(&core, owner);
+        let (session, _) = signed_in(owner);
         let res = get_with_cookie(&app, &format!("/chat/runs/{run_id}/trace"), &session).await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN, "debug is off");
 
@@ -1394,7 +1395,7 @@ mod tests {
         assert_eq!(body["rows"][0]["tool"], "search_web");
         assert_eq!(body["rows"][0]["result"], r#"{"hits":1}"#);
 
-        let (session, _) = signed_in(&core, stranger);
+        let (session, _) = signed_in(stranger);
         scout_core::debug::set(&core, stranger, true).await.unwrap();
         let res = get_with_cookie(&app, &format!("/chat/runs/{run_id}/trace"), &session).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "someone else's run does not exist for them");
@@ -2099,6 +2100,16 @@ mod tests {
         let end = js[start..].find('}').expect("the arm must end") + start;
         let body = &js[start..end];
         assert!(body.contains("retract()"), "a refused send leaves its bubble on the screen");
+    }
+
+    #[test]
+    fn the_page_never_inserts_trace_text_as_html() {
+        // A trace carries tool arguments and results verbatim — a shop's
+        // page title, a provider's error body — and none of it is markup.
+        let js = include_str!("../chat.js");
+        let start = js.find("function renderTracePanel").expect("the panel renderer must exist");
+        let end = js[start..].find("\n  }\n").map(|i| start + i).unwrap_or(js.len());
+        assert!(!js[start..end].contains("innerHTML"), "trace content must go through textContent");
     }
 
     #[test]

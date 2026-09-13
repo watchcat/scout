@@ -209,6 +209,15 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - **Findable.** The site serves a robots.txt and a sitemap, the landing
   page carries a description and Open Graph tags, and `www.` is redirected
   to the apex, so a search engine sees one site and a pasted link unfurls
+- **A trace behind every answer.** An admin types `/debug on` and each
+  Scout reply gets a Trace button: every tool the run called, with its
+  arguments, how long it took, whether it failed and what it returned, the
+  flight desk's nested calls indented under it, and the run's own events —
+  a cut-short run, a stripped dead link. Rows stream in while the run is
+  going, and a run that failed keeps its trace. Traces are recorded for
+  every run, so a bad answer from yesterday can be opened today; the newest
+  300 runs are kept. `/debug` is a web command; on Telegram the word reaches
+  the model
 
 **Lets people in without a redeploy**
 - **Invite rounds.** `/invite new autumn 100` opens a named round and hands
@@ -409,7 +418,7 @@ trip builder, a hotel agent and an experience agent will be added.
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **781 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **910 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,

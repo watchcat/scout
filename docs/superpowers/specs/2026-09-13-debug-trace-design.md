@@ -194,8 +194,14 @@ they run out, the tool's final error is the row's `detail`.
   rows are indented. An event row spans the width and is marked as an error
   when it is one. Clicking a tool row expands it: arguments and result
   pretty-printed as JSON, or the error text; a truncated result says so.
+- **A failed run keeps its trace.** A run that ends in an error writes no
+  turn to history and, with debug off, the page removes its bubble. With
+  debug on and rows collected, the bubble stays with "(no answer)" in it,
+  the panel stays, and the Trace button is attached, because a failed run
+  is the one an admin most wants to open.
 - **Live.** While a run streams with debug on, the panel opens under the
-  answer in progress. A `Started` frame adds a row with a running timer, a
+  answer in progress. Redrawing keeps the reader's scroll position and any
+  row they expanded. A `Started` frame adds a row with a running timer, a
   `Finished` frame fills it in, an `Event` frame adds a line. When the
   stream ends the panel stays and the button takes the run id from the end
   frame, so a click re-fetches the saved trace with results.

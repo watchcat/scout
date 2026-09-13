@@ -152,7 +152,7 @@ pub(crate) fn save_history(store: &crate::store::Store, conversation_id: i64, hi
 /// window and does not have to agree with it: the window is cut on the way
 /// out, by `load_history`.
 pub(crate) fn append_history(store: &crate::store::Store, conversation_id: i64, messages: &[LlmMessage]) -> anyhow::Result<()> {
-    store.append_messages(conversation_id, &bodies_of(messages)?)
+    store.append_messages(conversation_id, None, &bodies_of(messages)?)
 }
 
 fn bodies_of(messages: &[LlmMessage]) -> anyhow::Result<Vec<String>> {
@@ -174,7 +174,7 @@ fn bodies_of(messages: &[LlmMessage]) -> anyhow::Result<Vec<String>> {
 pub(crate) fn load_history_raw(store: &crate::store::Store, conversation_id: i64, cap: usize) -> anyhow::Result<Vec<LlmMessage>> {
     let bodies = store.conversation_messages(conversation_id, cap)?;
     let mut out = Vec::with_capacity(bodies.len());
-    for body in bodies {
+    for (_run_id, body) in bodies {
         match serde_json::from_str::<LlmMessage>(&body) {
             Ok(m) => out.push(m),
             Err(e) => tracing::warn!(error = %e, "dropping an unreadable stored message"),

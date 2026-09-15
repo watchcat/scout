@@ -5,7 +5,7 @@
 //! outlives the conversation that made it, so a trip holds the itinerary —
 //! airports, dates, flight numbers — and finalisation re-prices it.
 
-use crate::store::{ExpectedSegment, NewCandidate, Store, Trip, TripCandidate, TripSegment};
+use crate::store::{ExpectedItem, NewCandidate, Store, Trip, TripCandidate, TripItem};
 use crate::tools::budget::FlightBudget;
 use crate::tools::duffel::{
     dominant_currency, merged_search, DuffelClient, Flight, FlightQuery, MultiCityQuery, Slice, Source,
@@ -28,15 +28,15 @@ const TIGHT_TURNAROUND_MINUTES: i64 = 180;
 /// Both of these are legitimate trips, so they are notes rather than
 /// errors. Silence would be the actual failure: an itinerary that reads as
 /// continuous when it is not is one somebody plans around.
-pub fn itinerary_notes(segments: &[TripSegment]) -> Vec<String> {
+pub fn itinerary_notes(segments: &[TripItem]) -> Vec<String> {
     let mut notes = Vec::new();
     for pair in segments.windows(2) {
         let (before, after) = (&pair[0], &pair[1]);
-        if before.destination != after.origin {
+        if before.destination.as_deref().unwrap_or("") != after.origin.as_deref().unwrap_or("") {
             notes.push(format!(
                 "segment {} arrives at {} and segment {} leaves from {} — getting between \
                  them is not part of this trip",
-                before.position, before.destination, after.position, after.origin
+                before.position, before.destination.as_deref().unwrap_or(""), after.position, after.origin.as_deref().unwrap_or("")
             ));
             // Two clocks in two places. This codebase does not subtract
             // those, so the gap note is all there is to say.
@@ -58,7 +58,7 @@ pub fn itinerary_notes(segments: &[TripSegment]) -> Vec<String> {
                     "only {}h {:02}m at {} between segment {} landing and segment {} leaving",
                     minutes / 60,
                     minutes % 60,
-                    before.destination,
+                    before.destination.as_deref().unwrap_or(""),
                     before.position,
                     after.position
                 ));
@@ -74,7 +74,7 @@ pub fn itinerary_notes(segments: &[TripSegment]) -> Vec<String> {
 /// Same airport is what makes this legitimate: both timestamps are local to
 /// that one place, so unlike the two ends of a leg they really are
 /// comparable. See `Connection`, which relies on the same fact.
-fn turnaround_minutes(before: &TripSegment, after: &TripSegment) -> Option<i64> {
+fn turnaround_minutes(before: &TripItem, after: &TripItem) -> Option<i64> {
     let parse = |s: &String| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok();
     let landed = parse(taken(before)?.arriving_at_local.as_ref()?)?;
     let leaves = parse(taken(after)?.departing_at_local.as_ref()?)?;
@@ -84,7 +84,7 @@ fn turnaround_minutes(before: &TripSegment, after: &TripSegment) -> Option<i64> 
 /// The option a segment is going with: the chosen one, or the only one
 /// there is. Matches what `ready_to_price` will accept, so the warning and
 /// the pricing never disagree about which flight is meant.
-fn taken(segment: &TripSegment) -> Option<&TripCandidate> {
+fn taken(segment: &TripItem) -> Option<&TripCandidate> {
     segment
         .candidates
         .iter()
@@ -103,18 +103,18 @@ fn taken(segment: &TripSegment) -> Option<&TripCandidate> {
 /// dates. That is enforced at the tool boundary before a segment is ever
 /// stored, not here, so a caller that bypasses it gets a wrong answer
 /// instead of an error.
-pub fn dates_run_forwards(segments: &[TripSegment]) -> Result<(), String> {
+pub fn dates_run_forwards(segments: &[TripItem]) -> Result<(), String> {
     for pair in segments.windows(2) {
         // ISO dates compare correctly as text, which is the one place that
         // is true of them.
-        if pair[1].departure_date.trim() < pair[0].departure_date.trim() {
+        if pair[1].date.trim() < pair[0].date.trim() {
             return Err(format!(
                 "segment {} leaves on {} but segment {} leaves on {}, which is earlier — \
                  fix the dates or the order before pricing this",
                 pair[0].position,
-                pair[0].departure_date,
+                pair[0].date,
                 pair[1].position,
-                pair[1].departure_date
+                pair[1].date
             ));
         }
     }
@@ -154,10 +154,10 @@ pub struct TripView {
 impl TripView {
     fn of(trip: Trip) -> Self {
         // Exactly what finalisation checks, in the order it checks it.
-        let not_ready = ready_to_price(&trip.segments)
+        let not_ready = ready_to_price(&trip.items)
             .err()
-            .or_else(|| dates_run_forwards(&trip.segments).err());
-        let notes = itinerary_notes(&trip.segments);
+            .or_else(|| dates_run_forwards(&trip.items).err());
+        let notes = itinerary_notes(&trip.items);
         Self { trip, not_ready, changed: None, notes }
     }
 
@@ -460,7 +460,7 @@ pub fn comparison_notes(
 /// A segment holding exactly one undecided option needs no decision: it is
 /// the pick by elimination. Two or more without one is a question, so the
 /// refusal lists them and asks it.
-pub fn ready_to_price(segments: &[TripSegment]) -> Result<Vec<(&TripSegment, &TripCandidate)>, String> {
+pub fn ready_to_price(segments: &[TripItem]) -> Result<Vec<(&TripItem, &TripCandidate)>, String> {
     if segments.is_empty() {
         return Err("this trip has no segments yet, so there is nothing to price".to_string());
     }
@@ -473,7 +473,7 @@ pub fn ready_to_price(segments: &[TripSegment]) -> Result<Vec<(&TripSegment, &Tr
                     return Err(format!(
                         "segment {} ({}→{} on {}) has no flight on it yet — search that route \
                          and add one before pricing the trip",
-                        segment.position, segment.origin, segment.destination, segment.departure_date
+                        segment.position, segment.origin.as_deref().unwrap_or(""), segment.destination.as_deref().unwrap_or(""), segment.date
                     ))
                 }
                 [only] => only,
@@ -484,8 +484,8 @@ pub fn ready_to_price(segments: &[TripSegment]) -> Result<Vec<(&TripSegment, &Tr
                         "segment {} ({}→{}) still has {} options and none chosen: {}. \
                          Ask which one before pricing the trip.",
                         segment.position,
-                        segment.origin,
-                        segment.destination,
+                        segment.origin.as_deref().unwrap_or(""),
+                        segment.destination.as_deref().unwrap_or(""),
                         many.len(),
                         options.join(", ")
                     ));
@@ -583,9 +583,9 @@ impl Tool for FinaliseTripTool {
 
         // Everything that can refuse, refuses before a single paid search: a
         // trip that cannot be priced must cost nothing to discover.
-        let ready = ready_to_price(&trip.segments).map_err(StoreToolError)?;
-        dates_run_forwards(&trip.segments).map_err(StoreToolError)?;
-        self.budget.grant_trip(trip.segments.len());
+        let ready = ready_to_price(&trip.items).map_err(StoreToolError)?;
+        dates_run_forwards(&trip.items).map_err(StoreToolError)?;
+        self.budget.grant_trip(trip.items.len());
 
         let adults = u32::try_from(trip.adults).unwrap_or(1).max(1);
         let cabin = trip.cabin_class.clone();
@@ -595,14 +595,14 @@ impl Tool for FinaliseTripTool {
         // reason.
         let per_segment = futures::future::join_all(ready.iter().map(|(segment, chosen)| {
             // Owned, not borrowed: these outlive `trip` inside the async
-            // block below, and `TripSegment`/`TripCandidate` are cheap to
+            // block below, and `TripItem`/`TripCandidate` are cheap to
             // clone next to a network round trip.
             let segment = (*segment).clone();
             let chosen = (*chosen).clone();
             let day = FlightQuery {
-                origin: segment.origin.clone(),
-                destination: segment.destination.clone(),
-                departure_date: segment.departure_date.clone(),
+                origin: segment.origin.clone().unwrap_or_default(),
+                destination: segment.destination.clone().unwrap_or_default(),
+                departure_date: segment.date.clone(),
                 return_date: None,
                 adults: Some(adults),
                 cabin_class: cabin.clone(),
@@ -630,14 +630,14 @@ impl Tool for FinaliseTripTool {
             let duffel = self.duffel.as_ref()?;
             // A single slice is an ordinary search, not a comparison — and
             // the budget was only ever granted for a real multi-city request.
-            if trip.segments.len() < 2 || !self.budget.claim_one() {
+            if trip.items.len() < 2 || !self.budget.claim_one() {
                 return None;
             }
             let query = MultiCityQuery {
                 slices: trip
-                    .segments
+                    .items
                     .iter()
-                    .map(|s| Slice::new(&s.origin, &s.destination, &s.departure_date))
+                    .map(|s| Slice::new(s.origin.as_deref().unwrap_or(""), s.destination.as_deref().unwrap_or(""), &s.date))
                     .collect(),
                 adults,
                 cabin_class: cabin.clone(),
@@ -670,10 +670,10 @@ impl Tool for FinaliseTripTool {
                     "segment {} ({}→{}): {} is not sold on {} any more, so this trip has no \
                      current total. Search that route again and pick a replacement.",
                     segment.position,
-                    segment.origin,
-                    segment.destination,
+                    segment.origin.as_deref().unwrap_or(""),
+                    segment.destination.as_deref().unwrap_or(""),
                     chosen.flight_numbers,
-                    segment.departure_date
+                    segment.date
                 ));
             }
             // Runners-up come free with the same search: a decision made a
@@ -691,8 +691,8 @@ impl Tool for FinaliseTripTool {
             };
             segments.push(PricedSegment {
                 position: segment.position,
-                route: format!("{}→{}", segment.origin, segment.destination),
-                departure_date: segment.departure_date.clone(),
+                route: format!("{}→{}", segment.origin.as_deref().unwrap_or(""), segment.destination.as_deref().unwrap_or("")),
+                departure_date: segment.date.clone(),
                 chosen: priced,
                 also_considered,
                 booking,
@@ -843,7 +843,7 @@ impl Tool for AddTripSegmentTool {
                 Some(conversation_id),
             )?;
             store
-                .add_segment(trip.id, args.position, &origin, &destination, &date)
+                .add_flight(trip.id, &origin, &destination, &date)
                 .map_err(lost_trip_race)
         })
         .await
@@ -1034,10 +1034,11 @@ impl Tool for AddTripOptionTool {
         let decided = args.decided.unwrap_or(true);
         let trip = tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
             let trip = find_trip_or_list(&store, account_id, &trip_name)?;
-            let expected = ExpectedSegment {
-                origin: &leg_origin,
-                destination: &leg_destination,
-                departure_date: leg_date.as_deref(),
+            let expected = ExpectedItem {
+                origin: Some(&leg_origin),
+                destination: Some(&leg_destination),
+                title: None,
+                date: leg_date.as_deref(),
             };
             store.add_candidate(trip.id, position, expected, candidate, decided).map_err(lost_trip_race)
         })
@@ -1046,7 +1047,7 @@ impl Tool for AddTripOptionTool {
         .map_err(internal)?;
 
         let parked = trip
-            .segments
+            .items
             .iter()
             .find(|s| s.position == position)
             .and_then(|s| s.candidates.last().map(|c| (s, c)))
@@ -1057,8 +1058,8 @@ impl Tool for AddTripOptionTool {
                         "option {} on segment {} ({}→{}): {} {}{}",
                         c.candidate,
                         s.position,
-                        s.origin,
-                        s.destination,
+                        s.origin.as_deref().unwrap_or(""),
+                        s.destination.as_deref().unwrap_or(""),
                         c.airline,
                         c.flight_numbers,
                         match c.chosen {
@@ -1076,10 +1077,10 @@ impl Tool for AddTripOptionTool {
             // that failure mode with extra steps.
             let segment_date = view
                 .trip
-                .segments
+                .items
                 .iter()
                 .find(|s| s.position == position)
-                .map(|s| s.departure_date.as_str())
+                .map(|s| s.date.as_str())
                 .unwrap_or("?");
             view.notes.push(format!(
                 "the flight just added to segment {position} stated no departure time, so its \
@@ -1280,7 +1281,7 @@ impl Tool for UpdateTripSegmentTool {
         tokio::task::spawn_blocking(move || -> anyhow::Result<(Trip, usize, bool)> {
             let trip = find_trip_or_list(&store, account_id, &args.trip)?;
             store
-                .update_segment(
+                .update_flight(
                     trip.id,
                     args.position,
                     origin.as_deref(),
@@ -1292,13 +1293,13 @@ impl Tool for UpdateTripSegmentTool {
         .await
         .map_err(internal)?
         .map(|(trip, dropped, changed)| {
-            let at = trip.segments.iter().find(|s| s.position == args.position);
+            let at = trip.items.iter().find(|s| s.position == args.position);
             let now = at.map_or_else(
                 || format!("segment {}", args.position),
                 |s| {
                     format!(
                         "segment {} is {}→{} on {}",
-                        s.position, s.origin, s.destination, s.departure_date
+                        s.position, s.origin.as_deref().unwrap_or(""), s.destination.as_deref().unwrap_or(""), s.date
                     )
                 },
             );
@@ -1359,7 +1360,7 @@ impl Tool for DropTripSegmentTool {
             let trip = find_trip_or_list(&store, account_id, &args.trip)?;
             match args.candidate {
                 Some(candidate) => store.drop_candidate(trip.id, args.position, candidate),
-                None => store.drop_segment(trip.id, args.position),
+                None => store.drop_item(trip.id, args.position),
             }
         })
         .await
@@ -1498,7 +1499,7 @@ impl Tool for KeepTripTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Store, TripCandidate, TripSegment};
+    use crate::store::{Store, TripCandidate, TripItem};
     use crate::tools::duffel::{Flight, Leg, PriceStatus, Source};
     use crate::tools::shown::ShownFlights;
     use rig::tool::Tool;
@@ -1533,9 +1534,9 @@ mod tests {
             .unwrap();
         assert_eq!(trip.trip.name, "September");
         assert_eq!(trip.trip.adults, 2);
-        assert_eq!(trip.trip.segments.len(), 1);
-        assert_eq!(trip.trip.segments[0].origin, "AMS", "codes are normalised on the way in");
-        assert_eq!(trip.trip.segments[0].destination, "LIS");
+        assert_eq!(trip.trip.items.len(), 1);
+        assert_eq!(trip.trip.items[0].origin.as_deref(), Some("AMS"), "codes are normalised on the way in");
+        assert_eq!(trip.trip.items[0].destination.as_deref(), Some("LIS"));
     }
 
     #[tokio::test]
@@ -1600,7 +1601,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            trip.trip.segments[0].departure_date, "2026-09-03",
+            trip.trip.items[0].date, "2026-09-03",
             "unpadded input must be normalised, not stored as typed"
         );
     }
@@ -1619,12 +1620,24 @@ mod tests {
         assert_eq!(other.to_string(), "origin and destination are both AMS");
     }
 
-    fn segment(position: i64, origin: &str, destination: &str, date: &str) -> TripSegment {
-        TripSegment {
+    fn segment(position: i64, origin: &str, destination: &str, date: &str) -> TripItem {
+        TripItem {
+            id: position,
             position,
-            origin: origin.to_string(),
-            destination: destination.to_string(),
-            departure_date: date.to_string(),
+            kind: "flight".to_string(),
+            title: format!("{origin} → {destination}"),
+            place: None,
+            origin: Some(origin.to_string()),
+            destination: Some(destination.to_string()),
+            date: date.to_string(),
+            starts_at: None,
+            ends_at: None,
+            booked: false,
+            confirmation_code: None,
+            price: None,
+            currency: None,
+            notes: None,
+            arrival_id: None,
             candidates: Vec::new(),
         }
     }
@@ -1828,16 +1841,16 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(view.trip.segments[0].candidates.len(), 3, "the same flight may be parked twice");
-        assert_eq!(view.trip.segments[0].candidates[1].flight_numbers, "CX270,CX500");
-        assert!(view.trip.segments[0].candidates.iter().all(|c| !c.chosen));
+        assert_eq!(view.trip.items[0].candidates.len(), 3, "the same flight may be parked twice");
+        assert_eq!(view.trip.items[0].candidates[1].flight_numbers, "CX270,CX500");
+        assert!(view.trip.items[0].candidates.iter().all(|c| !c.chosen));
 
         let choose = ChooseTripOptionTool { store: store.clone(), account_id: 7 };
         let view = choose
             .call(ChooseOptionArgs { trip: "Japan".into(), position: 1, candidate: 2 })
             .await
             .unwrap();
-        assert!(view.trip.segments[0].candidates[1].chosen);
+        assert!(view.trip.items[0].candidates[1].chosen);
     }
 
     #[tokio::test]
@@ -1872,7 +1885,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("was not shown"), "got: {err}");
-        assert!(store.find_trip(7, "Japan").unwrap().unwrap().segments[0].candidates.is_empty());
+        assert!(store.find_trip(7, "Japan").unwrap().unwrap().items[0].candidates.is_empty());
     }
 
     #[tokio::test]
@@ -2019,7 +2032,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            view.trip.segments[0].candidates.len(),
+            view.trip.items[0].candidates.len(),
             1,
             "must not be refused for a date check that cannot run"
         );
@@ -2216,10 +2229,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(view.trip.segments.len(), 2, "the trip is edited, not rebuilt");
-        assert_eq!(view.trip.segments[0].departure_date, "2026-09-15", "leg 1 is untouched");
-        assert_eq!(view.trip.segments[1].departure_date, "2026-09-26");
-        assert!(view.trip.segments[1].candidates.is_empty());
+        assert_eq!(view.trip.items.len(), 2, "the trip is edited, not rebuilt");
+        assert_eq!(view.trip.items[0].date, "2026-09-15", "leg 1 is untouched");
+        assert_eq!(view.trip.items[1].date, "2026-09-26");
+        assert!(view.trip.items[1].candidates.is_empty());
         assert!(
             view.notes.iter().any(|n| n.contains("dropped")),
             "a shortlist must not empty silently: {:?}",
@@ -2354,14 +2367,14 @@ mod tests {
             .call(DropSegmentArgs { trip: "Japan".into(), position: 1, candidate: Some(1) })
             .await
             .unwrap();
-        assert_eq!(view.trip.segments.len(), 1, "the segment survives losing its option");
-        assert!(view.trip.segments[0].candidates.is_empty());
+        assert_eq!(view.trip.items.len(), 1, "the segment survives losing its option");
+        assert!(view.trip.items[0].candidates.is_empty());
 
         let view = drop
             .call(DropSegmentArgs { trip: "Japan".into(), position: 1, candidate: None })
             .await
             .unwrap();
-        assert!(view.trip.segments.is_empty());
+        assert!(view.trip.items.is_empty());
     }
 
     #[tokio::test]
@@ -2732,15 +2745,7 @@ mod tests {
 
     #[test]
     fn a_trip_that_cannot_be_priced_is_refused_before_anything_is_bought() {
-        use crate::store::TripSegment as Seg;
-
-        let empty = vec![Seg {
-            position: 1,
-            origin: "AMS".into(),
-            destination: "NRT".into(),
-            departure_date: "2026-09-03".into(),
-            candidates: vec![],
-        }];
+        let empty = vec![segment(1, "AMS", "NRT", "2026-09-03")];
         let problem = ready_to_price(&empty).unwrap_err();
         assert!(problem.contains("segment 1"), "got: {problem}");
         assert!(problem.contains("no flight"), "got: {problem}");
@@ -2958,7 +2963,7 @@ mod tests {
         let trip = store.find_trip(7, "Japan").unwrap().unwrap();
         assert_eq!(trip.status, "finalised");
         assert_eq!(
-            trip.segments[0].candidates[0].quoted_price,
+            trip.items[0].candidates[0].quoted_price,
             Some(940.0),
             "quoted_price is never overwritten by a re-price"
         );
@@ -3199,11 +3204,11 @@ mod tests {
 
         let trip = store.find_trip(7, "Japan").unwrap().unwrap();
         assert_eq!(
-            trip.segments[0].candidates[0].quoted_price,
+            trip.items[0].candidates[0].quoted_price,
             Some(940.0),
             "two finalisations in a row must not move the parked price at all"
         );
-        assert_eq!(trip.segments[0].candidates[0].quoted_currency.as_deref(), Some("EUR"));
+        assert_eq!(trip.items[0].candidates[0].quoted_currency.as_deref(), Some("EUR"));
     }
 
     #[tokio::test]

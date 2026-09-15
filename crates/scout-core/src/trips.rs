@@ -5,8 +5,8 @@
 //! handle live offers: those remain flight-agent responsibilities.
 
 use crate::core::{blocking, Core};
-use crate::store::{CandidateChoice, ExpectedSegment, NewCandidate, TripChat};
-pub use crate::store::{Trip, TripCandidate, TripSegment};
+use crate::store::{CandidateChoice, ExpectedItem, NewCandidate, TripChat};
+pub use crate::store::{Trip, TripCandidate, TripItem};
 
 /// A trip plus the same readiness and connection warnings the flight agent
 /// sees. One representation keeps chat and the visual client from disagreeing
@@ -24,10 +24,10 @@ pub struct Plan {
 
 impl Plan {
     fn from_trip(trip: Trip, chat: Option<TripChat>) -> Self {
-        let not_ready = crate::tools::trips::ready_to_price(&trip.segments)
+        let not_ready = crate::tools::trips::ready_to_price(&trip.items)
             .err()
-            .or_else(|| crate::tools::trips::dates_run_forwards(&trip.segments).err());
-        let notes = crate::tools::trips::itinerary_notes(&trip.segments);
+            .or_else(|| crate::tools::trips::dates_run_forwards(&trip.items).err());
+        let notes = crate::tools::trips::itinerary_notes(&trip.items);
         Self {
             trip,
             not_ready,
@@ -220,7 +220,7 @@ pub async fn add_leg(
     core: &Core,
     account_id: i64,
     trip_name: &str,
-    position: Option<i64>,
+    _position: Option<i64>,
     origin: &str,
     destination: &str,
     departure_date: &str,
@@ -248,7 +248,7 @@ pub async fn add_leg(
         // rather than an apology. `add_segment_checked` reports it as a
         // value; nothing here reads the text of an error to find out.
         let Some(trip) =
-            store.add_segment_checked(trip.id, position, &origin, &destination, &date)?
+            store.add_flight_checked(trip.id, &origin, &destination, &date)?
         else {
             return Ok(LegEdit::SegmentChanged);
         };
@@ -297,15 +297,16 @@ pub async fn remove_leg(
         let Some(trip) = store.find_trip(account_id, &trip_name)? else {
             return Ok(LegEdit::TripNotFound);
         };
-        let expected = ExpectedSegment {
-            origin: &origin,
-            destination: &destination,
-            departure_date: date.as_deref(),
+        let expected = ExpectedItem {
+            origin: Some(&origin),
+            destination: Some(&destination),
+            title: None,
+            date: date.as_deref(),
         };
         // The trip this read against may already be stale by the time the
         // store takes its lock — which is exactly why the expectation is
         // passed down and checked there rather than compared here.
-        if !store.remove_segment_checked(trip.id, position, expected)? {
+        if !store.remove_item_checked(trip.id, position, expected)? {
             return Ok(LegEdit::SegmentChanged);
         }
         // Re-read for what to draw. A trip that has gone in the meantime is
@@ -329,14 +330,15 @@ pub async fn seed_trip_for_tests(core: &Core, account_id: i64, name: &str) -> an
     let name = name.to_string();
     blocking(move || {
         let trip = store.upsert_trip(account_id, &name, Some(2), Some("economy"), None)?;
-        let trip = store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12")?;
+        let trip = store.add_flight(trip.id, "AMS", "LIS", "2026-10-12")?;
         let trip = store.add_candidate(
             trip.id,
             1,
-            ExpectedSegment {
-                origin: "AMS",
-                destination: "LIS",
-                departure_date: Some("2026-10-12"),
+            ExpectedItem {
+                origin: Some("AMS"),
+                destination: Some("LIS"),
+                title: None,
+                date: Some("2026-10-12"),
             },
             NewCandidate {
                 airline: "KLM".to_string(),
@@ -354,10 +356,11 @@ pub async fn seed_trip_for_tests(core: &Core, account_id: i64, name: &str) -> an
         let trip = store.add_candidate(
             trip.id,
             1,
-            ExpectedSegment {
-                origin: "AMS",
-                destination: "LIS",
-                departure_date: Some("2026-10-12"),
+            ExpectedItem {
+                origin: Some("AMS"),
+                destination: Some("LIS"),
+                title: None,
+                date: Some("2026-10-12"),
             },
             NewCandidate {
                 airline: "TAP Air Portugal".to_string(),
@@ -419,7 +422,7 @@ mod tests {
         else {
             panic!("a stored option was not chosen");
         };
-        assert!(after.trip.segments[0].candidates[1].chosen);
+        assert!(after.trip.items[0].candidates[1].chosen);
         assert!(after.not_ready.is_none());
     }
 
@@ -465,7 +468,7 @@ mod tests {
 
         let plan = find(&core, account_id, "october").await.unwrap().unwrap();
         assert!(!plan.trip.kept, "the trip a flight search builds is a draft");
-        assert_eq!(plan.trip.segments.len(), 1);
+        assert_eq!(plan.trip.items.len(), 1);
         assert_eq!(
             find(&core, account_id, "a trip nobody made").await.unwrap(),
             None,
@@ -530,9 +533,9 @@ mod tests {
         assert_eq!(
             theirs[0]
                 .trip
-                .segments
+                .items
                 .iter()
-                .map(|s| s.destination.as_str())
+                .map(|s| s.destination.as_deref().unwrap_or(""))
                 .collect::<Vec<_>>(),
             vec!["FCO"],
             "the stranger's own trip is the one both edits landed on",
@@ -543,9 +546,9 @@ mod tests {
         assert_eq!(
             owned[0]
                 .trip
-                .segments
+                .items
                 .iter()
-                .map(|s| s.destination.as_str())
+                .map(|s| s.destination.as_deref().unwrap_or(""))
                 .collect::<Vec<_>>(),
             vec!["LIS"],
             "neither edit reached the other account's trip",
@@ -605,9 +608,9 @@ mod tests {
 
         let owned = list(&core, owner).await.unwrap();
         assert_eq!(owned.len(), 1, "the owner's trip of the same name is untouched");
-        assert_eq!(owned[0].trip.segments.len(), 1);
+        assert_eq!(owned[0].trip.items.len(), 1);
         assert_eq!(
-            owned[0].trip.segments[0].candidates.len(),
+            owned[0].trip.items[0].candidates.len(),
             2,
             "and so are the options parked on it",
         );
@@ -656,12 +659,12 @@ mod tests {
 
         let owned = list(&core, owner).await.unwrap();
         assert_eq!(
-            owned[0].trip.segments.len(),
+            owned[0].trip.items.len(),
             1,
             "the owner's plan is untouched"
         );
         assert!(
-            !owned[0].trip.segments[0].candidates.is_empty(),
+            !owned[0].trip.items[0].candidates.is_empty(),
             "and so are its options"
         );
     }
@@ -708,9 +711,9 @@ mod tests {
         assert_eq!(
             added
                 .trip
-                .segments
+                .items
                 .iter()
-                .map(|s| (s.position, s.origin.as_str()))
+                .map(|s| (s.position, s.origin.as_deref().unwrap_or("")))
                 .collect::<Vec<_>>(),
             vec![(1, "AMS"), (2, "LIS")],
             "codes are upper-cased and the trip is found by a lower-cased name",
@@ -734,7 +737,7 @@ mod tests {
         .unwrap() else {
             panic!("a leg that matched what the caller saw was not removed");
         };
-        assert_eq!(removed.trip.segments.len(), 1);
+        assert_eq!(removed.trip.items.len(), 1);
         assert_eq!(removed.chat.map(|c| c.id), Some(conversation_id));
     }
 
@@ -791,9 +794,9 @@ mod tests {
         );
 
         let plans = list(&core, account_id).await.unwrap();
-        assert_eq!(plans[0].trip.segments.len(), 1);
+        assert_eq!(plans[0].trip.items.len(), 1);
         assert_eq!(
-            plans[0].trip.segments[0].destination, "FCO",
+            plans[0].trip.items[0].destination.as_deref(), Some("FCO"),
             "the surviving leg is untouched"
         );
     }
@@ -836,9 +839,9 @@ mod tests {
         assert_eq!(
             plans[0]
                 .trip
-                .segments
+                .items
                 .iter()
-                .map(|s| s.origin.as_str())
+                .map(|s| s.origin.as_deref().unwrap_or(""))
                 .collect::<Vec<_>>(),
             vec!["AMS", "LIS"],
             "the trip is exactly as it was",
@@ -896,17 +899,17 @@ mod tests {
         };
         assert_eq!(
             plan.trip
-                .segments
+                .items
                 .iter()
-                .map(|s| (s.position, s.origin.as_str()))
+                .map(|s| (s.position, s.origin.as_deref().unwrap_or("")))
                 .collect::<Vec<_>>(),
             vec![(1, "BCN"), (2, "AMS"), (3, "LIS")],
             "inserting at 1 shifts the rest down; nothing is overwritten",
         );
         // The parked options moved with their segment rather than staying
         // on position 1 and reattaching to a route nobody quoted them for.
-        assert!(plan.trip.segments[0].candidates.is_empty());
-        assert_eq!(plan.trip.segments[1].candidates.len(), 2);
+        assert!(plan.trip.items[0].candidates.is_empty());
+        assert_eq!(plan.trip.items[1].candidates.len(), 2);
     }
 
     #[tokio::test]
@@ -978,7 +981,7 @@ mod tests {
 
         let plans = list(&core, account_id).await.unwrap();
         assert!(
-            plans[0].trip.segments.is_empty(),
+            plans[0].trip.items.is_empty(),
             "nothing reached the store"
         );
     }

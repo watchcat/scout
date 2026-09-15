@@ -157,7 +157,7 @@ impl AuthConfig {
 /// page needs a cached admission and nothing else, and giving it a `Core`
 /// it does not use would be an invitation to query the database from the
 /// one path that exists to avoid doing that.
-fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
+fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inbound::InboundState>) -> Router {
     let session_key = auth.as_ref().map(|a| a.cfg.session_key.clone());
     // Only when we know an https address to send people to. A deployment
     // configured with an http base URL is a local one, and redirecting it
@@ -184,8 +184,9 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
     // cookie, no `Origin` and no form token, so the CSRF layer would turn
     // it away and the security headers would be sent to nobody. It has
     // its own proof of who is calling — the signature — and is mounted
-    // only when there is a secret to check it against.
-    if let Some(state) = auth.as_ref().and_then(inbound::state_from) {
+    // only when there is a secret to check it against, which is what
+    // `inbound` being `Some` means.
+    if let Some(state) = inbound {
         public = public.merge(inbound::routes(state));
     }
 
@@ -578,7 +579,8 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
     // The inbox worker runs only where the webhook does: the same secret
     // gates both, and a worker with nothing feeding it would tick every
     // minute against an empty table for the life of the process.
-    if let Some(state) = auth.as_ref().filter(|a| inbound::state_from(a).is_some()) {
+    let inbound = auth.as_ref().and_then(inbound::state_from);
+    if let Some(state) = auth.as_ref().filter(|_| inbound.is_some()) {
         let client = resend::ResendClient::new(
             inbox_worker::client(),
             state.cfg.resend_api_key.clone(),
@@ -589,7 +591,7 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
     }
 
     tracing::info!(bind, "the front door is open");
-    axum::serve(listener, router(cache, auth))
+    axum::serve(listener, router(cache, auth, inbound))
         .with_graceful_shutdown(closing_time())
         .await?;
     Ok(())
@@ -711,7 +713,16 @@ mod tests {
     pub(crate) async fn test_app_with_inbox(
         secret: &str,
     ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
-        build_app_full("https://example.com", None, crate::email::Mailer::Discard, Some(secret)).await
+        build_app_full("https://example.com", None, crate::email::Mailer::Discard, Some(secret), None).await
+    }
+
+    /// `test_app`, with the model at `model_url` instead of the closed
+    /// port, for the tests that need an answer from it — a wiremock that
+    /// plays MiniMax, never the real thing.
+    pub(crate) async fn test_app_with_model(
+        model_url: &str,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        build_app_full("https://example.com", None, crate::email::Mailer::Discard, None, Some(model_url)).await
     }
 
     /// Signs in a Telegram id against an open round and returns the
@@ -740,7 +751,7 @@ mod tests {
         return_url: Option<&str>,
         mailer: crate::email::Mailer,
     ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
-        build_app_full(base_url, return_url, mailer, None).await
+        build_app_full(base_url, return_url, mailer, None, None).await
     }
 
     /// The whole harness, every knob exposed. The named wrappers above are
@@ -751,6 +762,7 @@ mod tests {
         return_url: Option<&str>,
         mailer: crate::email::Mailer,
         webhook_secret: Option<&str>,
+        model_url: Option<&str>,
     ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("test.duckdb");
@@ -763,11 +775,11 @@ mod tests {
             "TELEGRAM_BOT_TOKEN" => Some("123456:test-bot-token".to_string()),
             "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
             "MINIMAX_API_KEY" => Some("mk".to_string()),
-            // A port nothing listens on, as `Config::for_test` does. A
-            // route that reaches the model under test fails at once with a
-            // connection error instead of putting a request with a bogus
-            // key on the wire.
-            "MINIMAX_BASE_URL" => Some("http://127.0.0.1:1".to_string()),
+            // A port nothing listens on, as `Config::for_test` does, unless
+            // the test brought a stand-in. A route that reaches the model
+            // under test fails at once with a connection error instead of
+            // putting a request with a bogus key on the wire.
+            "MINIMAX_BASE_URL" => Some(model_url.unwrap_or("http://127.0.0.1:1").to_string()),
             "KAGI_API_KEY" => Some("kk".to_string()),
             "SCOUT_DB_PATH" => Some(db.to_str().unwrap().to_string()),
             _ => None,
@@ -796,7 +808,8 @@ mod tests {
         // of that promise, and it points at a closed port.
         let mut state = crate::AuthState::new(auth, core.clone());
         state.mailer = mailer;
-        let app = crate::router(cache, Some(state));
+        let inbound = crate::inbound::state_from(&state);
+        let app = crate::router(cache, Some(state), inbound);
         (app, core, dir)
     }
 
@@ -946,7 +959,7 @@ mod tests {
         assert_eq!(other.status(), StatusCode::OK);
 
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let local = router(cache, None);
+        let local = router(cache, None, None);
         let res = get_with_headers(
             &local,
             "/healthz",
@@ -1067,7 +1080,7 @@ mod tests {
     #[tokio::test]
     async fn the_root_serves_the_page_and_an_unknown_path_does_not() {
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let app = router(cache, None);
+        let app = router(cache, None, None);
 
         let res = app.clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1198,7 +1211,7 @@ mod tests {
         // And when sign-in is not configured at all, so the whole
         // signed-in half is absent along with its header layer.
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let bare = crate::router(cache, None);
+        let bare = crate::router(cache, None, None);
         let res = bare
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1216,7 +1229,7 @@ mod tests {
         // Booting with a generated default would sign sessions that a
         // restart could not verify, and nobody would notice until someone
         // forged one.
-        let app = router(cache, None);
+        let app = router(cache, None, None);
         let res = app
             .oneshot(Request::builder().uri("/sign-in").body(Body::empty()).unwrap())
             .await.unwrap();

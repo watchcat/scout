@@ -366,6 +366,9 @@ CREATE TABLE IF NOT EXISTS inbound_mail (
     received_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
     status       TEXT NOT NULL DEFAULT 'new',
     attempts     BIGINT NOT NULL DEFAULT 0,
+    -- When the last attempt began, so a retry waits a while: the model
+    -- that refused a minute ago is the model that refuses now.
+    attempted_at TIMESTAMP,
     forwarded_at TIMESTAMP,
     error        TEXT
 );
@@ -1124,7 +1127,7 @@ CREATE TABLE IF NOT EXISTS inbound_mail (
     truncated BOOLEAN NOT NULL DEFAULT false,
     received_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     status TEXT NOT NULL DEFAULT 'new', attempts BIGINT NOT NULL DEFAULT 0,
-    forwarded_at TIMESTAMP, error TEXT
+    attempted_at TIMESTAMP, forwarded_at TIMESTAMP, error TEXT
 );
 CREATE SEQUENCE IF NOT EXISTS attachments_id_seq;
 CREATE TABLE IF NOT EXISTS attachments (
@@ -4117,6 +4120,16 @@ fn days_ago(days: i64) -> String {
     (chrono::Utc::now().naive_utc() - chrono::Duration::days(days)).to_string()
 }
 
+/// `days_ago`, in minutes, for the retry spacing on inbound mail.
+fn minutes_ago(minutes: i64) -> String {
+    (chrono::Utc::now().naive_utc() - chrono::Duration::minutes(minutes)).to_string()
+}
+
+/// How long a mail waits after a failed attempt before it is served
+/// again. A model that is down is down for a while, and three attempts
+/// spent in the same second are one attempt.
+pub const MAIL_RETRY_MINUTES: i64 = 5;
+
 /// A booking that is still waiting on its owner. Only a booking waits: a
 /// non-booking is born decided, so this is the one condition both the
 /// inbox and the sweep read as "undecided".
@@ -4204,7 +4217,8 @@ impl Store {
     }
 
     /// Mail the extractor has not finished with, oldest first so a burst
-    /// is read in the order it came.
+    /// is read in the order it came, and not one attempted in the last
+    /// `MAIL_RETRY_MINUTES`.
     pub fn mail_to_work(&self, limit: usize) -> Result<Vec<MailToWork>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -4212,9 +4226,10 @@ impl Store {
                     forwarded_at IS NOT NULL
              FROM inbound_mail
              WHERE status IN ('new', 'extracting') AND attempts < ?
+               AND (attempted_at IS NULL OR attempted_at < ?)
              ORDER BY received_at, id LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![MAIL_ATTEMPTS, limit as i64], |r| {
+        let rows = stmt.query_map(params![MAIL_ATTEMPTS, minutes_ago(MAIL_RETRY_MINUTES), limit as i64], |r| {
             Ok(MailToWork {
                 id: r.get(0)?, account_id: r.get(1)?, provider_id: r.get(2)?, from: r.get(3)?,
                 subject: r.get(4)?, text: r.get(5)?, html: r.get(6)?, attempts: r.get(7)?,
@@ -4229,9 +4244,18 @@ impl Store {
     pub fn mail_attempted(&self, id: i64) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "UPDATE inbound_mail SET attempts = attempts + 1, status = 'extracting' WHERE id = ?",
+            "UPDATE inbound_mail SET attempts = attempts + 1, status = 'extracting', attempted_at = now() WHERE id = ?",
             params![id],
         )?;
+        Ok(())
+    }
+
+    /// Backdates the last attempt by an hour, so a test can walk a mail
+    /// through its retries without waiting `MAIL_RETRY_MINUTES` between.
+    #[doc(hidden)]
+    pub fn age_attempts(&self, id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE inbound_mail SET attempted_at = ? WHERE id = ?", params![minutes_ago(60), id])?;
         Ok(())
     }
 
@@ -8176,12 +8200,26 @@ CREATE TABLE messages (
         store.mail_done(first).unwrap();
         assert_eq!(store.mail_to_work(10).unwrap().len(), 1);
         store.mail_attempted(second).unwrap();
+        store.age_attempts(second).unwrap();
         store.mail_attempted(second).unwrap();
+        store.age_attempts(second).unwrap();
         assert_eq!(store.mail_to_work(10).unwrap().len(), 1, "two attempts leave one more");
         store.mail_attempted(second).unwrap();
+        store.age_attempts(second).unwrap();
         assert!(store.mail_to_work(10).unwrap().is_empty(), "the third attempt is the last");
         store.mail_failed(second, "the model said no").unwrap();
         assert!(store.mail_to_work(10).unwrap().is_empty(), "failed mail is not retried");
+    }
+
+    #[test]
+    fn a_mail_just_attempted_waits_its_turn_and_an_aged_one_is_served() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        store.mail_attempted(m).unwrap();
+        assert!(store.mail_to_work(10).unwrap().is_empty(), "attempted a moment ago: not yet");
+        store.age_attempts(m).unwrap();
+        assert_eq!(store.mail_to_work(10).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(), vec![m]);
     }
 
     #[test]

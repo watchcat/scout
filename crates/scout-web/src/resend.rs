@@ -118,7 +118,7 @@ fn path_id(id: &str) -> anyhow::Result<&str> {
 impl ResendClient {
     /// `http` is the caller's: it should carry a timeout and a bounded
     /// redirect policy, since `download` follows a URL the attachment
-    /// list named. `email::client` is the one built for this.
+    /// list named. `inbox_worker::client` is the one built for this.
     pub fn new(http: reqwest::Client, api_key: String, base_url: String) -> Self {
         Self { http, api_key, base_url: base_url.trim_end_matches('/').to_string() }
     }
@@ -240,24 +240,31 @@ fn accepted(res: reqwest::Response, what: &str) -> anyhow::Result<reqwest::Respo
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A Resend that received `re_1` from a hotel with one PDF attached,
+    /// and accepts a send from key `k`: the four calls the worker makes.
+    /// Shared with the worker's tests, so both halves agree on the shape.
+    pub(crate) async fn resend_like(server: &MockServer) {
+        Mock::given(method("GET")).and(path("/emails/receiving/re_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"re_1","from":"hotel@example.com","to":["sasha@goodscout.fyi"],"subject":"Your booking","text":"Check-in 12 Oct","html":"<p>Check-in 12 Oct</p>","attachments":[{"id":"att_1","filename":"ticket.pdf","content_type":"application/pdf","size":3}]})))
+            .mount(server).await;
+        Mock::given(method("GET")).and(path("/emails/receiving/re_1/attachments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"object":"list","data":[{"id":"att_1","filename":"ticket.pdf","size":3,"content_type":"application/pdf","download_url":format!("{}/dl/att_1", server.uri()),"expires_at":"2026-09-15T13:00:00Z"}]})))
+            .mount(server).await;
+        Mock::given(method("GET")).and(path("/dl/att_1")).respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF".to_vec())).mount(server).await;
+        Mock::given(method("POST")).and(path("/emails")).and(header("authorization", "Bearer k"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"sent_1"}))).mount(server).await;
+    }
 
     #[tokio::test]
     async fn the_client_reads_a_received_mail_its_attachments_and_sends_a_forward() {
-        let server = wiremock::MockServer::start().await;
-        Mock::given(method("GET")).and(path("/emails/receiving/re_1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"re_1","from":"hotel@example.com","to":["sasha@goodscout.fyi"],"subject":"Your booking","text":"Check-in 12 Oct","html":"<p>Check-in 12 Oct</p>","attachments":[{"id":"att_1","filename":"ticket.pdf","content_type":"application/pdf","size":3}]})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(path("/emails/receiving/re_1/attachments"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"object":"list","data":[{"id":"att_1","filename":"ticket.pdf","size":3,"content_type":"application/pdf","download_url":format!("{}/dl/att_1", server.uri()),"expires_at":"2026-09-15T13:00:00Z"}]})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(path("/dl/att_1")).respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF".to_vec())).mount(&server).await;
-        Mock::given(method("POST")).and(path("/emails")).and(header("authorization", "Bearer k"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"sent_1"}))).mount(&server).await;
+        let server = MockServer::start().await;
+        resend_like(&server).await;
 
         let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
         let mail = client.received("re_1").await.unwrap();

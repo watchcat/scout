@@ -722,6 +722,14 @@ pub async fn seed_attachment_for_tests(
     .await
 }
 
+/// Backdates a mail's last attempt, so a test can run the worker's passes
+/// back to back where production waits `MAIL_RETRY_MINUTES` between.
+#[doc(hidden)]
+pub async fn age_attempts_for_tests(core: &Core, mail_id: i64) -> anyhow::Result<()> {
+    let store = core.store();
+    blocking(move || store.age_attempts(mail_id)).await
+}
+
 /// An `email` identity on the account, so a forward has somewhere to go.
 #[doc(hidden)]
 pub async fn seed_email_identity_for_tests(core: &Core, account_id: i64, address: &str) -> anyhow::Result<()> {

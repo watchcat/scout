@@ -4044,7 +4044,7 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
 const ARRIVAL_COLUMNS: &str =
     "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination, a.date,
      a.starts_at, a.ends_at, a.confirmation_code, a.price, a.currency, a.confidence, a.summary,
-     a.trip_id, t.name, a.status, m.received_at::TEXT
+     a.trip_id, t.name, a.status, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ')
      FROM arrivals a
      JOIN inbound_mail m ON m.id = a.mail_id
      LEFT JOIN trips t ON t.id = a.trip_id";
@@ -4338,7 +4338,7 @@ impl Store {
         // it. The reasons are ranked: unreadable mail has no arrival, and a
         // non-booking is that before it is anything else.
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.from_address, m.subject, m.received_at::TEXT, m.forwarded_at IS NOT NULL, a.id,
+            "SELECT m.id, m.from_address, m.subject, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ'), m.forwarded_at IS NOT NULL, a.id,
                     CASE WHEN m.status = 'failed' THEN 'failed'
                          WHEN NOT a.booking THEN 'not_booking'
                          ELSE 'ignored' END
@@ -8088,9 +8088,11 @@ CREATE TABLE messages (
             price: None, currency: None, travellers: None, confidence: None, summary: "x".into(), trip_id: None,
         };
         let id = store.insert_arrival(a, m, &arrival).unwrap();
+        let ticket = store.insert_attachment(m, "ticket.pdf", "application/pdf", Some(b"%PDF".to_vec()), None).unwrap();
         store.conn().execute("UPDATE inbound_mail SET received_at = received_at - INTERVAL 40 DAY WHERE id = ?", params![m]).unwrap();
         assert_eq!(store.sweep_inbox(30).unwrap(), 0, "undecided, so kept");
         assert!(store.arrival_of(id, a).unwrap().is_some());
+        assert!(store.attachment(ticket).unwrap().is_some(), "the ticket waits with its booking");
         store.set_arrival_status(id, "added", Some(5)).unwrap();
         assert_eq!(store.sweep_inbox(30).unwrap(), 1);
         assert!(store.arrival_of(id, a).unwrap().is_none());
@@ -8117,6 +8119,7 @@ CREATE TABLE messages (
         assert_eq!(reasons, vec![(spam, "not_booking"), (failed, "failed")], "newest first");
         assert_eq!(view.other[0].arrival_id, Some(id));
         assert!(view.other[0].forwarded);
+        assert!(view.other[0].received_at.contains('T') && view.other[0].received_at.ends_with('Z'), "{}", view.other[0].received_at);
         assert_eq!(view.other[0].attachments[0].size, 3);
         assert!(!view.other[1].forwarded);
         assert_eq!(view.other[1].arrival_id, None);
@@ -8137,6 +8140,9 @@ CREATE TABLE messages (
         let id = store.insert_arrival(a, m, &arrival).unwrap();
         let got = store.arrival_of(id, a).unwrap().expect("theirs");
         assert_eq!(got.trip_name.as_deref(), Some("Lisbon"));
+        // ISO UTC with the `Z`, the shape `threads_of` sends and the page
+        // parses without a date library.
+        assert!(got.received_at.contains('T') && got.received_at.ends_with('Z'), "{}", got.received_at);
         assert_eq!(got.attachments, vec![scout_api::AttachmentRef { id: att, filename: "ticket.pdf".into(), mime: "application/pdf".into(), size: 0 }]);
         assert_eq!(store.attachment_owner(att).unwrap(), Some(a));
         assert_eq!(store.attachments_of_mail(m).unwrap().len(), 1);

@@ -3132,6 +3132,9 @@ impl Store {
         date: &str,
     ) -> Result<Option<Trip>> {
         let conn = self.conn();
+        // Checked here as well as inside `add_flight_within`: this one turns
+        // "no such trip" into `None` before the write path is entered, so
+        // nothing has to read the text of an error to tell it apart.
         if !trip_exists(&conn, trip_id)? {
             return Ok(None);
         }
@@ -3144,6 +3147,11 @@ impl Store {
     pub fn add_item(&self, trip_id: i64, item: NewItem) -> Result<Trip> {
         if item.kind == "flight" {
             anyhow::bail!("flights go through add_flight");
+        }
+        // The page has a card for each of these and nothing else; an item
+        // of some other kind would be stored and never drawn.
+        if !matches!(item.kind.as_str(), "stay" | "activity" | "transport") {
+            anyhow::bail!("kind must be stay, activity or transport, not {:?}", item.kind);
         }
         let conn = self.conn();
         if !trip_exists(&conn, trip_id)? {
@@ -3274,30 +3282,45 @@ impl Store {
             "SELECT id, origin, destination, title, date FROM trip_items
              WHERE trip_id = ? AND position = ?",
         )?;
-        let item: Option<(i64, Option<String>, Option<String>, String, String)> = stmt
+        /// What the row says the item is, for comparing with what the
+        /// caller saw.
+        struct Seen {
+            id: i64,
+            origin: Option<String>,
+            destination: Option<String>,
+            title: String,
+            date: String,
+        }
+        let item: Option<Seen> = stmt
             .query_map(params![trip_id, position], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok(Seen {
+                    id: r.get(0)?,
+                    origin: r.get(1)?,
+                    destination: r.get(2)?,
+                    title: r.get(3)?,
+                    date: r.get(4)?,
+                })
             })?
             .next()
             .transpose()?;
         drop(stmt);
-        let Some((item_id, origin, destination, title, date)) = item else {
+        let Some(item) = item else {
             return Ok(false);
         };
         // `None` is "nothing to verify", not "verified" — the same reading
         // `add_candidate` gives these fields, so a caller that has only a
         // route to go on is not quietly granted a free pass on the date.
         let seen = |expected: Option<&str>, actual: Option<&str>| {
-            expected.map_or(true, |e| actual == Some(e))
+            expected.is_none_or(|e| actual == Some(e))
         };
-        if !seen(expected.origin, origin.as_deref())
-            || !seen(expected.destination, destination.as_deref())
-            || !seen(expected.title, Some(&title))
-            || !seen(expected.date, Some(&date))
+        if !seen(expected.origin, item.origin.as_deref())
+            || !seen(expected.destination, item.destination.as_deref())
+            || !seen(expected.title, Some(&item.title))
+            || !seen(expected.date, Some(&item.date))
         {
             return Ok(false);
         }
-        remove_item_within(&conn, trip_id, item_id)?;
+        remove_item_within(&conn, trip_id, item.id)?;
         Ok(true)
     }
 
@@ -3422,9 +3445,12 @@ impl Store {
         if !trip_exists(&conn, trip_id)? {
             anyhow::bail!("no such trip");
         }
-        let Some((item_id, _)) = item_at(&conn, trip_id, position)? else {
+        let Some((item_id, kind)) = item_at(&conn, trip_id, position)? else {
             anyhow::bail!("this trip has no segment {position}");
         };
+        if kind != "flight" {
+            anyhow::bail!("segment {position} is a {kind}; options go on flights");
+        }
         choose_within(&conn, item_id, candidate)?;
         reorder_items(&conn, trip_id)?;
         touch(&conn, trip_id)?;
@@ -3454,9 +3480,14 @@ impl Store {
         let Some(id) = id else {
             return Ok(CandidateChoice::TripNotFound);
         };
-        let Some((item_id, _)) = item_at(&conn, id, position)? else {
+        let Some((item_id, kind)) = item_at(&conn, id, position)? else {
             return Ok(CandidateChoice::CandidateNotFound);
         };
+        // An error, not `CandidateNotFound`: that variant means "re-read and
+        // pick again", and no re-read will put an option on a stay.
+        if kind != "flight" {
+            anyhow::bail!("segment {position} is a {kind}; options go on flights");
+        }
 
         let known: i64 = conn.query_row(
             "SELECT count(*) FROM item_candidates WHERE item_id = ? AND candidate = ?",
@@ -3475,9 +3506,12 @@ impl Store {
 
     pub fn drop_candidate(&self, trip_id: i64, position: i64, candidate: i64) -> Result<Trip> {
         let conn = self.conn();
-        let Some((item_id, _)) = item_at(&conn, trip_id, position)? else {
+        let Some((item_id, kind)) = item_at(&conn, trip_id, position)? else {
             anyhow::bail!("this trip has no segment {position}");
         };
+        if kind != "flight" {
+            anyhow::bail!("segment {position} is a {kind}; options go on flights");
+        }
         let removed = conn.execute(
             "DELETE FROM item_candidates WHERE item_id = ? AND candidate = ?",
             params![item_id, candidate],
@@ -3710,10 +3744,15 @@ fn remove_item_within(conn: &Connection, trip_id: i64, item_id: i64) -> Result<T
 /// activity — then the previous position, so two items nothing else
 /// separates keep their order. Called inside every write, under the lock
 /// the caller already holds.
+///
+/// The chosen option is joined through a GROUP BY, not the raw table: "at
+/// most one chosen" is enforced in Rust, and a duplicate slipping past it
+/// would otherwise number the item twice and leave a position vacant.
 fn reorder_items(conn: &Connection, trip_id: i64) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT i.id FROM trip_items i
-         LEFT JOIN item_candidates c ON c.item_id = i.id AND c.chosen
+         LEFT JOIN (SELECT item_id, min(departing_at_local) AS departing_at_local
+                    FROM item_candidates WHERE chosen GROUP BY item_id) c ON c.item_id = i.id
          WHERE i.trip_id = ?
          ORDER BY i.date,
                   COALESCE(i.starts_at, c.departing_at_local) IS NULL,
@@ -6214,6 +6253,11 @@ CREATE TABLE trips (
         let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
         store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
         store.add_item(trip.id, stay("Hotel Alfama", "2026-10-12", "2026-10-15")).unwrap();
+        // A kind the page has no card for is refused, not stored and lost.
+        let mut cruise = stay("Boat", "2026-10-14", "2026-10-14");
+        cruise.kind = "cruise".into();
+        let err = store.add_item(trip.id, cruise).unwrap_err();
+        assert!(err.to_string().contains("kind must be stay, activity or transport"), "got: {err}");
         store.add_item(trip.id, NewItem {
             kind: "activity".into(), title: "Azulejo museum".into(), place: Some("Lisbon".into()),
             date: "2026-10-13".into(), starts_at: Some("2026-10-13T10:00:00".into()), ends_at: None,
@@ -6271,6 +6315,37 @@ CREATE TABLE trips (
         let trip = store.add_item(trip.id, stay("Hotel", "2026-10-12", "2026-10-15")).unwrap();
         let err = store.add_candidate(trip.id, 1, expected("AMS", "LIS", None), candidate("TAP", "TP1", "2026-10-12T07:00:00"), false).unwrap_err();
         assert!(err.to_string().contains("is a stay"), "got: {err}");
+        // The same refusal from every door: a stay has no options to choose
+        // or drop, and "no option 1" would send the caller looking for one.
+        let err = store.choose_candidate(trip.id, 1, 1).unwrap_err();
+        assert!(err.to_string().contains("is a stay"), "choose: {err}");
+        let err = store.drop_candidate(trip.id, 1, 1).unwrap_err();
+        assert!(err.to_string().contains("is a stay"), "drop: {err}");
+        let err = store.choose_candidate_for_account(account, "Lisbon", 1, 1).unwrap_err();
+        assert!(err.to_string().contains("is a stay"), "choose by name: {err}");
+    }
+
+    #[test]
+    fn a_time_beats_kind_rank_and_two_times_sort_by_the_clock() {
+        // The rule, pinned: on one day an item with a time sorts before an
+        // item without one whatever their kinds, and two timed items sort
+        // by the clock.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        let mut hotel = stay("Hotel", "2026-10-12", "2026-10-15");
+        hotel.starts_at = Some("2026-10-12T15:00:00".into());
+        store.add_item(trip.id, hotel).unwrap();
+        let trip = store.add_item(trip.id, NewItem {
+            kind: "activity".into(), title: "Tram 28".into(), place: Some("Lisbon".into()),
+            date: "2026-10-12".into(), starts_at: Some("2026-10-12T09:00:00".into()), ends_at: None,
+            notes: None, booked: false, confirmation_code: None, price: None, currency: None,
+            arrival_id: None,
+        }).unwrap();
+        let order: Vec<(i64, &str)> = trip.items.iter().map(|i| (i.position, i.title.as_str())).collect();
+        assert_eq!(order, vec![(1, "Tram 28"), (2, "Hotel"), (3, "AMS → LIS")],
+            "09:00 before 15:00, and both before the flight that has no time yet");
     }
 
     #[test]

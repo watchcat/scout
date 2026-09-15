@@ -5,7 +5,7 @@
 //! self-contained HTML page that Chromium can print without network access.
 
 use chrono::{NaiveDate, NaiveDateTime, Utc};
-use scout_core::trips::{Plan, TripCandidate, TripSegment};
+use scout_core::trips::{Plan, TripCandidate, TripItem};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -219,21 +219,30 @@ fn complete(bytes: &[u8]) -> bool {
 }
 
 fn validate_plan(plan: &Plan) -> Result<(), Error> {
-    if plan.trip.segments.len() > MAX_SEGMENTS
+    if plan.trip.items.len() > MAX_SEGMENTS
         || plan.trip.name.len() > MAX_FIELD_BYTES
         || plan.notes.iter().any(|note| note.len() > MAX_FIELD_BYTES)
     {
         return Err(Error::InputTooLarge);
     }
-    for segment in &plan.trip.segments {
-        if segment.candidates.len() > MAX_CANDIDATES_PER_SEGMENT
-            || segment.origin.len() > MAX_FIELD_BYTES
-            || segment.destination.len() > MAX_FIELD_BYTES
-            || segment.departure_date.len() > MAX_FIELD_BYTES
+    let too_long = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_FIELD_BYTES)
+    };
+    for item in &plan.trip.items {
+        if item.candidates.len() > MAX_CANDIDATES_PER_SEGMENT
+            || item.title.len() > MAX_FIELD_BYTES
+            || item.date.len() > MAX_FIELD_BYTES
+            || too_long(&item.origin)
+            || too_long(&item.destination)
+            || too_long(&item.place)
+            || too_long(&item.notes)
+            || too_long(&item.confirmation_code)
         {
             return Err(Error::InputTooLarge);
         }
-        for candidate in &segment.candidates {
+        for candidate in &item.candidates {
             if candidate.airline.len() > MAX_FIELD_BYTES
                 || candidate.flight_numbers.len() > MAX_FIELD_BYTES
                 || candidate.itinerary.len() > MAX_FIELD_BYTES
@@ -294,12 +303,17 @@ fn escape(text: &str) -> String {
     out
 }
 
-fn selected(segment: &TripSegment) -> Option<&TripCandidate> {
-    segment
-        .candidates
+fn selected(item: &TripItem) -> Option<&TripCandidate> {
+    item.candidates
         .iter()
         .find(|candidate| candidate.chosen)
-        .or_else(|| (segment.candidates.len() == 1).then(|| &segment.candidates[0]))
+        .or_else(|| (item.candidates.len() == 1).then(|| &item.candidates[0]))
+}
+
+/// An end of a flight leg for a sentence. Only a flight reaches the code
+/// that asks, so the fallback is for a row that lost its route, not a stay.
+fn airport(end: &Option<String>) -> &str {
+    end.as_deref().unwrap_or("—")
 }
 
 fn duration(minutes: Option<i64>) -> String {
@@ -358,8 +372,10 @@ fn saved_total(plan: &Plan) -> Option<String> {
     let mut currency: Option<&str> = None;
     let mut total = 0.0;
     let mut approximate = false;
-    for segment in &plan.trip.segments {
-        let candidate = selected(segment)?;
+    // Flights only: a stay's price is not a saved fare, and a stay with no
+    // options must not make the total unavailable.
+    for flight in plan.trip.flights() {
+        let candidate = selected(flight)?;
         let price = candidate.quoted_price?;
         let next = candidate.quoted_currency.as_deref()?;
         if currency.is_some_and(|known| known != next) {
@@ -384,7 +400,7 @@ fn saved_total(plan: &Plan) -> Option<String> {
     })
 }
 
-fn connection(before: &TripSegment, after: &TripSegment) -> (String, &'static str) {
+fn connection(before: &TripItem, after: &TripItem) -> (String, &'static str) {
     let Some(arrival) = selected(before) else {
         return (
             "Choose the arriving flight to check this connection.".to_string(),
@@ -397,11 +413,12 @@ fn connection(before: &TripSegment, after: &TripSegment) -> (String, &'static st
             "warn",
         );
     };
+    let at = airport(&before.destination);
     if before.destination != after.origin {
         return (
             format!(
-                "Airport transfer: arrive at {}, continue from {}. Ground travel is not included.",
-                before.destination, after.origin
+                "Airport transfer: arrive at {at}, continue from {}. Ground travel is not included.",
+                airport(&after.origin)
             ),
             "warn",
         );
@@ -413,36 +430,28 @@ fn connection(before: &TripSegment, after: &TripSegment) -> (String, &'static st
         parse(arrival.arriving_at_local.as_deref()),
         parse(departure.departing_at_local.as_deref()),
     ) else {
-        return (
-            format!("Connection at {}: timing unavailable.", before.destination),
-            "warn",
-        );
+        return (format!("Connection at {at}: timing unavailable."), "warn");
     };
     let minutes = (departure - arrival).num_minutes();
     if minutes < 0 {
         return (
-            format!(
-                "Impossible connection at {}: the next flight leaves before arrival.",
-                before.destination
-            ),
+            format!("Impossible connection at {at}: the next flight leaves before arrival."),
             "danger",
         );
     }
     if minutes < 180 {
         return (
             format!(
-                "{} at {} — tight connection; allow at least 3 hours between separate tickets.",
+                "{} at {at} — tight connection; allow at least 3 hours between separate tickets.",
                 duration(Some(minutes)),
-                before.destination
             ),
             "danger",
         );
     }
     (
         format!(
-            "{} at {} between the selected flights.",
+            "{} at {at} between the selected flights.",
             duration(Some(minutes)),
-            before.destination
         ),
         "ok",
     )
@@ -450,23 +459,26 @@ fn connection(before: &TripSegment, after: &TripSegment) -> (String, &'static st
 
 pub fn html(plan: &Plan) -> String {
     let trip = &plan.trip;
-    let route = if trip.segments.is_empty() {
+    // The route line, the selected count and the connection checks are
+    // about flights: a stay has no airports and no options to choose.
+    let flights: Vec<&TripItem> = trip.flights().collect();
+    let route = if flights.is_empty() {
         "Route not set".to_string()
     } else {
-        let mut airports = vec![trip.segments[0].origin.as_str()];
-        for segment in &trip.segments {
-            if airports.last().copied() != Some(segment.origin.as_str()) {
-                airports.push(&segment.origin);
+        let mut airports = vec![airport(&flights[0].origin)];
+        for flight in &flights {
+            let origin = airport(&flight.origin);
+            if airports.last().copied() != Some(origin) {
+                airports.push(origin);
             }
-            airports.push(&segment.destination);
+            airports.push(airport(&flight.destination));
         }
         airports.join(" → ")
     };
     let generated = Utc::now().format("%Y-%m-%d %H:%M UTC");
-    let selected_count = trip
-        .segments
+    let selected_count = flights
         .iter()
-        .filter(|segment| selected(segment).is_some())
+        .filter(|flight| selected(flight).is_some())
         .count();
 
     let mut out =
@@ -497,7 +509,7 @@ pub fn html(plan: &Plan) -> String {
         ("Status", trip.status.clone()),
         (
             "Flights selected",
-            format!("{selected_count}/{}", trip.segments.len()),
+            format!("{selected_count}/{}", flights.len()),
         ),
         (
             "Saved fare total",
@@ -539,14 +551,35 @@ pub fn html(plan: &Plan) -> String {
     }
     out.push_str("<p class=\"page-note\">Times are local to each airport. Flight options not marked Selected are saved alternatives.</p>");
 
-    for (index, segment) in trip.segments.iter().enumerate() {
+    for (index, segment) in trip.items.iter().enumerate() {
+        if !segment.is_flight() {
+            // One plain line for now: what it is, where, and when. The
+            // page's look for stays and the rest is a later change; this
+            // keeps the export from silently dropping them.
+            let place = segment
+                .place
+                .as_deref()
+                .map(|place| format!(" · {}", escape(place)))
+                .unwrap_or_default();
+            write!(
+                out,
+                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{} {}</div><h2>{}{}</h2></div><time>{}</time></div></section>",
+                escape(&segment.kind),
+                segment.position,
+                escape(&segment.title),
+                place,
+                escape(&date(&segment.date))
+            )
+            .unwrap();
+            continue;
+        }
         write!(
             out,
             "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">Segment {}</div><h2>{} → {}</h2></div><time>{}</time></div>",
             segment.position,
-            escape(&segment.origin),
-            escape(&segment.destination),
-            escape(&date(&segment.departure_date))
+            escape(airport(&segment.origin)),
+            escape(airport(&segment.destination)),
+            escape(&date(&segment.date))
         )
         .unwrap();
         if segment.candidates.is_empty() {
@@ -581,7 +614,9 @@ pub fn html(plan: &Plan) -> String {
             .unwrap();
         }
         out.push_str("</section>");
-        if let Some(after) = trip.segments.get(index + 1) {
+        // The connection is to the next *flight*, whatever sits between:
+        // a stay between two legs does not change when the second departs.
+        if let Some(after) = trip.items[index + 1..].iter().find(|item| item.is_flight()) {
             let (message, tone) = connection(segment, after);
             write!(
                 out,
@@ -604,7 +639,31 @@ pub fn html(plan: &Plan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scout_core::trips::{Plan, Trip, TripCandidate, TripSegment};
+    use scout_core::trips::{Plan, Trip, TripCandidate, TripItem};
+
+    /// A flight leg as `load_trip` reads one: its time of day comes from
+    /// the chosen option, the columns a stay uses are empty.
+    fn flight(position: i64, origin: &str, destination: &str, candidate: TripCandidate) -> TripItem {
+        TripItem {
+            id: position,
+            position,
+            kind: "flight".to_string(),
+            title: format!("{origin} → {destination}"),
+            place: None,
+            origin: Some(origin.to_string()),
+            destination: Some(destination.to_string()),
+            date: "2026-10-12".to_string(),
+            starts_at: candidate.departing_at_local.clone(),
+            ends_at: candidate.arriving_at_local.clone(),
+            booked: false,
+            confirmation_code: None,
+            price: None,
+            currency: None,
+            notes: None,
+            arrival_id: None,
+            candidates: vec![candidate],
+        }
+    }
 
     fn plan() -> Plan {
         Plan {
@@ -614,13 +673,12 @@ mod tests {
                 adults: 2,
                 cabin_class: Some("premium_economy".to_string()),
                 status: "planning".to_string(),
-                segments: vec![
-                    TripSegment {
-                        position: 1,
-                        origin: "AMS".to_string(),
-                        destination: "LIS".to_string(),
-                        departure_date: "2026-10-12".to_string(),
-                        candidates: vec![TripCandidate {
+                items: vec![
+                    flight(
+                        1,
+                        "AMS",
+                        "LIS",
+                        TripCandidate {
                             candidate: 1,
                             chosen: true,
                             airline: "KLM & friends".to_string(),
@@ -632,14 +690,13 @@ mod tests {
                             quoted_price: Some(184.0),
                             quoted_currency: Some("EUR".to_string()),
                             source: Some("duffel".to_string()),
-                        }],
-                    },
-                    TripSegment {
-                        position: 2,
-                        origin: "LIS".to_string(),
-                        destination: "FCO".to_string(),
-                        departure_date: "2026-10-12".to_string(),
-                        candidates: vec![TripCandidate {
+                        },
+                    ),
+                    flight(
+                        2,
+                        "LIS",
+                        "FCO",
+                        TripCandidate {
                             candidate: 1,
                             chosen: true,
                             airline: "TAP".to_string(),
@@ -651,7 +708,30 @@ mod tests {
                             quoted_price: Some(126.0),
                             quoted_currency: Some("EUR".to_string()),
                             source: Some("ignav".to_string()),
-                        }],
+                        },
+                    ),
+                    // A stay on the same timeline. It has no options and no
+                    // route, so it must not count towards "flights
+                    // selected" or the saved total, and must not break the
+                    // connection check between the two flights.
+                    TripItem {
+                        id: 3,
+                        position: 3,
+                        kind: "stay".to_string(),
+                        title: "Hotel <Roma>".to_string(),
+                        place: Some("Rome".to_string()),
+                        origin: None,
+                        destination: None,
+                        date: "2026-10-12".to_string(),
+                        starts_at: None,
+                        ends_at: None,
+                        booked: true,
+                        confirmation_code: Some("ABC123".to_string()),
+                        price: Some(410.0),
+                        currency: Some("EUR".to_string()),
+                        notes: None,
+                        arrival_id: None,
+                        candidates: vec![],
                     },
                 ],
                 // Only a kept trip can reach here: the traveller has to see
@@ -681,10 +761,14 @@ mod tests {
             "from €126.00",
             "estimate when saved",
             "Saved itinerary, not a ticket",
+            // The stay is on the page as one line, escaped like the rest.
+            "Hotel &lt;Roma&gt;",
+            "Rome",
         ] {
             assert!(html.contains(expected), "missing `{expected}`");
         }
         assert!(!html.contains("October <escape>"));
+        assert!(!html.contains("Hotel <Roma>"));
     }
 
     #[test]

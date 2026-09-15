@@ -243,6 +243,11 @@ fn leg_response(out: scout_core::trips::LegEdit) -> Response {
 #[derive(serde::Deserialize)]
 struct AddLegIn {
     trip: String,
+    /// Ignored: positions follow dates on every write, so a leg lands where
+    /// its `departure_date` puts it. Still accepted so a client built when
+    /// it meant something is not refused for sending it.
+    #[serde(default)]
+    #[allow(dead_code)]
     position: Option<i64>,
     origin: String,
     destination: String,
@@ -266,7 +271,6 @@ async fn add_leg(
         &auth.core,
         account_id,
         &body.trip,
-        body.position,
         &body.origin,
         &body.destination,
         &body.departure_date,
@@ -281,19 +285,26 @@ async fn add_leg(
     }
 }
 
+/// What the client drew on the item it wants gone. A flight card sends its
+/// route, a stay card its title; every field given must still match, so a
+/// tab that drew the trip before somebody else edited it cannot take the
+/// wrong item. `departure_date` is what flight cards have always sent and
+/// `date` is the field every item has; both name the same check.
 #[derive(serde::Deserialize)]
-struct RemoveLegIn {
+struct RemoveItemIn {
     trip: String,
     position: i64,
-    origin: String,
-    destination: String,
-    departure_date: Option<String>,
+    origin: Option<String>,
+    destination: Option<String>,
+    title: Option<String>,
+    #[serde(alias = "departure_date")]
+    date: Option<String>,
 }
 
 async fn remove_leg(
     axum::extract::State(auth): axum::extract::State<AuthState>,
     headers: HeaderMap,
-    axum::extract::Json(body): axum::extract::Json<RemoveLegIn>,
+    axum::extract::Json(body): axum::extract::Json<RemoveItemIn>,
 ) -> Response {
     let account_id = match admitted_account(&auth, &headers).await {
         Ok(id) => id,
@@ -303,20 +314,23 @@ async fn remove_leg(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    match scout_core::trips::remove_leg(
+    match scout_core::trips::remove_item(
         &auth.core,
         account_id,
         &body.trip,
         body.position,
-        &body.origin,
-        &body.destination,
-        body.departure_date.as_deref(),
+        scout_core::trips::RemoveExpectation {
+            origin: body.origin,
+            destination: body.destination,
+            title: body.title,
+            date: body.date,
+        },
     )
     .await
     {
         Ok(out) => leg_response(out),
         Err(e) => {
-            tracing::error!(error = %e, account_id, "could not remove a trip leg");
+            tracing::error!(error = %e, account_id, "could not remove a trip item");
             sorry()
         }
     }
@@ -411,9 +425,9 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
 
         assert_eq!(body[0]["name"], "October");
-        assert_eq!(body[0]["segments"][0]["origin"], "AMS");
+        assert_eq!(body[0]["items"][0]["origin"], "AMS");
         assert_eq!(
-            body[0]["segments"][0]["candidates"]
+            body[0]["items"][0]["candidates"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -713,9 +727,9 @@ mod tests {
             .await
             .unwrap()
             .expect("the owner's trip of the same name is untouched");
-        assert_eq!(theirs.trip.segments.len(), 1);
+        assert_eq!(theirs.trip.items.len(), 1);
         assert_eq!(
-            theirs.trip.segments[0].candidates.len(),
+            theirs.trip.items[0].candidates.len(),
             2,
             "and so are the options parked on it",
         );
@@ -748,7 +762,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the trip is still there");
-        assert_eq!(trip.trip.segments.len(), 1, "and so is the leg it was about");
+        assert_eq!(trip.trip.items.len(), 1, "and so is the leg it was about");
     }
 
     #[tokio::test]
@@ -776,7 +790,7 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
-        assert_eq!(body["segments"][0]["candidates"][1]["chosen"], true);
+        assert_eq!(body["items"][0]["candidates"][1]["chosen"], true);
         assert!(body["not_ready"].is_null());
     }
 
@@ -851,8 +865,8 @@ mod tests {
         let res = post_json(&app, uri, &cookie, Some(&csrf), body).await;
         assert_eq!(res.status(), StatusCode::OK);
         let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
-        assert_eq!(response["segments"][1]["origin"], "LIS");
-        assert_eq!(response["segments"][1]["destination"], "FCO");
+        assert_eq!(response["items"][1]["origin"], "LIS");
+        assert_eq!(response["items"][1]["destination"], "FCO");
 
         // Asserted against the store, not just the response: the response
         // is what the route claims happened, the store is what actually did.
@@ -862,8 +876,8 @@ mod tests {
             .into_iter()
             .find(|p| p.trip.name == "October")
             .unwrap();
-        assert_eq!(trip.trip.segments.len(), 2);
-        assert_eq!(trip.trip.segments[1].origin, "LIS");
+        assert_eq!(trip.trip.items.len(), 2);
+        assert_eq!(trip.trip.items[1].origin.as_deref(), Some("LIS"));
     }
 
     #[tokio::test]
@@ -915,29 +929,34 @@ mod tests {
             .find(|p| p.trip.name == "October")
             .unwrap();
         assert_eq!(
-            trip.trip.segments.len(),
+            trip.trip.items.len(),
             1,
             "the guard refused before touching anything"
         );
-        assert_eq!(trip.trip.segments[0].destination, "LIS");
+        assert_eq!(trip.trip.items[0].destination.as_deref(), Some("LIS"));
     }
 
     #[tokio::test]
-    async fn a_stale_insert_is_also_a_conflict() {
+    async fn a_position_on_an_added_leg_is_ignored_because_its_date_decides() {
         let (app, core, _dir, account_id, cookie, csrf) = setup().await;
-        // The trip has one leg, so the only positions it has are 1 (in
-        // front) and 2 (append). Position 5 is a tab that drew a much
-        // longer trip than this one currently is.
+        // A tab built before positions followed dates still sends one.
+        // Position 5 on a one-leg trip used to be a conflict; now it is
+        // simply not what decides where the leg goes — the date is, and
+        // 2026-10-10 is before the seeded 2026-10-12 flight.
         let res = post_json(
             &app,
             "/chat/trips/segment",
             &cookie,
             Some(&csrf),
-            r#"{"trip":"October","position":5,"origin":"LIS","destination":"FCO","departure_date":"2026-10-20"}"#,
+            r#"{"trip":"October","position":5,"origin":"BCN","destination":"MAD","departure_date":"2026-10-10"}"#,
         )
         .await;
 
-        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(response["items"][0]["origin"], "BCN");
+        assert_eq!(response["items"][0]["position"], 1);
+
         let trip = scout_core::trips::list(&core, account_id)
             .await
             .unwrap()
@@ -945,10 +964,74 @@ mod tests {
             .find(|p| p.trip.name == "October")
             .unwrap();
         assert_eq!(
-            trip.trip.segments.len(),
-            1,
-            "the stale insert added nothing"
+            trip.trip
+                .items
+                .iter()
+                .map(|i| i.origin.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec!["BCN", "AMS"],
+            "the leg landed where its date puts it, not at position 5",
         );
+    }
+
+    #[tokio::test]
+    async fn a_stay_is_removed_by_title_and_date_and_the_flight_body_still_works() {
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        // Same day as the seeded flight; a stay sorts behind a flight on
+        // its day, so it is position 2.
+        scout_core::trips::seed_item_for_tests(
+            &core,
+            account_id,
+            "October",
+            "stay",
+            "Hotel Lisboa",
+            "2026-10-12",
+        )
+        .await
+        .unwrap();
+
+        // This body is what a stay card sends: no route, a title and a
+        // date. The wrong title is a stale tab and changes nothing.
+        let stale = delete_json(
+            &app,
+            "/chat/trips/segment",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":2,"title":"Hostel Lisboa","date":"2026-10-12"}"#,
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let res = delete_json(
+            &app,
+            "/chat/trips/segment",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":2,"title":"Hotel Lisboa","date":"2026-10-12"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(response["items"].as_array().unwrap().len(), 1);
+        assert_eq!(response["items"][0]["kind"], "flight");
+
+        // The flight body a flight card has always sent is still accepted
+        // on the same route, so a client need not know two endpoints.
+        let res = delete_json(
+            &app,
+            "/chat/trips/segment",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":1,"origin":"AMS","destination":"LIS","departure_date":"2026-10-12"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let trip = scout_core::trips::find(&core, account_id, "October")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(trip.trip.items.is_empty(), "both removals reached the store");
     }
 
     #[tokio::test]
@@ -987,7 +1070,7 @@ mod tests {
             .find(|p| p.trip.name == "Atlantic loop")
             .unwrap();
         assert_eq!(
-            theirs.trip.segments.len(),
+            theirs.trip.items.len(),
             1,
             "the stranger's request never reached the owner's trip"
         );
@@ -1026,7 +1109,7 @@ mod tests {
             .find(|p| p.trip.name == "Atlantic loop")
             .unwrap();
         assert_eq!(
-            theirs.trip.segments.len(),
+            theirs.trip.items.len(),
             1,
             "the stranger's request never reached the owner's trip"
         );
@@ -1047,7 +1130,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
         assert!(
-            response["segments"].as_array().unwrap().is_empty(),
+            response["items"].as_array().unwrap().is_empty(),
             "the client can repaint from this body without a second fetch",
         );
 
@@ -1057,6 +1140,6 @@ mod tests {
             .into_iter()
             .find(|p| p.trip.name == "October")
             .unwrap();
-        assert!(trip.trip.segments.is_empty());
+        assert!(trip.trip.items.is_empty());
     }
 }

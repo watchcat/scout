@@ -9,7 +9,7 @@
 use crate::agent::{fare_market, rules_for_available_tools, AgentDeps};
 use crate::specialist::{Finding, Specialist, SPECIALIST_BUDGET};
 use crate::tools::trips::{
-    AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
+    AddTripItemTool, AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
     DropTripSegmentTool, FinaliseTripTool, KeepTripTool, ShowTripTool, UpdateTripSegmentTool,
 };
 use rig::client::CompletionClient;
@@ -26,6 +26,7 @@ pub const FLIGHT_TOOLS: &[&str] = &["flight_booking_links", "create_booking_link
 /// presentation rules.
 const TRIP_TOOLS: &[&str] = &[
     "add_trip_segment",
+    "add_trip_item",
     "add_trip_option",
     "choose_trip_option",
     "show_trip",
@@ -94,7 +95,9 @@ traveller is undecided between flights, park each with add_trip_option \
 and decided=false; several options may sit on one segment. Finalising is \
 the only thing that produces current prices and it costs a search per \
 segment, so call finalise_trip when the brief says the trip is settled, \
-not to check on it.
+not to check on it. When the brief says the traveller has a hotel, a \
+ticket or a train, add it with add_trip_item; a trip holds stays and \
+activities as well as flights, and they are shown, not searched.
 - When the brief asks to keep a named trip, call keep_trip with that name \
 and report that it is kept. Such a brief comes back after the traveller \
 was shown the draft and said yes, so there is nothing left to ask and \
@@ -188,6 +191,7 @@ pub fn build_flight_agent(
         // now an install with neither provider has no trip planning, by
         // design (spec decision: everything flight-shaped moves).
         .tool(AddTripSegmentTool { store: d.store.clone(), account_id, conversation_id })
+        .tool(AddTripItemTool { store: d.store.clone(), account_id, conversation_id })
         .tool(AddTripOptionTool {
             store: d.store.clone(),
             account_id,
@@ -428,7 +432,11 @@ only finalise_trip re-prices them. When finalise_trip ran, present both \
 totals it returns and never drop the note about separate tickets: a link \
 per segment is a ticket per segment, and the traveller carries the risk at \
 every join. If the single-ticket total is missing, say that it is missing - \
-it is not evidence that separate booking is better.";
+it is not evidence that separate booking is better. A trip may hold stays, \
+activities and transport beside its flights; present them in the order \
+given, and say when an item is booked and its confirmation code. \
+finalise_trip's fixed_costs are those items' prices as recorded; add them \
+to the flight totals in words, never silently.";
 
 #[cfg(test)]
 mod tests {

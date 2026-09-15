@@ -5,7 +5,7 @@
 //! outlives the conversation that made it, so a trip holds the itinerary —
 //! airports, dates, flight numbers — and finalisation re-prices it.
 
-use crate::store::{ExpectedItem, NewCandidate, Store, Trip, TripCandidate, TripItem};
+use crate::store::{ExpectedItem, NewCandidate, NewItem, Store, Trip, TripCandidate, TripItem};
 use crate::tools::budget::FlightBudget;
 use crate::tools::duffel::{
     dominant_currency, merged_search, DuffelClient, Flight, FlightQuery, MultiCityQuery, Slice, Source,
@@ -28,15 +28,24 @@ const TIGHT_TURNAROUND_MINUTES: i64 = 180;
 /// Both of these are legitimate trips, so they are notes rather than
 /// errors. Silence would be the actual failure: an itinerary that reads as
 /// continuous when it is not is one somebody plans around.
-pub fn itinerary_notes(segments: &[TripItem]) -> Vec<String> {
+///
+/// Runs over consecutive *flights*: a hotel between landing and the next
+/// departure is where the traveller sleeps, not a gap in the flying, so
+/// the stays and activities in between are skipped rather than compared.
+pub fn itinerary_notes(items: &[TripItem]) -> Vec<String> {
     let mut notes = Vec::new();
-    for pair in segments.windows(2) {
-        let (before, after) = (&pair[0], &pair[1]);
-        if before.destination.as_deref().unwrap_or("") != after.origin.as_deref().unwrap_or("") {
+    let flights: Vec<&TripItem> = items.iter().filter(|i| i.is_flight()).collect();
+    for pair in flights.windows(2) {
+        let (before, after) = (pair[0], pair[1]);
+        let (lands_at, leaves_from) = (
+            before.destination.as_deref().unwrap_or(""),
+            after.origin.as_deref().unwrap_or(""),
+        );
+        if lands_at != leaves_from {
             notes.push(format!(
                 "segment {} arrives at {} and segment {} leaves from {} — getting between \
                  them is not part of this trip",
-                before.position, before.destination.as_deref().unwrap_or(""), after.position, after.origin.as_deref().unwrap_or("")
+                before.position, lands_at, after.position, leaves_from
             ));
             // Two clocks in two places. This codebase does not subtract
             // those, so the gap note is all there is to say.
@@ -98,13 +107,19 @@ fn taken(segment: &TripItem) -> Option<&TripCandidate> {
 /// Dates must run forwards before an itinerary can be priced as one ticket.
 /// Equal dates are fine: a same-day connection is an ordinary thing.
 ///
-/// Assumes every `departure_date` is zero-padded `YYYY-MM-DD` — the one
-/// shape under which comparing them as text agrees with comparing them as
-/// dates. That is enforced at the tool boundary before a segment is ever
-/// stored, not here, so a caller that bypasses it gets a wrong answer
-/// instead of an error.
-pub fn dates_run_forwards(segments: &[TripItem]) -> Result<(), String> {
-    for pair in segments.windows(2) {
+/// Assumes every `date` is zero-padded `YYYY-MM-DD` — the one shape under
+/// which comparing them as text agrees with comparing them as dates. That
+/// is enforced at the tool boundary before an item is ever stored, not
+/// here, so a caller that bypasses it gets a wrong answer instead of an
+/// error.
+///
+/// Every write to the store reorders items by date, so a trip read from
+/// it cannot fail this. It stays as a check over *all* items, stays
+/// included, because a multi-city request built from a slice somebody
+/// assembled by hand is meaningless when its dates go backwards, and the
+/// refusal is cheaper than the search.
+pub fn dates_run_forwards(items: &[TripItem]) -> Result<(), String> {
+    for pair in items.windows(2) {
         // ISO dates compare correctly as text, which is the one place that
         // is true of them.
         if pair[1].date.trim() < pair[0].date.trim() {
@@ -309,6 +324,14 @@ pub struct FinalisedTrip {
     /// equal `currency`: a single ticket for the same itinerary can price
     /// in a currency none of the separate segments do.
     pub one_ticket_currency: Option<String>,
+    /// The stays, activities and transport with a recorded price. Not in
+    /// `separate_total`: that is a sum of live fares in one currency, and
+    /// these are figures the traveller typed in, possibly in several. The
+    /// reply adds them in words.
+    pub fixed_costs: Vec<FixedCost>,
+    /// The non-flight items with no price at all, by title, so the reply
+    /// can say what the totals leave out.
+    pub unpriced_items: Vec<String>,
     pub notes: Vec<String>,
 }
 
@@ -454,18 +477,21 @@ pub fn comparison_notes(
     notes
 }
 
-/// Each segment paired with the option that will be priced, or why the trip
+/// Each flight paired with the option that will be priced, or why the trip
 /// is not ready.
 ///
-/// A segment holding exactly one undecided option needs no decision: it is
+/// A flight holding exactly one undecided option needs no decision: it is
 /// the pick by elimination. Two or more without one is a question, so the
-/// refusal lists them and asks it.
-pub fn ready_to_price(segments: &[TripItem]) -> Result<Vec<(&TripItem, &TripCandidate)>, String> {
-    if segments.is_empty() {
-        return Err("this trip has no segments yet, so there is nothing to price".to_string());
+/// refusal lists them and asks it. Stays and activities have no options to
+/// decide and no fare to fetch, so they are neither ready nor not: a trip
+/// that is only a hotel has nothing here to price at all.
+pub fn ready_to_price(items: &[TripItem]) -> Result<Vec<(&TripItem, &TripCandidate)>, String> {
+    let flights: Vec<&TripItem> = items.iter().filter(|i| i.is_flight()).collect();
+    if flights.is_empty() {
+        return Err("this trip has no flights yet, so there is nothing to price".to_string());
     }
     let mut ready = Vec::new();
-    for segment in segments {
+    for segment in flights {
         let chosen = match segment.candidates.iter().find(|c| c.chosen) {
             Some(chosen) => chosen,
             None => match segment.candidates.as_slice() {
@@ -495,6 +521,41 @@ pub fn ready_to_price(segments: &[TripItem]) -> Result<Vec<(&TripItem, &TripCand
         ready.push((segment, chosen));
     }
     Ok(ready)
+}
+
+/// A non-flight item with a price, for the finalised total.
+///
+/// Its price is what the traveller recorded, not something re-fetched:
+/// nothing here can re-price a hotel, so it goes into the reply as a fixed
+/// cost beside the live flight totals rather than folded into them.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct FixedCost {
+    pub position: i64,
+    pub title: String,
+    pub price: f64,
+    pub currency: String,
+}
+
+/// Priced non-flights, and the titles of the ones with no price.
+///
+/// The unpriced ones are returned by name rather than dropped, so the reply
+/// can say the total is missing them: a hotel with no price is still a
+/// cost, and a total that quietly leaves it out reads as the whole trip.
+pub fn fixed_costs(items: &[TripItem]) -> (Vec<FixedCost>, Vec<String>) {
+    let mut fixed = Vec::new();
+    let mut unpriced = Vec::new();
+    for i in items.iter().filter(|i| !i.is_flight()) {
+        match (i.price, &i.currency) {
+            (Some(price), Some(currency)) => fixed.push(FixedCost {
+                position: i.position,
+                title: i.title.clone(),
+                price,
+                currency: currency.clone(),
+            }),
+            _ => unpriced.push(i.title.clone()),
+        }
+    }
+    (fixed, unpriced)
 }
 
 /// One candidate against today's offers.
@@ -585,7 +646,8 @@ impl Tool for FinaliseTripTool {
         // trip that cannot be priced must cost nothing to discover.
         let ready = ready_to_price(&trip.items).map_err(StoreToolError)?;
         dates_run_forwards(&trip.items).map_err(StoreToolError)?;
-        self.budget.grant_trip(trip.items.len());
+        // Granted per flight, not per item: a stay costs no search.
+        self.budget.grant_trip(ready.len());
 
         let adults = u32::try_from(trip.adults).unwrap_or(1).max(1);
         let cabin = trip.cabin_class.clone();
@@ -599,6 +661,8 @@ impl Tool for FinaliseTripTool {
             // clone next to a network round trip.
             let segment = (*segment).clone();
             let chosen = (*chosen).clone();
+            // Unwrapped without a fallback in mind: `ready_to_price` hands
+            // back flights only, and a flight always has both ends.
             let day = FlightQuery {
                 origin: segment.origin.clone().unwrap_or_default(),
                 destination: segment.destination.clone().unwrap_or_default(),
@@ -630,14 +694,20 @@ impl Tool for FinaliseTripTool {
             let duffel = self.duffel.as_ref()?;
             // A single slice is an ordinary search, not a comparison — and
             // the budget was only ever granted for a real multi-city request.
-            if trip.items.len() < 2 || !self.budget.claim_one() {
+            // Flights only: a hotel is not a slice Duffel can price.
+            if ready.len() < 2 || !self.budget.claim_one() {
                 return None;
             }
             let query = MultiCityQuery {
-                slices: trip
-                    .items
+                slices: ready
                     .iter()
-                    .map(|s| Slice::new(s.origin.as_deref().unwrap_or(""), s.destination.as_deref().unwrap_or(""), &s.date))
+                    .map(|(s, _)| {
+                        Slice::new(
+                            s.origin.as_deref().unwrap_or(""),
+                            s.destination.as_deref().unwrap_or(""),
+                            &s.date,
+                        )
+                    })
                     .collect(),
                 adults,
                 cabin_class: cabin.clone(),
@@ -691,7 +761,7 @@ impl Tool for FinaliseTripTool {
             };
             segments.push(PricedSegment {
                 position: segment.position,
-                route: format!("{}→{}", segment.origin.as_deref().unwrap_or(""), segment.destination.as_deref().unwrap_or("")),
+                route: segment.route(),
                 departure_date: segment.date.clone(),
                 chosen: priced,
                 also_considered,
@@ -726,6 +796,15 @@ impl Tool for FinaliseTripTool {
                     .to_string(),
             );
         }
+        let (fixed_costs, unpriced_items) = fixed_costs(&trip.items);
+        if !unpriced_items.is_empty() {
+            // Named in a note as well as listed: a total that silently
+            // leaves a hotel out reads as the whole trip.
+            notes.push(format!(
+                "{} items on this trip carry no price and are not in the totals",
+                unpriced_items.len()
+            ));
+        }
 
         // quoted_price and quoted_at are never touched here — see
         // TripCandidate's own comment. Only the status changes, to record
@@ -746,6 +825,8 @@ impl Tool for FinaliseTripTool {
             currency,
             one_ticket_total,
             one_ticket_currency,
+            fixed_costs,
+            unpriced_items,
             notes,
         })
     }
@@ -777,8 +858,6 @@ pub struct AddSegmentArgs {
     pub destination: String,
     pub departure_date: String,
     #[serde(default)]
-    pub position: Option<i64>,
-    #[serde(default)]
     pub adults: Option<i64>,
     #[serde(default)]
     pub cabin_class: Option<String>,
@@ -803,9 +882,8 @@ impl Tool for AddTripSegmentTool {
          new. Use this to build a multi-city itinerary the traveller is \
          planning across several messages. A segment is one direction on one \
          date: a return is two segments. Airports are 3-letter IATA codes, \
-         dates are YYYY-MM-DD. Segments are numbered from 1 in travel order, \
-         and a leg with no position lands where its date puts it; pass \
-         position only to override that."
+         dates are YYYY-MM-DD. Items are numbered from 1 in date order, and a \
+         leg lands where its date puts it."
             .to_string()
     }
 
@@ -817,7 +895,6 @@ impl Tool for AddTripSegmentTool {
                 "origin": {"type": "string", "description": "3-letter IATA code"},
                 "destination": {"type": "string", "description": "3-letter IATA code"},
                 "departure_date": {"type": "string", "description": "YYYY-MM-DD"},
-                "position": {"type": "integer", "description": "insert at this 1-based position; omit to let the departure date decide"},
                 "adults": {"type": "integer", "description": "passengers for the whole trip; 1 on a new trip, otherwise left as it was unless given"},
                 "cabin_class": {"type": "string", "description": "economy, premium_economy, business or first, for the whole trip"}
             },
@@ -835,12 +912,13 @@ impl Tool for AddTripSegmentTool {
         let account_id = self.account_id;
         let conversation_id = self.conversation_id;
         tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
-            let trip = store.upsert_trip(
+            let trip = find_or_create(
+                &store,
                 account_id,
+                conversation_id,
                 &args.trip,
                 args.adults,
                 args.cabin_class.as_deref(),
-                Some(conversation_id),
             )?;
             store
                 .add_flight(trip.id, &origin, &destination, &date)
@@ -849,6 +927,172 @@ impl Tool for AddTripSegmentTool {
         .await
         .map_err(internal)?
         .map(TripView::of)
+        .map_err(internal)
+    }
+}
+
+/// The trip called `name` for this account, created as a draft owned by
+/// `conversation_id` when there is none, with `adults` and `cabin_class`
+/// applied when given.
+///
+/// One function for both tools that can create a trip from chat, so a leg
+/// and a hotel added to a name nobody has used yet start the same trip in
+/// the same way — owned by the chat that made it, and a draft until kept.
+/// Two copies of this would drift, and a trip that a stay creates as
+/// nobody's while a flight creates it as this chat's is the kind of
+/// difference that shows up as one trip surviving and the other not.
+fn find_or_create(
+    store: &Store,
+    account_id: i64,
+    conversation_id: i64,
+    name: &str,
+    adults: Option<i64>,
+    cabin_class: Option<&str>,
+) -> anyhow::Result<Trip> {
+    store.upsert_trip(account_id, name, adults, cabin_class, Some(conversation_id))
+}
+
+/// `HH:MM`, 24-hour, zero-padded, or an error the model can act on. The
+/// stored `starts_at` is compared as text by the sort, so the padding is
+/// established here, the way `calendar_date` does for dates.
+pub(crate) fn local_time(value: &str) -> Result<String, StoreToolError> {
+    let time = value.trim();
+    chrono::NaiveTime::parse_from_str(time, "%H:%M")
+        .map(|t| t.format("%H:%M").to_string())
+        .map_err(|_| StoreToolError(format!("time must be HH:MM, not {value:?}")))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddItemArgs {
+    pub trip: String,
+    /// stay | activity | transport. A flight goes through add_trip_segment.
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub place: Option<String>,
+    /// YYYY-MM-DD, the day it starts.
+    pub date: String,
+    /// HH:MM local, when known.
+    #[serde(default)]
+    pub time: Option<String>,
+    /// YYYY-MM-DD for a stay's check-out or a multi-day activity.
+    #[serde(default)]
+    pub end_date: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub adults: Option<i64>,
+    #[serde(default)]
+    pub cabin_class: Option<String>,
+}
+
+/// Puts a stay, an activity or a transport booking on a trip. Flights are
+/// not accepted here: they carry a route and candidates, and one tool per
+/// shape keeps the model from describing a leg as a title.
+pub struct AddTripItemTool {
+    pub store: Store,
+    pub account_id: i64,
+    /// The conversation this run belongs to, so a trip it creates knows
+    /// which chat to die with — the same as `AddTripSegmentTool`.
+    pub conversation_id: i64,
+}
+
+impl Tool for AddTripItemTool {
+    const NAME: &'static str = "add_trip_item";
+    type Error = StoreToolError;
+    type Args = AddItemArgs;
+    type Output = TripView;
+
+    fn description(&self) -> String {
+        "Puts a stay, an activity or a transport booking on a trip - a hotel, a museum \
+         ticket, a train - when the traveller says they have one. Not for flights: \
+         add_trip_segment does those. Creates the trip when it does not exist yet, \
+         as a draft like add_trip_segment does. Never mark something booked or invent \
+         a confirmation code; those come from the traveller's own confirmations."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "trip": {"type": "string"},
+                "kind": {"type": "string", "enum": ["stay", "activity", "transport"]},
+                "title": {"type": "string", "description": "the hotel, the ticket, the train"},
+                "place": {"type": "string", "description": "city or address"},
+                "date": {"type": "string", "description": "YYYY-MM-DD, the day it starts"},
+                "time": {"type": "string", "description": "HH:MM local, when known"},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD check-out or last day"},
+                "notes": {"type": "string"},
+                "adults": {"type": "integer"},
+                "cabin_class": {"type": "string"}
+            },
+            "required": ["trip", "kind", "title", "date"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Refused here, before the store's own refusal, with the tool that
+        // does take a flight named: the model's next call should be the
+        // right one, not a guess.
+        let kind = args.kind.trim().to_lowercase();
+        if !["stay", "activity", "transport"].contains(&kind.as_str()) {
+            return Err(StoreToolError(
+                "kind must be stay, activity or transport; a flight goes through add_trip_segment"
+                    .to_string(),
+            ));
+        }
+        // Validated before anything is written, as in add_trip_segment: a
+        // bad date must not leave a half-built trip behind.
+        let date = calendar_date(&args.date)?;
+        let starts_at = match &args.time {
+            Some(t) => Some(format!("{date}T{}:00", local_time(t)?)),
+            None => None,
+        };
+        let ends_at = args.end_date.as_deref().map(calendar_date).transpose()?;
+        let title = args.title.trim().to_string();
+        if title.is_empty() {
+            return Err(StoreToolError("an item needs a title — the hotel, the ticket, the train".to_string()));
+        }
+
+        let store = self.store.clone();
+        let account_id = self.account_id;
+        let conversation_id = self.conversation_id;
+        let said = format!("added {title} on {date}");
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Trip> {
+            let trip = find_or_create(
+                &store,
+                account_id,
+                conversation_id,
+                &args.trip,
+                args.adults,
+                args.cabin_class.as_deref(),
+            )?;
+            store
+                .add_item(
+                    trip.id,
+                    NewItem {
+                        kind,
+                        title,
+                        place: args.place,
+                        date,
+                        starts_at,
+                        ends_at,
+                        notes: args.notes,
+                        // Never from the model: a booking and its code come
+                        // from the traveller's own confirmation.
+                        booked: false,
+                        confirmation_code: None,
+                        price: None,
+                        currency: None,
+                        arrival_id: None,
+                    },
+                )
+                .map_err(lost_trip_race)
+        })
+        .await
+        .map_err(internal)?
+        .map(|trip| TripView::after(trip, said))
         .map_err(internal)
     }
 }
@@ -1499,7 +1743,7 @@ impl Tool for KeepTripTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Store, TripCandidate, TripItem};
+    use crate::store::{NewItem, Store, TripCandidate, TripItem};
     use crate::tools::duffel::{Flight, Leg, PriceStatus, Source};
     use crate::tools::shown::ShownFlights;
     use rig::tool::Tool;
@@ -1526,7 +1770,6 @@ mod tests {
                 origin: "ams".into(),
                 destination: "lis".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: Some(2),
                 cabin_class: None,
             })
@@ -1552,7 +1795,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "LIS".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -1571,7 +1813,6 @@ mod tests {
                 origin: "Amsterdam".into(),
                 destination: "LIS".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -1594,7 +1835,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "LIS".into(),
                 departure_date: "2026-9-3".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -1812,7 +2052,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -1865,7 +2104,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -1905,7 +2143,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -1937,7 +2174,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -1974,7 +2210,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-05".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2014,7 +2249,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-05".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2053,7 +2287,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2091,7 +2324,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "HKG".into(),
                 departure_date: "2026-09-15".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2119,7 +2351,6 @@ mod tests {
                 origin: "HKG".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-19".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2129,59 +2360,21 @@ mod tests {
         assert!(waiting.contains("segment 2"), "got: {waiting}");
     }
 
-    #[tokio::test]
-    async fn a_trip_whose_dates_run_backwards_is_reported_as_not_ready() {
+    #[test]
+    fn a_trip_whose_dates_run_backwards_is_reported_as_not_ready() {
         // not_ready must be everything finalise_trip would refuse on, or a
         // trip can read as ready and then be turned away.
-        let (store, _d) = setup();
-        let shown = Arc::new(ShownFlights::default());
-        shown.remember(
-            99,
-            vec![
-                one_way("out", "AMS", "HKG", "2026-09-19", &["EY78"]),
-                one_way("on", "HKG", "NRT", "2026-09-15", &["CX500"]),
-            ],
-            Instant::now(),
-        );
-        let add = AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 };
-        let park = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 };
-        // Both legs decided, so the only thing left wrong is their order.
         //
-        // The positions are stated because a leg added without one now goes
-        // where its date belongs, which would sort these two as they were
-        // added and leave nothing for not_ready to report. A backwards trip
-        // is still reachable — by asking for one here, or by moving a date
-        // with update_segment afterwards — so the check still has work to
-        // do, and this is the shortest way to hand it that work.
-        for (position, o, d, date, offer) in [
-            (1, "AMS", "HKG", "2026-09-19", "out"),
-            (2, "HKG", "NRT", "2026-09-15", "on"),
-        ] {
-            add.call(AddSegmentArgs {
-                trip: "Japan".into(),
-                origin: o.into(),
-                destination: d.into(),
-                departure_date: date.into(),
-                position: Some(position),
-                adults: None,
-                cabin_class: None,
-            })
-            .await
-            .unwrap();
-            park.call(AddOptionArgs {
-                trip: "Japan".into(),
-                position,
-                offer_id: offer.into(),
-                decided: None,
-            })
-            .await
-            .unwrap();
-        }
-        let view = ShowTripTool { store, account_id: 7 }
-            .call(ShowTripArgs { trip: Some("Japan".into()) })
-            .await
-            .unwrap();
-        let waiting = view.trips[0].not_ready.as_deref().expect("backwards dates are not ready");
+        // Built by hand rather than through the store: every store write
+        // ends in a reorder by date, so no sequence of tool calls can
+        // produce a backwards trip any more. The check stays as a defence
+        // over a slice somebody assembled themselves, and this is the
+        // shortest way to hand it that work.
+        let items = vec![
+            segment(1, "AMS", "HKG", "2026-09-19"),
+            segment(2, "HKG", "NRT", "2026-09-15"),
+        ];
+        let waiting = dates_run_forwards(&items).expect_err("backwards dates are not ready");
         assert!(waiting.contains("2026-09-15"), "got: {waiting}");
     }
 
@@ -2200,7 +2393,6 @@ mod tests {
                 origin: o.into(),
                 destination: d.into(),
                 departure_date: date.into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2256,7 +2448,6 @@ mod tests {
                 origin: o.into(),
                 destination: d.into(),
                 departure_date: date.into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2316,7 +2507,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "HKG".into(),
                 departure_date: "2026-09-15".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2346,7 +2536,6 @@ mod tests {
             origin: "AMS".into(),
             destination: "NRT".into(),
             departure_date: "2026-09-03".into(),
-            position: None,
             adults: None,
             cabin_class: None,
         })
@@ -2386,7 +2575,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "LIS".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2413,7 +2601,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2437,7 +2624,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2463,7 +2649,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2789,7 +2974,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2817,7 +3001,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "LIS".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2846,7 +3029,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2915,7 +3097,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -2989,7 +3170,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -3042,7 +3222,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -3097,7 +3276,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "LIS".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -3109,7 +3287,6 @@ mod tests {
                 origin: "LIS".into(),
                 destination: "AMS".into(),
                 departure_date: "2026-09-07".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -3176,7 +3353,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -3279,7 +3455,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -3413,7 +3588,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "LIS".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -3425,7 +3599,6 @@ mod tests {
                 origin: "LIS".into(),
                 destination: "FCO".into(),
                 departure_date: "2026-09-07".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -3574,7 +3747,6 @@ mod tests {
                 origin: "AMS".into(),
                 destination: "NRT".into(),
                 departure_date: "2026-09-03".into(),
-                position: None,
                 adults: None,
                 cabin_class: None,
             })
@@ -3612,5 +3784,153 @@ mod tests {
             "a Duffel-sourced match must never carry an invented booking link: {:?}",
             out.segments[0].booking
         );
+    }
+
+    // ---- items that are not flights -------------------------------------
+
+    fn flight_item(position: i64, origin: &str, destination: &str, date: &str, taken: Option<TripCandidate>) -> TripItem {
+        TripItem { candidates: taken.into_iter().collect(), ..segment(position, origin, destination, date) }
+    }
+
+    fn stay_item(position: i64, title: &str, date: &str) -> TripItem {
+        stay_item_priced(position, title, date, None)
+    }
+
+    fn stay_item_priced(position: i64, title: &str, date: &str, price: Option<(f64, &str)>) -> TripItem {
+        TripItem {
+            id: position,
+            position,
+            kind: "stay".to_string(),
+            title: title.to_string(),
+            place: None,
+            origin: None,
+            destination: None,
+            date: date.to_string(),
+            starts_at: None,
+            ends_at: None,
+            booked: false,
+            confirmation_code: None,
+            price: price.map(|(p, _)| p),
+            currency: price.map(|(_, c)| c.to_string()),
+            notes: None,
+            arrival_id: None,
+            candidates: Vec::new(),
+        }
+    }
+
+    fn chosen_departing(departing: &str) -> TripCandidate {
+        TripCandidate { arriving_at_local: None, ..chosen("KL1", "", departing) }
+    }
+
+    fn chosen_arriving(arriving: &str) -> TripCandidate {
+        TripCandidate { departing_at_local: None, ..chosen("KL1", arriving, "") }
+    }
+
+    #[test]
+    fn connection_notes_skip_the_stay_between_two_flights() {
+        // A hotel between landing and the next departure is not a gap in
+        // the flying; the check runs on consecutive flights.
+        let items = vec![
+            flight_item(1, "AMS", "LIS", "2026-10-12", Some(chosen_arriving("2026-10-12T09:30:00"))),
+            stay_item(2, "Hotel", "2026-10-12"),
+            flight_item(3, "LIS", "AMS", "2026-10-19", Some(chosen_departing("2026-10-19T18:40:00"))),
+        ];
+        assert!(itinerary_notes(&items).is_empty(), "{:?}", itinerary_notes(&items));
+    }
+
+    #[test]
+    fn readiness_looks_at_flights_only() {
+        let items = vec![
+            flight_item(1, "AMS", "LIS", "2026-10-12", Some(chosen_departing("2026-10-12T07:15:00"))),
+            stay_item(2, "Hotel", "2026-10-12"),
+        ];
+        assert_eq!(ready_to_price(&items).unwrap().len(), 1);
+        let only_a_stay = vec![stay_item(1, "Hotel", "2026-10-12")];
+        assert!(ready_to_price(&only_a_stay).unwrap_err().contains("no flights"));
+    }
+
+    #[test]
+    fn a_priced_stay_is_a_fixed_cost_and_an_unpriced_one_is_listed() {
+        let items = vec![
+            stay_item_priced(1, "Hotel", "2026-10-12", Some((320.0, "EUR"))),
+            stay_item_priced(2, "Museum", "2026-10-13", None),
+        ];
+        let (fixed, unpriced) = fixed_costs(&items);
+        assert_eq!(
+            fixed,
+            vec![FixedCost { position: 1, title: "Hotel".into(), price: 320.0, currency: "EUR".into() }]
+        );
+        assert_eq!(unpriced, vec!["Museum".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn add_trip_item_puts_a_stay_on_the_trip_and_refuses_a_flight() {
+        let (store, _dir) = setup();
+        let tool = AddTripItemTool { store: store.clone(), account_id: 7, conversation_id: 1 };
+        let view = tool
+            .call(AddItemArgs {
+                trip: "Lisbon".into(),
+                kind: "stay".into(),
+                title: "Hotel Alfama".into(),
+                place: Some("Lisbon".into()),
+                date: "2026-10-12".into(),
+                time: None,
+                end_date: Some("2026-10-15".into()),
+                notes: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.trip.items[0].kind, "stay");
+        assert_eq!(view.trip.items[0].ends_at.as_deref(), Some("2026-10-15"));
+        assert!(!view.trip.items[0].booked, "the model does not invent a confirmation");
+        let err = tool
+            .call(AddItemArgs {
+                trip: "Lisbon".into(),
+                kind: "flight".into(),
+                title: "AMS → LIS".into(),
+                place: None,
+                date: "2026-10-12".into(),
+                time: None,
+                end_date: None,
+                notes: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("add_trip_segment"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn options_are_refused_on_a_stay_with_a_sentence() {
+        let (store, _dir) = setup();
+        let trip = store.upsert_trip(7, "Lisbon", None, None, None).unwrap();
+        store
+            .add_item(
+                trip.id,
+                NewItem {
+                    kind: "stay".into(),
+                    title: "Hotel".into(),
+                    place: None,
+                    date: "2026-10-12".into(),
+                    starts_at: None,
+                    ends_at: None,
+                    notes: None,
+                    booked: false,
+                    confirmation_code: None,
+                    price: None,
+                    currency: None,
+                    arrival_id: None,
+                },
+            )
+            .unwrap();
+        let tool = ChooseTripOptionTool { store: store.clone(), account_id: 7 };
+        let err = tool
+            .call(ChooseOptionArgs { trip: "Lisbon".into(), position: 1, candidate: 1 })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a stay"), "got: {err}");
     }
 }

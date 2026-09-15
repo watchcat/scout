@@ -12,6 +12,11 @@ use std::sync::{Arc, Mutex};
 /// would otherwise be retried against forever.
 pub const MIRROR_ATTEMPTS: i64 = 5;
 
+/// How many times the extractor is pointed at one mail before it is left
+/// as failed. Same reasoning as `MIRROR_ATTEMPTS`: nothing bounds a mail
+/// the model keeps choking on except this.
+pub const MAIL_ATTEMPTS: i64 = 3;
+
 /// Bytes of a tool result kept on a trace row. A flight search is a few
 /// thousand characters; a fetched page can be far more, and the page is
 /// not what anyone reads a trace for.
@@ -201,7 +206,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- Whether this person sees a Trace under each answer in the browser.
     -- Only an admin can turn it on; the flag lives here so it survives a
     -- restart and a new tab alike.
-    debug      BOOLEAN NOT NULL DEFAULT false
+    debug      BOOLEAN NOT NULL DEFAULT false,
+    -- The local part of this person's booking address, lowercase; NULL
+    -- until they pick one. Unique by the check in `set_handle`, not by an
+    -- index: DuckDB indexes and row updates do not mix, and these rows are
+    -- updated. Last, so a migrated database has the same column order.
+    handle     TEXT
 );
 -- One row per way of proving you are that account. `kind` is 'telegram'
 -- today; a web login is a second kind. The primary key is what stops one
@@ -335,6 +345,67 @@ CREATE TABLE IF NOT EXISTS run_traces (
     detail      TEXT,
     result      TEXT,
     truncated   BOOLEAN NOT NULL DEFAULT false
+);
+CREATE SEQUENCE IF NOT EXISTS inbound_mail_id_seq;
+-- One row per email received at a booking address, as delivered. The body
+-- is what the extractor reads; `status` walks new -> extracting -> done or
+-- failed, and `attempts` bounds the retries the way `outbox` does.
+CREATE TABLE IF NOT EXISTS inbound_mail (
+    id           BIGINT PRIMARY KEY DEFAULT nextval('inbound_mail_id_seq'),
+    account_id   BIGINT NOT NULL,
+    -- The provider's message id, so a redelivery is a no-op.
+    provider_id  TEXT NOT NULL UNIQUE,
+    from_address TEXT NOT NULL,
+    subject      TEXT,
+    text         TEXT,
+    html         TEXT,
+    truncated    BOOLEAN NOT NULL DEFAULT false,
+    received_at  TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    status       TEXT NOT NULL DEFAULT 'new',
+    attempts     BIGINT NOT NULL DEFAULT 0,
+    forwarded_at TIMESTAMP,
+    error        TEXT
+);
+CREATE SEQUENCE IF NOT EXISTS attachments_id_seq;
+-- A file that came with a mail. `item_id` is set once the booking is added
+-- to a trip, and is what keeps the file when the mail is swept.
+CREATE TABLE IF NOT EXISTS attachments (
+    id       BIGINT PRIMARY KEY DEFAULT nextval('attachments_id_seq'),
+    mail_id  BIGINT NOT NULL,
+    item_id  BIGINT,
+    filename TEXT NOT NULL,
+    mime     TEXT NOT NULL,
+    bytes    BLOB,
+    text     TEXT
+);
+CREATE SEQUENCE IF NOT EXISTS arrivals_id_seq;
+-- What the extractor read out of a mail. A booking waits here as `pending`
+-- until its owner adds it to a trip or ignores it; a non-booking is only
+-- ever listed under Other mail.
+CREATE TABLE IF NOT EXISTS arrivals (
+    id                BIGINT PRIMARY KEY DEFAULT nextval('arrivals_id_seq'),
+    account_id        BIGINT NOT NULL,
+    mail_id           BIGINT NOT NULL,
+    booking           BOOLEAN NOT NULL,
+    kind              TEXT,
+    title             TEXT,
+    place             TEXT,
+    origin            TEXT,
+    destination       TEXT,
+    date              TEXT,
+    starts_at         TEXT,
+    ends_at           TEXT,
+    timezone          TEXT,
+    confirmation_code TEXT,
+    price             DOUBLE,
+    currency          TEXT,
+    travellers        TEXT,
+    confidence        DOUBLE,
+    summary           TEXT NOT NULL,
+    trip_id           BIGINT,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    item_id           BIGINT,
+    decided_at        TIMESTAMP
 );
 "#;
 
@@ -1037,6 +1108,39 @@ fn step_15_reorder_items(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The booking address: a handle on the account, and the mail, files and
+/// readings it brings in. `IF NOT EXISTS` throughout, for the fixture
+/// pattern step 10 documents.
+const STEP_16_INBOX: &str = r#"
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS handle TEXT;
+CREATE SEQUENCE IF NOT EXISTS inbound_mail_id_seq;
+CREATE TABLE IF NOT EXISTS inbound_mail (
+    id BIGINT PRIMARY KEY DEFAULT nextval('inbound_mail_id_seq'),
+    account_id BIGINT NOT NULL, provider_id TEXT NOT NULL UNIQUE,
+    from_address TEXT NOT NULL, subject TEXT, text TEXT, html TEXT,
+    truncated BOOLEAN NOT NULL DEFAULT false,
+    received_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    status TEXT NOT NULL DEFAULT 'new', attempts BIGINT NOT NULL DEFAULT 0,
+    forwarded_at TIMESTAMP, error TEXT
+);
+CREATE SEQUENCE IF NOT EXISTS attachments_id_seq;
+CREATE TABLE IF NOT EXISTS attachments (
+    id BIGINT PRIMARY KEY DEFAULT nextval('attachments_id_seq'),
+    mail_id BIGINT NOT NULL, item_id BIGINT, filename TEXT NOT NULL, mime TEXT NOT NULL,
+    bytes BLOB, text TEXT
+);
+CREATE SEQUENCE IF NOT EXISTS arrivals_id_seq;
+CREATE TABLE IF NOT EXISTS arrivals (
+    id BIGINT PRIMARY KEY DEFAULT nextval('arrivals_id_seq'),
+    account_id BIGINT NOT NULL, mail_id BIGINT NOT NULL, booking BOOLEAN NOT NULL,
+    kind TEXT, title TEXT, place TEXT, origin TEXT, destination TEXT, date TEXT,
+    starts_at TEXT, ends_at TEXT, timezone TEXT, confirmation_code TEXT,
+    price DOUBLE, currency TEXT, travellers TEXT, confidence DOUBLE,
+    summary TEXT NOT NULL, trip_id BIGINT, status TEXT NOT NULL DEFAULT 'pending',
+    item_id BIGINT, decided_at TIMESTAMP
+);
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -1054,6 +1158,7 @@ fn steps() -> Vec<(i64, Step)> {
         (13, Step::Sql(STEP_13_DEBUG_NOT_NULL)),
         (14, Step::Sql(STEP_14_TRIP_ITEMS)),
         (15, Step::Code(step_15_reorder_items)),
+        (16, Step::Sql(STEP_16_INBOX)),
     ]
 }
 
@@ -1160,6 +1265,45 @@ pub struct ThreadRow {
     pub pinned: bool,
     /// RFC 3339, UTC.
     pub updated_at: String,
+}
+
+/// A mail the extractor should read next, with enough of its state to
+/// decide whether this is a retry and whether the owner already has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailToWork {
+    pub id: i64,
+    pub account_id: i64,
+    pub provider_id: String,
+    pub from: String,
+    pub subject: Option<String>,
+    pub text: Option<String>,
+    pub html: Option<String>,
+    pub attempts: i64,
+    pub forwarded: bool,
+}
+
+/// The extractor's reading of one mail: everything `arrivals` takes from
+/// the caller. The rest of the row — owner, status, the decision — is the
+/// store's.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NewArrival {
+    pub booking: bool,
+    pub kind: Option<String>,
+    pub title: Option<String>,
+    pub place: Option<String>,
+    pub origin: Option<String>,
+    pub destination: Option<String>,
+    pub date: Option<String>,
+    pub starts_at: Option<String>,
+    pub ends_at: Option<String>,
+    pub timezone: Option<String>,
+    pub confirmation_code: Option<String>,
+    pub price: Option<f64>,
+    pub currency: Option<String>,
+    pub travellers: Option<String>,
+    pub confidence: Option<f64>,
+    pub summary: String,
+    pub trip_id: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -3895,6 +4039,351 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
     })
 }
 
+/// The columns `arrival_row` reads, joined to the mail for its date and to
+/// the trip for its name. One list, so the two readers cannot drift.
+const ARRIVAL_COLUMNS: &str =
+    "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination, a.date,
+     a.starts_at, a.ends_at, a.confirmation_code, a.price, a.currency, a.confidence, a.summary,
+     a.trip_id, t.name, a.status, m.received_at::TEXT
+     FROM arrivals a
+     JOIN inbound_mail m ON m.id = a.mail_id
+     LEFT JOIN trips t ON t.id = a.trip_id";
+
+/// Everything but the attachments, which need a second query per row.
+fn arrival_row(r: &Row) -> duckdb::Result<scout_api::Arrival> {
+    Ok(scout_api::Arrival {
+        id: r.get(0)?, mail_id: r.get(1)?, booking: r.get(2)?, kind: r.get(3)?, title: r.get(4)?,
+        place: r.get(5)?, origin: r.get(6)?, destination: r.get(7)?, date: r.get(8)?,
+        starts_at: r.get(9)?, ends_at: r.get(10)?, confirmation_code: r.get(11)?, price: r.get(12)?,
+        currency: r.get(13)?, confidence: r.get(14)?, summary: r.get(15)?, trip_id: r.get(16)?,
+        trip_name: r.get(17)?, status: r.get(18)?, received_at: r.get(19)?, attachments: Vec::new(),
+    })
+}
+
+fn attachments_of(conn: &Connection, mail_id: i64) -> duckdb::Result<Vec<scout_api::AttachmentRef>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, filename, mime, CAST(coalesce(octet_length(bytes), 0) AS BIGINT)
+         FROM attachments WHERE mail_id = ? ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![mail_id], |r| {
+        Ok(scout_api::AttachmentRef { id: r.get(0)?, filename: r.get(1)?, mime: r.get(2)?, size: r.get(3)? })
+    })?;
+    rows.collect()
+}
+
+/// A wall-clock cutoff computed here rather than as `TIMESTAMP - INTERVAL`
+/// in SQL, for the reason `issue_login_token` documents at length.
+fn days_ago(days: i64) -> String {
+    (chrono::Utc::now().naive_utc() - chrono::Duration::days(days)).to_string()
+}
+
+/// A booking that is still waiting on its owner. Only a booking waits: a
+/// non-booking is born decided, so this is the one condition both the
+/// inbox and the sweep read as "undecided".
+const UNDECIDED: &str = "a.booking AND a.status = 'pending'";
+
+// `mod store` is private, so until `inbox` exists nothing reaches these and
+// the compiler is right that they are dead. Allowed here rather than
+// `#[cfg(test)]` on each, because the caller is the next commit, not a
+// maybe. Drop the attribute with it.
+#[allow(dead_code)]
+impl Store {
+    /// Claims `handle` for the account; `false` when another account holds
+    /// it. The check and the write share the lock, and that is the whole
+    /// uniqueness guarantee — see the column's comment for why there is no
+    /// index. Case is the caller's job.
+    pub fn set_handle(&self, account_id: i64, handle: &str) -> Result<bool> {
+        let conn = self.conn();
+        let taken: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM accounts WHERE handle = ? AND id <> ?",
+                params![handle, account_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Ok(false);
+        }
+        conn.execute("UPDATE accounts SET handle = ? WHERE id = ?", params![handle, account_id])?;
+        Ok(true)
+    }
+
+    pub fn handle_of(&self, account_id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row("SELECT handle FROM accounts WHERE id = ?", params![account_id], |r| r.get(0))
+            .optional()?
+            .flatten())
+    }
+
+    pub fn account_for_handle(&self, handle: &str) -> Result<Option<i64>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row("SELECT id FROM accounts WHERE handle = ?", params![handle], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The address this person signed in with, if they ever did — where a
+    /// forwarded mail goes.
+    pub fn email_of(&self, account_id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT external_id FROM identities WHERE account_id = ? AND kind = 'email'
+                 ORDER BY created_at, external_id LIMIT 1",
+                params![account_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Stores a delivered mail; `None` when this `provider_id` has been
+    /// seen, which a provider's retry makes routine. Checked under the lock
+    /// rather than caught from the UNIQUE index, because a redelivery is
+    /// not an error and should not read like one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_mail(
+        &self,
+        account_id: i64,
+        provider_id: &str,
+        from: &str,
+        subject: Option<&str>,
+        text: Option<&str>,
+        html: Option<&str>,
+        truncated: bool,
+    ) -> Result<Option<i64>> {
+        let conn = self.conn();
+        let seen: Option<i64> = conn
+            .query_row("SELECT id FROM inbound_mail WHERE provider_id = ?", params![provider_id], |r| r.get(0))
+            .optional()?;
+        if seen.is_some() {
+            return Ok(None);
+        }
+        let id = conn.query_row(
+            "INSERT INTO inbound_mail (account_id, provider_id, from_address, subject, text, html, truncated)
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            params![account_id, provider_id, from, subject, text, html, truncated],
+            |r| r.get(0),
+        )?;
+        Ok(Some(id))
+    }
+
+    /// Mail the extractor has not finished with, oldest first so a burst
+    /// is read in the order it came.
+    pub fn mail_to_work(&self, limit: usize) -> Result<Vec<MailToWork>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, provider_id, from_address, subject, text, html, attempts,
+                    forwarded_at IS NOT NULL
+             FROM inbound_mail
+             WHERE status IN ('new', 'extracting') AND attempts < ?
+             ORDER BY received_at, id LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![MAIL_ATTEMPTS, limit as i64], |r| {
+            Ok(MailToWork {
+                id: r.get(0)?, account_id: r.get(1)?, provider_id: r.get(2)?, from: r.get(3)?,
+                subject: r.get(4)?, text: r.get(5)?, html: r.get(6)?, attempts: r.get(7)?,
+                forwarded: r.get(8)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Counted before the model is called, not after, so a crash mid-call
+    /// still spends an attempt.
+    pub fn mail_attempted(&self, id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE inbound_mail SET attempts = attempts + 1, status = 'extracting' WHERE id = ?",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mail_done(&self, id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE inbound_mail SET status = 'done', error = NULL WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    pub fn mail_failed(&self, id: i64, error: &str) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE inbound_mail SET status = 'failed', error = ? WHERE id = ?", params![error, id])?;
+        Ok(())
+    }
+
+    pub fn mail_forwarded(&self, id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE inbound_mail SET forwarded_at = now() WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    pub fn insert_attachment(
+        &self,
+        mail_id: i64,
+        filename: &str,
+        mime: &str,
+        bytes: Option<Vec<u8>>,
+        text: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn();
+        Ok(conn.query_row(
+            "INSERT INTO attachments (mail_id, filename, mime, bytes, text)
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
+            params![mail_id, filename, mime, bytes, text],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn attachments_of_mail(&self, mail_id: i64) -> Result<Vec<scout_api::AttachmentRef>> {
+        let conn = self.conn();
+        Ok(attachments_of(&conn, mail_id)?)
+    }
+
+    /// `(mail_id, item_id, filename, mime, bytes)`.
+    #[allow(clippy::type_complexity)]
+    pub fn attachment(&self, id: i64) -> Result<Option<(i64, Option<i64>, String, String, Option<Vec<u8>>)>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT mail_id, item_id, filename, mime, bytes FROM attachments WHERE id = ?",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?)
+    }
+
+    /// Whose file this is, by way of the mail it came with: an attachment
+    /// has no owner of its own, so a download has to ask here.
+    pub fn attachment_owner(&self, id: i64) -> Result<Option<i64>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT m.account_id FROM attachments a JOIN inbound_mail m ON m.id = a.mail_id WHERE a.id = ?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn attach_to_item(&self, attachment_id: i64, item_id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE attachments SET item_id = ? WHERE id = ?", params![item_id, attachment_id])?;
+        Ok(())
+    }
+
+    pub fn insert_arrival(&self, account_id: i64, mail_id: i64, a: &NewArrival) -> Result<i64> {
+        let conn = self.conn();
+        Ok(conn.query_row(
+            "INSERT INTO arrivals (account_id, mail_id, booking, kind, title, place, origin, destination,
+                                   date, starts_at, ends_at, timezone, confirmation_code, price, currency,
+                                   travellers, confidence, summary, trip_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            params![
+                account_id, mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
+                a.date, a.starts_at, a.ends_at, a.timezone, a.confirmation_code, a.price, a.currency,
+                a.travellers, a.confidence, a.summary, a.trip_id
+            ],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The arrival, if it is this account's. The owner is part of the key
+    /// on purpose: an id from the page is not proof of anything.
+    pub fn arrival_of(&self, id: i64, account_id: i64) -> Result<Option<scout_api::Arrival>> {
+        let conn = self.conn();
+        let found = conn
+            .query_row(
+                &format!("SELECT {ARRIVAL_COLUMNS} WHERE a.id = ? AND a.account_id = ?"),
+                params![id, account_id],
+                arrival_row,
+            )
+            .optional()?;
+        match found {
+            Some(mut arrival) => {
+                arrival.attachments = attachments_of(&conn, arrival.mail_id)?;
+                Ok(Some(arrival))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Records the owner's decision. `item_id` is the trip item an added
+    /// booking became; `None` for the other outcomes.
+    pub fn set_arrival_status(&self, id: i64, status: &str, item_id: Option<i64>) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE arrivals SET status = ?, item_id = ?, decided_at = now() WHERE id = ?",
+            params![status, item_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// What the Trips tab shows of the inbox: bookings still waiting, then
+    /// the last month of everything that is not one. `handle` and `domain`
+    /// are the caller's — the store knows neither the address's domain nor
+    /// how the handle should read.
+    pub fn inbox_view(&self, account_id: i64) -> Result<scout_api::InboxView> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ARRIVAL_COLUMNS} WHERE a.account_id = ? AND {UNDECIDED}
+             ORDER BY m.received_at DESC, a.id DESC"
+        ))?;
+        let mut pending: Vec<scout_api::Arrival> =
+            stmt.query_map(params![account_id], arrival_row)?.collect::<duckdb::Result<_>>()?;
+        for arrival in &mut pending {
+            arrival.attachments = attachments_of(&conn, arrival.mail_id)?;
+        }
+        // One arrival per mail is the worker's invariant; the join leans on
+        // it. The reasons are ranked: unreadable mail has no arrival, and a
+        // non-booking is that before it is anything else.
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.from_address, m.subject, m.received_at::TEXT, m.forwarded_at IS NOT NULL, a.id,
+                    CASE WHEN m.status = 'failed' THEN 'failed'
+                         WHEN NOT a.booking THEN 'not_booking'
+                         ELSE 'ignored' END
+             FROM inbound_mail m LEFT JOIN arrivals a ON a.mail_id = m.id
+             WHERE m.account_id = ? AND m.received_at >= ?
+               AND (m.status = 'failed' OR (a.id IS NOT NULL AND (NOT a.booking OR a.status = 'ignored')))
+             ORDER BY m.received_at DESC, m.id DESC",
+        )?;
+        let mut other: Vec<scout_api::MailRow> = stmt
+            .query_map(params![account_id, days_ago(30)], |r| {
+                Ok(scout_api::MailRow {
+                    mail_id: r.get(0)?, from: r.get(1)?, subject: r.get(2)?, received_at: r.get(3)?,
+                    forwarded: r.get(4)?, arrival_id: r.get(5)?, reason: r.get(6)?, attachments: Vec::new(),
+                })
+            })?
+            .collect::<duckdb::Result<_>>()?;
+        for row in &mut other {
+            row.attachments = attachments_of(&conn, row.mail_id)?;
+        }
+        Ok(scout_api::InboxView { handle: None, domain: String::new(), pending, other })
+    }
+
+    /// Forgets mail older than `days`, with its reading and its loose files.
+    /// Kept regardless of age: a mail whose booking nobody has decided on
+    /// yet, and any file that has become part of a trip item. Returns the
+    /// mail rows deleted.
+    pub fn sweep_inbox(&self, days: i64) -> Result<usize> {
+        let cutoff = days_ago(days);
+        let conn = self.conn();
+        // The one definition of "sweepable" the three deletes share; the
+        // mail goes last so a crash between them leaves nothing orphaned
+        // that the next sweep will not find again.
+        let sweepable = format!(
+            "SELECT m.id FROM inbound_mail m WHERE m.received_at < ?
+               AND NOT EXISTS (SELECT 1 FROM arrivals a WHERE a.mail_id = m.id AND {UNDECIDED})"
+        );
+        conn.execute(
+            &format!("DELETE FROM attachments WHERE item_id IS NULL AND mail_id IN ({sweepable})"),
+            params![cutoff],
+        )?;
+        conn.execute(&format!("DELETE FROM arrivals WHERE mail_id IN ({sweepable})"), params![cutoff])?;
+        Ok(conn.execute(&format!("DELETE FROM inbound_mail WHERE id IN ({sweepable})"), params![cutoff])?)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -4250,7 +4739,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 15);
+        assert_eq!(s.schema_version().unwrap(), 16);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -4314,7 +4803,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), 16);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -6222,7 +6711,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), 16);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -6880,7 +7369,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 15, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 16, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -6921,7 +7410,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 15);
+        assert_eq!(s.schema_version().unwrap(), 16);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -7408,7 +7897,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), 16);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -7499,5 +7988,167 @@ CREATE TABLE messages (
         assert!(store.trace_of(ids[4], me).unwrap().is_some());
         let rows: i64 = store.conn().query_row("SELECT count(*) FROM run_traces", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 2, "rows go with their runs");
+    }
+
+    #[test]
+    fn a_version_15_database_gains_the_inbox_tables_and_a_handle_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scout.duckdb");
+        {
+            let conn = duckdb::Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS).unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS arrivals; DROP TABLE IF EXISTS attachments; DROP TABLE IF EXISTS inbound_mail; ALTER TABLE accounts DROP COLUMN handle;").unwrap();
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.handle_of(1).unwrap(), None);
+    }
+
+    #[test]
+    fn a_handle_is_unique_lowercase_and_can_be_retired() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let b = store.account_for_telegram(2).unwrap();
+        assert!(store.set_handle(a, "sasha").unwrap(), "free");
+        assert!(!store.set_handle(b, "sasha").unwrap(), "taken");
+        assert_eq!(store.account_for_handle("sasha").unwrap(), Some(a));
+        assert!(store.set_handle(a, "sasha.k").unwrap(), "changed");
+        assert_eq!(store.account_for_handle("sasha").unwrap(), None, "retired, not redirected");
+        assert!(store.set_handle(b, "sasha").unwrap(), "free again");
+    }
+
+    fn mail(store: &Store, account: i64, provider_id: &str) -> i64 {
+        store.insert_mail(account, provider_id, "hotel@example.com", Some("Your booking"), Some("Check-in 12 Oct"), None, false).unwrap().expect("new")
+    }
+
+    #[test]
+    fn mail_is_stored_once_per_provider_id_and_worked_oldest_first() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let first = mail(&store, a, "re_1");
+        assert_eq!(store.insert_mail(a, "re_1", "x", None, None, None, false).unwrap(), None, "a redelivery is a no-op");
+        let second = mail(&store, a, "re_2");
+        let due = store.mail_to_work(10).unwrap();
+        assert_eq!(due.iter().map(|m| m.id).collect::<Vec<_>>(), vec![first, second]);
+        store.mail_attempted(first).unwrap();
+        store.mail_done(first).unwrap();
+        assert_eq!(store.mail_to_work(10).unwrap().len(), 1);
+        for _ in 0..3 { store.mail_attempted(second).unwrap(); }
+        store.mail_failed(second, "the model said no").unwrap();
+        assert!(store.mail_to_work(10).unwrap().is_empty(), "failed mail is not retried");
+    }
+
+    #[test]
+    fn an_arrival_moves_from_pending_to_added_or_ignored_and_is_read_by_its_owner() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let b = store.account_for_telegram(2).unwrap();
+        let m = mail(&store, a, "re_1");
+        let id = store.insert_arrival(a, m, &NewArrival {
+            booking: true, kind: Some("stay".into()), title: Some("Hotel Alfama".into()), place: Some("Lisbon".into()),
+            origin: None, destination: None, date: Some("2026-10-12".into()), starts_at: None, ends_at: Some("2026-10-15".into()),
+            timezone: None, confirmation_code: Some("ABC".into()), price: Some(320.0), currency: Some("EUR".into()),
+            travellers: None, confidence: Some(0.9), summary: "Hotel Alfama, 12–15 Oct".into(), trip_id: None,
+        }).unwrap();
+        let view = store.inbox_view(a).unwrap();
+        assert_eq!(view.pending.len(), 1);
+        assert_eq!(view.pending[0].title.as_deref(), Some("Hotel Alfama"));
+        assert!(store.inbox_view(b).unwrap().pending.is_empty());
+        assert!(store.arrival_of(id, b).unwrap().is_none(), "not theirs");
+        store.set_arrival_status(id, "ignored", None).unwrap();
+        let view = store.inbox_view(a).unwrap();
+        assert!(view.pending.is_empty());
+        assert_eq!(view.other[0].reason, "ignored");
+    }
+
+    #[test]
+    fn the_sweep_deletes_old_mail_but_keeps_an_attachment_that_belongs_to_an_item() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        let kept = store.insert_attachment(m, "ticket.pdf", "application/pdf", Some(b"%PDF".to_vec()), Some("Row 12")).unwrap();
+        let loose = store.insert_attachment(m, "logo.png", "image/png", Some(vec![1, 2]), None).unwrap();
+        store.attach_to_item(kept, 77).unwrap();
+        store.conn().execute("UPDATE inbound_mail SET received_at = received_at - INTERVAL 40 DAY WHERE id = ?", params![m]).unwrap();
+        let gone = store.sweep_inbox(30).unwrap();
+        assert_eq!(gone, 1, "one mail row");
+        assert!(store.attachment(kept).unwrap().is_some());
+        assert!(store.attachment(loose).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_pending_arrival_keeps_its_old_mail_through_the_sweep() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        let arrival = NewArrival {
+            booking: true, kind: None, title: None, place: None, origin: None, destination: None,
+            date: None, starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
+            price: None, currency: None, travellers: None, confidence: None, summary: "x".into(), trip_id: None,
+        };
+        let id = store.insert_arrival(a, m, &arrival).unwrap();
+        store.conn().execute("UPDATE inbound_mail SET received_at = received_at - INTERVAL 40 DAY WHERE id = ?", params![m]).unwrap();
+        assert_eq!(store.sweep_inbox(30).unwrap(), 0, "undecided, so kept");
+        assert!(store.arrival_of(id, a).unwrap().is_some());
+        store.set_arrival_status(id, "added", Some(5)).unwrap();
+        assert_eq!(store.sweep_inbox(30).unwrap(), 1);
+        assert!(store.arrival_of(id, a).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_inbox_view_lists_failed_mail_and_non_bookings_under_other() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let failed = mail(&store, a, "re_1");
+        store.mail_failed(failed, "unreadable").unwrap();
+        let spam = mail(&store, a, "re_2");
+        store.insert_attachment(spam, "logo.png", "image/png", Some(vec![1, 2, 3]), None).unwrap();
+        let arrival = NewArrival {
+            booking: false, kind: None, title: None, place: None, origin: None, destination: None,
+            date: None, starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
+            price: None, currency: None, travellers: None, confidence: None, summary: "A newsletter".into(), trip_id: None,
+        };
+        let id = store.insert_arrival(a, spam, &arrival).unwrap();
+        store.mail_forwarded(spam).unwrap();
+        let view = store.inbox_view(a).unwrap();
+        assert!(view.pending.is_empty(), "a non-booking never waits on the tab");
+        let reasons: Vec<(i64, &str)> = view.other.iter().map(|r| (r.mail_id, r.reason.as_str())).collect();
+        assert_eq!(reasons, vec![(spam, "not_booking"), (failed, "failed")], "newest first");
+        assert_eq!(view.other[0].arrival_id, Some(id));
+        assert!(view.other[0].forwarded);
+        assert_eq!(view.other[0].attachments[0].size, 3);
+        assert!(!view.other[1].forwarded);
+        assert_eq!(view.other[1].arrival_id, None);
+    }
+
+    #[test]
+    fn an_arrival_carries_its_trip_name_and_its_attachments() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        let m = mail(&store, a, "re_1");
+        let att = store.insert_attachment(m, "ticket.pdf", "application/pdf", None, Some("Row 12")).unwrap();
+        let arrival = NewArrival {
+            booking: true, kind: Some("flight".into()), title: None, place: None, origin: Some("AMS".into()), destination: Some("LIS".into()),
+            date: Some("2026-10-12".into()), starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
+            price: None, currency: None, travellers: None, confidence: None, summary: "AMS → LIS".into(), trip_id: Some(trip.id),
+        };
+        let id = store.insert_arrival(a, m, &arrival).unwrap();
+        let got = store.arrival_of(id, a).unwrap().expect("theirs");
+        assert_eq!(got.trip_name.as_deref(), Some("Lisbon"));
+        assert_eq!(got.attachments, vec![scout_api::AttachmentRef { id: att, filename: "ticket.pdf".into(), mime: "application/pdf".into(), size: 0 }]);
+        assert_eq!(store.attachment_owner(att).unwrap(), Some(a));
+        assert_eq!(store.attachments_of_mail(m).unwrap().len(), 1);
+        assert_eq!(store.attachment(att).unwrap().map(|(mail_id, item_id, _, _, bytes)| (mail_id, item_id, bytes)), Some((m, None, None)));
+    }
+
+    #[test]
+    fn email_of_is_the_address_the_account_signed_in_with() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        assert_eq!(store.email_of(a).unwrap(), None);
+        let b = store.account_for_identity("email", "sasha@example.com").unwrap();
+        assert_eq!(store.email_of(b).unwrap().as_deref(), Some("sasha@example.com"));
     }
 }

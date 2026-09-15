@@ -216,13 +216,17 @@ pub(crate) fn leg_ends(
 
 /// Reformats through the parsed date rather than returning the trimmed
 /// input: `chrono` accepts "2026-9-3", but `dates_run_forwards` compares
-/// `departure_date` as text, which only agrees with date order when every
-/// date is zero-padded. This is the one place that padding is established.
-pub(crate) fn calendar_date(value: &str) -> Result<String, StoreToolError> {
+/// `date` as text, which only agrees with date order when every date is
+/// zero-padded. This is the one place that padding is established.
+///
+/// `label` is the argument the caller was given the value under — a
+/// flight's `departure_date`, a stay's `date` or `end_date` — so the error
+/// sends the model to the field it actually passed, as `iata` does.
+pub(crate) fn calendar_date(label: &str, value: &str) -> Result<String, StoreToolError> {
     let date = value.trim();
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map(|d| d.format("%Y-%m-%d").to_string())
-        .map_err(|_| StoreToolError(format!("departure_date must be YYYY-MM-DD, not {value:?}")))
+        .map_err(|_| StoreToolError(format!("{label} must be YYYY-MM-DD, not {value:?}")))
 }
 
 /// The offer in `offers` that is the same itinerary as `candidate`, if it is
@@ -737,11 +741,10 @@ impl Tool for FinaliseTripTool {
                 // never quietly substituted for something else that matched
                 // the route.
                 notes.push(format!(
-                    "segment {} ({}→{}): {} is not sold on {} any more, so this trip has no \
+                    "segment {} ({}): {} is not sold on {} any more, so this trip has no \
                      current total. Search that route again and pick a replacement.",
                     segment.position,
-                    segment.origin.as_deref().unwrap_or(""),
-                    segment.destination.as_deref().unwrap_or(""),
+                    segment.route(),
                     chosen.flight_numbers,
                     segment.date
                 ));
@@ -906,7 +909,7 @@ impl Tool for AddTripSegmentTool {
         // Validated before anything is written, so a mistyped code cannot
         // leave a half-built trip behind.
         let (origin, destination) = leg_ends(&args.origin, &args.destination)?;
-        let date = calendar_date(&args.departure_date)?;
+        let date = calendar_date("departure_date", &args.departure_date)?;
 
         let store = self.store.clone();
         let account_id = self.account_id;
@@ -1044,12 +1047,12 @@ impl Tool for AddTripItemTool {
         }
         // Validated before anything is written, as in add_trip_segment: a
         // bad date must not leave a half-built trip behind.
-        let date = calendar_date(&args.date)?;
+        let date = calendar_date("date", &args.date)?;
         let starts_at = match &args.time {
             Some(t) => Some(format!("{date}T{}:00", local_time(t)?)),
             None => None,
         };
-        let ends_at = args.end_date.as_deref().map(calendar_date).transpose()?;
+        let ends_at = args.end_date.as_deref().map(|d| calendar_date("end_date", d)).transpose()?;
         let title = args.title.trim().to_string();
         if title.is_empty() {
             return Err(StoreToolError("an item needs a title — the hotel, the ticket, the train".to_string()));
@@ -1513,7 +1516,7 @@ impl Tool for UpdateTripSegmentTool {
         let origin = args.origin.as_deref().map(|o| iata("origin", o)).transpose()?;
         let destination =
             args.destination.as_deref().map(|d| iata("destination", d)).transpose()?;
-        let date = args.departure_date.as_deref().map(calendar_date).transpose()?;
+        let date = args.departure_date.as_deref().map(|d| calendar_date("departure_date", d)).transpose()?;
         if origin.is_none() && destination.is_none() && date.is_none() {
             return Err(StoreToolError(
                 "say what to change: origin, destination or departure_date".to_string(),
@@ -3784,6 +3787,53 @@ mod tests {
             "a Duffel-sourced match must never carry an invented booking link: {:?}",
             out.segments[0].booking
         );
+    }
+
+    #[test]
+    fn a_bad_date_names_the_field_it_was_given() {
+        // add_trip_item validates `date` and `end_date` with the same
+        // function add_trip_segment uses for `departure_date`; an error
+        // naming a field the model never passed sends it fixing the wrong
+        // argument.
+        let err = calendar_date("end_date", "2026-13-40").unwrap_err();
+        assert!(err.0.starts_with("end_date must be YYYY-MM-DD"), "got: {}", err.0);
+        let err = calendar_date("departure_date", "soon").unwrap_err();
+        assert!(err.0.starts_with("departure_date must be YYYY-MM-DD"), "got: {}", err.0);
+    }
+
+    #[tokio::test]
+    async fn add_trip_item_names_the_date_field_it_refused() {
+        let (store, _dir) = setup();
+        let tool = AddTripItemTool { store, account_id: 7, conversation_id: 1 };
+        let err = tool
+            .call(AddItemArgs {
+                trip: "Lisbon".into(),
+                kind: "stay".into(),
+                title: "Hotel".into(),
+                place: None,
+                date: "2026-10-12".into(),
+                time: None,
+                end_date: Some("15/10/2026".into()),
+                notes: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("end_date must be"), "got: {err}");
+    }
+
+    #[test]
+    fn a_local_time_is_zero_padded_and_anything_else_is_refused() {
+        // The sort compares starts_at as text, so "7:05" stored as typed
+        // would sort after "10:00"; the padding is what makes text order
+        // agree with clock order.
+        assert_eq!(local_time("7:05").unwrap(), "07:05");
+        assert_eq!(local_time(" 18:40 ").unwrap(), "18:40");
+        for bad in ["25:00", "07:05:00", "7pm", ""] {
+            let err = local_time(bad).unwrap_err();
+            assert!(err.0.starts_with("time must be HH:MM"), "{bad:?}: {}", err.0);
+        }
     }
 
     // ---- items that are not flights -------------------------------------

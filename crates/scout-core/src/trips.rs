@@ -229,7 +229,7 @@ pub async fn add_leg(
         Ok(ends) => ends,
         Err(e) => return Ok(LegEdit::Invalid(e.0)),
     };
-    let date = match crate::tools::trips::calendar_date(departure_date) {
+    let date = match crate::tools::trips::calendar_date("departure_date", departure_date) {
         Ok(date) => date,
         Err(e) => return Ok(LegEdit::Invalid(e.0)),
     };
@@ -285,7 +285,7 @@ pub async fn remove_leg(
         Err(e) => return Ok(LegEdit::Invalid(e.0)),
     };
     let date = match departure_date
-        .map(crate::tools::trips::calendar_date)
+        .map(|d| crate::tools::trips::calendar_date("departure_date", d))
         .transpose()
     {
         Ok(date) => date,

@@ -200,7 +200,8 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
             routes::auth::routes(auth.clone())
                 .merge(routes::account::routes(auth.clone()))
                 .merge(routes::chat::routes(auth.clone()))
-                .merge(routes::trips::routes(auth))
+                .merge(routes::trips::routes(auth.clone()))
+                .merge(routes::inbox::routes(auth))
                 .layer(axum::middleware::from_fn(security_headers)),
         ),
         None => public,
@@ -1075,6 +1076,60 @@ mod tests {
     pub(crate) async fn body_of(res: Response) -> String {
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
         String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    pub(crate) const DAY: i64 = 86_400;
+
+    /// `test_app`, with a round open so a sign-in can actually admit
+    /// someone rather than queuing them.
+    pub(crate) async fn test_app_with_a_round()
+        -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir)
+    {
+        let (app, core, dir) = test_app().await;
+        open_round(&core, "autumn", 5).await;
+        (app, core, dir)
+    }
+
+    /// The session cookie and CSRF token a signed-in page would carry.
+    pub(crate) fn signed_in(account_id: i64) -> (String, String) {
+        (
+            crate::session::mint(TEST_KEY, account_id, DAY),
+            crate::session::csrf_for(TEST_KEY, account_id),
+        )
+    }
+
+    /// A JSON `POST`, carrying a session cookie and — when given — the
+    /// `X-Scout-Csrf` header a real page would attach from its `<meta>` tag.
+    pub(crate) async fn post_json_with_cookie(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+        csrf: Option<&str>,
+        body: &str,
+    ) -> Response {
+        post_json_from_origin_opt(app, uri, session, csrf, "https://example.com", body).await
+    }
+
+    /// The same JSON `POST`, naming the `Origin` a caller wants sent — so a
+    /// test can exercise `only_from_our_own_pages` from outside it.
+    pub(crate) async fn post_json_from_origin_opt(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+        csrf: Option<&str>,
+        origin: &str,
+        body: &str,
+    ) -> Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("origin", origin)
+            .header("cookie", format!("{}={session}", crate::session::COOKIE));
+        if let Some(csrf) = csrf {
+            req = req.header("x-scout-csrf", csrf);
+        }
+        app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap()
     }
 
     #[tokio::test]

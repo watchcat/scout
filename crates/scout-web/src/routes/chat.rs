@@ -998,18 +998,6 @@ mod tests {
     }
     use axum::http::StatusCode;
 
-    const DAY: i64 = 86_400;
-
-    /// `test_app`, with a round open so a sign-in can actually admit
-    /// someone rather than queuing them.
-    async fn test_app_with_a_round()
-        -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir)
-    {
-        let (app, core, dir) = test_app().await;
-        open_round(&core, "autumn", 5).await;
-        (app, core, dir)
-    }
-
     /// Seeds a two-message exchange under the `"direct"` scope, the same
     /// scope `/chat` reads from.
     ///
@@ -1245,18 +1233,6 @@ mod tests {
         assert!(body.contains(r#""You""#), "the role is not on the wire: {body}");
     }
 
-    /// A JSON `POST`, carrying a session cookie and — when given — the
-    /// `X-Scout-Csrf` header a real page would attach from its `<meta>` tag.
-    async fn post_json_with_cookie(
-        app: &axum::Router,
-        uri: &str,
-        session: &str,
-        csrf: Option<&str>,
-        body: &str,
-    ) -> axum::response::Response {
-        post_json_from_origin_opt(app, uri, session, csrf, "https://example.com", body).await
-    }
-
     /// The same JSON `POST`, but naming the `Origin` a caller wants sent —
     /// so a test can exercise `only_from_our_own_pages` from outside it.
     async fn post_json_from_origin(
@@ -1268,39 +1244,6 @@ mod tests {
         body: &str,
     ) -> axum::response::Response {
         post_json_from_origin_opt(app, uri, session, Some(csrf), origin, body).await
-    }
-
-    async fn post_json_from_origin_opt(
-        app: &axum::Router,
-        uri: &str,
-        session: &str,
-        csrf: Option<&str>,
-        origin: &str,
-        body: &str,
-    ) -> axum::response::Response {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let mut req = axum::http::Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("origin", origin)
-            .header("cookie", format!("{}={session}", crate::session::COOKIE));
-        if let Some(csrf) = csrf {
-            req = req.header("x-scout-csrf", csrf);
-        }
-        let req: Request<Body> = req.body(Body::from(body.to_string())).unwrap();
-        app.clone().oneshot(req).await.unwrap()
-    }
-
-    /// The session cookie and CSRF token a signed-in page would carry.
-    fn signed_in(account_id: i64) -> (String, String) {
-        (
-            crate::session::mint(TEST_KEY, account_id, DAY),
-            crate::session::csrf_for(TEST_KEY, account_id),
-        )
     }
 
     /// A fresh, empty thread under the `"direct"` scope — what pressing

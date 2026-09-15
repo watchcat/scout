@@ -142,8 +142,9 @@ impl AuthConfig {
             resend_base_url: set("RESEND_BASE_URL")
                 .map(|u| u.trim().trim_end_matches('/').to_string())
                 .unwrap_or_else(|| "https://api.resend.com".to_string()),
-            // Lowercased once here, so the webhook's comparison against
-            // the address it was given can lowercase that side only.
+            // Lowercased so the value printed on the account page and in
+            // links is one spelling; the webhook's comparison is
+            // case-insensitive regardless.
             inbox_domain: set("INBOX_DOMAIN")
                 .map(|d| d.trim().to_lowercase())
                 .unwrap_or_else(|| "goodscout.fyi".to_string()),

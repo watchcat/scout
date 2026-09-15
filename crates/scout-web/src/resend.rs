@@ -41,7 +41,8 @@ pub struct Meta {
 /// Every field but `from` is optional because Resend's shape has been seen
 /// to omit an empty one rather than send `null`, and a forward that fails
 /// to parse because a mail had no subject is a mail nobody gets.
-#[derive(Debug, Clone, Deserialize)]
+/// No `Debug`: a mail body in a log is a mail body in a log.
+#[derive(Clone, Deserialize)]
 pub struct Received {
     #[serde(default)]
     pub from: String,
@@ -74,7 +75,8 @@ pub struct AttachmentMeta {
 /// A message to send. `attachments` are `(filename, bytes)`; the client
 /// base64s them, since that is a fact about Resend's wire format and not
 /// about the mail.
-#[derive(Debug, Clone)]
+/// No `Debug`, as for `Received`.
+#[derive(Clone)]
 pub struct Outgoing {
     pub from: String,
     pub to: String,
@@ -102,7 +104,21 @@ struct Page {
 /// thousand files to a booking.
 const MOST_PAGES: usize = 20;
 
+/// An id fit for a path. Resend's are `re_…`, `att_…` or UUIDs; anything
+/// else — a slash, a query, a fragment — would address a different
+/// endpoint with our key on the request.
+fn path_id(id: &str) -> anyhow::Result<&str> {
+    let plain = !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !plain {
+        anyhow::bail!("not a resend id");
+    }
+    Ok(id)
+}
+
 impl ResendClient {
+    /// `http` is the caller's: it should carry a timeout and a bounded
+    /// redirect policy, since `download` follows a URL the attachment
+    /// list named. `email::client` is the one built for this.
     pub fn new(http: reqwest::Client, api_key: String, base_url: String) -> Self {
         Self { http, api_key, base_url: base_url.trim_end_matches('/').to_string() }
     }
@@ -111,7 +127,7 @@ impl ResendClient {
     pub async fn received(&self, id: &str) -> anyhow::Result<Received> {
         let res = self
             .http
-            .get(format!("{}/emails/receiving/{id}", self.base_url))
+            .get(format!("{}/emails/receiving/{}", self.base_url, path_id(id)?))
             .bearer_auth(&self.api_key)
             .send()
             .await?;
@@ -121,7 +137,7 @@ impl ResendClient {
     /// `GET /emails/receiving/{id}/attachments`: every attachment with a
     /// URL to fetch it from, across pages if there are pages.
     pub async fn attachments(&self, id: &str) -> anyhow::Result<Vec<AttachmentMeta>> {
-        let url = format!("{}/emails/receiving/{id}/attachments", self.base_url);
+        let url = format!("{}/emails/receiving/{}/attachments", self.base_url, path_id(id)?);
         let mut all = Vec::new();
         let mut after: Option<String> = None;
         for _ in 0..MOST_PAGES {
@@ -139,7 +155,10 @@ impl ResendClient {
                 _ => return Ok(all),
             }
         }
-        anyhow::bail!("the attachment list did not end after {MOST_PAGES} pages")
+        // Past the bound, the same answer as the empty page: what was
+        // collected, not an error. A mail with more attachments than
+        // this is still a mail, and the forward carries what we saw.
+        Ok(all)
     }
 
     /// Fetches a pre-signed attachment URL, refusing anything over
@@ -153,12 +172,13 @@ impl ResendClient {
     /// given away.
     pub async fn download(&self, url: &str, cap_bytes: usize) -> anyhow::Result<Vec<u8>> {
         let res = accepted(self.http.get(url).send().await?, "downloading an attachment")?;
-        if let Some(len) = res.content_length() {
+        let stated = res.content_length();
+        if let Some(len) = stated {
             if len > cap_bytes as u64 {
                 anyhow::bail!("the attachment is {len} bytes, over the {cap_bytes}-byte cap");
             }
         }
-        let mut body = Vec::with_capacity(res.content_length().unwrap_or(0).min(cap_bytes as u64) as usize);
+        let mut body = Vec::with_capacity(stated.unwrap_or(0).min(cap_bytes as u64) as usize);
         let mut stream = res.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -293,6 +313,19 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("401"), "{text}");
         assert!(!text.contains("k-secret-echo"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_id_that_is_not_an_id_never_reaches_the_wire() {
+        // The id goes into a path. One with a slash or a query in it
+        // would address a different endpoint with our key attached.
+        let server = wiremock::MockServer::start().await;
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        for bad in ["re_1/../emails", "re_1?x=1", "re 1", "", "re_1#a"] {
+            assert!(client.received(bad).await.is_err(), "{bad:?}");
+            assert!(client.attachments(bad).await.is_err(), "{bad:?}");
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

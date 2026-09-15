@@ -285,7 +285,9 @@ pub async fn account_for_handle(core: &Core, raw: &str) -> anyhow::Result<Option
 }
 
 /// A delivered mail, as the webhook hands it over.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// No `Debug`: it carries the body, and a `{:?}` in an error path would
+/// put a mail in the log.
+#[derive(Clone, PartialEq, Eq)]
 pub struct MailIn {
     pub provider_id: String,
     pub from: String,

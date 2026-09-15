@@ -989,6 +989,9 @@ mod tests {
                 resend_api_key: "test-key".to_string(),
                 mail_from: "Scout <hello@example.com>".to_string(),
                 base_url: "https://example.com".to_string(),
+                resend_webhook_secret: None,
+                resend_base_url: "https://api.resend.com".to_string(),
+                inbox_domain: "goodscout.fyi".to_string(),
             },
             core.clone(),
         )
@@ -1005,18 +1008,6 @@ mod tests {
         let (app, core, dir) = test_app().await;
         open_round(&core, "autumn", 5).await;
         (app, core, dir)
-    }
-
-    /// Signs in a Telegram id against an open round and returns the
-    /// account id, panicking if the round had no room — every test that
-    /// calls this one wants a member, not a queued visitor.
-    async fn admitted(core: &scout_core::core::Core, telegram_id: &str) -> i64 {
-        let scout_core::identity::SignIn::In { account_id } =
-            scout_core::identity::sign_in(core, "telegram", telegram_id).await.unwrap()
-        else {
-            panic!("the round has room, so this should have admitted");
-        };
-        account_id
     }
 
     /// Seeds a two-message exchange under the `"direct"` scope, the same

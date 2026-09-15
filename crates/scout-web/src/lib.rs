@@ -11,9 +11,15 @@
 // same items two paths in from outside.
 mod cache;
 mod email;
+mod inbound;
 mod page;
 mod pages;
 mod ratelimit;
+// `pub` for the same interim reason the comment above describes: the
+// Resend client has no caller until the inbox worker (the next task) is
+// wired in, and dead-code analysis is about reachability. Narrow it to
+// `mod` when the worker calls it.
+pub mod resend;
 mod routes;
 mod session;
 mod telegram_login;
@@ -38,6 +44,16 @@ pub struct AuthConfig {
     pub resend_api_key: String,
     pub mail_from: String,
     pub base_url: String,
+    /// The signing secret Resend shows for the `email.received` webhook.
+    /// Optional, unlike the rest: the inbox is a feature a deployment may
+    /// not have set up — no receiving domain, no secret — and sign-in must
+    /// not go dark because of it. The route is mounted only when this is
+    /// set.
+    pub resend_webhook_secret: Option<String>,
+    /// Where the Resend API lives, so a test can stand in for it.
+    pub resend_base_url: String,
+    /// The domain after the `@` in every account's address.
+    pub inbox_domain: String,
 }
 
 /// The router's state for the signed-in half. The limiters live here, in
@@ -119,6 +135,18 @@ impl AuthConfig {
             resend_api_key: set("RESEND_API_KEY")?,
             mail_from: set("SCOUT_MAIL_FROM")?,
             base_url: set("SCOUT_BASE_URL")?,
+            resend_webhook_secret: set("RESEND_WEBHOOK_SECRET"),
+            // Trimmed of a trailing slash because the client joins paths
+            // onto it, and `https://api.resend.com//emails` is a different
+            // request from the one Resend documents.
+            resend_base_url: set("RESEND_BASE_URL")
+                .map(|u| u.trim().trim_end_matches('/').to_string())
+                .unwrap_or_else(|| "https://api.resend.com".to_string()),
+            // Lowercased once here, so the webhook's comparison against
+            // the address it was given can lowercase that side only.
+            inbox_domain: set("INBOX_DOMAIN")
+                .map(|d| d.trim().to_lowercase())
+                .unwrap_or_else(|| "goodscout.fyi".to_string()),
         })
     }
 }
@@ -142,7 +170,7 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         .as_ref()
         .and_then(|a| routes::origin_of(&a.cfg.base_url))
         .filter(|u| u.starts_with("https://"));
-    let public = Router::new()
+    let mut public = Router::new()
         .route("/", get(index))
         // Liveness only. Deliberately says nothing about the database: a
         // health check that fails when DuckDB is busy would take the site
@@ -154,6 +182,14 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         .route("/robots.txt", get(robots))
         .route("/sitemap.xml", get(sitemap))
         .with_state(Public { cache, session_key });
+    // On the public side, not the signed-in one: Resend posts here with no
+    // cookie, no `Origin` and no form token, so the CSRF layer would turn
+    // it away and the security headers would be sent to nobody. It has
+    // its own proof of who is calling — the signature — and is mounted
+    // only when there is a secret to check it against.
+    if let Some(state) = auth.as_ref().and_then(inbound::state_from) {
+        public = public.merge(inbound::routes(state));
+    }
 
     match auth {
         // The headers go on here rather than on the whole site because
@@ -659,6 +695,26 @@ mod tests {
         panic!("nothing was mailed");
     }
 
+    /// `test_app`, with the inbox switched on: `RESEND_WEBHOOK_SECRET` set
+    /// to this, so `POST /inbound/resend` is mounted.
+    pub(crate) async fn test_app_with_inbox(
+        secret: &str,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        build_app_full("https://example.com", None, crate::email::Mailer::Discard, Some(secret)).await
+    }
+
+    /// Signs in a Telegram id against an open round and returns the
+    /// account id, panicking if the round had no room — every test that
+    /// calls this one wants a member, not a queued visitor.
+    pub(crate) async fn admitted(core: &scout_core::core::Core, telegram_id: &str) -> i64 {
+        let scout_core::identity::SignIn::In { account_id } =
+            scout_core::identity::sign_in(core, "telegram", telegram_id).await.unwrap()
+        else {
+            panic!("the round has room, so this should have admitted");
+        };
+        account_id
+    }
+
     async fn build_app(
         return_url: Option<&str>,
         mailer: crate::email::Mailer,
@@ -672,6 +728,18 @@ mod tests {
         base_url: &str,
         return_url: Option<&str>,
         mailer: crate::email::Mailer,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        build_app_full(base_url, return_url, mailer, None).await
+    }
+
+    /// The whole harness, every knob exposed. The named wrappers above are
+    /// what tests call; this exists so there is one place that builds a
+    /// `Core` and an `AuthConfig` for all of them.
+    async fn build_app_full(
+        base_url: &str,
+        return_url: Option<&str>,
+        mailer: crate::email::Mailer,
+        webhook_secret: Option<&str>,
     ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("test.duckdb");
@@ -704,6 +772,9 @@ mod tests {
             resend_api_key: "test-key".to_string(),
             mail_from: "Scout <hello@example.com>".to_string(),
             base_url: base_url.to_string(),
+            resend_webhook_secret: webhook_secret.map(str::to_string),
+            resend_base_url: "https://api.resend.com".to_string(),
+            inbox_domain: "goodscout.fyi".to_string(),
         };
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
         // Never Resend: with the real mailer the sign-in tests fire an
@@ -1056,6 +1127,45 @@ mod tests {
                 assert!(cfg.is_none(), "{name}={blank:?} counted as configured");
             }
         }
+    }
+
+    #[test]
+    fn the_inbox_keys_are_optional_and_defaulted() {
+        // The three inbox keys must not join the all-or-nothing rule: a
+        // deployment without a receiving domain still signs people in.
+        let required = |k: &str| {
+            Some(match k {
+                "SCOUT_SESSION_KEY" => "a session key of at least 32 bytes".to_string(),
+                "TELEGRAM_BOT_TOKEN" | "RESEND_API_KEY" | "SCOUT_MAIL_FROM" | "SCOUT_BASE_URL" => "value".to_string(),
+                _ => return None,
+            })
+        };
+        let cfg = AuthConfig::from_lookup(required).expect("the inbox keys are not required");
+        assert_eq!(cfg.resend_webhook_secret, None);
+        assert_eq!(cfg.resend_base_url, "https://api.resend.com");
+        assert_eq!(cfg.inbox_domain, "goodscout.fyi");
+
+        let cfg = AuthConfig::from_lookup(|k: &str| match k {
+            "RESEND_WEBHOOK_SECRET" => Some("whsec_abc".to_string()),
+            // A trailing slash would double up against the paths the
+            // client joins on; a capital in the domain would never match
+            // the lowercased address the webhook compares it with.
+            "RESEND_BASE_URL" => Some("http://127.0.0.1:9/".to_string()),
+            "INBOX_DOMAIN" => Some("GoodScout.FYI".to_string()),
+            _ => required(k),
+        })
+        .unwrap();
+        assert_eq!(cfg.resend_webhook_secret.as_deref(), Some("whsec_abc"));
+        assert_eq!(cfg.resend_base_url, "http://127.0.0.1:9");
+        assert_eq!(cfg.inbox_domain, "goodscout.fyi");
+
+        // And blank means unset here as everywhere else.
+        let cfg = AuthConfig::from_lookup(|k: &str| match k {
+            "RESEND_WEBHOOK_SECRET" => Some("  ".to_string()),
+            _ => required(k),
+        })
+        .unwrap();
+        assert_eq!(cfg.resend_webhook_secret, None);
     }
 
     #[tokio::test]

@@ -462,7 +462,7 @@ fn client_bucket(headers: &HeaderMap) -> String {
     client_ip(headers).unwrap_or_else(|| NO_CLIENT_ADDRESS.to_string())
 }
 
-fn client_ip(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn client_ip(headers: &HeaderMap) -> Option<String> {
     let mut lines = headers.get_all("x-forwarded-for").iter();
     let raw = match lines.next_back() {
         Some(v) => v,

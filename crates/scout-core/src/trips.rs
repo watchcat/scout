@@ -23,7 +23,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    fn from_trip(trip: Trip, chat: Option<TripChat>) -> Self {
+    pub(crate) fn from_trip(trip: Trip, chat: Option<TripChat>) -> Self {
         let not_ready = crate::tools::trips::ready_to_price(&trip.items)
             .err()
             .or_else(|| crate::tools::trips::dates_run_forwards(&trip.items).err());

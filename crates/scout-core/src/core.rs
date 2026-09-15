@@ -31,6 +31,10 @@ pub struct Core {
     /// person admitted in the browser stayed a stranger at the gate until
     /// the next deploy.
     pub(crate) membership_wake: std::sync::Arc<tokio::sync::Notify>,
+    /// Woken when a mail has been stored for the extractor. The inbox
+    /// worker polls as a floor, like the mirror drain; this is what makes a
+    /// forwarded booking show up while the person is still looking.
+    pub(crate) inbox_wake: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// What a reorder reminder says, wherever it is delivered.
@@ -215,6 +219,7 @@ impl Core {
             deps,
             mirror_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             membership_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            inbox_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -299,6 +304,19 @@ impl Core {
     /// Resolves when something has been queued.
     pub async fn mirror_waiting(&self) {
         self.mirror_wake.notified().await;
+    }
+
+    /// A mail is waiting for the extractor. Wakes a worker that is asleep;
+    /// a permit is kept if none is listening yet, so a mail stored before
+    /// the worker started is read on its first pass.
+    pub fn wake_inbox(&self) {
+        self.inbox_wake.notify_one();
+    }
+
+    /// Resolves when a mail has been stored since the last time this
+    /// resolved.
+    pub async fn inbox_waiting(&self) {
+        self.inbox_wake.notified().await;
     }
 
     /// Membership changed where the bot could not see it. Wakes a watcher
@@ -517,6 +535,15 @@ impl Core {
                 Err(e) => tracing::warn!(error = %e, "could not trim the traces"),
             }
 
+            // Mail is somebody else's words kept on our disk, with their
+            // attachments; a month is long enough to decide on a booking
+            // and nothing else about an old mail is wanted.
+            match self.sweep_inbox().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(swept = n, "old mail dropped with its files"),
+                Err(e) => tracing::warn!(error = %e, "could not sweep the inbox"),
+            }
+
             match crate::backup::is_due(&dir) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -599,6 +626,18 @@ impl Core {
     async fn trim_traces(&self) -> anyhow::Result<usize> {
         let store = self.store();
         blocking(move || store.trim_traces(Self::TRACE_RUNS_KEEP)).await
+    }
+
+    /// How long a mail stays after it came, unless a booking in it is
+    /// still undecided. A window rather than a bound: the inbox view
+    /// shows the same month, so what the page cannot show is not kept.
+    const INBOX_KEEP_DAYS: i64 = 30;
+
+    /// Drops mail older than `INBOX_KEEP_DAYS` with its readings and loose
+    /// files. Returns how many mails went.
+    async fn sweep_inbox(&self) -> anyhow::Result<usize> {
+        let store = self.store();
+        blocking(move || store.sweep_inbox(Self::INBOX_KEEP_DAYS)).await
     }
 
     /// Turns a photo into a search description.
@@ -901,6 +940,15 @@ mod tests {
     fn maintenance_trims_traces_beside_the_message_logs() {
         let src = include_str!("core.rs");
         assert!(src.contains("trim_traces(Self::TRACE_RUNS_KEEP)"), "traces must be trimmed in maintenance");
+        assert!(src.contains("sweep_inbox(Self::INBOX_KEEP_DAYS)"), "old mail must be swept in maintenance");
+        // And from the loop itself, above the backup's `continue`, or the
+        // sweep would run on the one tick a day a backup is due.
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
+        let body = &src[start..];
+        let sweep = body.find("self.sweep_inbox()").expect("the sweep is never called from the loop");
+        let backup = body.find("backup::is_due").expect("the backup check must exist");
+        assert!(sweep < backup, "the sweep sits below the backup's continue and would run once a day");
     }
 
     #[test]

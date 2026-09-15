@@ -3331,6 +3331,28 @@ impl Store {
         load_trip(&conn, trip_id)
     }
 
+    /// Marks an item booked with what the confirmation said. Exists for
+    /// flights: `add_flight` builds a leg with no booking fields, because a
+    /// leg is normally planned before it is bought, and a forwarded ticket
+    /// is the one case where the buying came first. The caller has proven
+    /// the item is theirs, as `attach_to_item` demands.
+    pub fn book_item(
+        &self,
+        item_id: i64,
+        confirmation_code: Option<&str>,
+        price: Option<f64>,
+        currency: Option<&str>,
+        arrival_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE trip_items SET booked = true, confirmation_code = ?, price = ?, currency = ?, arrival_id = ?
+             WHERE id = ?",
+            params![confirmation_code, price, currency, arrival_id, item_id],
+        )?;
+        Ok(())
+    }
+
     /// Changes where or when one flight goes, leaving the rest alone.
     ///
     /// Returns the trip and how many parked options were dropped by the
@@ -4086,11 +4108,6 @@ fn days_ago(days: i64) -> String {
 /// inbox and the sweep read as "undecided".
 const UNDECIDED: &str = "a.booking AND a.status = 'pending'";
 
-// `mod store` is private, so until `inbox` exists nothing reaches these and
-// the compiler is right that they are dead. Allowed here rather than
-// `#[cfg(test)]` on each, because the caller is the next commit, not a
-// maybe. Drop the attribute with it.
-#[allow(dead_code)]
 impl Store {
     /// Claims `handle` for the account; `false` when another account holds
     /// it. The check and the write share the lock, and that is the whole
@@ -4222,6 +4239,29 @@ impl Store {
         Ok(())
     }
 
+    /// The body, fetched after the fact: the provider's webhook carries
+    /// the envelope and the content is a second call. Cut at `cap_chars`
+    /// characters — the model reads it, and a 4 MB newsletter is not a
+    /// booking — and `truncated` records that a cut happened, here or
+    /// on the way in, so the page can say the reading is of a part.
+    pub fn mail_body(&self, id: i64, text: Option<&str>, html: Option<&str>, cap_chars: usize) -> Result<()> {
+        let cut = |s: Option<&str>| -> (Option<String>, bool) {
+            match s {
+                Some(s) if s.chars().count() > cap_chars => (Some(s.chars().take(cap_chars).collect()), true),
+                Some(s) => (Some(s.to_string()), false),
+                None => (None, false),
+            }
+        };
+        let (text, text_cut) = cut(text);
+        let (html, html_cut) = cut(html);
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE inbound_mail SET text = ?, html = ?, truncated = truncated OR ? WHERE id = ?",
+            params![text, html, text_cut || html_cut, id],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_attachment(
         &self,
         mail_id: i64,
@@ -4286,6 +4326,28 @@ impl Store {
         let conn = self.conn();
         conn.execute("UPDATE attachments SET item_id = ? WHERE id = ?", params![item_id, attachment_id])?;
         Ok(())
+    }
+
+    /// `(filename, text)` for every attachment of a mail, in the order they
+    /// came: what the extractor reads alongside the body. A file with no
+    /// text (an image, a PDF nobody could read) is listed with `None` so
+    /// the model can still be told it exists.
+    pub fn attachment_texts_of(&self, mail_id: i64) -> Result<Vec<(String, Option<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT filename, text FROM attachments WHERE mail_id = ? ORDER BY id")?;
+        let rows = stmt.query_map(params![mail_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// `(filename, bytes)` for the attachments that kept their bytes: what
+    /// a forward carries along. A text-only row has nothing to send.
+    pub fn attachment_bytes_of(&self, mail_id: i64) -> Result<Vec<(String, Vec<u8>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT filename, bytes FROM attachments WHERE mail_id = ? AND bytes IS NOT NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![mail_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     /// A retry replaces the undecided reading of the same mail, so a mail
@@ -8236,5 +8298,66 @@ CREATE TABLE messages (
         assert_eq!(store.email_of(a).unwrap(), None);
         let b = store.account_for_identity("email", "sasha@example.com").unwrap();
         assert_eq!(store.email_of(b).unwrap().as_deref(), Some("sasha@example.com"));
+    }
+
+    #[test]
+    fn a_mail_body_is_cut_at_the_cap_and_says_so() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = store.insert_mail(a, "re_1", "x", None, None, None, false).unwrap().unwrap();
+        store.mail_body(m, Some("héllo wörld"), Some("<p>hi</p>"), 5).unwrap();
+        let row = &store.mail_to_work(1).unwrap()[0];
+        assert_eq!((row.text.as_deref(), row.html.as_deref()), (Some("héllo"), Some("<p>hi")), "chars, not bytes");
+        let truncated: bool = store.conn().query_row("SELECT truncated FROM inbound_mail WHERE id = ?", params![m], |r| r.get(0)).unwrap();
+        assert!(truncated);
+        // Within the cap nothing is cut, and a body that was already marked
+        // truncated on the way in stays so.
+        let n = store.insert_mail(a, "re_2", "x", None, None, None, true).unwrap().unwrap();
+        store.mail_body(n, Some("short"), None, 50).unwrap();
+        let row = &store.mail_to_work(2).unwrap()[1];
+        assert_eq!((row.text.as_deref(), row.html.as_deref()), (Some("short"), None));
+        let truncated: bool = store.conn().query_row("SELECT truncated FROM inbound_mail WHERE id = ?", params![n], |r| r.get(0)).unwrap();
+        assert!(truncated, "the webhook's verdict is not undone");
+    }
+
+    #[test]
+    fn attachment_texts_and_bytes_are_read_per_mail() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        let other = mail(&store, a, "re_2");
+        store.insert_attachment(m, "ticket.pdf", "application/pdf", Some(b"%PDF"), Some("Row 12")).unwrap();
+        store.insert_attachment(m, "note.txt", "text/plain", None, Some("see you")).unwrap();
+        store.insert_attachment(m, "logo.png", "image/png", Some(&[1, 2]), None).unwrap();
+        store.insert_attachment(other, "elsewhere.pdf", "application/pdf", Some(b"x"), Some("no")).unwrap();
+        assert_eq!(
+            store.attachment_texts_of(m).unwrap(),
+            vec![
+                ("ticket.pdf".to_string(), Some("Row 12".to_string())),
+                ("note.txt".to_string(), Some("see you".to_string())),
+                ("logo.png".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            store.attachment_bytes_of(m).unwrap(),
+            vec![("ticket.pdf".to_string(), b"%PDF".to_vec()), ("logo.png".to_string(), vec![1, 2])],
+            "only rows that kept their bytes"
+        );
+    }
+
+    #[test]
+    fn a_flight_leg_can_be_booked_after_the_fact() {
+        // `add_flight` knows nothing of bookings; a forwarded ticket does.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        let trip = store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        let leg = &trip.items[0];
+        assert!(!leg.booked);
+        store.book_item(leg.id, Some("PNR123"), Some(184.0), Some("EUR"), Some(7)).unwrap();
+        let leg = &store.find_trip(a, "Lisbon").unwrap().unwrap().items[0];
+        assert!(leg.booked);
+        assert_eq!(leg.confirmation_code.as_deref(), Some("PNR123"));
+        assert_eq!((leg.price, leg.currency.as_deref(), leg.arrival_id), (Some(184.0), Some("EUR"), Some(7)));
     }
 }

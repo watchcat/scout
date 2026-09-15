@@ -72,8 +72,11 @@ pub async fn run(core: Arc<Core>, client: ResendClient, from: String) {
         }
         let (core, client, from) = (core.clone(), client.clone(), from.clone());
         let pass = tokio::spawn(async move { work_once(&core, &client, &from, BATCH).await });
-        if let Err(e) = pass.await {
-            tracing::error!(error = %e, "an inbox pass panicked");
+        // The payload is not logged here: a panic message can quote the
+        // text it was slicing, and the default hook has already written it
+        // to stderr, where a mail body in the log is one line and not two.
+        if pass.await.is_err() {
+            tracing::error!("an inbox pass panicked");
         }
     }
 }
@@ -116,9 +119,11 @@ pub async fn work_once(core: &Core, client: &ResendClient, from: &str, limit: us
 /// Everything one mail needs, in the order that makes a retry safe: body,
 /// attachments, forward, then the model. The forward comes before the
 /// model on purpose — the person gets their mail even when the model is
-/// down — and a forward that fails is a warning, not a reason to leave
-/// the mail unread: it is tried again on the next attempt, if there is
-/// one, and shown as not forwarded either way.
+/// down — and a forward Resend refuses is a warning, not a reason to
+/// leave the mail unread. It is not retried: the mail is read and filed
+/// in the same pass, and the row then shows "not forwarded", which is
+/// the truth. (Only when the model also fails, and the mail comes round
+/// again, is the forward tried again with it.)
 async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork) -> anyhow::Result<()> {
     // 1. The body, from the API: the webhook carries none.
     let received = client.received(&m.provider_id).await?;

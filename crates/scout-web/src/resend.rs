@@ -130,7 +130,8 @@ impl ResendClient {
             .get(format!("{}/emails/receiving/{}", self.base_url, path_id(id)?))
             .bearer_auth(&self.api_key)
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
         Ok(accepted(res, "reading a received mail")?.json().await?)
     }
 
@@ -145,7 +146,8 @@ impl ResendClient {
             if let Some(a) = &after {
                 req = req.query(&[("after", a)]);
             }
-            let page: Page = accepted(req.send().await?, "listing attachments")?.json().await?;
+            let page: Page =
+                accepted(req.send().await.map_err(|e| e.without_url())?, "listing attachments")?.json().await?;
             let last = page.data.last().map(|a| a.id.clone());
             all.extend(page.data);
             match (page.has_more, last) {
@@ -170,8 +172,14 @@ impl ResendClient {
     /// No bearer token on this request. The URL is Resend's storage, not
     /// its API, and a key sent to whatever host the list named is a key
     /// given away.
+    ///
+    /// A transport error is stripped of its URL before it is returned:
+    /// reqwest's Display names the URL, the URL is pre-signed and good
+    /// for an hour, and the error is what the worker logs. The same on
+    /// the API calls, for one rule rather than one exception.
     pub async fn download(&self, url: &str, cap_bytes: usize) -> anyhow::Result<Vec<u8>> {
-        let res = accepted(self.http.get(url).send().await?, "downloading an attachment")?;
+        let res = self.http.get(url).send().await.map_err(|e| e.without_url())?;
+        let res = accepted(res, "downloading an attachment")?;
         let stated = res.content_length();
         if let Some(len) = stated {
             if len > cap_bytes as u64 {
@@ -221,7 +229,8 @@ impl ResendClient {
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
         accepted(res, "sending a message")?;
         Ok(())
     }
@@ -320,6 +329,25 @@ pub(crate) mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("401"), "{text}");
         assert!(!text.contains("k-secret-echo"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_download_that_fails_does_not_name_the_url() {
+        // The URL is pre-signed and good for an hour, and a transport
+        // error is what the worker logs. reqwest's Display appends
+        // " for url (…)" unless told not to.
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), "http://127.0.0.1:1".into());
+        let err = client.download("http://127.0.0.1:1/dl/att_1?sig=SECRET", 10).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(!text.contains("SECRET"), "{text}");
+        // The API calls carry the key in a header, not the URL, but an
+        // error that names neither is the uniform rule.
+        for text in [
+            format!("{:#}", client.received("re_1").await.err().expect("a closed port")),
+            format!("{:#}", client.attachments("re_1").await.unwrap_err()),
+        ] {
+            assert!(!text.contains("127.0.0.1"), "{text}");
+        }
     }
 
     #[tokio::test]

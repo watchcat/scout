@@ -1053,6 +1053,12 @@ impl Tool for AddTripItemTool {
             None => None,
         };
         let ends_at = args.end_date.as_deref().map(|d| calendar_date("end_date", d)).transpose()?;
+        // Both are `YYYY-MM-DD` by now, so text order is date order. Equal
+        // is allowed: a one-night stay checks out the next day, and an
+        // activity may end the day it starts.
+        if let Some(end) = ends_at.as_deref().filter(|end| *end < date.as_str()) {
+            return Err(StoreToolError(format!("end_date {end} is before date {date}")));
+        }
         let title = args.title.trim().to_string();
         if title.is_empty() {
             return Err(StoreToolError("an item needs a title — the hotel, the ticket, the train".to_string()));
@@ -3821,6 +3827,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("end_date must be"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn add_trip_item_refuses_an_end_before_its_start_but_not_the_same_day() {
+        let (store, _dir) = setup();
+        let tool = AddTripItemTool { store, account_id: 7, conversation_id: 1 };
+        let stay = |end_date: &str| AddItemArgs {
+            trip: "Lisbon".into(),
+            kind: "stay".into(),
+            title: "Hotel".into(),
+            place: None,
+            date: "2026-10-12".into(),
+            time: None,
+            end_date: Some(end_date.into()),
+            notes: None,
+            adults: None,
+            cabin_class: None,
+        };
+        // Both dates are named, so the model can see which one it got
+        // backwards rather than being told only that something is wrong.
+        let err = tool.call(stay("2026-10-10")).await.unwrap_err();
+        assert!(err.to_string().contains("2026-10-10"), "got: {err}");
+        assert!(err.to_string().contains("2026-10-12"), "got: {err}");
+        assert!(err.to_string().contains("before"), "got: {err}");
+        // Same day is not backwards: an activity may end the day it starts.
+        let view = tool.call(stay("2026-10-12")).await.unwrap();
+        assert_eq!(view.trip.items[0].ends_at.as_deref(), Some("2026-10-12"));
     }
 
     #[test]

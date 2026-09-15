@@ -262,7 +262,8 @@ pub async fn add_leg(
 /// sends its route, a stay sends its title; both may add the date. Every
 /// `Some` must match the row — `None` means "nothing to verify", not
 /// "verified" — so a caller with only a route to go on is not quietly
-/// granted a free pass on the date.
+/// granted a free pass on the date. The same goes end by end: a client that
+/// sends one end of a route and not the other checks less, not nothing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RemoveExpectation {
     pub origin: Option<String>,

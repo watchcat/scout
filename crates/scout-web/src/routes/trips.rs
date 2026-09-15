@@ -240,15 +240,12 @@ fn leg_response(out: scout_core::trips::LegEdit) -> Response {
     }
 }
 
+/// Positions follow dates on every write, so a leg lands where its
+/// `departure_date` puts it. An old client's `position` is an unknown field
+/// and ignored — not refused, which is why this is not `deny_unknown_fields`.
 #[derive(serde::Deserialize)]
 struct AddLegIn {
     trip: String,
-    /// Ignored: positions follow dates on every write, so a leg lands where
-    /// its `departure_date` puts it. Still accepted so a client built when
-    /// it meant something is not refused for sending it.
-    #[serde(default)]
-    #[allow(dead_code)]
-    position: Option<i64>,
     origin: String,
     destination: String,
     departure_date: String,

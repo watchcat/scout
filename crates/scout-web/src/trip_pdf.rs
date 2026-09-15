@@ -27,8 +27,8 @@ const MAX_PDF_BYTES: u64 = 10 * 1024 * 1024;
 /// Below this a `%PDF-` header is a fragment, not a page anybody can read.
 const MIN_PDF_BYTES: u64 = 1024;
 const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
-const MAX_SEGMENTS: usize = 64;
-const MAX_CANDIDATES_PER_SEGMENT: usize = 64;
+const MAX_ITEMS: usize = 64;
+const MAX_CANDIDATES_PER_ITEM: usize = 64;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
 
 static PDF_SLOTS: OnceLock<Semaphore> = OnceLock::new();
@@ -219,7 +219,7 @@ fn complete(bytes: &[u8]) -> bool {
 }
 
 fn validate_plan(plan: &Plan) -> Result<(), Error> {
-    if plan.trip.items.len() > MAX_SEGMENTS
+    if plan.trip.items.len() > MAX_ITEMS
         || plan.trip.name.len() > MAX_FIELD_BYTES
         || plan.notes.iter().any(|note| note.len() > MAX_FIELD_BYTES)
     {
@@ -231,7 +231,7 @@ fn validate_plan(plan: &Plan) -> Result<(), Error> {
             .is_some_and(|value| value.len() > MAX_FIELD_BYTES)
     };
     for item in &plan.trip.items {
-        if item.candidates.len() > MAX_CANDIDATES_PER_SEGMENT
+        if item.candidates.len() > MAX_CANDIDATES_PER_ITEM
             || item.title.len() > MAX_FIELD_BYTES
             || item.date.len() > MAX_FIELD_BYTES
             || too_long(&item.origin)
@@ -347,6 +347,33 @@ fn clock(value: Option<&str>) -> &str {
         .and_then(|value| value.get(11..16))
         .filter(|value| value.as_bytes().get(2) == Some(&b':'))
         .unwrap_or("—")
+}
+
+/// "Stay", "Activity", "Transport": a non-flight's kind as its kicker.
+fn kind_label(kind: &str) -> String {
+    let mut chars = kind.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// When a non-flight item is, by the page's rule (`itemDateLabel`): a stay
+/// that ends on a later day is a range, an activity with a clock shows it,
+/// anything else is its day.
+fn item_when(item: &TripItem) -> String {
+    let end = item
+        .ends_at
+        .as_deref()
+        .and_then(|end| end.get(..10))
+        .filter(|end| *end != item.date);
+    if let Some(end) = end {
+        return format!("{} – {}", date(&item.date), date(end));
+    }
+    match clock(item.starts_at.as_deref()) {
+        "—" => date(&item.date),
+        clock => format!("{}, {}", date(&item.date), clock),
+    }
 }
 
 fn fare(candidate: &TripCandidate) -> String {
@@ -487,7 +514,7 @@ pub fn html(plan: &Plan) -> String {
     out.push_str(
         r#"</title>
 <style>
-@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
+@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .booked{margin-top:.7mm;color:#4f5d10;font-size:7.5pt;font-weight:700}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
 </style></head><body>"#,
     );
     write!(
@@ -553,22 +580,30 @@ pub fn html(plan: &Plan) -> String {
 
     for (index, segment) in trip.items.iter().enumerate() {
         if !segment.is_flight() {
-            // One plain line for now: what it is, where, and when. The
-            // page's look for stays and the rest is a later change; this
-            // keeps the export from silently dropping them.
+            // The page's card, on paper: what it is, its name, where, and
+            // a booking's code — the one thing a traveller reads off an
+            // itinerary at a hotel desk.
             let place = segment
                 .place
                 .as_deref()
-                .map(|place| format!(" · {}", escape(place)))
+                .map(|place| format!("<div class=\"place\">{}</div>", escape(place)))
                 .unwrap_or_default();
+            let booked = if segment.booked {
+                match segment.confirmation_code.as_deref() {
+                    Some(code) => format!("<div class=\"booked\">booked · {}</div>", escape(code)),
+                    None => "<div class=\"booked\">booked</div>".to_string(),
+                }
+            } else {
+                String::new()
+            };
             write!(
                 out,
-                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{} {}</div><h2>{}{}</h2></div><time>{}</time></div></section>",
-                escape(&segment.kind),
-                segment.position,
+                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}{}</div><time>{}</time></div></section>",
+                escape(&kind_label(&segment.kind)),
                 escape(&segment.title),
                 place,
-                escape(&date(&segment.date))
+                booked,
+                escape(&item_when(segment))
             )
             .unwrap();
             continue;
@@ -692,8 +727,32 @@ mod tests {
                             source: Some("duffel".to_string()),
                         },
                     ),
+                    // A stay on the same timeline, between the two legs. It
+                    // has no options and no route, so it must not count
+                    // towards "flights selected" or the saved total — and
+                    // sitting between the flights, it is what the
+                    // connection check has to look past to find the second.
+                    TripItem {
+                        id: 2,
+                        position: 2,
+                        kind: "stay".to_string(),
+                        title: "Hotel <Roma>".to_string(),
+                        place: Some("Rome".to_string()),
+                        origin: None,
+                        destination: None,
+                        date: "2026-10-12".to_string(),
+                        starts_at: None,
+                        ends_at: Some("2026-10-15T11:00:00".to_string()),
+                        booked: true,
+                        confirmation_code: Some("ABC123".to_string()),
+                        price: Some(410.0),
+                        currency: Some("EUR".to_string()),
+                        notes: None,
+                        arrival_id: None,
+                        candidates: vec![],
+                    },
                     flight(
-                        2,
+                        3,
                         "LIS",
                         "FCO",
                         TripCandidate {
@@ -710,29 +769,6 @@ mod tests {
                             source: Some("ignav".to_string()),
                         },
                     ),
-                    // A stay on the same timeline. It has no options and no
-                    // route, so it must not count towards "flights
-                    // selected" or the saved total, and must not break the
-                    // connection check between the two flights.
-                    TripItem {
-                        id: 3,
-                        position: 3,
-                        kind: "stay".to_string(),
-                        title: "Hotel <Roma>".to_string(),
-                        place: Some("Rome".to_string()),
-                        origin: None,
-                        destination: None,
-                        date: "2026-10-12".to_string(),
-                        starts_at: None,
-                        ends_at: None,
-                        booked: true,
-                        confirmation_code: Some("ABC123".to_string()),
-                        price: Some(410.0),
-                        currency: Some("EUR".to_string()),
-                        notes: None,
-                        arrival_id: None,
-                        candidates: vec![],
-                    },
                 ],
                 // Only a kept trip can reach here: the traveller has to see
                 // a trip in their list before they can ask for its PDF.
@@ -761,12 +797,19 @@ mod tests {
             "from €126.00",
             "estimate when saved",
             "Saved itinerary, not a ticket",
-            // The stay is on the page as one line, escaped like the rest.
+            // The stay is on the page as its own line, escaped like the
+            // rest: kind, name, place, its range, and the booking code.
+            "<div class=\"number\">Stay</div>",
             "Hotel &lt;Roma&gt;",
             "Rome",
+            "booked · ABC123",
         ] {
             assert!(html.contains(expected), "missing `{expected}`");
         }
+        assert!(
+            html.contains(&format!("{} – {}", date("2026-10-12"), date("2026-10-15"))),
+            "a stay that ends on a later day is not shown as a range"
+        );
         assert!(!html.contains("October <escape>"));
         assert!(!html.contains("Hotel <Roma>"));
     }

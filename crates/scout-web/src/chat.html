@@ -396,8 +396,15 @@
     border-radius:9px; font:inherit; font-size:13px; font-weight:700; padding:9px 16px; cursor:pointer}
   .leg-add-row button:hover{background:#3196d8}
   .leg-add-row button:disabled{opacity:.6; cursor:default}
-  .segment-card{border:1px solid var(--line); border-radius:16px; background:rgba(7,54,66,.62);
+  .segment-card, .item-card{border:1px solid var(--line); border-radius:16px; background:rgba(7,54,66,.62);
     overflow:hidden}
+  /* A stay, an activity or a transport: the same box as a flight, but the
+     head is the whole card — there are no options under it for the rule
+     to divide from. */
+  .item-card .segment-head{border-bottom:0}
+  .item-title{margin:0; color:var(--base2); font-size:18px; line-height:1.2}
+  .item-place{margin:3px 0 0; color:var(--base1); font-size:13px}
+  .item-booked{display:inline-block; margin-top:6px; color:var(--green); font-size:12px; font-weight:650}
   .segment-head{display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
     padding:15px 16px 13px; border-bottom:1px solid rgba(13,74,90,.75)}
   .segment-kicker{margin:0 0 4px; color:var(--base01); font-size:11px; font-weight:800;

@@ -42,7 +42,10 @@ each option, and recalculates the next connection as soon as you choose another
 flight. Tight connections, impossible joins, and airport changes are called out
 before you continue. Download the current plan as a print-ready PDF with every
 segment, saved alternative, selected flight, local time, connection check, and
-fare caveat in one hand-off document.
+fare caveat in one hand-off document. A trip is not only flights: tell Scout
+"I've booked the Alfama hotel for the 12th to the 15th" and the stay lands on
+the timeline in date order beside the legs, with activities and trains the
+same way, each marked when it is booked and with its confirmation code.
 
 <p align="center">
   <img src="crates/scout-web/src/assets/trips-desktop.webp" alt="Scout trip planner on desktop, with an airport timeline, flight choices, saved fares and a tight connection warning" width="900">
@@ -398,7 +401,7 @@ Browser  ──► scout-web ──┴► core ──► rig agent ────�
                                                                              ├─ flight_booking_links  airline pages, pre-filled
                                                                              ├─ create_booking_link   Duffel hosted checkout
                                                                              ├─ add / update / drop segment,
-                                                                             │  add / choose option, show, delete
+                                                                             │  add / choose option, add item, show, delete
                                                                              │  a named multi-city plan
                                                                              └─ finalise_trip     re-prices it all
 
@@ -418,7 +421,7 @@ trip builder, a hotel agent and an experience agent will be added.
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **910 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **925 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,

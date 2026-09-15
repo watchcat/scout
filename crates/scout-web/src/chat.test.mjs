@@ -5,8 +5,8 @@ import {
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
-  tripPdfFilename,
-  composerTarget, removeLegBody, keepBody, deleteTripBody, tripDeleteConsequence,
+  tripPdfFilename, tripRoute, itemDateLabel,
+  composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
 } from './chat.js'
 
@@ -274,13 +274,13 @@ test('a change of airport is reported instead of subtracting unrelated clocks', 
 })
 
 test('the trip timeline includes layover airports and makes route gaps visible', () => {
-  const points = tripTimelinePoints({ segments: [
+  const points = tripTimelinePoints({ items: [
     {
-      origin: 'AMS', destination: 'HKG', departure_date: '2026-10-12',
+      kind: 'flight', origin: 'AMS', destination: 'HKG', date: '2026-10-12',
       candidates: [{ chosen: true, itinerary: 'AMS 08:00 12.10 ✈ PVG 3h 20m ✈ HKG 20:00 13.10' }],
     },
     {
-      origin: 'NRT', destination: 'SFO', departure_date: '2026-10-18',
+      kind: 'flight', origin: 'NRT', destination: 'SFO', date: '2026-10-18',
       candidates: [{ chosen: true, itinerary: 'NRT 09:00 18.10 ✈ SFO 02:00 18.10' }],
     },
   ] })
@@ -292,6 +292,37 @@ test('the trip timeline includes layover airports and makes route gaps visible',
     { code: 'NRT', date: '2026-10-18', gap: false },
     { code: 'SFO', date: '', gap: false },
   ])
+})
+
+test('the timeline is drawn from flights and skips the stays between them', () => {
+  const trip = { items: [
+    { position: 1, kind: 'flight', origin: 'AMS', destination: 'LIS', date: '2026-10-12', candidates: [] },
+    { position: 2, kind: 'stay', title: 'Hotel', date: '2026-10-12', candidates: [] },
+    { position: 3, kind: 'flight', origin: 'LIS', destination: 'AMS', date: '2026-10-19', candidates: [] },
+  ] }
+  assert.deepEqual(tripTimelinePoints(trip).map(p => p.code), ['AMS', 'LIS', 'AMS'])
+  assert.equal(tripRoute(trip), 'AMS → LIS → AMS')
+  // A trip of stays alone has flights to draw nothing from.
+  assert.deepEqual(tripTimelinePoints({ items: [trip.items[1]] }), [])
+  assert.equal(tripRoute({ items: [trip.items[1]] }), 'No route yet')
+})
+
+test('a remove body names what the reader saw, by route for a flight and by title otherwise', () => {
+  const flight = JSON.parse(removeItemBody('Lisbon', { position: 1, kind: 'flight', origin: 'AMS', destination: 'LIS', date: '2026-10-12' }))
+  assert.deepEqual(flight, { trip: 'Lisbon', position: 1, origin: 'AMS', destination: 'LIS', title: null, date: '2026-10-12' })
+  const stay = JSON.parse(removeItemBody('Lisbon', { position: 2, kind: 'stay', title: 'Hotel', date: '2026-10-12' }))
+  assert.deepEqual(stay, { trip: 'Lisbon', position: 2, origin: null, destination: null, title: 'Hotel', date: '2026-10-12' })
+})
+
+test('an item label shows a range for a stay and a time for a timed activity', () => {
+  // `en-GB` pins the short date `dateLabel` draws, which otherwise follows
+  // the reader's locale; the page passes none and the two agree anyway,
+  // because this is the same formatter.
+  assert.equal(itemDateLabel({ kind: 'stay', date: '2026-10-12', ends_at: '2026-10-15' }, 'en-GB'), '12 Oct – 15 Oct')
+  assert.equal(itemDateLabel({ kind: 'activity', date: '2026-10-13', starts_at: '2026-10-13T10:00:00' }, 'en-GB'), '13 Oct, 10:00')
+  assert.equal(itemDateLabel({ kind: 'activity', date: '2026-10-13' }, 'en-GB'), '13 Oct')
+  // A stay that ends the day it starts is one day, not a range to itself.
+  assert.equal(itemDateLabel({ kind: 'stay', date: '2026-10-12', ends_at: '2026-10-12T11:00:00' }, 'en-GB'), '12 Oct')
 })
 
 test('a stale trip read cannot repaint a newer choice', () => {
@@ -337,96 +368,83 @@ test('the composer says which thread a trip message lands in', () => {
   assert.deepEqual(composerTarget(undefined), { thread: null, label: '' })
 })
 
-test('a remove sends what the reader actually saw', () => {
-  // Positions renumber server-side, so the request carries the leg's
-  // identity and not just its index. Without this the server cannot tell a
-  // stale click from a current one.
-  const segment = { position: 2, origin: 'LIS', destination: 'FCO', departure_date: '2026-10-14' }
-  assert.deepEqual(JSON.parse(removeLegBody('Atlantic loop', segment)), {
-    trip: 'Atlantic loop',
-    position: 2,
-    origin: 'LIS',
-    destination: 'FCO',
-    departure_date: '2026-10-14',
-  })
-})
-
 test('a remove with no date on file sends null, not an omitted key', () => {
-  // `RemoveLegIn.departure_date` is `Option<String>` on the Rust side, where
-  // `null` reads as "nothing to verify" — the same thing a missing key would
-  // mean there. Sending `null` explicitly rather than dropping the key keeps
-  // the wire shape stable regardless of which of those the server actually
+  // `RemoveItemIn.date` is `Option<String>` on the Rust side, where `null`
+  // reads as "nothing to verify" — the same thing a missing key would mean
+  // there. Sending `null` explicitly rather than dropping the key keeps the
+  // wire shape stable regardless of which of those the server actually
   // requires, and matches the route test that already asserts this exact
   // body for a stale remove.
-  const segment = { position: 1, origin: 'AMS', destination: 'LIS', departure_date: null }
-  assert.deepEqual(JSON.parse(removeLegBody('October', segment)), {
+  const flight = { position: 1, kind: 'flight', origin: 'AMS', destination: 'LIS', date: null }
+  assert.deepEqual(JSON.parse(removeItemBody('October', flight)), {
     trip: 'October',
     position: 1,
     origin: 'AMS',
     destination: 'LIS',
-    departure_date: null,
+    title: null,
+    date: null,
   })
 })
 
 test('a keep sends only the name, nothing a stale tab could get wrong', () => {
-  // Unlike removeLegBody, there is no segment state to verify: keeping an
+  // Unlike removeItemBody, there is no item state to verify: keeping an
   // already-kept trip still succeeds server-side, so a second press racing
   // the first has nothing to disagree with the server about.
   assert.deepEqual(JSON.parse(keepBody('Atlantic loop')), { trip: 'Atlantic loop' })
 })
 
-test('a trip delete sends only the name, like keepBody and unlike removeLegBody', () => {
+test('a trip delete sends only the name, like keepBody and unlike removeItemBody', () => {
   // Same shape as `keepBody` and the same reason: `DeleteTripIn` is
   // `deny_unknown_fields`, so this must carry nothing that overlaps
-  // `removeLegBody`'s `position` for the server's refusal of that to mean
+  // `removeItemBody`'s `position` for the server's refusal of that to mean
   // anything.
   assert.deepEqual(JSON.parse(deleteTripBody('Atlantic loop')), { trip: 'Atlantic loop' })
 })
 
 test('an empty draft says there is nothing to lose', () => {
-  assert.equal(tripDeleteConsequence({ segments: [] }), 'Nothing is saved on it yet.')
-  // No `segments` key at all — the shape a trip with none can arrive in.
+  assert.equal(tripDeleteConsequence({ items: [] }), 'Nothing is saved on it yet.')
+  // No `items` key at all — the shape a trip with none can arrive in.
   assert.equal(tripDeleteConsequence({}), 'Nothing is saved on it yet.')
   // Nothing on screen yet at all, not just an empty trip.
   assert.equal(tripDeleteConsequence(null), 'Nothing is saved on it yet.')
 })
 
-test('one leg with nothing saved on it is singular, not "1 legs"', () => {
-  const trip = { segments: [{ candidates: [] }] }
-  assert.equal(tripDeleteConsequence(trip), 'Its 1 leg goes with it.')
+test('one item with nothing saved on it is singular, not "1 items"', () => {
+  const trip = { items: [{ candidates: [] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 1 item goes with it.')
 })
 
-test('several legs with nothing saved use the plural and "go", not "goes"', () => {
-  const trip = { segments: [{ candidates: [] }, { candidates: [] }, { candidates: [] }] }
-  assert.equal(tripDeleteConsequence(trip), 'Its 3 legs go with it.')
+test('several items with nothing saved use the plural and "go", not "goes"', () => {
+  const trip = { items: [{ candidates: [] }, { candidates: [] }, { candidates: [] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 3 items go with it.')
 })
 
-test('one leg and its one saved option are both singular', () => {
-  const trip = { segments: [{ candidates: [{ candidate: 1 }] }] }
-  assert.equal(tripDeleteConsequence(trip), 'Its 1 leg and 1 saved flight option go with it.')
+test('one item and its one saved option are both singular', () => {
+  const trip = { items: [{ candidates: [{ candidate: 1 }] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 1 item and 1 saved flight option go with it.')
 })
 
-test('one leg with several saved options pluralizes only the options', () => {
-  const trip = { segments: [{ candidates: [{ candidate: 1 }, { candidate: 2 }, { candidate: 3 }] }] }
-  assert.equal(tripDeleteConsequence(trip), 'Its 1 leg and 3 saved flight options go with it.')
+test('one item with several saved options pluralizes only the options', () => {
+  const trip = { items: [{ candidates: [{ candidate: 1 }, { candidate: 2 }, { candidate: 3 }] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 1 item and 3 saved flight options go with it.')
 })
 
-test('several legs and their several saved options are both plural', () => {
+test('several items and their several saved options are both plural', () => {
   // The afternoon-of-price-research case this confirm exists to name.
   const trip = {
-    segments: [
+    items: [
       { candidates: [{ candidate: 1 }, { candidate: 2 }] },
       { candidates: [{ candidate: 1 }, { candidate: 2 }, { candidate: 3 }] },
     ],
   }
-  assert.equal(tripDeleteConsequence(trip), 'Its 2 legs and 5 saved flight options go with it.')
+  assert.equal(tripDeleteConsequence(trip), 'Its 2 items and 5 saved flight options go with it.')
 })
 
-test('a segment with no candidates array at all counts as zero options, not a crash', () => {
-  // `renderSegment` always sets `candidates`, but the consequence helper
-  // reads trips straight from the wire and should not assume that.
-  const trip = { segments: [{}, { candidates: [{ candidate: 1 }] }] }
-  assert.equal(tripDeleteConsequence(trip), 'Its 2 legs and 1 saved flight option go with it.')
+test('an item with no candidates array at all counts as zero options, not a crash', () => {
+  // `renderItem` always sets `candidates` on a flight, but the consequence
+  // helper reads trips straight from the wire and should not assume that.
+  const trip = { items: [{}, { candidates: [{ candidate: 1 }] }] }
+  assert.equal(tripDeleteConsequence(trip), 'Its 2 items and 1 saved flight option go with it.')
 })
 
 test('a saved trace becomes one line per row, nested rows marked, events full width', () => {

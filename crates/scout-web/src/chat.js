@@ -194,7 +194,7 @@ export function parseItinerary(itinerary) {
   })
 }
 
-// The one option a segment is currently using. A sole candidate is the pick
+// The one option a flight is currently using. A sole candidate is the pick
 // by elimination, matching core's readiness rule even if its `chosen` flag is
 // false.
 export function selectedCandidate(segment) {
@@ -208,6 +208,41 @@ function localMinutes(value) {
     : null
   if (!match) return null
   return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5])) / 60000
+}
+
+// A day as the page prints it: in full on a flight card, short on the
+// timeline and on the cards for everything else. `locale` exists for the
+// tests, which need a short form they can spell out; the page passes none
+// and gets the reader's, so the two never disagree about a date — it is
+// one formatter.
+export function dateLabel(value, compact = false, locale = undefined) {
+  const match = typeof value === 'string' ? value.match(/^(\d{4})-(\d{2})-(\d{2})$/) : null
+  if (!match) return value || 'Date not set'
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
+  return new Intl.DateTimeFormat(locale, compact
+    ? { month: 'short', day: 'numeric', timeZone: 'UTC' }
+    : { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+    .format(date)
+}
+
+export function clockLabel(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)
+    ? value.slice(11, 16)
+    : '—'
+}
+
+// When a non-flight item is, in the timeline's short form: a stay that
+// ends on a later day is a range, an activity with a clock shows it, and
+// anything else is its day. A flight card prints its date in full instead
+// and leaves the clocks to its options.
+export function itemDateLabel(item, locale = undefined) {
+  const day = dateLabel(item.date, true, locale)
+  const end = typeof item.ends_at === 'string' ? item.ends_at.slice(0, 10) : ''
+  if (/^\d{4}-\d{2}-\d{2}$/.test(end) && end !== item.date) {
+    return `${day} – ${dateLabel(end, true, locale)}`
+  }
+  const clock = clockLabel(item.starts_at)
+  return clock === '—' ? day : `${day}, ${clock}`
 }
 
 export function durationLabel(minutes) {
@@ -226,7 +261,7 @@ export function durationLabel(minutes) {
   return rest === 0 ? `${hours}h` : `${hours}h ${String(rest).padStart(2, '0')}m`
 }
 
-// Checks the join between two independently stored trip segments. The two
+// Checks the join between two independently stored flights. The two
 // timestamps are comparable only when they name the same airport: both clocks
 // are local to that place. This is the same boundary core uses.
 export function connectionCheck(before, after) {
@@ -257,11 +292,19 @@ export function connectionCheck(before, after) {
   return { tone: 'ready', text: `${wait} at ${before.destination} between the selected flights.` }
 }
 
+// The flights on a trip, in order. The route, the timeline and the
+// connection checks are about airports, and a stay or an activity has
+// none: it sits between legs without being one.
+function tripFlights(trip) {
+  return (trip?.items ?? []).filter((item) => item.kind === 'flight')
+}
+
 export function tripTimelinePoints(trip) {
-  if (!trip?.segments?.length) return []
-  const points = [{ code: trip.segments[0].origin, date: trip.segments[0].departure_date, gap: false }]
-  for (let i = 0; i < trip.segments.length; i++) {
-    const segment = trip.segments[i]
+  const flights = tripFlights(trip)
+  if (!flights.length) return []
+  const points = [{ code: flights[0].origin, date: flights[0].date, gap: false }]
+  for (let i = 0; i < flights.length; i++) {
+    const segment = flights[i]
     const chosen = selectedCandidate(segment)
     const stops = chosen ? parseItinerary(chosen.itinerary).slice(1, -1) : []
     for (const stop of stops) {
@@ -272,15 +315,27 @@ export function tripTimelinePoints(trip) {
       })
     }
     points.push({ code: segment.destination, date: '', gap: false })
-    const next = trip.segments[i + 1]
+    const next = flights[i + 1]
     if (next && next.origin !== segment.destination) {
       points[points.length - 1].gap = true
-      points.push({ code: next.origin, date: next.departure_date, gap: false })
+      points.push({ code: next.origin, date: next.date, gap: false })
     } else if (next) {
-      points[points.length - 1].date = next.departure_date
+      points[points.length - 1].date = next.date
     }
   }
   return points
+}
+
+// The airports in order, as the list row and the eyebrow print them.
+export function tripRoute(trip) {
+  const flights = tripFlights(trip)
+  if (!flights.length) return 'No route yet'
+  const codes = [flights[0].origin]
+  for (const flight of flights) {
+    if (codes[codes.length - 1] !== flight.origin) codes.push(flight.origin)
+    codes.push(flight.destination)
+  }
+  return codes.join(' → ')
 }
 
 export function tripLoadIsCurrent(request, current, choicePending) {
@@ -302,27 +357,30 @@ export function tripPdfFilename(name) {
   return `${stem || 'trip'}-itinerary.pdf`
 }
 
-// The DELETE body for `/chat/trips/segment`. `drop_segment` renumbers —
-// removing leg 1 shifts leg 2 down to 1, and its parked options with it — so
-// a tab holding a trip it drew a while ago could ask to delete "leg 2" when
-// leg 2 is no longer the flight it drew. `position` alone gives the server
-// nothing to check that against, which is why the route also wants the route
-// and date the client believed were there: `null`, not an omitted key, for a
-// segment this client has no date for, matching `RemoveLegIn.departure_date`
-// on the Rust side, which is `Option<String>` and reads a JSON `null` as
-// "nothing to verify" rather than as a value.
-export function removeLegBody(tripName, segment) {
+// The DELETE body for `/chat/trips/segment`. Removing an item renumbers the
+// ones after it — removing item 1 shifts item 2 down to 1, and a flight's
+// parked options with it — so a tab holding a trip it drew a while ago
+// could ask to delete "item 2" when item 2 is no longer the thing it drew.
+// `position` alone gives the server nothing to check that against, which
+// is why the body also carries what the card showed: a flight its route,
+// anything else its title, and every item its date. What a card has no use
+// for is `null`, not an omitted key, matching `RemoveItemIn` on the Rust
+// side, whose `Option<String>`s read a JSON `null` as "nothing to verify"
+// rather than as a value.
+export function removeItemBody(tripName, item) {
+  const flight = item.kind === 'flight'
   return JSON.stringify({
     trip: tripName,
-    position: segment.position,
-    origin: segment.origin,
-    destination: segment.destination,
-    departure_date: segment.departure_date ?? null,
+    position: item.position,
+    origin: flight ? item.origin ?? null : null,
+    destination: flight ? item.destination ?? null : null,
+    title: flight ? null : item.title ?? null,
+    date: item.date ?? null,
   })
 }
 
 // The body for `/chat/trips/keep`. A name is everything the route needs —
-// unlike `removeLegBody` it carries nothing for the server to check a stale
+// unlike `removeItemBody` it carries nothing for the server to check a stale
 // tab against, because keeping is idempotent: `keep_trip` succeeds again on
 // a trip this account already kept, so there is no stale state for a second
 // press to collide with.
@@ -335,7 +393,7 @@ export function keepBody(tripName) {
 // and takes the same method, so the two bodies are the thing keeping "drop
 // this leg" and "drop the whole itinerary" apart on the wire. `DeleteTripIn`
 // is `deny_unknown_fields` on the Rust side: a body with `position` in it —
-// which is to say anything `removeLegBody` built — is refused there rather
+// which is to say anything `removeItemBody` built — is refused there rather
 // than read as a whole-trip delete. This carries no `position` for that
 // refusal to be about.
 export function deleteTripBody(tripName) {
@@ -343,17 +401,17 @@ export function deleteTripBody(tripName) {
 }
 
 // What the traveller is about to lose, counted, for the confirm to say out
-// loud. A trip delete takes every leg and every parked flight option with
+// loud. A trip delete takes every item and every parked flight option with
 // it — see `Store::delete_trip` — and "Delete this trip?" on its own gives
 // the reader no way to tell a stray press on an empty draft from one that
 // throws away an afternoon of price research.
 export function tripDeleteConsequence(trip) {
-  const segments = trip?.segments ?? []
-  const options = segments.reduce((total, segment) => total + (segment.candidates?.length ?? 0), 0)
-  if (!segments.length) return 'Nothing is saved on it yet.'
-  const legs = `${segments.length} ${segments.length === 1 ? 'leg' : 'legs'}`
-  if (!options) return `Its ${legs} go${segments.length === 1 ? 'es' : ''} with it.`
-  return `Its ${legs} and ${options} saved flight ${options === 1 ? 'option' : 'options'} go with it.`
+  const items = trip?.items ?? []
+  const options = items.reduce((total, item) => total + (item.candidates?.length ?? 0), 0)
+  if (!items.length) return 'Nothing is saved on it yet.'
+  const count = `${items.length} ${items.length === 1 ? 'item' : 'items'}`
+  if (!options) return `Its ${count} go${items.length === 1 ? 'es' : ''} with it.`
+  return `Its ${count} and ${options} saved flight ${options === 1 ? 'option' : 'options'} go with it.`
 }
 
 // Where a message typed on the Trips tab should go, and what the composer
@@ -749,22 +807,6 @@ function start() {
     return el
   }
 
-  function dateLabel(value, compact = false) {
-    const match = typeof value === 'string' ? value.match(/^(\d{4})-(\d{2})-(\d{2})$/) : null
-    if (!match) return value || 'Date not set'
-    const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
-    return new Intl.DateTimeFormat(undefined, compact
-      ? { month: 'short', day: 'numeric', timeZone: 'UTC' }
-      : { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
-      .format(date)
-  }
-
-  function clockLabel(value) {
-    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)
-      ? value.slice(11, 16)
-      : '—'
-  }
-
   function moneyLabel(price, currency) {
     if (!Number.isFinite(price)) return 'Price unavailable'
     if (!currency) return price.toFixed(2)
@@ -782,16 +824,6 @@ function start() {
   // nothing about what would happen to it; this says the actual
   // consequence, which is the only thing worth a glance answering.
   const DRAFT_NOTE = 'Clears with its chat unless kept'
-
-  function tripRoute(trip) {
-    if (!trip.segments?.length) return 'No route yet'
-    const codes = [trip.segments[0].origin]
-    for (const segment of trip.segments) {
-      if (codes[codes.length - 1] !== segment.origin) codes.push(segment.origin)
-      codes.push(segment.destination)
-    }
-    return codes.join(' → ')
-  }
 
   function switchView(view) {
     const showingTrips = view === 'trips'
@@ -879,7 +911,7 @@ function start() {
   function renderOverview(trip) {
     const card = node('section', 'trip-overview')
     const label = node('div', 'trip-overview-label')
-    label.append(node('span', '', 'Trip timeline'), node('span', '', `${trip.segments.length} ${trip.segments.length === 1 ? 'segment' : 'segments'}`))
+    label.append(node('span', '', 'Trip timeline'), node('span', '', `${trip.items.length} ${trip.items.length === 1 ? 'item' : 'items'}`))
     const timeline = node('div', 'trip-timeline')
     for (const point of tripTimelinePoints(trip)) {
       const item = node('div', point.gap ? 'trip-point gap' : 'trip-point')
@@ -954,39 +986,57 @@ function start() {
     return label
   }
 
-  // The plain "Remove" button a segment starts with. Kept as its own
+  // "Stay", "Activity", "Transport": the kicker on a non-flight card, where
+  // a flight's says "Segment N".
+  function kindLabel(item) {
+    return item.kind.charAt(0).toUpperCase() + item.kind.slice(1)
+  }
+
+  // What a sentence about an item calls it. A flight has always been a
+  // "leg" on this page; the rest are what their kind says.
+  function itemNoun(item) {
+    return item.kind === 'flight' ? 'leg' : item.kind
+  }
+
+  function itemName(item) {
+    return item.kind === 'flight' ? `${item.origin} → ${item.destination}` : item.title
+  }
+
+  // The plain "Remove" button an item starts with. Kept as its own
   // function so `removeConfirmRow`'s Cancel can rebuild exactly this and put
   // the card back the way it found it.
-  function segmentRemoveButton(trip, segment, slot) {
+  function segmentRemoveButton(trip, item, slot) {
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'segment-remove-button'
     button.textContent = 'Remove'
     button.setAttribute(
       'aria-label',
-      `Remove segment ${segment.position}, ${segment.origin} to ${segment.destination}`,
+      item.kind === 'flight'
+        ? `Remove segment ${item.position}, ${item.origin} to ${item.destination}`
+        : `Remove ${item.kind}, ${item.title}`,
     )
     button.addEventListener('click', () => {
-      slot.replaceChildren(removeConfirmRow(trip, segment, slot))
+      slot.replaceChildren(removeConfirmRow(trip, item, slot))
     })
     return button
   }
 
   // A second click, not `window.confirm`: a dialog blocks the whole page for
-  // one segment on one card, and this is destructive enough to ask about but
+  // one item on one card, and this is destructive enough to ask about but
   // not rare enough to justify that. The row swaps in over the button it
   // replaced and swaps back on Cancel or on a failed request — only a
   // response that actually rewrote the trip (200, or the reload a 409
   // triggers) is allowed to leave it gone for good, via the full repaint
   // those paths already do.
-  function removeConfirmRow(trip, segment, slot) {
+  function removeConfirmRow(trip, item, slot) {
     const row = node('span', 'segment-remove-confirm')
-    row.append(node('span', '', 'Remove this leg?'))
+    row.append(node('span', '', `Remove this ${itemNoun(item)}?`))
     const cancel = document.createElement('button')
     cancel.type = 'button'
     cancel.textContent = 'Cancel'
     cancel.addEventListener('click', () => {
-      slot.replaceChildren(segmentRemoveButton(trip, segment, slot))
+      slot.replaceChildren(segmentRemoveButton(trip, item, slot))
     })
     const confirm = document.createElement('button')
     confirm.type = 'button'
@@ -995,17 +1045,44 @@ function start() {
     confirm.addEventListener('click', () => {
       confirm.disabled = true
       cancel.disabled = true
-      removeLeg(trip, segment).then((restore) => {
-        if (restore) slot.replaceChildren(segmentRemoveButton(trip, segment, slot))
+      removeItem(trip, item).then((restore) => {
+        if (restore) slot.replaceChildren(segmentRemoveButton(trip, item, slot))
       }).catch(() => {
-        slot.replaceChildren(segmentRemoveButton(trip, segment, slot))
+        slot.replaceChildren(segmentRemoveButton(trip, item, slot))
       })
     })
     row.append(cancel, confirm)
     return row
   }
 
-  function renderSegment(trip, segment) {
+  // A stay, an activity or a transport: one card, nothing to choose on it.
+  // Its date line follows `itemDateLabel` — a range or a clock where the
+  // item has one — where a flight's shows the day in full and leaves the
+  // clocks to its options.
+  function renderOtherItem(trip, item) {
+    const card = node('article', 'item-card')
+    const head = node('header', 'segment-head')
+    const about = node('div')
+    about.append(
+      node('p', 'segment-kicker', kindLabel(item)),
+      node('h3', 'item-title', item.title),
+    )
+    if (item.place) about.append(node('p', 'item-place', item.place))
+    if (item.booked) {
+      about.append(node('span', 'item-booked', item.confirmation_code ? `booked · ${item.confirmation_code}` : 'booked'))
+    }
+    const actions = node('div', 'segment-head-actions')
+    actions.append(node('time', 'segment-date', itemDateLabel(item)))
+    const removeSlot = node('span', 'segment-remove')
+    removeSlot.append(segmentRemoveButton(trip, item, removeSlot))
+    actions.append(removeSlot)
+    head.append(about, actions)
+    card.append(head)
+    return card
+  }
+
+  function renderItem(trip, segment) {
+    if (segment.kind !== 'flight') return renderOtherItem(trip, segment)
     const card = node('article', 'segment-card')
     const head = node('header', 'segment-head')
     const route = node('div')
@@ -1019,7 +1096,7 @@ function start() {
       document.createTextNode(segment.destination),
     )
     const actions = node('div', 'segment-head-actions')
-    actions.append(node('time', 'segment-date', dateLabel(segment.departure_date)))
+    actions.append(node('time', 'segment-date', dateLabel(segment.date)))
     const removeSlot = node('span', 'segment-remove')
     removeSlot.append(segmentRemoveButton(trip, segment, removeSlot))
     actions.append(removeSlot)
@@ -1094,7 +1171,7 @@ function start() {
     deleteButton.addEventListener('click', () => {
       deleteSlot.replaceChildren(tripDeleteConfirm(trip, deleteSlot))
     })
-    if (trip.segments.length) tripDetail.append(renderOverview(trip))
+    if (trip.items.length) tripDetail.append(renderOverview(trip))
 
     const readiness = node('div', trip.not_ready ? 'trip-alert' : 'trip-alert ready')
     readiness.append(
@@ -1109,10 +1186,16 @@ function start() {
     }
 
     const stack = node('div', 'segment-stack')
-    for (let i = 0; i < trip.segments.length; i++) {
-      stack.append(renderSegment(trip, trip.segments[i]))
-      if (i < trip.segments.length - 1) {
-        const check = connectionCheck(trip.segments[i], trip.segments[i + 1])
+    for (let i = 0; i < trip.items.length; i++) {
+      const item = trip.items[i]
+      stack.append(renderItem(trip, item))
+      // The join is checked from one flight to the next flight, whatever
+      // sits between them: a stay does not change when the second leg
+      // leaves. The PDF draws it in the same place, under the first flight.
+      if (item.kind !== 'flight') continue
+      const next = trip.items.slice(i + 1).find((later) => later.kind === 'flight')
+      if (next) {
+        const check = connectionCheck(item, next)
         stack.append(node('div', `join-card ${check.tone}`, check.text))
       }
     }
@@ -1287,7 +1370,7 @@ function start() {
   }
 
   // Returns whether `tripDeleteConfirm` should be rebuilt in the slot it
-  // came from — the same convention `removeLeg` uses, and true for the same
+  // came from — the same convention `removeItem` uses, and true for the same
   // reason: only a response that actually rewrote the account's trips (200,
   // or the reload a 404 triggers) is allowed to leave the confirm gone for
   // good. `trip` here is always `currentTrip` — the × that opens the
@@ -1372,9 +1455,10 @@ function start() {
     tripDetail.append(toast)
   }
 
-  // Appends a leg via `position: null`. Same shape as `chooseFlight`: guard
-  // against an overlapping write, invalidate the load sequence before the
-  // request goes out, and repaint from the response's whole-trip snapshot.
+  // Adds a leg; the server puts it where its date falls, so the body names
+  // no position. Same shape as `chooseFlight`: guard against an overlapping
+  // write, invalidate the load sequence before the request goes out, and
+  // repaint from the response's whole-trip snapshot.
   async function addLeg(trip, origin, destination, departureDate) {
     if (tripChoicePending) return
     tripChoicePending = true
@@ -1382,7 +1466,7 @@ function start() {
     tripDetail.setAttribute('aria-busy', 'true')
     try {
       const res = await post('/chat/trips/segment', {
-        trip: trip.name, position: null, origin, destination, departure_date: departureDate,
+        trip: trip.name, origin, destination, departure_date: departureDate,
       })
       if (res.status === 409) {
         // Not an error: this tab's copy is simply older than the trip, and
@@ -1420,7 +1504,7 @@ function start() {
   // a 422, or the request never landing. On 200 and on the reload a 409
   // triggers, `renderTripDetail` already rebuilt this card from scratch,
   // so the caller has nothing left to put back.
-  async function removeLeg(trip, segment) {
+  async function removeItem(trip, item) {
     if (tripChoicePending) return false
     tripChoicePending = true
     tripLoadSeq++
@@ -1429,12 +1513,12 @@ function start() {
       const res = await fetch('/chat/trips/segment', {
         method: 'DELETE',
         headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
-        body: removeLegBody(trip.name, segment),
+        body: removeItemBody(trip.name, item),
       })
       if (res.status === 409) {
         // Not an error: this tab's copy is simply older than the trip — the
-        // renumbering `drop_segment` does server-side means the position
-        // this click named may no longer be the leg it was clicked on.
+        // renumbering a remove does server-side means the position this
+        // click named may no longer be the item it was clicked on.
         tripChoicePending = false
         tripsLoaded = false
         await loadTrips()
@@ -1451,10 +1535,10 @@ function start() {
       currentTrip = updated.name
       renderTripList()
       renderTripDetail()
-      showTripToast(`Removed ${segment.origin} → ${segment.destination}.`)
+      showTripToast(`Removed ${itemName(item)}.`)
       return false
     } catch {
-      showTripToast('Could not remove that leg. Try again.')
+      showTripToast(`Could not remove that ${itemNoun(item)}. Try again.`)
       return true
     } finally {
       tripChoicePending = false

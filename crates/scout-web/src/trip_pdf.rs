@@ -5,7 +5,7 @@
 //! self-contained HTML page that Chromium can print without network access.
 
 use chrono::{NaiveDate, NaiveDateTime, Utc};
-use scout_core::trips::{Plan, TripCandidate, TripSegment};
+use scout_core::trips::{Plan, TripCandidate, TripItem};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -27,8 +27,8 @@ const MAX_PDF_BYTES: u64 = 10 * 1024 * 1024;
 /// Below this a `%PDF-` header is a fragment, not a page anybody can read.
 const MIN_PDF_BYTES: u64 = 1024;
 const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
-const MAX_SEGMENTS: usize = 64;
-const MAX_CANDIDATES_PER_SEGMENT: usize = 64;
+const MAX_ITEMS: usize = 64;
+const MAX_CANDIDATES_PER_ITEM: usize = 64;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
 
 static PDF_SLOTS: OnceLock<Semaphore> = OnceLock::new();
@@ -219,21 +219,30 @@ fn complete(bytes: &[u8]) -> bool {
 }
 
 fn validate_plan(plan: &Plan) -> Result<(), Error> {
-    if plan.trip.segments.len() > MAX_SEGMENTS
+    if plan.trip.items.len() > MAX_ITEMS
         || plan.trip.name.len() > MAX_FIELD_BYTES
         || plan.notes.iter().any(|note| note.len() > MAX_FIELD_BYTES)
     {
         return Err(Error::InputTooLarge);
     }
-    for segment in &plan.trip.segments {
-        if segment.candidates.len() > MAX_CANDIDATES_PER_SEGMENT
-            || segment.origin.len() > MAX_FIELD_BYTES
-            || segment.destination.len() > MAX_FIELD_BYTES
-            || segment.departure_date.len() > MAX_FIELD_BYTES
+    let too_long = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_FIELD_BYTES)
+    };
+    for item in &plan.trip.items {
+        if item.candidates.len() > MAX_CANDIDATES_PER_ITEM
+            || item.title.len() > MAX_FIELD_BYTES
+            || item.date.len() > MAX_FIELD_BYTES
+            || too_long(&item.origin)
+            || too_long(&item.destination)
+            || too_long(&item.place)
+            || too_long(&item.notes)
+            || too_long(&item.confirmation_code)
         {
             return Err(Error::InputTooLarge);
         }
-        for candidate in &segment.candidates {
+        for candidate in &item.candidates {
             if candidate.airline.len() > MAX_FIELD_BYTES
                 || candidate.flight_numbers.len() > MAX_FIELD_BYTES
                 || candidate.itinerary.len() > MAX_FIELD_BYTES
@@ -294,12 +303,17 @@ fn escape(text: &str) -> String {
     out
 }
 
-fn selected(segment: &TripSegment) -> Option<&TripCandidate> {
-    segment
-        .candidates
+fn selected(item: &TripItem) -> Option<&TripCandidate> {
+    item.candidates
         .iter()
         .find(|candidate| candidate.chosen)
-        .or_else(|| (segment.candidates.len() == 1).then(|| &segment.candidates[0]))
+        .or_else(|| (item.candidates.len() == 1).then(|| &item.candidates[0]))
+}
+
+/// An end of a flight leg for a sentence. Only a flight reaches the code
+/// that asks, so the fallback is for a row that lost its route, not a stay.
+fn airport(end: &Option<String>) -> &str {
+    end.as_deref().unwrap_or("—")
 }
 
 fn duration(minutes: Option<i64>) -> String {
@@ -335,6 +349,33 @@ fn clock(value: Option<&str>) -> &str {
         .unwrap_or("—")
 }
 
+/// "Stay", "Activity", "Transport": a non-flight's kind as its kicker.
+fn kind_label(kind: &str) -> String {
+    let mut chars = kind.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// When a non-flight item is, by the page's rule (`itemDateLabel`): a stay
+/// that ends on a later day is a range, an activity with a clock shows it,
+/// anything else is its day.
+fn item_when(item: &TripItem) -> String {
+    let end = item
+        .ends_at
+        .as_deref()
+        .and_then(|end| end.get(..10))
+        .filter(|end| *end != item.date);
+    if let Some(end) = end {
+        return format!("{} – {}", date(&item.date), date(end));
+    }
+    match clock(item.starts_at.as_deref()) {
+        "—" => date(&item.date),
+        clock => format!("{}, {}", date(&item.date), clock),
+    }
+}
+
 fn fare(candidate: &TripCandidate) -> String {
     let Some(price) = candidate.quoted_price else {
         return "Price unavailable".to_string();
@@ -358,8 +399,10 @@ fn saved_total(plan: &Plan) -> Option<String> {
     let mut currency: Option<&str> = None;
     let mut total = 0.0;
     let mut approximate = false;
-    for segment in &plan.trip.segments {
-        let candidate = selected(segment)?;
+    // Flights only: a stay's price is not a saved fare, and a stay with no
+    // options must not make the total unavailable.
+    for flight in plan.trip.flights() {
+        let candidate = selected(flight)?;
         let price = candidate.quoted_price?;
         let next = candidate.quoted_currency.as_deref()?;
         if currency.is_some_and(|known| known != next) {
@@ -384,7 +427,7 @@ fn saved_total(plan: &Plan) -> Option<String> {
     })
 }
 
-fn connection(before: &TripSegment, after: &TripSegment) -> (String, &'static str) {
+fn connection(before: &TripItem, after: &TripItem) -> (String, &'static str) {
     let Some(arrival) = selected(before) else {
         return (
             "Choose the arriving flight to check this connection.".to_string(),
@@ -397,11 +440,12 @@ fn connection(before: &TripSegment, after: &TripSegment) -> (String, &'static st
             "warn",
         );
     };
+    let at = airport(&before.destination);
     if before.destination != after.origin {
         return (
             format!(
-                "Airport transfer: arrive at {}, continue from {}. Ground travel is not included.",
-                before.destination, after.origin
+                "Airport transfer: arrive at {at}, continue from {}. Ground travel is not included.",
+                airport(&after.origin)
             ),
             "warn",
         );
@@ -413,36 +457,28 @@ fn connection(before: &TripSegment, after: &TripSegment) -> (String, &'static st
         parse(arrival.arriving_at_local.as_deref()),
         parse(departure.departing_at_local.as_deref()),
     ) else {
-        return (
-            format!("Connection at {}: timing unavailable.", before.destination),
-            "warn",
-        );
+        return (format!("Connection at {at}: timing unavailable."), "warn");
     };
     let minutes = (departure - arrival).num_minutes();
     if minutes < 0 {
         return (
-            format!(
-                "Impossible connection at {}: the next flight leaves before arrival.",
-                before.destination
-            ),
+            format!("Impossible connection at {at}: the next flight leaves before arrival."),
             "danger",
         );
     }
     if minutes < 180 {
         return (
             format!(
-                "{} at {} — tight connection; allow at least 3 hours between separate tickets.",
+                "{} at {at} — tight connection; allow at least 3 hours between separate tickets.",
                 duration(Some(minutes)),
-                before.destination
             ),
             "danger",
         );
     }
     (
         format!(
-            "{} at {} between the selected flights.",
+            "{} at {at} between the selected flights.",
             duration(Some(minutes)),
-            before.destination
         ),
         "ok",
     )
@@ -450,23 +486,26 @@ fn connection(before: &TripSegment, after: &TripSegment) -> (String, &'static st
 
 pub fn html(plan: &Plan) -> String {
     let trip = &plan.trip;
-    let route = if trip.segments.is_empty() {
+    // The route line, the selected count and the connection checks are
+    // about flights: a stay has no airports and no options to choose.
+    let flights: Vec<&TripItem> = trip.flights().collect();
+    let route = if flights.is_empty() {
         "Route not set".to_string()
     } else {
-        let mut airports = vec![trip.segments[0].origin.as_str()];
-        for segment in &trip.segments {
-            if airports.last().copied() != Some(segment.origin.as_str()) {
-                airports.push(&segment.origin);
+        let mut airports = vec![airport(&flights[0].origin)];
+        for flight in &flights {
+            let origin = airport(&flight.origin);
+            if airports.last().copied() != Some(origin) {
+                airports.push(origin);
             }
-            airports.push(&segment.destination);
+            airports.push(airport(&flight.destination));
         }
         airports.join(" → ")
     };
     let generated = Utc::now().format("%Y-%m-%d %H:%M UTC");
-    let selected_count = trip
-        .segments
+    let selected_count = flights
         .iter()
-        .filter(|segment| selected(segment).is_some())
+        .filter(|flight| selected(flight).is_some())
         .count();
 
     let mut out =
@@ -475,7 +514,7 @@ pub fn html(plan: &Plan) -> String {
     out.push_str(
         r#"</title>
 <style>
-@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
+@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .booked{margin-top:.7mm;color:#4f5d10;font-size:7.5pt;font-weight:700}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
 </style></head><body>"#,
     );
     write!(
@@ -497,7 +536,7 @@ pub fn html(plan: &Plan) -> String {
         ("Status", trip.status.clone()),
         (
             "Flights selected",
-            format!("{selected_count}/{}", trip.segments.len()),
+            format!("{selected_count}/{}", flights.len()),
         ),
         (
             "Saved fare total",
@@ -539,14 +578,43 @@ pub fn html(plan: &Plan) -> String {
     }
     out.push_str("<p class=\"page-note\">Times are local to each airport. Flight options not marked Selected are saved alternatives.</p>");
 
-    for (index, segment) in trip.segments.iter().enumerate() {
+    for (index, segment) in trip.items.iter().enumerate() {
+        if !segment.is_flight() {
+            // The page's card, on paper: what it is, its name, where, and
+            // a booking's code — the one thing a traveller reads off an
+            // itinerary at a hotel desk.
+            let place = segment
+                .place
+                .as_deref()
+                .map(|place| format!("<div class=\"place\">{}</div>", escape(place)))
+                .unwrap_or_default();
+            let booked = if segment.booked {
+                match segment.confirmation_code.as_deref() {
+                    Some(code) => format!("<div class=\"booked\">booked · {}</div>", escape(code)),
+                    None => "<div class=\"booked\">booked</div>".to_string(),
+                }
+            } else {
+                String::new()
+            };
+            write!(
+                out,
+                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}{}</div><time>{}</time></div></section>",
+                escape(&kind_label(&segment.kind)),
+                escape(&segment.title),
+                place,
+                booked,
+                escape(&item_when(segment))
+            )
+            .unwrap();
+            continue;
+        }
         write!(
             out,
             "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">Segment {}</div><h2>{} → {}</h2></div><time>{}</time></div>",
             segment.position,
-            escape(&segment.origin),
-            escape(&segment.destination),
-            escape(&date(&segment.departure_date))
+            escape(airport(&segment.origin)),
+            escape(airport(&segment.destination)),
+            escape(&date(&segment.date))
         )
         .unwrap();
         if segment.candidates.is_empty() {
@@ -581,7 +649,9 @@ pub fn html(plan: &Plan) -> String {
             .unwrap();
         }
         out.push_str("</section>");
-        if let Some(after) = trip.segments.get(index + 1) {
+        // The connection is to the next *flight*, whatever sits between:
+        // a stay between two legs does not change when the second departs.
+        if let Some(after) = trip.items[index + 1..].iter().find(|item| item.is_flight()) {
             let (message, tone) = connection(segment, after);
             write!(
                 out,
@@ -604,7 +674,31 @@ pub fn html(plan: &Plan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scout_core::trips::{Plan, Trip, TripCandidate, TripSegment};
+    use scout_core::trips::{Plan, Trip, TripCandidate, TripItem};
+
+    /// A flight leg as `load_trip` reads one: its time of day comes from
+    /// the chosen option, the columns a stay uses are empty.
+    fn flight(position: i64, origin: &str, destination: &str, candidate: TripCandidate) -> TripItem {
+        TripItem {
+            id: position,
+            position,
+            kind: "flight".to_string(),
+            title: format!("{origin} → {destination}"),
+            place: None,
+            origin: Some(origin.to_string()),
+            destination: Some(destination.to_string()),
+            date: "2026-10-12".to_string(),
+            starts_at: candidate.departing_at_local.clone(),
+            ends_at: candidate.arriving_at_local.clone(),
+            booked: false,
+            confirmation_code: None,
+            price: None,
+            currency: None,
+            notes: None,
+            arrival_id: None,
+            candidates: vec![candidate],
+        }
+    }
 
     fn plan() -> Plan {
         Plan {
@@ -614,13 +708,12 @@ mod tests {
                 adults: 2,
                 cabin_class: Some("premium_economy".to_string()),
                 status: "planning".to_string(),
-                segments: vec![
-                    TripSegment {
-                        position: 1,
-                        origin: "AMS".to_string(),
-                        destination: "LIS".to_string(),
-                        departure_date: "2026-10-12".to_string(),
-                        candidates: vec![TripCandidate {
+                items: vec![
+                    flight(
+                        1,
+                        "AMS",
+                        "LIS",
+                        TripCandidate {
                             candidate: 1,
                             chosen: true,
                             airline: "KLM & friends".to_string(),
@@ -632,14 +725,37 @@ mod tests {
                             quoted_price: Some(184.0),
                             quoted_currency: Some("EUR".to_string()),
                             source: Some("duffel".to_string()),
-                        }],
-                    },
-                    TripSegment {
+                        },
+                    ),
+                    // A stay on the same timeline, between the two legs. It
+                    // has no options and no route, so it must not count
+                    // towards "flights selected" or the saved total — and
+                    // sitting between the flights, it is what the
+                    // connection check has to look past to find the second.
+                    TripItem {
+                        id: 2,
                         position: 2,
-                        origin: "LIS".to_string(),
-                        destination: "FCO".to_string(),
-                        departure_date: "2026-10-12".to_string(),
-                        candidates: vec![TripCandidate {
+                        kind: "stay".to_string(),
+                        title: "Hotel <Roma>".to_string(),
+                        place: Some("Rome".to_string()),
+                        origin: None,
+                        destination: None,
+                        date: "2026-10-12".to_string(),
+                        starts_at: None,
+                        ends_at: Some("2026-10-15T11:00:00".to_string()),
+                        booked: true,
+                        confirmation_code: Some("ABC123".to_string()),
+                        price: Some(410.0),
+                        currency: Some("EUR".to_string()),
+                        notes: None,
+                        arrival_id: None,
+                        candidates: vec![],
+                    },
+                    flight(
+                        3,
+                        "LIS",
+                        "FCO",
+                        TripCandidate {
                             candidate: 1,
                             chosen: true,
                             airline: "TAP".to_string(),
@@ -651,8 +767,8 @@ mod tests {
                             quoted_price: Some(126.0),
                             quoted_currency: Some("EUR".to_string()),
                             source: Some("ignav".to_string()),
-                        }],
-                    },
+                        },
+                    ),
                 ],
                 // Only a kept trip can reach here: the traveller has to see
                 // a trip in their list before they can ask for its PDF.
@@ -681,10 +797,21 @@ mod tests {
             "from €126.00",
             "estimate when saved",
             "Saved itinerary, not a ticket",
+            // The stay is on the page as its own line, escaped like the
+            // rest: kind, name, place, its range, and the booking code.
+            "<div class=\"number\">Stay</div>",
+            "Hotel &lt;Roma&gt;",
+            "Rome",
+            "booked · ABC123",
         ] {
             assert!(html.contains(expected), "missing `{expected}`");
         }
+        assert!(
+            html.contains(&format!("{} – {}", date("2026-10-12"), date("2026-10-15"))),
+            "a stay that ends on a later day is not shown as a range"
+        );
         assert!(!html.contains("October <escape>"));
+        assert!(!html.contains("Hotel <Roma>"));
     }
 
     #[test]

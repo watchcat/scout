@@ -148,6 +148,49 @@ CREATE TABLE IF NOT EXISTS segment_candidates (
     source             TEXT,
     PRIMARY KEY (trip_id, position, candidate)
 );
+-- The trip's timeline: flights, stays, activities and transport in one
+-- date-ordered list. Replaces trip_segments, which stays above until a
+-- later release drops it. `position` is recomputed by date on every write.
+CREATE SEQUENCE IF NOT EXISTS trip_items_id_seq;
+CREATE TABLE IF NOT EXISTS trip_items (
+    id                BIGINT PRIMARY KEY DEFAULT nextval('trip_items_id_seq'),
+    trip_id           BIGINT NOT NULL,
+    position          BIGINT NOT NULL,
+    kind              TEXT NOT NULL,
+    title             TEXT NOT NULL,
+    place             TEXT,
+    origin            TEXT,
+    destination       TEXT,
+    starts_at         TEXT,
+    ends_at           TEXT,
+    date              TEXT NOT NULL,
+    booked            BOOLEAN NOT NULL DEFAULT false,
+    confirmation_code TEXT,
+    price             DOUBLE,
+    currency          TEXT,
+    notes             TEXT,
+    arrival_id        BIGINT,
+    next_candidate    BIGINT NOT NULL DEFAULT 1,
+    created_at        TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at        TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+-- The options on a flight item; segment_candidates keyed by item id.
+CREATE TABLE IF NOT EXISTS item_candidates (
+    item_id            BIGINT NOT NULL,
+    candidate          BIGINT NOT NULL,
+    chosen             BOOLEAN NOT NULL DEFAULT false,
+    airline            TEXT NOT NULL,
+    flight_numbers     TEXT NOT NULL,
+    itinerary          TEXT NOT NULL,
+    departing_at_local TEXT,
+    arriving_at_local  TEXT,
+    duration_minutes   BIGINT,
+    quoted_price       DOUBLE,
+    quoted_currency    TEXT,
+    quoted_at          TIMESTAMP,
+    source             TEXT,
+    PRIMARY KEY (item_id, candidate)
+);
 CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
 -- A person, independent of how they reach Scout. Deliberately almost empty:
 -- everything knowable about someone belongs to one of their identities or to
@@ -350,19 +393,81 @@ pub struct Trip {
     /// returns it to `planning`: the prices it was finalised at stopped
     /// describing the trip when the trip stopped being that trip.
     pub status: String,
-    pub segments: Vec<TripSegment>,
+    pub items: Vec<TripItem>,
     /// False while this is a draft the specialist built as it searched.
     /// The model sees this — it needs to know whether to offer to keep it.
     pub kept: bool,
 }
 
+impl Trip {
+    /// The flight legs, in timeline order: what pricing and the
+    /// connection notes look at, since a stay has no candidates.
+    pub fn flights(&self) -> impl Iterator<Item = &TripItem> {
+        self.items.iter().filter(|i| i.is_flight())
+    }
+}
+
+/// One thing on a trip: a flight leg, a stay, an activity or a transport
+/// booking. Flights carry a route and candidates; the rest carry a title
+/// and a place. `position` is 1-based and recomputed by date on every
+/// write, so it is a name for talking about the item, not an identity.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct TripSegment {
+pub struct TripItem {
+    #[serde(skip)]
+    pub id: i64,
     pub position: i64,
-    pub origin: String,
-    pub destination: String,
-    pub departure_date: String,
+    /// `flight` | `stay` | `activity` | `transport`
+    pub kind: String,
+    /// "AMS → LIS" for a flight, the booking's name for the rest.
+    pub title: String,
+    pub place: Option<String>,
+    pub origin: Option<String>,
+    pub destination: Option<String>,
+    /// The day it starts, `YYYY-MM-DD`; the sort key.
+    pub date: String,
+    /// Local ISO datetime. For a flight, the chosen option's departure,
+    /// filled at read time; `None` while undecided.
+    pub starts_at: Option<String>,
+    pub ends_at: Option<String>,
+    pub booked: bool,
+    pub confirmation_code: Option<String>,
+    pub price: Option<f64>,
+    pub currency: Option<String>,
+    pub notes: Option<String>,
+    pub arrival_id: Option<i64>,
     pub candidates: Vec<TripCandidate>,
+}
+
+impl TripItem {
+    pub fn is_flight(&self) -> bool {
+        self.kind == "flight"
+    }
+    /// "AMS→LIS" for a flight, the title otherwise: what a sentence about
+    /// this item calls it.
+    pub fn route(&self) -> String {
+        match (&self.origin, &self.destination) {
+            (Some(o), Some(d)) => format!("{o}→{d}"),
+            _ => self.title.clone(),
+        }
+    }
+}
+
+/// An item on its way into the database. Flights do not come through this;
+/// `add_flight` builds theirs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewItem {
+    pub kind: String,
+    pub title: String,
+    pub place: Option<String>,
+    pub date: String,
+    pub starts_at: Option<String>,
+    pub ends_at: Option<String>,
+    pub notes: Option<String>,
+    pub booked: bool,
+    pub confirmation_code: Option<String>,
+    pub price: Option<f64>,
+    pub currency: Option<String>,
+    pub arrival_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -420,15 +525,16 @@ pub enum CandidateChoice {
     CandidateNotFound,
 }
 
-/// What a caller has already checked a flight against, for `add_candidate`
-/// to verify again inside the same lock as the write it guards — see that
-/// method's own comment for why the check cannot live only in the caller.
-pub struct ExpectedSegment<'a> {
-    pub origin: &'a str,
-    pub destination: &'a str,
-    /// `None` when the flight being added had no usable date to check —
-    /// "nothing to verify", not "verified".
-    pub departure_date: Option<&'a str>,
+/// What the caller saw when it decided to act on an item — for
+/// `add_candidate` and `remove_item_checked` to verify again inside the
+/// same lock as the write it guards; see `add_candidate`'s own comment for
+/// why the check cannot live only in the caller. Every `Some` must match;
+/// `None` is "nothing to verify", not "verified".
+pub struct ExpectedItem<'a> {
+    pub origin: Option<&'a str>,
+    pub destination: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub date: Option<&'a str>,
 }
 
 /// What happened when somebody pressed START on an invite link.
@@ -878,6 +984,59 @@ const STEP_13_DEBUG_NOT_NULL: &str = r#"
 ALTER TABLE accounts ALTER COLUMN debug SET NOT NULL;
 "#;
 
+/// Items replace segments: one table for flights, stays, activities and
+/// transport. Flights are copied in with their candidates re-keyed to the
+/// new item ids. The old tables stay until a later release drops them, so
+/// a rollback of this release still has its data.
+///
+/// The `WHERE NOT EXISTS` guards are for the fixture pattern step 10
+/// documents: a database built by `MIGRATIONS` and recorded below 14
+/// already carries the tables, and copying the flights in twice would
+/// double every trip.
+const STEP_14_TRIP_ITEMS: &str = r#"
+CREATE SEQUENCE IF NOT EXISTS trip_items_id_seq;
+CREATE TABLE IF NOT EXISTS trip_items (
+    id BIGINT PRIMARY KEY DEFAULT nextval('trip_items_id_seq'),
+    trip_id BIGINT NOT NULL, position BIGINT NOT NULL, kind TEXT NOT NULL,
+    title TEXT NOT NULL, place TEXT, origin TEXT, destination TEXT,
+    starts_at TEXT, ends_at TEXT, date TEXT NOT NULL,
+    booked BOOLEAN NOT NULL DEFAULT false, confirmation_code TEXT,
+    price DOUBLE, currency TEXT, notes TEXT, arrival_id BIGINT,
+    next_candidate BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE TABLE IF NOT EXISTS item_candidates (
+    item_id BIGINT NOT NULL, candidate BIGINT NOT NULL,
+    chosen BOOLEAN NOT NULL DEFAULT false, airline TEXT NOT NULL, flight_numbers TEXT NOT NULL,
+    itinerary TEXT NOT NULL, departing_at_local TEXT, arriving_at_local TEXT,
+    duration_minutes BIGINT, quoted_price DOUBLE, quoted_currency TEXT, quoted_at TIMESTAMP,
+    source TEXT, PRIMARY KEY (item_id, candidate)
+);
+INSERT INTO trip_items (trip_id, position, kind, title, origin, destination, date, next_candidate)
+SELECT trip_id, position, 'flight', origin || ' → ' || destination, origin, destination, departure_date, next_candidate
+FROM trip_segments
+WHERE NOT EXISTS (SELECT 1 FROM trip_items i WHERE i.trip_id = trip_segments.trip_id AND i.kind = 'flight');
+INSERT INTO item_candidates
+SELECT i.id, c.candidate, c.chosen, c.airline, c.flight_numbers, c.itinerary,
+       c.departing_at_local, c.arriving_at_local, c.duration_minutes,
+       c.quoted_price, c.quoted_currency, c.quoted_at, c.source
+FROM segment_candidates c
+JOIN trip_items i ON i.trip_id = c.trip_id AND i.position = c.position AND i.kind = 'flight'
+WHERE NOT EXISTS (SELECT 1 FROM item_candidates x WHERE x.item_id = i.id AND x.candidate = c.candidate);
+"#;
+
+/// Positions were copied as they stood; the date rule puts them right.
+fn step_15_reorder_items(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT DISTINCT trip_id FROM trip_items")?;
+    let ids: Vec<i64> = stmt.query_map([], |r| r.get(0))?.collect::<duckdb::Result<_>>()?;
+    drop(stmt);
+    for id in ids {
+        reorder_items(conn, id)?;
+    }
+    Ok(())
+}
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -893,6 +1052,8 @@ fn steps() -> Vec<(i64, Step)> {
         (11, Step::Sql(STEP_11_KEPT_TRIPS_NOT_NULL)),
         (12, Step::Sql(STEP_12_RUN_TRACES)),
         (13, Step::Sql(STEP_13_DEBUG_NOT_NULL)),
+        (14, Step::Sql(STEP_14_TRIP_ITEMS)),
+        (15, Step::Code(step_15_reorder_items)),
     ]
 }
 
@@ -1592,12 +1753,13 @@ impl Store {
             // Only here. `expire_conversations` detaches instead — see
             // `detach_trips_within`. That difference is the feature.
             conn.execute(
-                "DELETE FROM segment_candidates WHERE trip_id IN
-                     (SELECT id FROM trips WHERE conversation_id = ?)",
+                "DELETE FROM item_candidates WHERE item_id IN
+                     (SELECT id FROM trip_items WHERE trip_id IN
+                         (SELECT id FROM trips WHERE conversation_id = ?))",
                 params![conversation_id],
             )?;
             conn.execute(
-                "DELETE FROM trip_segments WHERE trip_id IN
+                "DELETE FROM trip_items WHERE trip_id IN
                      (SELECT id FROM trips WHERE conversation_id = ?)",
                 params![conversation_id],
             )?;
@@ -2938,58 +3100,91 @@ impl Store {
         Ok(true)
     }
 
-    /// Inserts at `position` and shifts the rest down; without one the leg
-    /// goes where its date belongs. Candidates move with their segment: they
-    /// are keyed by position, so a shift that forgot them would reattach
-    /// somebody's chosen flight to a different route.
-    pub fn add_segment(
+    /// Adds a flight leg. It lands where its date puts it — every write
+    /// ends in `reorder_items`, so there is no position to pass — and a leg
+    /// sharing a day with another sorts by kind and then behind the legs
+    /// already on it, until a chosen option gives it a time of day.
+    pub fn add_flight(
         &self,
         trip_id: i64,
-        position: Option<i64>,
         origin: &str,
         destination: &str,
-        departure_date: &str,
+        date: &str,
     ) -> Result<Trip> {
         let conn = self.conn();
-        match add_segment_within(&conn, trip_id, position, origin, destination, departure_date)? {
-            Inserted::Added(trip) => Ok(trip),
-            Inserted::NoSuchPlace { count, wanted } => {
-                let noun = if count == 1 { "segment" } else { "segments" };
-                anyhow::bail!(
-                    "this trip has {count} {noun}, so position {wanted} is not somewhere to put one"
-                )
-            }
-        }
+        add_flight_within(&conn, trip_id, origin, destination, date)
     }
 
-    /// `add_segment`, but a position this trip has nowhere to put reads as
-    /// `None` rather than an error.
+    /// `add_flight`, but a trip that is gone reads as `None` rather than an
+    /// error.
     ///
     /// For a caller drawing from a copy of the trip that may be older than
-    /// the trip — a browser tab — "insert at 4" on a trip now two legs long
-    /// is the same failure as a stale remove: its picture is out of date, and
-    /// the answer is to re-read, not to apologise. It needs to tell that
-    /// apart from a real fault, and matching on the text of an error message
-    /// would break silently the first time somebody rewords it.
-    pub fn add_segment_checked(
+    /// the trip — a browser tab — a trip deleted underneath it is the same
+    /// failure as a stale remove: its picture is out of date, and the
+    /// answer is to re-read, not to apologise. It needs to tell that apart
+    /// from a real fault, and matching on the text of an error message
+    /// would break silently the first time somebody reworded it.
+    pub fn add_flight_checked(
         &self,
         trip_id: i64,
-        position: Option<i64>,
         origin: &str,
         destination: &str,
-        departure_date: &str,
+        date: &str,
     ) -> Result<Option<Trip>> {
         let conn = self.conn();
-        Ok(
-            match add_segment_within(&conn, trip_id, position, origin, destination, departure_date)?
-            {
-                Inserted::Added(trip) => Some(trip),
-                Inserted::NoSuchPlace { .. } => None,
-            },
-        )
+        // Checked here as well as inside `add_flight_within`: this one turns
+        // "no such trip" into `None` before the write path is entered, so
+        // nothing has to read the text of an error to tell it apart.
+        if !trip_exists(&conn, trip_id)? {
+            return Ok(None);
+        }
+        add_flight_within(&conn, trip_id, origin, destination, date).map(Some)
     }
 
-    /// Changes where or when one segment goes, leaving the rest alone.
+    /// Adds a stay, an activity or a transport booking. Flights carry a
+    /// route and candidates and come through `add_flight`, so a flight here
+    /// is a caller's mistake rather than a second way in.
+    pub fn add_item(&self, trip_id: i64, item: NewItem) -> Result<Trip> {
+        if item.kind == "flight" {
+            anyhow::bail!("flights go through add_flight");
+        }
+        // The page has a card for each of these and nothing else; an item
+        // of some other kind would be stored and never drawn.
+        if !matches!(item.kind.as_str(), "stay" | "activity" | "transport") {
+            anyhow::bail!("kind must be stay, activity or transport, not {:?}", item.kind);
+        }
+        let conn = self.conn();
+        if !trip_exists(&conn, trip_id)? {
+            anyhow::bail!("no such trip");
+        }
+        conn.execute(
+            "INSERT INTO trip_items (
+                 trip_id, position, kind, title, place, date, starts_at, ends_at,
+                 notes, booked, confirmation_code, price, currency, arrival_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                trip_id,
+                next_position(&conn, trip_id)?,
+                item.kind,
+                item.title,
+                item.place,
+                item.date,
+                item.starts_at,
+                item.ends_at,
+                item.notes,
+                item.booked,
+                item.confirmation_code,
+                item.price,
+                item.currency,
+                item.arrival_id
+            ],
+        )?;
+        reorder_items(&conn, trip_id)?;
+        touch(&conn, trip_id)?;
+        load_trip(&conn, trip_id)
+    }
+
+    /// Changes where or when one flight goes, leaving the rest alone.
     ///
     /// Returns the trip and how many parked options were dropped by the
     /// change. They have to go: an option is a flight on a particular route
@@ -2999,34 +3194,37 @@ impl Store {
     ///
     /// A change that changes nothing keeps them — restating a date must not
     /// cost the traveller their shortlist.
-    pub fn update_segment(
+    pub fn update_flight(
         &self,
         trip_id: i64,
         position: i64,
         origin: Option<&str>,
         destination: Option<&str>,
-        departure_date: Option<&str>,
+        date: Option<&str>,
     ) -> Result<(Trip, usize, bool)> {
         let conn = self.conn();
-        let current = conn
-            .query_row(
-                "SELECT origin, destination, departure_date FROM trip_segments
-                 WHERE trip_id = ? AND position = ?",
-                params![trip_id, position],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("this trip has no segment {position}"))?;
+        let Some((item_id, kind)) = item_at(&conn, trip_id, position)? else {
+            anyhow::bail!("this trip has no segment {position}");
+        };
+        if kind != "flight" {
+            anyhow::bail!("segment {position} is a {kind}, not a flight");
+        }
+        let current = conn.query_row(
+            "SELECT origin, destination, date FROM trip_items WHERE id = ?",
+            params![item_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
 
         let wanted = (
             origin.unwrap_or(&current.0).to_string(),
             destination.unwrap_or(&current.1).to_string(),
-            departure_date.unwrap_or(&current.2).to_string(),
+            date.unwrap_or(&current.2).to_string(),
         );
         if wanted == current {
             // Asking for what is already true is not a failure, and the
@@ -3035,85 +3233,107 @@ impl Store {
         }
 
         conn.execute(
-            "UPDATE trip_segments SET origin = ?, destination = ?, departure_date = ?
-             WHERE trip_id = ? AND position = ?",
-            params![wanted.0, wanted.1, wanted.2, trip_id, position],
+            "UPDATE trip_items SET origin = ?, destination = ?, date = ?, title = ?,
+                 updated_at = current_timestamp
+             WHERE id = ?",
+            params![wanted.0, wanted.1, wanted.2, format!("{} → {}", wanted.0, wanted.1), item_id],
         )?;
-        let dropped = conn.execute(
-            "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ?",
-            params![trip_id, position],
-        )?;
+        let dropped =
+            conn.execute("DELETE FROM item_candidates WHERE item_id = ?", params![item_id])?;
+        reorder_items(&conn, trip_id)?;
         touch(&conn, trip_id)?;
         Ok((load_trip(&conn, trip_id)?, dropped, true))
     }
 
-    pub fn drop_segment(&self, trip_id: i64, position: i64) -> Result<Trip> {
+    pub fn drop_item(&self, trip_id: i64, position: i64) -> Result<Trip> {
         let conn = self.conn();
-        drop_segment_within(&conn, trip_id, position)
+        let Some((item_id, _)) = item_at(&conn, trip_id, position)? else {
+            anyhow::bail!("this trip has no segment {position}");
+        };
+        remove_item_within(&conn, trip_id, item_id)
     }
 
-    /// Removes a segment only if it is still the one the caller read.
+    /// Removes an item only if it is still the one the caller read.
     ///
     /// Returns whether it removed anything: a position that is gone and a
-    /// position now holding a different leg are both `false`, because both
+    /// position now holding a different item are both `false`, because both
     /// mean the caller's picture of the trip is stale, and neither is an
     /// error worth a log line — they are what a second browser tab looks
     /// like from here.
     ///
     /// **The single `self.conn()` is the guard, not the comparison.**
-    /// `drop_segment` renumbers, so between a check and a write under two
-    /// separate acquisitions a concurrent edit can slide a different leg
+    /// Every write renumbers, so between a check and a write under two
+    /// separate acquisitions a concurrent edit can slide a different item
     /// into `position` and this method would delete it. That is why the
-    /// check below and `drop_segment_within` share this one `conn`, and why
-    /// `drop_segment` is not called here: calling it would release the lock
+    /// check below and `remove_item_within` share this one `conn`, and why
+    /// `drop_item` is not called here: calling it would release the lock
     /// and re-take it. No test in this file can catch that regression —
     /// they are single-threaded, and every one of them still passes with
     /// the lock released in between. The structure is the whole protection;
-    /// do not "simplify" it back into a call to `drop_segment`.
-    pub fn remove_segment_checked(
+    /// do not "simplify" it back into a call to `drop_item`.
+    pub fn remove_item_checked(
         &self,
         trip_id: i64,
         position: i64,
-        expected: ExpectedSegment<'_>,
+        expected: ExpectedItem<'_>,
     ) -> Result<bool> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT origin, destination, departure_date FROM trip_segments
+            "SELECT id, origin, destination, title, date FROM trip_items
              WHERE trip_id = ? AND position = ?",
         )?;
-        let segment: Option<(String, String, String)> = stmt
-            .query_map(params![trip_id, position], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        /// What the row says the item is, for comparing with what the
+        /// caller saw.
+        struct Seen {
+            id: i64,
+            origin: Option<String>,
+            destination: Option<String>,
+            title: String,
+            date: String,
+        }
+        let item: Option<Seen> = stmt
+            .query_map(params![trip_id, position], |r| {
+                Ok(Seen {
+                    id: r.get(0)?,
+                    origin: r.get(1)?,
+                    destination: r.get(2)?,
+                    title: r.get(3)?,
+                    date: r.get(4)?,
+                })
+            })?
             .next()
             .transpose()?;
         drop(stmt);
-        let Some((origin, destination, departure_date)) = segment else {
+        let Some(item) = item else {
             return Ok(false);
         };
-        if origin != expected.origin || destination != expected.destination {
+        // `None` is "nothing to verify", not "verified" — the same reading
+        // `add_candidate` gives these fields, so a caller that has only a
+        // route to go on is not quietly granted a free pass on the date.
+        let seen = |expected: Option<&str>, actual: Option<&str>| {
+            expected.is_none_or(|e| actual == Some(e))
+        };
+        if !seen(expected.origin, item.origin.as_deref())
+            || !seen(expected.destination, item.destination.as_deref())
+            || !seen(expected.title, Some(&item.title))
+            || !seen(expected.date, Some(&item.date))
+        {
             return Ok(false);
         }
-        // `None` is "nothing to verify", not "verified" — the same reading
-        // `add_candidate` gives this field, so a caller that has only a
-        // route to go on is not quietly granted a free pass on the date.
-        if let Some(expected_date) = expected.departure_date {
-            if departure_date != expected_date {
-                return Ok(false);
-            }
-        }
-        drop_segment_within(&conn, trip_id, position)?;
+        remove_item_within(&conn, trip_id, item.id)?;
         Ok(true)
     }
 
-    /// Parks a flight against a segment. `decided` also marks it chosen, so
-    /// the common single-option path is one call.
+    /// Parks a flight against a flight item. `decided` also marks it
+    /// chosen, so the common single-option path is one call.
     ///
-    /// `expected` is checked against the segment's row in this same lock
+    /// `expected` is checked against the item's row in this same lock
     /// acquisition, not against a `Trip` the caller read earlier: that read
     /// and this write are two separate lock acquisitions, so a concurrent
-    /// `add_trip_segment` or `drop_trip_segment` renumbering positions in
-    /// between could otherwise land a candidate validated against one route
-    /// onto a segment that is now something else. The caller passes what it
-    /// validated; this re-checks that it is still true.
+    /// write renumbering positions in between could otherwise land a
+    /// candidate validated against one route onto an item that is now
+    /// something else. The caller passes what it validated; this re-checks
+    /// that it is still true.
     ///
     /// Candidate numbers are never reused: they are what the traveller sees and
     /// what `choose_candidate` takes, and recycling one would silently retarget
@@ -3122,74 +3342,77 @@ impl Store {
         &self,
         trip_id: i64,
         position: i64,
-        expected: ExpectedSegment,
+        expected: ExpectedItem,
         new: NewCandidate,
         decided: bool,
     ) -> Result<Trip> {
         let conn = self.conn();
-        // Distinguished from the segment check below: "no such trip" and
+        // Distinguished from the item check below: "no such trip" and
         // "this trip has no segment N" point the caller at different fixes.
-        let known: i64 = conn.query_row(
-            "SELECT count(*) FROM trips WHERE id = ?",
-            params![trip_id],
-            |row| row.get(0),
-        )?;
-        if known == 0 {
+        if !trip_exists(&conn, trip_id)? {
             anyhow::bail!("no such trip");
         }
-        let mut stmt = conn.prepare(
-            "SELECT origin, destination, departure_date FROM trip_segments
-             WHERE trip_id = ? AND position = ?",
-        )?;
-        let segment: Option<(String, String, String)> = stmt
-            .query_map(params![trip_id, position], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .next()
-            .transpose()?;
-        drop(stmt);
-        let Some((origin, destination, departure_date)) = segment else {
+        let Some((item_id, kind)) = item_at(&conn, trip_id, position)? else {
             anyhow::bail!("this trip has no segment {position}");
         };
+        if kind != "flight" {
+            anyhow::bail!("segment {position} is a {kind}; options go on flights");
+        }
+        let (origin, destination, title, date) = conn.query_row(
+            "SELECT origin, destination, title, date FROM trip_items WHERE id = ?",
+            params![item_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
         // The route and date guard: nothing else stops a flight validated
-        // against one segment being written to a different one by the time
+        // against one item being written to a different one by the time
         // this lock is taken.
-        if origin != expected.origin || destination != expected.destination {
+        if expected.origin.is_some_and(|o| o != origin)
+            || expected.destination.is_some_and(|d| d != destination)
+        {
             anyhow::bail!(
                 "segment {position} is {origin}→{destination} but that flight is \
                  {}→{}",
-                expected.origin,
-                expected.destination
+                expected.origin.unwrap_or("?"),
+                expected.destination.unwrap_or("?")
             );
         }
-        if let Some(expected_date) = expected.departure_date {
-            if departure_date != expected_date {
+        if expected.title.is_some_and(|t| t != title) {
+            anyhow::bail!("segment {position} is {title}, not {}", expected.title.unwrap_or("?"));
+        }
+        if let Some(expected_date) = expected.date {
+            if date != expected_date {
                 anyhow::bail!(
-                    "segment {position} departs {departure_date} but that flight departs \
-                     {expected_date}"
+                    "segment {position} departs {date} but that flight departs {expected_date}"
                 );
             }
         }
-        // next_candidate is a high-water mark on the segment row: read and
+        // next_candidate is a high-water mark on the item row: read and
         // advance it here, inside the lock this method already holds, so a
         // dropped candidate's number is never handed to the next insert.
         let next: i64 = conn.query_row(
-            "SELECT next_candidate FROM trip_segments WHERE trip_id = ? AND position = ?",
-            params![trip_id, position],
+            "SELECT next_candidate FROM trip_items WHERE id = ?",
+            params![item_id],
             |row| row.get(0),
         )?;
         conn.execute(
-            "UPDATE trip_segments SET next_candidate = next_candidate + 1
-             WHERE trip_id = ? AND position = ?",
-            params![trip_id, position],
+            "UPDATE trip_items SET next_candidate = next_candidate + 1 WHERE id = ?",
+            params![item_id],
         )?;
         conn.execute(
-            "INSERT INTO segment_candidates (
-                 trip_id, position, candidate, chosen, airline, flight_numbers, itinerary,
+            "INSERT INTO item_candidates (
+                 item_id, candidate, chosen, airline, flight_numbers, itinerary,
                  departing_at_local, arriving_at_local, duration_minutes,
                  quoted_price, quoted_currency, quoted_at, source)
-             VALUES (?, ?, ?, false, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp, ?)",
+             VALUES (?, ?, false, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp, ?)",
             params![
-                trip_id,
-                position,
+                item_id,
                 next,
                 new.airline,
                 new.flight_numbers,
@@ -3203,28 +3426,33 @@ impl Store {
             ],
         )?;
         if decided {
-            choose_within(&conn, trip_id, position, next)?;
+            choose_within(&conn, item_id, next)?;
         }
+        // A chosen departure gives the flight a time of day, which can move
+        // it past an item that shares its date.
+        reorder_items(&conn, trip_id)?;
         touch(&conn, trip_id)?;
         load_trip(&conn, trip_id)
     }
 
     pub fn choose_candidate(&self, trip_id: i64, position: i64, candidate: i64) -> Result<Trip> {
         let conn = self.conn();
-        // choose_within only checks the segment_candidates row, which a
-        // deleted trip has none of — indistinguishable, from there, from a
-        // numbering mistake on a trip that still exists. Checked here,
-        // separately, so a trip gone by the time this runs reads as "no
-        // such trip" rather than a bad option number.
-        let known: i64 = conn.query_row(
-            "SELECT count(*) FROM trips WHERE id = ?",
-            params![trip_id],
-            |row| row.get(0),
-        )?;
-        if known == 0 {
+        // Checked first, separately: a trip gone by the time this runs
+        // reads as "no such trip" rather than a bad position or option
+        // number — a deleted trip has no items, which from the item lookup
+        // alone is indistinguishable from a numbering mistake on a trip
+        // that still exists.
+        if !trip_exists(&conn, trip_id)? {
             anyhow::bail!("no such trip");
         }
-        choose_within(&conn, trip_id, position, candidate)?;
+        let Some((item_id, kind)) = item_at(&conn, trip_id, position)? else {
+            anyhow::bail!("this trip has no segment {position}");
+        };
+        if kind != "flight" {
+            anyhow::bail!("segment {position} is a {kind}; options go on flights");
+        }
+        choose_within(&conn, item_id, candidate)?;
+        reorder_items(&conn, trip_id)?;
         touch(&conn, trip_id)?;
         load_trip(&conn, trip_id)
     }
@@ -3252,31 +3480,47 @@ impl Store {
         let Some(id) = id else {
             return Ok(CandidateChoice::TripNotFound);
         };
+        let Some((item_id, kind)) = item_at(&conn, id, position)? else {
+            return Ok(CandidateChoice::CandidateNotFound);
+        };
+        // An error, not `CandidateNotFound`: that variant means "re-read and
+        // pick again", and no re-read will put an option on a stay.
+        if kind != "flight" {
+            anyhow::bail!("segment {position} is a {kind}; options go on flights");
+        }
 
         let known: i64 = conn.query_row(
-            "SELECT count(*) FROM segment_candidates
-             WHERE trip_id = ? AND position = ? AND candidate = ?",
-            params![id, position, candidate],
+            "SELECT count(*) FROM item_candidates WHERE item_id = ? AND candidate = ?",
+            params![item_id, candidate],
             |row| row.get(0),
         )?;
         if known == 0 {
             return Ok(CandidateChoice::CandidateNotFound);
         }
 
-        choose_within(&conn, id, position, candidate)?;
+        choose_within(&conn, item_id, candidate)?;
+        reorder_items(&conn, id)?;
         touch(&conn, id)?;
         Ok(CandidateChoice::Chosen(load_trip(&conn, id)?))
     }
 
     pub fn drop_candidate(&self, trip_id: i64, position: i64, candidate: i64) -> Result<Trip> {
         let conn = self.conn();
+        let Some((item_id, kind)) = item_at(&conn, trip_id, position)? else {
+            anyhow::bail!("this trip has no segment {position}");
+        };
+        if kind != "flight" {
+            anyhow::bail!("segment {position} is a {kind}; options go on flights");
+        }
         let removed = conn.execute(
-            "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ? AND candidate = ?",
-            params![trip_id, position, candidate],
+            "DELETE FROM item_candidates WHERE item_id = ? AND candidate = ?",
+            params![item_id, candidate],
         )?;
         if removed == 0 {
             anyhow::bail!("segment {position} has no option {candidate}");
         }
+        // Dropping the chosen option takes the flight's time of day with it.
+        reorder_items(&conn, trip_id)?;
         touch(&conn, trip_id)?;
         load_trip(&conn, trip_id)
     }
@@ -3294,35 +3538,66 @@ impl Store {
         };
         drop(ids);
         drop(stmt);
-        conn.execute("DELETE FROM segment_candidates WHERE trip_id = ?", params![id])?;
-        conn.execute("DELETE FROM trip_segments WHERE trip_id = ?", params![id])?;
+        // Children before parents, or the subquery finds nothing.
+        conn.execute(
+            "DELETE FROM item_candidates WHERE item_id IN
+                 (SELECT id FROM trip_items WHERE trip_id = ?)",
+            params![id],
+        )?;
+        conn.execute("DELETE FROM trip_items WHERE trip_id = ?", params![id])?;
         conn.execute("DELETE FROM trips WHERE id = ?", params![id])?;
         Ok(true)
     }
 }
 
-/// Clears the position's flags and sets one. "At most one chosen" cannot be
-/// a `UNIQUE` constraint because `false` repeats, so it is this function's
+fn trip_exists(conn: &Connection, trip_id: i64) -> Result<bool> {
+    let known: i64 =
+        conn.query_row("SELECT count(*) FROM trips WHERE id = ?", params![trip_id], |row| {
+            row.get(0)
+        })?;
+    Ok(known > 0)
+}
+
+/// The item a traveller-facing position names right now: its id and kind.
+/// Positions are recomputed on every write, so the id is what the write
+/// that follows must key on — under the same lock as this lookup.
+fn item_at(conn: &Connection, trip_id: i64, position: i64) -> Result<Option<(i64, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, kind FROM trip_items WHERE trip_id = ? AND position = ?")?;
+    let found = stmt
+        .query_map(params![trip_id, position], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .next()
+        .transpose()?;
+    Ok(found)
+}
+
+/// Clears the item's flags and sets one. "At most one chosen" cannot be a
+/// `UNIQUE` constraint because `false` repeats, so it is this function's
 /// job — and the caller always holds the connection lock, which is what
 /// makes the pair of statements indivisible.
-fn choose_within(conn: &Connection, trip_id: i64, position: i64, candidate: i64) -> Result<()> {
+fn choose_within(conn: &Connection, item_id: i64, candidate: i64) -> Result<()> {
     let known: i64 = conn.query_row(
-        "SELECT count(*) FROM segment_candidates
-         WHERE trip_id = ? AND position = ? AND candidate = ?",
-        params![trip_id, position, candidate],
+        "SELECT count(*) FROM item_candidates WHERE item_id = ? AND candidate = ?",
+        params![item_id, candidate],
         |row| row.get(0),
     )?;
     if known == 0 {
+        // Worded by position, which is the name the traveller knows the
+        // item by; only the error path pays for the lookup.
+        let position: i64 = conn.query_row(
+            "SELECT position FROM trip_items WHERE id = ?",
+            params![item_id],
+            |row| row.get(0),
+        )?;
         anyhow::bail!("segment {position} has no option {candidate}");
     }
     conn.execute(
-        "UPDATE segment_candidates SET chosen = false WHERE trip_id = ? AND position = ?",
-        params![trip_id, position],
+        "UPDATE item_candidates SET chosen = false WHERE item_id = ?",
+        params![item_id],
     )?;
     conn.execute(
-        "UPDATE segment_candidates SET chosen = true
-         WHERE trip_id = ? AND position = ? AND candidate = ?",
-        params![trip_id, position, candidate],
+        "UPDATE item_candidates SET chosen = true WHERE item_id = ? AND candidate = ?",
+        params![item_id, candidate],
     )?;
     Ok(())
 }
@@ -3370,7 +3645,7 @@ fn detach_trips_within(conn: &Connection, conversation_ids: &[i64]) -> Result<us
 }
 
 /// Removes the unkept drafts owned by these conversations, with their
-/// segments and parked options.
+/// items and parked options.
 ///
 /// Children before parents, or the subquery finds nothing. Guards the empty
 /// slice for the same reason `detach_trips_within` does: `IN ()` is a parser
@@ -3383,11 +3658,14 @@ fn delete_drafts_within(conn: &Connection, conversation_ids: &[i64]) -> Result<u
     let doomed =
         format!("(SELECT id FROM trips WHERE NOT kept AND conversation_id IN ({holes}))");
     conn.execute(
-        &format!("DELETE FROM segment_candidates WHERE trip_id IN {doomed}"),
+        &format!(
+            "DELETE FROM item_candidates WHERE item_id IN
+                 (SELECT id FROM trip_items WHERE trip_id IN {doomed})"
+        ),
         duckdb::params_from_iter(conversation_ids.iter()),
     )?;
     conn.execute(
-        &format!("DELETE FROM trip_segments WHERE trip_id IN {doomed}"),
+        &format!("DELETE FROM trip_items WHERE trip_id IN {doomed}"),
         duckdb::params_from_iter(conversation_ids.iter()),
     )?;
     Ok(conn.execute(
@@ -3396,136 +3674,99 @@ fn delete_drafts_within(conn: &Connection, conversation_ids: &[i64]) -> Result<u
     )?)
 }
 
-/// How `add_segment_within` ended up.
-///
-/// `NoSuchPlace` carries the two numbers its explanation needs rather than a
-/// formatted string, so the one caller that turns this into an error owns
-/// the wording and the one that turns it into a status is not tempted to
-/// read that wording back.
-enum Inserted {
-    Added(Trip),
-    NoSuchPlace { count: i64, wanted: i64 },
+/// Where a new item goes before `reorder_items` has looked at it: behind
+/// everything already there. The date puts it right; the position only
+/// breaks ties, and a leg sharing its day with legs already on it should
+/// land behind them — the traveller typing legs in order expects it, and
+/// there is nothing better to break that tie with until a chosen option
+/// gives it a time of day.
+fn next_position(conn: &Connection, trip_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT coalesce(max(position), 0) + 1 FROM trip_items WHERE trip_id = ?",
+        params![trip_id],
+        |row| row.get(0),
+    )?)
 }
 
-/// Adds a leg, inserting at `position` and shifting the rest down. Without
-/// a position the leg goes where its date belongs, which for a trip built
-/// front to back is the end and is the same answer appending gave.
-///
-/// A position outside 1..=count+1 comes back as `NoSuchPlace` instead of an
-/// error because its two callers disagree about what it means — see
-/// `add_segment_checked`. Splitting it out here rather than re-deriving the
-/// range at each of them keeps one definition of where a leg may go.
-fn add_segment_within(
+/// Adds a flight leg and lets `reorder_items` put it where its date
+/// belongs. Shared by `add_flight` and `add_flight_checked`, whose only
+/// disagreement is what a missing trip means.
+fn add_flight_within(
     conn: &Connection,
     trip_id: i64,
-    position: Option<i64>,
     origin: &str,
     destination: &str,
-    departure_date: &str,
-) -> Result<Inserted> {
+    date: &str,
+) -> Result<Trip> {
     // Checked before anything is written: without this, a bad trip_id
-    // still passed the count query (as 0) and reached the INSERT below,
-    // leaving a segment row for a trip that does not exist — and no read
-    // path can ever find it again, because every read goes through a trip.
-    let known: i64 = conn.query_row(
-        "SELECT count(*) FROM trips WHERE id = ?",
-        params![trip_id],
-        |row| row.get(0),
-    )?;
-    if known == 0 {
+    // would reach the INSERT below and leave an item row for a trip that
+    // does not exist — and no read path can ever find it again, because
+    // every read goes through a trip.
+    if !trip_exists(conn, trip_id)? {
         anyhow::bail!("no such trip");
     }
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM trip_segments WHERE trip_id = ?",
-        params![trip_id],
-        |row| row.get(0),
-    )?;
-    let at = match position {
-        Some(p) if p >= 1 && p <= count => p,
-        Some(p) if p == count + 1 => p,
-        Some(wanted) => return Ok(Inserted::NoSuchPlace { count, wanted }),
-        // Where the date belongs, not the end. Appending regardless of date
-        // is how a traveller who added a leg dated before their first one
-        // ended up with it last: dates_run_forwards then saw the disorder
-        // and refused to price the trip at all, so the system knew the order
-        // was wrong and would not fix it.
-        //
-        // The place is ahead of the first leg that leaves after this one, or
-        // the end when none does. Comparing the dates as text is comparing
-        // them as dates for as long as every one is zero-padded YYYY-MM-DD,
-        // which `calendar_date` establishes at the tool boundary and
-        // `dates_run_forwards` already relies on.
-        //
-        // Strictly after, so a leg sharing its date with legs already here
-        // lands behind them. There is nothing better to break that tie with:
-        // the obvious answer, departure time, does not exist yet — a
-        // brand-new leg carries no candidates, and a candidate is the only
-        // thing that ever gives a leg a time of day.
-        None => conn
-            .query_row(
-                "SELECT min(position) FROM trip_segments
-                 WHERE trip_id = ? AND departure_date > ?",
-                params![trip_id, departure_date],
-                |row| row.get::<_, Option<i64>>(0),
-            )?
-            .unwrap_or(count + 1),
-    };
-    if at <= count {
-        // Descending is not needed: DuckDB applies this set-wise, so no
-        // intermediate state can collide with the primary key.
-        conn.execute(
-            "UPDATE trip_segments SET position = position + 1
-             WHERE trip_id = ? AND position >= ?",
-            params![trip_id, at],
-        )?;
-        conn.execute(
-            "UPDATE segment_candidates SET position = position + 1
-             WHERE trip_id = ? AND position >= ?",
-            params![trip_id, at],
-        )?;
-    }
     conn.execute(
-        "INSERT INTO trip_segments (trip_id, position, origin, destination, departure_date)
-         VALUES (?, ?, ?, ?, ?)",
-        params![trip_id, at, origin, destination, departure_date],
+        "INSERT INTO trip_items (trip_id, position, kind, title, origin, destination, date)
+         VALUES (?, ?, 'flight', ?, ?, ?, ?)",
+        params![
+            trip_id,
+            next_position(conn, trip_id)?,
+            format!("{origin} → {destination}"),
+            origin,
+            destination,
+            date
+        ],
     )?;
-    touch(conn, trip_id)?;
-    Ok(Inserted::Added(load_trip(conn, trip_id)?))
-}
-
-/// Removes a segment and closes the gap behind it.
-///
-/// Takes `&Connection` rather than `&Store` so a caller that has already
-/// checked something about the segment can do the check and this delete
-/// under one acquisition of the store's non-reentrant mutex — see
-/// `remove_segment_checked`, whose correctness is exactly that. Re-locking
-/// would deadlock; releasing and re-locking would silently reintroduce the
-/// race the check exists to close.
-fn drop_segment_within(conn: &Connection, trip_id: i64, position: i64) -> Result<Trip> {
-    let removed = conn.execute(
-        "DELETE FROM trip_segments WHERE trip_id = ? AND position = ?",
-        params![trip_id, position],
-    )?;
-    if removed == 0 {
-        anyhow::bail!("this trip has no segment {position}");
-    }
-    conn.execute(
-        "DELETE FROM segment_candidates WHERE trip_id = ? AND position = ?",
-        params![trip_id, position],
-    )?;
-    // Closing the gap keeps positions contiguous, which is the invariant
-    // that makes the shift above correct.
-    conn.execute(
-        "UPDATE trip_segments SET position = position - 1 WHERE trip_id = ? AND position > ?",
-        params![trip_id, position],
-    )?;
-    conn.execute(
-        "UPDATE segment_candidates SET position = position - 1
-         WHERE trip_id = ? AND position > ?",
-        params![trip_id, position],
-    )?;
+    reorder_items(conn, trip_id)?;
     touch(conn, trip_id)?;
     load_trip(conn, trip_id)
+}
+
+/// Removes an item by id, with its options, and renumbers what is left.
+///
+/// Takes `&Connection` rather than `&Store` so a caller that has already
+/// checked something about the item can do the check and this delete
+/// under one acquisition of the store's non-reentrant mutex — see
+/// `remove_item_checked`, whose correctness is exactly that. Re-locking
+/// would deadlock; releasing and re-locking would silently reintroduce the
+/// race the check exists to close.
+fn remove_item_within(conn: &Connection, trip_id: i64, item_id: i64) -> Result<Trip> {
+    conn.execute("DELETE FROM item_candidates WHERE item_id = ?", params![item_id])?;
+    conn.execute("DELETE FROM trip_items WHERE id = ?", params![item_id])?;
+    reorder_items(conn, trip_id)?;
+    touch(conn, trip_id)?;
+    load_trip(conn, trip_id)
+}
+
+/// Recomputes positions for one trip: by date, then a start time (an item
+/// with one sorts before an item without on the same day; a flight's is its
+/// chosen option's departure), then kind — flight, transport, stay,
+/// activity — then the previous position, so two items nothing else
+/// separates keep their order. Called inside every write, under the lock
+/// the caller already holds.
+///
+/// The chosen option is joined through a GROUP BY, not the raw table: "at
+/// most one chosen" is enforced in Rust, and a duplicate slipping past it
+/// would otherwise number the item twice and leave a position vacant.
+fn reorder_items(conn: &Connection, trip_id: i64) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id FROM trip_items i
+         LEFT JOIN (SELECT item_id, min(departing_at_local) AS departing_at_local
+                    FROM item_candidates WHERE chosen GROUP BY item_id) c ON c.item_id = i.id
+         WHERE i.trip_id = ?
+         ORDER BY i.date,
+                  COALESCE(i.starts_at, c.departing_at_local) IS NULL,
+                  COALESCE(i.starts_at, c.departing_at_local),
+                  CASE i.kind WHEN 'flight' THEN 0 WHEN 'transport' THEN 1 WHEN 'stay' THEN 2 ELSE 3 END,
+                  i.position, i.id",
+    )?;
+    let ids: Vec<i64> =
+        stmt.query_map(params![trip_id], |r| r.get(0))?.collect::<duckdb::Result<_>>()?;
+    drop(stmt);
+    for (n, id) in ids.iter().enumerate() {
+        conn.execute("UPDATE trip_items SET position = ? WHERE id = ?", params![n as i64 + 1, id])?;
+    }
+    Ok(())
 }
 
 /// Reads one whole trip. Takes `&Connection` rather than `&Store` so it can
@@ -3547,18 +3788,41 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
     )?;
 
     let mut stmt = conn.prepare(
-        "SELECT position, origin, destination, departure_date FROM trip_segments
-         WHERE trip_id = ? ORDER BY position",
+        "SELECT id, position, kind, title, place, origin, destination, date, starts_at, ends_at,
+                booked, confirmation_code, price, currency, notes, arrival_id
+         FROM trip_items WHERE trip_id = ? ORDER BY position",
     )?;
-    let rows: Vec<(i64, String, String, String)> = stmt
-        .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+    let rows: Vec<TripItem> = stmt
+        .query_map(params![id], |r| {
+            Ok(TripItem {
+                id: r.get(0)?,
+                position: r.get(1)?,
+                kind: r.get(2)?,
+                title: r.get(3)?,
+                place: r.get(4)?,
+                origin: r.get(5)?,
+                destination: r.get(6)?,
+                date: r.get(7)?,
+                starts_at: r.get(8)?,
+                ends_at: r.get(9)?,
+                booked: r.get(10)?,
+                confirmation_code: r.get(11)?,
+                price: r.get(12)?,
+                currency: r.get(13)?,
+                notes: r.get(14)?,
+                arrival_id: r.get(15)?,
+                candidates: Vec::new(),
+            })
+        })?
         .collect::<duckdb::Result<_>>()?;
 
     let mut stmt = conn.prepare(
-        "SELECT position, candidate, chosen, airline, flight_numbers, itinerary,
+        "SELECT item_id, candidate, chosen, airline, flight_numbers, itinerary,
                 departing_at_local, arriving_at_local, duration_minutes,
                 quoted_price, quoted_currency, source
-         FROM segment_candidates WHERE trip_id = ? ORDER BY position, candidate",
+         FROM item_candidates
+         WHERE item_id IN (SELECT id FROM trip_items WHERE trip_id = ?)
+         ORDER BY item_id, candidate",
     )?;
     let candidates: Vec<(i64, TripCandidate)> = stmt
         .query_map(params![id], |r| {
@@ -3581,22 +3845,29 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
         })?
         .collect::<duckdb::Result<_>>()?;
 
-    let segments = rows
+    let items = rows
         .into_iter()
-        .map(|(position, origin, destination, departure_date)| TripSegment {
-            position,
-            origin,
-            destination,
-            departure_date,
-            candidates: candidates
+        .map(|mut item| {
+            item.candidates = candidates
                 .iter()
-                .filter(|(p, _)| *p == position)
+                .filter(|(item_id, _)| *item_id == item.id)
                 .map(|(_, c)| c.clone())
-                .collect(),
+                .collect();
+            // A flight's start is its chosen option's departure, read here
+            // rather than kept in a second column that would have to be
+            // updated in step with every choose and drop.
+            if item.starts_at.is_none() {
+                item.starts_at = item
+                    .candidates
+                    .iter()
+                    .find(|c| c.chosen)
+                    .and_then(|c| c.departing_at_local.clone());
+            }
+            item
         })
         .collect();
 
-    Ok(Trip { id, name, adults, cabin_class, status, segments, kept })
+    Ok(Trip { id, name, adults, cabin_class, status, items, kept })
 }
 
 fn row_to_purchase(row: &Row) -> duckdb::Result<Purchase> {
@@ -3979,7 +4250,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 13);
+        assert_eq!(s.schema_version().unwrap(), 15);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -4043,7 +4314,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 13);
+        assert_eq!(store.schema_version().unwrap(), 15);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -4813,7 +5084,7 @@ CREATE TABLE segment_candidates (
         assert_eq!(trip.name, "September");
         assert_eq!(trip.adults, 1, "one adult unless said otherwise");
         assert_eq!(trip.status, "planning");
-        assert!(trip.segments.is_empty());
+        assert!(trip.items.is_empty());
 
         assert!(store.find_trip(7, "september").unwrap().is_some(), "names are not case-sensitive");
         assert!(store.find_trip(8, "September").unwrap().is_none(), "another user has no such trip");
@@ -5146,39 +5417,39 @@ CREATE TABLE trips (
     }
 
     #[test]
-    fn segments_stay_contiguous_through_inserts_and_drops() {
-        // Positions are how the traveller refers to a segment ("drop the
+    fn items_stay_contiguous_through_inserts_and_drops() {
+        // Positions are how the traveller refers to an item ("drop the
         // second leg"), so a hole would make every later instruction target
         // the wrong row.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
-            store.add_segment(trip.id, None, o, d, date).unwrap();
+            store.add_flight(trip.id, o, d, date).unwrap();
         }
-        let trip = store.add_segment(trip.id, Some(2), "BCN", "MAD", "2026-09-05").unwrap();
+        let trip = store.add_flight(trip.id, "BCN", "MAD", "2026-09-05").unwrap();
         assert_eq!(
-            trip.segments.iter().map(|s| (s.position, s.origin.as_str())).collect::<Vec<_>>(),
+            trip.items.iter().map(|s| (s.position, s.origin.as_deref().unwrap_or(""))).collect::<Vec<_>>(),
             vec![(1, "AMS"), (2, "BCN"), (3, "LIS")],
-            "inserting at 2 shifts the rest down rather than colliding"
+            "a leg dated between the others lands between them and the rest renumber"
         );
 
-        let trip = store.drop_segment(trip.id, 1).unwrap();
+        let trip = store.drop_item(trip.id, 1).unwrap();
         assert_eq!(
-            trip.segments.iter().map(|s| (s.position, s.origin.as_str())).collect::<Vec<_>>(),
+            trip.items.iter().map(|s| (s.position, s.origin.as_deref().unwrap_or(""))).collect::<Vec<_>>(),
             vec![(1, "BCN"), (2, "LIS")],
             "dropping the first renumbers what is left from 1"
         );
 
         // A position nobody has is refused rather than silently doing nothing.
-        assert!(store.drop_segment(trip.id, 9).is_err());
+        assert!(store.drop_item(trip.id, 9).is_err());
     }
 
     /// Every leg of a trip as (position, origin, date), for reading an
     /// assertion failure without decoding a struct.
     fn legs(trip: &Trip) -> Vec<(i64, &str, &str)> {
-        trip.segments
+        trip.items
             .iter()
-            .map(|s| (s.position, s.origin.as_str(), s.departure_date.as_str()))
+            .map(|s| (s.position, s.origin.as_deref().unwrap_or(""), s.date.as_str()))
             .collect()
     }
 
@@ -5192,10 +5463,10 @@ CREATE TABLE trips (
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
-            store.add_segment(trip.id, None, o, d, date).unwrap();
+            store.add_flight(trip.id, o, d, date).unwrap();
         }
 
-        let trip = store.add_segment(trip.id, None, "BER", "AMS", "2026-09-01").unwrap();
+        let trip = store.add_flight(trip.id, "BER", "AMS", "2026-09-01").unwrap();
         assert_eq!(
             legs(&trip),
             vec![
@@ -5207,7 +5478,7 @@ CREATE TABLE trips (
         );
 
         // And in the middle, ahead of the first leg that leaves after it.
-        let trip = store.add_segment(trip.id, None, "FCO", "MAD", "2026-09-05").unwrap();
+        let trip = store.add_flight(trip.id, "FCO", "MAD", "2026-09-05").unwrap();
         assert_eq!(
             legs(&trip),
             vec![
@@ -5231,7 +5502,7 @@ CREATE TABLE trips (
             ("LIS", "FCO", "2026-09-07"),
             ("FCO", "AMS", "2026-09-11"),
         ] {
-            store.add_segment(trip.id, None, o, d, date).unwrap();
+            store.add_flight(trip.id, o, d, date).unwrap();
         }
         assert_eq!(
             legs(&store.find_trip(7, "September").unwrap().unwrap()),
@@ -5258,10 +5529,10 @@ CREATE TABLE trips (
             ("LIS", "FCO", "2026-09-03"),
             ("FCO", "AMS", "2026-09-09"),
         ] {
-            store.add_segment(trip.id, None, o, d, date).unwrap();
+            store.add_flight(trip.id, o, d, date).unwrap();
         }
 
-        let trip = store.add_segment(trip.id, None, "FCO", "MAD", "2026-09-03").unwrap();
+        let trip = store.add_flight(trip.id, "FCO", "MAD", "2026-09-03").unwrap();
         assert_eq!(
             legs(&trip),
             vec![
@@ -5271,28 +5542,6 @@ CREATE TABLE trips (
                 (4, "FCO", "2026-09-09"),
             ],
             "the new leg goes after the legs already on its date, and before the later one"
-        );
-    }
-
-    #[test]
-    fn an_explicit_position_still_means_that_position_whatever_the_date_says() {
-        // Callers that know where a leg goes keep saying so — the browser's
-        // stale-tab guard is built on a position meaning exactly one row.
-        let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
-        for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
-            store.add_segment(trip.id, None, o, d, date).unwrap();
-        }
-
-        let trip = store.add_segment(trip.id, Some(3), "BER", "AMS", "2026-09-01").unwrap();
-        assert_eq!(
-            legs(&trip),
-            vec![
-                (1, "AMS", "2026-09-03"),
-                (2, "LIS", "2026-09-07"),
-                (3, "BER", "2026-09-01"),
-            ],
-            "an explicit position is an instruction, not a hint"
         );
     }
 
@@ -5309,11 +5558,11 @@ CREATE TABLE trips (
             ("LIS", "FCO", "2026-09-07"),
             ("BER", "AMS", "2026-09-01"),
         ] {
-            store.add_segment(trip.id, None, o, d, date).unwrap();
+            store.add_flight(trip.id, o, d, date).unwrap();
         }
         let trip = store.find_trip(7, "September").unwrap().unwrap();
         assert_eq!(
-            crate::tools::trips::dates_run_forwards(&trip.segments),
+            crate::tools::trips::dates_run_forwards(&trip.items),
             Ok(()),
             "legs added in any order must still read as one journey: {:?}",
             legs(&trip)
@@ -5322,23 +5571,22 @@ CREATE TABLE trips (
 
     #[test]
     fn a_leg_inserted_by_its_date_carries_every_parked_option_with_its_segment() {
-        // The hazard the date-ordered insert inherits from the explicit one:
-        // segment_candidates is keyed by (trip_id, position), so a shift that
-        // moved segments and not their candidates would hand somebody's
-        // chosen flight to a different city pair while the trip still looked
-        // perfectly well-formed. The traveller does not have to ask for an
-        // insert to be exposed to it any more — a date does it for them.
+        // Every write renumbers, so a renumber that moved items and not
+        // their candidates would hand somebody's chosen flight to a
+        // different city pair while the trip still looked perfectly
+        // well-formed. Candidates are keyed by item id for exactly this
+        // reason; this is the check that they stay with their leg.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
         for (o, d, date) in [("AMS", "LIS", "2026-09-03"), ("LIS", "FCO", "2026-09-07")] {
-            store.add_segment(trip.id, None, o, d, date).unwrap();
+            store.add_flight(trip.id, o, d, date).unwrap();
         }
         store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "LIS", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL1693", 180.0),
+                expected("AMS", "LIS", Some("2026-09-03")),
+                candidate("KLM", "KL1693", "2026-09-03T10:05:00"),
                 true,
             )
             .unwrap();
@@ -5346,22 +5594,22 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 2,
-                ExpectedSegment { origin: "LIS", destination: "FCO", departure_date: Some("2026-09-07") },
-                candidate("TAP", "TP830", 120.0),
+                expected("LIS", "FCO", Some("2026-09-07")),
+                candidate("TAP", "TP830", "2026-09-07T10:05:00"),
                 true,
             )
             .unwrap();
 
         // No position given: the date puts this at the front, and both
         // existing legs shift down.
-        let trip = store.add_segment(trip.id, None, "BER", "AMS", "2026-09-01").unwrap();
+        let trip = store.add_flight(trip.id, "BER", "AMS", "2026-09-01").unwrap();
         let by_route: Vec<(&str, &str, Vec<&str>)> = trip
-            .segments
+            .items
             .iter()
             .map(|s| {
                 (
-                    s.origin.as_str(),
-                    s.destination.as_str(),
+                    s.origin.as_deref().unwrap_or(""),
+                    s.destination.as_deref().unwrap_or(""),
                     s.candidates.iter().map(|c| c.flight_numbers.as_str()).collect(),
                 )
             })
@@ -5388,24 +5636,22 @@ CREATE TABLE trips (
         let (store, _dir) = test_store();
         let account = store.account_for_telegram(1).unwrap();
         let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
-        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
-        store.add_segment(trip.id, None, "LIS", "FCO", "2026-10-14").unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_flight(trip.id, "LIS", "FCO", "2026-10-14").unwrap();
 
         // The browser drew both legs, then someone removed the first.
-        store.drop_segment(trip.id, 1).unwrap();
+        store.drop_item(trip.id, 1).unwrap();
 
         // The stale click: "remove leg 2", which the browser believes is
         // LIS→FCO. After the renumber, position 2 does not exist and
         // position 1 IS LIS→FCO.
-        let stale = ExpectedSegment {
-            origin: "LIS", destination: "FCO", departure_date: Some("2026-10-14"),
-        };
-        assert!(!store.remove_segment_checked(trip.id, 2, stale).unwrap(),
+        let stale = expected("LIS", "FCO", Some("2026-10-14"));
+        assert!(!store.remove_item_checked(trip.id, 2, stale).unwrap(),
             "a position that no longer exists must refuse");
 
         let after = store.find_trip(account, "Atlantic loop").unwrap().unwrap();
-        assert_eq!(after.segments.len(), 1, "the surviving leg is untouched");
-        assert_eq!(after.segments[0].destination, "FCO");
+        assert_eq!(after.items.len(), 1, "the surviving leg is untouched");
+        assert_eq!(after.items[0].destination.as_deref(), Some("FCO"));
     }
 
     #[test]
@@ -5416,22 +5662,20 @@ CREATE TABLE trips (
         let (store, _dir) = test_store();
         let account = store.account_for_telegram(1).unwrap();
         let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
-        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
-        store.add_segment(trip.id, None, "LIS", "FCO", "2026-10-14").unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_flight(trip.id, "LIS", "FCO", "2026-10-14").unwrap();
 
-        store.drop_segment(trip.id, 1).unwrap();
+        store.drop_item(trip.id, 1).unwrap();
 
         // "Remove leg 1", which the browser drew as AMS→LIS. Position 1 is
         // now LIS→FCO, a leg the traveller never asked to lose.
-        let stale = ExpectedSegment {
-            origin: "AMS", destination: "LIS", departure_date: Some("2026-10-12"),
-        };
-        assert!(!store.remove_segment_checked(trip.id, 1, stale).unwrap(),
+        let stale = expected("AMS", "LIS", Some("2026-10-12"));
+        assert!(!store.remove_item_checked(trip.id, 1, stale).unwrap(),
             "a position holding a different route must refuse");
 
         let after = store.find_trip(account, "Atlantic loop").unwrap().unwrap();
-        assert_eq!(after.segments.len(), 1, "the surviving leg is untouched");
-        assert_eq!(after.segments[0].destination, "FCO");
+        assert_eq!(after.items.len(), 1, "the surviving leg is untouched");
+        assert_eq!(after.items[0].destination.as_deref(), Some("FCO"));
     }
 
     #[test]
@@ -5439,16 +5683,14 @@ CREATE TABLE trips (
         let (store, _dir) = test_store();
         let account = store.account_for_telegram(1).unwrap();
         let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
-        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
-        store.add_segment(trip.id, None, "LIS", "FCO", "2026-10-14").unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_flight(trip.id, "LIS", "FCO", "2026-10-14").unwrap();
 
-        let seen = ExpectedSegment {
-            origin: "LIS", destination: "FCO", departure_date: Some("2026-10-14"),
-        };
-        assert!(store.remove_segment_checked(trip.id, 2, seen).unwrap());
+        let seen = expected("LIS", "FCO", Some("2026-10-14"));
+        assert!(store.remove_item_checked(trip.id, 2, seen).unwrap());
         let after = store.find_trip(account, "Atlantic loop").unwrap().unwrap();
-        assert_eq!(after.segments.len(), 1);
-        assert_eq!(after.segments[0].destination, "LIS");
+        assert_eq!(after.items.len(), 1);
+        assert_eq!(after.items[0].destination.as_deref(), Some("LIS"));
     }
 
     #[test]
@@ -5458,29 +5700,25 @@ CREATE TABLE trips (
         let (store, _dir) = test_store();
         let account = store.account_for_telegram(1).unwrap();
         let trip = store.upsert_trip(account, "Atlantic loop", None, None, None).unwrap();
-        store.add_segment(trip.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
 
-        let wrong_route = ExpectedSegment {
-            origin: "LIS", destination: "FCO", departure_date: None,
-        };
-        assert!(!store.remove_segment_checked(trip.id, 1, wrong_route).unwrap());
+        let wrong_route = expected("LIS", "FCO", None);
+        assert!(!store.remove_item_checked(trip.id, 1, wrong_route).unwrap());
 
-        let undated = ExpectedSegment {
-            origin: "AMS", destination: "LIS", departure_date: None,
-        };
-        assert!(store.remove_segment_checked(trip.id, 1, undated).unwrap());
-        assert!(store.find_trip(account, "Atlantic loop").unwrap().unwrap().segments.is_empty());
+        let undated = expected("AMS", "LIS", None);
+        assert!(store.remove_item_checked(trip.id, 1, undated).unwrap());
+        assert!(store.find_trip(account, "Atlantic loop").unwrap().unwrap().items.is_empty());
     }
 
     #[test]
     fn editing_a_trip_puts_it_back_to_planning() {
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
-        store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-09-03").unwrap();
         store.set_trip_status(trip.id, "finalised").unwrap();
         assert_eq!(store.find_trip(7, "September").unwrap().unwrap().status, "finalised");
 
-        let trip = store.add_segment(trip.id, None, "LIS", "AMS", "2026-09-10").unwrap();
+        let trip = store.add_flight(trip.id, "LIS", "AMS", "2026-09-10").unwrap();
         assert_eq!(trip.status, "planning", "the trip changed, so its pricing no longer describes it");
     }
 
@@ -5490,24 +5728,29 @@ CREATE TABLE trips (
         // trip_id left a segment row that could never be read back — every
         // read path goes through a trip, and this trip does not exist.
         let (store, _d) = test_store();
-        assert!(store.add_segment(999, None, "AMS", "LIS", "2026-09-03").is_err());
+        assert!(store.add_flight(999, "AMS", "LIS", "2026-09-03").is_err());
 
         let conn = store.conn.lock().unwrap();
         let count: i64 = conn
-            .query_row("SELECT count(*) FROM trip_segments", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM trip_items", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 0, "a failed add_segment must not leave an orphaned row");
+        assert_eq!(count, 0, "a failed add_flight must not leave an orphaned row");
     }
 
-    fn candidate(airline: &str, numbers: &str, price: f64) -> NewCandidate {
+    /// What a flight tool passes `add_candidate`: all three checked.
+    fn expected<'a>(origin: &'a str, destination: &'a str, date: Option<&'a str>) -> ExpectedItem<'a> {
+        ExpectedItem { origin: Some(origin), destination: Some(destination), title: None, date }
+    }
+
+    fn candidate(airline: &str, numbers: &str, departing: &str) -> NewCandidate {
         NewCandidate {
             airline: airline.to_string(),
             flight_numbers: numbers.to_string(),
             itinerary: format!("{numbers} somewhere"),
-            departing_at_local: Some("2026-09-03T10:05:00".to_string()),
+            departing_at_local: Some(departing.to_string()),
             arriving_at_local: Some("2026-09-03T12:15:00".to_string()),
             duration_minutes: Some(130),
-            quoted_price: Some(price),
+            quoted_price: Some(100.0),
             quoted_currency: Some("EUR".to_string()),
             source: Some("duffel".to_string()),
         }
@@ -5517,7 +5760,7 @@ CREATE TABLE trips (
     fn a_segment_holds_several_options_and_at_most_one_is_chosen() {
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
-        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        let trip = store.add_flight(trip.id, "AMS", "NRT", "2026-09-03").unwrap();
 
         // Parked undecided: the traveller is comparing a nonstop against a
         // one-stop through Hong Kong.
@@ -5525,8 +5768,8 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 false,
             )
             .unwrap();
@@ -5534,24 +5777,24 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("Cathay", "CX270,CX500", 780.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("Cathay", "CX270,CX500", "2026-09-03T13:30:00"),
                 false,
             )
             .unwrap();
-        let options = &trip.segments[0].candidates;
+        let options = &trip.items[0].candidates;
         assert_eq!(options.len(), 2);
         assert_eq!(options.iter().map(|c| c.candidate).collect::<Vec<_>>(), vec![1, 2]);
         assert!(options.iter().all(|c| !c.chosen), "nothing decided yet");
 
         let trip = store.choose_candidate(trip.id, 1, 2).unwrap();
-        let options = &trip.segments[0].candidates;
+        let options = &trip.items[0].candidates;
         assert!(!options[0].chosen);
         assert!(options[1].chosen);
 
         // Choosing again moves the flag rather than setting a second one.
         let trip = store.choose_candidate(trip.id, 1, 1).unwrap();
-        let options = &trip.segments[0].candidates;
+        let options = &trip.items[0].candidates;
         assert_eq!(options.iter().filter(|c| c.chosen).count(), 1);
         assert!(options[0].chosen);
 
@@ -5559,9 +5802,9 @@ CREATE TABLE trips (
         assert!(store.choose_candidate(trip.id, 1, 9).is_err());
 
         let trip = store.drop_candidate(trip.id, 1, 1).unwrap();
-        assert_eq!(trip.segments[0].candidates.len(), 1, "the segment survives losing an option");
+        assert_eq!(trip.items[0].candidates.len(), 1, "the segment survives losing an option");
         assert_eq!(
-            trip.segments[0].candidates[0].candidate, 2,
+            trip.items[0].candidates[0].candidate, 2,
             "dropping the lower-numbered candidate must not renumber the one that is left"
         );
     }
@@ -5576,13 +5819,13 @@ CREATE TABLE trips (
         // silently be given a different flight under the same name.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
-        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        let trip = store.add_flight(trip.id, "AMS", "NRT", "2026-09-03").unwrap();
         store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 false,
             )
             .unwrap();
@@ -5590,8 +5833,8 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("Cathay", "CX270,CX500", 780.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("Cathay", "CX270,CX500", "2026-09-03T13:30:00"),
                 false,
             )
             .unwrap();
@@ -5602,13 +5845,13 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("ANA", "NH205", 900.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("ANA", "NH205", "2026-09-03T09:00:00"),
                 false,
             )
             .unwrap();
 
-        let numbers: Vec<i64> = trip.segments[0].candidates.iter().map(|c| c.candidate).collect();
+        let numbers: Vec<i64> = trip.items[0].candidates.iter().map(|c| c.candidate).collect();
         assert_eq!(
             numbers,
             vec![1, 3],
@@ -5628,8 +5871,8 @@ CREATE TABLE trips (
             .add_candidate(
                 999,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 false,
             )
             .unwrap_err();
@@ -5640,8 +5883,8 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 false,
             )
             .unwrap_err();
@@ -5658,25 +5901,26 @@ CREATE TABLE trips (
         // call to say what it obviously meant.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
-        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        let trip = store.add_flight(trip.id, "AMS", "NRT", "2026-09-03").unwrap();
         let trip = store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 true,
             )
             .unwrap();
-        assert!(trip.segments[0].candidates[0].chosen);
+        assert!(trip.items[0].candidates[0].chosen);
     }
 
     #[test]
     fn a_shifted_segment_keeps_its_own_options() {
-        // segment_candidates is keyed by (trip_id, position), the same way
-        // trip_segments is — so a shift that moved segments but not their
-        // candidates would silently reattach somebody's chosen flight to a
-        // different route while the trip still looked perfectly well-formed.
+        // Positions are recomputed on every write, so a renumber that moved
+        // items but not their candidates would silently reattach somebody's
+        // chosen flight to a different route while the trip still looked
+        // perfectly well-formed. Candidates are keyed by item id for exactly
+        // this reason; this is the check.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
         for (o, d, date) in [
@@ -5684,15 +5928,15 @@ CREATE TABLE trips (
             ("NRT", "OSA", "2026-09-10"),
             ("OSA", "AMS", "2026-09-17"),
         ] {
-            store.add_segment(trip.id, None, o, d, date).unwrap();
+            store.add_flight(trip.id, o, d, date).unwrap();
         }
         // One chosen candidate per segment, identifiable by flight number.
         store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 true,
             )
             .unwrap();
@@ -5700,8 +5944,8 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 2,
-                ExpectedSegment { origin: "NRT", destination: "OSA", departure_date: Some("2026-09-10") },
-                candidate("ANA", "NH2001", 210.0),
+                expected("NRT", "OSA", Some("2026-09-10")),
+                candidate("ANA", "NH2001", "2026-09-10T08:00:00"),
                 true,
             )
             .unwrap();
@@ -5709,22 +5953,22 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 3,
-                ExpectedSegment { origin: "OSA", destination: "AMS", departure_date: Some("2026-09-17") },
-                candidate("KLM", "KL862", 980.0),
+                expected("OSA", "AMS", Some("2026-09-17")),
+                candidate("KLM", "KL862", "2026-09-17T11:00:00"),
                 true,
             )
             .unwrap();
 
-        // Insert a new segment at position 1: AMS-NRT, NRT-OSA, OSA-AMS all
-        // shift down one.
-        let trip = store.add_segment(trip.id, Some(1), "AMS", "HEL", "2026-09-02").unwrap();
+        // A leg dated before every other one lands at position 1: AMS-NRT,
+        // NRT-OSA, OSA-AMS all shift down one.
+        let trip = store.add_flight(trip.id, "AMS", "HEL", "2026-09-02").unwrap();
         let by_route: Vec<(String, String, Vec<String>)> = trip
-            .segments
+            .items
             .iter()
             .map(|s| {
                 (
-                    s.origin.clone(),
-                    s.destination.clone(),
+                    s.origin.clone().unwrap_or_default(),
+                    s.destination.clone().unwrap_or_default(),
                     s.candidates.iter().map(|c| c.flight_numbers.clone()).collect(),
                 )
             })
@@ -5742,14 +5986,14 @@ CREATE TABLE trips (
 
         // Now drop a middle segment (NRT-OSA, now at position 3) and check
         // again: the remaining segments must still carry their own options.
-        let trip = store.drop_segment(trip.id, 3).unwrap();
+        let trip = store.drop_item(trip.id, 3).unwrap();
         let by_route: Vec<(String, String, Vec<String>)> = trip
-            .segments
+            .items
             .iter()
             .map(|s| {
                 (
-                    s.origin.clone(),
-                    s.destination.clone(),
+                    s.origin.clone().unwrap_or_default(),
+                    s.destination.clone().unwrap_or_default(),
                     s.candidates.iter().map(|c| c.flight_numbers.clone()).collect(),
                 )
             })
@@ -5766,20 +6010,6 @@ CREATE TABLE trips (
     }
 
     #[test]
-    fn the_bounds_error_reads_correctly_with_exactly_one_segment() {
-        let (store, _d) = test_store();
-        let trip = store.upsert_trip(7, "September", None, None, None).unwrap();
-        store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
-
-        let err = store.add_segment(trip.id, Some(5), "LIS", "FCO", "2026-09-07").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "this trip has 1 segment, so position 5 is not somewhere to put one",
-            "1 segment(s) reads wrong at one"
-        );
-    }
-
-    #[test]
     fn add_candidate_refuses_when_the_route_or_date_no_longer_matches_what_was_checked() {
         // The caller validates a flight against a `Trip` it read earlier,
         // but that read and this write are two separate lock acquisitions —
@@ -5790,14 +6020,14 @@ CREATE TABLE trips (
         // to still be true.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
-        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        let trip = store.add_flight(trip.id, "AMS", "NRT", "2026-09-03").unwrap();
 
         let err = store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "LIS", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "LIS", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 false,
             )
             .unwrap_err();
@@ -5807,8 +6037,8 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-05") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-05")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 false,
             )
             .unwrap_err();
@@ -5822,24 +6052,24 @@ CREATE TABLE trips (
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 false,
             )
             .unwrap();
-        assert_eq!(trip.segments[0].candidates.len(), 1);
+        assert_eq!(trip.items[0].candidates.len(), 1);
 
         // No usable date to check is not the same as a checked mismatch.
         let trip = store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: None },
-                candidate("ANA", "NH205", 900.0),
+                expected("AMS", "NRT", None),
+                candidate("ANA", "NH205", "2026-09-03T09:00:00"),
                 false,
             )
             .unwrap();
-        assert_eq!(trip.segments[0].candidates.len(), 2, "None means nothing to check, not a refusal");
+        assert_eq!(trip.items[0].candidates.len(), 2, "None means nothing to check, not a refusal");
     }
 
     #[test]
@@ -5850,13 +6080,13 @@ CREATE TABLE trips (
         // has to check the trip itself first so the two are told apart.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
-        let trip = store.add_segment(trip.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        let trip = store.add_flight(trip.id, "AMS", "NRT", "2026-09-03").unwrap();
         store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 false,
             )
             .unwrap();
@@ -5873,31 +6103,27 @@ CREATE TABLE trips (
         // which is exactly what happened in production.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
-        let trip = store.add_segment(trip.id, None, "HND", "AMS", "2026-09-27").unwrap();
+        let trip = store.add_flight(trip.id, "HND", "AMS", "2026-09-27").unwrap();
         store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment {
-                    origin: "HND",
-                    destination: "AMS",
-                    departure_date: Some("2026-09-27"),
-                },
-                candidate("China Southern", "CZ324,CZ307", 408.69),
+                expected("HND", "AMS", Some("2026-09-27")),
+                candidate("China Southern", "CZ324,CZ307", "2026-09-27T12:00:00"),
                 true,
             )
             .unwrap();
 
         let (trip, dropped, changed) =
-            store.update_segment(trip.id, 1, None, None, Some("2026-09-26")).unwrap();
+            store.update_flight(trip.id, 1, None, None, Some("2026-09-26")).unwrap();
         assert!(changed);
-        assert_eq!(trip.segments[0].departure_date, "2026-09-26");
+        assert_eq!(trip.items[0].date, "2026-09-26");
         assert_eq!(dropped, 1, "an option for the 27th is not an option for the 26th");
         assert!(
-            trip.segments[0].candidates.is_empty(),
+            trip.items[0].candidates.is_empty(),
             "keeping it would leave a flight bound to a day it does not fly"
         );
-        assert_eq!(trip.segments[0].origin, "HND", "what was not asked for does not change");
+        assert_eq!(trip.items[0].origin.as_deref(), Some("HND"), "what was not asked for does not change");
     }
 
     #[test]
@@ -5906,29 +6132,25 @@ CREATE TABLE trips (
         // upsert that supplies nothing leaves a trip alone.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Japan", None, None, None).unwrap();
-        let trip = store.add_segment(trip.id, None, "HND", "AMS", "2026-09-27").unwrap();
+        let trip = store.add_flight(trip.id, "HND", "AMS", "2026-09-27").unwrap();
         store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment {
-                    origin: "HND",
-                    destination: "AMS",
-                    departure_date: Some("2026-09-27"),
-                },
-                candidate("China Southern", "CZ324,CZ307", 408.69),
+                expected("HND", "AMS", Some("2026-09-27")),
+                candidate("China Southern", "CZ324,CZ307", "2026-09-27T12:00:00"),
                 true,
             )
             .unwrap();
 
         let (trip, dropped, changed) =
-            store.update_segment(trip.id, 1, Some("HND"), None, Some("2026-09-27")).unwrap();
+            store.update_flight(trip.id, 1, Some("HND"), None, Some("2026-09-27")).unwrap();
         assert!(!changed, "nothing differed, so nothing was written");
         assert_eq!(dropped, 0);
-        assert_eq!(trip.segments[0].candidates.len(), 1, "nothing changed, so nothing is lost");
+        assert_eq!(trip.items[0].candidates.len(), 1, "nothing changed, so nothing is lost");
 
         // And a position that does not exist is refused rather than ignored.
-        assert!(store.update_segment(trip.id, 9, None, None, Some("2026-09-26")).is_err());
+        assert!(store.update_flight(trip.id, 9, None, None, Some("2026-09-26")).is_err());
     }
 
     #[test]
@@ -5936,13 +6158,13 @@ CREATE TABLE trips (
         // Creating a trip is a side effect of a typo, so a typo needs an undo.
         let (store, _d) = test_store();
         let trip = store.upsert_trip(7, "Setpember", None, None, None).unwrap();
-        let trip = store.add_segment(trip.id, None, "AMS", "LIS", "2026-09-03").unwrap();
+        let trip = store.add_flight(trip.id, "AMS", "LIS", "2026-09-03").unwrap();
         store
             .add_candidate(
                 trip.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "LIS", departure_date: Some("2026-09-03") },
-                candidate("TAP", "TP675", 118.0),
+                expected("AMS", "LIS", Some("2026-09-03")),
+                candidate("TAP", "TP675", "2026-09-03T10:05:00"),
                 true,
             )
             .unwrap();
@@ -5958,9 +6180,10 @@ CREATE TABLE trips (
         let orphans: i64 = store
             .conn()
             .query_row(
-                "SELECT (SELECT count(*) FROM trip_segments WHERE trip_id = ?)
-                      + (SELECT count(*) FROM segment_candidates WHERE trip_id = ?)",
-                params![trip.id, trip.id],
+                "SELECT (SELECT count(*) FROM trip_items WHERE trip_id = ?)
+                      + (SELECT count(*) FROM item_candidates c
+                         WHERE NOT EXISTS (SELECT 1 FROM trip_items i WHERE i.id = c.item_id))",
+                params![trip.id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -5970,6 +6193,171 @@ CREATE TABLE trips (
         store.upsert_trip(8, "Setpember", None, None, None).unwrap();
         assert!(!store.delete_trip(7, "Setpember").unwrap());
         assert!(store.find_trip(8, "Setpember").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_version_13_trip_becomes_flight_items_with_its_options_in_date_order() {
+        // Two legs stored out of date order (the return first), one chosen
+        // option and one undecided pair. After the migration: two flight
+        // items, positions by date, every option re-keyed to its item.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scout.duckdb");
+        {
+            let conn = duckdb::Connection::open(&path).unwrap();
+            // The fresh schema still creates the old tables (they are dropped
+            // in a later release), so the fixture is: everything, minus the
+            // two new tables, recorded as version 13.
+            conn.execute_batch(MIGRATIONS).unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS item_candidates; DROP TABLE IF EXISTS trip_items;").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
+                 DELETE FROM schema_version; INSERT INTO schema_version VALUES (13);
+                 INSERT INTO trips (id, account_id, name, name_key, kept) VALUES (1, 1, 'Lisbon', 'lisbon', true);
+                 INSERT INTO trip_segments VALUES (1, 1, 'LIS', 'AMS', '2026-10-19', 3), (1, 2, 'AMS', 'LIS', '2026-10-12', 2);
+                 INSERT INTO segment_candidates (trip_id, position, candidate, chosen, airline, flight_numbers, itinerary, departing_at_local)
+                 VALUES (1, 1, 1, false, 'TAP', 'TP670', 'LIS 18:40 19.10 ✈ AMS 22:55 19.10', '2026-10-19T18:40:00'),
+                        (1, 1, 2, false, 'KLM', 'KL1696', 'LIS 06:00 19.10 ✈ AMS 10:15 19.10', '2026-10-19T06:00:00'),
+                        (1, 2, 1, true,  'TAP', 'TP671', 'AMS 07:15 12.10 ✈ LIS 09:30 12.10', '2026-10-12T07:15:00');",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 15);
+        let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
+        assert_eq!(trip.items.len(), 2);
+        assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
+        assert_eq!(trip.items[0].origin.as_deref(), Some("AMS"));
+        assert_eq!(trip.items[0].title, "AMS → LIS");
+        assert_eq!(trip.items[0].candidates.len(), 1);
+        assert!(trip.items[0].candidates[0].chosen);
+        assert_eq!(trip.items[0].starts_at.as_deref(), Some("2026-10-12T07:15:00"), "a flight's start is its chosen option's departure");
+        assert_eq!((trip.items[1].position, trip.items[1].date.as_str()), (2, "2026-10-19"));
+        assert_eq!(trip.items[1].candidates.len(), 2);
+        assert!(trip.items[1].starts_at.is_none(), "undecided, so no start yet");
+        let old: i64 = store.conn().query_row("SELECT count(*) FROM trip_segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(old, 2, "the old tables are left in place until a later release drops them");
+    }
+
+    fn stay(title: &str, date: &str, ends: &str) -> NewItem {
+        NewItem {
+            kind: "stay".into(), title: title.into(), place: Some("Lisbon".into()),
+            date: date.into(), starts_at: None, ends_at: Some(ends.into()), notes: None,
+            booked: false, confirmation_code: None, price: None, currency: None, arrival_id: None,
+        }
+    }
+
+    #[test]
+    fn items_of_every_kind_sort_by_date_then_time_then_kind() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_item(trip.id, stay("Hotel Alfama", "2026-10-12", "2026-10-15")).unwrap();
+        // A kind the page has no card for is refused, not stored and lost.
+        let mut cruise = stay("Boat", "2026-10-14", "2026-10-14");
+        cruise.kind = "cruise".into();
+        let err = store.add_item(trip.id, cruise).unwrap_err();
+        assert!(err.to_string().contains("kind must be stay, activity or transport"), "got: {err}");
+        store.add_item(trip.id, NewItem {
+            kind: "activity".into(), title: "Azulejo museum".into(), place: Some("Lisbon".into()),
+            date: "2026-10-13".into(), starts_at: Some("2026-10-13T10:00:00".into()), ends_at: None,
+            notes: None, booked: true, confirmation_code: Some("GYG-1".into()), price: Some(12.0),
+            currency: Some("EUR".into()), arrival_id: None,
+        }).unwrap();
+        let trip = store.add_flight(trip.id, "LIS", "AMS", "2026-10-19").unwrap();
+        let order: Vec<(i64, &str, &str)> = trip.items.iter().map(|i| (i.position, i.kind.as_str(), i.title.as_str())).collect();
+        // Same date: a flight (no time yet) sorts before a stay by kind rank.
+        assert_eq!(order, vec![
+            (1, "flight", "AMS → LIS"), (2, "stay", "Hotel Alfama"),
+            (3, "activity", "Azulejo museum"), (4, "flight", "LIS → AMS"),
+        ]);
+        assert!(trip.items[2].booked);
+        assert_eq!(trip.items[2].confirmation_code.as_deref(), Some("GYG-1"));
+    }
+
+    #[test]
+    fn a_time_puts_an_item_before_an_untimed_one_on_the_same_day_and_a_chosen_flight_gets_a_time() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        store.add_item(trip.id, stay("Hotel", "2026-10-12", "2026-10-15")).unwrap();
+        let trip = store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        // Flight first by kind rank while it has no time.
+        assert_eq!(trip.items[0].kind, "flight");
+        let flight_position = trip.items[0].position;
+        let trip = store.add_candidate(trip.id, flight_position, expected("AMS", "LIS", Some("2026-10-12")),
+            candidate("TAP", "TP671", "2026-10-12T22:00:00"), true).unwrap();
+        // The chosen departure is 22:00; the stay has no time; a time still
+        // sorts before no time, so the flight stays first.
+        assert_eq!(trip.items[0].kind, "flight");
+        assert_eq!(trip.items[0].starts_at.as_deref(), Some("2026-10-12T22:00:00"));
+    }
+
+    #[test]
+    fn dropping_and_re_dating_renumber_by_date() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_item(trip.id, stay("Hotel", "2026-10-12", "2026-10-15")).unwrap();
+        let trip = store.add_flight(trip.id, "LIS", "AMS", "2026-10-19").unwrap();
+        let (trip, _, _) = store.update_flight(trip.id, 1, None, None, Some("2026-10-20")).unwrap();
+        assert_eq!(trip.items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(), vec!["Hotel", "LIS → AMS", "AMS → LIS"]);
+        let trip = store.drop_item(trip.id, 2).unwrap();
+        assert_eq!(trip.items.iter().map(|i| (i.position, i.title.as_str())).collect::<Vec<_>>(), vec![(1, "Hotel"), (2, "AMS → LIS")]);
+    }
+
+    #[test]
+    fn options_go_on_flights_only() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        let trip = store.add_item(trip.id, stay("Hotel", "2026-10-12", "2026-10-15")).unwrap();
+        let err = store.add_candidate(trip.id, 1, expected("AMS", "LIS", None), candidate("TAP", "TP1", "2026-10-12T07:00:00"), false).unwrap_err();
+        assert!(err.to_string().contains("is a stay"), "got: {err}");
+        // The same refusal from every door: a stay has no options to choose
+        // or drop, and "no option 1" would send the caller looking for one.
+        let err = store.choose_candidate(trip.id, 1, 1).unwrap_err();
+        assert!(err.to_string().contains("is a stay"), "choose: {err}");
+        let err = store.drop_candidate(trip.id, 1, 1).unwrap_err();
+        assert!(err.to_string().contains("is a stay"), "drop: {err}");
+        let err = store.choose_candidate_for_account(account, "Lisbon", 1, 1).unwrap_err();
+        assert!(err.to_string().contains("is a stay"), "choose by name: {err}");
+    }
+
+    #[test]
+    fn a_time_beats_kind_rank_and_two_times_sort_by_the_clock() {
+        // The rule, pinned: on one day an item with a time sorts before an
+        // item without one whatever their kinds, and two timed items sort
+        // by the clock.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        let mut hotel = stay("Hotel", "2026-10-12", "2026-10-15");
+        hotel.starts_at = Some("2026-10-12T15:00:00".into());
+        store.add_item(trip.id, hotel).unwrap();
+        let trip = store.add_item(trip.id, NewItem {
+            kind: "activity".into(), title: "Tram 28".into(), place: Some("Lisbon".into()),
+            date: "2026-10-12".into(), starts_at: Some("2026-10-12T09:00:00".into()), ends_at: None,
+            notes: None, booked: false, confirmation_code: None, price: None, currency: None,
+            arrival_id: None,
+        }).unwrap();
+        let order: Vec<(i64, &str)> = trip.items.iter().map(|i| (i.position, i.title.as_str())).collect();
+        assert_eq!(order, vec![(1, "Tram 28"), (2, "Hotel"), (3, "AMS → LIS")],
+            "09:00 before 15:00, and both before the flight that has no time yet");
+    }
+
+    #[test]
+    fn removing_an_item_checks_what_the_caller_saw() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        store.add_item(trip.id, stay("Hotel", "2026-10-12", "2026-10-15")).unwrap();
+        let wrong = ExpectedItem { origin: None, destination: None, title: Some("Hostel"), date: Some("2026-10-12") };
+        assert!(!store.remove_item_checked(trip.id, 1, wrong).unwrap());
+        let right = ExpectedItem { origin: None, destination: None, title: Some("Hotel"), date: Some("2026-10-12") };
+        assert!(store.remove_item_checked(trip.id, 1, right).unwrap());
     }
 
     // ---- invite rounds, membership, waitlist ----
@@ -6492,7 +6880,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 13, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 15, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -6533,7 +6921,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 13);
+        assert_eq!(s.schema_version().unwrap(), 15);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -6695,7 +7083,7 @@ CREATE TABLE conversations (
 
         let a = store.upsert_trip(account, "Atlantic loop", None, None, Some(doomed)).unwrap();
         store.upsert_trip(account, "Japan in spring", None, None, Some(spared)).unwrap();
-        store.add_segment(a.id, None, "AMS", "LIS", "2026-10-12").unwrap();
+        store.add_flight(a.id, "AMS", "LIS", "2026-10-12").unwrap();
 
         assert!(store.delete_conversation(account, doomed).unwrap());
 
@@ -6703,9 +7091,9 @@ CREATE TABLE conversations (
         assert!(store.find_trip(account, "Japan in spring").unwrap().is_some(), "another thread's trip stays");
         let orphans: i64 = store
             .conn()
-            .query_row("SELECT count(*) FROM trip_segments WHERE trip_id = ?", params![a.id], |r| r.get(0))
+            .query_row("SELECT count(*) FROM trip_items WHERE trip_id = ?", params![a.id], |r| r.get(0))
             .unwrap();
-        assert_eq!(orphans, 0, "a deleted trip leaves no segments behind");
+        assert_eq!(orphans, 0, "a deleted trip leaves no items behind");
     }
 
     #[test]
@@ -6873,13 +7261,13 @@ CREATE TABLE conversations (
         // The draft gets a leg with an option parked on it, because a delete
         // that takes the `trips` row and leaves its children behind is a leak
         // no read path can ever reach — `find_trip` alone would not notice.
-        store.add_segment(draft.id, None, "AMS", "NRT", "2026-09-03").unwrap();
+        store.add_flight(draft.id, "AMS", "NRT", "2026-09-03").unwrap();
         store
             .add_candidate(
                 draft.id,
                 1,
-                ExpectedSegment { origin: "AMS", destination: "NRT", departure_date: Some("2026-09-03") },
-                candidate("KLM", "KL861", 940.0),
+                expected("AMS", "NRT", Some("2026-09-03")),
+                candidate("KLM", "KL861", "2026-09-03T10:05:00"),
                 false,
             )
             .unwrap();
@@ -6906,9 +7294,10 @@ CREATE TABLE conversations (
         let conn = store.conn();
         let orphans: i64 = conn
             .query_row(
-                "SELECT (SELECT count(*) FROM trip_segments WHERE trip_id = ?)
-                      + (SELECT count(*) FROM segment_candidates WHERE trip_id = ?)",
-                params![draft.id, draft.id],
+                "SELECT (SELECT count(*) FROM trip_items WHERE trip_id = ?)
+                      + (SELECT count(*) FROM item_candidates c
+                         WHERE NOT EXISTS (SELECT 1 FROM trip_items i WHERE i.id = c.item_id))",
+                params![draft.id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -7019,7 +7408,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 13);
+        assert_eq!(store.schema_version().unwrap(), 15);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()

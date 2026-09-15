@@ -10,6 +10,7 @@ _(nothing)_
 
 ## Next
 
+- [ ] **A booking address for every account** — `<handle>@goodscout.fyi` via Resend inbound; forwarded, extracted into arrivals, reviewed inline on the trip timeline. Spec: docs/superpowers/specs/2026-09-15-trip-inbox-design.md
 - [ ] **Poller liveness** — record the last successful `getUpdates`; fail `/healthz` when it is stale so k8s restarts a bot Telegram has gone quiet on (24 restarts in 20 minutes happened once with nothing to catch it)
 - [ ] **Retention for the rest** — `outbox` never deletes sent rows, `request_log` never prunes; two DELETEs in `run_maintenance` next to the thread expiry
 - [ ] **CI** — `.github/workflows`: `cargo test`, `cargo clippy -D warnings`, `cargo audit`, `node --test 'crates/scout-web/src/*.test.mjs'`, cached with `Swatinem/rust-cache`
@@ -46,6 +47,7 @@ _(nothing)_
 
 ## Done
 
+- [x] 2026-09-15 — **One timeline for a trip** (`851fb62`): trip_items replaces trip_segments + segment_candidates: flights, stays, activities and transport in one date-ordered list, positions recomputed on every write; add_trip_item from chat; finalise_trip sums fixed costs. Spec: docs/superpowers/specs/2026-09-15-trip-timeline-design.md
 - [x] 2026-09-14 — **Debug trace behind every answer** (`b3708e0`): `/debug on|off` in the web chat (admins only, per account). Every run records a trace: each tool call with args, duration, status and result, nested flight-desk calls, run-level events. A Trace button under each Scout turn opens the panel; live rows stream during a run. Spec: `docs/superpowers/specs/2026-09-13-debug-trace-design.md`
 - [x] 2026-09-08 — **Crawlable front door** (`532f30e`): robots.txt, sitemap.xml, meta description and Open Graph tags on the landing page, www redirected to the apex. Google still showed Porkbun's parking page; www needs an A record at the DNS provider first.
 - [x] 2026-09-08 — **Flight agent as a tool** (`39e5d78`): `ask_flights`, a specialist rig agent with the flight prompt and every flight and trip tool, called by the main agent with a brief; findings plus Rust-generated guidance come back, the main prompt lost its flight half, `FLIGHT_MODEL` picks its model, and the stall guard reads a pulse the nested run keeps alive

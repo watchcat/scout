@@ -3166,6 +3166,20 @@ impl Store {
         Ok(())
     }
 
+    /// One trip by id, if it is this account's. The owner is part of the
+    /// key, as in `arrival_of`: an id from the page proves nothing.
+    pub fn trip_by_id(&self, account_id: i64, trip_id: i64) -> Result<Option<Trip>> {
+        let conn = self.conn();
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM trips WHERE id = ? AND account_id = ?",
+                params![trip_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        found.map(|id| load_trip(&conn, id)).transpose()
+    }
+
     pub fn find_trip(&self, account_id: i64, name: &str) -> Result<Option<Trip>> {
         let key = name.trim().to_lowercase();
         let conn = self.conn();
@@ -4240,10 +4254,11 @@ impl Store {
     }
 
     /// The body, fetched after the fact: the provider's webhook carries
-    /// the envelope and the content is a second call. Cut at `cap_chars`
-    /// characters — the model reads it, and a 4 MB newsletter is not a
-    /// booking — and `truncated` records that a cut happened, here or
-    /// on the way in, so the page can say the reading is of a part.
+    /// the envelope and the content is a second call. Text and html are
+    /// each cut at `cap_chars` characters, independently — the model reads
+    /// them, and a 4 MB newsletter is not a booking — and `truncated`
+    /// records that a cut happened, here or on the way in, so the page can
+    /// say the reading is of a part.
     pub fn mail_body(&self, id: i64, text: Option<&str>, html: Option<&str>, cap_chars: usize) -> Result<()> {
         let cut = |s: Option<&str>| -> (Option<String>, bool) {
             match s {
@@ -4321,10 +4336,15 @@ impl Store {
     }
 
     /// The caller has already proven both ids are theirs (`attachment_owner`
-    /// for the file, the trip for the item); nothing is checked here.
+    /// for the file, the trip for the item); nothing is checked here but
+    /// that the file is still loose. A ticket belongs to the booking it
+    /// came with, so the first item to claim it keeps it.
     pub fn attach_to_item(&self, attachment_id: i64, item_id: i64) -> Result<()> {
         let conn = self.conn();
-        conn.execute("UPDATE attachments SET item_id = ? WHERE id = ?", params![item_id, attachment_id])?;
+        conn.execute(
+            "UPDATE attachments SET item_id = ? WHERE id = ? AND item_id IS NULL",
+            params![item_id, attachment_id],
+        )?;
         Ok(())
     }
 
@@ -4390,16 +4410,42 @@ impl Store {
         }
     }
 
-    /// Records the owner's decision; `false` when the arrival is not this
-    /// account's, because an id from the page proves nothing. `item_id` is
-    /// the trip item an added booking became; `None` for the other outcomes.
-    pub fn set_arrival_status(&self, id: i64, account_id: i64, status: &str, item_id: Option<i64>) -> Result<bool> {
+    /// Records the owner's decision, and is the claim on it: `false` when
+    /// the arrival is not this account's (an id from the page proves
+    /// nothing), was decided already, or was never a booking. The check is
+    /// in the `WHERE`, under the one lock, so two clicks that both read
+    /// "pending" cannot both win — the second finds nothing to update.
+    /// `item_id` is the trip item an added booking became, when the caller
+    /// already knows it; `note_arrival_item` fills it in later otherwise.
+    pub fn decide_arrival(&self, id: i64, account_id: i64, status: &str, item_id: Option<i64>) -> Result<bool> {
         let conn = self.conn();
         let changed = conn.execute(
-            "UPDATE arrivals SET status = ?, item_id = ?, decided_at = now() WHERE id = ? AND account_id = ?",
+            "UPDATE arrivals SET status = ?, item_id = ?, decided_at = now()
+             WHERE id = ? AND account_id = ? AND status = 'pending' AND booking",
             params![status, item_id, id, account_id],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Undoes a claim whose item could not be built, so the booking waits
+    /// on the page again instead of reading as added with nothing to show.
+    /// No owner check: the caller reverts only what it just claimed.
+    pub fn reopen_arrival(&self, id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE arrivals SET status = 'pending', item_id = NULL, decided_at = NULL WHERE id = ?",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// The item a claimed arrival became. Written after the claim rather
+    /// than with it because the item does not exist until the claim has
+    /// won.
+    pub fn note_arrival_item(&self, id: i64, item_id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE arrivals SET item_id = ? WHERE id = ?", params![item_id, id])?;
+        Ok(())
     }
 
     /// What the Trips tab shows of the inbox: bookings still waiting, then
@@ -8155,12 +8201,39 @@ CREATE TABLE messages (
         assert_eq!(view.pending[0].title.as_deref(), Some("Hotel Alfama"));
         assert!(store.inbox_view(b).unwrap().pending.is_empty());
         assert!(store.arrival_of(id, b).unwrap().is_none(), "not theirs");
-        assert!(!store.set_arrival_status(id, b, "ignored", None).unwrap(), "not theirs to decide");
+        assert!(!store.decide_arrival(id, b, "ignored", None).unwrap(), "not theirs to decide");
         assert_eq!(store.inbox_view(a).unwrap().pending.len(), 1);
-        assert!(store.set_arrival_status(id, a, "ignored", None).unwrap());
+        assert!(store.decide_arrival(id, a, "ignored", None).unwrap());
         let view = store.inbox_view(a).unwrap();
         assert!(view.pending.is_empty());
         assert_eq!(view.other[0].reason, "ignored");
+        // The decision is the claim: a second one, whatever it says, finds
+        // nothing pending to decide. And a non-booking was never pending.
+        assert!(!store.decide_arrival(id, a, "added", Some(1)).unwrap(), "already decided");
+        assert_eq!(store.arrival_of(id, a).unwrap().unwrap().status, "ignored");
+        let n = mail(&store, a, "re_2");
+        let spam = store.insert_arrival(a, n, &NewArrival { booking: false, summary: "ad".into(), ..Default::default() }).unwrap();
+        assert!(!store.decide_arrival(spam, a, "ignored", None).unwrap(), "nothing to decide on a non-booking");
+        // Reopened, it can be decided again; the item it became is noted
+        // by its own write.
+        store.reopen_arrival(id).unwrap();
+        assert!(store.decide_arrival(id, a, "added", None).unwrap());
+        store.note_arrival_item(id, 7).unwrap();
+        let item: Option<i64> = store.conn().query_row("SELECT item_id FROM arrivals WHERE id = ?", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(item, Some(7));
+    }
+
+    #[test]
+    fn a_trip_is_read_by_id_only_by_its_owner() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let b = store.account_for_telegram(2).unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap();
+        let got = store.trip_by_id(a, trip.id).unwrap().expect("theirs");
+        assert_eq!((got.name.as_str(), got.items.len()), ("Lisbon", 1));
+        assert!(store.trip_by_id(b, trip.id).unwrap().is_none(), "not theirs");
+        assert!(store.trip_by_id(a, trip.id + 100).unwrap().is_none());
     }
 
     #[test]
@@ -8177,6 +8250,9 @@ CREATE TABLE messages (
             price: None, currency: None, arrival_id: None,
         }).unwrap();
         store.attach_to_item(kept, trip.items[0].id).unwrap();
+        // A file joins the first item that claims it and stays there.
+        store.attach_to_item(kept, trip.items[0].id + 1).unwrap();
+        assert_eq!(store.attachment(kept).unwrap().unwrap().1, Some(trip.items[0].id), "first wins");
         store.conn().execute("UPDATE inbound_mail SET received_at = received_at - INTERVAL 40 DAY WHERE id = ?", params![m]).unwrap();
         let gone = store.sweep_inbox(30).unwrap();
         assert_eq!(gone, 1, "one mail row");
@@ -8201,7 +8277,7 @@ CREATE TABLE messages (
         assert_eq!(store.sweep_inbox(30).unwrap(), 0, "undecided, so kept");
         assert!(store.arrival_of(id, a).unwrap().is_some());
         assert!(store.attachment(ticket).unwrap().is_some(), "the ticket waits with its booking");
-        assert!(store.set_arrival_status(id, a, "added", Some(5)).unwrap());
+        assert!(store.decide_arrival(id, a, "added", Some(5)).unwrap());
         assert_eq!(store.sweep_inbox(30).unwrap(), 1);
         assert!(store.arrival_of(id, a).unwrap().is_none());
     }
@@ -8286,7 +8362,7 @@ CREATE TABLE messages (
         assert_eq!(view.pending.iter().map(|p| (p.id, p.summary.as_str())).collect::<Vec<_>>(), vec![(second, "second")]);
         assert!(store.arrival_of(first, a).unwrap().is_none());
         // A decided reading is history, not a draft: a retry sits beside it.
-        assert!(store.set_arrival_status(second, a, "ignored", None).unwrap());
+        assert!(store.decide_arrival(second, a, "ignored", None).unwrap());
         store.insert_arrival(a, m, &reading).unwrap();
         assert!(store.arrival_of(second, a).unwrap().is_some());
     }

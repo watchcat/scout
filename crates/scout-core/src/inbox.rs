@@ -25,14 +25,16 @@ pub const RESERVED_HANDLES: &[&str] = &[
 /// everyone who types one, so the store only ever sees one spelling.
 pub fn normalise_handle(raw: &str) -> Result<String, String> {
     let h = raw.trim().to_ascii_lowercase();
+    // Charset before length: the length is counted in bytes, which is
+    // only the number of characters once everything is ASCII.
+    if !h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.') {
+        return Err("letters, digits and dots only".into());
+    }
     if h.len() < 3 || h.len() > 30 {
         return Err("a handle is 3 to 30 characters".into());
     }
     if h.starts_with('.') || h.ends_with('.') {
         return Err("a handle cannot start or end with a dot".into());
-    }
-    if !h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.') {
-        return Err("letters, digits and dots only".into());
     }
     if RESERVED_HANDLES.contains(&h.as_str()) {
         return Err("that one is reserved".into());
@@ -92,16 +94,38 @@ impl Extraction {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let text = crate::text::strip_thinking(text);
         let start = text.find('{').ok_or_else(|| anyhow::anyhow!("no JSON in the answer"))?;
-        let end = text.rfind('}').ok_or_else(|| anyhow::anyhow!("no JSON in the answer"))?;
+        // Searched from the opener, not the whole text: a `}` before the
+        // first `{` would put the end before the start.
+        let end = text[start..]
+            .rfind('}')
+            .map(|i| start + i)
+            .ok_or_else(|| anyhow::anyhow!("no JSON in the answer"))?;
         let mut e: Self = serde_json::from_str(&text[start..=end])?;
+        // Every field the page shows or the store keeps is trimmed and
+        // capped here, once: the model is told the shape, not bound to it.
+        let cut = |s: Option<String>, n: usize| -> Option<String> {
+            s.map(|s| s.trim().chars().take(n).collect::<String>()).filter(|s| !s.is_empty())
+        };
+        e.kind = cut(e.kind, 16);
+        e.title = cut(e.title, 200);
+        e.place = cut(e.place, 200);
+        e.origin = cut(e.origin, 16);
+        e.destination = cut(e.destination, 16);
+        e.date = cut(e.date, 40);
+        e.starts_at = cut(e.starts_at, 40);
+        e.ends_at = cut(e.ends_at, 40);
+        e.timezone = cut(e.timezone, 40);
+        e.confirmation_code = cut(e.confirmation_code, 64);
+        e.currency = cut(e.currency, 40);
+        e.travellers = e.travellers.map(|names| {
+            names.into_iter().filter_map(|n| cut(Some(n), 100)).take(10).collect::<Vec<_>>()
+        });
         let kind_ok = matches!(e.kind.as_deref(), Some("flight" | "stay" | "activity" | "transport"));
         let date_ok = e
             .date
             .as_deref()
             .is_some_and(|d| crate::tools::trips::calendar_date("date", d).is_ok());
-        let route_ok = e.kind.as_deref() != Some("flight")
-            || (e.origin.as_deref().is_some_and(|s| !s.trim().is_empty())
-                && e.destination.as_deref().is_some_and(|s| !s.trim().is_empty()));
+        let route_ok = e.kind.as_deref() != Some("flight") || (e.origin.is_some() && e.destination.is_some());
         if e.booking && !(kind_ok && date_ok && route_ok) {
             e.booking = false;
         }
@@ -150,7 +174,7 @@ impl Placement {
 /// The trip whose items span the arrival's date, preferring one that names
 /// the same place; none: a draft named "<place>, <Month>".
 pub(crate) fn place_arrival(store: &Store, account_id: i64, e: &Extraction) -> anyhow::Result<Placement> {
-    let date = e.date.as_deref().expect("a booking has a date");
+    let date = e.date.as_deref().ok_or_else(|| anyhow::anyhow!("a booking with no date"))?;
     place_by(store, account_id, date, e.place.as_deref())
 }
 
@@ -204,10 +228,6 @@ fn shift(date: &str, days: i64) -> String {
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map(|d| (d + chrono::Duration::days(days)).to_string())
         .unwrap_or_else(|_| date.to_string())
-}
-
-fn trip_of(store: &Store, account_id: i64, trip_id: i64) -> anyhow::Result<Option<Trip>> {
-    Ok(store.list_trips(account_id)?.into_iter().find(|t| t.id == trip_id))
 }
 
 // ---- the door ----------------------------------------------------------
@@ -388,10 +408,9 @@ pub async fn record_arrival(
     core: &Core,
     account_id: i64,
     mail_id: i64,
-    e: &Extraction,
+    e: Extraction,
 ) -> anyhow::Result<(i64, Option<Placement>)> {
     let store = core.store();
-    let e = e.clone();
     blocking(move || {
         let placement = if e.booking { Some(place_arrival(&store, account_id, &e)?) } else { None };
         let row = NewArrival {
@@ -422,7 +441,7 @@ pub async fn record_arrival(
 /// The name of one of this account's trips, for the nudge's sentence.
 pub async fn trip_name(core: &Core, account_id: i64, trip_id: i64) -> anyhow::Result<Option<String>> {
     let store = core.store();
-    blocking(move || Ok(trip_of(&store, account_id, trip_id)?.map(|t| t.name))).await
+    blocking(move || Ok(store.trip_by_id(account_id, trip_id)?.map(|t| t.name))).await
 }
 
 /// Where the person asked an arrival to go.
@@ -432,7 +451,9 @@ pub enum AddTarget {
     Matched,
     /// One of their trips, by id.
     Trip(i64),
-    /// A draft named for the booking's place and month.
+    /// A draft named for the booking's place and month — an upsert by
+    /// name, so a draft already called that (the one `record_arrival`
+    /// made, typically) is landed on rather than doubled.
     New,
 }
 
@@ -450,6 +471,12 @@ pub enum Outcome<T> {
 /// code and price and the mail's files, and the arrival is `added`. A draft
 /// is kept — adding to it is the person's intent, which is all keeping ever
 /// meant.
+///
+/// The status write comes first and is the claim (`decide_arrival`), so a
+/// double-click builds one item: the second click finds nothing pending.
+/// An item that then cannot be built reopens the arrival, so the page
+/// shows a booking still waiting rather than one added with nothing to
+/// show for it.
 pub async fn add_arrival(
     core: &Core,
     account_id: i64,
@@ -467,23 +494,25 @@ pub async fn add_arrival(
         let Some(date) = arrival.date.clone() else {
             anyhow::bail!("arrival {arrival_id} is a booking with no date");
         };
+        // The trip is settled before the claim, so a wrong id costs
+        // nothing to undo. A draft made here for a click that then loses
+        // the claim is no worse than the one `record_arrival` makes.
         let trip = match target {
-            AddTarget::Trip(id) => match trip_of(&store, account_id, id)? {
+            AddTarget::Trip(id) => match store.trip_by_id(account_id, id)? {
                 Some(t) => t,
                 None => return Ok(Outcome::NotFound),
             },
             AddTarget::Matched => {
-                let placed = match arrival.trip_id {
-                    Some(id) => trip_of(&store, account_id, id)?,
-                    None => None,
-                };
+                let placed = arrival.trip_id.map(|id| store.trip_by_id(account_id, id)).transpose()?.flatten();
                 match placed {
                     Some(t) => t,
                     // The draft expired, or the reading was never placed:
                     // decide again now rather than refuse the click.
                     None => {
                         let p = place_by(&store, account_id, &date, arrival.place.as_deref())?;
-                        trip_of(&store, account_id, p.id())?.ok_or_else(|| anyhow::anyhow!("the trip just placed is gone"))?
+                        store
+                            .trip_by_id(account_id, p.id())?
+                            .ok_or_else(|| anyhow::anyhow!("the trip just placed is gone"))?
                     }
                 }
             }
@@ -493,67 +522,31 @@ pub async fn add_arrival(
             }
         };
 
-        let trip = if arrival.kind.as_deref() == Some("flight") {
-            let (Some(origin), Some(destination)) = (arrival.origin.as_deref(), arrival.destination.as_deref()) else {
-                anyhow::bail!("arrival {arrival_id} is a flight with no route");
-            };
-            let with_leg = store.add_flight(trip.id, origin, destination, &date)?;
-            // The leg just added is the newest unbooked one on that route
-            // and day; `add_flight` returns the trip, not the row.
-            let leg = with_leg
-                .items
-                .iter()
-                .filter(|i| {
-                    i.is_flight()
-                        && !i.booked
-                        && i.arrival_id.is_none()
-                        && i.origin.as_deref() == Some(origin)
-                        && i.destination.as_deref() == Some(destination)
-                        && i.date == date
-                })
-                .max_by_key(|i| i.id)
-                .ok_or_else(|| anyhow::anyhow!("the leg just added is not on the trip"))?;
-            store.book_item(
-                leg.id,
-                arrival.confirmation_code.as_deref(),
-                arrival.price,
-                arrival.currency.as_deref(),
-                Some(arrival_id),
-            )?;
-            trip_of(&store, account_id, trip.id)?.ok_or_else(|| anyhow::anyhow!("the trip just written is gone"))?
-        } else {
-            let item = NewItem {
-                kind: arrival.kind.clone().unwrap_or_default(),
-                title: arrival.title.clone().unwrap_or_else(|| arrival.summary.clone()),
-                place: arrival.place.clone(),
-                date: date.clone(),
-                starts_at: arrival.starts_at.clone(),
-                ends_at: arrival.ends_at.clone(),
-                notes: None,
-                booked: true,
-                confirmation_code: arrival.confirmation_code.clone(),
-                price: arrival.price,
-                currency: arrival.currency.clone(),
-                arrival_id: Some(arrival_id),
-            };
-            store.add_item(trip.id, item)?
+        if !store.decide_arrival(arrival_id, account_id, "added", None)? {
+            return Ok(Outcome::NotPending);
+        }
+        let (trip, item_id) = match build_item(&store, account_id, &arrival, trip, &date) {
+            Ok(built) => built,
+            Err(e) => {
+                return Err(match store.reopen_arrival(arrival_id) {
+                    Ok(()) => e,
+                    Err(undo) => e.context(format!("and the arrival could not be reopened: {undo}")),
+                });
+            }
         };
-
-        let item_id = trip
-            .items
-            .iter()
-            .find(|i| i.arrival_id == Some(arrival_id))
-            .map(|i| i.id)
-            .ok_or_else(|| anyhow::anyhow!("the item just added does not carry its arrival"))?;
+        store.note_arrival_item(arrival_id, item_id)?;
+        // `attach_to_item` leaves a file that already joined an item where
+        // it is, so only the mail's loose files follow this booking.
         for file in store.attachments_of_mail(arrival.mail_id)? {
             store.attach_to_item(file.id, item_id)?;
         }
-        store.set_arrival_status(arrival_id, account_id, "added", Some(item_id))?;
         let trip = if trip.kept {
             trip
         } else {
             store.keep_trip(account_id, &trip.name)?;
-            trip_of(&store, account_id, trip.id)?.unwrap_or(trip)
+            store
+                .trip_by_id(account_id, trip.id)?
+                .ok_or_else(|| anyhow::anyhow!("the trip just kept is gone"))?
         };
         let chat = store.trip_chat(trip.id)?;
         Ok(Outcome::Done(Box::new(Plan::from_trip(trip, chat))))
@@ -561,18 +554,87 @@ pub async fn add_arrival(
     .await
 }
 
+/// The item a claimed arrival becomes, on `trip`: a booked leg for a
+/// flight, a booked stay, activity or transport otherwise. Returns the
+/// trip as written and the new item's id. Split out of `add_arrival` so
+/// that everything between the claim and the item being real is one
+/// fallible step the caller can undo the claim after.
+fn build_item(
+    store: &Store,
+    account_id: i64,
+    arrival: &scout_api::Arrival,
+    trip: Trip,
+    date: &str,
+) -> anyhow::Result<(Trip, i64)> {
+    let arrival_id = arrival.id;
+    let trip = if arrival.kind.as_deref() == Some("flight") {
+        let (Some(origin), Some(destination)) = (arrival.origin.as_deref(), arrival.destination.as_deref()) else {
+            anyhow::bail!("arrival {arrival_id} is a flight with no route");
+        };
+        let with_leg = store.add_flight(trip.id, origin, destination, date)?;
+        // The leg just added is the newest unbooked one on that route
+        // and day; `add_flight` returns the trip, not the row.
+        let leg = with_leg
+            .items
+            .iter()
+            .filter(|i| {
+                i.is_flight()
+                    && !i.booked
+                    && i.arrival_id.is_none()
+                    && i.origin.as_deref() == Some(origin)
+                    && i.destination.as_deref() == Some(destination)
+                    && i.date == date
+            })
+            .max_by_key(|i| i.id)
+            .ok_or_else(|| anyhow::anyhow!("the leg just added is not on the trip"))?;
+        store.book_item(
+            leg.id,
+            arrival.confirmation_code.as_deref(),
+            arrival.price,
+            arrival.currency.as_deref(),
+            Some(arrival_id),
+        )?;
+        store
+            .trip_by_id(account_id, trip.id)?
+            .ok_or_else(|| anyhow::anyhow!("the trip just written is gone"))?
+    } else {
+        let item = NewItem {
+            kind: arrival.kind.clone().unwrap_or_default(),
+            title: arrival.title.clone().unwrap_or_else(|| arrival.summary.clone()),
+            place: arrival.place.clone(),
+            date: date.to_string(),
+            starts_at: arrival.starts_at.clone(),
+            ends_at: arrival.ends_at.clone(),
+            notes: None,
+            booked: true,
+            confirmation_code: arrival.confirmation_code.clone(),
+            price: arrival.price,
+            currency: arrival.currency.clone(),
+            arrival_id: Some(arrival_id),
+        };
+        store.add_item(trip.id, item)?
+    };
+    let item_id = trip
+        .items
+        .iter()
+        .find(|i| i.arrival_id == Some(arrival_id))
+        .map(|i| i.id)
+        .ok_or_else(|| anyhow::anyhow!("the item just added does not carry its arrival"))?;
+    Ok((trip, item_id))
+}
+
 /// The other click: the arrival moves under Other mail and nothing else
-/// changes.
+/// changes. One guarded write — the same claim an Add makes — so an
+/// ignore racing an add cannot flip an added booking to ignored.
 pub async fn ignore_arrival(core: &Core, account_id: i64, arrival_id: i64) -> anyhow::Result<Outcome<()>> {
     let store = core.store();
     blocking(move || {
-        let Some(arrival) = store.arrival_of(arrival_id, account_id)? else {
+        if store.arrival_of(arrival_id, account_id)?.is_none() {
             return Ok(Outcome::NotFound);
-        };
-        if !arrival.booking || arrival.status != "pending" {
+        }
+        if !store.decide_arrival(arrival_id, account_id, "ignored", None)? {
             return Ok(Outcome::NotPending);
         }
-        store.set_arrival_status(arrival_id, account_id, "ignored", None)?;
         Ok(Outcome::Done(()))
     })
     .await
@@ -708,7 +770,7 @@ mod tests {
     #[test]
     fn a_handle_is_lowercased_and_the_rules_are_enforced() {
         assert_eq!(normalise_handle(" Sasha.K ").unwrap(), "sasha.k");
-        for bad in ["ab", "a".repeat(31).as_str(), ".sasha", "sasha.", "sa sha", "sa@sha", "postmaster", "Admin", "no-reply"] {
+        for bad in ["ab", "a".repeat(31).as_str(), ".sasha", "sasha.", "sa sha", "sa@sha", "postmaster", "Admin", "no-reply", "sásha"] {
             assert!(normalise_handle(bad).is_err(), "{bad:?}");
         }
     }
@@ -730,6 +792,10 @@ mod tests {
         let e = Extraction::parse(r#"{"booking":true,"kind":"stay","summary":"x"}"#).unwrap();
         assert!(!e.booking, "downgraded to not-a-booking");
         assert!(Extraction::parse("no json here").is_err());
+        // A closer before the first opener, and a non-object: errors, not
+        // a slice from after the start to before it.
+        assert!(Extraction::parse("} noise {").is_err());
+        assert!(Extraction::parse("[]").is_err());
         let e = Extraction::parse(r#"{"booking":false,"summary":"Newsletter from TAP"}"#).unwrap();
         assert!(!e.booking);
         // A summary over 140 chars is cut; a kind outside the four is dropped.
@@ -742,6 +808,16 @@ mod tests {
         assert!(!e.booking, "a flight with half a route is downgraded");
         let e = Extraction::parse(r#"{"booking":true,"kind":"flight","date":"2026-10-12","origin":"AMS","destination":"LIS","summary":"x"}"#).unwrap();
         assert!(e.booking);
+        // Every field the page shows is capped and trimmed; a blank is None.
+        let e = Extraction::parse(&format!(
+            r#"{{"booking":true,"kind":"stay","date":"2026-10-12","title":"{}","place":"  ","confirmation_code":" ABC ","travellers":["{}","", "Kim"],"summary":"x"}}"#,
+            "t".repeat(300), "n".repeat(300)
+        )).unwrap();
+        assert_eq!(e.title.as_ref().map(|t| t.chars().count()), Some(200));
+        assert_eq!(e.place, None);
+        assert_eq!(e.confirmation_code.as_deref(), Some("ABC"));
+        let names = e.travellers.unwrap();
+        assert_eq!((names.len(), names[0].chars().count(), names[1].as_str()), (2, 100, "Kim"));
     }
 
     #[test]
@@ -820,7 +896,7 @@ mod tests {
             travellers: Some(vec!["Sasha".into(), "Kim".into()]),
             ..arrival("stay", "Hotel Alfama", Some("Lisbon"), "2026-10-13")
         };
-        let (id, placement) = record_arrival(&core, a, mail_id, &e).await.unwrap();
+        let (id, placement) = record_arrival(&core, a, mail_id, e).await.unwrap();
         assert_eq!(placement, Some(Placement::Trip(lisbon.id)));
         assert_eq!(trip_name(&core, a, lisbon.id).await.unwrap().as_deref(), Some("Lisbon, October"));
         assert_eq!(view(&core, a, "d").await.unwrap().pending[0].trip_name.as_deref(), Some("Lisbon, October"));
@@ -862,7 +938,7 @@ mod tests {
             currency: Some("EUR".into()),
             ..arrival("flight", "AMS → LIS", Some("Lisbon"), "2026-10-12")
         };
-        let (id, placement) = record_arrival(&core, a, mail_id, &e).await.unwrap();
+        let (id, placement) = record_arrival(&core, a, mail_id, e).await.unwrap();
         assert!(matches!(placement, Some(Placement::Draft(_))));
         let plan = match add_arrival(&core, a, id, AddTarget::Matched).await.unwrap() {
             Outcome::Done(plan) => plan,
@@ -908,6 +984,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_clicks_on_one_arrival_add_it_once() {
+        // A double-click reaches the door twice before either has written;
+        // the status write is the claim, so exactly one builds the item.
+        let (core, _dir) = core();
+        let store = core.store();
+        let a = store.account_for_telegram(1).unwrap();
+        let id = seed_arrival_for_tests(&core, a, "stay", "Hotel Roma", "2027-03-05", None).await.unwrap();
+        let (x, y) = tokio::join!(add_arrival(&core, a, id, AddTarget::New), add_arrival(&core, a, id, AddTarget::New));
+        let outcomes = [x.unwrap(), y.unwrap()];
+        assert_eq!(outcomes.iter().filter(|o| matches!(o, Outcome::Done(_))).count(), 1, "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|o| **o == Outcome::NotPending).count(), 1, "{outcomes:?}");
+        let trip = store.find_trip(a, "Trip, March").unwrap().unwrap();
+        assert_eq!(trip.items.len(), 1, "one item, not one per click");
+    }
+
+    #[tokio::test]
     async fn ignoring_an_arrival_moves_it_under_other_mail() {
         let (core, _dir) = core();
         let store = core.store();
@@ -931,7 +1023,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().unwrap();
         let e = Extraction { booking: false, summary: "Newsletter from TAP".into(), ..Extraction::default() };
-        let (id, placement) = record_arrival(&core, a, mail_id, &e).await.unwrap();
+        let (id, placement) = record_arrival(&core, a, mail_id, e).await.unwrap();
         assert_eq!(placement, None);
         assert!(store.list_trips(a).unwrap().is_empty(), "no draft for a newsletter");
         mail_done(&core, mail_id).await.unwrap();

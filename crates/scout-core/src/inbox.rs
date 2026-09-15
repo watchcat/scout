@@ -1000,6 +1000,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_add_reopens_the_arrival() {
+        // A reading no item can be built from: a flight with half a route,
+        // which `parse` would have downgraded but a row written straight
+        // into the store has not been through. The claim must be undone,
+        // or the page shows a booking added with nothing on the trip.
+        let (core, _dir) = core();
+        let store = core.store();
+        let a = store.account_for_telegram(1).unwrap();
+        let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().unwrap();
+        let id = store
+            .insert_arrival(a, mail_id, &NewArrival {
+                booking: true,
+                kind: Some("flight".into()),
+                origin: Some("AMS".into()),
+                date: Some("2026-10-12".into()),
+                summary: "half a route".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(add_arrival(&core, a, id, AddTarget::New).await.is_err());
+        assert_eq!(store.arrival_of(id, a).unwrap().unwrap().status, "pending");
+        let pending: Vec<i64> = view(&core, a, "d").await.unwrap().pending.iter().map(|p| p.id).collect();
+        assert_eq!(pending, vec![id], "still waiting on the page");
+        assert!(store.find_trip(a, "Trip, October").unwrap().unwrap().items.is_empty(), "nothing landed on the draft");
+        // The wire `Arrival` carries no item_id; the store's own test pins
+        // that a reopen clears it.
+    }
+
+    #[tokio::test]
     async fn ignoring_an_arrival_moves_it_under_other_mail() {
         let (core, _dir) = core();
         let store = core.store();

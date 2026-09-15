@@ -8219,8 +8219,13 @@ CREATE TABLE messages (
         store.reopen_arrival(id).unwrap();
         assert!(store.decide_arrival(id, a, "added", None).unwrap());
         store.note_arrival_item(id, 7).unwrap();
-        let item: Option<i64> = store.conn().query_row("SELECT item_id FROM arrivals WHERE id = ?", params![id], |r| r.get(0)).unwrap();
-        assert_eq!(item, Some(7));
+        let item_of = |id: i64| -> (String, Option<i64>) {
+            store.conn().query_row("SELECT status, item_id FROM arrivals WHERE id = ?", params![id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        };
+        assert_eq!(item_of(id), ("added".to_string(), Some(7)));
+        // A reopen forgets the item too, not just the status.
+        store.reopen_arrival(id).unwrap();
+        assert_eq!(item_of(id), ("pending".to_string(), None));
     }
 
     #[test]

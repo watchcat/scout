@@ -10,7 +10,7 @@ use crate::core::{blocking, Core};
 use crate::store::{NewArrival, NewItem, Store, Trip};
 use crate::trips::Plan;
 
-pub use crate::store::MailToWork;
+pub use crate::store::{MailToWork, MAIL_ATTEMPTS};
 
 /// Local parts nobody may claim: the ones mail software and people expect
 /// to reach an operator, and the product's own name.

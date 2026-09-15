@@ -36,7 +36,9 @@ pub struct Meta {
     pub size: Option<u64>,
 }
 
-/// A mail Resend received for us, body included.
+/// A mail Resend received for us, body included. Only what the worker
+/// reads: `to` is on the wire too, but the webhook already decided whose
+/// the mail is, and a field no one reads is a field no one keeps right.
 ///
 /// Every field but `from` is optional because Resend's shape has been seen
 /// to omit an empty one rather than send `null`, and a forward that fails
@@ -46,8 +48,6 @@ pub struct Meta {
 pub struct Received {
     #[serde(default)]
     pub from: String,
-    #[serde(default)]
-    pub to: Vec<String>,
     #[serde(default)]
     pub subject: Option<String>,
     #[serde(default)]

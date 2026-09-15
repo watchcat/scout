@@ -12,14 +12,11 @@
 mod cache;
 mod email;
 mod inbound;
+mod inbox_worker;
 mod page;
 mod pages;
 mod ratelimit;
-// `pub` for the same interim reason the comment above describes: the
-// Resend client has no caller until the inbox worker (the next task) is
-// wired in, and dead-code analysis is about reachability. Narrow it to
-// `mod` when the worker calls it.
-pub mod resend;
+mod resend;
 mod routes;
 mod session;
 mod telegram_login;
@@ -576,7 +573,20 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
     // a cache no reader will ever consult, on the one path where nobody is
     // reading: a bind that failed.
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tokio::spawn(refresh_forever(core, cache.clone()));
+    tokio::spawn(refresh_forever(core.clone(), cache.clone()));
+
+    // The inbox worker runs only where the webhook does: the same secret
+    // gates both, and a worker with nothing feeding it would tick every
+    // minute against an empty table for the life of the process.
+    if let Some(state) = auth.as_ref().filter(|a| inbound::state_from(a).is_some()) {
+        let client = resend::ResendClient::new(
+            inbox_worker::client(),
+            state.cfg.resend_api_key.clone(),
+            state.cfg.resend_base_url.clone(),
+        );
+        tokio::spawn(inbox_worker::run(core, client, state.cfg.mail_from.clone()));
+        tracing::info!("the inbox worker is running");
+    }
 
     tracing::info!(bind, "the front door is open");
     axum::serve(listener, router(cache, auth))

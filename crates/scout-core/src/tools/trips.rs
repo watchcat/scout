@@ -143,7 +143,8 @@ pub fn dates_run_forwards(items: &[TripItem]) -> Result<(), String> {
 #[derive(Debug, PartialEq, serde::Serialize)]
 pub struct TripView {
     pub trip: Trip,
-    /// Why this trip could not be priced yet, or absent when it could be.
+    /// Where this trip stands with pricing: booked outright, ready to
+    /// price named legs, or not ready with the reason why.
     ///
     /// Computed by the same functions `finalise_trip` refuses on, so the
     /// two can never disagree about whether a trip is finished. It rides on
@@ -153,7 +154,14 @@ pub struct TripView {
     /// reply. A model can forget an instruction to check; it cannot easily
     /// assert "all four are booked" in the same breath as data saying
     /// segment 2 has no flight on it.
-    pub not_ready: Option<String>,
+    ///
+    /// Three states rather than a reason that is present or absent. This
+    /// was `not_ready: Option<String>`, and an absent reason is defined by
+    /// the guidance as "the trip is complete" — so a trip whose flights
+    /// were all already bought arrived here byte-identical to one waiting
+    /// to be shopped, which is this card's own bug reachable through chat
+    /// while the browser had been fixed.
+    pub readiness: Readiness,
     /// What the call that produced this view actually did.
     ///
     /// The trip below is a snapshot, and when a turn makes two edits the
@@ -185,16 +193,9 @@ impl TripView {
         for item in &mut trip.items {
             item.attachments.clear();
         }
-        // Exactly what finalisation checks, in the order it checks it. A
-        // trip whose flights are all bought is absent here rather than
-        // refused: nothing is outstanding on it, and `finalise_trip` will
-        // answer for it with what it cost.
-        let not_ready = ready_to_price(&trip.items)
-            .refusal()
-            .map(str::to_string)
-            .or_else(|| dates_run_forwards(&trip.items).err());
+        let readiness = Readiness::of(&trip.items);
         let notes = itinerary_notes(&trip.items);
-        Self { trip, not_ready, changed: None, notes }
+        Self { trip, readiness, changed: None, notes }
     }
 
     /// The same view, with a note of what this call did to get it.
@@ -534,15 +535,62 @@ pub enum Pricing<'a> {
     NotReady(String),
 }
 
-impl Pricing<'_> {
-    /// Why this trip cannot be priced, for the views that carry a single
-    /// reason. `Booked` is deliberately not one of them: a trip with
-    /// nothing left to buy is finished, not blocked, and reporting it as a
-    /// refusal is how the model would come to ask for a decision nobody
-    /// owes it.
+/// Where a trip stands with pricing, as every view of a trip says it: the
+/// page, the printed plan, and the specialist's own tools.
+///
+/// One field naming one of three states rather than a pair of flags,
+/// because the states exclude each other: a trip cannot be both bought
+/// outright and waiting on a decision, and two booleans could claim it
+/// was. `Pricing` is the same three states carrying the borrowed legs;
+/// this is the owned, serialisable shape the views hand on.
+///
+/// A wire type twice over — `chat.js` switches on `state`, and the model
+/// reads it as JSON — so the three names here and the branches that read
+/// them move together.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Readiness {
+    /// Every flight on this trip is a ticket the traveller already holds.
+    /// Nothing to shop and nothing to decide.
+    Booked,
+    /// The legs that pricing would actually cover, named as
+    /// `ready_to_price`'s own refusals name them. A trip where nothing is
+    /// booked lists all of its flights; a reader compares that against the
+    /// trip to know whether "the whole trip" is what is being priced.
+    Ready { legs: Vec<String> },
+    /// Why this trip cannot be priced yet, in the words the flight agent
+    /// would refuse in.
+    NotReady { reason: String },
+}
+
+impl Readiness {
+    /// Everything `finalise_trip` would refuse on, in the order it checks
+    /// it: what is on the trip, then whether its dates run forwards.
+    ///
+    /// Dates that run backwards block a booked trip as well as a shoppable
+    /// one. Only reachable by a caller that bypassed the store — every
+    /// write reorders items by date — but leaving it out would let a view
+    /// call a trip finished that the tool still turns away, and
+    /// disagreeing with the tool is the older bug here.
+    pub fn of(items: &[TripItem]) -> Self {
+        match (ready_to_price(items), dates_run_forwards(items)) {
+            (Pricing::NotReady(reason), _) | (_, Err(reason)) => Readiness::NotReady { reason },
+            (Pricing::Booked, Ok(())) => Readiness::Booked,
+            (Pricing::Ready(legs), Ok(())) => Readiness::Ready {
+                legs: legs
+                    .iter()
+                    .map(|(segment, _)| format!("segment {} ({})", segment.position, segment.route()))
+                    .collect(),
+            },
+        }
+    }
+
+    /// Why this trip cannot be priced, for a reader that wants one string.
+    /// `Booked` is deliberately not one: a trip with nothing left to buy is
+    /// finished, not blocked.
     pub fn refusal(&self) -> Option<&str> {
         match self {
-            Pricing::NotReady(why) => Some(why),
+            Readiness::NotReady { reason } => Some(reason),
             _ => None,
         }
     }
@@ -2511,7 +2559,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let waiting = view.not_ready.expect("a segment with no flight is not ready");
+        let waiting = view.readiness.refusal().expect("a segment with no flight is not ready");
         assert!(waiting.contains("segment 1"), "and it says which: {waiting}");
 
         let view = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
@@ -2523,7 +2571,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(view.not_ready.is_none(), "every segment decided, so it is ready: {view:?}");
+        assert!(
+            matches!(view.readiness, Readiness::Ready { .. }),
+            "every segment decided, so it is ready: {view:?}",
+        );
 
         // A second segment with nothing on it puts it back to not-ready, so
         // "the trip is done" cannot survive adding a leg to it.
@@ -2538,8 +2589,54 @@ mod tests {
             })
             .await
             .unwrap();
-        let waiting = view.not_ready.expect("the new leg has no flight");
+        let waiting = view.readiness.refusal().expect("the new leg has no flight");
         assert!(waiting.contains("segment 2"), "got: {waiting}");
+    }
+
+    #[tokio::test]
+    async fn the_model_is_told_a_bought_trip_is_bought_rather_than_shown_nothing() {
+        // The page and the printed plan got three states; this view is what
+        // the specialist reads, and it had two. An absent reason is what
+        // the guidance defines as "the trip is complete, go and price it",
+        // so a fully ticketed trip was byte-identical here to one waiting
+        // to be shopped — the original failure, still reachable through
+        // chat while the browser was fixed.
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "HKG", "2026-09-15", &["EY78"])], Instant::now());
+        AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "HKG".into(),
+                departure_date: "2026-09-15".into(),
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
+            .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap();
+        let trip = store.find_trip(7, "Japan").unwrap().unwrap();
+        store
+            .book_item(trip.items[0].id, Some("EY7788"), Some(612.40), Some("EUR"), None)
+            .unwrap();
+
+        let view = ShowTripTool { store, account_id: 7 }
+            .call(ShowTripArgs { trip: Some("Japan".into()) })
+            .await
+            .unwrap();
+        let view = &view.trips[0];
+        assert_eq!(view.readiness, Readiness::Booked);
+        // It has to survive serialization: what reaches the model is the
+        // JSON, and a state that does not appear there is a state it
+        // cannot act on.
+        assert_eq!(
+            serde_json::to_value(view).unwrap()["readiness"],
+            serde_json::json!({"state": "booked"}),
+        );
     }
 
     #[test]
@@ -3130,7 +3227,9 @@ mod tests {
     #[test]
     fn a_trip_that_cannot_be_priced_is_refused_before_anything_is_bought() {
         let empty = vec![segment(1, "AMS", "NRT", "2026-09-03")];
-        let problem = ready_to_price(&empty).refusal().unwrap().to_string();
+        let Pricing::NotReady(problem) = ready_to_price(&empty) else {
+            panic!("a segment with no flight cannot be priced");
+        };
         assert!(problem.contains("segment 1"), "got: {problem}");
         assert!(problem.contains("no flight"), "got: {problem}");
 
@@ -3140,7 +3239,9 @@ mod tests {
             TripCandidate { candidate: 1, chosen: false, ..parked("KL861", 940.0) },
             TripCandidate { candidate: 2, chosen: false, ..parked("CX270,CX500", 780.0) },
         ];
-        let problem = ready_to_price(&undecided).refusal().unwrap().to_string();
+        let Pricing::NotReady(problem) = ready_to_price(&undecided) else {
+            panic!("two options and no decision cannot be priced");
+        };
         assert!(problem.contains("KL861"), "the options are listed: {problem}");
         assert!(problem.contains("CX270,CX500"), "got: {problem}");
 
@@ -3161,7 +3262,7 @@ mod tests {
 
     #[test]
     fn a_trip_with_no_segments_is_refused() {
-        assert!(ready_to_price(&[]).refusal().is_some());
+        assert!(matches!(ready_to_price(&[]), Pricing::NotReady(_)));
     }
 
     #[tokio::test]
@@ -4317,7 +4418,10 @@ mod tests {
         };
         assert_eq!(legs.len(), 1);
         let only_a_stay = vec![stay_item(1, "Hotel", "2026-10-12")];
-        assert!(ready_to_price(&only_a_stay).refusal().unwrap().contains("no flights"));
+        let Pricing::NotReady(problem) = ready_to_price(&only_a_stay) else {
+            panic!("a trip of one hotel has no flights to price");
+        };
+        assert!(problem.contains("no flights"), "got: {problem}");
     }
 
     #[test]
@@ -4333,11 +4437,11 @@ mod tests {
         items[0].booked = true;
         items[2].booked = true;
         assert_eq!(ready_to_price(&items), Pricing::Booked);
-        // And it is not a refusal. The two views that carry one reason
-        // string read it through `refusal`, and a reason there is what
-        // makes the model ask for a decision nobody owes it — the mirror
-        // of the "ready to price" the page was showing.
-        assert_eq!(ready_to_price(&items).refusal(), None);
+        // And it is not a refusal. `Readiness::refusal` is what every view
+        // carrying one reason string reads, and a reason there is what
+        // makes a reader ask for a decision nobody owes — the mirror of
+        // the "ready to price" the page was showing.
+        assert_eq!(Readiness::of(&items).refusal(), None);
 
         // A booked leg is skipped whatever state its options are in, so a
         // confirmation that never named a flight cannot hold up a trip the

@@ -424,9 +424,14 @@ re-send an old one.";
 
 const TRIP_GUIDANCE: &str = "\
 Presenting a trip: the findings carry the whole trip as the tools returned \
-it. When not_ready is present the trip cannot be priced and its reason \
-says which segment is missing what; when it is absent the trip is \
-complete. Say what it says, and never describe a trip from memory. Quote a \
+it. readiness.state says where a trip stands, and it is one of three. \
+not_ready carries the reason and says which segment is missing what. \
+ready lists in legs the segments pricing would actually cover, which is \
+every flight only when none of them is bought yet. booked means every \
+flight on the trip is a ticket the traveller already holds: nothing to \
+price, nothing to decide, and never offer to search those routes or to \
+refresh their fares. Say what it says, and never describe a trip from \
+memory. Quote a \
 trip's prices as of when each option was parked, never as a current total: \
 only finalise_trip re-prices them. When finalise_trip ran, present both \
 totals it returns and never drop the note about separate tickets: a link \
@@ -512,7 +517,15 @@ mod tests {
 
         for tool in ["add_trip_segment", "show_trip", "finalise_trip", "delete_trip"] {
             let text = guidance(&[ran(tool, json!({}))], 0.0).join("\n");
-            assert!(text.contains("not_ready"), "{tool}: {text}");
+            assert!(text.contains("readiness.state"), "{tool}: {text}");
+            // All three named, not just the two this used to have: an
+            // absent reason is defined here as "go and price it", so a
+            // booked trip the guidance cannot name is a booked trip the
+            // model offers to shop.
+            for state in ["not_ready", "ready lists", "booked means"] {
+                assert!(text.contains(state), "{tool} is missing {state}: {text}");
+            }
+            assert!(text.contains("never offer to search those routes"), "{tool}: {text}");
             assert!(text.contains("separate tickets"), "{tool}: {text}");
             // A correction rather than decoration: the sentence before it
             // enumerates stays, activities and transport as what
@@ -531,11 +544,11 @@ mod tests {
     fn every_trip_tool_brings_the_trip_rules_and_a_lookalike_does_not() {
         for tool in TRIP_TOOLS {
             let text = guidance(&[ran(tool, json!({}))], 0.0).join("\n");
-            assert!(text.contains("not_ready"), "{tool}: {text}");
+            assert!(text.contains("readiness.state"), "{tool}: {text}");
         }
         // A name with 'trip' in it is not a trip tool.
         let text = guidance(&[ran("round_trip_helper", json!({}))], 0.0).join("\n");
-        assert!(!text.contains("not_ready"), "got: {text}");
+        assert!(!text.contains("readiness.state"), "got: {text}");
     }
 
     #[test]
@@ -546,7 +559,7 @@ mod tests {
         let view = |kept: bool| {
             json!({
                 "trip": {"name": "Lisbon in May", "adults": 1, "status": "planning", "segments": [], "kept": kept},
-                "not_ready": null,
+                "readiness": {"state": "ready", "legs": []},
                 "changed": "segment 1 added",
                 "notes": [],
             })

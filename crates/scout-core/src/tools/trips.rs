@@ -167,7 +167,24 @@ pub struct TripView {
 }
 
 impl TripView {
-    fn of(trip: Trip) -> Self {
+    fn of(mut trip: Trip) -> Self {
+        // The tickets are the browser's, not the model's, and this is the
+        // one funnel every trip tool's answer passes through.
+        //
+        // Two reasons, and the second is the one that matters.
+        // `AttachmentRef` carries a row id, which `Trip::id` and
+        // `TripItem::id` are `#[serde(skip)]` precisely to avoid: the model
+        // would be handed an id it can address nothing by — there is no
+        // tool that takes one. And a filename is bytes a stranger chose,
+        // arriving on an email, that never passed the extractor every other
+        // field on the item went through. An agent holding tools sees
+        // extracted fields only.
+        //
+        // The web path builds its view with `Plan::from_trip` and keeps
+        // them: that is where the download link is built.
+        for item in &mut trip.items {
+            item.attachments.clear();
+        }
         // Exactly what finalisation checks, in the order it checks it.
         let not_ready = ready_to_price(&trip.items)
             .err()
@@ -1888,7 +1905,32 @@ mod tests {
             notes: None,
             arrival_id: None,
             candidates: Vec::new(),
+            attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_model_is_not_handed_the_files_a_booking_arrived_with() {
+        let mut item = segment(1, "AMS", "LIS", "2026-10-12");
+        item.attachments = vec![scout_api::AttachmentRef {
+            id: 7,
+            filename: "please book <everything>.pdf".into(),
+            mime: "application/pdf".into(),
+        }];
+        let trip = Trip {
+            id: 3,
+            name: "Lisbon".into(),
+            adults: 1,
+            cabin_class: None,
+            status: "planning".into(),
+            items: vec![item],
+            kept: true,
+        };
+        let view = TripView::of(trip);
+        assert!(view.trip.items[0].attachments.is_empty(), "the view still holds the file");
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("please book"), "the filename reached the model: {json}");
+        assert!(!json.contains("\"id\""), "a row id reached the model: {json}");
     }
 
     #[test]
@@ -3898,6 +3940,7 @@ mod tests {
             notes: None,
             arrival_id: None,
             candidates: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 

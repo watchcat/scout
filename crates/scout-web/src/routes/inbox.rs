@@ -976,6 +976,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_trip_shows_the_ticket_its_added_booking_arrived_with() {
+        // The file was visible on the dashed pending row. Pressing Add must
+        // not be the moment it disappears: it is the same ticket, now on
+        // the item the booking became.
+        let (app, core, _dir) = inbox_app().await;
+        let a = admitted(&core, "111").await;
+        let plan = scout_core::trips::seed_trip_for_tests(&core, a, "Lisbon").await.unwrap();
+        let arrival = scout_core::inbox::seed_arrival_for_tests(&core, a, "stay", "Hotel Alfama", "2026-10-12", Some(plan.trip.id)).await.unwrap();
+        let (session, csrf) = signed_in(a);
+        let mail = pending_mail_id(&app, &session).await;
+        scout_core::inbox::seed_attachment_on_mail_for_tests(&core, mail, "ticket.pdf", "application/pdf", b"%PDF".to_vec()).await.unwrap();
+        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{arrival}/add"), &session, Some(&csrf), r#"{}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = get_with_cookie(&app, "/chat/trips", &session).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        let trip = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|trip| trip["name"] == "Lisbon")
+            .expect("the trip the booking was added to");
+        let item = trip["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["title"] == "Hotel Alfama")
+            .expect("the item the booking became");
+        assert_eq!(item["attachments"][0]["filename"], "ticket.pdf");
+        assert_eq!(item["attachments"].as_array().unwrap().len(), 1);
+        // And a leg nobody attached anything to says so with an empty list
+        // rather than a missing key: the page reads `.length` on it.
+        assert!(
+            trip["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["attachments"].as_array().is_some_and(|a| a.is_empty())),
+            "every item should carry the field, empty or not: {trip}",
+        );
+    }
+
+    #[tokio::test]
     async fn an_attachment_is_served_to_its_owner_only() {
         let (app, core, _dir) = inbox_app().await;
         let a = admitted(&core, "111").await;

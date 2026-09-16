@@ -524,6 +524,11 @@ pub struct TripItem {
     pub notes: Option<String>,
     pub arrival_id: Option<i64>,
     pub candidates: Vec<TripCandidate>,
+    /// The ticket the booking arrived with: the files forwarded on the
+    /// confirmation mail, moved here by `attach_to_item` when the owner
+    /// pressed Add. Empty for an item nobody attached one to — a leg the
+    /// specialist searched, or a booking whose mail carried no file.
+    pub attachments: Vec<scout_api::AttachmentRef>,
 }
 
 impl TripItem {
@@ -4046,6 +4051,7 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
                 notes: r.get(14)?,
                 arrival_id: r.get(15)?,
                 candidates: Vec::new(),
+                attachments: Vec::new(),
             })
         })?
         .collect::<duckdb::Result<_>>()?;
@@ -4079,9 +4085,45 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
         })?
         .collect::<duckdb::Result<_>>()?;
 
+    // Every ticket on the trip in one query, joined to its item in memory
+    // below — the same shape as the candidates above, and for a harder
+    // reason. `list_trips` reads every trip of an account with all of its
+    // items, and it sits on the placement path — once per incoming mail,
+    // as `inbox::Trips::load` is careful to keep it. A query per item would
+    // make that read grow with the size of the account's trips rather than
+    // with the number of them, which is the one thing that read must not
+    // do. `item_id IN (…)` also drops a file that is still only the mail's:
+    // a NULL `item_id` matches nothing.
+    //
+    // It names four columns and not `bytes`, which matters more than it
+    // looks: this once computed each file's size with `octet_length(bytes)`,
+    // and DuckDB answers that by projecting the BLOB in the scan and taking
+    // the length above the join — 40 tickets of 250 KB cost ~13 ms cold and
+    // ~1 ms warm per trip read, to produce a number nothing displays. See
+    // `AttachmentRef` for why there is no size to fill.
+    let mut stmt = conn.prepare(
+        "SELECT item_id, id, filename, mime
+         FROM attachments
+         WHERE item_id IN (SELECT id FROM trip_items WHERE trip_id = ?)
+         ORDER BY item_id, id",
+    )?;
+    let attachments: Vec<(i64, scout_api::AttachmentRef)> = stmt
+        .query_map(params![id], |r| {
+            Ok((
+                r.get(0)?,
+                scout_api::AttachmentRef { id: r.get(1)?, filename: r.get(2)?, mime: r.get(3)? },
+            ))
+        })?
+        .collect::<duckdb::Result<_>>()?;
+
     let items = rows
         .into_iter()
         .map(|mut item| {
+            item.attachments = attachments
+                .iter()
+                .filter(|(item_id, _)| *item_id == item.id)
+                .map(|(_, a)| a.clone())
+                .collect();
             item.candidates = candidates
                 .iter()
                 .filter(|(item_id, _)| *item_id == item.id)
@@ -4167,11 +4209,10 @@ fn listed(stored: Option<String>) -> Vec<String> {
 
 fn attachments_of(conn: &Connection, mail_id: i64) -> duckdb::Result<Vec<scout_api::AttachmentRef>> {
     let mut stmt = conn.prepare(
-        "SELECT id, filename, mime, CAST(coalesce(octet_length(bytes), 0) AS BIGINT)
-         FROM attachments WHERE mail_id = ? ORDER BY id",
+        "SELECT id, filename, mime FROM attachments WHERE mail_id = ? ORDER BY id",
     )?;
     let rows = stmt.query_map(params![mail_id], |r| {
-        Ok(scout_api::AttachmentRef { id: r.get(0)?, filename: r.get(1)?, mime: r.get(2)?, size: r.get(3)? })
+        Ok(scout_api::AttachmentRef { id: r.get(0)?, filename: r.get(1)?, mime: r.get(2)? })
     })?;
     rows.collect()
 }
@@ -8768,6 +8809,59 @@ CREATE TABLE messages (
     }
 
     #[test]
+    fn a_trip_carries_the_tickets_its_bookings_arrived_with() {
+        // The other half of what `attach_to_item` is for: the file survives
+        // the mail, and the trip it survived onto has to show it. Without
+        // this the owner has a ticket nothing on the page draws.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        // Named so that the order they were written in is not the order
+        // their names sort in: the read has to be pinned to one of them,
+        // and it is the ids — the order the mail carried them in.
+        let boarding = store.insert_attachment(m, "zulu-boarding.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let receipt = store.insert_attachment(m, "alpha-receipt.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let loose = store.insert_attachment(m, "logo.png", "image/png", Some(&[1, 2]), None).unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        let trip = store.add_item(trip.id, NewItem {
+            kind: "stay".into(), title: "Hotel Alfama".into(), place: None, date: "2026-10-12".into(),
+            starts_at: None, ends_at: None, notes: None, booked: true, confirmation_code: None,
+            price: None, currency: None, arrival_id: None,
+        }).unwrap();
+        let trip = store.add_item(trip.id, NewItem {
+            kind: "activity".into(), title: "Museu do Azulejo".into(), place: None, date: "2026-10-13".into(),
+            starts_at: None, ends_at: None, notes: None, booked: false, confirmation_code: None,
+            price: None, currency: None, arrival_id: None,
+        }).unwrap();
+        let hotel = trip.items.iter().find(|i| i.title == "Hotel Alfama").expect("the stay").id;
+        // Attached out of order on purpose: the read orders them, so a
+        // reload does not shuffle the links under the reader's cursor.
+        store.attach_to_item(receipt, hotel).unwrap();
+        store.attach_to_item(boarding, hotel).unwrap();
+
+        let got = store.trip_by_id(a, trip.id).unwrap().expect("theirs");
+        let stay = got.items.iter().find(|i| i.title == "Hotel Alfama").expect("the stay");
+        assert!(boarding < receipt, "the ids are the order the mail carried them in");
+        assert_eq!(
+            stay.attachments.iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(),
+            vec!["zulu-boarding.pdf", "alpha-receipt.pdf"],
+            "read back in id order, not by name and not by when they were attached",
+        );
+        assert_eq!(
+            stay.attachments[0],
+            scout_api::AttachmentRef { id: boarding, filename: "zulu-boarding.pdf".into(), mime: "application/pdf".into() },
+        );
+        let museum = got.items.iter().find(|i| i.title == "Museu do Azulejo").expect("the activity");
+        assert!(museum.attachments.is_empty(), "nobody attached anything to it");
+        // Still the mail's, so it belongs to no item — it shows under Other
+        // mail, not on the trip.
+        assert!(
+            got.items.iter().flat_map(|i| &i.attachments).all(|f| f.id != loose),
+            "a file that never joined an item was drawn on one",
+        );
+    }
+
+    #[test]
     fn the_sweep_deletes_old_mail_but_keeps_an_attachment_that_belongs_to_an_item() {
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
@@ -8956,7 +9050,7 @@ CREATE TABLE messages (
         assert_eq!(view.other[0].arrival_id, Some(id));
         assert!(view.other[0].forwarded);
         assert!(view.other[0].received_at.contains('T') && view.other[0].received_at.ends_with('Z'), "{}", view.other[0].received_at);
-        assert_eq!(view.other[0].attachments[0].size, 3);
+        assert_eq!(view.other[0].attachments[0].filename, "logo.png");
         assert!(!view.other[1].forwarded);
         assert_eq!(view.other[1].arrival_id, None);
     }
@@ -8985,7 +9079,7 @@ CREATE TABLE messages (
         // ISO UTC with the `Z`, the shape `threads_of` sends and the page
         // parses without a date library.
         assert!(got.received_at.contains('T') && got.received_at.ends_with('Z'), "{}", got.received_at);
-        assert_eq!(got.attachments, vec![scout_api::AttachmentRef { id: att, filename: "ticket.pdf".into(), mime: "application/pdf".into(), size: 0 }]);
+        assert_eq!(got.attachments, vec![scout_api::AttachmentRef { id: att, filename: "ticket.pdf".into(), mime: "application/pdf".into() }]);
         assert_eq!(store.attachment_owner(att).unwrap(), Some(a));
         assert_eq!(store.attachments_of_mail(m).unwrap().len(), 1);
         assert_eq!(store.attachment(att).unwrap().map(|(mail_id, item_id, _, _, bytes)| (mail_id, item_id, bytes)), Some((m, None, None)));

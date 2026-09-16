@@ -181,11 +181,12 @@ as "could not read".
   click that shows the text and the attachments. Thirty days.
 - **Chat** sees pending arrivals in the trip view marked pending, from
   their extracted fields only, never from the mail body. No tool adds one.
+  (deferred: not in the first slice)
 
 Routes: `GET /chat/inbox` (pending arrivals and other mail for the account),
 `POST /chat/arrivals/{id}/add` with an optional `trip` (id or `new`),
 `POST /chat/arrivals/{id}/ignore`, `POST /chat/handle`, `GET /chat/handle/
-check?h=`, `GET /chat/attachments/{id}` (the file, owner only).
+check?handle=`, `GET /chat/attachments/{id}` (the file, owner only).
 
 ## Safety and retention
 

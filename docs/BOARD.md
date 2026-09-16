@@ -10,6 +10,8 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## Next
 
+- [ ] **Chat sees pending arrivals** — the trip view in chat marks arrivals waiting on the Trips tab, from their extracted fields only (deferred from the booking-address slice)
+- [ ] **Show the stored mail text** — the Other-mail row's click shows the message text and attachments (stored, capped at 512 KB, not yet served)
 - [ ] **Poller liveness** — record the last successful `getUpdates`; fail `/healthz` when it is stale so k8s restarts a bot Telegram has gone quiet on (24 restarts in 20 minutes happened once with nothing to catch it)
 - [ ] **Retention for the rest** — `outbox` never deletes sent rows, `request_log` never prunes; two DELETEs in `run_maintenance` next to the thread expiry
 - [ ] **CI** — `.github/workflows`: `cargo test`, `cargo clippy -D warnings`, `cargo audit`, `node --test 'crates/scout-web/src/*.test.mjs'`, cached with `Swatinem/rust-cache`

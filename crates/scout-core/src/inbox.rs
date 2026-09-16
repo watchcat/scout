@@ -10,7 +10,7 @@ use crate::core::{blocking, Core};
 use crate::store::{NewArrival, NewItem, Store, Trip};
 use crate::trips::Plan;
 
-pub use crate::store::{MailToWork, MAIL_ATTEMPTS};
+pub use crate::store::{MailGone, MailToWork, MAIL_ATTEMPTS};
 
 /// Local parts nobody may claim: the ones mail software and people expect
 /// to reach an operator, and the product's own name.
@@ -1096,6 +1096,14 @@ pub async fn ignore_arrival(core: &Core, account_id: i64, arrival_id: i64) -> an
         Ok(Outcome::Done(()))
     })
     .await
+}
+
+/// The × on a row under Other mail: the mail goes now rather than waiting
+/// out the thirty days the retention sweep gives it. One store call, whose
+/// doc says what goes with it and what survives.
+pub async fn delete_mail(core: &Core, account_id: i64, mail_id: i64) -> anyhow::Result<MailGone> {
+    let store = core.store();
+    blocking(move || store.delete_mail(account_id, mail_id)).await
 }
 
 /// One line to the phone that a booking is waiting. Keyed on the mail, so

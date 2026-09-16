@@ -8,7 +8,7 @@ import {
   tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
-  pendingRowsFor, otherMailLines, handleProblem,
+  pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem,
 } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
@@ -585,6 +585,17 @@ test('other mail reads as sender, subject, when, reason', () => {
   assert.equal(lines[1].reason, 'could not read')
   assert.equal(lines[1].note, 'not forwarded')
   assert.equal(lines[1].attachments.length, 1)
+})
+
+test('the delete button on an other-mail row names what it would delete', () => {
+  // Every × in the list is the same glyph. Read on its own — which is how
+  // a screen reader offers it — only the label tells them apart.
+  const [sale, nameless] = otherMailLines([
+    { mail_id: 1, from: 'TAP <news@flytap.com>', subject: 'Autumn sale', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking' },
+    { mail_id: 2, from: 'x@y.z', subject: '   ', received_at: '2026-10-02T10:00:00Z', reason: 'failed' },
+  ])
+  assert.equal(otherMailDeleteLabel(sale), 'Delete mail from TAP: Autumn sale')
+  assert.equal(otherMailDeleteLabel(nameless), 'Delete mail from x@y.z: (no subject)')
 })
 
 test('a quoted display name and a bare bracketed address both yield the address', () => {

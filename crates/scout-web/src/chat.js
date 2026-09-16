@@ -528,6 +528,15 @@ export function otherMailLines(rows, locale = undefined) {
   }))
 }
 
+// What the × on a row is called. A screen reader announces a button out
+// of its row's context, and a list of identical "Delete"s is a list of
+// buttons with nothing behind them — so the label carries the two things
+// the row is recognised by. Built from a line of `otherMailLines`, whose
+// `subject` is never blank.
+export function otherMailDeleteLabel(line) {
+  return `Delete mail from ${line.sender}: ${line.subject}`
+}
+
 // `Name <addr>`, `"Name, quoted" <addr>`, `<addr>` or a bare address:
 // the name is the part before the brackets, unquoted, and the address is
 // the part inside them — or the whole thing when there are none. A name
@@ -1576,7 +1585,14 @@ function start() {
       // The bare address beside the name, always — see `otherMailLines`.
       // Omitted only when it is the name, which would print it twice.
       if (line.address !== line.sender) who.append(node('span', 'other-mail-address', line.address))
-      top.append(who, node('span', 'other-mail-when', line.when))
+      // The date and the × travel together at the right, so the confirm
+      // that replaces the × takes the date's line with it when the row is
+      // too narrow for both, rather than splitting the sender.
+      const end = node('div', 'other-mail-end')
+      const removeSlot = node('span', 'other-mail-remove')
+      removeSlot.append(mailRemoveButton(line, removeSlot))
+      end.append(node('span', 'other-mail-when', line.when), removeSlot)
+      top.append(who, end)
       li.append(top, node('p', 'other-mail-subject', line.subject))
       li.append(node('p', 'other-mail-meta', `${line.reason} · ${line.note}`))
       if (line.attachments.length) li.append(attachmentLinks(line.attachments))
@@ -1591,6 +1607,79 @@ function start() {
       list.append(li)
     }
     otherMailEl.append(list)
+  }
+
+  // The × a row starts with. Its own function, as `segmentRemoveButton` is,
+  // so the confirm's Cancel can rebuild exactly this.
+  function mailRemoveButton(line, slot) {
+    const button = node('button', 'segment-remove-button other-mail-remove-button', '×')
+    button.type = 'button'
+    button.setAttribute('aria-label', otherMailDeleteLabel(line))
+    button.addEventListener('click', () => {
+      slot.replaceChildren(mailRemoveConfirm(line, slot))
+    })
+    return button
+  }
+
+  // A second press rather than `window.confirm`, for the reason
+  // `removeConfirmRow` gives — and the same swap-in-place: the ask stands
+  // where the × was and puts the × back on Cancel, on a refusal, or on a
+  // request that never landed. Only a delete that happened leaves it gone,
+  // and that repaints the whole list anyway.
+  function mailRemoveConfirm(line, slot) {
+    const row = node('span', 'segment-remove-confirm')
+    row.append(node('span', '', 'Delete?'))
+    const cancel = node('button', '', 'Cancel')
+    cancel.type = 'button'
+    cancel.addEventListener('click', () => {
+      slot.replaceChildren(mailRemoveButton(line, slot))
+    })
+    const confirm = node('button', 'danger', 'Delete')
+    confirm.type = 'button'
+    confirm.addEventListener('click', () => {
+      // Off until the answer, the way `decideArrival` disables the card it
+      // was pressed on: a button that still looks live invites a second
+      // press at a mail that is already going.
+      confirm.disabled = true
+      cancel.disabled = true
+      deleteMail(line).then((restore) => {
+        if (restore) slot.replaceChildren(mailRemoveButton(line, slot))
+      }).catch(() => {
+        slot.replaceChildren(mailRemoveButton(line, slot))
+      })
+    })
+    row.append(cancel, confirm)
+    return row
+  }
+
+  // Returns whether the confirm row that called this should go back to the
+  // ×. Both refusals this route gives are the reader's to act on — a mail
+  // that is not there any more (404) and one whose booking is still
+  // waiting (409) — so both are shown as the server worded them.
+  async function deleteMail(line) {
+    try {
+      const res = await fetch(`/chat/mail/${encodeURIComponent(line.mail_id)}`, {
+        method: 'DELETE',
+        headers: { 'x-scout-csrf': csrfToken },
+      })
+      if (!res.ok) {
+        const reason = await refusalReason(res)
+        showTripToast(reason ? `Could not delete it: ${reason}.` : 'Could not delete it. Try again.')
+        return true
+      }
+      // The row is gone whatever the reload then says, so it leaves this
+      // tab's copy first: an inbox that fails to load must not leave a
+      // deleted mail on screen with a live × on it.
+      inbox = { ...inbox, other: (inbox?.other ?? []).filter((row) => row.mail_id !== line.mail_id) }
+      const loaded = await fetchInbox()
+      if (loaded) inbox = loaded
+      renderInboxSide()
+      showTripToast('Deleted.')
+      return false
+    } catch {
+      showTripToast('Could not reach Scout. Try again.')
+      return true
+    }
   }
 
   // The address line at the foot of the aside. Three states: nothing

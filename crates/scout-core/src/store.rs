@@ -661,6 +661,19 @@ pub enum LinkOutcome {
     Merged { account_id: i64 },
 }
 
+/// What asking for one mail to go now came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailGone {
+    /// Nobody's, or not this account's — one answer for both, so an id
+    /// tried against a stranger's mail learns nothing from the reply.
+    NotFound,
+    /// A booking off this mail is still waiting on its owner. Deleting the
+    /// mail would take that row off the trip's timeline with nothing said,
+    /// so the decision comes first.
+    Waiting,
+    Gone,
+}
+
 /// What a magic link turned out to be worth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenOutcome {
@@ -4674,6 +4687,65 @@ impl Store {
         )?;
         conn.execute(&format!("DELETE FROM arrivals WHERE mail_id IN ({sweepable})"), params![cutoff])?;
         Ok(conn.execute(&format!("DELETE FROM inbound_mail WHERE id IN ({sweepable})"), params![cutoff])?)
+    }
+
+    /// Forgets one mail now, on its owner's say-so, instead of in thirty
+    /// days.
+    ///
+    /// The deletes are `sweep_inbox`'s, in `sweep_inbox`'s order and for
+    /// its reasons: the loose files, then the readings, then the mail, so
+    /// a crash between them orphans nothing the next sweep would not find
+    /// again. A file that has joined a trip item is the trip's now and
+    /// stays — `attachment_owner` answers for it through the item.
+    ///
+    /// Refused while a booking off this mail is still waiting, which is
+    /// `UNDECIDED`, the same predicate that keeps such a mail out of the
+    /// sweep. Both checks run under the one `conn()` the deletes hold, so
+    /// nothing can decide or undecide in between.
+    pub fn delete_mail(&self, account_id: i64, mail_id: i64) -> Result<MailGone> {
+        let conn = self.conn();
+        // The account is half the key, as in `arrival_of`: an id in a URL
+        // is not proof of anything.
+        let mine: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM inbound_mail WHERE id = ? AND account_id = ?",
+                params![mail_id, account_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if mine.is_none() {
+            return Ok(MailGone::NotFound);
+        }
+        let waiting: Option<i64> = conn
+            .query_row(
+                &format!("SELECT a.id FROM arrivals a WHERE a.mail_id = ? AND {UNDECIDED} LIMIT 1"),
+                params![mail_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if waiting.is_some() {
+            return Ok(MailGone::Waiting);
+        }
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<()> {
+            conn.execute(
+                "DELETE FROM attachments WHERE item_id IS NULL AND mail_id = ?",
+                params![mail_id],
+            )?;
+            conn.execute("DELETE FROM arrivals WHERE mail_id = ?", params![mail_id])?;
+            conn.execute("DELETE FROM inbound_mail WHERE id = ?", params![mail_id])?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(MailGone::Gone)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// `(trip id, date, place)` per booking still waiting on one of this
@@ -8696,6 +8768,59 @@ CREATE TABLE messages (
         assert!(store.decide_arrival(id, a, "added", Some(5)).unwrap());
         assert_eq!(store.sweep_inbox(30).unwrap(), 1);
         assert!(store.arrival_of(id, a).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_mail_deleted_by_hand_goes_the_way_the_sweep_would_have_taken_it() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let b = store.account_for_telegram(2).unwrap();
+        let m = mail(&store, a, "re_1");
+        let kept = store.insert_attachment(m, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let loose = store.insert_attachment(m, "logo.png", "image/png", Some(&[1, 2]), None).unwrap();
+        let reading = store
+            .insert_arrival(a, m, &NewArrival { booking: false, summary: "a newsletter".into(), ..Default::default() })
+            .unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        let trip = store.add_item(trip.id, NewItem {
+            kind: "stay".into(), title: "Hotel Alfama".into(), place: None, date: "2026-10-12".into(),
+            starts_at: None, ends_at: None, notes: None, booked: true, confirmation_code: None,
+            price: None, currency: None, arrival_id: None,
+        }).unwrap();
+        store.attach_to_item(kept, trip.items[0].id).unwrap();
+        assert_eq!(store.inbox_view(a).unwrap().other.len(), 1, "it is on the page to begin with");
+        // An id from the page proves nothing: the owner is half the key.
+        assert_eq!(store.delete_mail(b, m).unwrap(), MailGone::NotFound, "not theirs");
+        assert_eq!(store.inbox_view(a).unwrap().other.len(), 1, "and nothing of it went");
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Gone);
+        assert!(store.inbox_view(a).unwrap().other.is_empty(), "off the page at once");
+        assert!(store.arrival_of(reading, a).unwrap().is_none(), "its reading went with it");
+        assert!(store.attachment(loose).unwrap().is_none(), "a loose file was only the mail's");
+        // The ticket belongs to the trip now, and is still answered for
+        // through the item — the same survival the sweep was built for.
+        assert!(store.attachment(kept).unwrap().is_some());
+        assert_eq!(store.attachment_owner(kept).unwrap(), Some(a));
+        // A second press from a tab that has not repainted: already gone.
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::NotFound);
+    }
+
+    #[test]
+    fn a_mail_whose_booking_is_still_waiting_is_refused() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        let ticket = store.insert_attachment(m, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let id = store
+            .insert_arrival(a, m, &NewArrival { booking: true, summary: "Hotel Alfama".into(), ..Default::default() })
+            .unwrap();
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Waiting);
+        assert!(store.arrival_of(id, a).unwrap().is_some(), "nothing was deleted");
+        assert!(store.attachment(ticket).unwrap().is_some());
+        assert_eq!(store.inbox_view(a).unwrap().pending.len(), 1, "still on the timeline");
+        // Decided, it is ordinary Other mail and goes like any other.
+        assert!(store.decide_arrival(id, a, "ignored", None).unwrap());
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Gone);
+        assert!(store.attachment(ticket).unwrap().is_none());
     }
 
     #[test]

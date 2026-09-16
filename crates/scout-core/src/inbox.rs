@@ -65,6 +65,8 @@ activity|transport or null), \"title\" (the hotel, the ticket, the route \"AMS �
 \"place\" (city or address), \"origin\" and \"destination\" (IATA codes for a flight, \
 station names for transport, else null), \"airline\" (the carrier's name, flights only), \
 \"flight_number\" (\"KL887\", flights only, the first one when the journey connects), \
+\"stops\" (flights only: the IATA codes of the airports changed at, in order, \
+[] for a direct flight), \
 \"date\" (YYYY-MM-DD the booking starts), \
 \"starts_at\" (YYYY-MM-DDTHH:MM:SS local, when a time is stated), \"ends_at\" (check-out \
 or end, YYYY-MM-DD or datetime), \"timezone\", \"confirmation_code\", \"price\" (number, \
@@ -93,6 +95,10 @@ pub struct Extraction {
     /// offering to search a route the reader has already bought.
     #[serde(default)] pub airline: Option<String>,
     #[serde(default)] pub flight_number: Option<String>,
+    /// The airports changed at between `origin` and `destination`. A
+    /// connection is one booking, and without these the leg's itinerary
+    /// strip has two points and the card calls it direct.
+    #[serde(default)] pub stops: Option<Vec<String>>,
     #[serde(default)] pub date: Option<String>,
     #[serde(default)] pub starts_at: Option<String>,
     #[serde(default)] pub ends_at: Option<String>,
@@ -212,12 +218,31 @@ impl Extraction {
         e.travellers = e.travellers.map(|names| {
             names.into_iter().filter_map(|n| cut(Some(n), 100)).take(10).collect::<Vec<_>>()
         });
+        // Held to real codes, not merely capped: a stop goes into the
+        // itinerary strip the page splits on " ✈ ", so anything that is not
+        // an airport code is dropped rather than drawn.
+        e.stops = e.stops.map(|airports| {
+            airports
+                .into_iter()
+                .filter_map(|a| crate::tools::trips::iata("stop", &a).ok())
+                .take(5)
+                .collect::<Vec<_>>()
+        });
         let kind_ok = matches!(e.kind.as_deref(), Some("flight" | "stay" | "activity" | "transport"));
         let date_ok = e
             .date
             .as_deref()
             .is_some_and(|d| crate::tools::trips::calendar_date("date", d).is_ok());
-        let route_ok = e.kind.as_deref() != Some("flight") || (e.origin.is_some() && e.destination.is_some());
+        // A flight's route is held to what a leg's route must be — two
+        // different IATA codes — and not merely to being present. Mail is a
+        // stranger's text: it reaches `add_flight`, and it now reaches the
+        // itinerary strip, which the page splits on " ✈ ". An "origin"
+        // carrying that sequence would fabricate a hop on the card.
+        let route_ok = e.kind.as_deref() != Some("flight")
+            || matches!(
+                (e.origin.as_deref(), e.destination.as_deref()),
+                (Some(o), Some(d)) if crate::tools::trips::leg_ends(o, d).is_ok()
+            );
         if e.booking && !(kind_ok && date_ok && route_ok) {
             e.booking = false;
         }
@@ -307,11 +332,73 @@ impl Placement {
     }
 }
 
-/// The trip whose items span the arrival's date, preferring one that names
-/// the same place; none: a draft named "<place>, <Month>".
-pub(crate) fn place_arrival(store: &Store, account_id: i64, e: &Extraction) -> anyhow::Result<Placement> {
-    let date = e.date.as_deref().ok_or_else(|| anyhow::anyhow!("a booking with no date"))?;
-    place_by(store, account_id, date, e.place.as_deref(), lands_at(e.kind.as_deref(), e.destination.as_deref()))
+/// Everything placement reads about an account's trips, loaded once.
+///
+/// One mail can confirm several bookings and every one of them is asked
+/// where it fits, so this is read per mail rather than per booking:
+/// `list_trips` loads every trip with all its items and options, and doing
+/// that once per leg of a ticket was a whole account's trips read twice for
+/// a return.
+struct Trips {
+    trips: Vec<Trip>,
+    /// Trip id to the `(date, place)` of each booking still waiting on it.
+    waiting: std::collections::HashMap<i64, Vec<(String, Option<String>)>>,
+}
+
+impl Trips {
+    fn load(store: &Store, account_id: i64) -> anyhow::Result<Self> {
+        let mut waiting: std::collections::HashMap<i64, Vec<(String, Option<String>)>> = Default::default();
+        for (trip_id, date, place) in store.pending_arrival_marks(account_id)? {
+            waiting.entry(trip_id).or_default().push((date, place));
+        }
+        Ok(Self { trips: store.list_trips(account_id)?, waiting })
+    }
+
+    /// The trip a booking on `date` near `place` fits, or `None`.
+    fn matching(&self, date: &str, place: Option<&str>) -> Option<i64> {
+        let needle = place.unwrap_or("").trim().to_lowercase();
+        // (trip id, 0 when the trip names the place, 1 when only the dates fit)
+        let mut best: Option<(i64, i64)> = None;
+        for trip in &self.trips {
+            // The bookings still waiting on this trip, which for a draft is
+            // everything there is to go on: a draft holds no items until
+            // somebody presses Add, so a trip matched on items alone can
+            // never be the draft the last email made — which is exactly how
+            // a hotel confirmation used to start a second trip beside its
+            // own flights.
+            //
+            // They widen the trip's window as well as opening it, and that
+            // is the point: the mail of one journey converges on one trip.
+            // The widening is bounded by real bookings — a date somebody
+            // was actually sent a confirmation for — not by a guess.
+            let marks = self.waiting.get(&trip.id).map(Vec::as_slice).unwrap_or_default();
+            // Items are in timeline order, but a trip can hold a stay that
+            // starts before its first flight, so the span is the min and max
+            // rather than the ends of the list.
+            let dates = || trip.items.iter().map(|i| i.date.as_str()).chain(marks.iter().map(|(d, _)| d.as_str()));
+            let (Some(lo), Some(hi)) = (dates().min(), dates().max()) else {
+                continue;
+            };
+            // Two days of slack either side: a hotel checks in the night before the flight.
+            let inside = date >= shift(lo, -2).as_str() && date <= shift(hi, 2).as_str();
+            if !inside {
+                continue;
+            }
+            let names_place = !needle.is_empty()
+                && (trip.name.to_lowercase().contains(&needle)
+                    || trip
+                        .items
+                        .iter()
+                        .map(|i| i.place.as_deref())
+                        .chain(marks.iter().map(|(_, p)| p.as_deref()))
+                        .any(|p| p.unwrap_or("").to_lowercase().contains(&needle)));
+            let score = if names_place { 0 } else { 1 };
+            if best.is_none_or(|(_, s)| score < s) {
+                best = Some((trip.id, score));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
 }
 
 /// Where a booking arrives, when that is a flight: the one thing a ticket
@@ -335,51 +422,11 @@ fn place_by(
     Ok(Placement::Draft(trip.id))
 }
 
-/// The trip a booking on `date` near `place` fits, or `None`. Read-only,
-/// and split out for that: a caller with several bookings off one mail can
-/// ask about each of them before deciding that none fit and a draft is
-/// owed.
+/// The trip a booking on `date` near `place` fits, or `None`, for a caller
+/// with one booking to place. A caller with several off one mail loads
+/// `Trips` once and asks it directly rather than re-reading per booking.
 fn match_trip(store: &Store, account_id: i64, date: &str, place: Option<&str>) -> anyhow::Result<Option<i64>> {
-    let needle = place.unwrap_or("").trim().to_lowercase();
-    // The bookings still waiting on each trip, which for a draft is
-    // everything there is to go on: a draft holds no items until somebody
-    // presses Add, so a trip matched on items alone can never be the draft
-    // the last email made — which is exactly how a hotel confirmation used
-    // to start a second trip beside its own flights.
-    let mut waiting: std::collections::HashMap<i64, Vec<(String, Option<String>)>> = Default::default();
-    for (trip_id, date, place) in store.pending_arrival_marks(account_id)? {
-        waiting.entry(trip_id).or_default().push((date, place));
-    }
-    // (trip id, 0 when the trip names the place, 1 when only the dates fit)
-    let mut best: Option<(i64, i64)> = None;
-    for trip in store.list_trips(account_id)? {
-        let marks = waiting.get(&trip.id).map(Vec::as_slice).unwrap_or_default();
-        // Items are in timeline order, but a trip can hold a stay that
-        // starts before its first flight, so the span is the min and max
-        // rather than the ends of the list.
-        let dates = || trip.items.iter().map(|i| i.date.as_str()).chain(marks.iter().map(|(d, _)| d.as_str()));
-        let (Some(lo), Some(hi)) = (dates().min(), dates().max()) else {
-            continue;
-        };
-        // Two days of slack either side: a hotel checks in the night before the flight.
-        let inside = date >= shift(lo, -2).as_str() && date <= shift(hi, 2).as_str();
-        if !inside {
-            continue;
-        }
-        let names_place = !needle.is_empty()
-            && (trip.name.to_lowercase().contains(&needle)
-                || trip
-                    .items
-                    .iter()
-                    .map(|i| i.place.as_deref())
-                    .chain(marks.iter().map(|(_, p)| p.as_deref()))
-                    .any(|p| p.unwrap_or("").to_lowercase().contains(&needle)));
-        let score = if names_place { 0 } else { 1 };
-        if best.is_none_or(|(_, s)| score < s) {
-            best = Some((trip.id, score));
-        }
-    }
-    Ok(best.map(|(id, _)| id))
+    Ok(Trips::load(store, account_id)?.matching(date, place))
 }
 
 /// "Lisbon, October", or "Trip, October" when the mail named no place.
@@ -632,17 +679,32 @@ pub async fn record_arrivals(
         // when none fit, the first dated booking names the draft.
         let placement = {
             let dated: Vec<&Extraction> = readings.iter().filter(|e| e.booking && e.date.is_some()).collect();
+            // Read once for the whole mail, not once per booking: every
+            // dated leg is asked, and each ask would otherwise load every
+            // trip this account has with all its items and options.
+            let trips = Trips::load(&store, account_id)?;
             let mut fitted = None;
             for e in &dated {
                 let date = e.date.as_deref().unwrap_or_default();
-                if let Some(id) = match_trip(&store, account_id, date, e.place.as_deref())? {
+                if let Some(id) = trips.matching(date, e.place.as_deref()) {
                     fitted = Some(Placement::Trip(id));
                     break;
                 }
             }
             match fitted {
                 Some(p) => Some(p),
-                None => dated.first().map(|e| place_arrival(&store, account_id, e)).transpose()?,
+                // Nothing fits, which the loop above has just established
+                // for every one of them: the first dated booking names the
+                // draft, without asking again.
+                None => dated
+                    .first()
+                    .map(|e| -> anyhow::Result<Placement> {
+                        let date = e.date.as_deref().unwrap_or_default();
+                        let name =
+                            draft_name(e.place.as_deref(), lands_at(e.kind.as_deref(), e.destination.as_deref()), date)?;
+                        Ok(Placement::Draft(store.upsert_trip(account_id, &name, None, None, None)?.id))
+                    })
+                    .transpose()?,
             }
         };
         let rows: Vec<NewArrival> = readings.into_iter().map(|e| row_for(e, placement)).collect();
@@ -665,6 +727,7 @@ fn row_for(e: Extraction, placement: Option<Placement>) -> NewArrival {
         destination: e.destination,
         airline: e.airline,
         flight_number: e.flight_number,
+        stops: e.stops.filter(|s| !s.is_empty()).map(|s| s.join(", ")),
         date: e.date,
         starts_at: e.starts_at,
         ends_at: e.ends_at,
@@ -825,10 +888,10 @@ pub async fn add_arrival(
 /// person put it; a draft that outlives its purpose is untidy, and the
 /// hourly pass will have it either way.
 fn collect_drafts(store: &Store, account_id: i64) {
-    match store.sweep_empty_drafts(account_id) {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(collected = n, account_id, "empty placement drafts dropped"),
-        Err(e) => tracing::warn!(error = %e, account_id, "could not collect the empty drafts"),
+    // Only the failure is logged here: the sweep names every trip it
+    // collects, which is what somebody looking for a trip that went needs.
+    if let Err(e) = store.sweep_empty_drafts(account_id) {
+        tracing::warn!(error = %e, account_id, "could not collect the empty drafts");
     }
 }
 
@@ -947,18 +1010,21 @@ fn flight_candidate(
         .iter()
         .find(|i| i.arrival_id == Some(arrival.id))
         .ok_or_else(|| anyhow::anyhow!("the leg just booked is not on the trip"))?;
-    let itinerary = format!(
-        "{}{}{}",
-        crate::tools::duffel::stamped(origin, starts_at),
-        crate::tools::duffel::HOP,
-        crate::tools::duffel::stamped(destination, ends_at)
-    );
-    // Both clocks or nothing: the two are in different zones, so the
-    // subtraction is only a duration when the mail stated both ends.
-    let duration_minutes = starts_at
-        .zip(ends_at)
-        .and_then(|(from, to)| crate::tools::duffel::minutes_between(from, to))
-        .map(i64::from);
+    // Origin, every airport changed at, then the destination — the strip
+    // the searches draw, and the one the page counts stops from. A
+    // connection written as two points would put a "Direct" pill over a
+    // one-stop ticket.
+    let mut points = vec![crate::tools::duffel::stamped(origin, starts_at)];
+    points.extend(arrival.stops.iter().map(|stop| stop.to_string()));
+    points.push(crate::tools::duffel::stamped(destination, ends_at));
+    let itinerary = points.join(crate::tools::duffel::HOP);
+    // No duration from an email, ever. The two clocks a confirmation
+    // states are local to two different airports, and subtracting them
+    // gives 18h30 for an 11h30 flight to Hong Kong. A real duration needs
+    // a zone for each end, which the extractor is not asked for and a
+    // confirmation rarely states — so the card shows the two clocks it can
+    // stand behind and no total.
+    let duration_minutes = None;
     let expected = crate::store::ExpectedItem {
         origin: Some(origin),
         destination: Some(destination),
@@ -1131,6 +1197,15 @@ mod tests {
         (Core::start(crate::config::Config::for_test(&p), None).unwrap(), dir)
     }
 
+    /// Where one reading would land. `record_arrivals` decides this for a
+    /// whole mail off one load of the trips; this is the one-booking form,
+    /// for the tests that are about the rule rather than about the batch.
+    fn place(store: &Store, account_id: i64, e: &Extraction) -> Placement {
+        let date = e.date.as_deref().expect("a booking with a date");
+        place_by(store, account_id, date, e.place.as_deref(), lands_at(e.kind.as_deref(), e.destination.as_deref()))
+            .unwrap()
+    }
+
     /// A mail of this account's to hang an arrival on.
     async fn seed_mail(core: &Core, account_id: i64, provider_id: &str) -> i64 {
         record_mail(core, account_id, mail_in(provider_id)).await.unwrap().expect("a new mail")
@@ -1167,8 +1242,15 @@ mod tests {
         // without them the card can only say a flight was booked.
         assert!(EXTRACT_PREAMBLE.contains("\"airline\""));
         assert!(EXTRACT_PREAMBLE.contains("\"flight_number\""));
-        // And the two clocks a leg is drawn from, said for flights only.
-        assert!(EXTRACT_PREAMBLE.contains("arrives in"), "{EXTRACT_PREAMBLE}");
+        assert!(EXTRACT_PREAMBLE.contains("\"stops\""));
+        // And the two clocks a leg is drawn from, each said to be local to
+        // its own end — the sentence that stops the model reporting one
+        // zone for both, and the reason no duration is computed from them.
+        assert!(
+            EXTRACT_PREAMBLE.contains("the departure in the departure airport's local time"),
+            "{EXTRACT_PREAMBLE}"
+        );
+        assert!(EXTRACT_PREAMBLE.contains("the city the flight arrives in"), "{EXTRACT_PREAMBLE}");
     }
 
     #[test]
@@ -1188,6 +1270,47 @@ mod tests {
         .unwrap();
         assert_eq!(long.airline.map(|a| a.chars().count()), Some(80));
         assert_eq!(long.flight_number.map(|n| n.chars().count()), Some(40));
+    }
+
+    #[test]
+    fn the_stops_of_a_connection_are_read_as_codes_and_anything_else_is_dropped() {
+        // They go into the itinerary strip, which the page splits on
+        // " ✈ ": text that is not an airport code would draw a hop that
+        // was never booked.
+        let e = one(
+            r#"{"booking":true,"kind":"flight","origin":"HKG","destination":"AMS","date":"2026-11-23",
+                "stops":[" cdg ","Paris Charles de Gaulle","AMS ✈ LHR","DXB","x","y","z","w"],"summary":"back"}"#,
+        )
+        .unwrap();
+        assert_eq!(e.stops, Some(vec!["CDG".to_string(), "DXB".to_string()]), "codes only, uppercased");
+        let many = one(&format!(
+            r#"{{"booking":true,"kind":"flight","origin":"HKG","destination":"AMS","date":"2026-11-23",
+                "stops":[{}],"summary":"back"}}"#,
+            ["\"CDG\""; 9].join(",")
+        ))
+        .unwrap();
+        assert_eq!(many.stops.map(|s| s.len()), Some(5), "a runaway list is cut");
+    }
+
+    #[test]
+    fn a_flight_whose_route_is_not_a_route_is_not_offered_as_a_booking() {
+        // `add_flight` takes this text, and so does the itinerary strip.
+        for bad in [
+            r#""origin":"Amsterdam","destination":"HKG""#,
+            r#""origin":"AMS ✈ LHR","destination":"HKG""#,
+            r#""origin":"AMS","destination":"AMS""#,
+            r#""origin":"AM","destination":"HKG""#,
+        ] {
+            let e = one(&format!(
+                r#"{{"booking":true,"kind":"flight","date":"2026-11-02",{bad},"summary":"x"}}"#
+            ))
+            .unwrap();
+            assert!(!e.booking, "{bad} is not a leg anybody can build");
+        }
+        // Lower case is a code all the same, the way every other route the
+        // model states is read.
+        let e = one(r#"{"booking":true,"kind":"flight","date":"2026-11-02","origin":"ams","destination":"hkg","summary":"x"}"#).unwrap();
+        assert!(e.booking);
     }
 
     #[test]
@@ -1407,11 +1530,11 @@ mod tests {
         store.add_flight(porto.id, "AMS", "OPO", "2026-11-02").unwrap();
 
         let hotel = arrival("stay", "Hotel Alfama", Some("Lisbon"), "2026-10-13");
-        assert_eq!(place_arrival(&store, a, &hotel).unwrap(), Placement::Trip(lisbon.id));
+        assert_eq!(place(&store, a, &hotel), Placement::Trip(lisbon.id));
         let museum = arrival("activity", "Serralves", Some("Porto"), "2026-11-03");
-        assert_eq!(place_arrival(&store, a, &museum).unwrap(), Placement::Trip(porto.id));
+        assert_eq!(place(&store, a, &museum), Placement::Trip(porto.id));
         let rome = arrival("stay", "Hotel Roma", Some("Rome"), "2027-03-05");
-        match place_arrival(&store, a, &rome).unwrap() {
+        match place(&store, a, &rome) {
             Placement::Draft(id) => {
                 let t = store.find_trip(a, "Rome, March").unwrap().unwrap();
                 assert_eq!(t.id, id);
@@ -1422,7 +1545,7 @@ mod tests {
         // Dates overlap but the place does not: still Lisbon by date, since a
         // day trip from Lisbon is on the Lisbon trip.
         let sintra = arrival("activity", "Pena Palace", Some("Sintra"), "2026-10-14");
-        assert_eq!(place_arrival(&store, a, &sintra).unwrap(), Placement::Trip(lisbon.id));
+        assert_eq!(place(&store, a, &sintra), Placement::Trip(lisbon.id));
     }
 
     #[tokio::test]
@@ -1581,6 +1704,7 @@ mod tests {
                 ends_at: Some("2026-11-03T08:35:00".into()),
                 airline: Some("KLM".into()),
                 flight_number: Some("KL887".into()),
+                stops: None,
                 confirmation_code: Some("KL7788".into()),
                 price: Some(842.5),
                 currency: Some("EUR".into()),
@@ -1594,6 +1718,7 @@ mod tests {
         };
         let leg = plan.trip.items.iter().find(|i| i.arrival_id == Some(id)).expect("the leg is on the trip");
         assert!(leg.booked);
+        assert_eq!(leg.position, 2, "behind the stay: the option went on the leg, not on a guessed position");
         let option = match leg.candidates.as_slice() {
             [one] => one,
             other => panic!("one option, the one that was bought: {other:?}"),
@@ -1603,12 +1728,48 @@ mod tests {
         assert_eq!(option.itinerary, "AMS 14:05 02.11 ✈ HKG 08:35 03.11");
         assert_eq!(option.departing_at_local.as_deref(), Some("2026-11-02T14:05:00"));
         assert_eq!(option.arriving_at_local.as_deref(), Some("2026-11-03T08:35:00"));
-        assert_eq!(option.duration_minutes, Some(1110));
+        // No duration, ever, from an email: 14:05 in Amsterdam and 08:35
+        // in Hong Kong are two local clocks in two zones, and subtracting
+        // them reports 18h30 for an 11h30 flight. The confirmation states
+        // no zones, so the card shows the clocks and no total.
+        assert_eq!(option.duration_minutes, None);
         assert_eq!((option.quoted_price, option.quoted_currency.as_deref()), (Some(842.5), Some("EUR")));
         assert_eq!(option.source.as_deref(), Some("email"));
-        // And nothing landed on the stay, whose position the leg took.
+        // And nothing landed on the stay the leg sorts behind.
         let stay = plan.trip.items.iter().find(|i| i.kind == "stay").expect("the stay is still there");
         assert!(stay.candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_connecting_ticket_is_not_drawn_as_a_direct_flight() {
+        // A connection is one booking, and its strip has to carry the
+        // airport changed at: the card counts stops off the itinerary, so
+        // two points would put a Direct pill over a one-stop ticket.
+        let (core, _dir) = core();
+        let store = core.store();
+        let a = store.account_for_telegram(1).unwrap();
+        let id = store
+            .insert_arrival(a, seed_mail(&core, a, "re_back").await, &NewArrival {
+                booking: true,
+                kind: Some("flight".into()),
+                origin: Some("HKG".into()),
+                destination: Some("AMS".into()),
+                date: Some("2026-11-23".into()),
+                starts_at: Some("2026-11-23T23:55:00".into()),
+                ends_at: Some("2026-11-24T10:20:00".into()),
+                airline: Some("Air France".into()),
+                flight_number: Some("AF185".into()),
+                stops: Some("CDG".into()),
+                summary: "HKG → CDG → AMS".into(),
+                ..NewArrival::default()
+            })
+            .unwrap();
+        let plan = match add_arrival(&core, a, id, AddTarget::New).await.unwrap() {
+            Outcome::Done(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        let leg = plan.trip.items.iter().find(|i| i.arrival_id == Some(id)).expect("the leg is on the trip");
+        assert_eq!(leg.candidates[0].itinerary, "HKG 23:55 23.11 ✈ CDG ✈ AMS 10:20 24.11");
     }
 
     #[tokio::test]
@@ -1639,8 +1800,10 @@ mod tests {
         assert!(leg.booked, "the ticket is still held");
         assert!(leg.candidates.is_empty(), "nothing known is nothing shown");
 
-        // A departure time alone is enough to be worth showing, even with
-        // no airline: the flight number stands in for the required name.
+        // A flight number with no airline is still a flight worth showing:
+        // the number stands in for the name an option row must have. A
+        // departure time on its own would not be — there would be nothing
+        // to head the row with.
         let timed = store
             .insert_arrival(a, seed_mail(&core, a, "re_timed").await, &NewArrival {
                 booking: true,
@@ -1705,6 +1868,10 @@ mod tests {
         // would land on the draft itself.
         let elsewhere = store.upsert_trip(a, "Our week in Kowloon", None, None, None).unwrap();
         store.keep_trip(a, "Our week in Kowloon").unwrap();
+        // The grace spares a draft made moments ago — a mail being placed
+        // right now looks exactly like this one. Backdated past it, so what
+        // is under test is the collection and not the clock.
+        store.age_trip(draft).unwrap();
 
         match add_arrival(&core, a, ids[0], AddTarget::Trip(elsewhere.id)).await.unwrap() {
             Outcome::Done(plan) => assert_eq!(plan.trip.id, elsewhere.id),
@@ -1723,6 +1890,7 @@ mod tests {
         let stay = arrival("stay", "Hotel Panorama", Some("Hong Kong"), "2026-11-04");
         let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay]).await.unwrap();
         let draft = placed.expect("the stay was placed").id();
+        store.age_trip(draft).unwrap();
         assert_eq!(ignore_arrival(&core, a, ids[0]).await.unwrap(), Outcome::Done(()));
         assert_eq!(store.trip_by_id(a, draft).unwrap(), None, "nothing is waiting on it any more");
     }

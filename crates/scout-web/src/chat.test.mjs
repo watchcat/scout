@@ -5,7 +5,7 @@ import {
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
-  tripPdfFilename, tripRoute, itemDateLabel, noFlightLine,
+  tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, handleProblem,
@@ -335,6 +335,14 @@ test('a stale trip read cannot repaint a newer choice', () => {
 test('Ignav saved fares stay visibly approximate', () => {
   assert.deepEqual(savedFareQualifier('ignav'), { prefix: 'from ', note: 'estimate when saved' })
   assert.deepEqual(savedFareQualifier('duffel'), { prefix: '', note: 'when saved' })
+  // A fare off a forwarded confirmation is the total paid, not a quote
+  // that may have moved since it was parked.
+  assert.deepEqual(savedFareQualifier('email'), { prefix: '', note: 'paid' })
+})
+
+test('a booked item is marked the same way whatever kind it is', () => {
+  assert.equal(bookedMark({ confirmation_code: 'KL7788' }), 'booked \u00b7 KL7788')
+  assert.equal(bookedMark({ confirmation_code: null }), 'booked')
 })
 
 test('a flight card with no option says which of the two silences it is', () => {

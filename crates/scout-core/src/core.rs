@@ -548,10 +548,10 @@ impl Core {
             // belongs to no conversation, so the thread expiry above can
             // never reach it. `inbox::add_arrival` collects the one it just
             // abandoned; this is for the ones already sitting in a list.
-            match self.sweep_empty_drafts().await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(collected = n, "empty placement drafts dropped"),
-                Err(e) => tracing::warn!(error = %e, "could not collect the empty drafts"),
+            // Only the failure is logged: the sweep names every trip it
+            // collects, which a count could never do.
+            if let Err(e) = self.sweep_empty_drafts().await {
+                tracing::warn!(error = %e, "could not collect the empty drafts");
             }
 
             match crate::backup::is_due(&dir) {

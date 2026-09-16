@@ -310,6 +310,19 @@ fn selected(item: &TripItem) -> Option<&TripCandidate> {
         .or_else(|| (item.candidates.len() == 1).then(|| &item.candidates[0]))
 }
 
+/// What a leg with no option says, as `(headline, detail)`. The paper
+/// half of `chat.js::noFlightLine`, and it has to agree with it: a ticket
+/// the traveller holds must not be printed as a route still to be
+/// searched, and the two surfaces describing one leg differently is worse
+/// than either wording alone. Neither string is escaped because neither
+/// comes from anywhere but here.
+fn no_flight_line(booked: bool) -> (&'static str, &'static str) {
+    match booked {
+        true => ("Booked.", "The confirmation did not say which flight."),
+        false => ("No flight saved yet.", "Ask Scout in chat to search this route."),
+    }
+}
+
 /// An end of a flight leg for a sentence. Only a flight reaches the code
 /// that asks, so the fallback is for a row that lost its route, not a stay.
 fn airport(end: &Option<String>) -> &str {
@@ -618,7 +631,9 @@ pub fn html(plan: &Plan) -> String {
         )
         .unwrap();
         if segment.candidates.is_empty() {
-            out.push_str("<div class=\"option\"><div></div><div><strong>No flight saved yet.</strong><div class=\"meta\">Ask Scout in chat to search this route.</div></div></div>");
+            let (headline, detail) = no_flight_line(segment.booked);
+            write!(out, "<div class=\"option\"><div></div><div><strong>{headline}</strong><div class=\"meta\">{detail}</div></div></div>")
+                .unwrap();
         }
         let picked = selected(segment).map(|candidate| candidate.candidate);
         for candidate in &segment.candidates {
@@ -812,6 +827,24 @@ mod tests {
         );
         assert!(!html.contains("October <escape>"));
         assert!(!html.contains("Hotel <Roma>"));
+    }
+
+    #[test]
+    fn a_booked_leg_with_no_option_is_not_printed_as_a_route_to_search() {
+        // The paper half of `chat.js::noFlightLine`: a ticket the traveller
+        // is carrying must not be printed as a flight nobody has looked for
+        // yet — least of all on the page they hand to a desk.
+        let mut booked = plan();
+        let leg = &mut booked.trip.items[0];
+        leg.candidates.clear();
+        leg.booked = true;
+        let page = html(&booked);
+        assert!(page.contains("The confirmation did not say which flight."), "{page}");
+        assert!(!page.contains("No flight saved yet."));
+        // A leg nobody has bought still says what it needs.
+        let mut unbooked = plan();
+        unbooked.trip.items[0].candidates.clear();
+        assert!(html(&unbooked).contains("Ask Scout in chat to search this route."));
     }
 
     #[test]

@@ -74,7 +74,11 @@ Use null for anything not stated. Never invent a code or a price.";
 /// when the rest is enough to make a trip item of.
 #[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
 pub struct Extraction {
-    pub booking: bool,
+    /// Defaulted so an entry of a `bookings` list that leaves it off still
+    /// parses; `readable` then reads that absence as true, and `parse_many`
+    /// keeps it required of the old bare object. Nothing else defaults it
+    /// on purpose.
+    #[serde(default)] pub booking: bool,
     #[serde(default)] pub kind: Option<String>,
     #[serde(default)] pub title: Option<String>,
     #[serde(default)] pub place: Option<String>,
@@ -127,7 +131,16 @@ impl Extraction {
             // Nothing booked, said as null rather than as an empty list.
             Some(serde_json::Value::Null) => Vec::new(),
             Some(_) => anyhow::bail!("\"bookings\" is neither a list of bookings nor one booking"),
-            None => vec![serde_json::from_value::<Self>(root.clone())?.checked()],
+            // The old shape is the model's verdict on one mail rather than
+            // a list of things booked, so it still has to give one: an
+            // object that says nothing about `booking` is not an answer to
+            // the question that was asked.
+            None => {
+                if root.get("booking").is_none() {
+                    anyhow::bail!("the answer does not say whether it is a booking");
+                }
+                vec![serde_json::from_value::<Self>(root.clone())?.checked()]
+            }
         };
         if list.is_empty() {
             let summary = root.get("summary").and_then(|s| s.as_str()).unwrap_or_default();
@@ -217,7 +230,20 @@ impl Extraction {
 fn readable<'a>(items: impl Iterator<Item = &'a serde_json::Value>) -> Vec<Extraction> {
     items
         .filter_map(|item| match serde_json::from_value::<Extraction>(item.clone()) {
-            Ok(e) => Some(e.checked()),
+            Ok(mut e) => {
+                // Being under `bookings` is the model saying this is one: a
+                // model that has listed the legs of a ticket can reasonably
+                // leave `booking` off as redundant, and dropping the entry
+                // for that would lose exactly the leg this reading exists
+                // to keep. `checked` still downgrades it when the kind, the
+                // date or the route are not there, so nothing unusable
+                // reaches the page — and an explicit `false` is the model's
+                // own verdict and stands.
+                if item.get("booking").is_none() {
+                    e.booking = true;
+                }
+                Some(e.checked())
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "a booking in the answer could not be read and was left out");
                 None
@@ -1122,6 +1148,34 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_inside_bookings_is_a_booking_unless_it_says_otherwise() {
+        // A model that has listed the legs can reasonably leave `booking`
+        // off as redundant. Being in the list is the answer.
+        let legs = Extraction::parse_many(
+            r#"{"bookings":[
+              {"kind":"flight","title":"AMS → HKG","origin":"AMS","destination":"HKG","date":"2026-11-02","summary":"out"},
+              {"kind":"flight","title":"HKG → AMS","origin":"HKG","destination":"AMS","date":"2026-11-23","summary":"back"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(legs.len(), 2);
+        assert!(legs.iter().all(|e| e.booking), "both legs are bookings");
+        // The checks still apply: an entry with no date is no more usable
+        // for being in the list.
+        let thin = Extraction::parse_many(r#"{"bookings":[{"kind":"flight","origin":"AMS","summary":"x"}]}"#).unwrap();
+        assert!(!thin[0].booking, "membership is not a date");
+        // An explicit verdict is the model's own and stands.
+        let said = Extraction::parse_many(
+            r#"{"bookings":[{"booking":false,"kind":"stay","date":"2026-10-12","summary":"a quote, not a booking"}]}"#,
+        )
+        .unwrap();
+        assert!(!said[0].booking);
+        // The old bare object is one mail's verdict, not a list of things
+        // booked: an object that does not say is not an answer.
+        assert!(Extraction::parse_many(r#"{"kind":"stay","date":"2026-10-12","summary":"x"}"#).is_err());
+    }
+
+    #[test]
     fn a_runaway_answer_is_cut_at_ten_bookings() {
         let one = r#"{"booking":true,"kind":"stay","date":"2026-10-12","summary":"x"}"#;
         let many = format!("{{\"bookings\":[{}]}}", [one; 25].join(","));
@@ -1439,6 +1493,30 @@ mod tests {
         for old in ids {
             assert!(store.arrival_of(old, a).unwrap().is_none(), "the first reading gave way");
         }
+    }
+
+    #[tokio::test]
+    async fn legs_that_never_said_booking_still_land_on_one_trip() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let a = store.account_for_telegram(1).unwrap();
+        let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().unwrap();
+        let legs = Extraction::parse_many(
+            r#"{"bookings":[
+              {"kind":"flight","title":"AMS → HKG","place":"Hong Kong","origin":"AMS","destination":"HKG","date":"2026-11-02","summary":"out"},
+              {"kind":"flight","title":"HKG → AMS","place":"Amsterdam","origin":"HKG","destination":"AMS","date":"2026-11-23","summary":"back"}
+            ]}"#,
+        )
+        .unwrap();
+        let (ids, placement) = record_arrivals(&core, a, mail_id, legs).await.unwrap();
+        let placed = placement.expect("a booking was placed");
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            let row = store.arrival_of(id, a).unwrap().unwrap();
+            assert!(row.booking, "waiting on the page, not filed away as mail");
+            assert_eq!(row.trip_id, Some(placed.id()));
+        }
+        assert_eq!(view(&core, a, "d").await.unwrap().pending.len(), 2);
     }
 
     #[tokio::test]

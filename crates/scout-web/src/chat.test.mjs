@@ -527,16 +527,16 @@ test('pending arrivals slot into the timeline at their date, after items on the 
     { position: 2, kind: 'flight', date: '2026-10-19' },
   ] }
   const arrivals = [
+    // Listed first but the latest by id: on its day it goes after 9, which
+    // pins the order within a day to arrival rather than to the list.
+    { id: 12, trip_id: 5, trip_name: 'Lisbon', kind: 'activity', title: 'Fado', date: '2026-10-12', status: 'pending', booking: true },
     { id: 9, trip_id: 5, trip_name: 'Lisbon', kind: 'stay', title: 'Hotel Alfama', date: '2026-10-12', ends_at: '2026-10-15', status: 'pending', booking: true },
     { id: 10, trip_id: 6, trip_name: 'Porto', kind: 'activity', title: 'Elsewhere', date: '2026-10-13', status: 'pending', booking: true },
     { id: 11, trip_id: 5, trip_name: 'Lisbon', kind: 'activity', title: 'Azulejo', date: '2026-10-13', status: 'pending', booking: true },
-    // Listed last but earlier by id than 11 and later than 9: on its day
-    // it goes after 9, which pins the order within a day to arrival.
-    { id: 10.5, trip_id: 5, trip_name: 'Lisbon', kind: 'activity', title: 'Fado', date: '2026-10-12', status: 'pending', booking: true },
   ]
   const rows = pendingRowsFor(trip, arrivals)
   assert.deepEqual(rows.map(r => [r.kind, r.kind === 'item' ? r.item.position : r.arrival.id]), [
-    ['item', 1], ['pending', 9], ['pending', 10.5], ['pending', 11], ['item', 2],
+    ['item', 1], ['pending', 9], ['pending', 12], ['pending', 11], ['item', 2],
   ])
 })
 

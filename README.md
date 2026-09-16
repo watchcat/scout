@@ -47,6 +47,14 @@ fare caveat in one hand-off document. A trip is not only flights: tell Scout
 the timeline in date order beside the legs, with activities and trains the
 same way, each marked when it is booked and with its confirmation code.
 
+Every account also has a booking address, `you@goodscout.fyi`. Give it to a
+hotel or a museum shop at checkout, or forward a confirmation to it. Each
+message is forwarded to your own email first, so nothing is ever only in
+Scout, and then read into a pending row on the trip it belongs to — the one
+whose dates it overlaps, or a draft trip started for it. Nothing lands on a
+trip until you click Add. Everything else — newsletters, mail Scout could not
+read, arrivals you ignored — sits under Other mail for thirty days.
+
 <p align="center">
   <img src="crates/scout-web/src/assets/trips-desktop.webp" alt="Scout trip planner on desktop, with an airport timeline, flight choices, saved fares and a tight connection warning" width="900">
 </p>
@@ -324,6 +332,9 @@ compiles from source.
 | `RESEND_API_KEY` | web sign-in | — | sends the email sign-in link |
 | `SCOUT_MAIL_FROM` | web sign-in | — | the address that link comes from, unquoted |
 | `SCOUT_BASE_URL` | web sign-in | — | the site's own https address, used in the link and to send plain http to https |
+| `RESEND_WEBHOOK_SECRET` | inbox | — | signing secret of the `email.received` webhook that delivers mail to `/inbound/resend`; unset means no booking address |
+| `RESEND_BASE_URL` | no | `https://api.resend.com` | where the Resend API lives; the worker fetches each message's body and attachments from it |
+| `INBOX_DOMAIN` | no | `goodscout.fyi` | the domain the booking addresses are on; must be the one Resend receives for |
 
 Keys are read from `.env` at runtime and never baked into the image. Memory
 lives in the `scout-data` volume and survives rebuilds.
@@ -344,6 +355,14 @@ record at the DNS provider **before** the first deploy that carries it:
 cert-manager proves ownership by serving an HTTP-01 challenge on the name,
 so a `www` that does not resolve fails the `scout-www-tls` certificate and
 each retry counts against Let's Encrypt's rate limit.
+
+The booking address needs three things in Resend and one in DNS. Add
+`goodscout.fyi` as a receiving domain in Resend and copy the MX record it
+shows into Porkbun — the docs do not print the record, the dashboard does,
+and the sending domain `send.goodscout.fyi` is unaffected. Create a webhook
+for `email.received` pointing at `https://goodscout.fyi/inbound/resend`. Put
+its signing secret into `.env` as `RESEND_WEBHOOK_SECRET` and deploy. Until
+then the inbox is off and the Trips tab shows no address.
 
 The script runs here and **builds there**, because this repository is
 developed on arm64 and the server is x86_64 — emulating the DuckDB C++
@@ -421,7 +440,7 @@ trip builder, a hotel agent and an experience agent will be added.
 
 The agent chooses tools; the tools enforce the rules. Page budgets, search
 budgets, dead-link probes, price extraction and the price maths all live in
-Rust, where they can be tested — `cargo test` runs **925 tests** with HTTP
+Rust, where they can be tested — `cargo test` runs **994 tests** with HTTP
 mocked via wiremock and DuckDB on temp files. No network, no API keys, no
 flakiness. The schema migration that moved every table onto account ids was
 rehearsed against a copy of the live database before it ran on the real one,
@@ -527,7 +546,7 @@ Roughly 38,000 lines of Rust across 60 focused modules.
 ## Development
 
 ```bash
-cargo test --workspace      # 781 tests across four crates, no network
+cargo test --workspace      # 994 tests across four crates, no network
 node --test 'crates/scout-web/src/*.test.mjs'  # the chat client's own tests
 cargo clippy --workspace --all-targets  # clean
 RUST_LOG=debug cargo run    # verbose logs

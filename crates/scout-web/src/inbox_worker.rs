@@ -225,7 +225,14 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
         (m.from.clone(), m.subject.clone(), m.text.clone(), m.html.clone(), true, Vec::new())
     } else {
         let r = client.received(&m.provider_id).await.map_err(resend)?;
-        scout_core::inbox::mail_body(core, m.id, r.text.clone(), r.html.clone(), BODY_CAP).await.map_err(Failure::Reading)?;
+        // The record's sender is stored with its body, so the passes
+        // after this one read the same sender this one is about to judge.
+        // Without that, a mail held back here for coming from the account
+        // is forwarded by the next pass off the row's weaker copy, and the
+        // row then says the opposite of what was decided.
+        scout_core::inbox::mail_body(core, m.id, Some(r.from.clone()), r.text.clone(), r.html.clone(), BODY_CAP)
+            .await
+            .map_err(Failure::Reading)?;
         let sender = if r.from.is_empty() { m.from.clone() } else { r.from };
         (sender, r.subject.or_else(|| m.subject.clone()), r.text, r.html, !r.attachments.is_empty(), r.attachments)
     };
@@ -1576,6 +1583,44 @@ mod tests {
         // And a pass over it now finds nothing to do rather than sending late.
         work_once(&core, &client, FROM, 10).await;
         assert_eq!(forwards(&server.received_requests().await.unwrap()), 0);
+    }
+
+    #[tokio::test]
+    async fn the_sender_the_record_named_is_the_one_every_later_pass_reads() {
+        // The guarantee has to survive a retry, and the two passes read
+        // the sender from different places: the first from the record it
+        // fetched, every later one from the row. The webhook's `from` is
+        // optional — a payload without the key stores an empty string —
+        // so the row can be silent about a sender the record names, and
+        // then a mail suppressed on the first pass is forwarded on the
+        // second, with the row claiming the opposite of what was decided.
+        let server = MockServer::start().await;
+        resend_like_from(&server, "Sasha Q <sasha@example.com>").await;
+        // The model fails once, which is what buys the second pass: the
+        // mail is not settled, so it comes round again with its body — and
+        // its sender — read off the row.
+        Mock::given(method("POST")).and(path("/chat/completions")).respond_with(ResponseTemplate::new(500)).up_to_n_times(1).mount(&server).await;
+        model_saying(&server, r#"{"booking":false,"summary":"A newsletter"}"#).await;
+        let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        scout_core::inbox::seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
+        // The webhook said nothing about who wrote, as `Data::from`'s
+        // default allows. Only the record knows, and only on pass one.
+        let silent = MailIn { from: String::new(), ..a_mail("re_1") };
+        let mail_id = scout_core::inbox::record_mail(&core, a, silent).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+        assert_eq!(forwards(&server.received_requests().await.unwrap()), 0, "pass one held it back");
+
+        scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        work_once(&core, &client, FROM, 10).await;
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(forwards(&reqs), 0, "the retry read a sender the first pass had already judged, and sent the mail anyway");
+        assert_eq!(extractions(&reqs), 2, "and it was the reading that brought it round again");
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert!(view.other[0].sent_by_you, "the row is drawn from the same sender the worker judged");
+        assert!(!view.other[0].forwarded);
     }
 
     #[tokio::test]

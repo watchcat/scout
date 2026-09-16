@@ -1853,13 +1853,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_draft_a_mail_was_just_placed_on_is_not_swept_from_under_it() {
-        // The window the grace exists for. `record_arrivals` makes the
-        // draft and then writes the arrivals, and `add_arrival` claims the
-        // arrival before it builds the item; in both gaps the draft is
-        // empty with nothing pending on it, and any Add or Ignore on the
-        // account — or the hourly pass — sweeps. A draft made seconds ago
-        // is never collectable, whatever zone the machine is in.
+    async fn a_mails_placement_is_not_swept_out_from_under_it() {
+        // A booking still waiting is enough on its own: the sweep spares
+        // any draft one points at, whatever its age. This is the clause
+        // that protects the gap inside `record_arrivals`, between the
+        // draft being made and the arrivals being written. Its pair below
+        // is the grace, which is what protects the draft once the booking
+        // has been decided and that clause no longer applies.
         let (core, _dir) = core();
         let store = core.store();
         let a = store.account_for_telegram(1).unwrap();
@@ -1867,10 +1867,32 @@ mod tests {
         let stay = arrival("stay", "Hotel Panorama", Some("Hong Kong"), "2026-11-04");
         let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay]).await.unwrap();
         let draft = placed.expect("the stay was placed").id();
-        assert_eq!(store.sweep_all_empty_drafts().unwrap(), 0, "swept out from under the mail that made it");
+        store.age_trip(draft).unwrap();
+        assert_eq!(store.sweep_all_empty_drafts().unwrap(), 0, "a booking is waiting on it");
         assert!(store.trip_by_id(a, draft).unwrap().is_some());
         // And the booking it was made for still knows where it is going.
         assert_eq!(store.arrival_of(ids[0], a).unwrap().unwrap().trip_id, Some(draft));
+    }
+
+    #[tokio::test]
+    async fn a_draft_decided_a_moment_ago_is_left_alone_until_it_is_stale() {
+        // The window the grace exists for, with the pending clause taken
+        // out of the way so only the five minutes are left standing:
+        // `ignore_arrival` decides the booking and then sweeps the account
+        // in the same call. Its pair, `ignoring_the_only_booking_of_a_draft
+        // _collects_it`, ages the draft first and gets the opposite answer.
+        let (core, _dir) = core();
+        let store = core.store();
+        let a = store.account_for_telegram(1).unwrap();
+        let mail_id = record_mail(&core, a, mail_in("re_hotel")).await.unwrap().unwrap();
+        let stay = arrival("stay", "Hotel Panorama", Some("Hong Kong"), "2026-11-04");
+        let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay]).await.unwrap();
+        let draft = placed.expect("the stay was placed").id();
+        assert_eq!(ignore_arrival(&core, a, ids[0]).await.unwrap(), Outcome::Done(()));
+        assert!(
+            store.trip_by_id(a, draft).unwrap().is_some(),
+            "swept out from under the click that decided it"
+        );
     }
 
     #[tokio::test]

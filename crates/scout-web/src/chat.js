@@ -1270,6 +1270,10 @@ function start() {
     if (item.booked) {
       about.append(node('span', 'item-booked', bookedMark(item)))
     }
+    // Last in the head, where the pending row puts it: the ticket forwarded
+    // with the confirmation sits in the same place before and after Add,
+    // so pressing Add does not look like it took the file away.
+    if (item.attachments?.length) about.append(attachmentLinks(item.attachments))
     const actions = node('div', 'segment-head-actions')
     actions.append(node('time', 'segment-date', itemDateLabel(item)))
     const removeSlot = node('span', 'segment-remove')
@@ -1300,6 +1304,8 @@ function start() {
     if (segment.booked) {
       route.append(node('span', 'item-booked', bookedMark(segment)))
     }
+    // As on a stay, and as on the pending row this leg was added from.
+    if (segment.attachments?.length) route.append(attachmentLinks(segment.attachments))
     const actions = node('div', 'segment-head-actions')
     actions.append(node('time', 'segment-date', dateLabel(segment.date)))
     const removeSlot = node('span', 'segment-remove')

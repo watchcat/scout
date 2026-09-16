@@ -239,6 +239,9 @@ fn validate_plan(plan: &Plan) -> Result<(), Error> {
             || too_long(&item.place)
             || too_long(&item.notes)
             || too_long(&item.confirmation_code)
+            // A filename came off a stranger's mail like the rest of this,
+            // and now reaches the page, so it is bounded like the rest.
+            || item.attachments.iter().any(|file| file.filename.len() > MAX_FIELD_BYTES)
         {
             return Err(Error::InputTooLarge);
         }
@@ -322,6 +325,28 @@ fn booked_mark(item: &TripItem) -> String {
         Some(code) => format!("<div class=\"booked\">booked · {}</div>", escape(code)),
         None => "<div class=\"booked\">booked</div>".to_string(),
     }
+}
+
+/// The files the booking arrived with, named, or nothing when it arrived
+/// with none. A traveller carrying the printed plan and a folder of PDFs
+/// has to be able to say which file belongs to which booking, and the
+/// filename is the only handle both halves share — the page's
+/// `attachmentLinks` prints the same string.
+///
+/// Names only: there is nothing a piece of paper can do with a link, and
+/// the bytes are behind a session anyway.
+fn tickets(item: &TripItem) -> String {
+    if item.attachments.is_empty() {
+        return String::new();
+    }
+    let label = if item.attachments.len() == 1 { "ticket" } else { "tickets" };
+    let names = item
+        .attachments
+        .iter()
+        .map(|file| escape(&file.filename))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("<div class=\"tickets\">{label} · {names}</div>")
 }
 
 /// What a leg with no option says, as `(headline, detail)`. The paper
@@ -541,7 +566,7 @@ pub fn html(plan: &Plan) -> String {
     out.push_str(
         r#"</title>
 <style>
-@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .booked{margin-top:.7mm;color:#4f5d10;font-size:7.5pt;font-weight:700}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
+@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .booked{margin-top:.7mm;color:#4f5d10;font-size:7.5pt;font-weight:700}.segment-head .tickets{margin-top:.7mm;color:#50666b;font-size:7.5pt}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
 </style></head><body>"#,
     );
     write!(
@@ -618,11 +643,12 @@ pub fn html(plan: &Plan) -> String {
             let booked = booked_mark(segment);
             write!(
                 out,
-                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}{}</div><time>{}</time></div></section>",
+                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}{}{}</div><time>{}</time></div></section>",
                 escape(&kind_label(&segment.kind)),
                 escape(&segment.title),
                 place,
                 booked,
+                tickets(segment),
                 escape(&item_when(segment))
             )
             .unwrap();
@@ -630,7 +656,7 @@ pub fn html(plan: &Plan) -> String {
         }
         write!(
             out,
-            "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">Segment {}</div><h2>{} → {}</h2>{}</div><time>{}</time></div>",
+            "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">Segment {}</div><h2>{} → {}</h2>{}{}</div><time>{}</time></div>",
             segment.position,
             escape(airport(&segment.origin)),
             escape(airport(&segment.destination)),
@@ -638,6 +664,7 @@ pub fn html(plan: &Plan) -> String {
             // a confirmation has a code, and the code is the one thing a
             // traveller reads off a printed itinerary at a desk.
             booked_mark(segment),
+            tickets(segment),
             escape(&date(&segment.date))
         )
         .unwrap();
@@ -723,6 +750,7 @@ mod tests {
             notes: None,
             arrival_id: None,
             candidates: vec![candidate],
+            attachments: Vec::new(),
         }
     }
 
@@ -776,6 +804,15 @@ mod tests {
                         notes: None,
                         arrival_id: None,
                         candidates: vec![],
+                        // The booking arrived by mail with its ticket on
+                        // it, which is the common case for an item that
+                        // is already booked.
+                        attachments: vec![scout_api::AttachmentRef {
+                            id: 4,
+                            filename: "voucher <1>.pdf".to_string(),
+                            mime: "application/pdf".to_string(),
+                            size: 12,
+                        }],
                     },
                     flight(
                         3,
@@ -829,6 +866,11 @@ mod tests {
             "Hotel &lt;Roma&gt;",
             "Rome",
             "booked · ABC123",
+            // Beside the code: which ticket belongs to this booking, for a
+            // traveller holding the printed plan and a folder of PDFs.
+            // Escaped like everything else that came out of a stranger's
+            // mail.
+            "ticket · voucher &lt;1&gt;.pdf",
         ] {
             assert!(html.contains(expected), "missing `{expected}`");
         }

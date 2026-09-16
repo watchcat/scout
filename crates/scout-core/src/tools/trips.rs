@@ -1888,6 +1888,7 @@ mod tests {
             notes: None,
             arrival_id: None,
             candidates: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -3898,6 +3899,7 @@ mod tests {
             notes: None,
             arrival_id: None,
             candidates: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 

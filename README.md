@@ -169,6 +169,12 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   comparison between two prices quoted in different ones. A missing
   single-ticket price says it is missing — it never reads as a verdict for
   booking separately
+- **A trip is not only flights.** *"I've booked the Alfama hotel for the 12th
+  to the 15th"* puts the stay between the legs it belongs between; activities
+  and trains land the same way. Positions are recomputed from the dates on
+  every change, so the list always reads in the order you will live it.
+  Finalising prices the flights and sums the rest as fixed costs — a hotel is
+  never quietly treated as a segment to search
 
 **Remembers things**
 - **A conversation survives a restart.** History lives in DuckDB, not in
@@ -213,7 +219,17 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   timeline, dated segments, flight numbers, saved fares and layovers. Parked
   flight options can be selected in place, and the connection time between
   the chosen flights is recalculated immediately — including airport-change
-  and tight-connection warnings
+  and tight-connection warnings. Stays, activities and trains stand in the
+  same date-ordered column beside the legs, each marked when it is booked
+  and with its confirmation code
+- **A booking address of your own.** Every account gets `you@goodscout.fyi`.
+  Give it to a hotel or a museum shop at checkout, or forward a confirmation
+  to it. Each message is forwarded to your real inbox first — nothing is ever
+  only in Scout — and then read into a pending row on the trip whose dates it
+  overlaps, or on a draft trip started for it. The row waits there, dashed,
+  until you press Add: mail never changes an itinerary on its own. Tickets
+  come with it, PDFs included. Newsletters, mail Scout could not read and
+  arrivals you ignored sit under Other mail for thirty days, then go
 - **Your phone follows along.** A toggle sends the browser thread to your
   Telegram chat as it happens, so a question asked at a desk is answered on
   the train
@@ -415,7 +431,7 @@ Browser  ──► scout-web ──┴► core ──► rig agent ────�
                                                      ├─ remember_fact      │
                                                      ├─ forget_fact       ─┘
                                                      ├─ reminders (create/list/cancel)
-                                                     └─ ask_flights *  ──► flight agent ──► 11 tools
+                                                     └─ ask_flights *  ──► flight agent ──► 13 tools
                                                                              ├─ search_flights    Duffel + Ignav, merged
                                                                              ├─ flight_booking_links  airline pages, pre-filled
                                                                              ├─ create_booking_link   Duffel hosted checkout
@@ -429,6 +445,23 @@ Browser  ──► scout-web ──┴► core ──► rig agent ────�
           Duffel and Ignav both hand out free keys, though Duffel gates
           hosted checkout until they enable it for you
 ```
+
+Mail arrives on a path of its own, and it never meets an agent that holds a
+tool:
+
+```
+Resend ──► POST /inbound/resend ──► inbox worker ───────► extractor ──► arrival
+ MX for     signature over the      forwards it to you,   one model     waits on a trip
+ the apex   raw bytes; the hook     fetches the body      call, no      until you press
+            carries no body         and the PDFs          tools         Add
+```
+
+The extractor is the only thing that ever reads a stranger's email, it is
+built without a single tool, and its answer is parsed as fields and checked
+one by one — a date that is not a date, a kind that is not one of the four,
+and the booking is downgraded rather than shown with holes. An instruction
+buried in a confirmation therefore has nothing to act on and nowhere to act:
+the only way onto an itinerary is a click on the page.
 
 The flight agent is a second rig agent with its own prompt, called by the
 first as one tool. It sees only the brief the main agent writes, and it
@@ -450,15 +483,16 @@ That middle arrow is a crate boundary, not a convention. Scout is a cargo
 workspace of four:
 
 ```
-scout-core       27,800 lines  the agent, the tools, the database — everything
+scout-core       36,000 lines  the agent, the tools, the database — everything
                                that answers a question, and nothing that knows
                                who asked
 scout-telegram    3,100 lines  teloxide, streaming into one edited message,
                                chunking, flood control, delivery
-scout-api           300 lines  the events core emits and a channel renders,
+scout-api           500 lines  the events core emits and a channel renders,
                                so the two cannot disagree about what one is
-scout-web         6,800 lines  the website and the browser chat: sign-in, the
-                               thread list, streaming into the page
+scout-web        12,200 lines  the website and the browser chat: sign-in, the
+                               thread list, streaming into the page, the
+                               inbound webhook and the mail worker
 ```
 
 `scout-core` does not export its store. The adapter cannot open a database,
@@ -476,7 +510,8 @@ That is what makes the second front end cheap. A web app talks to the same
 core, and neither side can reach around the other, because the crate graph
 will not compile it.
 
-Roughly 38,000 lines of Rust across 60 focused modules.
+Roughly 52,000 lines of Rust across 72 focused modules, plus 2,800 lines
+of JavaScript in the browser client.
 
 ---
 
@@ -522,6 +557,14 @@ Roughly 38,000 lines of Rust across 60 focused modules.
   `/invite announce` sends the join *command* (`/start autumn`, tap to copy)
   rather than a link, and why a dead round's link stays dead: codes do not
   carry between rounds.
+- **A booking address reads; it never acts.** A confirmation Scout misreads
+  is a pending row with the wrong date, which you refuse — not an itinerary
+  that changed behind you. An image-only PDF has no text to read, so a
+  ticket that is a photograph arrives attached and unread. Mail to a handle
+  nobody holds is dropped without a bounce, because answering would tell a
+  stranger which addresses exist, and changing your handle retires the old
+  one rather than forwarding it. Raw messages are deleted after thirty days;
+  what you added to a trip stays.
 - **Threads expire, and only the web can pin.** A conversation untouched
   for 48 hours is deleted, in every scope. The pin that exempts one lives in
   the browser's sidebar; there is no Telegram command for it yet. History

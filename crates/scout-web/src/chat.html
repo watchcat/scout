@@ -497,7 +497,8 @@
      long unbreakable token, and it wraps inside the border. */
   .attachment-links a svg{flex:none}
   .attachment-links a span{min-width:0; overflow-wrap:anywhere}
-  .attachment-links a:hover{border-color:var(--cyan); background:rgba(42,161,152,.1); color:var(--base2)}
+  .attachment-links a:hover{border-color:var(--cyan); background:rgba(42,161,152,.1); color:var(--base2);
+    text-decoration:none}
   .attachment-links a:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   .pending-actions{display:flex; gap:6px; flex-wrap:wrap; padding:0 16px 14px}
   .pending-actions button, .pending-picker button, .other-mail-add, .handle-row button, .handle-cancel{
@@ -626,6 +627,13 @@
        and the row of them decides whether a booking joins a trip or is
        thrown away — not a thing to mis-tap with a thumb. The circle that
        deletes a whole trip was 28px. */
+    /* `.attachment-links a` is in this list on purpose, and it is the one
+       entry that also lands in the Other-mail aside, which is otherwise
+       kept deliberately quiet so it does not compete with the trips. The
+       tap target wins: a file on an Other-mail row is a real control a
+       thumb has to hit, and a 32px chip there would be the same miss as
+       anywhere else. Quiet means low contrast and small type, not small
+       enough to mis-tap. */
     .pending-actions button, .pending-picker button, .other-mail-add,
     .handle-row button, .handle-cancel, .segment-remove-button,
     .trip-keep, .trip-download, .attachment-links a{min-height:42px; padding:10px 14px; font-size:13px}

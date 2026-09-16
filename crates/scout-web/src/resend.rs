@@ -28,10 +28,14 @@ pub struct ResendClient {
 ///
 /// `content_disposition` and `content_id` are the two fields that tell an
 /// attachment from the mail's own furniture — a signature logo, a tracking
-/// pixel, an image the HTML body draws. Neither is documented on this
-/// endpoint and neither has been seen on the wire, so both are optional
-/// and an absent one means nothing: see `inbox_worker::winnow`, which
-/// keeps every part when the record says neither.
+/// pixel, an image the HTML body draws. Resend sends both on the inbound
+/// webhook, per part: the payload pinned in `inbound.rs` carries them. What
+/// is unknown is this endpoint, which documents neither, so both are
+/// optional here and an absent one means nothing — see
+/// `inbox_worker::winnow`, which keeps every part the record does not mark.
+/// `content_disposition` arrives as a full header value, parameters and
+/// all (`inline; filename="logo.png"`); `inbox_worker::disposition` is what
+/// reads the token out of it.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Meta {
     pub id: String,

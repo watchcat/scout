@@ -453,13 +453,15 @@ export function composerTarget(trip) {
 // waits behind them rather than pushing in front. Pendings on one day keep
 // their id order, which is arrival order — a stable read on every repaint.
 export function pendingRowsFor(trip, arrivals) {
-  const rows = (trip.items ?? []).map((item) => ({ kind: 'item', item }))
+  const rows = trip.items.map((item) => ({ kind: 'item', item }))
   const mine = (arrivals ?? [])
     .filter((a) => a.status === 'pending' && a.booking && a.trip_name === trip.name)
     .sort((a, b) => a.id - b.id)
   for (const arrival of mine) {
     // The first row on a later day is where this one goes; none means the
-    // end. `>` rather than `>=` is the "after same-day items" rule.
+    // end. `>` rather than `>=` is the "after same-day items" rule. The
+    // server guarantees a date on anything it read as a booking; the
+    // fallback only keeps a malformed row from throwing, at the front.
     let at = rows.findIndex((row) => rowDate(row) > (arrival.date ?? ''))
     if (at < 0) at = rows.length
     rows.splice(at, 0, { kind: 'pending', arrival })
@@ -473,10 +475,12 @@ function rowDate(row) {
 
 // One line per mail that did not become a pending row: what the reader
 // needs to recognise it (who, what, when) and why it is here rather than
-// on a timeline. The sender is the display name when the address carried
+// on a timeline. `sender` is the display name when the address carried
 // one — "TAP" is recognisable where "news@flytap.com" is a squint — and
-// the bare address otherwise. `locale` exists for the tests, as on
-// `dateLabel`; the page passes none.
+// `address` is always the bare address, shown beside it: a display name
+// is whatever the sender typed, and a mail calling itself "Booking.com"
+// from elsewhere must not be the only thing on screen. `locale` exists
+// for the tests, as on `dateLabel`; the page passes none.
 const MAIL_REASONS = {
   not_booking: 'not a booking',
   failed: 'could not read',
@@ -486,7 +490,8 @@ const MAIL_REASONS = {
 export function otherMailLines(rows, locale = undefined) {
   return (rows ?? []).map((row) => ({
     mail_id: row.mail_id,
-    sender: senderName(row.from),
+    sender: sender(row.from).name,
+    address: sender(row.from).address,
     subject: row.subject?.trim() ? row.subject : '(no subject)',
     when: dateLabel(String(row.received_at ?? '').slice(0, 10), true, locale),
     reason: MAIL_REASONS[row.reason] ?? row.reason ?? '',
@@ -498,11 +503,16 @@ export function otherMailLines(rows, locale = undefined) {
   }))
 }
 
-function senderName(from) {
+// `Name <addr>`, `"Name, quoted" <addr>`, `<addr>` or a bare address:
+// the name is the part before the brackets, unquoted, and the address is
+// the part inside them — or the whole thing when there are none. A name
+// that is empty falls back to the address, so `sender` is never blank.
+function sender(from) {
   const text = String(from ?? '').trim()
   const match = text.match(/^"?([^"<]*?)"?\s*<([^>]*)>$/)
-  if (!match) return text
-  return match[1].trim() || match[2].trim()
+  if (!match) return { name: text, address: text }
+  const address = match[2].trim()
+  return { name: match[1].trim() || address, address }
 }
 
 // Mirrors `scout_core::inbox::normalise_handle` — the same checks, in the
@@ -511,8 +521,11 @@ function senderName(from) {
 // list is deliberately not copied: it is the server's to keep, and the
 // live check asks it. `null` means nothing to say.
 export function handleProblem(raw) {
-  const h = String(raw ?? '').trim().toLowerCase()
-  if (!/^[a-z0-9.]*$/.test(h)) return 'letters, digits and dots only'
+  const trimmed = String(raw ?? '').trim()
+  // Checked before lowercasing: JS folds the Kelvin sign to an ASCII k
+  // where the server, lowercasing bytes, sees something it refuses.
+  if (!/^[A-Za-z0-9.]*$/.test(trimmed)) return 'letters, digits and dots only'
+  const h = trimmed.toLowerCase()
   if (h.length < 3 || h.length > 30) return 'a handle is 3 to 30 characters'
   if (h.startsWith('.') || h.endsWith('.')) return 'a handle cannot start or end with a dot'
   return null
@@ -646,7 +659,6 @@ function start() {
   // route is not there (the feature off), and then nothing of it is drawn:
   // the Trips tab is exactly what it was before.
   let inbox = null
-  let handleCheckTimer = null
   // Set by Change on a saved address and cleared by Save or Cancel, so the
   // form can stand in for the address line without forgetting the handle.
   let handleEditing = false
@@ -997,17 +1009,6 @@ function start() {
     }
   }
 
-  // A refresh of the aside alone, for the one write that changes nothing
-  // on a timeline: saving the address. Every arrival verb goes through
-  // `loadTrips`, which reloads both, because a decided arrival changes
-  // the trip it landed in.
-  async function loadInbox() {
-    const loaded = await fetchInbox()
-    if (!loaded) return
-    inbox = loaded
-    renderInboxSide()
-  }
-
   function renderInboxSide() {
     renderOtherMail()
     renderHandle()
@@ -1322,18 +1323,22 @@ function start() {
     // an arrival started holds nothing but its pending row, and that row
     // is the whole reason the trip is on the list.
     const stack = node('div', 'segment-stack')
+    // Counts item rows as they pass: the join below looks past this item
+    // in `trip.items`, and pending rows are not in that list.
+    let itemIndex = 0
     for (const row of pendingRowsFor(trip, inbox?.pending ?? [])) {
       if (row.kind === 'pending') {
         stack.append(renderPendingRow(trip, row.arrival))
         continue
       }
       const item = row.item
+      itemIndex++
       stack.append(renderItem(trip, item))
       // The join is checked from one flight to the next flight, whatever
       // sits between them: a stay does not change when the second leg
       // leaves. The PDF draws it in the same place, under the first flight.
       if (item.kind !== 'flight') continue
-      const next = trip.items.slice(trip.items.indexOf(item) + 1).find((later) => later.kind === 'flight')
+      const next = trip.items.slice(itemIndex).find((later) => later.kind === 'flight')
       if (next) {
         const check = connectionCheck(item, next)
         stack.append(node('div', `join-card ${check.tone}`, check.text))
@@ -1393,15 +1398,26 @@ function start() {
     row.append(add, elsewhere, ignore)
     card.append(row)
     // The picker opens under the buttons rather than replacing them, so
-    // Ignore stays reachable while it is open; a second press closes it.
+    // Ignore stays reachable while it is open; a second press, or Escape
+    // anywhere on the card while it is open, closes it and puts focus
+    // back on the button. On the card, not the slot: right after the
+    // click that opened it, focus is still on the button.
     const pickerSlot = node('div', 'pending-picker-slot')
+    pickerSlot.id = `arrival-${arrival.id}-picker`
     card.append(pickerSlot)
-    elsewhere.addEventListener('click', () => {
-      const open = pickerSlot.firstChild
-      elsewhere.setAttribute('aria-expanded', String(!open))
-      pickerSlot.replaceChildren(...(open ? [] : [tripPicker(trip, arrival)]))
-    })
+    function setPicker(open) {
+      elsewhere.setAttribute('aria-expanded', String(open))
+      pickerSlot.replaceChildren(...(open ? [tripPicker(trip, arrival)] : []))
+    }
     elsewhere.setAttribute('aria-expanded', 'false')
+    elsewhere.setAttribute('aria-controls', pickerSlot.id)
+    elsewhere.addEventListener('click', () => setPicker(!pickerSlot.firstChild))
+    card.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape' || !pickerSlot.firstChild) return
+      e.stopPropagation()
+      setPicker(false)
+      elsewhere.focus()
+    })
     return card
   }
 
@@ -1444,6 +1460,13 @@ function start() {
     tripChoicePending = true
     tripLoadSeq++
     tripDetail.setAttribute('aria-busy', 'true')
+    // Every button on this card, picker included, is off until the answer:
+    // `tripChoicePending` already drops a second press on the floor, but
+    // a button that still looks live invites it. Any reload repaints the
+    // card; the `finally` is for the refusals that leave it standing.
+    const card = document.getElementById(`arrival-${arrival.id}-picker`)?.closest('.item-card')
+    const buttons = [...(card?.querySelectorAll('.pending-actions button, .pending-picker button') ?? [])]
+    for (const button of buttons) button.disabled = true
     try {
       const res = await post(`/chat/arrivals/${encodeURIComponent(arrival.id)}/${verb}`, body)
       if (res.status === 409) {
@@ -1471,6 +1494,7 @@ function start() {
     } finally {
       tripChoicePending = false
       tripDetail.removeAttribute('aria-busy')
+      for (const button of buttons) button.disabled = false
     }
   }
 
@@ -1517,7 +1541,11 @@ function start() {
     for (const line of lines) {
       const li = node('li', 'other-mail-row')
       const top = node('div', 'other-mail-top')
-      top.append(node('span', 'other-mail-sender', line.sender), node('span', 'other-mail-when', line.when))
+      const who = node('span', 'other-mail-sender', line.sender)
+      // The bare address beside the name, always — see `otherMailLines`.
+      // Omitted only when it is the name, which would print it twice.
+      if (line.address !== line.sender) who.append(node('span', 'other-mail-address', line.address))
+      top.append(who, node('span', 'other-mail-when', line.when))
       li.append(top, node('p', 'other-mail-subject', line.subject))
       li.append(node('p', 'other-mail-meta', `${line.reason} · ${line.note}`))
       if (line.attachments.length) li.append(attachmentLinks(line.attachments))
@@ -1537,8 +1565,17 @@ function start() {
   // The address line at the foot of the aside. Three states: nothing
   // (the inbox has not answered, or never will), the form (no handle yet,
   // or Change pressed), and the address with Copy and Change.
+  //
+  // Called on every reload — a tab waking, every arrival verb — and a
+  // form the reader is in the middle of is left alone then: a rebuild
+  // would wipe the half-typed handle and the hint under it. "In the
+  // middle of" is the input focused or holding something other than the
+  // saved handle; Save and Cancel go through `renderHandle` with the
+  // form's own state settled, so those still repaint.
   function renderHandle() {
     if (!handleLineEl) return
+    const input = handleLineEl.querySelector('.handle-form input')
+    if (input && inbox && (document.activeElement === input || input.value !== (inbox.handle ?? ''))) return
     handleLineEl.replaceChildren()
     handleLineEl.hidden = !inbox
     if (!inbox) return
@@ -1582,7 +1619,8 @@ function start() {
     const row = node('div', 'handle-form-row')
     const input = document.createElement('input')
     input.type = 'text'
-    input.maxLength = 30
+    // No `maxLength`: a pasted 31-character handle should get the "3 to
+    // 30" sentence, not a silent cut to something the reader did not type.
     input.autocomplete = 'off'
     input.spellcheck = false
     input.placeholder = 'yourname'
@@ -1595,24 +1633,30 @@ function start() {
     const hint = node('p', 'handle-hint')
     hint.id = 'handle-hint'
     form.append(row, hint)
-    if (inbox.handle) {
-      const cancel = node('button', 'handle-cancel', 'Cancel')
-      cancel.type = 'button'
-      cancel.addEventListener('click', () => {
-        handleEditing = false
-        renderHandle()
-      })
-      row.append(cancel)
-    }
-
     function say(text, problem) {
       hint.className = problem ? 'handle-hint problem' : 'handle-hint'
       hint.textContent = text
     }
 
     // A check that answers after the input moved on is about a handle
-    // nobody is looking at any more.
+    // nobody is looking at any more; the timer is the one not yet sent.
     let checkSeq = 0
+    let checkTimer = null
+
+    if (inbox.handle) {
+      const cancel = node('button', 'handle-cancel', 'Cancel')
+      cancel.type = 'button'
+      cancel.addEventListener('click', () => {
+        clearTimeout(checkTimer)
+        checkSeq++
+        handleEditing = false
+        // Back to the saved handle first, or `renderHandle` reads the
+        // abandoned edit as one still in progress and keeps the form.
+        input.value = inbox.handle
+        renderHandle()
+      })
+      row.append(cancel)
+    }
     async function checkHandle(raw, seq) {
       try {
         const res = await fetch(`/chat/handle/check?handle=${encodeURIComponent(raw)}`)
@@ -1627,7 +1671,7 @@ function start() {
     }
 
     input.addEventListener('input', () => {
-      clearTimeout(handleCheckTimer)
+      clearTimeout(checkTimer)
       checkSeq++
       const raw = input.value
       if (!raw.trim()) return say('', false)
@@ -1635,7 +1679,7 @@ function start() {
       say(problem ?? '', Boolean(problem))
       if (problem) return
       const seq = checkSeq
-      handleCheckTimer = setTimeout(() => checkHandle(raw, seq).catch(() => {}), 400)
+      checkTimer = setTimeout(() => checkHandle(raw, seq).catch(() => {}), 400)
     })
 
     form.addEventListener('submit', (event) => {
@@ -1647,7 +1691,7 @@ function start() {
         input.focus()
         return
       }
-      clearTimeout(handleCheckTimer)
+      clearTimeout(checkTimer)
       checkSeq++
       save.disabled = true
       saveHandle(raw).catch(() => {}).finally(() => {
@@ -1665,6 +1709,10 @@ function start() {
         const saved = await res.json()
         handleEditing = false
         inbox = { ...inbox, handle: saved.handle }
+        // The form's own state is settled: value and focus both cleared
+        // so `renderHandle` does not read a finished edit as one in flight.
+        input.value = saved.handle
+        input.blur()
         renderHandle()
         showTripToast(`Your booking address is ${saved.handle}@${inbox.domain}.`)
       } catch {

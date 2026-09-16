@@ -530,10 +530,13 @@ test('pending arrivals slot into the timeline at their date, after items on the 
     { id: 9, trip_id: 5, trip_name: 'Lisbon', kind: 'stay', title: 'Hotel Alfama', date: '2026-10-12', ends_at: '2026-10-15', status: 'pending', booking: true },
     { id: 10, trip_id: 6, trip_name: 'Porto', kind: 'activity', title: 'Elsewhere', date: '2026-10-13', status: 'pending', booking: true },
     { id: 11, trip_id: 5, trip_name: 'Lisbon', kind: 'activity', title: 'Azulejo', date: '2026-10-13', status: 'pending', booking: true },
+    // Listed last but earlier by id than 11 and later than 9: on its day
+    // it goes after 9, which pins the order within a day to arrival.
+    { id: 10.5, trip_id: 5, trip_name: 'Lisbon', kind: 'activity', title: 'Fado', date: '2026-10-12', status: 'pending', booking: true },
   ]
   const rows = pendingRowsFor(trip, arrivals)
   assert.deepEqual(rows.map(r => [r.kind, r.kind === 'item' ? r.item.position : r.arrival.id]), [
-    ['item', 1], ['pending', 9], ['pending', 11], ['item', 2],
+    ['item', 1], ['pending', 9], ['pending', 10.5], ['pending', 11], ['item', 2],
   ])
 })
 
@@ -553,14 +556,27 @@ test('other mail reads as sender, subject, when, reason', () => {
     { mail_id: 2, from: 'x@y.z', subject: null, received_at: '2026-10-02T10:00:00Z', reason: 'failed', forwarded: false, attachments: [{ id: 3, filename: 'a.pdf', mime: 'application/pdf', size: 10 }] },
   ], 'en-US')
   assert.equal(lines[0].sender, 'TAP')
+  assert.equal(lines[0].address, 'news@flytap.com')
   assert.equal(lines[0].reason, 'not a booking')
   assert.equal(lines[0].note, 'forwarded to you')
   assert.equal(lines[0].when, 'Oct 1')
   assert.equal(lines[1].sender, 'x@y.z')
+  assert.equal(lines[1].address, 'x@y.z')
   assert.equal(lines[1].subject, '(no subject)')
   assert.equal(lines[1].reason, 'could not read')
   assert.equal(lines[1].note, 'not forwarded')
   assert.equal(lines[1].attachments.length, 1)
+})
+
+test('a quoted display name and a bare bracketed address both yield the address', () => {
+  const [quoted, bare] = otherMailLines([
+    { mail_id: 1, from: '"Booking, Team" <hi@booking.example>', received_at: '2026-10-01T10:00:00Z', reason: 'ignored' },
+    { mail_id: 2, from: '<hi@booking.example>', received_at: '2026-10-01T10:00:00Z', reason: 'ignored' },
+  ])
+  assert.equal(quoted.sender, 'Booking, Team')
+  assert.equal(quoted.address, 'hi@booking.example')
+  assert.equal(bare.sender, 'hi@booking.example')
+  assert.equal(bare.address, 'hi@booking.example')
 })
 
 test('the handle form explains the rules before the server does', () => {
@@ -569,4 +585,7 @@ test('the handle form explains the rules before the server does', () => {
   assert.equal(handleProblem('ab'), 'a handle is 3 to 30 characters')
   assert.equal(handleProblem('sa sha'), 'letters, digits and dots only')
   assert.equal(handleProblem('.sasha'), 'a handle cannot start or end with a dot')
+  // The Kelvin sign lowercases to an ASCII k in JS; the server sees a
+  // non-ASCII byte and refuses, so the charset is checked before the case.
+  assert.equal(handleProblem('sasha\u212a'), 'letters, digits and dots only')
 })

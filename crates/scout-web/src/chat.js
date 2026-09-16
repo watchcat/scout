@@ -1937,7 +1937,15 @@ function start() {
       save.disabled = true
       // An empty box clears the note, which is the only way to take one
       // off — a separate remove would be a second thing to explain.
-      noteItem(trip, item, input.value).catch(() => {})
+      //
+      // Re-enabled whatever happens: a save that was refused, or that
+      // never went because another write held the page, leaves this
+      // editor on screen, and a dead Save button on it would look like
+      // the note had been taken. Where the save did land the card is
+      // redrawn and this node is already gone.
+      noteItem(trip, item, input.value).finally(() => {
+        save.disabled = false
+      })
     })
     return form
   }

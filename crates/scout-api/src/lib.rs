@@ -283,6 +283,9 @@ pub struct MailRow {
     /// `not_booking` | `failed` | `ignored`
     pub reason: String,
     pub forwarded: bool,
+    /// The first decided reading of that mail. One mail can hold several —
+    /// a return ticket is two — and this row stands for the mail, so this
+    /// names one of them rather than all.
     pub arrival_id: Option<i64>,
     pub attachments: Vec<AttachmentRef>,
 }

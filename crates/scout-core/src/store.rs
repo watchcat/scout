@@ -4414,24 +4414,56 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
-    /// A retry replaces the undecided reading of the same mail, so a mail
-    /// worked twice shows once; a reading the owner has already decided on
-    /// is history and stays.
-    pub fn insert_arrival(&self, account_id: i64, mail_id: i64, a: &NewArrival) -> Result<i64> {
+    /// Every reading of one mail, written together. A retry replaces the
+    /// undecided readings of that mail, so a mail worked twice shows once;
+    /// readings the owner has already decided on are history and stay.
+    ///
+    /// The delete runs once for the batch rather than once per row: one
+    /// email can confirm a round trip, and a delete per insert would leave
+    /// only the last leg standing.
+    ///
+    /// All of it in one transaction. Half a batch would be worse than
+    /// none: the worker takes any arrival on a mail as proof it has been
+    /// read, so the legs that did not land would never be read again.
+    pub fn insert_arrivals(&self, account_id: i64, mail_id: i64, rows: &[NewArrival]) -> Result<Vec<i64>> {
         let conn = self.conn();
-        conn.execute("DELETE FROM arrivals WHERE mail_id = ? AND status = 'pending'", params![mail_id])?;
-        Ok(conn.query_row(
-            "INSERT INTO arrivals (account_id, mail_id, booking, kind, title, place, origin, destination,
-                                   date, starts_at, ends_at, timezone, confirmation_code, price, currency,
-                                   travellers, confidence, summary, trip_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-            params![
-                account_id, mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
-                a.date, a.starts_at, a.ends_at, a.timezone, a.confirmation_code, a.price, a.currency,
-                a.travellers, a.confidence, a.summary, a.trip_id
-            ],
-            |r| r.get(0),
-        )?)
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<Vec<i64>> {
+            conn.execute("DELETE FROM arrivals WHERE mail_id = ? AND status = 'pending'", params![mail_id])?;
+            rows.iter()
+                .map(|a| {
+                    Ok(conn.query_row(
+                        "INSERT INTO arrivals (account_id, mail_id, booking, kind, title, place, origin, destination,
+                                               date, starts_at, ends_at, timezone, confirmation_code, price, currency,
+                                               travellers, confidence, summary, trip_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                        params![
+                            account_id, mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
+                            a.date, a.starts_at, a.ends_at, a.timezone, a.confirmation_code, a.price, a.currency,
+                            a.travellers, a.confidence, a.summary, a.trip_id
+                        ],
+                        |r| r.get(0),
+                    )?)
+                })
+                .collect()
+        })();
+        match result {
+            Ok(ids) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(ids)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// The one-reading case, for the tests that want a row and its id
+    /// rather than a batch.
+    pub fn insert_arrival(&self, account_id: i64, mail_id: i64, a: &NewArrival) -> Result<i64> {
+        let mut ids = self.insert_arrivals(account_id, mail_id, std::slice::from_ref(a))?;
+        Ok(ids.remove(0))
     }
 
     /// The arrival, if it is this account's. The owner is part of the key
@@ -4499,21 +4531,28 @@ impl Store {
     pub fn inbox_view(&self, account_id: i64) -> Result<scout_api::InboxView> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
+            // Newest mail first, but the readings of one mail in the order
+            // they were read: the legs of a ticket belong in the ticket's
+            // order, out before back.
             "SELECT {ARRIVAL_SELECT} WHERE a.account_id = ? AND {UNDECIDED}
-             ORDER BY m.received_at DESC, a.id DESC"
+             ORDER BY m.received_at DESC, a.id ASC"
         ))?;
         let mut pending: Vec<scout_api::Arrival> =
             stmt.query_map(params![account_id], arrival_row)?.collect::<duckdb::Result<_>>()?;
         for arrival in &mut pending {
             arrival.attachments = attachments_of(&conn, arrival.mail_id)?;
         }
-        // One undecided arrival per mail is `insert_arrival`'s invariant; the
-        // join leans on it. A mail that spent its attempts without a verdict
-        // — the worker died mid-call — is as failed as one the model
-        // refused. The reasons are ranked: unreadable mail comes first (a
-        // failed mail with an undecided arrival cannot be produced by the
-        // worker, which writes the arrival and only then marks the mail
-        // done), and a non-booking is that before it is anything else.
+        // Other mail lists mail, one row each. One mail can hold several
+        // readings — a return ticket is two — and the join would name it
+        // once per decided reading, so the `QUALIFY` keeps the first and
+        // the row is named by it. A mail that spent its attempts without a
+        // verdict — the worker died mid-call — is as failed as one the
+        // model refused. The reasons are ranked: unreadable mail comes
+        // first (a failed mail with an undecided arrival cannot be produced
+        // by the worker, which writes the arrival and only then marks the
+        // mail done), and a non-booking is that before it is anything else.
+        // The ranking survives the collapse: `failed` is the mail's own
+        // status, so it is every reading of that mail's reason at once.
         let failed = format!("(m.status = 'failed' OR (m.status = 'extracting' AND m.attempts >= {MAIL_ATTEMPTS}))");
         let mut stmt = conn.prepare(&format!(
             "SELECT m.id, m.from_address, m.subject, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ'), m.forwarded_at IS NOT NULL, a.id,
@@ -4523,6 +4562,12 @@ impl Store {
              FROM inbound_mail m LEFT JOIN arrivals a ON a.mail_id = m.id
              WHERE m.account_id = ? AND m.received_at >= ?
                AND ({failed} OR (a.id IS NOT NULL AND (NOT a.booking OR a.status = 'ignored')))
+             -- One row per mail. The partition is ordered by the same rank the
+             -- CASE above uses, so the reason the collapse keeps is the reason
+             -- the mail would have shown anyway: a not-a-booking reading
+             -- outranks an ignored one, and `failed` is the mail's own status
+             -- and so is every row's reason at once.
+             QUALIFY row_number() OVER (PARTITION BY m.id ORDER BY (NOT a.booking) DESC, a.id) = 1
              ORDER BY m.received_at DESC, m.id DESC"
         ))?;
         let mut other: Vec<scout_api::MailRow> = stmt
@@ -8461,6 +8506,81 @@ CREATE TABLE messages (
         assert!(store.decide_arrival(second, a, "ignored", None).unwrap());
         store.insert_arrival(a, m, &reading).unwrap();
         assert!(store.arrival_of(second, a).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_several_readings_of_one_mail_are_written_together_and_replaced_together() {
+        // One email can confirm a round trip. The delete that keeps a retry
+        // from doubling the rows has to run once for the batch, or each
+        // insert wipes the one before it and a leg is lost.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        let legs = |tag: &str| {
+            vec![
+                NewArrival { booking: true, date: Some("2026-11-02".into()), summary: format!("out {tag}"), ..Default::default() },
+                NewArrival { booking: true, date: Some("2026-11-23".into()), summary: format!("back {tag}"), ..Default::default() },
+            ]
+        };
+        let first = store.insert_arrivals(a, m, &legs("first")).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(store.inbox_view(a).unwrap().pending.len(), 2, "both legs are on the page");
+        let second = store.insert_arrivals(a, m, &legs("second")).unwrap();
+        let view = store.inbox_view(a).unwrap();
+        assert_eq!(view.pending.len(), 2, "a retry replaces the two, it does not add two more");
+        assert_eq!(
+            view.pending.iter().map(|p| p.id).collect::<std::collections::HashSet<_>>(),
+            second.iter().copied().collect::<std::collections::HashSet<_>>()
+        );
+        assert!(first.iter().all(|id| store.arrival_of(*id, a).unwrap().is_none()));
+    }
+
+    #[test]
+    fn a_mail_with_several_decided_readings_is_one_row_under_other_mail() {
+        // A round trip both legs of which the owner ignored is still one
+        // email, and Other mail lists mail.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        let ids = store
+            .insert_arrivals(a, m, &[
+                NewArrival { booking: false, summary: "an ad".into(), ..Default::default() },
+                NewArrival { booking: false, summary: "more of the ad".into(), ..Default::default() },
+            ])
+            .unwrap();
+        let view = store.inbox_view(a).unwrap();
+        assert_eq!(view.other.len(), 1, "one mail, one row: {view:?}");
+        assert_eq!((view.other[0].mail_id, view.other[0].arrival_id), (m, Some(ids[0])), "named by its first reading");
+        assert_eq!(view.other[0].reason, "not_booking");
+    }
+
+    #[test]
+    fn the_row_a_mail_collapses_to_keeps_the_reason_it_would_have_shown() {
+        // One mail read as two things: a booking the owner ignored, and
+        // something that was never a booking. The CASE ranks not-a-booking
+        // above ignored, so the collapse has to keep that row rather than
+        // whichever arrived first, or the reason on the page depends on the
+        // order the readings happened to be written in.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        let ids = store
+            .insert_arrivals(a, m, &[
+                NewArrival {
+                    booking: true,
+                    kind: Some("stay".into()),
+                    date: Some("2026-10-12".into()),
+                    summary: "a room".into(),
+                    ..Default::default()
+                },
+                NewArrival { booking: false, summary: "an ad under it".into(), ..Default::default() },
+            ])
+            .unwrap();
+        assert!(store.decide_arrival(ids[0], a, "ignored", None).unwrap());
+        let view = store.inbox_view(a).unwrap();
+        assert_eq!(view.other.len(), 1, "one mail, one row: {view:?}");
+        assert_eq!(view.other[0].reason, "not_booking", "the ranked reason, not the older row's");
+        assert_eq!(view.other[0].arrival_id, Some(ids[1]));
     }
 
     #[test]

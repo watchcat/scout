@@ -483,8 +483,22 @@
   .pending-mark{width:26px; height:26px; display:grid; place-items:center; border:1px dashed var(--yellow);
     border-radius:50%; color:#d1c27e; font-size:13px; font-weight:800}
   .pending-facts{margin:5px 0 0; color:var(--base0); font-size:12.5px}
-  .attachment-links{margin:6px 0 0; display:flex; flex-wrap:wrap; gap:4px 10px; font-size:12px}
-  .attachment-links a{color:var(--cyan); min-width:0; overflow-wrap:anywhere}
+  /* The files a booking arrived with. Chips, not bare text links: see
+     `chat.js::attachmentLinks` for why they had to stop looking like the
+     muted 12px labels they sit under. The border, the 8px radius and the
+     transparent fill are `.trip-download`'s — the other control on this
+     card that opens a file — so nothing new is introduced, only reused at
+     a smaller size. */
+  .attachment-links{margin:7px 0 0; display:flex; flex-wrap:wrap; gap:6px; font-size:12px}
+  .attachment-links a{display:inline-flex; align-items:center; gap:6px; max-width:100%; min-width:0;
+    padding:5px 9px; border:1px solid var(--line); border-radius:8px; background:transparent;
+    color:#6fc5bd; font-weight:650; text-decoration:none}
+  /* The glyph keeps its size while the name shrinks; the name is the one
+     long unbreakable token, and it wraps inside the border. */
+  .attachment-links a svg{flex:none}
+  .attachment-links a span{min-width:0; overflow-wrap:anywhere}
+  .attachment-links a:hover{border-color:var(--cyan); background:rgba(42,161,152,.1); color:var(--base2)}
+  .attachment-links a:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   .pending-actions{display:flex; gap:6px; flex-wrap:wrap; padding:0 16px 14px}
   .pending-actions button, .pending-picker button, .other-mail-add, .handle-row button, .handle-cancel{
     background:transparent; border:1px solid var(--line); border-radius:8px; color:var(--base1);
@@ -614,7 +628,7 @@
        deletes a whole trip was 28px. */
     .pending-actions button, .pending-picker button, .other-mail-add,
     .handle-row button, .handle-cancel, .segment-remove-button,
-    .trip-keep, .trip-download{min-height:42px; padding:10px 14px; font-size:13px}
+    .trip-keep, .trip-download, .attachment-links a{min-height:42px; padding:10px 14px; font-size:13px}
     /* Listed apart from the rule above, not inside it: a media query adds
        no specificity, so this has to come after the desktop
        `.other-mail-remove-button` to beat it on source order. A glyph needs

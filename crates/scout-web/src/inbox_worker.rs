@@ -11,7 +11,7 @@
 //! of the visible parts: the forward is recorded on the row, and the
 //! attachments are fetched only while the row has none.
 
-use crate::resend::{Outgoing, ResendClient};
+use crate::resend::{AttachmentMeta, Meta, Outgoing, ResendClient};
 use scout_core::core::Core;
 use scout_core::inbox::{MailToWork, Placement};
 use std::sync::Arc;
@@ -200,13 +200,19 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
     // does not depend on Resend; else the API's, since the webhook
     // carries none. The record's sender is preferred over the row's copy:
     // the same mail, seen in full rather than capped on the way in.
-    let (sender, subject, text, html, listed) = if m.text.is_some() || m.html.is_some() {
-        (m.from.clone(), m.subject.clone(), m.text.clone(), m.html.clone(), true)
+    //
+    // The record's own part list comes out with the body, because it is
+    // the only thing that says which parts are the mail's furniture — see
+    // `winnow`. On the retry path the body is the row's and there is no
+    // record to have; then the list is empty and only the no-name rule
+    // applies, which is the same answer as a record that says nothing.
+    let (sender, subject, text, html, listed, parts) = if m.text.is_some() || m.html.is_some() {
+        (m.from.clone(), m.subject.clone(), m.text.clone(), m.html.clone(), true, Vec::new())
     } else {
         let r = client.received(&m.provider_id).await.map_err(resend)?;
         scout_core::inbox::mail_body(core, m.id, r.text.clone(), r.html.clone(), BODY_CAP).await.map_err(Failure::Reading)?;
         let sender = if r.from.is_empty() { m.from.clone() } else { r.from };
-        (sender, r.subject.or_else(|| m.subject.clone()), r.text, r.html, !r.attachments.is_empty())
+        (sender, r.subject.or_else(|| m.subject.clone()), r.text, r.html, !r.attachments.is_empty(), r.attachments)
     };
 
     // 2. Attachments, once. A download that fails or is over the cap
@@ -218,7 +224,19 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
     let stored = scout_core::inbox::attachment_texts(core, m.id).await.map_err(Failure::Reading)?;
     let texts = if stored.is_empty() && listed {
         let mut texts = Vec::new();
-        for meta in client.attachments(&m.provider_id).await.map_err(resend)?.into_iter().take(ATTACHMENTS_PER_MAIL) {
+        let (keep, skipped) = winnow(&parts, client.attachments(&m.provider_id).await.map_err(resend)?);
+        if skipped.any() {
+            // Once per mail, counts only. Worth saying because a mail that
+            // loses its ticket this way looks, from the trip card, exactly
+            // like a mail that never had one.
+            tracing::debug!(
+                id = m.id,
+                decoration = skipped.decoration,
+                nameless = skipped.nameless,
+                "parts left out of a mail: the body's own images, and parts with no filename"
+            );
+        }
+        for meta in keep.into_iter().take(ATTACHMENTS_PER_MAIL) {
             let bytes = match client.download(&meta.download_url, ATTACHMENT_CAP).await {
                 Ok(bytes) => Some(bytes),
                 Err(e) => {
@@ -328,6 +346,69 @@ async fn forward(
             Ok(Forwarded::Refused)
         }
     }
+}
+
+/// What one mail's listing lost, by reason. Counts only: a filename is
+/// the sender's text and the log is not the place for it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Skipped {
+    /// Parts the received record marks as the mail's own furniture.
+    decoration: usize,
+    /// Parts with no filename, whatever the record says about them.
+    nameless: usize,
+}
+
+impl Skipped {
+    fn any(&self) -> bool {
+        self.decoration + self.nameless > 0
+    }
+}
+
+/// The listed parts worth keeping, and a count of what was left behind.
+///
+/// Two rules, and the order matters only to the counting:
+///
+/// A part the `record` calls `inline`, or gives a Content-ID, is how an
+/// HTML mail carries the pictures it draws — a signature logo, a header
+/// banner, a tracking pixel. It is not a file the traveller attached
+/// anything to, and stored it becomes a row on the trip card competing
+/// with the ticket. Neither field is documented on `GET
+/// /emails/receiving/{id}`, so when the record carries neither this set
+/// is empty and every part survives: the behaviour before this rule
+/// existed, which is the safe way to be wrong about a provider.
+///
+/// A part with no filename goes regardless of what the record says. The
+/// page renders it as "attachment 12" — its provider id — which tells the
+/// reader nothing they can act on, and a real attachment has a name.
+///
+/// Winnowing happens before `ATTACHMENTS_PER_MAIL`, which is the point:
+/// the cap must be spent on files, not on four logos and a ticket that
+/// did not fit.
+fn winnow(record: &[Meta], listed: Vec<AttachmentMeta>) -> (Vec<AttachmentMeta>, Skipped) {
+    let decoration: std::collections::HashSet<&str> = record
+        .iter()
+        .filter(|m| {
+            m.content_disposition.as_deref().is_some_and(|d| d.trim().eq_ignore_ascii_case("inline"))
+                || m.content_id.as_deref().is_some_and(|c| !c.trim().is_empty())
+        })
+        .map(|m| m.id.as_str())
+        .collect();
+    let mut skipped = Skipped::default();
+    let kept = listed
+        .into_iter()
+        .filter(|a| {
+            if decoration.contains(a.id.as_str()) {
+                skipped.decoration += 1;
+                return false;
+            }
+            if a.filename.trim().is_empty() {
+                skipped.nameless += 1;
+                return false;
+            }
+            true
+        })
+        .collect();
+    (kept, skipped)
 }
 
 /// The attachments that fit under `cap` bytes together, in order, the
@@ -552,6 +633,76 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// A part as the received record lists it.
+    fn part(id: &str, filename: Option<&str>, disposition: Option<&str>, cid: Option<&str>) -> Meta {
+        Meta {
+            id: id.into(),
+            filename: filename.map(Into::into),
+            content_type: Some("application/octet-stream".into()),
+            size: Some(1),
+            content_disposition: disposition.map(Into::into),
+            content_id: cid.map(Into::into),
+        }
+    }
+
+    /// The same part as the list endpoint returns it, with a URL.
+    fn listed(id: &str, filename: &str) -> AttachmentMeta {
+        AttachmentMeta {
+            id: id.into(),
+            filename: filename.into(),
+            size: 1,
+            content_type: "application/octet-stream".into(),
+            download_url: format!("https://example.invalid/dl/{id}"),
+        }
+    }
+
+    #[test]
+    fn the_mails_decoration_is_left_off_and_a_record_that_says_nothing_leaves_everything_on() {
+        // The four shapes one leg actually arrived with: a logo the body
+        // draws, a calendar invite the mailer marked inline, a part sent
+        // with no filename at all, and the one thing the traveller wants.
+        let record = [
+            part("att_logo", Some("logo.png"), Some("inline"), Some("<logo@mailer>")),
+            part("att_cal", Some("Add_to_your_calendar.ics"), Some("INLINE"), None),
+            part("att_12", None, None, None),
+            part("att_tkt", Some("Electronic_ticket.pdf"), Some("attachment"), None),
+        ];
+        let all = vec![
+            listed("att_logo", "logo.png"),
+            listed("att_cal", "Add_to_your_calendar.ics"),
+            // The list endpoint defaults a missing name to the empty
+            // string, which is what `attachmentLinks` renders as
+            // "attachment 12" — a label that tells the reader nothing.
+            listed("att_12", ""),
+            listed("att_tkt", "Electronic_ticket.pdf"),
+        ];
+        let (kept, skipped) = winnow(&record, all.clone());
+        assert_eq!(kept.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["att_tkt"]);
+        assert_eq!(skipped, Skipped { decoration: 2, nameless: 1 });
+
+        // A record that carries neither field — which is every record
+        // Resend is documented to send — changes nothing. Only the part
+        // with no name goes, because a real attachment has one.
+        let silent: Vec<Meta> = record.iter().map(|m| part(&m.id, m.filename.as_deref(), None, None)).collect();
+        let (kept, skipped) = winnow(&silent, all.clone());
+        assert_eq!(kept.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["att_logo", "att_cal", "att_tkt"]);
+        assert_eq!(skipped, Skipped { decoration: 0, nameless: 1 });
+
+        // And no record at all — the retry path, where the body came off
+        // the row and Resend was never asked — is the same again.
+        let (kept, _) = winnow(&[], all);
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn a_name_that_is_only_spaces_is_no_name() {
+        // `attachmentLinks` would render this as a chip the reader cannot
+        // see the label of, which is worse than not offering it.
+        let (kept, skipped) = winnow(&[], vec![listed("att_1", "   ")]);
+        assert!(kept.is_empty());
+        assert_eq!(skipped, Skipped { decoration: 0, nameless: 1 });
+    }
+
     #[test]
     fn the_extractor_sees_the_body_then_each_attachments_text_within_the_cap() {
         let text = assemble(Some("Body"), None, &[("ticket.pdf", Some("Row 12")), ("logo.png", None)], 50);
@@ -704,6 +855,72 @@ mod tests {
         scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
         work_once(&core, &client, FROM, 10).await;
         assert_eq!(fetches(&server.received_requests().await.unwrap()), 1);
+    }
+
+    #[tokio::test]
+    async fn only_the_ticket_is_kept_out_of_a_mail_of_logos() {
+        // The leg the owner reported: four parts listed, one of them the
+        // thing they came for. Every step is the real one — record, list,
+        // download, store — so this fails if the winnowing is done
+        // anywhere the worker does not actually look.
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/emails/receiving/re_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "re_1", "from": "airline@example.com", "subject": "Your booking",
+                "text": "Row 12", "html": "<p>Row 12</p>",
+                "attachments": [
+                    {"id": "att_logo", "filename": "attachment-1.png", "content_type": "image/png", "size": 9, "content_disposition": "inline"},
+                    {"id": "att_cal", "filename": "Add_to_your_calendar.ics", "content_type": "text/calendar", "size": 9, "content_id": "<cal@mailer>"},
+                    {"id": "att_12", "content_type": "image/gif", "size": 9},
+                    {"id": "att_tkt", "filename": "Electronic_ticket.pdf", "content_type": "application/pdf", "size": 3, "content_disposition": "attachment"},
+                ],
+            })))
+            .mount(&server).await;
+        let listing = |id: &str, name: Option<&str>, kind: &str| {
+            let mut part = json!({"id": id, "size": 3, "content_type": kind, "download_url": format!("{}/dl/{id}", server.uri())});
+            if let Some(name) = name {
+                part["filename"] = json!(name);
+            }
+            part
+        };
+        Mock::given(method("GET")).and(path("/emails/receiving/re_1/attachments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": [
+                listing("att_logo", Some("attachment-1.png"), "image/png"),
+                listing("att_cal", Some("Add_to_your_calendar.ics"), "text/calendar"),
+                // No `filename` key at all, which is how the part with no
+                // name reaches us — `AttachmentMeta::filename` defaults.
+                listing("att_12", None, "image/gif"),
+                listing("att_tkt", Some("Electronic_ticket.pdf"), "application/pdf"),
+            ]})))
+            .mount(&server).await;
+        for id in ["att_logo", "att_cal", "att_12", "att_tkt"] {
+            Mock::given(method("GET")).and(path(format!("/dl/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF".to_vec())).mount(&server).await;
+        }
+        Mock::given(method("POST")).and(path("/emails"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "sent_1"}))).mount(&server).await;
+
+        let (_app, core, _dir) = test_app().await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        scout_core::inbox::seed_email_identity_for_tests(&core, a, "me@example.com").await.unwrap();
+        let mail_id = scout_core::inbox::record_mail(&core, a, a_mail("re_1")).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+
+        let stored = scout_core::inbox::attachment_texts(&core, mail_id).await.unwrap();
+        assert_eq!(
+            stored.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            ["Electronic_ticket.pdf"],
+            "the ticket was crowded out by the mail's own decoration"
+        );
+        // Not stored is also not downloaded: three fetches we do not make.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.iter().filter(|r| r.url.path().starts_with("/dl/")).count(), 1);
+        // The forward still carries what survived, and still goes.
+        let forward: serde_json::Value = serde_json::from_slice(&reqs.iter().find(|r| r.url.path() == "/emails").unwrap().body).unwrap();
+        assert_eq!(forward["attachments"][0]["filename"], "Electronic_ticket.pdf");
+        assert_eq!(forward["attachments"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

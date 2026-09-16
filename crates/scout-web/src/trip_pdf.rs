@@ -33,6 +33,10 @@ const MAX_CANDIDATES_PER_ITEM: usize = 64;
 /// prints is bounded by this file. One mail could carry a hundred files.
 const MAX_ATTACHMENTS_PER_ITEM: usize = 32;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
+/// How many calendar days apart two legs have to be before they stop being
+/// a join. Three, not one, because `days_apart` is coarse in the direction
+/// that would go quiet — see there. The page holds the same number.
+const DAYS_APART: i64 = 2;
 
 static PDF_SLOTS: OnceLock<Semaphore> = OnceLock::new();
 
@@ -611,14 +615,12 @@ fn connection(
     if item_between {
         return None;
     }
-    // Minutes where they are real, days where they are all there is. Two
-    // local calendar days are coarse by up to a day across a change of
-    // zone, which the day of slack in the threshold absorbs — and the
-    // error can only make this say "closer together", which is the side
-    // that warns rather than the side that goes quiet.
+    // Minutes where they are real — one airport, two decided flights, two
+    // clocks that mean the same thing — and calendar days where they are
+    // all there is. See `days_apart` for why that threshold is two.
     let apart = match minutes {
         Some(minutes) => minutes > 24 * 60,
-        None => days_between(before, after) > 1,
+        None => days_apart(before, after) > DAYS_APART,
     };
     if apart {
         return None;
@@ -665,24 +667,18 @@ fn connection(
     ))
 }
 
-/// Whole days from the day one leg lands to the day the next leaves, from
-/// whatever this plan knows: the chosen options' own stamps, and the legs'
-/// dates where an option has none or none was chosen. A date that will not
-/// parse leaves the two treated as adjacent, so the check still runs —
-/// silence is what costs somebody a connection.
-fn days_between(before: &TripItem, after: &TripItem) -> i64 {
-    let day = |stamp: Option<&str>, fallback: &str| {
-        NaiveDate::parse_from_str(stamp.unwrap_or(fallback).get(..10).unwrap_or(""), "%Y-%m-%d").ok()
+/// Whole days from the day one leg leaves to the day the next one leaves.
+/// The paper half of `chat.js::daysApart`, and the comment there is the
+/// long version: both sides are the same kind of day on purpose, the
+/// measure errs only towards looking further apart than the legs are, and
+/// `DAYS_APART` is the slack that buys back. A date that will not parse
+/// leaves the two treated as adjacent, so the check still runs — silence
+/// is what costs somebody a connection.
+fn days_apart(before: &TripItem, after: &TripItem) -> i64 {
+    let day = |item: &TripItem| {
+        NaiveDate::parse_from_str(item.date.get(..10).unwrap_or(""), "%Y-%m-%d").ok()
     };
-    let from = day(
-        selected(before).and_then(|c| c.arriving_at_local.as_deref()),
-        &before.date,
-    );
-    let to = day(
-        selected(after).and_then(|c| c.departing_at_local.as_deref()),
-        &after.date,
-    );
-    match from.zip(to) {
+    match day(before).zip(day(after)) {
         Some((from, to)) => (to - from).num_days(),
         None => 0,
     }
@@ -873,6 +869,24 @@ pub fn html(plan: &Plan) -> String {
 mod tests {
     use super::*;
     use scout_core::trips::{Plan, Trip, TripCandidate, TripItem};
+
+    /// A chosen option with nothing on it but the fact of being chosen:
+    /// a base for the cases that care only about times and airports.
+    fn candidate() -> TripCandidate {
+        TripCandidate {
+            candidate: 1,
+            chosen: true,
+            airline: "KLM".to_string(),
+            flight_numbers: "KL1579".to_string(),
+            itinerary: "somewhere".to_string(),
+            departing_at_local: None,
+            arriving_at_local: None,
+            duration_minutes: None,
+            quoted_price: None,
+            quoted_currency: None,
+            source: None,
+        }
+    }
 
     /// A flight leg as `load_trip` reads one: its time of day comes from
     /// the chosen option, the columns a stay uses are empty.
@@ -1099,6 +1113,53 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_connection_cases_decide_the_same_way_here_as_on_the_page() {
+        // `connection_gaps.json` is read by this test and by the matching
+        // one in chat.test.mjs. The page and this plan draw the same card
+        // in the same places from two implementations, and that file is
+        // the only thing that makes one of them go red when the other's
+        // threshold moves — the calendar-day fallback in particular is
+        // reached by none of the hand-written cases on either side.
+        let gaps: serde_json::Value =
+            serde_json::from_str(include_str!("connection_gaps.json")).unwrap();
+        let cases = gaps["cases"].as_array().unwrap();
+        assert!(cases.len() >= 12, "the shared cases went missing");
+        let leg = |side: &serde_json::Value| {
+            let stamp = |key: &str| side[key].as_str().map(str::to_string);
+            let (arriving, departing) = (stamp("arriving_at_local"), stamp("departing_at_local"));
+            let decided = arriving.is_some() || departing.is_some() || side["chosen"] == true;
+            TripItem {
+                origin: side["origin"].as_str().map(str::to_string),
+                destination: side["destination"].as_str().map(str::to_string),
+                date: side["date"].as_str().unwrap().to_string(),
+                candidates: match decided {
+                    false => Vec::new(),
+                    true => vec![TripCandidate {
+                        arriving_at_local: arriving,
+                        departing_at_local: departing,
+                        ..candidate()
+                    }],
+                },
+                ..flight(1, "AAA", "BBB", candidate())
+            }
+        };
+        for case in cases {
+            let drawn = connection(
+                &leg(&case["before"]),
+                &leg(&case["after"]),
+                case["item_between"] == true,
+            );
+            let got = match &drawn {
+                None => "none",
+                Some((_, "ok")) => "fine",
+                Some((_, "warn")) => "warning",
+                Some((_, tone)) => tone,
+            };
+            assert_eq!(got, case["expect"].as_str().unwrap(), "{}", case["name"]);
+        }
+    }
+
+    #[test]
     fn the_printed_plan_draws_a_join_only_where_the_page_would() {
         // The paper half of `chat.js::connectionCheck`. This plan's two
         // legs are a same-day connection with a hotel booked between them,
@@ -1107,9 +1168,15 @@ mod tests {
         let mut joined = plan();
         assert!(!html(&joined).contains("Connection:"), "{}", html(&joined));
 
-        // Nothing between them, and it is a join again.
+        // Nothing between them, and it is a join again — saying how long
+        // it is and where, which is the whole use of the card. The shared
+        // cases pin which card appears; only this pins what it reads.
         joined.trip.items.remove(1);
-        assert!(html(&joined).contains("tight connection"), "{}", html(&joined));
+        let page = html(&joined);
+        assert!(
+            page.contains("1h 35m at LIS — tight connection; allow at least 3 hours between separate tickets."),
+            "{page}",
+        );
 
         // A week apart is not a connection however little sits between.
         let mut apart = joined.clone();

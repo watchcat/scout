@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
   applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow,
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
@@ -258,6 +259,28 @@ test('the join between selected flights is checked on the shared local clock', (
   assert.deepEqual(connectionCheck(before, tight), {
     tone: 'danger', text: '1h 15m at LIS — tight connection; allow at least 3 hours between separate tickets.',
   })
+})
+
+test('the shared connection cases decide the same way here as on paper', () => {
+  // `connection_gaps.json` is read by this test and by the printed plan's
+  // tests in trip_pdf.rs. The page and the plan draw this card in the same
+  // places from two implementations, and this file is the only thing that
+  // makes one of them go red when the other's threshold moves.
+  const gaps = JSON.parse(readFileSync(new URL('./connection_gaps.json', import.meta.url), 'utf8'))
+  const tones = { ready: 'fine', warning: 'warning', danger: 'danger' }
+  const leg = (side) => ({
+    destination: side.destination,
+    origin: side.origin,
+    date: side.date,
+    candidates: side.arriving_at_local || side.departing_at_local || side.chosen
+      ? [{ chosen: true, arriving_at_local: side.arriving_at_local, departing_at_local: side.departing_at_local }]
+      : [],
+  })
+  assert.ok(gaps.cases.length >= 12, 'the shared cases went missing')
+  for (const gap of gaps.cases) {
+    const check = connectionCheck(leg(gap.before), leg(gap.after), { itemBetween: gap.item_between ?? false })
+    assert.equal(check === null ? 'none' : tones[check.tone], gap.expect, gap.name)
+  }
 })
 
 test('a week in Hong Kong is not a connection', () => {

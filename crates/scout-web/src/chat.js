@@ -282,22 +282,37 @@ export function durationLabel(minutes) {
 }
 
 const DAY_MINUTES = 24 * 60
+// How many calendar days apart two legs have to be before they stop being
+// a join. Three, not one, because `daysApart` is coarse in the direction
+// that would go quiet — see there.
+const DAYS_APART = 2
 
-// Whole days from the day one leg lands to the day the next one leaves,
-// from whatever the page knows: the chosen options' own timestamps, and
-// the legs' dates where an option has none or has not been chosen.
+// Whole days from the day one leg leaves to the day the next one leaves.
 //
-// Only used where the minutes cannot be had — the two legs leave from
-// different airports, so their clocks are local to different places and
-// subtracting them would be meaningless. Two local calendar days are
-// coarse by up to a day for the same reason, which is why a day of slack
-// is built into the threshold: the error can only make this say "closer
-// together than they are", and closer together is the side that warns.
-function daysBetween(before, after, arrival, departure) {
-  const day = (stamp, fallback) => String(stamp ?? fallback ?? '').slice(0, 10)
-  const from = Date.parse(`${day(arrival?.arriving_at_local, before?.date)}T00:00:00Z`)
-  const to = Date.parse(`${day(departure?.departing_at_local, after?.date)}T00:00:00Z`)
-  const days = (to - from) / 86400000
+// Both sides are the same kind of day on purpose. An earlier version took
+// the arrival stamp on the left and fell back to the leg's date, which is
+// its *departure*: the same pair then landed on either side of the
+// threshold depending only on whether an option had been chosen, and
+// "Choose both flights to check this connection" disappeared on exactly
+// the overnight long-hauls that need it. A leg's `date` is the day it
+// leaves and so is its chosen option's stamp, so the date alone says it
+// with nothing to mix up.
+//
+// What that costs is precision, in one direction: a departure-to-departure
+// gap is longer than the join by the first leg's own flight time, and two
+// local calendars can be up to 26 hours out of step with each other. Both
+// errors make two legs look further apart than they are, which is the
+// silent side, so the threshold carries two days of slack. The residual is
+// a genuine transfer more than two days out going unremarked — which is
+// the gap the traveller has most obviously planned around.
+//
+// Only reached where the minutes are not available: the two legs leave
+// from different airports, so their clocks are local to different places
+// and subtracting them would be meaningless, or one of them has no flight
+// decided to take a time from.
+function daysApart(before, after) {
+  const day = (item) => String(item?.date ?? '').slice(0, 10)
+  const days = (Date.parse(`${day(after)}T00:00:00Z`) - Date.parse(`${day(before)}T00:00:00Z`)) / 86400000
   // A date this page cannot read leaves the two legs treated as adjacent,
   // so the check still runs. Silence is what costs somebody a connection.
   return Number.isFinite(days) ? days : 0
@@ -308,13 +323,13 @@ function daysBetween(before, after, arrival, departure) {
 // they name the same airport: both clocks are local to that place. This is
 // the same boundary core uses.
 //
-// Two flights a week apart are not a connection, and neither is a pair
-// with something planned between them — the renderer pairs a flight with
-// the *next* flight, whatever sits between, so seven days in Hong Kong
-// between an outbound and a return was announced as a connection with
-// "168h at HKG" on it. Whether an item sits between is the renderer's
-// knowledge, not this function's, so it is passed in rather than guessed
-// at from two legs that cannot see the trip they are on.
+// Two flights far enough apart are not a connection, and neither is a
+// pair with something planned between them — the renderer pairs a flight
+// with the *next* flight, whatever sits between, so seven days in Hong
+// Kong between an outbound and a return was announced as a connection
+// with "168h at HKG" on it. Whether an item sits between is the
+// renderer's knowledge, not this function's, so it is passed in rather
+// than guessed at from two legs that cannot see the trip they are on.
 //
 // One thing survives both silences: a flight scheduled to leave before the
 // previous one lands is impossible however long the gap and whatever is
@@ -342,8 +357,10 @@ export function connectionCheck(before, after, { itemBetween = false } = {}) {
     return { tone: 'danger', text: `Impossible connection at ${before.destination}: the next flight leaves before arrival.` }
   }
   if (itemBetween) return null
-  // Minutes where they are real, days where they are all there is.
-  const apart = minutes !== null ? minutes > DAY_MINUTES : daysBetween(before, after, arrival, departure) > 1
+  // Minutes where they are real — one airport, two decided flights, two
+  // clocks that mean the same thing — and calendar days where they are
+  // all there is.
+  const apart = minutes !== null ? minutes > DAY_MINUTES : daysApart(before, after) > DAYS_APART
   if (apart) return null
 
   if (!arrival || !departure) {

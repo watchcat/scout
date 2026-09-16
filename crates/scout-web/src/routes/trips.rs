@@ -26,6 +26,7 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/trips/keep", post(keep))
         .route("/chat/trips/choice", post(choose))
         .route("/chat/trips/segment", post(add_leg).delete(remove_leg))
+        .route("/chat/trips/item-note", post(note_item))
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             super::only_from_our_own_pages,
@@ -298,6 +299,64 @@ struct RemoveItemIn {
     date: Option<String>,
 }
 
+/// What the page sends to write a note. The item is named the way
+/// `RemoveItemIn` names one — a position plus what the card showed — for
+/// the same reason: positions are recomputed on every write, so a tab
+/// holding an older copy of the trip could otherwise write a link onto
+/// whatever has since taken that number.
+///
+/// `note` absent, `null`, or blank all clear the field. There is no
+/// separate "clear" request because there is no difference to draw: the
+/// page's box is empty in both cases, and a second endpoint would be a
+/// second thing to keep in step with `note_text`.
+#[derive(serde::Deserialize)]
+struct NoteItemIn {
+    trip: String,
+    position: i64,
+    origin: Option<String>,
+    destination: Option<String>,
+    title: Option<String>,
+    #[serde(alias = "departure_date")]
+    date: Option<String>,
+    note: Option<String>,
+}
+
+async fn note_item(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<NoteItemIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    match scout_core::trips::note_item(
+        &auth.core,
+        account_id,
+        &body.trip,
+        body.position,
+        scout_core::trips::ItemExpectation {
+            origin: body.origin,
+            destination: body.destination,
+            title: body.title,
+            date: body.date,
+        },
+        body.note,
+    )
+    .await
+    {
+        Ok(out) => leg_response(out),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not note a trip item");
+            sorry()
+        }
+    }
+}
+
 async fn remove_leg(
     axum::extract::State(auth): axum::extract::State<AuthState>,
     headers: HeaderMap,
@@ -316,7 +375,7 @@ async fn remove_leg(
         account_id,
         &body.trip,
         body.position,
-        scout_core::trips::RemoveExpectation {
+        scout_core::trips::ItemExpectation {
             origin: body.origin,
             destination: body.destination,
             title: body.title,
@@ -934,6 +993,91 @@ mod tests {
             "the guard refused before touching anything"
         );
         assert_eq!(trip.trip.items[0].destination.as_deref(), Some("LIS"));
+    }
+
+    #[test]
+    fn the_box_the_page_offers_holds_what_the_store_accepts() {
+        // Two copies of one number, and the cheap failure is the box that
+        // takes more than the store will: the traveller types a note, is
+        // told nothing, and loses it on save. `note_text` is the rule; this
+        // is what keeps the page's `maxLength` standing next to it.
+        let js = include_str!("../chat.js");
+        let line = js
+            .lines()
+            .find(|line| line.contains("export const NOTE_MAX_CHARS"))
+            .expect("the page must say how long a note may be");
+        assert!(
+            line.contains(&scout_core::trips::MAX_NOTE_CHARS.to_string()),
+            "the page offers a different length than the store accepts: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_note_is_written_from_the_page_and_a_stale_card_is_a_conflict() {
+        // The page's half of the request behind this feature: a link for an
+        // item already on the trip. The body is a stay card's — a title and
+        // a date — and it is checked the way a removal's is, because a note
+        // on the wrong item is a mistake the page never announces.
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        scout_core::trips::seed_item_for_tests(
+            &core,
+            account_id,
+            "October",
+            "activity",
+            "Lunch with Stanley",
+            "2026-10-12",
+        )
+        .await
+        .unwrap();
+        let link = "https://www.google.com/maps/search/?api=1&query=Queen%27s+Cafe";
+
+        let stale = post_json(
+            &app,
+            "/chat/trips/item-note",
+            &cookie,
+            Some(&csrf),
+            &format!(r#"{{"trip":"October","position":2,"title":"Dinner with Stanley","date":"2026-10-12","note":"{link}"}}"#),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let res = post_json(
+            &app,
+            "/chat/trips/item-note",
+            &cookie,
+            Some(&csrf),
+            &format!(r#"{{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","note":"{link}"}}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(response["items"][1]["notes"], link);
+
+        // No CSRF header is the same refusal every write on this router
+        // gives, and it must reach the store no more than the stale one did.
+        let bare = post_json(
+            &app,
+            "/chat/trips/item-note",
+            &cookie,
+            None,
+            r#"{"trip":"October","position":2,"title":"Lunch with Stanley","note":"elsewhere"}"#,
+        )
+        .await;
+        assert_eq!(bare.status(), StatusCode::BAD_REQUEST);
+
+        // Sending nothing clears it, which is how the page's empty box is
+        // meant to read.
+        let res = post_json(
+            &app,
+            "/chat/trips/item-note",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert!(response["items"][1]["notes"].is_null(), "{response}");
     }
 
     #[tokio::test]

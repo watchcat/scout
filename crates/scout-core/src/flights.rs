@@ -10,7 +10,8 @@ use crate::agent::{fare_market, rules_for_available_tools, AgentDeps};
 use crate::specialist::{Finding, Specialist, SPECIALIST_BUDGET};
 use crate::tools::trips::{
     AddTripItemTool, AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
-    DropTripSegmentTool, FinaliseTripTool, KeepTripTool, ShowTripTool, UpdateTripSegmentTool,
+    DropTripSegmentTool, FinaliseTripTool, KeepTripTool, NoteTripItemTool, ShowTripTool,
+    UpdateTripSegmentTool,
 };
 use rig::client::CompletionClient;
 
@@ -27,6 +28,7 @@ pub const FLIGHT_TOOLS: &[&str] = &["flight_booking_links", "create_booking_link
 const TRIP_TOOLS: &[&str] = &[
     "add_trip_segment",
     "add_trip_item",
+    "note_trip_item",
     "add_trip_option",
     "choose_trip_option",
     "show_trip",
@@ -98,6 +100,11 @@ segment, so call finalise_trip when the brief says the trip is settled, \
 not to check on it. When the brief says the traveller has a hotel, a \
 ticket or a train, add it with add_trip_item; a trip holds stays and \
 activities as well as flights, and they are shown, not searched.
+- When the brief carries a link, a meeting place or a reminder about \
+something already on the trip, call note_trip_item on that item. Never add \
+a second item to carry one and never drop and re-add an item to give it \
+one: both leave the traveller a duplicate day or a renumbered trip for the \
+sake of a sentence. Sending no note clears the note that is there.
 - When the brief asks to keep a named trip, call keep_trip with that name \
 and report that it is kept. Such a brief comes back after the traveller \
 was shown the draft and said yes, so there is nothing left to ask and \
@@ -192,6 +199,7 @@ pub fn build_flight_agent(
         // design (spec decision: everything flight-shaped moves).
         .tool(AddTripSegmentTool { store: d.store.clone(), account_id, conversation_id })
         .tool(AddTripItemTool { store: d.store.clone(), account_id, conversation_id })
+        .tool(NoteTripItemTool { store: d.store.clone(), account_id })
         .tool(AddTripOptionTool {
             store: d.store.clone(),
             account_id,
@@ -439,7 +447,10 @@ per segment is a ticket per segment, and the traveller carries the risk at \
 every join. If the single-ticket total is missing, say that it is missing - \
 it is not evidence that separate booking is better. A trip may hold stays, \
 activities and transport beside its flights; present them in the order \
-given, and say when an item is booked and its confirmation code. \
+given, and say when an item is booked and its confirmation code. An item's \
+notes field is the traveller's own words about it - a link they sent, where \
+to meet, what to ask for - so read it back as theirs and never write \
+anything of your own into one. \
 finalise_trip's fixed_costs are those items' prices as recorded; add them \
 to the flight totals in words, never silently. A flight the traveller \
 already holds a ticket for is one of those fixed costs, at what they paid: \
@@ -577,6 +588,28 @@ mod tests {
         // No trip at all: nothing to offer, and nothing to name.
         let text = guidance(&[ran("search_flights", json!({"route": "AMS-LIS"}))], 0.0).join("\n");
         assert!(!text.contains("draft"), "got: {text}");
+    }
+
+    #[test]
+    fn a_note_written_on_an_item_brings_the_trip_rules_and_says_whose_words_it_is() {
+        // note_trip_item is a trip edit like any other, so a turn that only
+        // wrote a note still gets the rules for presenting the trip it
+        // returned. And the rule the tool cannot enforce belongs here: a
+        // note is quoted, not composed — Scout writing its own reasoning
+        // into the traveller's note is how a field for "meet at the blue
+        // door" fills up with things nobody said.
+        let view = json!({
+            "trip": {"name": "Lisbon", "adults": 1, "status": "planning", "items": [], "kept": true},
+            "readiness": {"state": "ready", "legs": []},
+            "changed": "the note on Lunch with Stanley is saved",
+            "notes": [],
+        });
+        let text = guidance(&[ran("note_trip_item", view)], 0.0).join("\n");
+        assert!(text.contains("A trip may hold stays"), "the trip rules are missing: {text}");
+        assert!(text.contains("note"), "got: {text}");
+        // The desk is the half that holds the tool, so the rule that stops
+        // it building a duplicate item to carry a link lives in its prompt.
+        assert!(FLIGHT_PREAMBLE.contains("note_trip_item"), "the desk was never told it can note an item");
     }
 
     #[test]

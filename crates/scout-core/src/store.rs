@@ -3600,50 +3600,64 @@ impl Store {
         expected: ExpectedItem<'_>,
     ) -> Result<bool> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, origin, destination, title, date FROM trip_items
-             WHERE trip_id = ? AND position = ?",
-        )?;
-        /// What the row says the item is, for comparing with what the
-        /// caller saw.
-        struct Seen {
-            id: i64,
-            origin: Option<String>,
-            destination: Option<String>,
-            title: String,
-            date: String,
-        }
-        let item: Option<Seen> = stmt
-            .query_map(params![trip_id, position], |r| {
-                Ok(Seen {
-                    id: r.get(0)?,
-                    origin: r.get(1)?,
-                    destination: r.get(2)?,
-                    title: r.get(3)?,
-                    date: r.get(4)?,
-                })
-            })?
-            .next()
-            .transpose()?;
-        drop(stmt);
-        let Some(item) = item else {
+        let Some(item_id) = item_still_seen(&conn, trip_id, position, expected)? else {
             return Ok(false);
         };
-        // `None` is "nothing to verify", not "verified" — the same reading
-        // `add_candidate` gives these fields, so a caller that has only a
-        // route to go on is not quietly granted a free pass on the date.
-        let seen = |expected: Option<&str>, actual: Option<&str>| {
-            expected.is_none_or(|e| actual == Some(e))
-        };
-        if !seen(expected.origin, item.origin.as_deref())
-            || !seen(expected.destination, item.destination.as_deref())
-            || !seen(expected.title, Some(&item.title))
-            || !seen(expected.date, Some(&item.date))
-        {
-            return Ok(false);
-        }
-        remove_item_within(&conn, trip_id, item.id)?;
+        remove_item_within(&conn, trip_id, item_id)?;
         Ok(true)
+    }
+
+    /// Writes one item's note, or clears it when `note` is `None` — the
+    /// traveller's own words about this booking, which is where a map link
+    /// or a "ask for the terrace" lives. Nothing here reads it.
+    ///
+    /// Returns the trip and whether anything changed, the way
+    /// `update_flight` does: a note that already says exactly this is not a
+    /// failure, and a caller that has to tell the traveller what it did has
+    /// to be able to tell the two apart.
+    ///
+    /// The lookup and the write share the one `self.conn()` for the reason
+    /// The traveller's note, but only on the item the caller still says it
+    /// is looking at — `remove_item_checked`'s guard, and worth more here
+    /// rather than less. A stale tab that removes the wrong item shows the
+    /// traveller something missing; one that writes a map link onto the
+    /// wrong item shows them nothing at all, and the mistake keeps.
+    ///
+    /// `false` is "that is not the item you drew", which the caller answers
+    /// by re-reading, exactly as a refused removal does.
+    pub fn note_item_checked(
+        &self,
+        trip_id: i64,
+        position: i64,
+        expected: ExpectedItem<'_>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let Some(item_id) = item_still_seen(&conn, trip_id, position, expected)? else {
+            return Ok(false);
+        };
+        note_item_within(&conn, trip_id, item_id, note)?;
+        Ok(true)
+    }
+
+    /// `remove_item_checked` spells out: positions are recomputed on every
+    /// write, so an id read under one acquisition and written under the
+    /// next can be a different item by then.
+    ///
+    /// The note's length is capped at both doors — the model's tool and the
+    /// browser's route — through `tools::trips::note_text`, and not here,
+    /// the same division dates and airport codes already follow.
+    pub fn note_item(
+        &self,
+        trip_id: i64,
+        position: i64,
+        note: Option<&str>,
+    ) -> Result<(Trip, bool)> {
+        let conn = self.conn();
+        let Some((item_id, _)) = item_at(&conn, trip_id, position)? else {
+            anyhow::bail!("this trip has no segment {position}");
+        };
+        note_item_within(&conn, trip_id, item_id, note)
     }
 
     /// Parks a flight against a flight item. `decided` also marks it
@@ -3897,6 +3911,65 @@ fn item_at(conn: &Connection, trip_id: i64, position: i64) -> Result<Option<(i64
     Ok(found)
 }
 
+/// The id of the item at `position`, but only while it is still the item
+/// the caller says it saw. `None` means the caller's picture is stale —
+/// nothing there any more, or something else there now.
+///
+/// Takes `&Connection` so the check and the write it guards happen under
+/// one acquisition of the store's non-reentrant mutex: every write
+/// renumbers, so a check and a write under two acquisitions can be about
+/// two different items. Shared by `remove_item_checked` and
+/// `note_item_checked` so a stale tab means the same thing to both.
+fn item_still_seen(
+    conn: &Connection,
+    trip_id: i64,
+    position: i64,
+    expected: ExpectedItem<'_>,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, origin, destination, title, date FROM trip_items
+         WHERE trip_id = ? AND position = ?",
+    )?;
+    /// What the row says the item is, for comparing with what the caller
+    /// saw.
+    struct Seen {
+        id: i64,
+        origin: Option<String>,
+        destination: Option<String>,
+        title: String,
+        date: String,
+    }
+    let item: Option<Seen> = stmt
+        .query_map(params![trip_id, position], |r| {
+            Ok(Seen {
+                id: r.get(0)?,
+                origin: r.get(1)?,
+                destination: r.get(2)?,
+                title: r.get(3)?,
+                date: r.get(4)?,
+            })
+        })?
+        .next()
+        .transpose()?;
+    drop(stmt);
+    let Some(item) = item else {
+        return Ok(None);
+    };
+    // `None` is "nothing to verify", not "verified" — the same reading
+    // `add_candidate` gives these fields, so a caller that has only a
+    // route to go on is not quietly granted a free pass on the date.
+    let seen =
+        |expected: Option<&str>, actual: Option<&str>| expected.is_none_or(|e| actual == Some(e));
+    if !seen(expected.origin, item.origin.as_deref())
+        || !seen(expected.destination, item.destination.as_deref())
+        || !seen(expected.title, Some(&item.title))
+        || !seen(expected.date, Some(&item.date))
+    {
+        return Ok(None);
+    }
+    Ok(Some(item.id))
+}
+
 /// Clears the item's flags and sets one. "At most one chosen" cannot be a
 /// `UNIQUE` constraint because `false` repeats, so it is this function's
 /// job — and the caller always holds the connection lock, which is what
@@ -4075,6 +4148,49 @@ fn remove_item_within(conn: &Connection, trip_id: i64, item_id: i64) -> Result<T
     reorder_items(conn, trip_id)?;
     touch(conn, trip_id)?;
     load_trip(conn, trip_id)
+}
+
+/// Writes an item's note by id, and says whether that changed anything.
+///
+/// Takes `&Connection` for the reason `remove_item_within` does: the
+/// caller has already turned a position into this id and must not release
+/// the lock in between.
+///
+/// A blank note is no note. Both doors trim before they get here, but the
+/// normalisation is repeated rather than assumed, so that clearing a note
+/// and never having written one are the same row for every caller —
+/// including the tests and anything added later that reaches the store
+/// directly.
+///
+/// No `reorder_items`: nothing a note touches sorts the timeline, so the
+/// positions the caller is holding stay the positions it drew. No `touch`
+/// either — that would put a finalised trip back to `planning`, and a note
+/// changes nothing that was priced. The trip's `updated_at` does move: the
+/// traveller edited this trip, and the list they see is ordered by it.
+fn note_item_within(
+    conn: &Connection,
+    trip_id: i64,
+    item_id: i64,
+    note: Option<&str>,
+) -> Result<(Trip, bool)> {
+    let note = note.map(str::trim).filter(|note| !note.is_empty());
+    let current: Option<String> = conn.query_row(
+        "SELECT notes FROM trip_items WHERE id = ?",
+        params![item_id],
+        |row| row.get(0),
+    )?;
+    if current.as_deref() == note {
+        return Ok((load_trip(conn, trip_id)?, false));
+    }
+    conn.execute(
+        "UPDATE trip_items SET notes = ?, updated_at = current_timestamp WHERE id = ?",
+        params![note, item_id],
+    )?;
+    conn.execute(
+        "UPDATE trips SET updated_at = current_timestamp WHERE id = ?",
+        params![trip_id],
+    )?;
+    Ok((load_trip(conn, trip_id)?, true))
 }
 
 /// What becomes of the files these items are carrying, called just before
@@ -7695,6 +7811,77 @@ CREATE TABLE trips (
     }
 
     #[test]
+    fn a_note_belongs_to_the_item_and_not_to_where_it_sits() {
+        // The whole point of a note: the traveller pastes a map link onto
+        // the lunch, and it is still on the lunch after something earlier
+        // in the week is added and every position is recomputed.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        let mut lunch = stay("Lunch with Stanley", "2026-10-14", "2026-10-14");
+        lunch.kind = "activity".into();
+        store.add_item(trip.id, lunch).unwrap();
+        let (trip, changed) = store
+            .note_item(trip.id, 1, Some("https://maps.example/lunch"))
+            .unwrap();
+        assert!(changed);
+        assert_eq!(trip.items[0].notes.as_deref(), Some("https://maps.example/lunch"));
+
+        // An earlier item renumbers everything; the note rides on the row.
+        let trip = store.add_item(trip.id, stay("Hotel", "2026-10-12", "2026-10-15")).unwrap();
+        assert_eq!(trip.items[0].title, "Hotel");
+        assert_eq!(trip.items[0].notes, None);
+        assert_eq!(trip.items[1].title, "Lunch with Stanley");
+        assert_eq!(trip.items[1].notes.as_deref(), Some("https://maps.example/lunch"));
+
+        // Writing what is already there is not a failure and says so.
+        let (_, changed) = store
+            .note_item(trip.id, 2, Some("https://maps.example/lunch"))
+            .unwrap();
+        assert!(!changed, "the same note twice changed nothing");
+        let err = store.note_item(trip.id, 9, Some("x")).unwrap_err();
+        assert!(err.to_string().contains("no segment 9"), "got: {err}");
+    }
+
+    #[test]
+    fn a_cleared_note_and_a_note_never_written_are_the_same_state() {
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        store.add_item(trip.id, stay("Hotel", "2026-10-12", "2026-10-15")).unwrap();
+        let (trip, changed) = store.note_item(trip.id, 1, None).unwrap();
+        assert_eq!(trip.items[0].notes, None);
+        assert!(!changed, "there was nothing to clear");
+
+        let (trip, _) = store.note_item(trip.id, 1, Some("ask for the terrace")).unwrap();
+        assert_eq!(trip.items[0].notes.as_deref(), Some("ask for the terrace"));
+        let (trip, changed) = store.note_item(trip.id, 1, None).unwrap();
+        assert!(changed);
+        assert_eq!(trip.items[0].notes, None, "cleared is empty, not an empty string");
+        // Whitespace is not a note either, whichever door it arrives at.
+        let (trip, _) = store.note_item(trip.id, 1, Some("ask for the terrace")).unwrap();
+        assert_eq!(trip.items[0].notes.as_deref(), Some("ask for the terrace"));
+        let (trip, changed) = store.note_item(trip.id, 1, Some("   ")).unwrap();
+        assert!(changed);
+        assert_eq!(trip.items[0].notes, None);
+    }
+
+    #[test]
+    fn a_note_does_not_re_price_the_trip_it_is_written_on() {
+        // `touch` puts a trip back to `planning` because an edit to what
+        // would be priced invalidates the prices it was finalised at. A
+        // note prices nothing, so a pasted map link must not quietly undo
+        // a finalisation.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Lisbon", None, None, None).unwrap();
+        store.add_item(trip.id, stay("Hotel", "2026-10-12", "2026-10-15")).unwrap();
+        store.set_trip_status(trip.id, "finalised").unwrap();
+        let (trip, _) = store.note_item(trip.id, 1, Some("courtyard room")).unwrap();
+        assert_eq!(trip.status, "finalised");
+    }
+
+    #[test]
     fn removing_an_item_checks_what_the_caller_saw() {
         let (store, _dir) = test_store();
         let account = store.account_for_telegram(1).unwrap();
@@ -7704,6 +7891,30 @@ CREATE TABLE trips (
         assert!(!store.remove_item_checked(trip.id, 1, wrong).unwrap());
         let right = ExpectedItem { origin: None, destination: None, title: Some("Hotel"), date: Some("2026-10-12") };
         assert!(store.remove_item_checked(trip.id, 1, right).unwrap());
+    }
+
+    #[test]
+    fn a_note_is_written_only_onto_the_item_the_caller_still_sees() {
+        // The same guard removing an item has, and it is worth more here
+        // rather than less: a map link written onto the wrong item is
+        // quieter than the wrong item disappearing, so nothing tells the
+        // traveller to look.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Hong Kong", None, None, None).unwrap();
+        store.add_item(trip.id, stay("Lunch with Stanley", "2026-09-24", "2026-09-24")).unwrap();
+        let seen = |title| ExpectedItem { origin: None, destination: None, title: Some(title), date: Some("2026-09-24") };
+        let link = "https://www.google.com/maps/search/?api=1&query=Queen%27s+Cafe";
+
+        assert!(!store.note_item_checked(trip.id, 1, seen("Dinner with Stanley"), Some(link)).unwrap());
+        assert_eq!(store.trip_by_id(account, trip.id).unwrap().unwrap().items[0].notes, None, "a note went onto an item nobody asked about");
+
+        assert!(store.note_item_checked(trip.id, 1, seen("Lunch with Stanley"), Some(link)).unwrap());
+        assert_eq!(store.trip_by_id(account, trip.id).unwrap().unwrap().items[0].notes.as_deref(), Some(link));
+
+        // Clearing and never having had one end in the same place.
+        assert!(store.note_item_checked(trip.id, 1, seen("Lunch with Stanley"), None).unwrap());
+        assert_eq!(store.trip_by_id(account, trip.id).unwrap().unwrap().items[0].notes, None);
     }
 
     // ---- invite rounds, membership, waitlist ----

@@ -291,14 +291,14 @@ pub async fn add_leg(
     .await
 }
 
-/// What the client saw on the item it is asking to remove. A flight card
+/// What the client saw on the item it is writing to. A flight card
 /// sends its route, a stay sends its title; both may add the date. Every
 /// `Some` must match the row — `None` means "nothing to verify", not
 /// "verified" — so a caller with only a route to go on is not quietly
 /// granted a free pass on the date. The same goes end by end: a client that
 /// sends one end of a route and not the other checks less, not nothing.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct RemoveExpectation {
+pub struct ItemExpectation {
     pub origin: Option<String>,
     pub destination: Option<String>,
     pub title: Option<String>,
@@ -321,7 +321,7 @@ pub async fn remove_item(
     account_id: i64,
     trip_name: &str,
     position: i64,
-    expected: RemoveExpectation,
+    expected: ItemExpectation,
 ) -> anyhow::Result<LegEdit> {
     let (origin, destination) = match (expected.origin, expected.destination) {
         (Some(origin), Some(destination)) => {
@@ -375,6 +375,90 @@ pub async fn remove_item(
         // Re-read for what to draw. A trip that has gone in the meantime is
         // only reachable by a concurrent delete; the leg did go, but there
         // is no longer a plan to show for it.
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(LegEdit::TripNotFound);
+        };
+        let chat = store.trip_chat(trip.id)?;
+        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+    })
+    .await
+}
+
+/// How long a note may be, re-exported from the tools where it is
+/// enforced so the browser's half of this feature — its input's
+/// `maxLength`, and the test in `routes/trips.rs` that pins the two
+/// together — has a public door to the one number.
+pub const MAX_NOTE_CHARS: usize = crate::tools::trips::MAX_NOTE_CHARS;
+
+/// Write, replace or clear the traveller's note on one item.
+///
+/// The same guard `remove_item` carries, for a reason that is stronger
+/// here than there: a stale tab that removes the wrong item shows the
+/// traveller something missing, while one that writes a map link onto the
+/// wrong item shows them nothing, and the mistake keeps until somebody
+/// reads the item and wonders. `SegmentChanged` is the answer; the client
+/// re-reads and asks again.
+///
+/// The note goes through `tools::trips::note_text`, the one rule every
+/// door that writes this column shares, so the browser cannot store a note
+/// chat would refuse to clear. `None` — and a note of nothing but spaces —
+/// clears it.
+pub async fn note_item(
+    core: &Core,
+    account_id: i64,
+    trip_name: &str,
+    position: i64,
+    expected: ItemExpectation,
+    note: Option<String>,
+) -> anyhow::Result<LegEdit> {
+    let note = match crate::tools::trips::note_text(note.as_deref()) {
+        Ok(note) => note,
+        Err(e) => return Ok(LegEdit::Invalid(e.0)),
+    };
+    let (origin, destination) = match (expected.origin, expected.destination) {
+        (Some(origin), Some(destination)) => {
+            match crate::tools::trips::leg_ends(&origin, &destination) {
+                Ok((origin, destination)) => (Some(origin), Some(destination)),
+                Err(e) => return Ok(LegEdit::Invalid(e.0)),
+            }
+        }
+        (origin, destination) => {
+            let end = |label, value: Option<String>| {
+                value.map(|v| crate::tools::trips::iata(label, &v)).transpose()
+            };
+            match (end("origin", origin), end("destination", destination)) {
+                (Ok(origin), Ok(destination)) => (origin, destination),
+                (Err(e), _) | (_, Err(e)) => return Ok(LegEdit::Invalid(e.0)),
+            }
+        }
+    };
+    let date = match expected
+        .date
+        .as_deref()
+        .map(|d| crate::tools::trips::calendar_date("date", d))
+        .transpose()
+    {
+        Ok(date) => date,
+        Err(e) => return Ok(LegEdit::Invalid(e.0)),
+    };
+    let title = expected.title;
+    let store = core.store();
+    let trip_name = trip_name.to_string();
+    blocking(move || {
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(LegEdit::TripNotFound);
+        };
+        let expected = ExpectedItem {
+            origin: origin.as_deref(),
+            destination: destination.as_deref(),
+            title: title.as_deref(),
+            date: date.as_deref(),
+        };
+        // Checked inside the store for the reason `remove_item` gives: the
+        // trip read above may be stale by the time the lock is taken.
+        if !store.note_item_checked(trip.id, position, expected, note.as_deref())? {
+            return Ok(LegEdit::SegmentChanged);
+        }
         let Some(trip) = store.find_trip(account_id, &trip_name)? else {
             return Ok(LegEdit::TripNotFound);
         };
@@ -508,8 +592,8 @@ mod tests {
     }
 
     /// What a client that drew a flight leg sends back to remove it.
-    fn flight(origin: &str, destination: &str, date: Option<&str>) -> RemoveExpectation {
-        RemoveExpectation {
+    fn flight(origin: &str, destination: &str, date: Option<&str>) -> ItemExpectation {
+        ItemExpectation {
             origin: Some(origin.to_string()),
             destination: Some(destination.to_string()),
             title: None,
@@ -980,6 +1064,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_note_lands_on_the_item_the_tab_drew_and_nowhere_else() {
+        // The request this exists for: a link for a lunch already on the
+        // trip. The guard is the one removal has, because a note written
+        // onto the wrong item is a mistake nothing on the page announces.
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+        seed_item_for_tests(&core, account_id, "October", "activity", "Lunch with Stanley", "2026-10-12")
+            .await
+            .unwrap();
+        let link = "https://www.google.com/maps/search/?api=1&query=Queen%27s+Cafe";
+        let seen = |title: &str| ItemExpectation { title: Some(title.to_string()), ..Default::default() };
+
+        assert_eq!(
+            note_item(&core, account_id, "October", 2, seen("Dinner with Stanley"), Some(link.to_string()))
+                .await
+                .unwrap(),
+            LegEdit::SegmentChanged,
+            "a title that is not what is there is a stale tab, not a match",
+        );
+        let LegEdit::Done(plan) =
+            note_item(&core, account_id, "October", 2, seen("Lunch with Stanley"), Some(link.to_string()))
+                .await
+                .unwrap()
+        else {
+            panic!("the note was refused on the item it names");
+        };
+        assert_eq!(plan.trip.items[1].notes.as_deref(), Some(link));
+        assert_eq!(plan.trip.items[0].notes, None, "the note reached a second item");
+
+        // Too long to store is the model's answer too, and it is refused
+        // before anything is written rather than truncated silently.
+        let LegEdit::Invalid(message) =
+            note_item(&core, account_id, "October", 2, seen("Lunch with Stanley"), Some("x".repeat(501)))
+                .await
+                .unwrap()
+        else {
+            panic!("a note over the cap was stored");
+        };
+        assert!(message.contains("500"), "{message}");
+        assert_eq!(plan.trip.items[1].notes.as_deref(), Some(link), "the refusal left the note it had");
+    }
+
+    #[tokio::test]
     async fn a_stay_is_removed_by_its_title_and_a_wrong_title_removes_nothing() {
         // A stay has no route, so its title is what the client saw and what
         // the guard checks. The wrong title is a tab whose copy of the trip
@@ -1009,7 +1136,7 @@ mod tests {
                 account_id,
                 "October",
                 2,
-                RemoveExpectation {
+                ItemExpectation {
                     title: Some("Hostel Lisboa".to_string()),
                     ..Default::default()
                 },
@@ -1024,7 +1151,7 @@ mod tests {
             account_id,
             "October",
             2,
-            RemoveExpectation {
+            ItemExpectation {
                 title: Some("Hotel Lisboa".to_string()),
                 ..Default::default()
             },
@@ -1077,7 +1204,7 @@ mod tests {
                 account_id,
                 "Atlantic loop",
                 1,
-                RemoveExpectation {
+                ItemExpectation {
                     title: Some("Hotel Lisboa".to_string()),
                     date: Some("14/10/2026".to_string()),
                     ..Default::default()

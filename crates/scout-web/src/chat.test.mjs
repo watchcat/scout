@@ -8,6 +8,7 @@ import {
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier, savedFareLine,
   tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
+  noteParts, noteBody,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   ITINERARY_NOTE,
@@ -808,4 +809,70 @@ test('the confirm stays dead longer than a double-click takes', () => {
   // about 500ms; anything shorter than that leaves the slower half of them
   // pressing a button nobody read.
   assert.ok(CONFIRM_ARM_MS >= 500, `${CONFIRM_ARM_MS}ms is inside the double-click range`)
+})
+
+test('a note is drawn as text, and only an http link inside it is a link', () => {
+  // The field exists because a traveller wanted a map link on a lunch, so
+  // a link in it has to be pressable. Everything else is the characters
+  // they typed: `noteParts` decides which is which, and the page builds
+  // each part as a node, so nothing here can become markup.
+  assert.deepEqual(noteParts('Queen\'s Cafe — https://maps.example/a?b=1 upstairs'), [
+    { text: "Queen's Cafe — " },
+    { link: 'https://maps.example/a?b=1' },
+    { text: ' upstairs' },
+  ])
+  assert.deepEqual(noteParts('http://plain.example/x'), [{ link: 'http://plain.example/x' }])
+  // A scheme that is not http(s) is text. `javascript:` is the one that
+  // matters — a note is free text a traveller pastes, and an anchor with
+  // that href runs on click.
+  for (const hostile of [
+    'javascript:alert(1)',
+    'JavaScript:alert(1)',
+    'data:text/html,<script>alert(1)</script>',
+    'vbscript:msgbox(1)',
+    'file:///etc/passwd',
+  ]) {
+    assert.deepEqual(noteParts(hostile), [{ text: hostile }], hostile)
+  }
+  // Angle brackets stay characters; there is no markup path here at all.
+  assert.deepEqual(noteParts('<script>alert(1)</script>'), [{ text: '<script>alert(1)</script>' }])
+  // A link wearing a sentence's punctuation: the full stop is the
+  // sentence's, not the URL's, and a trailing bracket closes the aside.
+  assert.deepEqual(noteParts('see https://maps.example/a.'), [
+    { text: 'see ' },
+    { link: 'https://maps.example/a' },
+    { text: '.' },
+  ])
+  assert.deepEqual(noteParts('(https://maps.example/a)'), [
+    { text: '(' },
+    { link: 'https://maps.example/a' },
+    { text: ')' },
+  ])
+  // A scheme with nothing after it is not a link anybody can follow.
+  assert.deepEqual(noteParts('https://'), [{ text: 'https://' }])
+  assert.deepEqual(noteParts(''), [])
+  assert.deepEqual(noteParts(null), [])
+})
+
+test('the note body names the item the card drew, as a removal does', () => {
+  // Positions renumber on every write, so the server has to be able to
+  // tell a stale tab from a live one — the same reason `removeItemBody`
+  // carries what the card showed.
+  const stay = JSON.parse(noteBody('Hong Kong', { position: 2, kind: 'activity', title: 'Lunch with Stanley', date: '2026-09-24' }, 'https://maps.example/a'))
+  assert.deepEqual(stay, {
+    trip: 'Hong Kong',
+    position: 2,
+    origin: null,
+    destination: null,
+    title: 'Lunch with Stanley',
+    date: '2026-09-24',
+    note: 'https://maps.example/a',
+  })
+  const flight = JSON.parse(noteBody('Hong Kong', { position: 1, kind: 'flight', origin: 'AMS', destination: 'HKG', date: '2026-09-20' }, ''))
+  assert.equal(flight.title, null)
+  assert.equal(flight.origin, 'AMS')
+  // An empty box clears the note, and says so as `null` rather than by
+  // omitting the key: the route reads both the same way, and a body that
+  // says what it means is the one worth sending.
+  assert.equal(flight.note, null)
 })

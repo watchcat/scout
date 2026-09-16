@@ -236,6 +236,37 @@ pub(crate) fn leg_ends(
     Ok((origin, destination))
 }
 
+/// The longest note one item may carry, in characters.
+///
+/// 500 because that is what `tools::memory` already allows a remembered
+/// fact, the other free-text field a traveller dictates and the store keeps
+/// for good; a second number for the same shape of text would be two rules
+/// to remember and one of them arbitrary. It is comfortably more than the
+/// longest map link and a sentence about where to meet, which is what this
+/// field was asked for.
+pub(crate) const MAX_NOTE_CHARS: usize = 500;
+
+/// The traveller's own words about one item, trimmed, with blank read as
+/// no note at all.
+///
+/// Counted in characters rather than bytes, as `memory` counts its facts:
+/// a note in Greek or Japanese must not be worth a quarter of one in
+/// English. Shared by every door that writes the field — the two tools here
+/// and the browser's route through `crate::trips` — so a note the browser
+/// accepts is a note chat can clear, and the traveller is never told two
+/// different rules about one field.
+pub(crate) fn note_text(note: Option<&str>) -> Result<Option<String>, StoreToolError> {
+    let note = note.map(str::trim).filter(|note| !note.is_empty());
+    match note {
+        Some(note) if note.chars().count() > MAX_NOTE_CHARS => Err(StoreToolError(format!(
+            "a note is at most {MAX_NOTE_CHARS} characters; this one is {} — keep what the \
+             traveller needs to find the place and leave the rest out",
+            note.chars().count()
+        ))),
+        _ => Ok(note.map(str::to_string)),
+    }
+}
+
 /// Reformats through the parsed date rather than returning the trimmed
 /// input: `chrono` accepts "2026-9-3", but `dates_run_forwards` compares
 /// `date` as text, which only agrees with date order when every date is
@@ -1276,6 +1307,10 @@ impl Tool for AddTripItemTool {
         if title.is_empty() {
             return Err(StoreToolError("an item needs a title — the hotel, the ticket, the train".to_string()));
         }
+        // The same rule `note_trip_item` applies later to this same column:
+        // a note only this door accepted would be one the other could never
+        // clear back to, and the cap is a property of the field.
+        let notes = note_text(args.notes.as_deref())?;
 
         let store = self.store.clone();
         let account_id = self.account_id;
@@ -1300,7 +1335,7 @@ impl Tool for AddTripItemTool {
                         date,
                         starts_at,
                         ends_at,
-                        notes: args.notes,
+                        notes,
                         // Never from the model: a booking and its code come
                         // from the traveller's own confirmation.
                         booked: false,
@@ -1784,6 +1819,103 @@ impl Tool for UpdateTripSegmentTool {
                 ));
             }
             view
+        })
+        .map_err(internal)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NoteItemArgs {
+    pub trip: String,
+    pub position: i64,
+    /// Absent or empty clears whatever note is there.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Writes the note on an item that is already on the trip — the one edit
+/// to a stored item this desk can make.
+///
+/// It exists because the alternative was worse than nothing: asked to put a
+/// map link on a lunch already on a trip, the desk could only add a second
+/// activity on the same day with the link in its title, because
+/// `add_trip_item` was the only tool that could carry a note and the only
+/// thing it can do is create.
+pub struct NoteTripItemTool {
+    pub store: Store,
+    pub account_id: i64,
+}
+
+impl Tool for NoteTripItemTool {
+    const NAME: &'static str = "note_trip_item";
+    type Error = StoreToolError;
+    type Args = NoteItemArgs;
+    type Output = TripView;
+
+    fn description(&self) -> String {
+        "Write a note on something already on a trip - a leg, a stay, an activity, a \
+         train - or clear it by sending no note. This is where a link the traveller \
+         sent, a meeting place or a reminder goes: do NOT add a second item to carry \
+         one, and do not drop and re-add an item to give it a note. A note is the \
+         traveller's own words about that booking, so write what they said and \
+         nothing you worked out yourself. Positions are the ones show_trip gave; \
+         sending the note again unchanged is safe and says so."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "trip": {"type": "string", "description": "the trip's name"},
+                "position": {"type": "integer", "description": "which item, 1-based"},
+                "note": {
+                    "type": "string",
+                    "description": format!(
+                        "the traveller's words, at most {MAX_NOTE_CHARS} characters; \
+                         omit or send empty to clear the note"
+                    )
+                }
+            },
+            "required": ["trip", "position"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Validated before anything is written, as everywhere else here: a
+        // note too long to store must not leave half an edit behind.
+        let note = note_text(args.note.as_deref())?;
+        let store = self.store.clone();
+        let account_id = self.account_id;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(Trip, bool)> {
+            let trip = find_trip_or_list(&store, account_id, &args.trip)?;
+            store
+                .note_item(trip.id, args.position, note.as_deref())
+                .map_err(lost_trip_race)
+        })
+        .await
+        .map_err(internal)?
+        .map(|(trip, changed)| {
+            // Named by what the traveller calls the item rather than by its
+            // number: the number is how the model addressed it, and the
+            // sentence this becomes is read by somebody who never saw one.
+            let name = trip
+                .items
+                .iter()
+                .find(|item| item.position == args.position)
+                .map_or_else(|| format!("item {}", args.position), |item| item.route());
+            let noted = trip
+                .items
+                .iter()
+                .find(|item| item.position == args.position)
+                .is_some_and(|item| item.notes.is_some());
+            let said = match (changed, noted) {
+                (true, true) => format!("the note on {name} is saved"),
+                (true, false) => format!("the note on {name} is cleared"),
+                (false, true) => format!("{name} already says that — nothing to change"),
+                (false, false) => format!("{name} has no note — nothing to change"),
+            };
+            TripView::after(trip, said)
         })
         .map_err(internal)
     }
@@ -4387,6 +4519,156 @@ mod tests {
         // Same day is not backwards: an activity may end the day it starts.
         let view = tool.call(stay("2026-10-12")).await.unwrap();
         assert_eq!(view.trip.items[0].ends_at.as_deref(), Some("2026-10-12"));
+    }
+
+    /// The lunch the traveller wanted a map link on, on a trip of its own.
+    async fn trip_with_lunch(store: &Store) {
+        AddTripItemTool { store: store.clone(), account_id: 7, conversation_id: 1 }
+            .call(AddItemArgs {
+                trip: "Lisbon".into(),
+                kind: "activity".into(),
+                title: "Lunch with Stanley".into(),
+                place: None,
+                date: "2026-10-14".into(),
+                time: None,
+                end_date: None,
+                notes: None,
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_note_goes_onto_an_item_the_trip_already_holds() {
+        // The whole reason this tool exists: asked to put a map link on an
+        // activity already on the trip, Scout could only offer a second row
+        // on the same day with the link in its title.
+        let (store, _dir) = setup();
+        trip_with_lunch(&store).await;
+        let tool = NoteTripItemTool { store: store.clone(), account_id: 7 };
+        let view = tool
+            .call(NoteItemArgs {
+                trip: "Lisbon".into(),
+                position: 1,
+                note: Some("https://maps.example/lunch".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.trip.items.len(), 1, "a note is not a second item");
+        // The traveller's own words, so the model sees them: unlike a
+        // ticket's filename, which `TripView::of` clears, a note passed no
+        // stranger's hands and there is no reading a trip without it.
+        assert_eq!(view.trip.items[0].notes.as_deref(), Some("https://maps.example/lunch"));
+        assert!(view.changed.as_deref().is_some_and(|said| said.contains("Lunch with Stanley")), "got: {:?}", view.changed);
+
+        // Saying again what it already says is not a failure, and the reply
+        // has to be able to tell the traveller which of the two happened.
+        let view = tool
+            .call(NoteItemArgs {
+                trip: "Lisbon".into(),
+                position: 1,
+                note: Some("https://maps.example/lunch".into()),
+            })
+            .await
+            .unwrap();
+        assert!(view.changed.as_deref().is_some_and(|said| said.contains("nothing to change")), "got: {:?}", view.changed);
+    }
+
+    #[tokio::test]
+    async fn an_absent_or_empty_note_clears_the_one_that_was_there() {
+        let (store, _dir) = setup();
+        trip_with_lunch(&store).await;
+        let tool = NoteTripItemTool { store: store.clone(), account_id: 7 };
+        let note = |note: Option<&str>| NoteItemArgs {
+            trip: "Lisbon".into(),
+            position: 1,
+            note: note.map(str::to_string),
+        };
+        tool.call(note(Some("table by the window"))).await.unwrap();
+        let view = tool.call(note(Some("   "))).await.unwrap();
+        assert_eq!(view.trip.items[0].notes, None, "blank is no note");
+
+        tool.call(note(Some("table by the window"))).await.unwrap();
+        let view = tool.call(note(None)).await.unwrap();
+        assert_eq!(view.trip.items[0].notes, None, "an absent note clears it too");
+        // Cleared and never written end in the same place, so a second
+        // clear has nothing to do.
+        let view = tool.call(note(None)).await.unwrap();
+        assert!(view.changed.as_deref().is_some_and(|said| said.contains("nothing to change")), "got: {:?}", view.changed);
+    }
+
+    #[tokio::test]
+    async fn a_note_past_the_cap_is_refused_and_nothing_is_written() {
+        let (store, _dir) = setup();
+        trip_with_lunch(&store).await;
+        let tool = NoteTripItemTool { store: store.clone(), account_id: 7 };
+        let err = tool
+            .call(NoteItemArgs {
+                trip: "Lisbon".into(),
+                position: 1,
+                note: Some("é".repeat(MAX_NOTE_CHARS + 1)),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(&MAX_NOTE_CHARS.to_string()), "got: {err}");
+        assert_eq!(store.find_trip(7, "Lisbon").unwrap().unwrap().items[0].notes, None);
+        // Characters, not bytes: a note of accented text at the cap fits.
+        let view = tool
+            .call(NoteItemArgs {
+                trip: "Lisbon".into(),
+                position: 1,
+                note: Some("é".repeat(MAX_NOTE_CHARS)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.trip.items[0].notes.as_deref().map(str::chars).map(Iterator::count), Some(MAX_NOTE_CHARS));
+    }
+
+    #[tokio::test]
+    async fn noting_a_position_the_trip_does_not_have_says_which() {
+        let (store, _dir) = setup();
+        trip_with_lunch(&store).await;
+        let tool = NoteTripItemTool { store: store.clone(), account_id: 7 };
+        let err = tool
+            .call(NoteItemArgs { trip: "Lisbon".into(), position: 4, note: Some("x".into()) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no segment 4"), "got: {err}");
+        // And a trip nobody has lists the ones they do, as every other
+        // trip tool does.
+        let err = tool
+            .call(NoteItemArgs { trip: "Setpember".into(), position: 1, note: Some("x".into()) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Lisbon"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_item_added_with_a_note_past_the_cap_is_refused_by_the_same_rule() {
+        // One cap on the field, not one per door: `add_trip_item` writes
+        // the same column, and a note only the creating tool would accept
+        // is a note the noting tool could never clear back to.
+        let (store, _dir) = setup();
+        let tool = AddTripItemTool { store: store.clone(), account_id: 7, conversation_id: 1 };
+        let err = tool
+            .call(AddItemArgs {
+                trip: "Lisbon".into(),
+                kind: "stay".into(),
+                title: "Hotel".into(),
+                place: None,
+                date: "2026-10-12".into(),
+                time: None,
+                end_date: None,
+                notes: Some("x".repeat(MAX_NOTE_CHARS + 1)),
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(&MAX_NOTE_CHARS.to_string()), "got: {err}");
+        assert!(store.find_trip(7, "Lisbon").unwrap().is_none(), "nothing was created");
     }
 
     #[test]

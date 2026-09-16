@@ -3854,6 +3854,10 @@ impl Store {
                  (SELECT id FROM trip_items WHERE trip_id = ?)",
             params![id],
         )?;
+        // Every item at once, which is the same rule `remove_item_within`
+        // applies to one: a ticket goes back to its mail if that mail is
+        // still there, and goes with the item if it is not.
+        release_attachments_within(&conn, &item_ids_of(&conn, id)?)?;
         conn.execute("DELETE FROM trip_items WHERE trip_id = ?", params![id])?;
         conn.execute("DELETE FROM trips WHERE id = ?", params![id])?;
         Ok(true)
@@ -4042,10 +4046,67 @@ fn add_flight_within(
 /// race the check exists to close.
 fn remove_item_within(conn: &Connection, trip_id: i64, item_id: i64) -> Result<Trip> {
     conn.execute("DELETE FROM item_candidates WHERE item_id = ?", params![item_id])?;
+    release_attachments_within(conn, &[item_id])?;
     conn.execute("DELETE FROM trip_items WHERE id = ?", params![item_id])?;
     reorder_items(conn, trip_id)?;
     touch(conn, trip_id)?;
     load_trip(conn, trip_id)
+}
+
+/// What becomes of the files these items are carrying, called just before
+/// the items go. An attachment has no owner of its own — `attachment_owner`
+/// finds one through the mail it came with, or through the trip behind its
+/// item — so deleting an item without deciding this leaves rows that answer
+/// with nobody: undownloadable, and unreachable by both mail sweeps, whose
+/// deletes are keyed on mail ids that by then no longer exist.
+///
+/// The mail decides it. While the mail is still there the file goes back to
+/// being loose: a leg coming off a trip must not destroy the traveller's
+/// ticket, which is still listed under Other mail and will be swept with
+/// that mail at thirty days like any other loose file. Once the mail has
+/// gone the item was the last thing that could reach those bytes, and
+/// keeping a stranger's PDF that nobody can see, download or delete is a
+/// liability rather than a kindness — so it goes with the item.
+///
+/// `attachments.mail_id` is `NOT NULL` and keeps pointing at a mail that
+/// has been deleted, so "the mail is still there" is this join and never a
+/// null check. The residual risk is the obvious one: a file whose mail has
+/// already been swept and whose item is removed by accident is gone for
+/// good, with no undo. That is the same bargain the inbox sweep already
+/// made when it let the mail go.
+///
+/// Takes `&Connection` for the reason `remove_item_within` documents at
+/// length: its callers hold the store's non-reentrant mutex already.
+fn release_attachments_within(conn: &Connection, item_ids: &[i64]) -> Result<()> {
+    // `IN ()` is a parser error rather than an empty set — the trap
+    // `detach_trips_within` documents.
+    if item_ids.is_empty() {
+        return Ok(());
+    }
+    let holes = ["?"].repeat(item_ids.len()).join(", ");
+    // The orphans first, so the hand-back below needs no condition of its
+    // own: what is left on these items after this delete is exactly the
+    // files whose mail is still there.
+    conn.execute(
+        &format!(
+            "DELETE FROM attachments WHERE item_id IN ({holes})
+               AND NOT EXISTS (SELECT 1 FROM inbound_mail m WHERE m.id = attachments.mail_id)"
+        ),
+        duckdb::params_from_iter(item_ids.iter()),
+    )?;
+    conn.execute(
+        &format!("UPDATE attachments SET item_id = NULL WHERE item_id IN ({holes})"),
+        duckdb::params_from_iter(item_ids.iter()),
+    )?;
+    Ok(())
+}
+
+/// The ids of every item on a trip, for the callers that are about to
+/// delete all of them at once and have to decide about their files first.
+fn item_ids_of(conn: &Connection, trip_id: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM trip_items WHERE trip_id = ?")?;
+    let ids = stmt.query_map(params![trip_id], |r| r.get(0))?.collect::<duckdb::Result<_>>()?;
+    Ok(ids)
 }
 
 /// Recomputes positions for one trip: by date, then a start time (an item
@@ -5017,6 +5078,7 @@ impl Store {
         let conn = self.conn();
         sweep_drafts_within(&conn, None)
     }
+
 }
 
 /// How long a draft has to have existed before it can be collected.
@@ -9142,6 +9204,96 @@ CREATE TABLE messages (
         assert!(store.attachment(kept).unwrap().is_some());
         assert!(store.attachment(loose).unwrap().is_none());
         assert_eq!(store.attachment_owner(kept).unwrap(), Some(a), "owned through the item once the mail is gone");
+    }
+
+    /// A stay on `trip`, booked, with a ticket already on it: the shape
+    /// every test below starts from. Returns the trip as written and the
+    /// new item's id.
+    fn stay_with(store: &Store, trip_id: i64, title: &str) -> (Trip, i64) {
+        let trip = store
+            .add_item(trip_id, NewItem {
+                kind: "stay".into(), title: title.into(), place: None, date: "2026-10-12".into(),
+                starts_at: None, ends_at: None, notes: None, booked: true, confirmation_code: None,
+                price: None, currency: None, arrival_id: None,
+            })
+            .unwrap();
+        let id = trip.items.iter().find(|i| i.title == title).expect("just added").id;
+        (trip, id)
+    }
+
+    /// Deletes a mail the way its owner's x does, refusing to pretend it
+    /// worked: the delete has preconditions, and a test that skipped them
+    /// would be testing nothing.
+    fn delete_mail_now(store: &Store, account: i64, mail_id: i64) {
+        store.mail_done(mail_id).unwrap();
+        assert_eq!(store.delete_mail(account, mail_id).unwrap(), MailGone::Gone);
+    }
+
+    #[test]
+    fn removing_an_item_gives_its_files_back_to_the_mail_and_takes_the_ones_no_mail_is_left_for() {
+        // The item is the second of an attachment's two owners, so taking
+        // it away decides the file's fate. If the mail it came with is
+        // still there the file is still perfectly reachable under Other
+        // mail, and destroying a traveller's ticket because they took one
+        // leg off a trip would be indefensible. If the mail has already
+        // gone, the item was the only thing that could reach those bytes:
+        // left behind, the row answers `attachment_owner` with nothing,
+        // which no reader may download and no sweep can find — the sweeps
+        // are keyed on mail ids that no longer exist.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let live = mail(&store, a, "re_1");
+        let doomed = mail(&store, a, "re_2");
+        let ticket = store.insert_attachment(live, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let boarding = store.insert_attachment(doomed, "boarding.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        let (trip, hotel) = stay_with(&store, trip.id, "Hotel Alfama");
+        store.attach_to_item(ticket, hotel).unwrap();
+        store.attach_to_item(boarding, hotel).unwrap();
+        delete_mail_now(&store, a, doomed);
+        assert_eq!(store.attachment_owner(boarding).unwrap(), Some(a), "kept by the item, which is the state this is about");
+
+        store.drop_item(trip.id, 1).unwrap();
+
+        assert_eq!(
+            store.attachment(ticket).unwrap().expect("the mail it came with is still there").1,
+            None,
+            "the ticket was not handed back to its mail, so nothing will ever sweep it",
+        );
+        assert_eq!(store.attachment_owner(ticket).unwrap(), Some(a), "handed back but unreachable");
+        assert!(
+            store.attachment(boarding).unwrap().is_none(),
+            "a file whose mail is gone outlived the only item that could reach it",
+        );
+    }
+
+    #[test]
+    fn deleting_a_trip_decides_every_item_s_files_the_same_way_removing_one_item_would() {
+        // `delete_trip` takes every item at once, so it is the same rule
+        // applied to a set — and the set is what makes it worth its own
+        // test: one statement over many items must not quietly take the
+        // files of the ones whose mail is alive along with the rest.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let live = mail(&store, a, "re_1");
+        let doomed = mail(&store, a, "re_2");
+        let ticket = store.insert_attachment(live, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let boarding = store.insert_attachment(doomed, "boarding.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        let (_, hotel) = stay_with(&store, trip.id, "Hotel Alfama");
+        let (_, museum) = stay_with(&store, trip.id, "Museu do Azulejo");
+        store.attach_to_item(ticket, hotel).unwrap();
+        store.attach_to_item(boarding, museum).unwrap();
+        delete_mail_now(&store, a, doomed);
+
+        assert!(store.delete_trip(a, "Lisbon").unwrap());
+
+        assert_eq!(
+            store.attachment(ticket).unwrap().expect("its mail is still there").1,
+            None,
+            "the ticket was left pointing at an item the trip took with it",
+        );
+        assert!(store.attachment(boarding).unwrap().is_none(), "a file no mail and no item can reach was kept");
     }
 
     #[test]

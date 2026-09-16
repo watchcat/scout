@@ -544,6 +544,16 @@ impl Core {
                 Err(e) => tracing::warn!(error = %e, "could not sweep the inbox"),
             }
 
+            // A draft made to hold a booking that then went somewhere else
+            // belongs to no conversation, so the thread expiry above can
+            // never reach it. `inbox::add_arrival` collects the one it just
+            // abandoned; this is for the ones already sitting in a list.
+            match self.sweep_empty_drafts().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(collected = n, "empty placement drafts dropped"),
+                Err(e) => tracing::warn!(error = %e, "could not collect the empty drafts"),
+            }
+
             match crate::backup::is_due(&dir) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -638,6 +648,17 @@ impl Core {
     async fn sweep_inbox(&self) -> anyhow::Result<usize> {
         let store = self.store();
         blocking(move || store.sweep_inbox(Self::INBOX_KEEP_DAYS)).await
+    }
+
+    /// Drops every account's drafts that hold nothing and that no booking
+    /// is waiting on. Returns how many went.
+    ///
+    /// One statement over all of them rather than a loop: there is no
+    /// per-account pass in this loop to hang it off, and the condition is
+    /// the same for everyone.
+    async fn sweep_empty_drafts(&self) -> anyhow::Result<usize> {
+        let store = self.store();
+        blocking(move || store.sweep_all_empty_drafts()).await
     }
 
     /// Turns a photo into a search description.
@@ -947,6 +968,21 @@ mod tests {
         let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
         let body = &src[start..];
         let sweep = body.find("self.sweep_inbox()").expect("the sweep is never called from the loop");
+        let backup = body.find("backup::is_due").expect("the backup check must exist");
+        assert!(sweep < backup, "the sweep sits below the backup's continue and would run once a day");
+    }
+
+    #[test]
+    fn maintenance_collects_the_drafts_nothing_landed_on() {
+        // `inbox::add_arrival` collects the draft it just abandoned, which
+        // does nothing for the ones already in a list — and a placement
+        // draft belongs to no conversation, so the thread expiry above can
+        // never reach it either. Without this call they are permanent.
+        let src = include_str!("core.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
+        let body = &src[start..];
+        let sweep = body.find("self.sweep_empty_drafts()").expect("empty drafts are never collected");
         let backup = body.find("backup::is_due").expect("the backup check must exist");
         assert!(sweep < backup, "the sweep sits below the backup's continue and would run once a day");
     }

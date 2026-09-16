@@ -398,6 +398,10 @@ CREATE TABLE IF NOT EXISTS arrivals (
     place             TEXT,
     origin            TEXT,
     destination       TEXT,
+    -- Which flight the confirmation named. Only a flight has these, and
+    -- only these say on the leg's card what was actually bought.
+    airline           TEXT,
+    flight_number     TEXT,
     date              TEXT,
     starts_at         TEXT,
     ends_at           TEXT,
@@ -1147,6 +1151,14 @@ CREATE TABLE IF NOT EXISTS arrivals (
 );
 "#;
 
+/// Which flight a confirmation named. Nullable and added in place: every
+/// arrival written before this one is a reading that never had them, and
+/// there is nothing to backfill from — the mail it came out of may be gone.
+const STEP_17_ARRIVAL_FLIGHT: &str = r#"
+ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS airline TEXT;
+ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS flight_number TEXT;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -1165,6 +1177,7 @@ fn steps() -> Vec<(i64, Step)> {
         (14, Step::Sql(STEP_14_TRIP_ITEMS)),
         (15, Step::Code(step_15_reorder_items)),
         (16, Step::Sql(STEP_16_INBOX)),
+        (17, Step::Sql(STEP_17_ARRIVAL_FLIGHT)),
     ]
 }
 
@@ -1299,6 +1312,9 @@ pub struct NewArrival {
     pub place: Option<String>,
     pub origin: Option<String>,
     pub destination: Option<String>,
+    /// A flight's own name and number, when the confirmation said them.
+    pub airline: Option<String>,
+    pub flight_number: Option<String>,
     pub date: Option<String>,
     pub starts_at: Option<String>,
     pub ends_at: Option<String>,
@@ -4085,7 +4101,8 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
 /// readers cannot drift. The trip join is owner-scoped: a `trip_id` that
 /// names someone else's trip yields no name rather than theirs.
 const ARRIVAL_SELECT: &str =
-    "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination, a.date,
+    "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
+     a.airline, a.flight_number, a.date,
      a.starts_at, a.ends_at, a.confirmation_code, a.price, a.currency, a.confidence, a.summary,
      a.trip_id, t.name, a.status, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ')
      FROM arrivals a
@@ -4096,10 +4113,11 @@ const ARRIVAL_SELECT: &str =
 fn arrival_row(r: &Row) -> duckdb::Result<scout_api::Arrival> {
     Ok(scout_api::Arrival {
         id: r.get(0)?, mail_id: r.get(1)?, booking: r.get(2)?, kind: r.get(3)?, title: r.get(4)?,
-        place: r.get(5)?, origin: r.get(6)?, destination: r.get(7)?, date: r.get(8)?,
-        starts_at: r.get(9)?, ends_at: r.get(10)?, confirmation_code: r.get(11)?, price: r.get(12)?,
-        currency: r.get(13)?, confidence: r.get(14)?, summary: r.get(15)?, trip_id: r.get(16)?,
-        trip_name: r.get(17)?, status: r.get(18)?, received_at: r.get(19)?, attachments: Vec::new(),
+        place: r.get(5)?, origin: r.get(6)?, destination: r.get(7)?, airline: r.get(8)?,
+        flight_number: r.get(9)?, date: r.get(10)?,
+        starts_at: r.get(11)?, ends_at: r.get(12)?, confirmation_code: r.get(13)?, price: r.get(14)?,
+        currency: r.get(15)?, confidence: r.get(16)?, summary: r.get(17)?, trip_id: r.get(18)?,
+        trip_name: r.get(19)?, status: r.get(20)?, received_at: r.get(21)?, attachments: Vec::new(),
     })
 }
 
@@ -4434,11 +4452,13 @@ impl Store {
                 .map(|a| {
                     Ok(conn.query_row(
                         "INSERT INTO arrivals (account_id, mail_id, booking, kind, title, place, origin, destination,
+                                               airline, flight_number,
                                                date, starts_at, ends_at, timezone, confirmation_code, price, currency,
                                                travellers, confidence, summary, trip_id)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                         params![
                             account_id, mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
+                            a.airline, a.flight_number,
                             a.date, a.starts_at, a.ends_at, a.timezone, a.confirmation_code, a.price, a.currency,
                             a.travellers, a.confidence, a.summary, a.trip_id
                         ],
@@ -4605,7 +4625,57 @@ impl Store {
         conn.execute(&format!("DELETE FROM arrivals WHERE mail_id IN ({sweepable})"), params![cutoff])?;
         Ok(conn.execute(&format!("DELETE FROM inbound_mail WHERE id IN ({sweepable})"), params![cutoff])?)
     }
+
+    /// `(trip id, date, place)` per booking still waiting on one of this
+    /// account's trips.
+    ///
+    /// A draft holds no items until its owner presses Add, so for the hours
+    /// or days in between these rows are the only thing that says what the
+    /// trip is about. Placement reads them beside the items, or a second
+    /// email about the same journey can never find the draft the first one
+    /// made.
+    pub fn pending_arrival_marks(&self, account_id: i64) -> Result<Vec<(i64, String, Option<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT a.trip_id, a.date, a.place FROM arrivals a
+             WHERE a.account_id = ? AND {UNDECIDED} AND a.trip_id IS NOT NULL AND a.date IS NOT NULL
+             ORDER BY a.id"
+        ))?;
+        let rows = stmt.query_map(params![account_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Deletes this account's drafts that hold nothing and that nothing is
+    /// waiting on. Returns how many went.
+    pub fn sweep_empty_drafts(&self, account_id: i64) -> Result<usize> {
+        let conn = self.conn();
+        Ok(conn.execute(
+            &format!("DELETE FROM trips WHERE account_id = ? AND {COLLECTABLE_DRAFT}"),
+            params![account_id],
+        )?)
+    }
+
+    /// The same collection over every account, for the hourly maintenance:
+    /// the drafts already sitting in somebody's list were abandoned before
+    /// `add_arrival` swept, and nothing else will ever reach them.
+    pub fn sweep_all_empty_drafts(&self) -> Result<usize> {
+        let conn = self.conn();
+        Ok(conn.execute(&format!("DELETE FROM trips WHERE {COLLECTABLE_DRAFT}"), [])?)
+    }
 }
+
+/// A draft nothing landed on: not kept, owned by no conversation, holding
+/// no items, and with no booking waiting to become one.
+///
+/// All four together are only ever a placement draft that was abandoned —
+/// `place_arrival` made it to have somewhere to put a booking, and the
+/// booking went elsewhere or was ignored. A chat's own draft has a
+/// conversation and is the thread sweep's business; a draft whose booking
+/// is still pending is the reason that booking has a trip name on the page.
+/// Nothing is cascaded because there is by definition nothing to cascade.
+const COLLECTABLE_DRAFT: &str = "NOT kept AND conversation_id IS NULL
+     AND NOT EXISTS (SELECT 1 FROM trip_items i WHERE i.trip_id = trips.id)
+     AND NOT EXISTS (SELECT 1 FROM arrivals a WHERE a.trip_id = trips.id AND a.booking AND a.status = 'pending')";
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -4962,7 +5032,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 16);
+        assert_eq!(s.schema_version().unwrap(), 17);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -5026,7 +5096,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -6934,7 +7004,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -7592,7 +7662,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 16, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 17, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -7633,7 +7703,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 16);
+        assert_eq!(s.schema_version().unwrap(), 17);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -8120,7 +8190,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -8224,7 +8294,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -8328,7 +8398,7 @@ CREATE TABLE messages (
         let m = mail(&store, a, "re_1");
         let id = store.insert_arrival(a, m, &NewArrival {
             booking: true, kind: Some("stay".into()), title: Some("Hotel Alfama".into()), place: Some("Lisbon".into()),
-            origin: None, destination: None, date: Some("2026-10-12".into()), starts_at: None, ends_at: Some("2026-10-15".into()),
+            origin: None, destination: None, airline: None, flight_number: None, date: Some("2026-10-12".into()), starts_at: None, ends_at: Some("2026-10-15".into()),
             timezone: None, confirmation_code: Some("ABC".into()), price: Some(320.0), currency: Some("EUR".into()),
             travellers: None, confidence: Some(0.9), summary: "Hotel Alfama, 12–15 Oct".into(), trip_id: None,
         }).unwrap();
@@ -8409,7 +8479,7 @@ CREATE TABLE messages (
         let m = mail(&store, a, "re_1");
         let arrival = NewArrival {
             booking: true, kind: None, title: None, place: None, origin: None, destination: None,
-            date: None, starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
+            airline: None, flight_number: None, date: None, starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
             price: None, currency: None, travellers: None, confidence: None, summary: "x".into(), trip_id: None,
         };
         let id = store.insert_arrival(a, m, &arrival).unwrap();
@@ -8433,6 +8503,7 @@ CREATE TABLE messages (
         store.insert_attachment(spam, "logo.png", "image/png", Some(&[1, 2, 3]), None).unwrap();
         let arrival = NewArrival {
             booking: false, kind: None, title: None, place: None, origin: None, destination: None,
+            airline: None, flight_number: None,
             date: None, starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
             price: None, currency: None, travellers: None, confidence: None, summary: "A newsletter".into(), trip_id: None,
         };
@@ -8459,12 +8530,15 @@ CREATE TABLE messages (
         let att = store.insert_attachment(m, "ticket.pdf", "application/pdf", None, Some("Row 12")).unwrap();
         let arrival = NewArrival {
             booking: true, kind: Some("flight".into()), title: None, place: None, origin: Some("AMS".into()), destination: Some("LIS".into()),
+            airline: Some("KLM".into()), flight_number: Some("KL1691".into()),
             date: Some("2026-10-12".into()), starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
             price: None, currency: None, travellers: None, confidence: None, summary: "AMS → LIS".into(), trip_id: Some(trip.id),
         };
         let id = store.insert_arrival(a, m, &arrival).unwrap();
         let got = store.arrival_of(id, a).unwrap().expect("theirs");
         assert_eq!(got.trip_name.as_deref(), Some("Lisbon"));
+        // Which flight it was, kept for the leg's own option row.
+        assert_eq!((got.airline.as_deref(), got.flight_number.as_deref()), (Some("KLM"), Some("KL1691")));
         // ISO UTC with the `Z`, the shape `threads_of` sends and the page
         // parses without a date library.
         assert!(got.received_at.contains('T') && got.received_at.ends_with('Z'), "{}", got.received_at);
@@ -8581,6 +8655,88 @@ CREATE TABLE messages (
         assert_eq!(view.other.len(), 1, "one mail, one row: {view:?}");
         assert_eq!(view.other[0].reason, "not_booking", "the ranked reason, not the older row's");
         assert_eq!(view.other[0].arrival_id, Some(ids[1]));
+    }
+
+    #[test]
+    fn a_trips_waiting_bookings_are_readable_without_its_items() {
+        // A draft holds no items until somebody presses Add, so its dates
+        // live only on the arrivals placed on it. Placement reads these to
+        // know the draft is about November at all.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let b = store.account_for_telegram(2).unwrap();
+        let m = mail(&store, a, "re_1");
+        let draft = store.upsert_trip(a, "HKG, November", None, None, None).unwrap();
+        let waiting = NewArrival {
+            booking: true,
+            kind: Some("flight".into()),
+            place: Some("Hong Kong".into()),
+            date: Some("2026-11-02".into()),
+            summary: "out".into(),
+            trip_id: Some(draft.id),
+            ..Default::default()
+        };
+        // One batch: a second `insert_arrivals` on the same mail is a retry
+        // and replaces the pending rows of the first.
+        let ids = store
+            .insert_arrivals(a, m, &[
+                waiting.clone(),
+                // Not a mark: decided, not a booking, no date, or on no trip.
+                NewArrival { date: Some("2027-01-01".into()), summary: "decided".into(), ..waiting.clone() },
+                NewArrival { booking: false, date: Some("2027-02-02".into()), summary: "an ad".into(), ..waiting.clone() },
+                NewArrival { date: None, summary: "no date".into(), ..waiting.clone() },
+                NewArrival { trip_id: None, summary: "unplaced".into(), ..waiting.clone() },
+            ])
+            .unwrap();
+        let (id, decided) = (ids[0], ids[1]);
+        assert!(store.decide_arrival(decided, a, "ignored", None).unwrap());
+
+        assert_eq!(
+            store.pending_arrival_marks(a).unwrap(),
+            vec![(draft.id, "2026-11-02".to_string(), Some("Hong Kong".to_string()))]
+        );
+        assert_eq!(store.pending_arrival_marks(b).unwrap(), vec![], "not theirs");
+        assert!(store.decide_arrival(id, a, "added", None).unwrap());
+        assert_eq!(store.pending_arrival_marks(a).unwrap(), vec![], "a decided booking waits for nothing");
+    }
+
+    #[test]
+    fn a_draft_with_nothing_on_it_and_nothing_waiting_is_collected() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let b = store.account_for_telegram(2).unwrap();
+        let m = mail(&store, a, "re_1");
+        let empty = store.upsert_trip(a, "Empty draft", None, None, None).unwrap();
+        let with_item = store.upsert_trip(a, "Has an item", None, None, None).unwrap();
+        store.add_flight(with_item.id, "AMS", "HKG", "2026-11-02").unwrap();
+        let kept = store.upsert_trip(a, "Kept", None, None, None).unwrap();
+        store.keep_trip(a, "Kept").unwrap();
+        let waited_on = store.upsert_trip(a, "Waited on", None, None, None).unwrap();
+        store
+            .insert_arrival(a, m, &NewArrival {
+                booking: true,
+                date: Some("2026-11-02".into()),
+                summary: "waiting".into(),
+                trip_id: Some(waited_on.id),
+                ..Default::default()
+            })
+            .unwrap();
+        // A chat's own draft is the thread sweep's business, not this one.
+        let chat = store.start_conversation(a, "direct").unwrap();
+        let theirs = store.upsert_trip(a, "A chat draft", None, None, Some(chat)).unwrap();
+        let strangers = store.upsert_trip(b, "Somebody else's", None, None, None).unwrap();
+
+        assert_eq!(store.sweep_empty_drafts(a).unwrap(), 1);
+        assert_eq!(store.trip_by_id(a, empty.id).unwrap(), None);
+        for still_there in [with_item.id, kept.id, waited_on.id, theirs.id] {
+            assert!(store.trip_by_id(a, still_there).unwrap().is_some(), "trip {still_there} went");
+        }
+        assert!(store.trip_by_id(b, strangers.id).unwrap().is_some(), "not theirs to collect");
+        assert_eq!(store.sweep_empty_drafts(a).unwrap(), 0, "nothing left to collect");
+        // The account-less pass the hourly maintenance runs reaches the
+        // drafts already sitting in somebody's list.
+        assert_eq!(store.sweep_all_empty_drafts().unwrap(), 1);
+        assert_eq!(store.trip_by_id(b, strangers.id).unwrap(), None);
     }
 
     #[test]

@@ -348,6 +348,18 @@ export function savedFareQualifier(source) {
     : { prefix: '', note: 'when saved' }
 }
 
+// What a flight card says where its options would be when it has none.
+//
+// A booked leg with no option is a ticket the reader holds whose flight
+// the confirmation did not name — offering to search that route reads as
+// though the booking never arrived, which is the complaint this answers.
+// An unbooked leg is a route waiting for a search, and says so.
+export function noFlightLine(item) {
+  return item.booked
+    ? 'Booked. The confirmation did not say which flight.'
+    : 'No flight saved yet. Ask Scout in chat to search this route.'
+}
+
 export function tripPdfFilename(name) {
   const stem = String(name).toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -1228,6 +1240,12 @@ function start() {
       node('span', 'route-arrow', '→'),
       document.createTextNode(segment.destination),
     )
+    // The same mark a stay or an activity carries, for the same reason: a
+    // leg bought by forwarding a confirmation has a code on it, and the
+    // card said nothing about either.
+    if (segment.booked) {
+      route.append(node('span', 'item-booked', segment.confirmation_code ? `booked · ${segment.confirmation_code}` : 'booked'))
+    }
     const actions = node('div', 'segment-head-actions')
     actions.append(node('time', 'segment-date', dateLabel(segment.date)))
     const removeSlot = node('span', 'segment-remove')
@@ -1237,7 +1255,7 @@ function start() {
     card.append(head)
 
     if (!segment.candidates.length) {
-      card.append(node('p', 'no-options', 'No flight saved yet. Ask Scout in chat to search this route.'))
+      card.append(node('p', 'no-options', noFlightLine(segment)))
       return card
     }
     const options = node('div', 'option-list')

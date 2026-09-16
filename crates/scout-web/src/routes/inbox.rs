@@ -51,6 +51,7 @@ const TAKEN: &str = "that one is taken";
 const NOT_YOURS: &str = "not yours or not there";
 const DECIDED: &str = "already decided";
 const STILL_WAITING: &str = "a booking from this email is still waiting";
+const STILL_READING: &str = "Scout is still reading this email";
 
 /// The inbox as the tab draws it: the address, what is waiting, and the
 /// mail that was not a booking.
@@ -241,9 +242,10 @@ async fn ignore(
 /// Forgets one Other-mail row now, rather than in the thirty days the
 /// retention sweep would take.
 ///
-/// `{}` on success, for the reason `ignore` gives. The 409 says which
-/// booking is in the way — a refusal the reader can act on, unlike
-/// `DECIDED`, which is about the row they just pressed.
+/// `{}` on success, for the reason `ignore` gives. Both 409s name what is
+/// in the way — a booking waiting on a decision, or a read still running —
+/// because both are refusals the reader can act on by waiting or deciding,
+/// unlike `DECIDED`, which is about the row they just pressed.
 async fn delete_mail(
     State(auth): State<AuthState>,
     headers: HeaderMap,
@@ -262,6 +264,7 @@ async fn delete_mail(
         // already took are the same answer, as in `add` and `ignore`.
         Ok(MailGone::NotFound) => refused(StatusCode::NOT_FOUND, NOT_YOURS),
         Ok(MailGone::Waiting) => refused(StatusCode::CONFLICT, STILL_WAITING),
+        Ok(MailGone::Unsettled) => refused(StatusCode::CONFLICT, STILL_READING),
         Err(e) => {
             tracing::error!(error = %e, account_id, mail_id, "could not delete a mail");
             sorry()
@@ -680,6 +683,42 @@ mod tests {
         // A second press from a tab that has not repainted yet.
         let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, Some(&csrf)).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_mail_still_being_read_is_refused_until_the_worker_is_done() {
+        // No reading yet, so the pending-booking rule says nothing about
+        // it; deleting it would strand the row the worker is about to
+        // write against it.
+        let (app, core, _dir) = inbox_app().await;
+        let a = admitted(&core, "111").await;
+        let mail = scout_core::inbox::seed_unread_mail_for_tests(&core, a).await.unwrap();
+        let (session, csrf) = signed_in(a);
+        let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, Some(&csrf)).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(body_of(res).await, r#"{"ok":false,"reason":"Scout is still reading this email"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_that_joined_a_trip_is_still_downloadable_once_its_mail_is_deleted() {
+        let (app, core, _dir) = inbox_app().await;
+        let a = admitted(&core, "111").await;
+        let plan = scout_core::trips::seed_trip_for_tests(&core, a, "Lisbon").await.unwrap();
+        let arrival = scout_core::inbox::seed_arrival_for_tests(&core, a, "stay", "Hotel Alfama", "2026-10-12", Some(plan.trip.id)).await.unwrap();
+        let (session, csrf) = signed_in(a);
+        let mail = pending_mail_id(&app, &session).await;
+        let ticket = scout_core::inbox::seed_attachment_on_mail_for_tests(&core, mail, "ticket.pdf", "application/pdf", b"%PDF".to_vec()).await.unwrap();
+        // Add is what moves the file from the mail onto the trip's item.
+        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{arrival}/add"), &session, Some(&csrf), r#"{}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, Some(&csrf)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        // The mail it arrived with is gone and the ticket is still served:
+        // `attachment_owner` answers for it through the item now.
+        let res = get_with_cookie(&app, &format!("/chat/attachments/{ticket}"), &session).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers()["content-disposition"].to_str().unwrap().contains("ticket.pdf"));
+        assert_eq!(body_of(res).await, "%PDF");
     }
 
     #[tokio::test]

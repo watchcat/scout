@@ -1161,7 +1161,41 @@ pub async fn seed_arrival_for_tests(
         let mail_id = store
             .insert_mail(account_id, &seed_provider_id(), "seed@example.com", Some(&title), None, None, false)?
             .expect("a seed id is never repeated");
-        store.insert_arrival(account_id, mail_id, &row)
+        let id = store.insert_arrival(account_id, mail_id, &row)?;
+        // In the worker's order: the reading is written and then the mail
+        // is marked read. A seed that skipped this would leave a mail no
+        // `delete_mail` would touch, which is not the state an arrival on
+        // the page is ever in.
+        store.mail_done(mail_id)?;
+        Ok(id)
+    })
+    .await
+}
+
+/// A file on an existing seeded mail, so a test can put a booking and its
+/// ticket on one mail the way a real confirmation arrives.
+#[doc(hidden)]
+pub async fn seed_attachment_on_mail_for_tests(
+    core: &Core,
+    mail_id: i64,
+    filename: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<i64> {
+    let store = core.store();
+    let (filename, mime) = (filename.to_string(), mime.to_string());
+    blocking(move || store.insert_attachment(mail_id, &filename, &mime, Some(&bytes), None)).await
+}
+
+/// A mail that has just been delivered and not yet read: the state
+/// `delete_mail` refuses, which no other seed can produce.
+#[doc(hidden)]
+pub async fn seed_unread_mail_for_tests(core: &Core, account_id: i64) -> anyhow::Result<i64> {
+    let store = core.store();
+    blocking(move || {
+        Ok(store
+            .insert_mail(account_id, &seed_provider_id(), "seed@example.com", Some("Unread"), None, None, false)?
+            .expect("a seed id is never repeated"))
     })
     .await
 }

@@ -109,6 +109,19 @@ export function composerHeight(scrollHeight, cap = COMPOSER_CAP) {
   return Math.min(scrollHeight, cap)
 }
 
+// How long the Delete button of a confirm-in-place stays dead after the
+// confirm opens.
+//
+// Every one of these swaps the button for the confirm synchronously, and
+// the confirm's Delete lands on the pixel the button it replaced occupied —
+// so the second click of a double-click, or a double-tap, presses Delete
+// without the confirm having been on screen for a frame. Measured at both
+// phone and desktop widths. A window longer than any double-click interval
+// (Windows tops out at 900ms for a deliberately slow setting; the usual
+// threshold is 400–500ms) closes it, and one this short is invisible to
+// anyone who is reading the question the confirm asks.
+const CONFIRM_ARM_MS = 350
+
 // The idle window after which an unpinned thread is deleted, and the point
 // at which the sidebar starts saying so. Both mirror core: 48h expiry in
 // `Core::THREAD_IDLE_SECS`, and "worth warning" at 36h.
@@ -1169,6 +1182,15 @@ function start() {
     return item.kind === 'flight' ? `${item.origin} → ${item.destination}` : item.title
   }
 
+  // Holds the destructive half of a confirm-in-place dead until the gesture
+  // that opened it is over — see `CONFIRM_ARM_MS` for the hazard. Setting
+  // `disabled` on a node that has since been replaced does nothing, so an
+  // opened-and-cancelled confirm needs no cleanup.
+  function armConfirm(button) {
+    button.disabled = true
+    setTimeout(() => { button.disabled = false }, CONFIRM_ARM_MS)
+  }
+
   // The plain "Remove" button an item starts with. Kept as its own
   // function so `removeConfirmRow`'s Cancel can rebuild exactly this and put
   // the card back the way it found it.
@@ -1209,6 +1231,9 @@ function start() {
     confirm.type = 'button'
     confirm.className = 'danger'
     confirm.textContent = 'Remove'
+    // A double-click on Remove would otherwise take the leg on one gesture,
+    // the confirm never seen.
+    armConfirm(confirm)
     confirm.addEventListener('click', () => {
       confirm.disabled = true
       cancel.disabled = true
@@ -1609,63 +1634,121 @@ function start() {
     otherMailEl.append(list)
   }
 
+  // Whether the row's right-hand group is showing more than the date and
+  // the ×. It is allowed to wrap onto its own line only then: in the
+  // resting state a wrap puts a stray date and × on a line of their own,
+  // and at the aside's width flex breaks on max-content, so the stacked
+  // sender block triggers it on ordinary rows.
+  function mailRowWide(slot, wide) {
+    slot.closest('.other-mail-row')?.classList.toggle('confirming', wide)
+  }
+
   // The × a row starts with. Its own function, as `segmentRemoveButton` is,
-  // so the confirm's Cancel can rebuild exactly this.
+  // so the confirm's Cancel and a refusal can both rebuild exactly this.
   function mailRemoveButton(line, slot) {
     const button = node('button', 'segment-remove-button other-mail-remove-button', '×')
     button.type = 'button'
     button.setAttribute('aria-label', otherMailDeleteLabel(line))
     button.addEventListener('click', () => {
-      slot.replaceChildren(mailRemoveConfirm(line, slot))
+      const row = mailRemoveConfirm(line, slot)
+      mailRowWide(slot, true)
+      slot.replaceChildren(row)
+      // Focus was on the × this just replaced. Cancel is first in the row
+      // and is the safe half of the choice, so it takes it — and Delete is
+      // still dead for the moment below, so focus could not go there.
+      row.querySelector('button')?.focus()
     })
     return button
   }
 
   // A second press rather than `window.confirm`, for the reason
   // `removeConfirmRow` gives — and the same swap-in-place: the ask stands
-  // where the × was and puts the × back on Cancel, on a refusal, or on a
-  // request that never landed. Only a delete that happened leaves it gone,
-  // and that repaints the whole list anyway.
+  // where the × was and puts the × back on Cancel or on a failure. Only a
+  // delete that happened leaves it gone, and that repaints the whole list
+  // anyway.
   function mailRemoveConfirm(line, slot) {
     const row = node('span', 'segment-remove-confirm')
     row.append(node('span', '', 'Delete?'))
     const cancel = node('button', '', 'Cancel')
     cancel.type = 'button'
     cancel.addEventListener('click', () => {
+      mailRowWide(slot, false)
       slot.replaceChildren(mailRemoveButton(line, slot))
     })
     const confirm = node('button', 'danger', 'Delete')
     confirm.type = 'button'
+    armConfirm(confirm)
     confirm.addEventListener('click', () => {
       // Off until the answer, the way `decideArrival` disables the card it
       // was pressed on: a button that still looks live invites a second
       // press at a mail that is already going.
       confirm.disabled = true
       cancel.disabled = true
-      deleteMail(line).then((restore) => {
-        if (restore) slot.replaceChildren(mailRemoveButton(line, slot))
+      deleteMail(line).then((problem) => {
+        if (problem) mailRemoveProblem(line, slot, problem)
       }).catch(() => {
-        slot.replaceChildren(mailRemoveButton(line, slot))
+        mailRemoveProblem(line, slot, 'Could not reach Scout.')
       })
     })
     row.append(cancel, confirm)
     return row
   }
 
-  // Returns whether the confirm row that called this should go back to the
-  // ×. Both refusals this route gives are the reader's to act on — a mail
-  // that is not there any more (404) and one whose booking is still
-  // waiting (409) — so both are shown as the server worded them.
+  // A refusal belongs in the row it was pressed in. `showTripToast` appends
+  // into the right-hand pane, and on a phone Other mail sits below the
+  // trip, so the sentence explaining the refusal would land off-screen —
+  // the reader would see a × that did nothing. The × comes back beside the
+  // reason, because both refusals are answered by acting and pressing
+  // again: decide the booking, or let the read finish.
+  function mailRemoveProblem(line, slot, text) {
+    const row = node('span', 'other-mail-problem')
+    const said = node('span', '', text)
+    said.id = `mail-${line.mail_id}-problem`
+    const button = mailRemoveButton(line, slot)
+    // Described by the reason rather than announced by a live region: this
+    // node is inserted with its text already in it, which a live region is
+    // not obliged to read out, and focus lands on the button in the same
+    // breath — so the description is what a reader actually hears.
+    button.setAttribute('aria-describedby', said.id)
+    row.append(said, button)
+    mailRowWide(slot, true)
+    slot.replaceChildren(row)
+    button.focus()
+  }
+
+  // Focus was on the × of a row that no longer exists, and a repaint that
+  // leaves it on nothing drops it to the body — which sends a keyboard
+  // reader back to the top of the page, the hazard `closeDrawer` names. It
+  // goes to the × that took this row's place, to the last × when the row
+  // that went was last, and to the address line below the section when
+  // there are no rows left and the section hides itself.
+  function focusAfterMailDelete(index) {
+    const buttons = [...(otherMailEl?.querySelectorAll('.other-mail-remove-button') ?? [])]
+    const next = buttons[Math.min(index, buttons.length - 1)]
+    ;(next ?? handleLineEl?.querySelector('button'))?.focus()
+  }
+
+  // The reason to put back in the row, or `null` when the row is gone and
+  // the list has been repainted. A 404 is the second of those: the mail is
+  // already gone, all but always because another tab deleted it, and
+  // restoring the × would leave a row with nothing behind it.
+  //
+  // Takes the same three lines every other write on this page takes — the
+  // guard, the flag, the sequence bump — because a `loadTrips` already in
+  // flight would otherwise repaint the deleted row back with a live ×.
   async function deleteMail(line) {
+    if (tripChoicePending) return 'Something else is saving.'
+    tripChoicePending = true
+    tripLoadSeq++
+    const index = Math.max(0, (inbox?.other ?? []).findIndex((row) => row.mail_id === line.mail_id))
     try {
       const res = await fetch(`/chat/mail/${encodeURIComponent(line.mail_id)}`, {
         method: 'DELETE',
         headers: { 'x-scout-csrf': csrfToken },
       })
-      if (!res.ok) {
+      if (!res.ok && res.status !== 404) {
         const reason = await refusalReason(res)
-        showTripToast(reason ? `Could not delete it: ${reason}.` : 'Could not delete it. Try again.')
-        return true
+        return reason ? `${reason[0].toUpperCase()}${reason.slice(1)}.` : 'Could not delete it.'
       }
       // The row is gone whatever the reload then says, so it leaves this
       // tab's copy first: an inbox that fails to load must not leave a
@@ -1674,11 +1757,13 @@ function start() {
       const loaded = await fetchInbox()
       if (loaded) inbox = loaded
       renderInboxSide()
-      showTripToast('Deleted.')
-      return false
+      // Nothing is said on success: the row leaving is the whole answer.
+      focusAfterMailDelete(index)
+      return null
     } catch {
-      showTripToast('Could not reach Scout. Try again.')
-      return true
+      return 'Could not reach Scout.'
+    } finally {
+      tripChoicePending = false
     }
   }
 

@@ -4562,7 +4562,12 @@ impl Store {
              FROM inbound_mail m LEFT JOIN arrivals a ON a.mail_id = m.id
              WHERE m.account_id = ? AND m.received_at >= ?
                AND ({failed} OR (a.id IS NOT NULL AND (NOT a.booking OR a.status = 'ignored')))
-             QUALIFY row_number() OVER (PARTITION BY m.id ORDER BY a.id) = 1
+             -- One row per mail. The partition is ordered by the same rank the
+             -- CASE above uses, so the reason the collapse keeps is the reason
+             -- the mail would have shown anyway: a not-a-booking reading
+             -- outranks an ignored one, and `failed` is the mail's own status
+             -- and so is every row's reason at once.
+             QUALIFY row_number() OVER (PARTITION BY m.id ORDER BY (NOT a.booking) DESC, a.id) = 1
              ORDER BY m.received_at DESC, m.id DESC"
         ))?;
         let mut other: Vec<scout_api::MailRow> = stmt
@@ -8547,6 +8552,35 @@ CREATE TABLE messages (
         assert_eq!(view.other.len(), 1, "one mail, one row: {view:?}");
         assert_eq!((view.other[0].mail_id, view.other[0].arrival_id), (m, Some(ids[0])), "named by its first reading");
         assert_eq!(view.other[0].reason, "not_booking");
+    }
+
+    #[test]
+    fn the_row_a_mail_collapses_to_keeps_the_reason_it_would_have_shown() {
+        // One mail read as two things: a booking the owner ignored, and
+        // something that was never a booking. The CASE ranks not-a-booking
+        // above ignored, so the collapse has to keep that row rather than
+        // whichever arrived first, or the reason on the page depends on the
+        // order the readings happened to be written in.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        let ids = store
+            .insert_arrivals(a, m, &[
+                NewArrival {
+                    booking: true,
+                    kind: Some("stay".into()),
+                    date: Some("2026-10-12".into()),
+                    summary: "a room".into(),
+                    ..Default::default()
+                },
+                NewArrival { booking: false, summary: "an ad under it".into(), ..Default::default() },
+            ])
+            .unwrap();
+        assert!(store.decide_arrival(ids[0], a, "ignored", None).unwrap());
+        let view = store.inbox_view(a).unwrap();
+        assert_eq!(view.other.len(), 1, "one mail, one row: {view:?}");
+        assert_eq!(view.other[0].reason, "not_booking", "the ranked reason, not the older row's");
+        assert_eq!(view.other[0].arrival_id, Some(ids[1]));
     }
 
     #[test]

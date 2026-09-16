@@ -78,7 +78,7 @@ pub struct Extraction {
     /// parses; `readable` then reads that absence as true, and `parse_many`
     /// keeps it required of the old bare object. Nothing else defaults it
     /// on purpose.
-    #[serde(default)] pub booking: bool,
+    #[serde(default, deserialize_with = "booking_said")] pub booking: bool,
     #[serde(default)] pub kind: Option<String>,
     #[serde(default)] pub title: Option<String>,
     #[serde(default)] pub place: Option<String>,
@@ -227,6 +227,16 @@ impl Extraction {
 /// spend the mail's attempts and file it as unreadable, losing the legs
 /// that were perfectly clear. When nothing survives, `parse_many`'s empty
 /// branch still files the mail under Other mail.
+/// `null` is what the preamble asks for wherever a thing is not stated, so
+/// it must not fail the entry the way a wrong type does: it reads as the
+/// default here and `readable` then treats it as an absent verdict. Before
+/// this, `"booking": null` on a leg dropped that leg with nothing on the
+/// page to show for it, which is the loss this whole reading exists to
+/// prevent.
+fn booking_said<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(<Option<bool> as serde::Deserialize>::deserialize(d)?.unwrap_or_default())
+}
+
 fn readable<'a>(items: impl Iterator<Item = &'a serde_json::Value>) -> Vec<Extraction> {
     items
         .filter_map(|item| match serde_json::from_value::<Extraction>(item.clone()) {
@@ -239,7 +249,10 @@ fn readable<'a>(items: impl Iterator<Item = &'a serde_json::Value>) -> Vec<Extra
                 // date or the route are not there, so nothing unusable
                 // reaches the page — and an explicit `false` is the model's
                 // own verdict and stands.
-                if item.get("booking").is_none() {
+                // `null` counts as absent, not as false: the preamble asks
+                // for null wherever something is not stated, so a model
+                // following it says nothing about a leg's verdict that way.
+                if matches!(item.get("booking"), None | Some(serde_json::Value::Null)) {
                     e.booking = true;
                 }
                 Some(e.checked())
@@ -1173,6 +1186,23 @@ mod tests {
         // The old bare object is one mail's verdict, not a list of things
         // booked: an object that does not say is not an answer.
         assert!(Extraction::parse_many(r#"{"kind":"stay","date":"2026-10-12","summary":"x"}"#).is_err());
+        // `null` is what the preamble asks for wherever a thing is not
+        // stated, so a leg that answers it that way is unstated, not
+        // refused — and above all not dropped, which is how it read before.
+        let nulled = Extraction::parse_many(
+            r#"{"bookings":[{"booking":null,"kind":"flight","origin":"AMS","destination":"HKG","date":"2026-11-02","summary":"out"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(nulled.len(), 1, "a null verdict does not lose the leg");
+        assert!(nulled[0].booking);
+        // A verdict of the wrong type is not a verdict. The entry goes,
+        // with a line in the log, rather than being guessed at.
+        let junk = Extraction::parse_many(
+            r#"{"bookings":[{"booking":"yes","kind":"stay","date":"2026-10-12","summary":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(junk.len(), 1);
+        assert!(!junk[0].booking, "nothing readable survived, so the mail is filed as no booking");
     }
 
     #[test]

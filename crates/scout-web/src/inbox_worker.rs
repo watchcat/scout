@@ -408,6 +408,15 @@ fn disposition(m: &Meta) -> Option<String> {
 /// Only when no disposition is stated does the Content-ID decide, and
 /// then a non-blank one means the HTML body references this part by it:
 /// a signature logo, a header banner, a tracking pixel.
+/// One residual, chosen rather than overlooked: a real attachment that
+/// states no disposition at all but carries a Content-ID is dropped. An
+/// unstated disposition beside a Content-ID is the body-referenced image,
+/// which is the case this exists for, so the weaker signal decides when
+/// there is no stronger one. If the received record turns out to carry
+/// Content-IDs and never dispositions, every identified ticket would go
+/// that way — the `warn!` when winnowing leaves nothing is what would say
+/// so, and the fix then is to read both fields off the webhook at ingest,
+/// where Resend is known to send them.
 fn is_decoration(m: &Meta) -> bool {
     match disposition(m) {
         Some(token) => token == "inline",

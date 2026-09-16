@@ -172,8 +172,9 @@ async fn work_one(core: &Core, client: &ResendClient, from: &str, m: &MailToWork
 enum Forwarded {
     /// Sent — now, or on a pass before this one.
     Yes,
-    /// The account has no email identity: nowhere to send it. Asked again
-    /// on a retry, in case one was linked since.
+    /// The account has no email identity: nowhere to send it. The mail is
+    /// settled as done on this pass; only a retry of a failed reading asks
+    /// again, in case one was linked since.
     NoAddress,
     /// Resend refused it. Asking again would get the same answer.
     Refused,
@@ -660,7 +661,7 @@ mod tests {
         let mail_id = scout_core::inbox::record_mail(&core, a, a_mail("re_1")).await.unwrap().unwrap();
         let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
         work_once(&core, &client, FROM, 10).await;
-        // Forwarded (one POST /emails), attachment stored, extraction failed on the closed port → attempts 1, still new.
+        // Forwarded (one POST /emails), attachment stored, extraction failed on the closed port → attempts 1, status extracting.
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(forwards(&reqs), 1);
         let forward: serde_json::Value = serde_json::from_slice(&reqs.iter().find(|r| r.url.path() == "/emails").unwrap().body).unwrap();

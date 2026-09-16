@@ -464,6 +464,13 @@ fn disposition_for(mime: &SafeMime) -> Disposition {
 /// website, an airline's check-in page — will not open under this policy.
 /// That is the price of the three capabilities above, paid knowingly, and
 /// the reader still has the address in the mail the file came with.
+/// `allow-downloads` is inert only because `allow-scripts`, `allow-forms`,
+/// `allow-popups` and `allow-top-navigation` are all absent: with those
+/// gone, the only actor left that can start a download is the reader
+/// pressing Save on the document in front of them. The two tokens are one
+/// decision. Add `allow-scripts` — the fallback if a browser turns out to
+/// refuse a sandboxed PDF outright — and this stops being a save button
+/// and becomes a drive-by download from an opaque origin.
 const FILE_CSP: &str = "default-src 'none'; sandbox allow-downloads";
 
 /// `[A-Za-z0-9._-]` of the name, anything else an underscore, runs of
@@ -529,12 +536,22 @@ const KINDS: [&str; 9] = [
 /// `nosniff` should already keep them inert, and this is the third lock
 /// on the same door: a stored SVG served as SVG is a script under our
 /// origin the moment either of those is bypassed.
-const ACTIVE: [&str; 7] = [
+const ACTIVE: [&str; 12] = [
     "text/html",
     "application/xhtml+xml",
     "image/svg+xml",
     "text/javascript",
     "application/javascript",
+    // The older and stranger spellings of the same two things. None of
+    // them is on the inline list, so each was already served as a byte
+    // stream and could not render — but this is the list that documents
+    // what must never be a document, and a list that omits half the
+    // spellings of JavaScript teaches the next reader the wrong rule.
+    "application/x-javascript",
+    "application/ecmascript",
+    "text/ecmascript",
+    "text/vbscript",
+    "application/xslt+xml",
     "text/xml",
     "application/xml",
 ];
@@ -574,8 +591,14 @@ impl SafeMime {
 fn safe_mime(mime: &str) -> SafeMime {
     let lower = mime.trim().to_ascii_lowercase();
     let base = lower.split(';').next().unwrap_or("").trim();
+    // 127 is the subtype's limit in RFC 6838, and a bound belongs here for
+    // the same reason `safe_filename` has one: a stranger sizes this
+    // header, and nothing downstream would refuse a three-hundred-letter
+    // subtype that nothing can render anyway.
     let token = |s: &str| {
-        !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-'))
+        !s.is_empty()
+            && s.len() <= 127
+            && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-'))
     };
     match base.split_once('/') {
         Some((kind, sub)) if KINDS.contains(&kind) && token(sub) && !ACTIVE.contains(&base) => {

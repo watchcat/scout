@@ -1107,6 +1107,47 @@ mod tests {
         assert!(get(&app, "/").await.headers().get("content-security-policy").is_none());
     }
 
+    #[tokio::test]
+    async fn the_layer_leaves_a_policy_the_handler_already_chose() {
+        // The layer runs after the handler, so an unconditional insert
+        // overwrites whatever the handler decided. That is wrong for the
+        // one route that serves a stranger's file rather than our own page:
+        // `/chat/attachments` answers `default-src 'none'; sandbox`, which
+        // is stricter than the site policy could ever be, and being
+        // replaced by a policy that allows `script-src 'self'` would be
+        // exactly backwards. A synthetic router rather than the app, so
+        // this says what the layer does and not what one route asks of it.
+        use axum::http::header;
+        use axum::response::IntoResponse;
+        const STRICT: &str = "default-src 'none'; sandbox";
+        let app = axum::Router::new()
+            .route(
+                "/strict",
+                axum::routing::get(|| async {
+                    ([(header::CONTENT_SECURITY_POLICY, STRICT)], "a stranger's file").into_response()
+                }),
+            )
+            .route("/page", axum::routing::get(|| async { "one of ours" }))
+            .layer(axum::middleware::from_fn(crate::security_headers));
+
+        let res = get(&app, "/strict").await;
+        assert_eq!(res.headers()["content-security-policy"], STRICT);
+
+        // A handler that says nothing still gets the site's policy — the
+        // layer exists so the handler that forgot is still covered.
+        let res = get(&app, "/page").await;
+        assert_eq!(res.headers()["content-security-policy"], crate::CSP);
+
+        // And the other four are unchanged either way: only the policy
+        // learned to defer.
+        for (res, what) in [(get(&app, "/strict").await, "/strict"), (get(&app, "/page").await, "/page")] {
+            assert_eq!(res.headers()["referrer-policy"], "strict-origin", "{what}");
+            assert_eq!(res.headers()["x-content-type-options"], "nosniff", "{what}");
+            assert_eq!(res.headers()["x-frame-options"], "DENY", "{what}");
+            assert_eq!(res.headers()["cache-control"], "no-store", "{what}");
+        }
+    }
+
     /// An address, as a form body carries it.
     ///
     /// `+` means a space in a form encoding, so a tagged address written

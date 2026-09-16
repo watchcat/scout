@@ -278,9 +278,16 @@ async fn delete_mail(
 /// neither is put on the wire as it arrived: the name is reduced to the
 /// characters a header cannot be broken out of with (the real one rides
 /// beside it, percent-encoded), and the type is passed through only when
-/// it is shaped like one and is not one a browser would execute. `nosniff`
-/// and `attachment` together are what keep a file that claims to be a PDF
-/// from being run as a page under our origin.
+/// it is shaped like one and is not one a browser would execute.
+///
+/// A ticket or a voucher is meant to be looked at, so a type the browser
+/// renders in a viewer of its own goes out `inline` and opens in a tab
+/// (see `INLINE`); everything else stays `attachment` and lands in
+/// Downloads. What keeps a file that claims to be a PDF from being run as
+/// a page under our origin is then three things rather than two:
+/// `safe_mime` never names an executable type, `nosniff` stops the browser
+/// guessing one, and the `inline` response carries `FILE_CSP`, under which
+/// a document can do nothing even if it somehow became one.
 ///
 /// The body is bounded by `inbox_worker::ATTACHMENT_CAP`, the most the
 /// worker ever stored for one file.
@@ -295,17 +302,30 @@ async fn attachment(
     };
     match inbox::attachment_for(&auth.core, id, account_id).await {
         Ok(Some((filename, mime, bytes))) => {
+            // The sanitised type decides both what is sent and whether it
+            // opens, so it is computed once and the disposition reads it —
+            // a second call on the raw `mime` would be an allowlist over a
+            // stranger's string.
+            let mime = safe_mime(&mime);
+            let disposition = disposition_for(&mime);
             let mut response = bytes.into_response();
             let h = response.headers_mut();
             h.insert(
                 header::CONTENT_TYPE,
-                HeaderValue::from_str(&safe_mime(&mime)).expect("a checked mime is header-safe"),
+                HeaderValue::from_str(&mime).expect("a checked mime is header-safe"),
             );
             h.insert(
                 header::CONTENT_DISPOSITION,
-                HeaderValue::from_str(&content_disposition(&filename))
+                HeaderValue::from_str(&content_disposition(disposition, &filename))
                     .expect("a sanitised and a percent-encoded name are both header-safe"),
             );
+            if disposition == "inline" {
+                // Only the response that actually renders needs this, and
+                // it needs it instead of the site's: see `FILE_CSP`. The
+                // shared layer defers to a policy a handler set, which is
+                // what lets this survive being written here.
+                h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(FILE_CSP));
+            }
             h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
             // Said here as well as by the signed-half layer: a route that
             // serves somebody's ticket must not depend on where it is
@@ -342,13 +362,60 @@ const REAL_NAME_CAP: usize = 200;
 /// a quoted string, and `filename*=` (RFC 8187) is how a browser that
 /// knows it restores a name written in another alphabet — which a booking
 /// forwarded from a Portuguese hotel usually is.
-fn content_disposition(name: &str) -> String {
+fn content_disposition(disposition: &str, name: &str) -> String {
     format!(
-        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        "{disposition}; filename=\"{}\"; filename*=UTF-8''{}",
         safe_filename(name),
         encoded_filename(name)
     )
 }
+
+/// The types that open in a tab rather than land in Downloads, and the
+/// only ones: a browser renders each of these in a viewer of its own — the
+/// PDF reader, the image viewer, the plain-text pane — none of which
+/// executes anything the file says, and none of which is the HTML parser.
+///
+/// The list is short on purpose. It is also *safely* short rather than
+/// merely short, and the reason is one line up the call chain: the type
+/// tested here has already been through `safe_mime`, which turns
+/// `text/html`, `application/xhtml+xml`, `image/svg+xml`, both spellings
+/// of JavaScript and both of XML into `application/octet-stream` (see
+/// `ACTIVE`). So the types a browser would *execute* cannot reach this
+/// list as themselves — they arrive as `application/octet-stream`, which
+/// is not on it. Two independent conditions, and a test holds both: if
+/// `safe_mime` is ever loosened, the allowlist is still the thing that
+/// decides, and it names nothing executable.
+const INLINE: [&str; 6] = [
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "text/plain",
+];
+
+/// `inline` for a file the browser can render, `attachment` for the rest.
+///
+/// Takes the type *after* `safe_mime`, never the one the mail carried:
+/// that is what makes `INLINE` an allowlist over a sanitised value rather
+/// than over a stranger's string.
+fn disposition_for(safe_mime: &str) -> &'static str {
+    if INLINE.contains(&safe_mime) {
+        "inline"
+    } else {
+        "attachment"
+    }
+}
+
+/// What a rendered stranger's file is allowed to do: nothing.
+///
+/// The site policy allows `script-src 'self'`, which is right for our own
+/// pages and wrong for somebody's forwarded ticket. `default-src 'none'`
+/// means the document loads no subresource of any kind, and `sandbox` with
+/// no tokens puts it in an opaque origin — no scripts, no forms, no
+/// plugins, no same-origin access to anything of ours. A PDF or an image
+/// needs none of that to be shown.
+const FILE_CSP: &str = "default-src 'none'; sandbox";
 
 /// `[A-Za-z0-9._-]` of the name, anything else an underscore, runs of
 /// them collapsed, capped at `ASCII_NAME_CAP` with the extension kept,
@@ -439,7 +506,7 @@ fn safe_mime(mime: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_disposition, safe_filename, safe_mime};
+    use super::{content_disposition, disposition_for, safe_filename, safe_mime, ACTIVE, INLINE};
     use crate::tests::*;
     use axum::http::StatusCode;
 
@@ -459,17 +526,25 @@ mod tests {
     #[test]
     fn the_disposition_carries_an_ascii_name_and_the_real_one_encoded() {
         assert_eq!(
-            content_disposition("my \"ticket\".pdf"),
+            content_disposition("attachment", "my \"ticket\".pdf"),
             "attachment; filename=\"my_ticket_.pdf\"; filename*=UTF-8''my%20%22ticket%22.pdf"
         );
         assert_eq!(
-            content_disposition("билет.pdf"),
+            content_disposition("attachment", "билет.pdf"),
             "attachment; filename=\"_.pdf\"; filename*=UTF-8''%D0%B1%D0%B8%D0%BB%D0%B5%D1%82.pdf"
+        );
+        // Both names on `inline` too, and for the same two readers: they
+        // are what the browser's own PDF viewer puts in the tab title and
+        // hands to its save button, so a file that opens rather than
+        // downloads must not lose the name it arrived with.
+        assert_eq!(
+            content_disposition("inline", "билет.pdf"),
+            "inline; filename=\"_.pdf\"; filename*=UTF-8''%D0%B1%D0%B8%D0%BB%D0%B5%D1%82.pdf"
         );
         // The encoded original is capped at 200 bytes of the name before
         // encoding, on a character boundary.
         let long = "é".repeat(150);
-        let header = content_disposition(&long);
+        let header = content_disposition("attachment", &long);
         let encoded = header.rsplit("''").next().unwrap();
         assert_eq!(encoded.len(), 100 * 6, "100 two-byte chars, 3 header bytes each: {header}");
     }
@@ -487,6 +562,49 @@ mod tests {
         assert_eq!(safe_mime("text/html; charset=utf-8"), "application/octet-stream");
         assert_eq!(safe_mime("pdf"), "application/octet-stream");
         assert_eq!(safe_mime("a/b\r\nX: y"), "application/octet-stream");
+    }
+
+    #[test]
+    fn only_what_a_browser_renders_in_a_viewer_of_its_own_is_opened() {
+        // Every type on the list, named one by one rather than looped over
+        // `INLINE`: a test that iterates the constant it is checking agrees
+        // with whatever someone adds to it, which is the one thing this
+        // test exists to notice.
+        for mime in [
+            "application/pdf",
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "text/plain",
+        ] {
+            assert_eq!(disposition_for(mime), "inline", "{mime}");
+        }
+        assert_eq!(INLINE.len(), 6, "a type was added to the allowlist without a reason above it");
+
+        // And the kinds a browser cannot render, which is everything else:
+        // a Word document, a zip, a type nobody claimed.
+        for mime in [
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/zip",
+            "application/octet-stream",
+            "text/calendar",
+            "video/mp4",
+        ] {
+            assert_eq!(disposition_for(mime), "attachment", "{mime}");
+        }
+
+        // What makes the allowlist safe rather than merely short: the types
+        // a browser would *execute* never reach `disposition_for` as
+        // themselves, because `safe_mime` has already turned them into
+        // `application/octet-stream`. Asserted rather than asserted-in-
+        // prose, because the day someone loosens `safe_mime` this is the
+        // test that should go red.
+        for mime in ACTIVE {
+            assert_eq!(safe_mime(mime), "application/octet-stream", "{mime}");
+            assert_eq!(disposition_for(&safe_mime(mime)), "attachment", "{mime}");
+            assert!(!INLINE.contains(&mime), "{mime} is both active and inline");
+        }
     }
 
     /// The inbox switched on — the same condition that mounts the webhook
@@ -746,12 +864,95 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             res.headers()["content-disposition"],
-            "attachment; filename=\"my_ticket_.pdf\"; filename*=UTF-8''my%20%22ticket%22.pdf"
+            "inline; filename=\"my_ticket_.pdf\"; filename*=UTF-8''my%20%22ticket%22.pdf"
         );
         assert_eq!(res.headers()["x-content-type-options"], "nosniff");
         assert_eq!(res.headers()["cache-control"], "no-store");
         let page = scout_core::inbox::seed_attachment_for_tests(&core, a, "map.svg", "image/svg+xml", b"<svg/>".to_vec()).await.unwrap();
         let res = get_with_cookie(&app, &format!("/chat/attachments/{page}"), &session).await;
         assert_eq!(res.headers()["content-type"], "application/octet-stream", "never a type a browser would run");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_opens_in_the_browser_under_a_policy_of_its_own() {
+        let (app, core, _dir) = inbox_app().await;
+        let a = admitted(&core, "111").await;
+        let id = scout_core::inbox::seed_attachment_for_tests(&core, a, "билет.pdf", "application/pdf", b"%PDF".to_vec()).await.unwrap();
+        let (session, _) = signed_in(a);
+        let res = get_with_cookie(&app, &format!("/chat/attachments/{id}"), &session).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "application/pdf");
+        // Open it, and under both names: the ASCII one for every browser
+        // that has ever read the header, the encoded one for the viewer's
+        // title and its save button.
+        assert_eq!(
+            res.headers()["content-disposition"],
+            "inline; filename=\"_.pdf\"; filename*=UTF-8''%D0%B1%D0%B8%D0%BB%D0%B5%D1%82.pdf"
+        );
+        // A stranger's file that renders gets a policy of its own, not the
+        // site's — the site's allows `script-src 'self'`, which is the last
+        // thing a rendered stranger's file should have. `sandbox` with no
+        // token is an opaque origin: no scripts, no forms, no same-origin,
+        // so it can load nothing and reach nothing of ours.
+        assert_eq!(
+            res.headers()["content-security-policy"],
+            "default-src 'none'; sandbox",
+            "the shared layer clobbered the handler's policy"
+        );
+        assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(res.headers()["cache-control"], "no-store");
+        // Opening changes nothing about whose file it is.
+        let b = admitted(&core, "777").await;
+        let (session_b, _) = signed_in(b);
+        assert_eq!(
+            get_with_cookie(&app, &format!("/chat/attachments/{id}"), &session_b).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_the_browser_cannot_render_is_still_saved() {
+        let (app, core, _dir) = inbox_app().await;
+        let a = admitted(&core, "111").await;
+        let id = scout_core::inbox::seed_attachment_for_tests(
+            &core,
+            a,
+            "voucher.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            b"PK".to_vec(),
+        )
+        .await
+        .unwrap();
+        let (session, _) = signed_in(a);
+        let res = get_with_cookie(&app, &format!("/chat/attachments/{id}"), &session).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            res.headers()["content-disposition"].to_str().unwrap().starts_with("attachment;"),
+            "{:?}",
+            res.headers()["content-disposition"]
+        );
+        assert!(res.headers()["content-disposition"].to_str().unwrap().contains("voucher.docx"));
+        assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(res.headers()["cache-control"], "no-store");
+    }
+
+    #[tokio::test]
+    async fn a_stored_page_is_neither_rendered_nor_offered_as_one() {
+        // Belt and braces, and both halves pinned: `safe_mime` turns the
+        // type into one no browser runs, and the disposition says save it.
+        // Either alone would do; the point of asserting both is that
+        // loosening one does not quietly become the only line of defence.
+        let (app, core, _dir) = inbox_app().await;
+        let a = admitted(&core, "111").await;
+        let id = scout_core::inbox::seed_attachment_for_tests(&core, a, "itinerary.html", "text/html", b"<script>1</script>".to_vec()).await.unwrap();
+        let (session, _) = signed_in(a);
+        let res = get_with_cookie(&app, &format!("/chat/attachments/{id}"), &session).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "application/octet-stream");
+        assert!(
+            res.headers()["content-disposition"].to_str().unwrap().starts_with("attachment;"),
+            "a stored page must never be opened: {:?}",
+            res.headers()["content-disposition"]
+        );
     }
 }

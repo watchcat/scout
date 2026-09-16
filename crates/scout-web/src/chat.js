@@ -1589,7 +1589,18 @@ function start() {
     for (const file of attachments) {
       const link = node('a', '', file.filename || `attachment ${file.id}`)
       link.href = `/chat/attachments/${encodeURIComponent(file.id)}`
-      link.setAttribute('download', '')
+      // One behaviour here, and the server decides what it means: no
+      // `download`, so a ticket that came back `inline` — a PDF, an image,
+      // plain text — opens in the new tab, and a type the browser cannot
+      // render comes back `attachment`, downloads, and the tab it opened
+      // closes itself. Either way the trip stays on screen behind it,
+      // which is the point of the new tab rather than this one.
+      //
+      // `noopener noreferrer` because what opens is a stranger's file: it
+      // must not be able to reach back through `window.opener`, and the
+      // request for it must not carry the page it was opened from.
+      link.setAttribute('target', '_blank')
+      link.setAttribute('rel', 'noopener noreferrer')
       list.append(link)
     }
     return list

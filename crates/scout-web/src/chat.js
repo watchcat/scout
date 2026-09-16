@@ -281,29 +281,82 @@ export function durationLabel(minutes) {
   return rest === 0 ? `${hours}h` : `${hours}h ${String(rest).padStart(2, '0')}m`
 }
 
-// Checks the join between two independently stored flights. The two
-// timestamps are comparable only when they name the same airport: both clocks
-// are local to that place. This is the same boundary core uses.
-export function connectionCheck(before, after) {
+const DAY_MINUTES = 24 * 60
+
+// Whole days from the day one leg lands to the day the next one leaves,
+// from whatever the page knows: the chosen options' own timestamps, and
+// the legs' dates where an option has none or has not been chosen.
+//
+// Only used where the minutes cannot be had — the two legs leave from
+// different airports, so their clocks are local to different places and
+// subtracting them would be meaningless. Two local calendar days are
+// coarse by up to a day for the same reason, which is why a day of slack
+// is built into the threshold: the error can only make this say "closer
+// together than they are", and closer together is the side that warns.
+function daysBetween(before, after, arrival, departure) {
+  const day = (stamp, fallback) => String(stamp ?? fallback ?? '').slice(0, 10)
+  const from = Date.parse(`${day(arrival?.arriving_at_local, before?.date)}T00:00:00Z`)
+  const to = Date.parse(`${day(departure?.departing_at_local, after?.date)}T00:00:00Z`)
+  const days = (to - from) / 86400000
+  // A date this page cannot read leaves the two legs treated as adjacent,
+  // so the check still runs. Silence is what costs somebody a connection.
+  return Number.isFinite(days) ? days : 0
+}
+
+// Checks the join between two independently stored flights, or `null` when
+// there is no join to check. The two timestamps are comparable only when
+// they name the same airport: both clocks are local to that place. This is
+// the same boundary core uses.
+//
+// Two flights a week apart are not a connection, and neither is a pair
+// with something planned between them — the renderer pairs a flight with
+// the *next* flight, whatever sits between, so seven days in Hong Kong
+// between an outbound and a return was announced as a connection with
+// "168h at HKG" on it. Whether an item sits between is the renderer's
+// knowledge, not this function's, so it is passed in rather than guessed
+// at from two legs that cannot see the trip they are on.
+//
+// One thing survives both silences: a flight scheduled to leave before the
+// previous one lands is impossible however long the gap and whatever is
+// booked in it — that is an error in the itinerary, not information about
+// a join. The airport-transfer warning does not survive them, because it
+// is only ever advice about making a connection: told a week ahead, or
+// over a hotel booking, "travel between them is not included" describes
+// the trip the traveller deliberately planned.
+//
+// The risk in going quiet over a booked item is a genuinely tight
+// turnaround with something small booked inside it — an airport lounge on
+// the same day would read here as a stay. It is not lost: core's
+// `itinerary_notes` still reports a tight or impossible turnaround between
+// consecutive flights whatever sits between them, and this page draws
+// those notes above the timeline.
+export function connectionCheck(before, after, { itemBetween = false } = {}) {
   const arrival = selectedCandidate(before)
   const departure = selectedCandidate(after)
+  const sameAirport = before.destination === after.origin
+  const landed = arrival ? localMinutes(arrival.arriving_at_local) : null
+  const leaves = departure ? localMinutes(departure.departing_at_local) : null
+  const minutes = sameAirport && landed !== null && leaves !== null ? leaves - landed : null
+
+  if (minutes !== null && minutes < 0) {
+    return { tone: 'danger', text: `Impossible connection at ${before.destination}: the next flight leaves before arrival.` }
+  }
+  if (itemBetween) return null
+  // Minutes where they are real, days where they are all there is.
+  const apart = minutes !== null ? minutes > DAY_MINUTES : daysBetween(before, after, arrival, departure) > 1
+  if (apart) return null
+
   if (!arrival || !departure) {
     return { tone: 'warning', text: 'Choose both flights to check this connection.' }
   }
-  if (before.destination !== after.origin) {
+  if (!sameAirport) {
     return {
       tone: 'warning',
       text: `Airport transfer: arrive at ${before.destination}, continue from ${after.origin}. Travel between them is not included.`,
     }
   }
-  const landed = localMinutes(arrival.arriving_at_local)
-  const leaves = localMinutes(departure.departing_at_local)
-  if (landed === null || leaves === null) {
+  if (minutes === null) {
     return { tone: 'warning', text: `Connection at ${before.destination}: timing unavailable.` }
-  }
-  const minutes = leaves - landed
-  if (minutes < 0) {
-    return { tone: 'danger', text: `Impossible connection at ${before.destination}: the next flight leaves before arrival.` }
   }
   const wait = durationLabel(minutes)
   if (minutes < 180) {
@@ -1465,12 +1518,15 @@ function start() {
       stack.append(renderItem(trip, item))
       // The join is checked from one flight to the next flight, whatever
       // sits between them: a stay does not change when the second leg
-      // leaves. The PDF draws it in the same place, under the first flight.
+      // leaves. But what sits between changes whether there is a join to
+      // check at all, and only this loop can see it, so it is passed down.
+      // The PDF draws it in the same place, under the first flight.
       if (item.kind !== 'flight') continue
-      const next = trip.items.slice(itemIndex).find((later) => later.kind === 'flight')
-      if (next) {
-        const check = connectionCheck(item, next)
-        stack.append(node('div', `join-card ${check.tone}`, check.text))
+      const rest = trip.items.slice(itemIndex)
+      const nextIndex = rest.findIndex((later) => later.kind === 'flight')
+      if (nextIndex >= 0) {
+        const check = connectionCheck(item, rest[nextIndex], { itemBetween: nextIndex > 0 })
+        if (check) stack.append(node('div', `join-card ${check.tone}`, check.text))
       }
     }
     tripDetail.append(stack)

@@ -260,6 +260,68 @@ test('the join between selected flights is checked on the shared local clock', (
   })
 })
 
+test('a week in Hong Kong is not a connection', () => {
+  // The renderer pairs a flight with the next flight, whatever sits
+  // between, so the outbound and the return of a two-week trip were drawn
+  // as a join with "336h at HKG" on it.
+  const before = {
+    destination: 'HKG', date: '2026-10-12',
+    candidates: [{ chosen: true, arriving_at_local: '2026-10-12T16:00:00' }],
+  }
+  const after = {
+    origin: 'HKG', date: '2026-10-19',
+    candidates: [{ chosen: true, departing_at_local: '2026-10-19T23:40:00' }],
+  }
+  assert.equal(connectionCheck(before, after), null)
+  // A day is still a connection, however uncomfortable: an overnight at
+  // the airport is a join somebody has to make.
+  const overnight = { ...after, date: '2026-10-13', candidates: [{ chosen: true, departing_at_local: '2026-10-13T09:00:00' }] }
+  assert.equal(connectionCheck(before, overnight).tone, 'ready')
+})
+
+test('a stay between two flights is not a connection either', () => {
+  // The reader booked the hotel; they know they are staying. Nothing at
+  // all is the answer here, not a card saying the same thing differently.
+  const before = {
+    destination: 'LIS', date: '2026-10-12',
+    candidates: [{ chosen: true, arriving_at_local: '2026-10-12T10:00:00' }],
+  }
+  const after = {
+    origin: 'LIS', date: '2026-10-12',
+    candidates: [{ chosen: true, departing_at_local: '2026-10-12T22:00:00' }],
+  }
+  assert.equal(connectionCheck(before, after, { itemBetween: true }), null)
+  assert.equal(connectionCheck(before, after).tone, 'ready', 'with nothing between, it is a join')
+})
+
+test('an itinerary that cannot be flown is reported however far apart its legs are', () => {
+  // No gap and no hotel makes a departure before the previous arrival
+  // possible, so this one survives both silences.
+  const before = {
+    destination: 'LIS', date: '2026-10-12',
+    candidates: [{ chosen: true, arriving_at_local: '2026-10-12T22:00:00' }],
+  }
+  const after = {
+    origin: 'LIS', date: '2026-10-12',
+    candidates: [{ chosen: true, departing_at_local: '2026-10-12T20:00:00' }],
+  }
+  const impossible = { tone: 'danger', text: 'Impossible connection at LIS: the next flight leaves before arrival.' }
+  assert.deepEqual(connectionCheck(before, after), impossible)
+  assert.deepEqual(connectionCheck(before, after, { itemBetween: true }), impossible)
+})
+
+test('an undecided pair far apart says nothing rather than asking for a choice', () => {
+  // "Choose both flights to check this connection" is about a join. There
+  // is no join between a flight in October and one the week after.
+  const before = { destination: 'HKG', date: '2026-10-12', candidates: [] }
+  const after = { origin: 'HKG', date: '2026-10-19', candidates: [] }
+  assert.equal(connectionCheck(before, after), null)
+  assert.equal(
+    connectionCheck(before, { ...after, date: '2026-10-12' }).text,
+    'Choose both flights to check this connection.',
+  )
+})
+
 test('a change of airport is reported instead of subtracting unrelated clocks', () => {
   const before = {
     destination: 'FCO',

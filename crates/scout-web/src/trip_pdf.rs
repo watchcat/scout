@@ -530,61 +530,129 @@ fn readiness_notice(readiness: &Readiness, flights: usize) -> (&'static str, Str
     }
 }
 
-fn connection(before: &TripItem, after: &TripItem) -> (String, &'static str) {
-    let Some(arrival) = selected(before) else {
-        return (
+/// The join between two legs, or `None` where there is no join to draw.
+///
+/// The paper half of `chat.js::connectionCheck`, and it has to agree with
+/// it: two flights a week apart are not a connection, and neither is a
+/// pair with something booked between them — the traveller planned that
+/// stay, and a card counting the hours of it as a layover is the bug this
+/// answers. `item_between` is the caller's knowledge, because only the
+/// loop below can see what sits in the gap.
+///
+/// A departure scheduled before the previous arrival survives both
+/// silences: that is an error in the itinerary rather than advice about a
+/// join, and no amount of time or hotel nights makes it flyable. The
+/// transfer warning does not survive them — a week ahead, or over a
+/// booking, "ground travel is not included" describes the trip the
+/// traveller deliberately planned.
+///
+/// Nothing is lost by the silence over a booked stay: `itinerary_notes` in
+/// core still reports a tight turnaround between consecutive flights
+/// whatever sits between them, and this plan prints those notes above.
+fn connection(
+    before: &TripItem,
+    after: &TripItem,
+    item_between: bool,
+) -> Option<(String, &'static str)> {
+    let at = airport(&before.destination);
+    let same_airport = before.destination == after.origin;
+    let parse = |value: Option<&str>| {
+        value.and_then(|value| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").ok())
+    };
+    let arrival = selected(before);
+    let departure = selected(after);
+    // Only comparable at one airport: both clocks are local to the place
+    // they are stated in, so two ends of a transfer cannot be subtracted.
+    let minutes = match (same_airport, arrival, departure) {
+        (true, Some(arrival), Some(departure)) => parse(arrival.arriving_at_local.as_deref())
+            .zip(parse(departure.departing_at_local.as_deref()))
+            .map(|(arrival, departure)| (departure - arrival).num_minutes()),
+        _ => None,
+    };
+    if minutes.is_some_and(|minutes| minutes < 0) {
+        return Some((
+            format!("Impossible connection at {at}: the next flight leaves before arrival."),
+            "danger",
+        ));
+    }
+    if item_between {
+        return None;
+    }
+    // Minutes where they are real, days where they are all there is. Two
+    // local calendar days are coarse by up to a day across a change of
+    // zone, which the day of slack in the threshold absorbs — and the
+    // error can only make this say "closer together", which is the side
+    // that warns rather than the side that goes quiet.
+    let apart = match minutes {
+        Some(minutes) => minutes > 24 * 60,
+        None => days_between(before, after) > 1,
+    };
+    if apart {
+        return None;
+    }
+    if arrival.is_none() {
+        return Some((
             "Choose the arriving flight to check this connection.".to_string(),
             "warn",
-        );
-    };
-    let Some(departure) = selected(after) else {
-        return (
+        ));
+    }
+    if departure.is_none() {
+        return Some((
             "Choose the departing flight to check this connection.".to_string(),
             "warn",
-        );
-    };
-    let at = airport(&before.destination);
-    if before.destination != after.origin {
-        return (
+        ));
+    }
+    if !same_airport {
+        return Some((
             format!(
                 "Airport transfer: arrive at {at}, continue from {}. Ground travel is not included.",
                 airport(&after.origin)
             ),
             "warn",
-        );
+        ));
     }
-    let parse = |value: Option<&str>| {
-        value.and_then(|value| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").ok())
+    let Some(minutes) = minutes else {
+        return Some((format!("Connection at {at}: timing unavailable."), "warn"));
     };
-    let (Some(arrival), Some(departure)) = (
-        parse(arrival.arriving_at_local.as_deref()),
-        parse(departure.departing_at_local.as_deref()),
-    ) else {
-        return (format!("Connection at {at}: timing unavailable."), "warn");
-    };
-    let minutes = (departure - arrival).num_minutes();
-    if minutes < 0 {
-        return (
-            format!("Impossible connection at {at}: the next flight leaves before arrival."),
-            "danger",
-        );
-    }
     if minutes < 180 {
-        return (
+        return Some((
             format!(
                 "{} at {at} — tight connection; allow at least 3 hours between separate tickets.",
                 duration(Some(minutes)),
             ),
             "danger",
-        );
+        ));
     }
-    (
+    Some((
         format!(
             "{} at {at} between the selected flights.",
             duration(Some(minutes)),
         ),
         "ok",
-    )
+    ))
+}
+
+/// Whole days from the day one leg lands to the day the next leaves, from
+/// whatever this plan knows: the chosen options' own stamps, and the legs'
+/// dates where an option has none or none was chosen. A date that will not
+/// parse leaves the two treated as adjacent, so the check still runs —
+/// silence is what costs somebody a connection.
+fn days_between(before: &TripItem, after: &TripItem) -> i64 {
+    let day = |stamp: Option<&str>, fallback: &str| {
+        NaiveDate::parse_from_str(stamp.unwrap_or(fallback).get(..10).unwrap_or(""), "%Y-%m-%d").ok()
+    };
+    let from = day(
+        selected(before).and_then(|c| c.arriving_at_local.as_deref()),
+        &before.date,
+    );
+    let to = day(
+        selected(after).and_then(|c| c.departing_at_local.as_deref()),
+        &after.date,
+    );
+    match from.zip(to) {
+        Some((from, to)) => (to - from).num_days(),
+        None => 0,
+    }
 }
 
 pub fn html(plan: &Plan) -> String {
@@ -747,15 +815,19 @@ pub fn html(plan: &Plan) -> String {
         out.push_str("</section>");
         // The connection is to the next *flight*, whatever sits between:
         // a stay between two legs does not change when the second departs.
-        if let Some(after) = trip.items[index + 1..].iter().find(|item| item.is_flight()) {
-            let (message, tone) = connection(segment, after);
-            write!(
-                out,
-                "<div class=\"connection {}\"><strong>Connection:</strong> {}</div>",
-                tone,
-                escape(&message)
-            )
-            .unwrap();
+        // What sits between does change whether there is a join to draw at
+        // all, and only this loop can see it, so it is passed down.
+        let rest = &trip.items[index + 1..];
+        if let Some(gap) = rest.iter().position(|item| item.is_flight()) {
+            if let Some((message, tone)) = connection(segment, &rest[gap], gap > 0) {
+                write!(
+                    out,
+                    "<div class=\"connection {}\"><strong>Connection:</strong> {}</div>",
+                    tone,
+                    escape(&message)
+                )
+                .unwrap();
+            }
         }
     }
 
@@ -909,8 +981,6 @@ mod tests {
             "KLM &amp; friends",
             "KL1579",
             "AMS 08:20 12.10 ✈ LIS 10:25 12.10",
-            "1h 35m at LIS",
-            "tight connection",
             "from €126.00",
             "estimate when saved",
             "Saved itinerary, not a ticket",
@@ -958,6 +1028,33 @@ mod tests {
         let mut unbooked = plan();
         unbooked.trip.items[0].candidates.clear();
         assert!(html(&unbooked).contains("Ask Scout in chat to search this route."));
+    }
+
+    #[test]
+    fn the_printed_plan_draws_a_join_only_where_the_page_would() {
+        // The paper half of `chat.js::connectionCheck`. This plan's two
+        // legs are a same-day connection with a hotel booked between them,
+        // which is where the page now says nothing at all: the traveller
+        // booked the stay and knows they are staying.
+        let mut joined = plan();
+        assert!(!html(&joined).contains("Connection:"), "{}", html(&joined));
+
+        // Nothing between them, and it is a join again.
+        joined.trip.items.remove(1);
+        assert!(html(&joined).contains("tight connection"), "{}", html(&joined));
+
+        // A week apart is not a connection however little sits between.
+        let mut apart = joined.clone();
+        apart.trip.items[1].date = "2026-10-19".to_string();
+        apart.trip.items[1].candidates[0].departing_at_local = Some("2026-10-19T12:00:00".to_string());
+        assert!(!html(&apart).contains("Connection:"), "{}", html(&apart));
+
+        // An itinerary that cannot be flown is an error, not information
+        // about a join, so it survives both silences.
+        let mut impossible = plan();
+        impossible.trip.items[2].candidates[0].departing_at_local =
+            Some("2026-10-12T09:00:00".to_string());
+        assert!(html(&impossible).contains("Impossible connection"), "{}", html(&impossible));
     }
 
     #[test]

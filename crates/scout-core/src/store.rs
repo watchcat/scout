@@ -5079,6 +5079,30 @@ impl Store {
         sweep_drafts_within(&conn, None)
     }
 
+    /// Deletes the attachments nothing owns, and returns how many went.
+    ///
+    /// A row whose owner resolves to nothing is unreachable by definition:
+    /// no reader may download it, no listing draws it, and neither mail
+    /// sweep can find it, because both key their deletes on a mail id that
+    /// is already gone. Nothing can be lost by deleting it, and nothing
+    /// else will ever delete it — which is why this exists even though the
+    /// delete paths no longer make such rows. It is what clears the ones
+    /// already stranded in a live database.
+    ///
+    /// The condition is `attachment_owner`'s two routes, negated: neither
+    /// the mail nor a trip behind the item is still there. Run from the
+    /// hourly maintenance; a pass that finds nothing is two index-less
+    /// scans of a small table, which is what the sweeps beside it cost too.
+    pub fn sweep_orphaned_attachments(&self) -> Result<usize> {
+        let conn = self.conn();
+        Ok(conn.execute(
+            "DELETE FROM attachments a
+             WHERE NOT EXISTS (SELECT 1 FROM inbound_mail m WHERE m.id = a.mail_id)
+               AND NOT EXISTS (SELECT 1 FROM trip_items i JOIN trips t ON t.id = i.trip_id
+                               WHERE i.id = a.item_id)",
+            params![],
+        )?)
+    }
 }
 
 /// How long a draft has to have existed before it can be collected.
@@ -9294,6 +9318,49 @@ CREATE TABLE messages (
             "the ticket was left pointing at an item the trip took with it",
         );
         assert!(store.attachment(boarding).unwrap().is_none(), "a file no mail and no item can reach was kept");
+    }
+
+    #[test]
+    fn the_orphan_sweep_takes_only_the_files_nothing_can_reach() {
+        // This sweep deletes rows on a schedule with nobody watching, so
+        // what matters is everything it must not touch: a loose file whose
+        // mail is alive, a file on an item of a live trip, and a file whose
+        // mail is gone but whose item still holds it — the exact state the
+        // inbox sweep is careful to leave behind. Only the fourth, which
+        // answers `attachment_owner` with nothing and which no other path
+        // can ever delete, is the sweep's.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let live = mail(&store, a, "re_1");
+        let doomed = mail(&store, a, "re_2");
+        let loose = store.insert_attachment(live, "logo.png", "image/png", Some(&[1, 2]), None).unwrap();
+        let on_item = store.insert_attachment(live, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let outlived_its_mail = store.insert_attachment(doomed, "boarding.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        let (_, hotel) = stay_with(&store, trip.id, "Hotel Alfama");
+        store.attach_to_item(on_item, hotel).unwrap();
+        store.attach_to_item(outlived_its_mail, hotel).unwrap();
+        delete_mail_now(&store, a, doomed);
+        // The orphan is made the way the bug made the ones already in the
+        // live database: the item goes out from under a file whose mail has
+        // gone. Written as raw SQL on purpose — the delete paths are fixed
+        // now, so nothing above this line can produce this row any more,
+        // and it is precisely the rows they left behind that this sweep is
+        // here to clear.
+        let orphan = store.insert_attachment(doomed, "old.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        store.conn().execute("UPDATE attachments SET item_id = ? WHERE id = ?", params![hotel + 500, orphan]).unwrap();
+        assert_eq!(store.attachment_owner(orphan).unwrap(), None, "the row must be unreachable for this test to mean anything");
+
+        assert_eq!(store.sweep_orphaned_attachments().unwrap(), 1);
+
+        assert!(store.attachment(orphan).unwrap().is_none(), "the unreachable row survived the sweep");
+        assert!(store.attachment(loose).unwrap().is_some(), "the sweep took a loose file whose mail is still there");
+        assert!(store.attachment(on_item).unwrap().is_some(), "the sweep took a file on an item of a live trip");
+        assert!(
+            store.attachment(outlived_its_mail).unwrap().is_some(),
+            "the sweep took a ticket the inbox sweep deliberately kept — owned through its item",
+        );
+        assert_eq!(store.sweep_orphaned_attachments().unwrap(), 0, "a second pass found work that was already done");
     }
 
     #[test]

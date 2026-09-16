@@ -573,7 +573,7 @@ test('a decided or non-booking arrival never reaches the timeline', () => {
 test('other mail reads as sender, subject, when, reason', () => {
   const lines = otherMailLines([
     { mail_id: 1, from: 'TAP <news@flytap.com>', subject: 'Autumn sale', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking', forwarded: true, attachments: [] },
-    { mail_id: 2, from: 'x@y.z', subject: null, received_at: '2026-10-02T10:00:00Z', reason: 'failed', forwarded: false, attachments: [{ id: 3, filename: 'a.pdf', mime: 'application/pdf', size: 10 }] },
+    { mail_id: 2, from: 'x@y.z', subject: null, received_at: '2026-10-02T10:00:00Z', reason: 'failed', forwarded: false, attachments: [{ id: 3, filename: 'a.pdf', mime: 'application/pdf' }] },
   ], 'en-US')
   assert.equal(lines[0].sender, 'TAP')
   assert.equal(lines[0].address, 'news@flytap.com')

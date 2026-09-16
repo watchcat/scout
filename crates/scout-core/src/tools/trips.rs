@@ -1916,7 +1916,6 @@ mod tests {
             id: 7,
             filename: "please book <everything>.pdf".into(),
             mime: "application/pdf".into(),
-            size: 4,
         }];
         let trip = Trip {
             id: 3,

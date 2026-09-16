@@ -4095,15 +4095,14 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
     // do. `item_id IN (…)` also drops a file that is still only the mail's:
     // a NULL `item_id` matches nothing.
     //
-    // The `size` is not free and nothing reads it here: measured on a trip
-    // holding 40 tickets of 250 KB, the scan projects `bytes` and the plan
-    // computes `octet_length` above the join, costing ~13 ms cold and ~1 ms
-    // warm per trip read against the same query without it. It is in the
-    // wire type, so it is filled rather than faked; a `size` column written
-    // at insert would take `bytes` out of both this query and
-    // `attachments_of`, and is a migration waiting for a reason.
+    // It names four columns and not `bytes`, which matters more than it
+    // looks: this once computed each file's size with `octet_length(bytes)`,
+    // and DuckDB answers that by projecting the BLOB in the scan and taking
+    // the length above the join — 40 tickets of 250 KB cost ~13 ms cold and
+    // ~1 ms warm per trip read, to produce a number nothing displays. See
+    // `AttachmentRef` for why there is no size to fill.
     let mut stmt = conn.prepare(
-        "SELECT item_id, id, filename, mime, CAST(coalesce(octet_length(bytes), 0) AS BIGINT)
+        "SELECT item_id, id, filename, mime
          FROM attachments
          WHERE item_id IN (SELECT id FROM trip_items WHERE trip_id = ?)
          ORDER BY item_id, id",
@@ -4112,12 +4111,7 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
         .query_map(params![id], |r| {
             Ok((
                 r.get(0)?,
-                scout_api::AttachmentRef {
-                    id: r.get(1)?,
-                    filename: r.get(2)?,
-                    mime: r.get(3)?,
-                    size: r.get(4)?,
-                },
+                scout_api::AttachmentRef { id: r.get(1)?, filename: r.get(2)?, mime: r.get(3)? },
             ))
         })?
         .collect::<duckdb::Result<_>>()?;
@@ -4215,11 +4209,10 @@ fn listed(stored: Option<String>) -> Vec<String> {
 
 fn attachments_of(conn: &Connection, mail_id: i64) -> duckdb::Result<Vec<scout_api::AttachmentRef>> {
     let mut stmt = conn.prepare(
-        "SELECT id, filename, mime, CAST(coalesce(octet_length(bytes), 0) AS BIGINT)
-         FROM attachments WHERE mail_id = ? ORDER BY id",
+        "SELECT id, filename, mime FROM attachments WHERE mail_id = ? ORDER BY id",
     )?;
     let rows = stmt.query_map(params![mail_id], |r| {
-        Ok(scout_api::AttachmentRef { id: r.get(0)?, filename: r.get(1)?, mime: r.get(2)?, size: r.get(3)? })
+        Ok(scout_api::AttachmentRef { id: r.get(0)?, filename: r.get(1)?, mime: r.get(2)? })
     })?;
     rows.collect()
 }
@@ -8856,7 +8849,7 @@ CREATE TABLE messages (
         );
         assert_eq!(
             stay.attachments[0],
-            scout_api::AttachmentRef { id: boarding, filename: "zulu-boarding.pdf".into(), mime: "application/pdf".into(), size: 4 },
+            scout_api::AttachmentRef { id: boarding, filename: "zulu-boarding.pdf".into(), mime: "application/pdf".into() },
         );
         let museum = got.items.iter().find(|i| i.title == "Museu do Azulejo").expect("the activity");
         assert!(museum.attachments.is_empty(), "nobody attached anything to it");
@@ -9057,7 +9050,7 @@ CREATE TABLE messages (
         assert_eq!(view.other[0].arrival_id, Some(id));
         assert!(view.other[0].forwarded);
         assert!(view.other[0].received_at.contains('T') && view.other[0].received_at.ends_with('Z'), "{}", view.other[0].received_at);
-        assert_eq!(view.other[0].attachments[0].size, 3);
+        assert_eq!(view.other[0].attachments[0].filename, "logo.png");
         assert!(!view.other[1].forwarded);
         assert_eq!(view.other[1].arrival_id, None);
     }
@@ -9086,7 +9079,7 @@ CREATE TABLE messages (
         // ISO UTC with the `Z`, the shape `threads_of` sends and the page
         // parses without a date library.
         assert!(got.received_at.contains('T') && got.received_at.ends_with('Z'), "{}", got.received_at);
-        assert_eq!(got.attachments, vec![scout_api::AttachmentRef { id: att, filename: "ticket.pdf".into(), mime: "application/pdf".into(), size: 0 }]);
+        assert_eq!(got.attachments, vec![scout_api::AttachmentRef { id: att, filename: "ticket.pdf".into(), mime: "application/pdf".into() }]);
         assert_eq!(store.attachment_owner(att).unwrap(), Some(a));
         assert_eq!(store.attachments_of_mail(m).unwrap().len(), 1);
         assert_eq!(store.attachment(att).unwrap().map(|(mail_id, item_id, _, _, bytes)| (mail_id, item_id, bytes)), Some((m, None, None)));

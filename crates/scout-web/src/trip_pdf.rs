@@ -823,7 +823,6 @@ mod tests {
                             id: 4,
                             filename: "voucher <1>.pdf".to_string(),
                             mime: "application/pdf".to_string(),
-                            size: 12,
                         }],
                     },
                     flight(
@@ -866,7 +865,6 @@ mod tests {
             id: 9,
             filename: "eTicket <KL1579>.pdf".to_string(),
             mime: "application/pdf".to_string(),
-            size: 12,
         }];
         let html = html(&plan);
         for expected in [
@@ -961,7 +959,6 @@ mod tests {
                 id: 1,
                 filename: "t.pdf".to_string(),
                 mime: "application/pdf".to_string(),
-                size: 1,
             },
             MAX_ATTACHMENTS_PER_ITEM + 1,
         )

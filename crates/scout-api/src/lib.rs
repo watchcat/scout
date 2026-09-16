@@ -281,8 +281,18 @@ pub struct Arrival {
     pub attachments: Vec<AttachmentRef>,
 }
 
+/// A file that came in on an email: what the page needs to draw a link to
+/// it and nothing else.
+///
+/// There is deliberately no size. Nothing displays one — not the pending
+/// row, not the Other-mail row, not the trip card, not the printed plan —
+/// and the only way to produce one is `octet_length(bytes)`, which makes
+/// the query read the file itself: measured at ~13 ms cold and ~1 ms warm
+/// per trip read for 40 tickets, on a path that runs once per incoming
+/// mail. A feature that wants the size should add a `size` column written
+/// at insert, not put that expression back.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AttachmentRef { pub id: i64, pub filename: String, pub mime: String, pub size: i64 }
+pub struct AttachmentRef { pub id: i64, pub filename: String, pub mime: String }
 
 /// A message under Other mail: not a booking, unreadable, or ignored.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -468,7 +478,7 @@ mod tests {
             price: Some(320.0), currency: Some("EUR".into()), confidence: Some(0.9),
             summary: "Hotel Alfama, 12–15 Oct".into(), trip_id: Some(3), trip_name: Some("Lisbon".into()),
             status: "pending".into(), received_at: "2026-09-15 10:00:00".into(),
-            attachments: vec![AttachmentRef { id: 4, filename: "ticket.pdf".into(), mime: "application/pdf".into(), size: 12 }],
+            attachments: vec![AttachmentRef { id: 4, filename: "ticket.pdf".into(), mime: "application/pdf".into() }],
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<Arrival>(&json).unwrap(), a);

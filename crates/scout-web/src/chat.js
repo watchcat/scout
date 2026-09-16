@@ -1610,16 +1610,18 @@ function start() {
       // The bare address beside the name, always — see `otherMailLines`.
       // Omitted only when it is the name, which would print it twice.
       if (line.address !== line.sender) who.append(node('span', 'other-mail-address', line.address))
-      // The date and the × travel together at the right, so the confirm
-      // that replaces the × takes the date's line with it when the row is
-      // too narrow for both, rather than splitting the sender.
+      // Only the × rides the top line. The date went with it at first and
+      // cost the sender fifty pixels it does not have in a 260px column:
+      // an address is identity, and `newsletter@flytap.c om` broken across
+      // two lines reads as damage. It says the same thing one line down,
+      // beside the two other facts about what became of the mail.
       const end = node('div', 'other-mail-end')
       const removeSlot = node('span', 'other-mail-remove')
       removeSlot.append(mailRemoveButton(line, removeSlot))
-      end.append(node('span', 'other-mail-when', line.when), removeSlot)
+      end.append(removeSlot)
       top.append(who, end)
       li.append(top, node('p', 'other-mail-subject', line.subject))
-      li.append(node('p', 'other-mail-meta', `${line.reason} · ${line.note}`))
+      li.append(node('p', 'other-mail-meta', `${line.when} · ${line.reason} · ${line.note}`))
       if (line.attachments.length) li.append(attachmentLinks(line.attachments))
       if (line.failed) {
         const byHand = node('button', 'other-mail-add', 'Add by hand')

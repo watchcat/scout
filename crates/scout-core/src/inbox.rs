@@ -753,12 +753,31 @@ pub fn sender_is_the_account(sender: &str, theirs: &[String]) -> bool {
 /// lowercased whole, with any `+tag` off the local part, and `None` when
 /// what is left cannot identify anybody.
 ///
-/// Lowercased whole, because an address is case-insensitive to everyone
-/// who types one — the local part is the sender's to case as they like,
-/// and no provider we forward for treats two spellings as two people.
+/// Lowercased as ASCII, because an address is case-insensitive to
+/// everyone who types one — the local part is the sender's to case as
+/// they like, and no provider we forward for treats two spellings as two
+/// people. ASCII rather than Unicode on purpose: `to_lowercase` folds
+/// U+212A, the Kelvin sign, to a plain `k`, which would make two
+/// different mailboxes one and silently withhold a confirmation from
+/// whoever owns the plain one. It also matches how `our_handle` compares
+/// our own domain. (Turkish costs nothing either way here: Rust
+/// lowercases `İ` to two code points and leaves `ı` alone, so neither
+/// spelling of an `i` was ever going to fold onto the other.)
+///
+/// The residual of that choice runs the other way: a genuinely
+/// non-ASCII address written in two cases stops being one mailbox, so
+/// the person's own mail is forwarded back to them. A copy they did not
+/// need is the cheaper of the two mistakes.
 ///
 /// The tag comes off both sides: `sasha+hotel@…` is the mailbox
-/// `sasha@…`, and either side may be the one carrying it.
+/// `sasha@…`, and either side may be the one carrying it. That costs
+/// something, and it is worth saying what: `+` is a legal local-part
+/// character, so at a provider that does not do plus-addressing
+/// `sasha+news@example.com` is a different person from `sasha@…`, and
+/// their mail to the booking address is now quietly not forwarded.
+/// Plus-addressing is near-universal at the providers a booking address
+/// meets, and a person tagging their own forwards is exactly the case
+/// this exists for, so the trade stands.
 ///
 /// Dots in the local part are left alone on purpose. Folding them is
 /// Gmail's convention and is wrong at most other providers, where
@@ -776,7 +795,8 @@ fn mailbox(raw: &str) -> Option<String> {
     let (local, domain) = bare_address(raw).rsplit_once('@')?;
     let local = local.split('+').next().unwrap_or_default().trim();
     let domain = domain.trim();
-    (!local.is_empty() && !domain.is_empty()).then(|| format!("{}@{}", local.to_lowercase(), domain.to_lowercase()))
+    (!local.is_empty() && !domain.is_empty())
+        .then(|| format!("{}@{}", local.to_ascii_lowercase(), domain.to_ascii_lowercase()))
 }
 
 /// Stores the extractor's reading. A booking is placed on a trip (or a
@@ -2520,6 +2540,28 @@ mod tests {
         assert!(!sender_is_the_account("", &[String::new()]));
         assert!(!sender_is_the_account("   ", &["  ".to_string()]));
         assert!(!sender_is_the_account("sasha@", &["sasha@".to_string()]));
+
+        // Folded as ASCII, not as Unicode: U+212A, the Kelvin sign,
+        // lowercases to a plain `k` under `to_lowercase`, which would
+        // make `kelvin@` and `KELVIN@` with that sign one mailbox and
+        // so withhold somebody's confirmation from them. Reaching it
+        // needs an address at the victim's own domain, which is a narrow
+        // door — but over-matching is the direction that loses mail.
+        assert!(!sender_is_the_account("\u{212a}elvin@example.com", &["kelvin@example.com".to_string()]));
+        assert!(sender_is_the_account("KELVIN@EXAMPLE.COM", &["kelvin@example.com".to_string()]), "ASCII still folds");
+    }
+
+    #[test]
+    fn an_address_is_read_out_of_a_display_name_however_the_name_is_written() {
+        assert_eq!(bare_address("sasha@example.com"), "sasha@example.com");
+        assert_eq!(bare_address("Sasha Q <sasha@example.com>"), "sasha@example.com");
+        assert_eq!(bare_address(" <sasha@example.com> "), "sasha@example.com");
+        assert_eq!(bare_address("\"Q <the hotel>\" <sasha@example.com>"), "sasha@example.com", "the last bracketed span");
+        // A string with no pair of brackets is left as it came rather
+        // than half-parsed: a caller gets a whole address or the whole
+        // string, never a fragment of one.
+        assert_eq!(bare_address("Sasha <sasha@example.com"), "Sasha <sasha@example.com");
+        assert_eq!(bare_address("  "), "");
     }
 
     #[tokio::test]

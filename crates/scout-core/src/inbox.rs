@@ -246,31 +246,47 @@ pub async fn view(core: &Core, account_id: i64, domain: &str) -> anyhow::Result<
     .await
 }
 
-/// Claims a handle. The inner `Err` is a sentence for the person — a rule
-/// broken, or "that one is taken" — and the outer one is the database.
-pub async fn set_handle(core: &Core, account_id: i64, raw: &str) -> anyhow::Result<Result<String, String>> {
+/// What asking for a handle came to. One answer for the claim and the
+/// live check alike, so a route matches on meaning rather than on which
+/// sentence the door happened to say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// Claimed — or, from `check_handle`, free — as the normalised handle.
+    Claimed(String),
+    /// A rule broken, with the sentence for the person.
+    Invalid(String),
+    /// Somebody else's.
+    Taken,
+}
+
+/// Claims a handle. `Err` is the database; everything a person can do
+/// wrong is a `Claim`.
+pub async fn set_handle(core: &Core, account_id: i64, raw: &str) -> anyhow::Result<Claim> {
     let handle = match normalise_handle(raw) {
         Ok(h) => h,
-        Err(why) => return Ok(Err(why)),
+        Err(why) => return Ok(Claim::Invalid(why)),
     };
     let store = core.store();
     let wanted = handle.clone();
     let claimed = blocking(move || store.set_handle(account_id, &wanted)).await?;
-    Ok(if claimed { Ok(handle) } else { Err("that one is taken".into()) })
+    Ok(if claimed { Claim::Claimed(handle) } else { Claim::Taken })
 }
 
-/// Whether a handle could be claimed right now, for a form that checks as
-/// the person types. Anyone holding it counts, the asker included.
-pub async fn check_handle(core: &Core, raw: &str) -> anyhow::Result<Result<(), String>> {
+/// Whether `account_id` could claim a handle right now, for a form that
+/// checks as the person types. Their own current handle counts as free —
+/// the same exception `store.set_handle` makes — so re-typing it does not
+/// paint the form red for a name they already hold.
+pub async fn check_handle(core: &Core, account_id: i64, raw: &str) -> anyhow::Result<Claim> {
     let handle = match normalise_handle(raw) {
         Ok(h) => h,
-        Err(why) => return Ok(Err(why)),
+        Err(why) => return Ok(Claim::Invalid(why)),
     };
     let store = core.store();
-    let held = blocking(move || store.account_for_handle(&handle)).await?;
+    let wanted = handle.clone();
+    let held = blocking(move || store.account_for_handle(&wanted)).await?;
     Ok(match held {
-        Some(_) => Err("that one is taken".into()),
-        None => Ok(()),
+        Some(holder) if holder != account_id => Claim::Taken,
+        _ => Claim::Claimed(handle),
     })
 }
 
@@ -871,11 +887,20 @@ mod tests {
         let (core, _dir) = core();
         let a = core.store().account_for_telegram(1).unwrap();
         let b = core.store().account_for_telegram(2).unwrap();
-        assert_eq!(set_handle(&core, a, " Sasha ").await.unwrap(), Ok("sasha".to_string()));
-        assert_eq!(set_handle(&core, b, "SASHA").await.unwrap(), Err("that one is taken".to_string()));
-        assert!(set_handle(&core, b, "ab").await.unwrap().is_err(), "the rules apply at the door");
-        assert!(check_handle(&core, "sasha").await.unwrap().is_err());
-        assert_eq!(check_handle(&core, "free.one").await.unwrap(), Ok(()));
+        assert_eq!(set_handle(&core, a, " Sasha ").await.unwrap(), Claim::Claimed("sasha".to_string()));
+        assert_eq!(set_handle(&core, b, "SASHA").await.unwrap(), Claim::Taken);
+        assert!(
+            matches!(set_handle(&core, b, "ab").await.unwrap(), Claim::Invalid(_)),
+            "the rules apply at the door"
+        );
+        assert_eq!(check_handle(&core, b, "sasha").await.unwrap(), Claim::Taken);
+        assert_eq!(check_handle(&core, b, "Free.One").await.unwrap(), Claim::Claimed("free.one".to_string()));
+        assert!(matches!(check_handle(&core, b, "postmaster").await.unwrap(), Claim::Invalid(_)));
+        assert_eq!(
+            check_handle(&core, a, "SASHA").await.unwrap(),
+            Claim::Claimed("sasha".to_string()),
+            "re-typing your own handle is not a collision with yourself"
+        );
         assert_eq!(account_for_handle(&core, "SASHA").await.unwrap(), Some(a));
         assert_eq!(account_for_handle(&core, "no@such").await.unwrap(), None, "a bad handle is nobody's");
         let view = view(&core, a, "goodscout.fyi").await.unwrap();

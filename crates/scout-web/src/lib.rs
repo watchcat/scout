@@ -73,6 +73,11 @@ pub struct AuthState {
     /// PDF rendering starts Chromium and is CPU-heavy even though it makes no
     /// paid model call, so it has its own smaller per-account budget.
     pub pdf_by_account: Arc<ratelimit::Limiter>,
+    /// The live handle check fires as a person types, so it gets a budget
+    /// sized for keystrokes rather than for model calls: a minute of
+    /// typing at one check a second, and a bound on a script that walks
+    /// the namespace asking which names are somebody's.
+    pub handle_by_account: Arc<ratelimit::Limiter>,
     pub mailer: email::Mailer,
 }
 
@@ -94,6 +99,7 @@ impl AuthState {
             by_ip: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(3600))),
             by_account: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(300))),
             pdf_by_account: Arc::new(ratelimit::Limiter::new(6, Duration::from_secs(60))),
+            handle_by_account: Arc::new(ratelimit::Limiter::new(60, Duration::from_secs(60))),
         }
     }
 }

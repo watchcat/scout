@@ -389,7 +389,10 @@ mod tests {
     async fn the_webhook_stores_one_row_for_a_known_handle_and_nothing_otherwise() {
         let (app, core, _dir) = inbound_app(SECRET).await;
         let a = admitted(&core, "111").await;
-        scout_core::inbox::set_handle(&core, a, "sasha").await.unwrap().unwrap();
+        assert_eq!(
+            scout_core::inbox::set_handle(&core, a, "sasha").await.unwrap(),
+            scout_core::inbox::Claim::Claimed("sasha".into())
+        );
         let body = received_payload("re_1", "sasha@goodscout.fyi");
         assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200);
         assert_eq!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().len(), 1);
@@ -408,7 +411,10 @@ mod tests {
     async fn the_stored_row_carries_what_the_webhook_said_and_no_body() {
         let (app, core, _dir) = inbound_app(SECRET).await;
         let a = admitted(&core, "111").await;
-        scout_core::inbox::set_handle(&core, a, "sasha").await.unwrap().unwrap();
+        assert_eq!(
+            scout_core::inbox::set_handle(&core, a, "sasha").await.unwrap(),
+            scout_core::inbox::Claim::Claimed("sasha".into())
+        );
         // A display name around the address, and a differently-cased
         // domain: both are the same mailbox.
         let body = received_payload("re_9", "Sasha Q <Sasha@GoodScout.fyi>");
@@ -423,7 +429,10 @@ mod tests {
     async fn headers_missing_is_400_and_other_events_are_ignored() {
         let (app, core, _dir) = inbound_app(SECRET).await;
         let a = admitted(&core, "111").await;
-        scout_core::inbox::set_handle(&core, a, "sasha").await.unwrap().unwrap();
+        assert_eq!(
+            scout_core::inbox::set_handle(&core, a, "sasha").await.unwrap(),
+            scout_core::inbox::Claim::Claimed("sasha".into())
+        );
 
         let body = received_payload("re_1", "sasha@goodscout.fyi");
         let bare = app.clone()
@@ -557,7 +566,10 @@ mod tests {
         let (app, core, _dir) = test_app().await;
         open_round(&core, "autumn", 5).await;
         let a = admitted(&core, "111").await;
-        scout_core::inbox::set_handle(&core, a, "sasha").await.unwrap().unwrap();
+        assert_eq!(
+            scout_core::inbox::set_handle(&core, a, "sasha").await.unwrap(),
+            scout_core::inbox::Claim::Claimed("sasha".into())
+        );
         let body = received_payload("re_1", "sasha@goodscout.fyi");
         let ts = now_secs();
         let sig = sign(SECRET, "msg_1", ts, &body).unwrap();

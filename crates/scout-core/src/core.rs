@@ -544,6 +544,19 @@ impl Core {
                 Err(e) => tracing::warn!(error = %e, "could not sweep the inbox"),
             }
 
+            // The files the sweep above cannot reach. An attachment is
+            // owned through the mail it came with or through the trip
+            // behind its item; when both are gone nobody can download it,
+            // no listing draws it, and the inbox sweep's deletes are keyed
+            // on a mail id that no longer exists. Deleting a row nothing
+            // can reach loses nothing, and this is the only thing that
+            // clears the ones an older build stranded.
+            match self.sweep_orphaned_attachments().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(swept = n, "files no mail and no trip could reach dropped"),
+                Err(e) => tracing::warn!(error = %e, "could not sweep the orphaned files"),
+            }
+
             // A draft made to hold a booking that then went somewhere else
             // belongs to no conversation, so the thread expiry above can
             // never reach it. `inbox::add_arrival` collects the one it just
@@ -659,6 +672,14 @@ impl Core {
     async fn sweep_empty_drafts(&self) -> anyhow::Result<usize> {
         let store = self.store();
         blocking(move || store.sweep_all_empty_drafts()).await
+    }
+
+    /// Drops the attachments no mail and no trip can reach any more.
+    /// Returns how many went. Private for the same reason
+    /// `prune_login_tokens` is.
+    async fn sweep_orphaned_attachments(&self) -> anyhow::Result<usize> {
+        let store = self.store();
+        blocking(move || store.sweep_orphaned_attachments()).await
     }
 
     /// Turns a photo into a search description.
@@ -983,6 +1004,24 @@ mod tests {
         let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
         let body = &src[start..];
         let sweep = body.find("self.sweep_empty_drafts()").expect("empty drafts are never collected");
+        let backup = body.find("backup::is_due").expect("the backup check must exist");
+        assert!(sweep < backup, "the sweep sits below the backup's continue and would run once a day");
+    }
+
+    #[test]
+    fn maintenance_sweeps_the_attachments_nothing_owns() {
+        // The only thing that can ever delete them: an attachment whose
+        // mail and whose item are both gone answers `attachment_owner`
+        // with nobody, so no reader can reach it and neither mail sweep
+        // can find it — its deletes are keyed on a mail id that no longer
+        // exists. Without this call those bytes sit in the database
+        // forever.
+        let src = include_str!("core.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
+        let body = &src[start..];
+        let sweep =
+            body.find("self.sweep_orphaned_attachments()").expect("orphaned attachments are never swept");
         let backup = body.find("backup::is_due").expect("the backup check must exist");
         assert!(sweep < backup, "the sweep sits below the backup's continue and would run once a day");
     }

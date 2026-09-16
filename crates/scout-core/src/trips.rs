@@ -39,6 +39,23 @@ pub struct Plan {
     #[serde(flatten)]
     pub trip: Trip,
     pub readiness: Readiness,
+    /// What `readiness` replaced, kept on the wire for one release.
+    ///
+    /// A browser holds the `chat.js` it loaded for as long as the tab stays
+    /// open, and that copy knows this field alone: absent means "nothing
+    /// wrong", which it prints as "Ready to price. Ask Scout to refresh
+    /// live fares". Dropping this in the same deploy that added `readiness`
+    /// would hand every trip on every open tab exactly the sentence this
+    /// change exists to stop — on the fully ticketed trip most of all —
+    /// and a trip that really is waiting on a decision would lose its
+    /// reason at the same time.
+    ///
+    /// A bought trip has no refusal to put here, so it carries a sentence
+    /// instead: an old tab heads it "Needs a decision.", which is wrong and
+    /// survivable, where the alternative is telling the reader to go and
+    /// re-shop seats they are holding. Delete this field, and the sentence
+    /// with it, one release after `readiness` ships.
+    pub not_ready: Option<String>,
     pub notes: Vec<String>,
     /// The chat this trip belongs to. `None` is orphaned — an ordinary
     /// state, reached by outliving the chat that made it.
@@ -67,9 +84,20 @@ impl Plan {
             },
         };
         let notes = crate::tools::trips::itinerary_notes(&trip.items);
+        // Derived from the state above rather than computed again, so the
+        // two cannot come apart while both are on the wire.
+        let not_ready = match &readiness {
+            Readiness::NotReady { reason } => Some(reason.clone()),
+            Readiness::Booked => Some(
+                "every flight on this trip is already booked, so there is nothing left to price"
+                    .to_string(),
+            ),
+            Readiness::Ready { .. } => None,
+        };
         Self {
             trip,
             readiness,
+            not_ready,
             notes,
             chat,
         }
@@ -572,6 +600,40 @@ mod tests {
             serde_json::to_value(&plan).unwrap()["readiness"],
             serde_json::json!({"state": "booked"}),
         );
+    }
+
+    #[tokio::test]
+    async fn a_tab_loaded_before_this_deploy_is_not_told_a_bought_trip_is_ready_to_price() {
+        // The browser holds `chat.js` from before the deploy for as long as
+        // the tab stays open, and that copy knows one field: a `not_ready`
+        // it reads as "nothing wrong" when it is absent. Dropping the field
+        // would hand every trip on that tab — the fully ticketed one
+        // included — "Ready to price. Ask Scout to refresh live fares",
+        // which is the exact bug this branch exists to fix, and a trip that
+        // really needs a decision would lose its reason with it.
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+        let store = core.store();
+
+        let undecided = serde_json::to_value(find(&core, account_id, "October").await.unwrap().unwrap()).unwrap();
+        assert!(
+            undecided["not_ready"].as_str().unwrap().contains("2 options"),
+            "the old client still has its reason: {undecided}",
+        );
+
+        store.choose_candidate_for_account(account_id, "October", 1, 2).unwrap();
+        let ready = serde_json::to_value(find(&core, account_id, "October").await.unwrap().unwrap()).unwrap();
+        assert_eq!(ready["not_ready"], serde_json::Value::Null, "nothing is outstanding on it");
+
+        let trip = store.find_trip(account_id, "October").unwrap().unwrap();
+        store.book_item(trip.items[0].id, Some("KL7788"), Some(612.40), Some("EUR"), None).unwrap();
+        let booked = serde_json::to_value(find(&core, account_id, "October").await.unwrap().unwrap()).unwrap();
+        let legacy = booked["not_ready"].as_str().expect("a bought trip must not read as null here");
+        assert!(legacy.contains("already booked"), "got: {legacy}");
+        // An old tab heads that with "Needs a decision.", which is wrong and
+        // survivable. Telling the reader to go and re-shop flights they are
+        // holding tickets for is neither.
+        assert!(!legacy.contains("refresh"), "got: {legacy}");
     }
 
     #[tokio::test]

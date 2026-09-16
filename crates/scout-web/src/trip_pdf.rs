@@ -984,6 +984,10 @@ mod tests {
             readiness: Readiness::Ready {
                 legs: vec!["segment 1 (AMS→LIS)".to_string(), "segment 3 (LIS→FCO)".to_string()],
             },
+            // The field one release of open tabs still reads. Nothing in
+            // this file touches it: the printed plan is built from
+            // `readiness` like the page's own renderer.
+            not_ready: None,
             notes: vec!["Separate tickets need extra care.".to_string()],
             chat: None,
         }

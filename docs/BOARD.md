@@ -6,6 +6,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## In progress
 
+_(nothing)_
 
 ## Next
 

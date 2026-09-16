@@ -120,7 +120,14 @@ export function composerHeight(scrollHeight, cap = COMPOSER_CAP) {
 // (Windows tops out at 900ms for a deliberately slow setting; the usual
 // threshold is 400–500ms) closes it, and one this short is invisible to
 // anyone who is reading the question the confirm asks.
-const CONFIRM_ARM_MS = 350
+//
+// Past that range, not inside it: at 350 the protection ran out before the
+// slower half of ordinary double-clicks landed, which is the half made by
+// a person rather than by a trackpad, and the button underneath is live the
+// instant the window closes. Exported so a test can hold it there — the
+// tempting edit is to trim it back to feel snappier, and the thing it
+// guards is the only gesture here that destroys something.
+export const CONFIRM_ARM_MS = 500
 
 // The idle window after which an unpinned thread is deleted, and the point
 // at which the sidebar starts saying so. Both mirror core: 48h expiry in

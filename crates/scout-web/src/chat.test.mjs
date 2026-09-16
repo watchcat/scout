@@ -9,6 +9,7 @@ import {
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem,
+  CONFIRM_ARM_MS,
 } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
@@ -618,4 +619,12 @@ test('the handle form explains the rules before the server does', () => {
   // The Kelvin sign lowercases to an ASCII k in JS; the server sees a
   // non-ASCII byte and refuses, so the charset is checked before the case.
   assert.equal(handleProblem('sasha\u212a'), 'letters, digits and dots only')
+})
+
+test('the confirm stays dead longer than a double-click takes', () => {
+  // The Delete button appears on the pixel the x occupied, so the second
+  // click of a double-click lands on it. Ordinary double-clicks run to
+  // about 500ms; anything shorter than that leaves the slower half of them
+  // pressing a button nobody read.
+  assert.ok(CONFIRM_ARM_MS >= 500, `${CONFIRM_ARM_MS}ms is inside the double-click range`)
 })

@@ -3617,6 +3617,29 @@ impl Store {
     /// to be able to tell the two apart.
     ///
     /// The lookup and the write share the one `self.conn()` for the reason
+    /// The traveller's note, but only on the item the caller still says it
+    /// is looking at — `remove_item_checked`'s guard, and worth more here
+    /// rather than less. A stale tab that removes the wrong item shows the
+    /// traveller something missing; one that writes a map link onto the
+    /// wrong item shows them nothing at all, and the mistake keeps.
+    ///
+    /// `false` is "that is not the item you drew", which the caller answers
+    /// by re-reading, exactly as a refused removal does.
+    pub fn note_item_checked(
+        &self,
+        trip_id: i64,
+        position: i64,
+        expected: ExpectedItem<'_>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let Some(item_id) = item_still_seen(&conn, trip_id, position, expected)? else {
+            return Ok(false);
+        };
+        note_item_within(&conn, trip_id, item_id, note)?;
+        Ok(true)
+    }
+
     /// `remove_item_checked` spells out: positions are recomputed on every
     /// write, so an id read under one acquisition and written under the
     /// next can be a different item by then.
@@ -7868,6 +7891,30 @@ CREATE TABLE trips (
         assert!(!store.remove_item_checked(trip.id, 1, wrong).unwrap());
         let right = ExpectedItem { origin: None, destination: None, title: Some("Hotel"), date: Some("2026-10-12") };
         assert!(store.remove_item_checked(trip.id, 1, right).unwrap());
+    }
+
+    #[test]
+    fn a_note_is_written_only_onto_the_item_the_caller_still_sees() {
+        // The same guard removing an item has, and it is worth more here
+        // rather than less: a map link written onto the wrong item is
+        // quieter than the wrong item disappearing, so nothing tells the
+        // traveller to look.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Hong Kong", None, None, None).unwrap();
+        store.add_item(trip.id, stay("Lunch with Stanley", "2026-09-24", "2026-09-24")).unwrap();
+        let seen = |title| ExpectedItem { origin: None, destination: None, title: Some(title), date: Some("2026-09-24") };
+        let link = "https://www.google.com/maps/search/?api=1&query=Queen%27s+Cafe";
+
+        assert!(!store.note_item_checked(trip.id, 1, seen("Dinner with Stanley"), Some(link)).unwrap());
+        assert_eq!(store.trip_by_id(account, trip.id).unwrap().unwrap().items[0].notes, None, "a note went onto an item nobody asked about");
+
+        assert!(store.note_item_checked(trip.id, 1, seen("Lunch with Stanley"), Some(link)).unwrap());
+        assert_eq!(store.trip_by_id(account, trip.id).unwrap().unwrap().items[0].notes.as_deref(), Some(link));
+
+        // Clearing and never having had one end in the same place.
+        assert!(store.note_item_checked(trip.id, 1, seen("Lunch with Stanley"), None).unwrap());
+        assert_eq!(store.trip_by_id(account, trip.id).unwrap().unwrap().items[0].notes, None);
     }
 
     // ---- invite rounds, membership, waitlist ----

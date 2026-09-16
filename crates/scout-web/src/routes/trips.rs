@@ -316,7 +316,7 @@ async fn remove_leg(
         account_id,
         &body.trip,
         body.position,
-        scout_core::trips::RemoveExpectation {
+        scout_core::trips::ItemExpectation {
             origin: body.origin,
             destination: body.destination,
             title: body.title,

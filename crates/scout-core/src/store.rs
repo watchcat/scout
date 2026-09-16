@@ -4354,18 +4354,21 @@ impl Store {
             .optional()?)
     }
 
-    /// The address this person signed in with, if they ever did — where a
-    /// forwarded mail goes.
-    pub fn email_of(&self, account_id: i64) -> Result<Option<String>> {
+    /// Every address this person signed in with, oldest first — the first
+    /// of them is where a forwarded mail goes, and the rest matter because
+    /// a mail this person sent themselves may come from any of them.
+    ///
+    /// Ordered by the address as well as the time, so two identities
+    /// linked in the same instant still come back in one order and the
+    /// destination of a forward does not change from read to read.
+    pub fn emails_of(&self, account_id: i64) -> Result<Vec<String>> {
         let conn = self.conn();
-        Ok(conn
-            .query_row(
-                "SELECT external_id FROM identities WHERE account_id = ? AND kind = 'email'
-                 ORDER BY created_at, external_id LIMIT 1",
-                params![account_id],
-                |r| r.get(0),
-            )
-            .optional()?)
+        let mut stmt = conn.prepare(
+            "SELECT external_id FROM identities WHERE account_id = ? AND kind = 'email'
+             ORDER BY created_at, external_id",
+        )?;
+        let rows = stmt.query_map(params![account_id], |r| r.get(0))?.collect::<duckdb::Result<Vec<String>>>()?;
+        Ok(rows)
     }
 
     /// Stores a delivered mail and what the webhook said its parts are;
@@ -9574,12 +9577,16 @@ CREATE TABLE messages (
     }
 
     #[test]
-    fn email_of_is_the_address_the_account_signed_in_with() {
+    fn emails_of_are_the_addresses_the_account_signed_in_with_oldest_first() {
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
-        assert_eq!(store.email_of(a).unwrap(), None);
+        assert_eq!(store.emails_of(a).unwrap(), Vec::<String>::new());
         let b = store.account_for_identity("email", "sasha@example.com").unwrap();
-        assert_eq!(store.email_of(b).unwrap().as_deref(), Some("sasha@example.com"));
+        assert_eq!(store.emails_of(b).unwrap(), ["sasha@example.com"]);
+        // A second address on the same account: both are read, and the
+        // first stays first so a forward keeps going where it went.
+        store.link_identity(b, "email", "sasha@work.example").unwrap();
+        assert_eq!(store.emails_of(b).unwrap(), ["sasha@example.com", "sasha@work.example"]);
     }
 
     #[test]

@@ -694,10 +694,72 @@ pub async fn attachment_for(core: &Core, id: i64, account_id: i64) -> anyhow::Re
     .await
 }
 
-/// The address the account signed in with, where a forward goes.
-pub async fn email_of(core: &Core, account_id: i64) -> anyhow::Result<Option<String>> {
+/// Every address the account signed in with, oldest first. The first is
+/// where a forward goes; the whole list is what a sender is compared
+/// against, because a person who signed in twice writes to Scout from
+/// either of their addresses and only one of them is the destination.
+pub async fn emails_of(core: &Core, account_id: i64) -> anyhow::Result<Vec<String>> {
     let store = core.store();
-    blocking(move || store.email_of(account_id)).await
+    blocking(move || store.emails_of(account_id)).await
+}
+
+/// `addr` out of `Name <addr>`, or the string itself when there are no
+/// angle brackets.
+pub fn bare_address(raw: &str) -> &str {
+    // Both from the right: a display name may itself contain a `<`, and
+    // the address is always the last bracketed thing.
+    match (raw.rfind('<'), raw.rfind('>')) {
+        (Some(open), Some(close)) if open < close => &raw[open + 1..close],
+        _ => raw,
+    }
+    .trim()
+}
+
+/// Whether this mail came from the account itself — the person forwarding
+/// something out of their own inbox rather than a hotel writing to the
+/// booking address. Forwarding such a mail back hands them a copy of what
+/// they just sent, and the Other-mail row says so rather than reading as
+/// a failure.
+///
+/// The one place this is decided. The worker asks it before sending and
+/// `view` asks it again when it draws the row, and the two must agree —
+/// which is why the row's flag is derived here rather than stored beside
+/// the mail or written a second time in SQL.
+pub fn sender_is_the_account(sender: &str, theirs: &[String]) -> bool {
+    let Some(sender) = mailbox(sender) else {
+        return false;
+    };
+    theirs.iter().filter_map(|t| mailbox(t)).any(|t| t == sender)
+}
+
+/// The mailbox an address names, as addresses are compared here:
+/// lowercased whole, with any `+tag` off the local part, and `None` when
+/// what is left cannot identify anybody.
+///
+/// Lowercased whole, because an address is case-insensitive to everyone
+/// who types one — the local part is the sender's to case as they like,
+/// and no provider we forward for treats two spellings as two people.
+///
+/// The tag comes off both sides: `sasha+hotel@…` is the mailbox
+/// `sasha@…`, and either side may be the one carrying it.
+///
+/// Dots in the local part are left alone on purpose. Folding them is
+/// Gmail's convention and is wrong at most other providers, where
+/// `s.q@` and `sq@` are two people — and being wrong here means not
+/// forwarding a stranger's confirmation to the person waiting for it.
+///
+/// The domain is compared whole, so `example.com.evil.example` is a
+/// stranger's host and not ours: a suffix is not a domain.
+///
+/// `None` for a local part or a domain that is empty once that is done —
+/// an address nobody can be reached at is not evidence that two mails
+/// came from the same person, and without this a blank sender would
+/// match a blank identity.
+fn mailbox(raw: &str) -> Option<String> {
+    let (local, domain) = bare_address(raw).rsplit_once('@')?;
+    let local = local.split('+').next().unwrap_or_default().trim();
+    let domain = domain.trim();
+    (!local.is_empty() && !domain.is_empty()).then(|| format!("{}@{}", local.to_lowercase(), domain.to_lowercase()))
 }
 
 /// Stores the extractor's reading. A booking is placed on a trip (or a
@@ -2369,9 +2431,54 @@ mod tests {
         assert!(mail_to_work(&core, 10).await.unwrap().is_empty());
         let v = view(&core, a, "d").await.unwrap();
         assert_eq!(v.other.iter().map(|r| (r.mail_id, r.reason.as_str(), r.forwarded)).collect::<Vec<_>>(), vec![(first, "failed", false)]);
-        assert_eq!(email_of(&core, a).await.unwrap(), None);
+        assert_eq!(emails_of(&core, a).await.unwrap(), Vec::<String>::new());
         seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
-        assert_eq!(email_of(&core, a).await.unwrap().as_deref(), Some("sasha@example.com"));
+        assert_eq!(emails_of(&core, a).await.unwrap(), ["sasha@example.com"]);
+    }
+
+    #[tokio::test]
+    async fn an_account_is_read_with_every_address_it_signed_in_with_and_forwards_go_to_the_first() {
+        // The forward has one destination and the comparison has a set:
+        // a person who signed in twice writes to Scout from either
+        // address, and only the list sees both.
+        let (core, _dir) = core();
+        let a = core.store().account_for_telegram(1).unwrap();
+        seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
+        seed_email_identity_for_tests(&core, a, "sasha@work.example").await.unwrap();
+        let mine = emails_of(&core, a).await.unwrap();
+        assert_eq!(mine, ["sasha@example.com", "sasha@work.example"]);
+        assert!(sender_is_the_account("sasha@work.example", &mine));
+    }
+
+    #[test]
+    fn an_address_is_the_accounts_own_by_mailbox_and_by_nothing_looser_than_that() {
+        let mine = ["sasha@example.com".to_string(), "s.q@work.example".to_string()];
+        assert!(sender_is_the_account("sasha@example.com", &mine));
+        assert!(sender_is_the_account("Sasha Q <sasha@example.com>", &mine), "a display name is not part of the address");
+        assert!(sender_is_the_account("\"Q <the hotel>\" <sasha@example.com>", &mine), "a name may hold a bracket of its own");
+        assert!(sender_is_the_account("SASHA@Example.COM", &mine), "an address is case-insensitive to everyone who types one");
+        assert!(sender_is_the_account("sasha+hotel@example.com", &mine), "a plus tag is the same mailbox");
+        assert!(sender_is_the_account("bo@x.example", &["Bo <bo+scout@x.example>".to_string()]), "and the tag may be on the stored side");
+        assert!(sender_is_the_account("S.Q@Work.Example", &mine), "the match may be on any identity, not the first");
+
+        assert!(!sender_is_the_account("hotel@example.com", &mine), "a stranger at a shared domain");
+        assert!(
+            !sender_is_the_account("sasha@example.com.evil.example", &mine),
+            "a suffix is not a domain: this is a stranger's host that merely starts with ours"
+        );
+        assert!(
+            !sender_is_the_account("s.a.s.h.a@example.com", &mine),
+            "dots in the local part are Gmail's convention and wrong almost everywhere else"
+        );
+        assert!(!sender_is_the_account("sasha@example.com", &[]), "an account with no address of its own sent nothing");
+
+        // Nothing left to compare is not a match, however the two sides
+        // arrive at nothing: an account whose identity is unusable must
+        // not swallow every unusable sender with it.
+        assert!(!sender_is_the_account("+tag@example.com", &["+tag@example.com".to_string()]));
+        assert!(!sender_is_the_account("", &[String::new()]));
+        assert!(!sender_is_the_account("   ", &["  ".to_string()]));
+        assert!(!sender_is_the_account("sasha@", &["sasha@".to_string()]));
     }
 
     #[tokio::test]

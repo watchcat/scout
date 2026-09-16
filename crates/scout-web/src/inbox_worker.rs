@@ -348,7 +348,10 @@ async fn forward(
     if m.forwarded {
         return Ok(Forwarded::Yes);
     }
-    let Some(to) = scout_core::inbox::email_of(core, m.account_id).await.map_err(Failure::Reading)? else {
+    // Every address the account holds, of which the first is where a
+    // forward goes — as it went when this read one address and no more.
+    let theirs = scout_core::inbox::emails_of(core, m.account_id).await.map_err(Failure::Reading)?;
+    let Some(to) = theirs.first().cloned() else {
         return Ok(Forwarded::NoAddress);
     };
     let all = scout_core::inbox::attachment_bytes(core, m.id).await.map_err(Failure::Reading)?;

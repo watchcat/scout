@@ -384,6 +384,12 @@ pub async fn remove_item(
     .await
 }
 
+/// How long a note may be, re-exported from the tools where it is
+/// enforced so the browser's half of this feature — its input's
+/// `maxLength`, and the test in `routes/trips.rs` that pins the two
+/// together — has a public door to the one number.
+pub const MAX_NOTE_CHARS: usize = crate::tools::trips::MAX_NOTE_CHARS;
+
 /// Write, replace or clear the traveller's note on one item.
 ///
 /// The same guard `remove_item` carries, for a reason that is stronger

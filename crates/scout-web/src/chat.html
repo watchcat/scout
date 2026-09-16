@@ -489,6 +489,26 @@
      transparent fill are `.trip-download`'s — the other control on this
      card that opens a file — so nothing new is introduced, only reused at
      a smaller size. */
+  /* The note, and the way in to writing one. Under the head rather than in
+     it: a map link is one unbreakable token, and the head is a flex row
+     whose other half is the date — a long link there pushes the date off
+     the card, which is the bug the ticket chips already taught us. */
+  .item-note-slot{padding:0 14px 12px; display:flex; flex-direction:column; align-items:flex-start; gap:7px}
+  .item-note{margin:0; color:var(--base01); font-size:12.5px; line-height:1.45; overflow-wrap:anywhere}
+  .item-note a{color:var(--cyan); text-decoration:underline; text-underline-offset:2px}
+  .item-note a:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
+  .item-note-button{background:transparent; border:1px dashed var(--line); border-radius:8px;
+    color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
+  .item-note-button:hover{color:var(--base1); border-color:var(--cyan); border-style:solid}
+  .item-note-button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  .item-note-editor{display:flex; flex-wrap:wrap; gap:6px; width:100%}
+  .item-note-editor input{flex:1 1 15em; min-width:0; background:var(--base03); color:var(--base1);
+    border:1px solid var(--line); border-radius:8px; font:inherit; font-size:12.5px; padding:7px 9px}
+  .item-note-editor input:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  .item-note-editor button{background:transparent; border:1px solid var(--line); border-radius:8px;
+    color:var(--base1); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
+  .item-note-editor button:hover{color:var(--base2); border-color:var(--cyan)}
+  .item-note-editor button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   .attachment-links{margin:7px 0 0; display:flex; flex-wrap:wrap; gap:6px; font-size:12px}
   .attachment-links a{display:inline-flex; align-items:center; gap:6px; max-width:100%; min-width:0;
     padding:5px 9px; border:1px solid var(--line); border-radius:8px; background:transparent;
@@ -637,6 +657,11 @@
     .pending-actions button, .pending-picker button, .other-mail-add,
     .handle-row button, .handle-cancel, .segment-remove-button,
     .trip-keep, .trip-download, .attachment-links a{min-height:42px; padding:10px 14px; font-size:13px}
+    /* A thumb's worth, like every other control down here — and the
+       editor goes to one column so the box is not a slot between two
+       buttons on a phone. */
+    .item-note-button, .item-note-editor button{min-height:42px; padding:10px 14px; font-size:13px}
+    .item-note-editor input{flex:1 1 100%; min-height:42px; font-size:16px}
     /* Listed apart from the rule above, not inside it: a media query adds
        no specificity, so this has to come after the desktop
        `.other-mail-remove-button` to beat it on source order. A glyph needs

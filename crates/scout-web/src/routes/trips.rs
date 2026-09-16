@@ -995,6 +995,23 @@ mod tests {
         assert_eq!(trip.trip.items[0].destination.as_deref(), Some("LIS"));
     }
 
+    #[test]
+    fn the_box_the_page_offers_holds_what_the_store_accepts() {
+        // Two copies of one number, and the cheap failure is the box that
+        // takes more than the store will: the traveller types a note, is
+        // told nothing, and loses it on save. `note_text` is the rule; this
+        // is what keeps the page's `maxLength` standing next to it.
+        let js = include_str!("../chat.js");
+        let line = js
+            .lines()
+            .find(|line| line.contains("export const NOTE_MAX_CHARS"))
+            .expect("the page must say how long a note may be");
+        assert!(
+            line.contains(&scout_core::trips::MAX_NOTE_CHARS.to_string()),
+            "the page offers a different length than the store accepts: {line}"
+        );
+    }
+
     #[tokio::test]
     async fn a_note_is_written_from_the_page_and_a_stale_card_is_a_conflict() {
         // The page's half of the request behind this feature: a link for an

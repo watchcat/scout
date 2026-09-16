@@ -569,6 +569,78 @@ export function tripPdfFilename(name) {
   return `${stem || 'trip'}-itinerary.pdf`
 }
 
+// What the box will hold, the same number `tools::trips::MAX_NOTE_CHARS`
+// enforces — pinned to it by a test in `routes/trips.rs`, because a box
+// that accepts more than the store does is a note the traveller watches
+// get refused after they typed it.
+export const NOTE_MAX_CHARS = 500
+
+// A note, split into the parts the card draws: plain text, and the links
+// inside it. Exported because the rule it encodes — which schemes may
+// become an anchor — is the security boundary of this field, and a rule
+// nobody can test is one nobody can trust.
+//
+// A note is free text the traveller pastes, and this feature exists
+// because they wanted to paste a map link. So `http` and `https` become
+// links and every other scheme stays characters: `javascript:` in an
+// anchor's href runs on click, and `data:` can carry a page of its own.
+// The parts are built into nodes with `textContent` by `noteLine`, so
+// even the text half never travels as markup.
+//
+// Trailing `.,;:!?` and a closing bracket are left out of the link: they
+// are punctuation belonging to the sentence far more often than to the
+// URL, and a link that swallows the full stop after it is the everyday
+// version of this being wrong. The reverse mistake — a real URL ending in
+// a bracket, which Wikipedia's do — costs a character off the end of a
+// link the reader can still read and retype, so it is the cheaper way to
+// be wrong.
+const NOTE_LINK = /https?:\/\/[^\s<>"']+/gi
+
+export function noteParts(note) {
+  const text = typeof note === 'string' ? note : ''
+  const parts = []
+  let at = 0
+  for (const match of text.matchAll(NOTE_LINK)) {
+    let url = match[0]
+    const trimmed = url.replace(/[.,;:!?)\]]+$/, '')
+    // Only a scheme is not an address: `https://` on its own matches the
+    // pattern and leads nowhere, so it stays text like any other word.
+    let usable = trimmed
+    try {
+      const parsed = new URL(trimmed)
+      if (!parsed.host) usable = ''
+    } catch {
+      usable = ''
+    }
+    if (!usable) continue
+    if (match.index > at) parts.push({ text: text.slice(at, match.index) })
+    parts.push({ link: usable })
+    at = match.index + usable.length
+  }
+  if (at < text.length) parts.push({ text: text.slice(at) })
+  return parts
+}
+
+// What the page sends to write or clear a note. The item is named the way
+// `removeItemBody` names one and for the same reason: positions renumber
+// on every write, so `position` alone cannot say which item was meant, and
+// the server refuses a body that describes something else. An empty box is
+// `null` rather than an omitted key — `NoteItemIn` reads both as "clear
+// it", and a body that says what it means is the one worth sending.
+export function noteBody(tripName, item, note) {
+  const flight = item.kind === 'flight'
+  const written = String(note ?? '').trim()
+  return JSON.stringify({
+    trip: tripName,
+    position: item.position,
+    origin: flight ? item.origin ?? null : null,
+    destination: flight ? item.destination ?? null : null,
+    title: flight ? null : item.title ?? null,
+    date: item.date ?? null,
+    note: written === '' ? null : written,
+  })
+}
+
 // The DELETE body for `/chat/trips/segment`. Removing an item renumbers the
 // ones after it — removing item 1 shifts item 2 down to 1, and a flight's
 // parked options with it — so a tab holding a trip it drew a while ago
@@ -1442,6 +1514,7 @@ function start() {
     actions.append(removeSlot)
     head.append(about, actions)
     card.append(head)
+    card.append(noteSlot(trip, item))
     return card
   }
 
@@ -1474,6 +1547,7 @@ function start() {
     actions.append(removeSlot)
     head.append(route, actions)
     card.append(head)
+    card.append(noteSlot(trip, segment))
 
     if (!segment.candidates.length) {
       card.append(node('p', 'no-options', noFlightLine(segment)))
@@ -1797,6 +1871,117 @@ function start() {
   // airline's `eTicket_Receipt_ABC123_SURNAME_LIS.pdf` is one unbreakable
   // token that has to be allowed to shrink and wrap inside the border
   // rather than push it out of the card.
+  // The traveller's note under the item it belongs to. Every part is a
+  // node: `noteParts` decides what may become a link, and the text halves
+  // arrive through `textContent`, so a note containing markup is a note
+  // containing the characters of markup.
+  function noteLine(item) {
+    const line = node('p', 'item-note')
+    for (const part of noteParts(item.notes)) {
+      if (part.text !== undefined) {
+        line.append(document.createTextNode(part.text))
+        continue
+      }
+      const link = node('a', '', part.link)
+      link.href = part.link
+      // What opens is a page the traveller pasted, not ours: it must not
+      // reach back through `window.opener`, and the request for it must
+      // not carry the trip it was opened from. The same rule as a ticket.
+      link.setAttribute('target', '_blank')
+      link.setAttribute('rel', 'noopener noreferrer')
+      line.append(link)
+    }
+    return line
+  }
+
+  // The note and the button that edits it, as one slot, so saving can
+  // redraw this much and leave the rest of the card alone.
+  function noteSlot(trip, item) {
+    const slot = node('div', 'item-note-slot')
+    drawNote(trip, item, slot)
+    return slot
+  }
+
+  function drawNote(trip, item, slot) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'item-note-button'
+    button.textContent = item.notes ? 'Edit note' : 'Add note'
+    button.setAttribute('aria-label', `${item.notes ? 'Edit' : 'Add'} note on ${itemName(item)}`)
+    button.addEventListener('click', () => {
+      slot.replaceChildren(noteEditor(trip, item, slot))
+      slot.querySelector('input')?.focus()
+    })
+    slot.replaceChildren(...(item.notes ? [noteLine(item), button] : [button]))
+  }
+
+  // A box, a save and a way out. Deliberately plain: this field exists so
+  // a map link can be pasted onto an item, and anything more elaborate
+  // than an input would be in the way of that.
+  function noteEditor(trip, item, slot) {
+    const form = node('form', 'item-note-editor')
+    const input = document.createElement('input')
+    input.type = 'text'
+    input.value = item.notes ?? ''
+    input.maxLength = NOTE_MAX_CHARS
+    input.placeholder = 'A link, or where to meet'
+    input.setAttribute('aria-label', `Note on ${itemName(item)}`)
+    const save = node('button', 'item-note-save', 'Save')
+    save.type = 'submit'
+    const cancel = node('button', 'item-note-cancel', 'Cancel')
+    cancel.type = 'button'
+    cancel.addEventListener('click', () => drawNote(trip, item, slot))
+    form.append(input, save, cancel)
+    form.addEventListener('submit', (event) => {
+      event.preventDefault()
+      save.disabled = true
+      // An empty box clears the note, which is the only way to take one
+      // off — a separate remove would be a second thing to explain.
+      noteItem(trip, item, input.value).catch(() => {})
+    })
+    return form
+  }
+
+  async function noteItem(trip, item, note) {
+    if (tripChoicePending) return
+    tripChoicePending = true
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    try {
+      const res = await fetch('/chat/trips/item-note', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body: noteBody(trip.name, item, note),
+      })
+      if (res.status === 409) {
+        // This tab's copy is older than the trip, exactly as on a removal:
+        // the position this note names may no longer be the item it was
+        // typed on, and writing it anyway is the quiet mistake.
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        showTripToast('This trip changed elsewhere. Showing the current itinerary.')
+        return
+      }
+      if (res.status === 422) {
+        showTripToast(await res.text())
+        return
+      }
+      if (!res.ok) throw new Error('refused')
+      const updated = await res.json()
+      trips = [updated, ...trips.filter((other) => other.name !== updated.name)]
+      currentTrip = updated.name
+      renderTripList()
+      renderTripDetail()
+      showTripToast(String(note).trim() ? `Note saved on ${itemName(item)}.` : `Note cleared on ${itemName(item)}.`)
+    } catch {
+      showTripToast('Could not save that note. Try again.')
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+    }
+  }
+
   function attachmentLinks(attachments) {
     const list = node('p', 'attachment-links')
     for (const file of attachments) {

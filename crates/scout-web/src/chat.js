@@ -540,10 +540,16 @@ export function otherMailLines(rows, locale = undefined) {
     subject: row.subject?.trim() ? row.subject : '(no subject)',
     when: dateLabel(String(row.received_at ?? '').slice(0, 10), true, locale),
     reason: MAIL_REASONS[row.reason] ?? row.reason ?? '',
-    // Three states, and the reader's own mail is checked first: it is
-    // never forwarded, and "not forwarded" on a mail they sent reads as
-    // a failure when nothing failed — they hold the mail already.
-    note: row.sent_by_you ? 'you sent this to Scout' : row.forwarded ? 'forwarded to you' : 'not forwarded',
+    // Three states. `forwarded` is asked first because it is a fact
+    // about this mail — it was sent, and the row records when — while
+    // `sent_by_you` is recomputed from the addresses on the account as
+    // they are now: link an address after a mail came in from it and
+    // every old row from that sender starts saying so. A mail that was
+    // forwarded must go on saying that, whoever its sender turns out to
+    // be today. Only then is "you sent this" better than the bare "not
+    // forwarded", which on a mail they sent reads as a failure when
+    // nothing failed: they hold the mail already.
+    note: row.forwarded ? 'forwarded to you' : row.sent_by_you ? 'you sent this to Scout' : 'not forwarded',
     attachments: row.attachments ?? [],
     // The one reason that gets a button; kept as a flag so the page does
     // not compare against its own display text.

@@ -1564,9 +1564,16 @@ mod tests {
             scout_core::inbox::attachment_texts(&core, mail_id).await.unwrap().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
             ["ticket.pdf"],
         );
-        assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "settled, not held for a forward that is never coming");
-        // And on a later pass it stays settled rather than being picked up again.
+        // Aged first, and only then asked: a row attempted a moment ago is
+        // out of `mail_to_work` whatever `settle` decided, so asking
+        // before the backoff had passed would have said "settled" about a
+        // mail that was merely waiting.
         scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        assert!(
+            scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(),
+            "held for a forward that is never coming"
+        );
+        // And a pass over it now finds nothing to do rather than sending late.
         work_once(&core, &client, FROM, 10).await;
         assert_eq!(forwards(&server.received_requests().await.unwrap()), 0);
     }

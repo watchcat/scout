@@ -468,9 +468,17 @@ fn disposition_for(mime: &SafeMime) -> Disposition {
 /// `allow-popups` and `allow-top-navigation` are all absent: with those
 /// gone, the only actor left that can start a download is the reader
 /// pressing Save on the document in front of them. The two tokens are one
-/// decision. Add `allow-scripts` — the fallback if a browser turns out to
-/// refuse a sandboxed PDF outright — and this stops being a save button
-/// and becomes a drive-by download from an opaque origin.
+/// decision. Add `allow-scripts` and this stops being a save button and
+/// becomes a drive-by download from an opaque origin.
+///
+/// That escalation was held ready against the one thing this repo cannot
+/// decide — whether a browser renders a sandboxed PDF at all, rather than
+/// refusing it and leaving the reader with a blank tab. Checked in Chrome
+/// on 2026-09-16: a forwarded ticket opens in a new tab and renders under
+/// exactly this policy, so the escalation is not needed and must not be
+/// made on a guess. Firefox and Safari are unverified; if one of them
+/// comes back blank, the fix is that browser's viewer, not `allow-scripts`
+/// for everyone.
 const FILE_CSP: &str = "default-src 'none'; sandbox allow-downloads";
 
 /// `[A-Za-z0-9._-]` of the name, anything else an underscore, runs of

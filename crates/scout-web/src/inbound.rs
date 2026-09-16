@@ -193,8 +193,13 @@ impl Attachment {
     /// The part as the store keeps it, unless it has no id — which is the
     /// only thing that could ever tie it to a row of the attachment
     /// listing, so a part without one describes nothing.
+    ///
+    /// Stored as the trim leaves it, not as it came. The same padding that
+    /// would make an id blank makes a padded one match nothing, and the
+    /// check and the value have to agree or the row is one the worker can
+    /// never use.
     fn stored(self) -> Option<MailPart> {
-        let provider_id = self.id.filter(|id| !id.trim().is_empty())?;
+        let provider_id = self.id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty())?;
         Some(MailPart { provider_id, content_disposition: self.content_disposition, content_id: self.content_id })
     }
 }
@@ -531,6 +536,12 @@ mod tests {
                     {"id": "att_bare"},
                     {"filename": "nameless.pdf"},
                     {"id": "   "},
+                    // Padded rather than blank: an id kept as it came
+                    // would match nothing in the attachment listing, and
+                    // a row that can never match is a row that describes
+                    // nothing. The same trim that decides it is kept is
+                    // the one whose answer is stored.
+                    {"id": "  att_padded  ", "content_disposition": "inline"},
                 ],
             },
         })
@@ -545,6 +556,11 @@ mod tests {
                     content_id: Some("<logo@mailer>".into()),
                 },
                 MailPart { provider_id: "att_bare".into(), content_disposition: None, content_id: None },
+                MailPart {
+                    provider_id: "att_padded".into(),
+                    content_disposition: Some("inline".into()),
+                    content_id: None,
+                },
             ],
         );
 

@@ -254,6 +254,17 @@ pub struct Arrival {
     pub place: Option<String>,
     pub origin: Option<String>,
     pub destination: Option<String>,
+    /// Which flight it was, for a flight: what the card shows and what the
+    /// leg's own option row is written from. Defaulted on the wire because
+    /// a page or a stored reply from before these existed has neither.
+    #[serde(default)]
+    pub airline: Option<String>,
+    #[serde(default)]
+    pub flight_number: Option<String>,
+    /// The airports it changes planes at, in order. Empty for a direct
+    /// flight and for everything that is not one.
+    #[serde(default)]
+    pub stops: Vec<String>,
     pub date: Option<String>,
     pub starts_at: Option<String>,
     pub ends_at: Option<String>,
@@ -451,7 +462,8 @@ mod tests {
     fn an_arrival_survives_a_round_trip() {
         let a = Arrival {
             id: 1, mail_id: 2, booking: true, kind: Some("stay".into()), title: Some("Hotel Alfama".into()),
-            place: Some("Lisbon".into()), origin: None, destination: None, date: Some("2026-10-12".into()),
+            place: Some("Lisbon".into()), origin: None, destination: None, airline: None,
+            flight_number: None, stops: Vec::new(), date: Some("2026-10-12".into()),
             starts_at: None, ends_at: Some("2026-10-15".into()), confirmation_code: Some("ABC".into()),
             price: Some(320.0), currency: Some("EUR".into()), confidence: Some(0.9),
             summary: "Hotel Alfama, 12–15 Oct".into(), trip_id: Some(3), trip_name: Some("Lisbon".into()),

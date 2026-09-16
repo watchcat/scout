@@ -5,7 +5,7 @@ import {
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
-  tripPdfFilename, tripRoute, itemDateLabel,
+  tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, handleProblem,
@@ -335,6 +335,25 @@ test('a stale trip read cannot repaint a newer choice', () => {
 test('Ignav saved fares stay visibly approximate', () => {
   assert.deepEqual(savedFareQualifier('ignav'), { prefix: 'from ', note: 'estimate when saved' })
   assert.deepEqual(savedFareQualifier('duffel'), { prefix: '', note: 'when saved' })
+  // A fare off a forwarded confirmation is the total paid, not a quote
+  // that may have moved since it was parked.
+  assert.deepEqual(savedFareQualifier('email'), { prefix: '', note: 'paid' })
+})
+
+test('a booked item is marked the same way whatever kind it is', () => {
+  assert.equal(bookedMark({ confirmation_code: 'KL7788' }), 'booked \u00b7 KL7788')
+  assert.equal(bookedMark({ confirmation_code: null }), 'booked')
+})
+
+test('a flight card with no option says which of the two silences it is', () => {
+  // The bug from production: a leg booked by forwarding the airline's
+  // confirmation offered to go and search the route the reader had
+  // already bought a seat on.
+  assert.equal(noFlightLine({ booked: true }), 'Booked. The confirmation did not say which flight.')
+  assert.equal(
+    noFlightLine({ booked: false }),
+    'No flight saved yet. Ask Scout in chat to search this route.',
+  )
 })
 
 test('a trip PDF filename is bounded and safe for local download', () => {

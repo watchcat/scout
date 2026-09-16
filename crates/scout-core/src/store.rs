@@ -411,7 +411,18 @@ CREATE TABLE IF NOT EXISTS arrivals (
     trip_id           BIGINT,
     status            TEXT NOT NULL DEFAULT 'pending',
     item_id           BIGINT,
-    decided_at        TIMESTAMP
+    decided_at        TIMESTAMP,
+    -- Which flight the confirmation named, and where it changes planes.
+    -- Only a flight has these, and only these say on the leg's card what
+    -- was actually bought. Last, and in this order, so a fresh database and
+    -- a migrated one — where they arrive by ALTER TABLE in step 17 — have
+    -- the same column order.
+    airline           TEXT,
+    flight_number     TEXT,
+    -- The airports changed at, comma-separated, the way `travellers` keeps
+    -- its list: a connection is one booking, and the leg's itinerary strip
+    -- has to show the stop or the card calls a one-stop ticket direct.
+    stops             TEXT
 );
 "#;
 
@@ -1147,6 +1158,18 @@ CREATE TABLE IF NOT EXISTS arrivals (
 );
 "#;
 
+/// Which flight a confirmation named, and where it stops. Nullable and
+/// added in place: every arrival written before this one is a reading that
+/// never had them, and there is nothing to backfill from — the mail it came
+/// out of may be gone. The order matches the tail of `arrivals` in
+/// `MIGRATIONS`, which is what keeps a migrated table the same shape as a
+/// fresh one.
+const STEP_17_ARRIVAL_FLIGHT: &str = r#"
+ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS airline TEXT;
+ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS flight_number TEXT;
+ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS stops TEXT;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -1165,6 +1188,7 @@ fn steps() -> Vec<(i64, Step)> {
         (14, Step::Sql(STEP_14_TRIP_ITEMS)),
         (15, Step::Code(step_15_reorder_items)),
         (16, Step::Sql(STEP_16_INBOX)),
+        (17, Step::Sql(STEP_17_ARRIVAL_FLIGHT)),
     ]
 }
 
@@ -1299,6 +1323,12 @@ pub struct NewArrival {
     pub place: Option<String>,
     pub origin: Option<String>,
     pub destination: Option<String>,
+    /// A flight's own name and number, when the confirmation said them,
+    /// and the airports it changes planes at, comma-separated the way
+    /// `travellers` is.
+    pub airline: Option<String>,
+    pub flight_number: Option<String>,
+    pub stops: Option<String>,
     pub date: Option<String>,
     pub starts_at: Option<String>,
     pub ends_at: Option<String>,
@@ -4085,7 +4115,8 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
 /// readers cannot drift. The trip join is owner-scoped: a `trip_id` that
 /// names someone else's trip yields no name rather than theirs.
 const ARRIVAL_SELECT: &str =
-    "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination, a.date,
+    "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
+     a.airline, a.flight_number, a.stops, a.date,
      a.starts_at, a.ends_at, a.confirmation_code, a.price, a.currency, a.confidence, a.summary,
      a.trip_id, t.name, a.status, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ')
      FROM arrivals a
@@ -4096,11 +4127,24 @@ const ARRIVAL_SELECT: &str =
 fn arrival_row(r: &Row) -> duckdb::Result<scout_api::Arrival> {
     Ok(scout_api::Arrival {
         id: r.get(0)?, mail_id: r.get(1)?, booking: r.get(2)?, kind: r.get(3)?, title: r.get(4)?,
-        place: r.get(5)?, origin: r.get(6)?, destination: r.get(7)?, date: r.get(8)?,
-        starts_at: r.get(9)?, ends_at: r.get(10)?, confirmation_code: r.get(11)?, price: r.get(12)?,
-        currency: r.get(13)?, confidence: r.get(14)?, summary: r.get(15)?, trip_id: r.get(16)?,
-        trip_name: r.get(17)?, status: r.get(18)?, received_at: r.get(19)?, attachments: Vec::new(),
+        place: r.get(5)?, origin: r.get(6)?, destination: r.get(7)?, airline: r.get(8)?,
+        flight_number: r.get(9)?, stops: listed(r.get(10)?), date: r.get(11)?,
+        starts_at: r.get(12)?, ends_at: r.get(13)?, confirmation_code: r.get(14)?, price: r.get(15)?,
+        currency: r.get(16)?, confidence: r.get(17)?, summary: r.get(18)?, trip_id: r.get(19)?,
+        trip_name: r.get(20)?, status: r.get(21)?, received_at: r.get(22)?, attachments: Vec::new(),
     })
+}
+
+/// A comma-separated column back as the list it was written from. Blanks
+/// are dropped, so a stored `""` and a NULL are the same empty list.
+fn listed(stored: Option<String>) -> Vec<String> {
+    stored
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn attachments_of(conn: &Connection, mail_id: i64) -> duckdb::Result<Vec<scout_api::AttachmentRef>> {
@@ -4279,6 +4323,30 @@ impl Store {
         Ok(())
     }
 
+    /// Backdates a trip's creation past `DRAFT_GRACE_MINUTES`, so a test
+    /// can sweep a draft the grace would otherwise spare.
+    ///
+    /// Written by the same bare `current_timestamp` the column's default
+    /// uses, for the reason `collectable_draft` gives at length: a value
+    /// from `chrono::Utc` would land hours off the rows it has to compare
+    /// with, and the test would pass or fail on the host's zone.
+    ///
+    /// `#[cfg(test)]` rather than `#[doc(hidden)] pub` like `age_attempts`,
+    /// which the web crate's tests need from outside: nothing outside this
+    /// crate moves a trip's clock backwards, and a door that exists gets
+    /// opened.
+    #[cfg(test)]
+    pub(crate) fn age_trip(&self, trip_id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE trips SET created_at =
+                 CAST(current_timestamp AS TIMESTAMP) - to_minutes(CAST(? AS INTEGER))
+             WHERE id = ?",
+            params![DRAFT_GRACE_MINUTES + 60, trip_id],
+        )?;
+        Ok(())
+    }
+
     pub fn mail_done(&self, id: i64) -> Result<()> {
         let conn = self.conn();
         conn.execute("UPDATE inbound_mail SET status = 'done', error = NULL WHERE id = ?", params![id])?;
@@ -4434,11 +4502,13 @@ impl Store {
                 .map(|a| {
                     Ok(conn.query_row(
                         "INSERT INTO arrivals (account_id, mail_id, booking, kind, title, place, origin, destination,
+                                               airline, flight_number, stops,
                                                date, starts_at, ends_at, timezone, confirmation_code, price, currency,
                                                travellers, confidence, summary, trip_id)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                         params![
                             account_id, mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
+                            a.airline, a.flight_number, a.stops,
                             a.date, a.starts_at, a.ends_at, a.timezone, a.confirmation_code, a.price, a.currency,
                             a.travellers, a.confidence, a.summary, a.trip_id
                         ],
@@ -4604,6 +4674,147 @@ impl Store {
         )?;
         conn.execute(&format!("DELETE FROM arrivals WHERE mail_id IN ({sweepable})"), params![cutoff])?;
         Ok(conn.execute(&format!("DELETE FROM inbound_mail WHERE id IN ({sweepable})"), params![cutoff])?)
+    }
+
+    /// `(trip id, date, place)` per booking still waiting on one of this
+    /// account's trips.
+    ///
+    /// A draft holds no items until its owner presses Add, so for the hours
+    /// or days in between these rows are the only thing that says what the
+    /// trip is about. Placement reads them beside the items, or a second
+    /// email about the same journey can never find the draft the first one
+    /// made.
+    pub fn pending_arrival_marks(&self, account_id: i64) -> Result<Vec<(i64, String, Option<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT a.trip_id, a.date, a.place FROM arrivals a
+             WHERE a.account_id = ? AND {UNDECIDED} AND a.trip_id IS NOT NULL AND a.date IS NOT NULL
+             ORDER BY a.id"
+        ))?;
+        let rows = stmt.query_map(params![account_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Deletes this account's drafts that hold nothing, that nothing is
+    /// waiting on, and that are old enough to be stale. Returns how many
+    /// went.
+    pub fn sweep_empty_drafts(&self, account_id: i64) -> Result<usize> {
+        let conn = self.conn();
+        sweep_drafts_within(&conn, Some(account_id))
+    }
+
+    /// The same collection over every account, for the hourly maintenance:
+    /// the drafts already sitting in somebody's list were abandoned before
+    /// `add_arrival` swept, and nothing else will ever reach them.
+    pub fn sweep_all_empty_drafts(&self) -> Result<usize> {
+        let conn = self.conn();
+        sweep_drafts_within(&conn, None)
+    }
+}
+
+/// How long a draft has to have existed before it can be collected.
+///
+/// Without a floor a draft is collectable the instant `upsert_trip`
+/// returns, and there are two windows in which that is reachable now that
+/// every Add and Ignore sweeps: `record_arrivals` between placing a mail
+/// and writing its arrivals, and `add_arrival` between claiming the arrival
+/// and building the item. Both are milliseconds; five minutes is far past
+/// either and far short of any draft a person is looking at.
+const DRAFT_GRACE_MINUTES: i64 = 5;
+
+/// A draft nothing landed on: not kept, owned by no conversation, holding
+/// no items, with no booking waiting to become one, and older than the
+/// grace above.
+///
+/// Those together are only ever a placement draft that was abandoned —
+/// `inbox::record_arrivals` made it to have somewhere to put a booking,
+/// and the booking went elsewhere or was ignored. A chat's own draft has a
+/// conversation and is the thread sweep's business; a draft whose booking
+/// is still pending is the reason that booking has a trip name on the page.
+///
+/// `UNDECIDED` is interpolated rather than restated: it is the same "still
+/// waiting" that makes a trip matchable in `inbox::Trips::matching`, and a
+/// collection rule that drifted from the matching rule would delete a draft
+/// the next mail could still have joined.
+///
+/// **Both sides of the age test are on the clock that writes the column.**
+/// `trips.created_at` defaults to bare `current_timestamp`, which DuckDB
+/// resolves in the session's zone — measured on this build with
+/// `SET TimeZone = 'America/New_York'`: a trip written at 10:54 UTC stores
+/// `06:54`, while `current_timestamp AT TIME ZONE 'UTC'` and
+/// `chrono::Utc::now()` both read `10:54`. A cutoff taken from either of
+/// those sits hours ahead of every row west of UTC, which makes the floor a
+/// no-op and silently reopens the two windows it exists to close. So the
+/// cutoff is derived in SQL from the same bare `current_timestamp`, and
+/// `age_trip` writes on it too. A daylight-saving shift moves both sides
+/// together; the worst it can do inside the shifted hour is collect an
+/// empty draft an hour early.
+fn collectable_draft() -> String {
+    format!(
+        "NOT kept AND conversation_id IS NULL
+         AND created_at < CAST(current_timestamp AS TIMESTAMP) - to_minutes(CAST(? AS INTEGER))
+         AND NOT EXISTS (SELECT 1 FROM trip_items i WHERE i.trip_id = trips.id)
+         AND NOT EXISTS (SELECT 1 FROM arrivals a WHERE a.trip_id = trips.id AND {UNDECIDED})"
+    )
+}
+
+/// Collects the stale empty drafts of one account, or of everybody.
+///
+/// Reads the rows before deleting them and logs what went by name: a sweep
+/// that deletes a person's trip must leave enough behind to say which trip
+/// it was. The arrivals that pointed at a collected draft — decided ones,
+/// which is why it was collectable — have their `trip_id` cleared in the
+/// same transaction, so nothing is left naming a trip that is gone.
+fn sweep_drafts_within(conn: &Connection, account_id: Option<i64>) -> Result<usize> {
+    let mine = if account_id.is_some() { "account_id = ? AND " } else { "" };
+    // The account first when there is one, then the grace: the order the
+    // `?`s appear in the statement. The grace is a number of minutes, not a
+    // timestamp — see `collectable_draft` for why the cutoff cannot come
+    // from Rust.
+    let mut args: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+    if let Some(id) = account_id {
+        args.push(Box::new(id));
+    }
+    args.push(Box::new(DRAFT_GRACE_MINUTES));
+    // Bounded: the hourly pass over every account must not build an
+    // unbounded id list out of a database nobody has swept in a year. What
+    // it leaves behind the next pass takes.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, account_id, name FROM trips WHERE {mine}{} LIMIT 500",
+        collectable_draft()
+    ))?;
+    let doomed: Vec<(i64, i64, String)> = stmt
+        .query_map(duckdb::params_from_iter(args.iter()), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<duckdb::Result<_>>()?;
+    drop(stmt);
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> = doomed.iter().map(|(id, _, _)| *id).collect();
+    let holes = ["?"].repeat(ids.len()).join(", ");
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> Result<usize> {
+        conn.execute(
+            &format!("UPDATE arrivals SET trip_id = NULL WHERE trip_id IN ({holes})"),
+            duckdb::params_from_iter(ids.iter()),
+        )?;
+        Ok(conn.execute(
+            &format!("DELETE FROM trips WHERE id IN ({holes})"),
+            duckdb::params_from_iter(ids.iter()),
+        )?)
+    })();
+    match result {
+        Ok(n) => {
+            conn.execute_batch("COMMIT")?;
+            for (id, account_id, name) in &doomed {
+                tracing::info!(trip_id = id, account_id, name = %name, "empty placement draft collected");
+            }
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
     }
 }
 
@@ -4962,7 +5173,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 16);
+        assert_eq!(s.schema_version().unwrap(), 17);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -5026,7 +5237,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -6934,7 +7145,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -7592,7 +7803,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 16, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 17, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -7633,7 +7844,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 16);
+        assert_eq!(s.schema_version().unwrap(), 17);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -7687,6 +7898,18 @@ CREATE TABLE conversations (
         let (_d2, db) = legacy_db();
         let migrated = Store::open(&db).unwrap();
         assert_eq!(shape(&fresh.conn(), "trips"), shape(&migrated.conn(), "trips"));
+    }
+
+    #[test]
+    fn a_migrated_arrivals_table_has_exactly_the_shape_a_fresh_one_has() {
+        // Step 17 appends its columns; `MIGRATIONS` lists them last and in
+        // the same order. Put them anywhere else in the DDL and a fresh
+        // database and a migrated one disagree about ordinal positions —
+        // the drift the `conversations` and `trips` tests above exist for.
+        let (fresh, _d1) = test_store();
+        let (_d2, path) = version_sixteen_db();
+        let migrated = Store::open(&path).unwrap();
+        assert_eq!(shape(&fresh.conn(), "arrivals"), shape(&migrated.conn(), "arrivals"));
     }
 
     #[test]
@@ -8120,7 +8343,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -8224,7 +8447,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -8232,6 +8455,58 @@ CREATE TABLE messages (
         store.insert_attachment(m, "ticket.pdf", "application/pdf", Some(b"%PDF"), Some("Row 12")).unwrap();
         let id = store.insert_arrival(1, m, &NewArrival { booking: true, summary: "x".into(), ..Default::default() }).unwrap();
         assert!(store.arrival_of(id, 1).unwrap().is_some());
+    }
+
+    /// A database in the shape step 16 left it: `arrivals` without the
+    /// three columns step 17 adds. Built by dropping them from the finished
+    /// shape rather than by restating the old DDL, so it cannot drift from
+    /// what `MIGRATIONS` says the rest of the table is.
+    fn version_sixteen_db() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v16.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE arrivals DROP COLUMN airline;
+             ALTER TABLE arrivals DROP COLUMN flight_number;
+             ALTER TABLE arrivals DROP COLUMN stops;
+             CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
+             DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES (16);
+             INSERT INTO accounts (id) VALUES (1);",
+        )
+        .unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    #[test]
+    fn a_version_16_database_gains_the_flight_columns_and_takes_a_flight_arrival() {
+        // Every other fixture builds `arrivals` from `MIGRATIONS`, which
+        // already carries these columns, so without this nothing ever runs
+        // step 17's ALTERs against the shape a deployed database is in —
+        // and a broken step would pass the whole suite.
+        let (_dir, path) = version_sixteen_db();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 17);
+        let m = mail(&store, 1, "re_1");
+        let id = store
+            .insert_arrival(1, m, &NewArrival {
+                booking: true,
+                kind: Some("flight".into()),
+                origin: Some("AMS".into()),
+                destination: Some("HKG".into()),
+                airline: Some("KLM".into()),
+                flight_number: Some("KL887".into()),
+                stops: Some("CDG".into()),
+                date: Some("2026-11-02".into()),
+                summary: "AMS → HKG".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let got = store.arrival_of(id, 1).unwrap().expect("written through the migrated table");
+        assert_eq!((got.airline.as_deref(), got.flight_number.as_deref()), (Some("KLM"), Some("KL887")));
+        assert_eq!(got.stops, vec!["CDG".to_string()]);
     }
 
     #[test]
@@ -8328,7 +8603,7 @@ CREATE TABLE messages (
         let m = mail(&store, a, "re_1");
         let id = store.insert_arrival(a, m, &NewArrival {
             booking: true, kind: Some("stay".into()), title: Some("Hotel Alfama".into()), place: Some("Lisbon".into()),
-            origin: None, destination: None, date: Some("2026-10-12".into()), starts_at: None, ends_at: Some("2026-10-15".into()),
+            origin: None, destination: None, airline: None, flight_number: None, stops: None, date: Some("2026-10-12".into()), starts_at: None, ends_at: Some("2026-10-15".into()),
             timezone: None, confirmation_code: Some("ABC".into()), price: Some(320.0), currency: Some("EUR".into()),
             travellers: None, confidence: Some(0.9), summary: "Hotel Alfama, 12–15 Oct".into(), trip_id: None,
         }).unwrap();
@@ -8409,7 +8684,7 @@ CREATE TABLE messages (
         let m = mail(&store, a, "re_1");
         let arrival = NewArrival {
             booking: true, kind: None, title: None, place: None, origin: None, destination: None,
-            date: None, starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
+            airline: None, flight_number: None, stops: None, date: None, starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
             price: None, currency: None, travellers: None, confidence: None, summary: "x".into(), trip_id: None,
         };
         let id = store.insert_arrival(a, m, &arrival).unwrap();
@@ -8433,6 +8708,7 @@ CREATE TABLE messages (
         store.insert_attachment(spam, "logo.png", "image/png", Some(&[1, 2, 3]), None).unwrap();
         let arrival = NewArrival {
             booking: false, kind: None, title: None, place: None, origin: None, destination: None,
+            airline: None, flight_number: None, stops: None,
             date: None, starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
             price: None, currency: None, travellers: None, confidence: None, summary: "A newsletter".into(), trip_id: None,
         };
@@ -8459,12 +8735,18 @@ CREATE TABLE messages (
         let att = store.insert_attachment(m, "ticket.pdf", "application/pdf", None, Some("Row 12")).unwrap();
         let arrival = NewArrival {
             booking: true, kind: Some("flight".into()), title: None, place: None, origin: Some("AMS".into()), destination: Some("LIS".into()),
+            airline: Some("KLM".into()), flight_number: Some("KL1691".into()), stops: Some("CDG, DXB".into()),
             date: Some("2026-10-12".into()), starts_at: None, ends_at: None, timezone: None, confirmation_code: None,
             price: None, currency: None, travellers: None, confidence: None, summary: "AMS → LIS".into(), trip_id: Some(trip.id),
         };
         let id = store.insert_arrival(a, m, &arrival).unwrap();
         let got = store.arrival_of(id, a).unwrap().expect("theirs");
         assert_eq!(got.trip_name.as_deref(), Some("Lisbon"));
+        // Which flight it was, kept for the leg's own option row. The stops
+        // are stored as one comma-separated column and read back as the
+        // list the itinerary strip is built from.
+        assert_eq!((got.airline.as_deref(), got.flight_number.as_deref()), (Some("KLM"), Some("KL1691")));
+        assert_eq!(got.stops, vec!["CDG".to_string(), "DXB".to_string()]);
         // ISO UTC with the `Z`, the shape `threads_of` sends and the page
         // parses without a date library.
         assert!(got.received_at.contains('T') && got.received_at.ends_with('Z'), "{}", got.received_at);
@@ -8581,6 +8863,118 @@ CREATE TABLE messages (
         assert_eq!(view.other.len(), 1, "one mail, one row: {view:?}");
         assert_eq!(view.other[0].reason, "not_booking", "the ranked reason, not the older row's");
         assert_eq!(view.other[0].arrival_id, Some(ids[1]));
+    }
+
+    #[test]
+    fn a_trips_waiting_bookings_are_readable_without_its_items() {
+        // A draft holds no items until somebody presses Add, so its dates
+        // live only on the arrivals placed on it. Placement reads these to
+        // know the draft is about November at all.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let b = store.account_for_telegram(2).unwrap();
+        let m = mail(&store, a, "re_1");
+        let draft = store.upsert_trip(a, "HKG, November", None, None, None).unwrap();
+        let waiting = NewArrival {
+            booking: true,
+            kind: Some("flight".into()),
+            place: Some("Hong Kong".into()),
+            date: Some("2026-11-02".into()),
+            summary: "out".into(),
+            trip_id: Some(draft.id),
+            ..Default::default()
+        };
+        // One batch: a second `insert_arrivals` on the same mail is a retry
+        // and replaces the pending rows of the first.
+        let ids = store
+            .insert_arrivals(a, m, &[
+                waiting.clone(),
+                // Not a mark: decided, not a booking, no date, or on no trip.
+                NewArrival { date: Some("2027-01-01".into()), summary: "decided".into(), ..waiting.clone() },
+                NewArrival { booking: false, date: Some("2027-02-02".into()), summary: "an ad".into(), ..waiting.clone() },
+                NewArrival { date: None, summary: "no date".into(), ..waiting.clone() },
+                NewArrival { trip_id: None, summary: "unplaced".into(), ..waiting.clone() },
+            ])
+            .unwrap();
+        let (id, decided) = (ids[0], ids[1]);
+        assert!(store.decide_arrival(decided, a, "ignored", None).unwrap());
+
+        assert_eq!(
+            store.pending_arrival_marks(a).unwrap(),
+            vec![(draft.id, "2026-11-02".to_string(), Some("Hong Kong".to_string()))]
+        );
+        assert_eq!(store.pending_arrival_marks(b).unwrap(), vec![], "not theirs");
+        assert!(store.decide_arrival(id, a, "added", None).unwrap());
+        assert_eq!(store.pending_arrival_marks(a).unwrap(), vec![], "a decided booking waits for nothing");
+    }
+
+    #[test]
+    fn a_draft_with_nothing_on_it_and_nothing_waiting_is_collected() {
+        let (store, _dir) = test_store();
+        // Pinned off UTC, the way `a_spent_token_is_stamped_on_the_clock_
+        // that_expires_it` is: the grace compares `created_at` — written by
+        // the column's own default — against a cutoff, and two clocks in
+        // that comparison agree only on a UTC machine. A test that ran in
+        // the host's zone would agree with the host and prove nothing.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("SET TimeZone = 'America/New_York'", [])
+            .expect("the session's zone can be set");
+        let a = store.account_for_telegram(1).unwrap();
+        let b = store.account_for_telegram(2).unwrap();
+        let m = mail(&store, a, "re_1");
+        let empty = store.upsert_trip(a, "Empty draft", None, None, None).unwrap();
+        let with_item = store.upsert_trip(a, "Has an item", None, None, None).unwrap();
+        store.add_flight(with_item.id, "AMS", "HKG", "2026-11-02").unwrap();
+        let kept = store.upsert_trip(a, "Kept", None, None, None).unwrap();
+        store.keep_trip(a, "Kept").unwrap();
+        let waited_on = store.upsert_trip(a, "Waited on", None, None, None).unwrap();
+        let waiting = store
+            .insert_arrival(a, m, &NewArrival {
+                booking: true,
+                date: Some("2026-11-02".into()),
+                summary: "waiting".into(),
+                trip_id: Some(waited_on.id),
+                ..Default::default()
+            })
+            .unwrap();
+        // A chat's own draft is the thread sweep's business, not this one.
+        let chat = store.start_conversation(a, "direct").unwrap();
+        let theirs = store.upsert_trip(a, "A chat draft", None, None, Some(chat)).unwrap();
+        let strangers = store.upsert_trip(b, "Somebody else's", None, None, None).unwrap();
+        // Every one of them is seconds old, and the grace spares a draft
+        // that new — a mail being placed is making one right now. Backdated
+        // past it, so what is under test is the rest of the rule.
+        for trip in [empty.id, with_item.id, kept.id, waited_on.id, theirs.id, strangers.id] {
+            store.age_trip(trip).unwrap();
+        }
+
+        assert_eq!(store.sweep_empty_drafts(a).unwrap(), 1);
+        assert_eq!(store.trip_by_id(a, empty.id).unwrap(), None);
+        for still_there in [with_item.id, kept.id, waited_on.id, theirs.id] {
+            assert!(store.trip_by_id(a, still_there).unwrap().is_some(), "trip {still_there} went");
+        }
+        assert!(store.trip_by_id(b, strangers.id).unwrap().is_some(), "not theirs to collect");
+        assert_eq!(store.sweep_empty_drafts(a).unwrap(), 0, "nothing left to collect");
+        // Once that booking is decided — added to some other trip — its
+        // draft has nothing left waiting on it, and the arrival stops
+        // naming a trip that is gone rather than pointing at nothing.
+        assert!(store.decide_arrival(waiting, a, "added", None).unwrap());
+        assert_eq!(store.sweep_empty_drafts(a).unwrap(), 1);
+        assert_eq!(store.trip_by_id(a, waited_on.id).unwrap(), None);
+        assert_eq!(store.arrival_of(waiting, a).unwrap().unwrap().trip_id, None, "no dangling trip");
+        // A draft made a moment ago is spared however empty it looks: a
+        // mail being placed right now has one in exactly that state.
+        let fresh = store.upsert_trip(a, "Just made", None, None, None).unwrap();
+        assert_eq!(store.sweep_empty_drafts(a).unwrap(), 0, "the grace spares a new draft");
+        store.age_trip(fresh.id).unwrap();
+        assert_eq!(store.sweep_empty_drafts(a).unwrap(), 1, "and takes it once it is stale");
+        // The account-less pass the hourly maintenance runs reaches the
+        // drafts already sitting in somebody's list.
+        assert_eq!(store.sweep_all_empty_drafts().unwrap(), 1);
+        assert_eq!(store.trip_by_id(b, strangers.id).unwrap(), None);
     }
 
     #[test]

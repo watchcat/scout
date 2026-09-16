@@ -343,9 +343,34 @@ export function tripLoadIsCurrent(request, current, choicePending) {
 }
 
 export function savedFareQualifier(source) {
-  return String(source).toLowerCase() === 'ignav'
+  const from = String(source).toLowerCase()
+  // A fare off a forwarded confirmation is not a quote that may have
+  // moved since: the preamble defines it as the total actually paid, and
+  // "when saved" would hedge a number there is nothing tentative about.
+  if (from === 'email') return { prefix: '', note: 'paid' }
+  return from === 'ignav'
     ? { prefix: 'from ', note: 'estimate when saved' }
     : { prefix: '', note: 'when saved' }
+}
+
+// The mark a booked item carries: the confirmation code where there is
+// one, and otherwise the fact of it. One helper because a flight and
+// everything else say it the same way, and a card that said it two ways
+// would read as two different states.
+export function bookedMark(item) {
+  return item.confirmation_code ? `booked · ${item.confirmation_code}` : 'booked'
+}
+
+// What a flight card says where its options would be when it has none.
+//
+// A booked leg with no option is a ticket the reader holds whose flight
+// the confirmation did not name — offering to search that route reads as
+// though the booking never arrived, which is the complaint this answers.
+// An unbooked leg is a route waiting for a search, and says so.
+export function noFlightLine(item) {
+  return item.booked
+    ? 'Booked. The confirmation did not say which flight.'
+    : 'No flight saved yet. Ask Scout in chat to search this route.'
 }
 
 export function tripPdfFilename(name) {
@@ -1202,7 +1227,7 @@ function start() {
     )
     if (item.place) about.append(node('p', 'item-place', item.place))
     if (item.booked) {
-      about.append(node('span', 'item-booked', item.confirmation_code ? `booked · ${item.confirmation_code}` : 'booked'))
+      about.append(node('span', 'item-booked', bookedMark(item)))
     }
     const actions = node('div', 'segment-head-actions')
     actions.append(node('time', 'segment-date', itemDateLabel(item)))
@@ -1228,6 +1253,12 @@ function start() {
       node('span', 'route-arrow', '→'),
       document.createTextNode(segment.destination),
     )
+    // The same mark a stay or an activity carries, for the same reason: a
+    // leg bought by forwarding a confirmation has a code on it, and the
+    // card said nothing about either.
+    if (segment.booked) {
+      route.append(node('span', 'item-booked', bookedMark(segment)))
+    }
     const actions = node('div', 'segment-head-actions')
     actions.append(node('time', 'segment-date', dateLabel(segment.date)))
     const removeSlot = node('span', 'segment-remove')
@@ -1237,7 +1268,7 @@ function start() {
     card.append(head)
 
     if (!segment.candidates.length) {
-      card.append(node('p', 'no-options', 'No flight saved yet. Ask Scout in chat to search this route.'))
+      card.append(node('p', 'no-options', noFlightLine(segment)))
       return card
     }
     const options = node('div', 'option-list')

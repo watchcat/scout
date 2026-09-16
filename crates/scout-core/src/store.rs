@@ -9602,6 +9602,19 @@ CREATE TABLE messages (
         // first stays first so a forward keeps going where it went.
         store.link_identity(b, "email", "sasha@work.example").unwrap();
         assert_eq!(store.emails_of(b).unwrap(), ["sasha@example.com", "sasha@work.example"]);
+        // A third, linked last and sorting first by address: only the
+        // time can put it where it belongs, so the order is the order
+        // they were linked in and not the alphabet's. The address the
+        // account has always been forwarded at stays the destination.
+        store.link_identity(b, "email", "a.later@example.com").unwrap();
+        // Aged by hand rather than by the clock: `current_timestamp` is
+        // the transaction's, and three links in one millisecond could
+        // tie and leave the alphabet deciding after all.
+        store
+            .conn()
+            .execute("UPDATE identities SET created_at = created_at + INTERVAL 1 HOUR WHERE external_id = ?", params!["a.later@example.com"])
+            .unwrap();
+        assert_eq!(store.emails_of(b).unwrap(), ["sasha@example.com", "sasha@work.example", "a.later@example.com"]);
     }
 
     #[test]

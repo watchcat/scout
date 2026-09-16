@@ -488,12 +488,20 @@ pub fn comparison_notes(
         // A missing comparison must never read as a verdict either way —
         // that silence is exactly what would cost somebody money, whichever
         // side turns out to be the one that is actually missing.
-        (Some(_), None) => notes.push(
+        //
+        // Gated on the segment count for the reason the connection warning
+        // above is: with one segment left to buy there is no comparison to
+        // miss, because a single ticket for one leg is that same leg's
+        // ticket, and the multi-city search is deliberately never made.
+        // Announcing a failure nobody attempted costs the rest of the
+        // output its credibility as surely as missing a real one.
+        (Some(_), None) if segment_count >= 2 => notes.push(
             "the single-ticket comparison could not be made, so nothing here says whether \
              booking the whole trip on one ticket would be better — this is a missing \
              answer, not an argument for separate bookings"
                 .to_string(),
         ),
+        (Some(_), None) => {}
         (None, Some(_)) => notes.push(
             "the separate-booking total could not be given, so nothing here says whether \
              booking each segment apart would be better — this is a missing answer, not an \
@@ -3055,6 +3063,23 @@ mod tests {
     }
 
     #[test]
+    fn a_single_segment_trip_is_not_told_a_comparison_it_never_needed_is_missing() {
+        // Reachable now that booked legs are left out of the shopping: a
+        // trip with one leg still to buy skips the multi-city search,
+        // because a single ticket for one leg is that same ticket. The
+        // reply then said "the single-ticket comparison could not be made"
+        // — a failure announced where nothing was attempted and nothing
+        // was owed. Same reasoning that already gates the sentence above.
+        let notes = comparison_notes(1, Some((640.0, "EUR")), None);
+        assert!(notes.is_empty(), "nothing is missing from a one-leg trip: {notes:?}");
+
+        // With two legs there really is a comparison to make, and its
+        // absence really is a missing answer.
+        let notes = comparison_notes(2, Some((640.0, "EUR")), None).join(" ");
+        assert!(notes.contains("could not be made"), "got: {notes}");
+    }
+
+    #[test]
     fn every_combination_of_the_two_totals_reads_unambiguously() {
         // Both present, same currency: a stated comparison.
         let both = comparison_notes(2, Some((100.0, "EUR")), Some((142.0, "EUR"))).join(" ");
@@ -3309,11 +3334,18 @@ mod tests {
         assert_eq!(chosen.price_now_currency.as_deref(), Some("EUR"), "the currency the fresh price is actually in");
         assert_eq!(chosen.moved, Some(40.0));
         assert!(chosen.still_offered);
-        // One segment, so there is no single-ticket comparison to make, and
-        // the output has to say so rather than let the separate total stand
-        // alone.
+        // One segment, so no single-ticket comparison was attempted: a
+        // single ticket for one leg is that leg's ticket. This used to
+        // report the comparison as one that "could not be made", which is
+        // a failure announced where nothing was tried and nothing is
+        // owed — the same thing the connection-risk warning beside it is
+        // already gated against claiming on a one-leg trip.
         assert!(out.one_ticket_total.is_none());
-        assert!(out.notes.iter().any(|n| n.contains("could not")), "notes: {:?}", out.notes);
+        assert!(
+            !out.notes.iter().any(|n| n.contains("could not")),
+            "notes: {:?}",
+            out.notes,
+        );
 
         // Priced means priced: the trip records it, and the parked price is
         // left exactly as it was.
@@ -3370,7 +3402,7 @@ mod tests {
             server.uri(),
         );
         let out = FinaliseTripTool {
-            store,
+            store: store.clone(),
             account_id: 7,
             duffel: Some(duffel),
             ignav: None,
@@ -3386,12 +3418,129 @@ mod tests {
             vec![FixedCost { position: 1, title: "AMS→NRT on 2026-09-03".into(), price: 612.40, currency: "EUR".into() }],
             "what the trip cost is what the traveller paid",
         );
-        let notes = out.notes.join(" ");
-        assert!(notes.contains("already booked"), "got: {notes}");
-        // Nothing here failed, so nothing here may read as a failure: the
-        // empty search has no missing total and no missing comparison.
-        assert!(!notes.contains("no total"), "got: {notes}");
-        assert!(!notes.contains("could not"), "got: {notes}");
+        // The whole note set, not a substring of it. Nothing here failed,
+        // so nothing here may read as a failure — and the note that would
+        // have appeared is `separate_total`'s "no segment states a
+        // currency", which says neither "no total" nor "could not" and so
+        // slipped past every looser assertion.
+        assert_eq!(
+            out.notes,
+            vec![
+                "every flight on this trip is already booked, so nothing was searched and there \
+                 is no live total to give: AMS→NRT on 2026-09-03 is in fixed_costs, at the price \
+                 paid where the confirmation stated one"
+                    .to_string(),
+            ],
+        );
+
+        // And with no Duffel at all: "no single-ticket price could be
+        // fetched" is about a comparison this trip never needed, so a
+        // Duffel-less deployment must not report one as missing either.
+        let out = FinaliseTripTool {
+            store,
+            account_id: 7,
+            duffel: None,
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap();
+        assert!(
+            !out.notes.iter().any(|n| n.contains("Duffel")),
+            "notes: {:?}",
+            out.notes,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_part_booked_trip_does_not_present_the_shopped_leg_as_the_whole_total() {
+        // One leg bought, one still to buy. The flight totals cover the
+        // second only, and a total over half a trip presented as the trip's
+        // total is the same lie as one that quietly leaves a hotel out —
+        // so the reply has to say which legs it is for, in words, beside
+        // the number.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(duffel_offer("640.00", &["TP676"])))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(
+            99,
+            vec![
+                one_way("a", "AMS", "LIS", "2026-09-03", &["TP675"]),
+                one_way("b", "LIS", "AMS", "2026-09-07", &["TP676"]),
+            ],
+            Instant::now(),
+        );
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 };
+        for (origin, destination, date) in
+            [("AMS", "LIS", "2026-09-03"), ("LIS", "AMS", "2026-09-07")]
+        {
+            add_seg
+                .call(AddSegmentArgs {
+                    trip: "Lisbon".into(),
+                    origin: origin.into(),
+                    destination: destination.into(),
+                    departure_date: date.into(),
+                    adults: None,
+                    cabin_class: None,
+                })
+                .await
+                .unwrap();
+        }
+        let add_option = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 };
+        for (position, offer) in [(1, "a"), (2, "b")] {
+            add_option
+                .call(AddOptionArgs { trip: "Lisbon".into(), position, offer_id: offer.into(), decided: None })
+                .await
+                .unwrap();
+        }
+        let trip = store.find_trip(7, "Lisbon").unwrap().unwrap();
+        store
+            .book_item(trip.items[0].id, Some("TP9911"), Some(188.50), Some("EUR"), None)
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store,
+            account_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Lisbon".into() })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out.segments.iter().map(|s| s.position).collect::<Vec<_>>(),
+            vec![2],
+            "the bought leg is not shopped again",
+        );
+        assert_eq!(out.separate_total, Some(640.0), "the live total is the one leg it covers");
+        assert_eq!(
+            out.fixed_costs,
+            vec![FixedCost { position: 1, title: "AMS→LIS on 2026-09-03".into(), price: 188.50, currency: "EUR".into() }],
+        );
+        assert!(
+            out.notes.contains(
+                &"the flight totals here cover only the legs still to buy: AMS→LIS on 2026-09-03 \
+                  is already booked, and what it cost is in fixed_costs, at the price paid where \
+                  the confirmation stated one"
+                    .to_string()
+            ),
+            "the reply must say what the total is not: {:?}",
+            out.notes,
+        );
     }
 
     #[tokio::test]
@@ -4184,6 +4333,11 @@ mod tests {
         items[0].booked = true;
         items[2].booked = true;
         assert_eq!(ready_to_price(&items), Pricing::Booked);
+        // And it is not a refusal. The two views that carry one reason
+        // string read it through `refusal`, and a reason there is what
+        // makes the model ask for a decision nobody owes it — the mirror
+        // of the "ready to price" the page was showing.
+        assert_eq!(ready_to_price(&items).refusal(), None);
 
         // A booked leg is skipped whatever state its options are in, so a
         // confirmation that never named a flight cannot hold up a trip the

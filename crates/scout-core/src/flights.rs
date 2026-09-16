@@ -514,6 +514,16 @@ mod tests {
             let text = guidance(&[ran(tool, json!({}))], 0.0).join("\n");
             assert!(text.contains("not_ready"), "{tool}: {text}");
             assert!(text.contains("separate tickets"), "{tool}: {text}");
+            // A correction rather than decoration: the sentence before it
+            // enumerates stays, activities and transport as what
+            // fixed_costs holds, which stopped being the whole list when a
+            // bought flight started counting there. Without this the model
+            // is told the fares it can see are all still to shop.
+            assert!(
+                text.contains("already holds a ticket for is one of those fixed costs"),
+                "{tool}: {text}",
+            );
+            assert!(text.contains("never offer to re-shop it"), "{tool}: {text}");
         }
     }
 

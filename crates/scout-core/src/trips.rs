@@ -8,6 +8,29 @@ use crate::core::{blocking, Core};
 use crate::store::{CandidateChoice, ExpectedItem, NewCandidate, NewItem, TripChat};
 pub use crate::store::{Trip, TripCandidate, TripItem};
 
+/// Where a trip stands with pricing, as the page and the printed plan say
+/// it. One field naming one of three states rather than a pair of flags,
+/// because the states exclude each other: a trip cannot be both bought
+/// outright and waiting on a decision, and two booleans could claim it was.
+///
+/// This is a wire type — `chat.js` reads `state` and switches on it — so
+/// the three names here and the three branches there move together.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Readiness {
+    /// Every flight on this trip is a ticket the traveller already holds.
+    /// Nothing to shop and nothing to decide.
+    Booked,
+    /// The legs that pricing would actually cover, named as
+    /// `ready_to_price`'s own refusals name them. A trip where nothing is
+    /// booked lists all of its flights; both readers compare that against
+    /// the trip to know whether "the whole trip" is what is being priced.
+    Ready { legs: Vec<String> },
+    /// Why this trip cannot be priced yet, in the words the flight agent
+    /// would refuse in.
+    NotReady { reason: String },
+}
+
 /// A trip plus the same readiness and connection warnings the flight agent
 /// sees. One representation keeps chat and the visual client from disagreeing
 /// about whether a plan can be priced safely.
@@ -15,7 +38,7 @@ pub use crate::store::{Trip, TripCandidate, TripItem};
 pub struct Plan {
     #[serde(flatten)]
     pub trip: Trip,
-    pub not_ready: Option<String>,
+    pub readiness: Readiness,
     pub notes: Vec<String>,
     /// The chat this trip belongs to. `None` is orphaned — an ordinary
     /// state, reached by outliving the chat that made it.
@@ -24,13 +47,29 @@ pub struct Plan {
 
 impl Plan {
     pub(crate) fn from_trip(trip: Trip, chat: Option<TripChat>) -> Self {
-        let not_ready = crate::tools::trips::ready_to_price(&trip.items)
-            .err()
-            .or_else(|| crate::tools::trips::dates_run_forwards(&trip.items).err());
+        let pricing = crate::tools::trips::ready_to_price(&trip.items);
+        let dates = crate::tools::trips::dates_run_forwards(&trip.items);
+        // Dates that run backwards block a booked trip as well as a
+        // shoppable one. Only reachable by a caller that bypassed the store
+        // — every write reorders items by date — but leaving it out would
+        // mean the page called a trip finished that `finalise_trip` still
+        // refuses, and disagreeing with the tool is the older bug here.
+        let readiness = match (pricing, dates) {
+            (crate::tools::trips::Pricing::NotReady(reason), _) | (_, Err(reason)) => {
+                Readiness::NotReady { reason }
+            }
+            (crate::tools::trips::Pricing::Booked, Ok(())) => Readiness::Booked,
+            (crate::tools::trips::Pricing::Ready(legs), Ok(())) => Readiness::Ready {
+                legs: legs
+                    .iter()
+                    .map(|(segment, _)| format!("segment {} ({})", segment.position, segment.route()))
+                    .collect(),
+            },
+        };
         let notes = crate::tools::trips::itinerary_notes(&trip.items);
         Self {
             trip,
-            not_ready,
+            readiness,
             notes,
             chat,
         }
@@ -492,18 +531,47 @@ mod tests {
             .unwrap();
 
         let before = list(&core, account_id).await.unwrap();
-        assert!(before[0]
-            .not_ready
-            .as_deref()
-            .unwrap()
-            .contains("2 options"));
+        let Readiness::NotReady { reason } = &before[0].readiness else {
+            panic!("two options and none chosen is a question: {:?}", before[0].readiness);
+        };
+        assert!(reason.contains("2 options"), "got: {reason}");
 
         let Selection::Chosen(after) = choose(&core, account_id, "october", 1, 2).await.unwrap()
         else {
             panic!("a stored option was not chosen");
         };
         assert!(after.trip.items[0].candidates[1].chosen);
-        assert!(after.not_ready.is_none());
+        assert_eq!(
+            after.readiness,
+            Readiness::Ready { legs: vec!["segment 1 (AMS→LIS)".to_string()] },
+            "the one leg on this trip is the one being priced",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trip_whose_flights_are_all_bought_is_neither_ready_to_price_nor_undecided() {
+        // What the owner hit: every leg ticketed and imported, and the trip
+        // still offering to go and find fares. "Needs a decision" would be
+        // just as wrong — there is no decision left to make.
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+        let store = core.store();
+        let trip = store.find_trip(account_id, "October").unwrap().unwrap();
+        store
+            .choose_candidate_for_account(account_id, "October", 1, 2)
+            .unwrap();
+        store
+            .book_item(trip.items[0].id, Some("KL7788"), Some(612.40), Some("EUR"), None)
+            .unwrap();
+
+        let plan = find(&core, account_id, "October").await.unwrap().unwrap();
+        assert_eq!(plan.readiness, Readiness::Booked);
+        // The state has to survive serialization or the page cannot draw
+        // the difference, and a bought trip reads as a shoppable one again.
+        assert_eq!(
+            serde_json::to_value(&plan).unwrap()["readiness"],
+            serde_json::json!({"state": "booked"}),
+        );
     }
 
     #[tokio::test]

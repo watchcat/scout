@@ -8,7 +8,7 @@ import {
   tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
-  pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem,
+  pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   CONFIRM_ARM_MS,
 } from './chat.js'
 
@@ -344,6 +344,45 @@ test('Ignav saved fares stay visibly approximate', () => {
 test('a booked item is marked the same way whatever kind it is', () => {
   assert.equal(bookedMark({ confirmation_code: 'KL7788' }), 'booked \u00b7 KL7788')
   assert.equal(bookedMark({ confirmation_code: null }), 'booked')
+})
+
+test('a trip with every flight bought is called booked, not ready to price', () => {
+  // The bug from production: a fully ticketed AMS→HKG→AMS trip told its
+  // owner it was ready to price, which reads as an invitation to go and
+  // shop fares for seats they were already holding. "Needs a decision"
+  // would be the other wrong answer — there is no decision left.
+  const trip = { readiness: { state: 'booked' }, items: [] }
+  const alert = readinessAlert(trip)
+  assert.equal(alert.tone, 'ready')
+  assert.equal(alert.headline, 'Booked.')
+  assert.doesNotMatch(alert.text, /price|decision/i)
+})
+
+test('the legs being priced are named when the rest of the trip is already bought', () => {
+  const flights = (count) => Array.from({ length: count }, () => ({ kind: 'flight' }))
+  // Nothing booked: every segment is being priced, so the copy that has
+  // always said so still fits.
+  assert.equal(
+    readinessAlert({ readiness: { state: 'ready', legs: ['segment 1 (AMS→HKG)', 'segment 2 (HKG→AMS)'] }, items: flights(2) }).text,
+    'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.',
+  )
+  // One of three bought: naming the other two is the difference between
+  // pricing a trip and pricing what is left of it.
+  const part = readinessAlert({ readiness: { state: 'ready', legs: ['segment 2 (HKG→BKK)'] }, items: flights(3) })
+  assert.equal(part.headline, 'Ready to price.')
+  assert.match(part.text, /segment 2 \(HKG→BKK\)/)
+  assert.match(part.text, /already booked/)
+})
+
+test('a readiness this page cannot read says nothing rather than something false', () => {
+  // An older server, or a tab open across a deploy. Silence is the only
+  // answer that cannot be wrong about whether a trip was bought.
+  assert.equal(readinessAlert({ items: [] }), null)
+  assert.equal(readinessAlert({ readiness: { state: 'something-new' }, items: [] }), null)
+  const undecided = readinessAlert({ readiness: { state: 'not_ready', reason: 'segment 1 still has 2 options' }, items: [] })
+  assert.deepEqual(undecided, {
+    tone: 'alert', headline: 'Needs a decision.', text: 'segment 1 still has 2 options',
+  })
 })
 
 test('a flight card with no option says which of the two silences it is', () => {

@@ -319,6 +319,45 @@ function tripFlights(trip) {
   return (trip?.items ?? []).filter((item) => item.kind === 'flight')
 }
 
+// The alert above the timeline, from the three states `Readiness` can be
+// in — or `null` when this page cannot read the one it was sent, which is
+// a tab open across a deploy. Saying nothing is the only answer that
+// cannot be wrong about whether a trip has been bought.
+//
+// "Ready to price" on a trip whose flights are all already ticketed is the
+// bug this answers: it reads as an invitation to go and shop seats the
+// reader is holding. "Needs a decision" would be the opposite mistake,
+// asking for a decision nobody owes. So booked is its own state, and the
+// wording of the other two is unchanged where it still fits.
+export function readinessAlert(trip) {
+  const readiness = trip?.readiness
+  if (readiness?.state === 'booked') {
+    return {
+      tone: 'ready',
+      headline: 'Booked.',
+      text: 'Every flight on this trip is a ticket you already hold. Nothing here is waiting on you.',
+    }
+  }
+  if (readiness?.state === 'ready') {
+    const legs = readiness.legs ?? []
+    // Comparing the named legs against the trip's own flights is what
+    // tells "price this trip" from "price what is left of it". The server
+    // names the legs; only the page knows how many flights are drawn.
+    const rest = tripFlights(trip).length - legs.length
+    return {
+      tone: 'ready',
+      headline: 'Ready to price.',
+      text: rest > 0
+        ? `${legs.join(', ')} ${legs.length === 1 ? 'is' : 'are'} not booked yet. Ask Scout in chat to price ${legs.length === 1 ? 'it' : 'them'}; the rest of this trip is already booked.`
+        : 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.',
+    }
+  }
+  if (readiness?.state === 'not_ready') {
+    return { tone: 'alert', headline: 'Needs a decision.', text: readiness.reason ?? '' }
+  }
+  return null
+}
+
 export function tripTimelinePoints(trip) {
   const flights = tripFlights(trip)
   if (!flights.length) return []
@@ -1393,12 +1432,15 @@ function start() {
     })
     if (trip.items.length) tripDetail.append(renderOverview(trip))
 
-    const readiness = node('div', trip.not_ready ? 'trip-alert' : 'trip-alert ready')
-    readiness.append(
-      node('strong', '', trip.not_ready ? 'Needs a decision.' : 'Ready to price.'),
-      document.createTextNode(` ${trip.not_ready ?? 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.'}`),
-    )
-    tripDetail.append(readiness)
+    const alert = readinessAlert(trip)
+    if (alert) {
+      const readiness = node('div', alert.tone === 'ready' ? 'trip-alert ready' : 'trip-alert')
+      readiness.append(
+        node('strong', '', alert.headline),
+        document.createTextNode(` ${alert.text}`),
+      )
+      tripDetail.append(readiness)
+    }
     for (const note of trip.notes ?? []) {
       const alert = node('div', 'trip-alert')
       alert.append(node('strong', '', 'Connection check.'), document.createTextNode(` ${note}`))

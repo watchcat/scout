@@ -5,7 +5,7 @@
 //! self-contained HTML page that Chromium can print without network access.
 
 use chrono::{NaiveDate, NaiveDateTime, Utc};
-use scout_core::trips::{Plan, TripCandidate, TripItem};
+use scout_core::trips::{Plan, Readiness, TripCandidate, TripItem};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -493,6 +493,43 @@ fn saved_total(plan: &Plan) -> Option<String> {
     })
 }
 
+/// The notice at the top of the plan, as `(headline, detail, class)`. The
+/// paper half of `chat.js::readinessAlert`, and it has to agree with it in
+/// all three states: a hand-off copy that tells its reader to go and shop
+/// fares for seats they are already holding is the complaint this answers,
+/// and two surfaces describing one trip differently is worse than either
+/// wording alone.
+///
+/// `flights` is how many flights the plan draws, which is what tells
+/// "pricing this trip" from "pricing what is left of it" — `legs` names
+/// only the ones still to buy.
+fn readiness_notice(readiness: &Readiness, flights: usize) -> (&'static str, String, &'static str) {
+    match readiness {
+        Readiness::Booked => (
+            "Booked.",
+            "Every flight on this trip is a ticket the traveller already holds.".to_string(),
+            "ok",
+        ),
+        Readiness::Ready { legs } if legs.len() < flights => (
+            "Ready to price.",
+            format!(
+                "{} {} not booked yet; the rest of this trip is already booked. Refresh live \
+                 fares with Scout before booking.",
+                legs.join(", "),
+                if legs.len() == 1 { "is" } else { "are" },
+            ),
+            "ok",
+        ),
+        Readiness::Ready { .. } => (
+            "Ready to price.",
+            "Every segment has a flight selected. Refresh live fares with Scout before booking."
+                .to_string(),
+            "ok",
+        ),
+        Readiness::NotReady { reason } => ("Needs a decision.", reason.clone(), ""),
+    }
+}
+
 fn connection(before: &TripItem, after: &TripItem) -> (String, &'static str) {
     let Some(arrival) = selected(before) else {
         return (
@@ -619,19 +656,11 @@ pub fn html(plan: &Plan) -> String {
     }
     out.push_str("</div></header>");
 
-    let readiness = plan.not_ready.as_deref().unwrap_or(
-        "Every segment has a flight selected. Refresh live fares with Scout before booking.",
-    );
+    let (headline, detail, tone) = readiness_notice(&plan.readiness, flights.len());
     write!(
         out,
-        "<div class=\"notice {}\"><strong>{}</strong> {}</div>",
-        if plan.not_ready.is_some() { "" } else { "ok" },
-        if plan.not_ready.is_some() {
-            "Needs a decision."
-        } else {
-            "Ready to price."
-        },
-        escape(readiness)
+        "<div class=\"notice {tone}\"><strong>{headline}</strong> {}</div>",
+        escape(&detail)
     )
     .unwrap();
     for note in &plan.notes {
@@ -850,7 +879,9 @@ mod tests {
                 // a trip in their list before they can ask for its PDF.
                 kept: true,
             },
-            not_ready: None,
+            readiness: Readiness::Ready {
+                legs: vec!["segment 1 (AMS→LIS)".to_string(), "segment 3 (LIS→FCO)".to_string()],
+            },
             notes: vec!["Separate tickets need extra care.".to_string()],
             chat: None,
         }
@@ -927,6 +958,33 @@ mod tests {
         let mut unbooked = plan();
         unbooked.trip.items[0].candidates.clear();
         assert!(html(&unbooked).contains("Ask Scout in chat to search this route."));
+    }
+
+    #[test]
+    fn the_printed_plan_says_the_same_three_things_about_pricing_the_page_does() {
+        // The page and the paper describing one trip differently is worse
+        // than either wording alone, and a hand-off copy telling its reader
+        // to go and shop flights they have already bought is the complaint
+        // this whole change comes from.
+        let mut booked = plan();
+        booked.readiness = Readiness::Booked;
+        let page = html(&booked);
+        assert!(page.contains("Booked."), "{page}");
+        assert!(!page.contains("Ready to price."), "{page}");
+        assert!(!page.contains("Needs a decision."), "{page}");
+
+        let mut part = plan();
+        part.readiness = Readiness::Ready { legs: vec!["segment 3 (LIS→FCO)".to_string()] };
+        let page = html(&part);
+        assert!(page.contains("Ready to price."), "{page}");
+        assert!(page.contains("segment 3 (LIS→FCO)"), "{page}");
+        assert!(page.contains("already booked"), "the bought leg is not in that total: {page}");
+
+        let mut undecided = plan();
+        undecided.readiness = Readiness::NotReady { reason: "segment 1 has no flight".to_string() };
+        let page = html(&undecided);
+        assert!(page.contains("Needs a decision."), "{page}");
+        assert!(page.contains("segment 1 has no flight"), "{page}");
     }
 
     #[test]

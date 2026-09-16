@@ -380,7 +380,9 @@ frame-src https://oauth.telegram.org; \
 img-src 'self' data:; \
 style-src 'self' 'unsafe-inline'";
 
-/// Puts the five headers on every response the signed-in half makes.
+/// Puts the five headers on every response the signed-in half makes —
+/// four of them unconditionally, and the policy only where the handler did
+/// not already set one.
 ///
 /// A layer rather than five tuples repeated in nine handlers, because the
 /// handler that forgot them would be the one that mattered.
@@ -391,7 +393,22 @@ async fn security_headers(
     use axum::http::HeaderValue;
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    // The site policy, unless the handler already chose one — the only
+    // header here that defers.
+    //
+    // A layer runs after the handler it wraps, so inserting unconditionally
+    // means the layer always wins, and for a policy that is the wrong way
+    // round: the layer knows the half it is mounted on, the handler knows
+    // what it is about to send. `/chat/attachments` serves a file that came
+    // in from a stranger and answers `default-src 'none'; sandbox`, which
+    // is stricter than this one can be — `CSP` allows `script-src 'self'`
+    // because our own pages need it, and applying that to somebody else's
+    // file would hand it the loosest policy on the site. Absent a policy,
+    // this one still goes on: the layer exists so that a handler which said
+    // nothing is still covered, and saying nothing stays the default.
+    if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    }
     // Sign-in URLs carry tokens, so the path must never leave this site.
     // `strict-origin` sends `https://goodscout.fyi/` and never the path or
     // query, which keeps the token out of other people's logs just as

@@ -1582,14 +1582,28 @@ function start() {
     }
   }
 
-  // Plain anchors: the route sets `Content-Disposition`, and a click on
-  // one is a download with nothing for the page to do.
+  // Plain anchors: the route sets `Content-Disposition` and that is what
+  // decides whether a click renders the file or saves it. Nothing for the
+  // page to do either way.
   function attachmentLinks(attachments) {
     const list = node('p', 'attachment-links')
     for (const file of attachments) {
       const link = node('a', '', file.filename || `attachment ${file.id}`)
       link.href = `/chat/attachments/${encodeURIComponent(file.id)}`
-      link.setAttribute('download', '')
+      // One behaviour here, and the server decides what it means: no
+      // `download`, so a ticket that came back `inline` — a PDF, an image,
+      // plain text — opens in the new tab, and a type the browser cannot
+      // render comes back `attachment` and downloads instead. Either way
+      // the trip stays on screen behind it, which is the point of the new
+      // tab rather than this one. Chrome and Firefox close the tab they
+      // opened once the download starts; that is their behaviour and not a
+      // guarantee, so elsewhere the reader may be left with a blank tab.
+      //
+      // `noopener noreferrer` because what opens is a stranger's file: it
+      // must not be able to reach back through `window.opener`, and the
+      // request for it must not carry the page it was opened from.
+      link.setAttribute('target', '_blank')
+      link.setAttribute('rel', 'noopener noreferrer')
       list.append(link)
     }
     return list

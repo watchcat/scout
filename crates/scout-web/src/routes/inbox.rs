@@ -12,9 +12,9 @@ use crate::AuthState;
 use axum::extract::{Json, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
-use scout_core::inbox::{self, AddTarget, Claim, Outcome};
+use scout_core::inbox::{self, AddTarget, Claim, MailGone, Outcome};
 
 pub fn routes(auth: AuthState) -> Router {
     Router::new()
@@ -24,6 +24,7 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/arrivals/{id}/add", post(add))
         .route("/chat/arrivals/{id}/ignore", post(ignore))
         .route("/chat/attachments/{id}", get(attachment))
+        .route("/chat/mail/{id}", delete(delete_mail))
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             super::only_from_our_own_pages,
@@ -49,6 +50,8 @@ fn refused(status: StatusCode, reason: &str) -> Response {
 const TAKEN: &str = "that one is taken";
 const NOT_YOURS: &str = "not yours or not there";
 const DECIDED: &str = "already decided";
+const STILL_WAITING: &str = "a booking from this email is still waiting";
+const STILL_READING: &str = "Scout is still reading this email";
 
 /// The inbox as the tab draws it: the address, what is waiting, and the
 /// mail that was not a booking.
@@ -231,6 +234,39 @@ async fn ignore(
         Ok(Outcome::NotPending) => refused(StatusCode::CONFLICT, DECIDED),
         Err(e) => {
             tracing::error!(error = %e, account_id, arrival_id, "could not ignore an arrival");
+            sorry()
+        }
+    }
+}
+
+/// Forgets one Other-mail row now, rather than in the thirty days the
+/// retention sweep would take.
+///
+/// `{}` on success, for the reason `ignore` gives. Both 409s name what is
+/// in the way — a booking waiting on a decision, or a read still running —
+/// because both are refusals the reader can act on by waiting or deciding,
+/// unlike `DECIDED`, which is about the row they just pressed.
+async fn delete_mail(
+    State(auth): State<AuthState>,
+    headers: HeaderMap,
+    Path(mail_id): Path<i64>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return refused(StatusCode::BAD_REQUEST, "reload the page");
+    }
+    match inbox::delete_mail(&auth.core, account_id, mail_id).await {
+        Ok(MailGone::Gone) => Json(serde_json::json!({})).into_response(),
+        // A stranger's mail, one that never was, and one a second press
+        // already took are the same answer, as in `add` and `ignore`.
+        Ok(MailGone::NotFound) => refused(StatusCode::NOT_FOUND, NOT_YOURS),
+        Ok(MailGone::Waiting) => refused(StatusCode::CONFLICT, STILL_WAITING),
+        Ok(MailGone::Unsettled) => refused(StatusCode::CONFLICT, STILL_READING),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, mail_id, "could not delete a mail");
             sorry()
         }
     }
@@ -580,6 +616,109 @@ mod tests {
         let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{museum}/ignore"), &session, Some(&csrf), r#"{}"#).await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
         assert_eq!(body_of(res).await, r#"{"ok":false,"reason":"already decided"}"#);
+    }
+
+    /// A bodyless `DELETE` carrying the session cookie and — when given —
+    /// the CSRF header. Its own helper because every other write on this
+    /// router posts JSON: this route's whole request is its path.
+    async fn delete_with_cookie(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+        csrf: Option<&str>,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let mut request = Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("origin", "https://example.com")
+            .header("cookie", format!("{}={session}", crate::session::COOKIE));
+        if let Some(csrf) = csrf {
+            request = request.header("x-scout-csrf", csrf);
+        }
+        app.clone().oneshot(request.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// The mail behind the one pending booking, as the page would read it.
+    async fn pending_mail_id(app: &axum::Router, session: &str) -> i64 {
+        let res = get_with_cookie(app, "/chat/inbox", session).await;
+        let v: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        v["pending"][0]["mail_id"].as_i64().expect("a booking is waiting")
+    }
+
+    #[tokio::test]
+    async fn other_mail_is_deleted_by_its_owner_and_a_waiting_booking_is_refused() {
+        let (app, core, _dir) = inbox_app().await;
+        let a = admitted(&core, "111").await;
+        let plan = scout_core::trips::seed_trip_for_tests(&core, a, "Lisbon").await.unwrap();
+        let arrival = scout_core::inbox::seed_arrival_for_tests(&core, a, "stay", "Hotel Alfama", "2026-10-12", Some(plan.trip.id)).await.unwrap();
+        let (session, csrf) = signed_in(a);
+        let mail = pending_mail_id(&app, &session).await;
+        // Still waiting: deleting the mail would take the row off the
+        // trip's timeline with nothing said about why.
+        let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, Some(&csrf)).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(body_of(res).await, r#"{"ok":false,"reason":"a booking from this email is still waiting"}"#);
+        // Decided, the same mail is an ordinary Other-mail row.
+        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{arrival}/ignore"), &session, Some(&csrf), r#"{}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, None).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "no CSRF header, no delete");
+        let b = admitted(&core, "777").await;
+        let (session_b, csrf_b) = signed_in(b);
+        let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session_b, Some(&csrf_b)).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "a stranger's mail is not there");
+        assert_eq!(body_of(res).await, r#"{"ok":false,"reason":"not yours or not there"}"#);
+        let res = get_with_cookie(&app, "/chat/inbox", &session).await;
+        let v: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(v["other"].as_array().unwrap().len(), 1, "nothing refused took anything with it");
+        let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, Some(&csrf)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_of(res).await, "{}");
+        let res = get_with_cookie(&app, "/chat/inbox", &session).await;
+        let v: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert!(v["other"].as_array().unwrap().is_empty(), "off the page");
+        // A second press from a tab that has not repainted yet.
+        let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, Some(&csrf)).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_mail_still_being_read_is_refused_until_the_worker_is_done() {
+        // No reading yet, so the pending-booking rule says nothing about
+        // it; deleting it would strand the row the worker is about to
+        // write against it.
+        let (app, core, _dir) = inbox_app().await;
+        let a = admitted(&core, "111").await;
+        let mail = scout_core::inbox::seed_unread_mail_for_tests(&core, a).await.unwrap();
+        let (session, csrf) = signed_in(a);
+        let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, Some(&csrf)).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(body_of(res).await, r#"{"ok":false,"reason":"Scout is still reading this email"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_that_joined_a_trip_is_still_downloadable_once_its_mail_is_deleted() {
+        let (app, core, _dir) = inbox_app().await;
+        let a = admitted(&core, "111").await;
+        let plan = scout_core::trips::seed_trip_for_tests(&core, a, "Lisbon").await.unwrap();
+        let arrival = scout_core::inbox::seed_arrival_for_tests(&core, a, "stay", "Hotel Alfama", "2026-10-12", Some(plan.trip.id)).await.unwrap();
+        let (session, csrf) = signed_in(a);
+        let mail = pending_mail_id(&app, &session).await;
+        let ticket = scout_core::inbox::seed_attachment_on_mail_for_tests(&core, mail, "ticket.pdf", "application/pdf", b"%PDF".to_vec()).await.unwrap();
+        // Add is what moves the file from the mail onto the trip's item.
+        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{arrival}/add"), &session, Some(&csrf), r#"{}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, Some(&csrf)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        // The mail it arrived with is gone and the ticket is still served:
+        // `attachment_owner` answers for it through the item now.
+        let res = get_with_cookie(&app, &format!("/chat/attachments/{ticket}"), &session).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers()["content-disposition"].to_str().unwrap().contains("ticket.pdf"));
+        assert_eq!(body_of(res).await, "%PDF");
     }
 
     #[tokio::test]

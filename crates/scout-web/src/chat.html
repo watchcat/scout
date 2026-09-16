@@ -505,13 +505,40 @@
     letter-spacing:.1em; text-transform:uppercase}
   .other-mail-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px}
   .other-mail-row{padding:9px 10px; border:1px solid var(--line); border-radius:10px; font-size:12px}
-  .other-mail-top{display:flex; justify-content:space-between; gap:8px}
+  /* Never wraps at rest. Flex breaks on max-content, and the sender block
+     stacks a name over an address, so a wrapping row would put its date and
+     × on a line of their own on ordinary rows — a control in two places
+     depending on the sender's name. The sender shrinks and wraps inside
+     itself instead (`min-width:0` below), and only the confirm, which is
+     genuinely too wide for one line here, is allowed to take the row. */
+  .other-mail-top{display:flex; justify-content:space-between; gap:8px; flex-wrap:nowrap}
+  .other-mail-row.confirming .other-mail-top{flex-wrap:wrap}
+  /* The date and the × as one group at the right: when the confirm swaps in
+     for the × and the pair no longer fits, the whole group wraps together
+     rather than the confirm splitting off from the row it belongs to.
+     `margin-left:auto` keeps it right-aligned on whichever line it lands. */
+  .other-mail-end{flex:none; display:flex; align-items:center; gap:8px; margin-left:auto}
+  /* `flex:none` is right for a date and a glyph and wrong for a sentence:
+     measured at 260px, an unshrinkable refusal ran 61px past the row's
+     edge. While the slot holds one it may shrink and wrap instead. */
+  .other-mail-row.confirming .other-mail-end{flex:0 1 auto; min-width:0}
   .other-mail-sender{color:var(--base2); font-weight:700; min-width:0; overflow-wrap:anywhere}
   .other-mail-address{display:block; color:var(--base01); font-weight:400; font-size:11px}
-  .other-mail-when{flex:none; color:var(--base01)}
   .other-mail-subject{margin:3px 0 0; color:var(--base1); overflow-wrap:anywhere}
   .other-mail-meta{margin:3px 0 0; color:var(--base01); font-size:11px}
   .other-mail-add{margin-top:7px}
+  /* `.segment-remove-button`'s look, trimmed to a glyph: the two destructive
+     controls on the page should read as the same control, and only the
+     padding a word needed is wrong for an ×. */
+  .other-mail-remove-button{padding:2px 7px; font-size:14px; line-height:1.2}
+  /* A refusal, in the row it was pressed in rather than the toast pane —
+     which is the other column, and below the fold on a phone. Same yellow
+     as `.segment-remove-confirm`, because it stands in the same slot.
+     Not a flex row like the confirm beside it: the confirm holds three
+     short things that should stay on one line, this holds a sentence the
+     server wrote, which has to be free to wrap at the aside's width. */
+  .other-mail-problem{min-width:0; color:#d1c27e; font-size:11px; text-align:right}
+  .other-mail-problem .other-mail-remove-button{margin-left:6px; vertical-align:middle}
   /* The address line closes the aside. The form is one row — input,
      domain, Save — and its hint is a sentence under it in the same place
      whether it is the mirrored rule, the live check, or the server's no. */
@@ -588,6 +615,12 @@
     .pending-actions button, .pending-picker button, .other-mail-add,
     .handle-row button, .handle-cancel, .segment-remove-button,
     .trip-keep, .trip-download{min-height:42px; padding:10px 14px; font-size:13px}
+    /* Listed apart from the rule above, not inside it: a media query adds
+       no specificity, so this has to come after the desktop
+       `.other-mail-remove-button` to beat it on source order. A glyph needs
+       the width said as well as the height — the padding alone leaves it
+       38.6px against the 42px square the trip's own × keeps. */
+    .other-mail-remove-button{min-height:42px; min-width:42px; padding:10px; font-size:16px}
     .trip-delete-button{width:42px; height:42px; font-size:20px}
     .trip-overview{padding:15px 12px}
     .trip-point{min-width:64px; flex:1}

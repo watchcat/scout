@@ -661,6 +661,24 @@ pub enum LinkOutcome {
     Merged { account_id: i64 },
 }
 
+/// What asking for one mail to go now came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailGone {
+    /// Nobody's, or not this account's — one answer for both, so an id
+    /// tried against a stranger's mail learns nothing from the reply.
+    NotFound,
+    /// A booking off this mail is still waiting on its owner. Deleting the
+    /// mail would take that row off the trip's timeline with nothing said,
+    /// so the decision comes first.
+    Waiting,
+    /// The worker has not finished with it. A mail deleted mid-read has a
+    /// reading written against it a moment later: a row pointing at a mail
+    /// that is gone, which no page lists and no sweep can reach, because
+    /// both find arrivals through their mail.
+    Unsettled,
+    Gone,
+}
+
 /// What a magic link turned out to be worth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenOutcome {
@@ -4179,6 +4197,15 @@ pub const MAIL_RETRY_MINUTES: i64 = 5;
 /// inbox and the sweep read as "undecided".
 const UNDECIDED: &str = "a.booking AND a.status = 'pending'";
 
+/// Mail the worker could not read, over the alias `m`: refused outright, or
+/// out of attempts while still marked `extracting` because the worker died
+/// mid-call. The second is as unreadable as the first and must not be
+/// mistaken for work still in progress — `inbox_view` lists both as
+/// `failed`, and `delete_mail` counts both as finished with.
+fn unreadable(m: &str) -> String {
+    format!("({m}.status = 'failed' OR ({m}.status = 'extracting' AND {m}.attempts >= {MAIL_ATTEMPTS}))")
+}
+
 impl Store {
     /// Claims `handle` for the account; `false` when another account holds
     /// it. The check and the write share the lock, and that is the whole
@@ -4623,7 +4650,7 @@ impl Store {
         // mail done), and a non-booking is that before it is anything else.
         // The ranking survives the collapse: `failed` is the mail's own
         // status, so it is every reading of that mail's reason at once.
-        let failed = format!("(m.status = 'failed' OR (m.status = 'extracting' AND m.attempts >= {MAIL_ATTEMPTS}))");
+        let failed = unreadable("m");
         let mut stmt = conn.prepare(&format!(
             "SELECT m.id, m.from_address, m.subject, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ'), m.forwarded_at IS NOT NULL, a.id,
                     CASE WHEN {failed} THEN 'failed'
@@ -4674,6 +4701,88 @@ impl Store {
         )?;
         conn.execute(&format!("DELETE FROM arrivals WHERE mail_id IN ({sweepable})"), params![cutoff])?;
         Ok(conn.execute(&format!("DELETE FROM inbound_mail WHERE id IN ({sweepable})"), params![cutoff])?)
+    }
+
+    /// Forgets one mail now, on its owner's say-so, instead of in thirty
+    /// days.
+    ///
+    /// The three deletes are `sweep_inbox`'s — the loose files, then the
+    /// readings, then the mail — but unlike the sweep they are in one
+    /// transaction, which is what keeps them whole: a crash takes all three
+    /// back, so nothing is orphaned and the order between them decides
+    /// nothing. It is kept anyway, so the two paths that delete a mail read
+    /// the same. A file that has joined a trip item is the trip's now and
+    /// stays — `attachment_owner` answers for it through the item.
+    ///
+    /// Two refusals, both about rows this delete would strand:
+    ///
+    /// - a booking still waiting on its owner, which is `UNDECIDED`, the
+    ///   same predicate that keeps such a mail out of the sweep;
+    /// - a mail the worker has not finished with, which would have its
+    ///   reading written against it moments later.
+    ///
+    /// Every check runs under the one `conn()` the deletes hold, so nothing
+    /// can decide, undecide or finish reading in between.
+    pub fn delete_mail(&self, account_id: i64, mail_id: i64) -> Result<MailGone> {
+        let conn = self.conn();
+        // The account is half the key, as in `arrival_of`: an id in a URL
+        // is not proof of anything. Whether the worker is done with the
+        // mail is read in the same row — read, refused, or out of attempts,
+        // which is `unreadable` and so the same set `inbox_view` can list.
+        // A `new` or `extracting` mail with attempts left is still on its
+        // way to a reading.
+        let mine: Option<bool> = conn
+            .query_row(
+                &format!(
+                    "SELECT m.status = 'done' OR {} FROM inbound_mail m WHERE m.id = ? AND m.account_id = ?",
+                    unreadable("m")
+                ),
+                params![mail_id, account_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(settled) = mine else {
+            return Ok(MailGone::NotFound);
+        };
+        let waiting: Option<i64> = conn
+            .query_row(
+                &format!("SELECT a.id FROM arrivals a WHERE a.mail_id = ? AND {UNDECIDED} LIMIT 1"),
+                params![mail_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if waiting.is_some() {
+            return Ok(MailGone::Waiting);
+        }
+        if !settled {
+            return Ok(MailGone::Unsettled);
+        }
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<()> {
+            conn.execute(
+                "DELETE FROM attachments WHERE item_id IS NULL AND mail_id = ?",
+                params![mail_id],
+            )?;
+            conn.execute("DELETE FROM arrivals WHERE mail_id = ?", params![mail_id])?;
+            conn.execute("DELETE FROM inbound_mail WHERE id = ?", params![mail_id])?;
+            Ok(())
+        })();
+        match result {
+            // A `COMMIT` that fails leaves the transaction open, and DuckDB
+            // will not start another inside it — the next caller on this
+            // connection would fail for a reason that was never theirs.
+            Ok(()) => match conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(MailGone::Gone),
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// `(trip id, date, place)` per booking still waiting on one of this
@@ -4805,7 +4914,13 @@ fn sweep_drafts_within(conn: &Connection, account_id: Option<i64>) -> Result<usi
     })();
     match result {
         Ok(n) => {
-            conn.execute_batch("COMMIT")?;
+            // A failed `COMMIT` leaves the transaction open on a connection
+            // every other caller shares, and DuckDB will not start another
+            // inside it — see `delete_mail`, which closes the same door.
+            if let Err(e) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
             for (id, account_id, name) in &doomed {
                 tracing::info!(trip_id = id, account_id, name = %name, "empty placement draft collected");
             }
@@ -8696,6 +8811,126 @@ CREATE TABLE messages (
         assert!(store.decide_arrival(id, a, "added", Some(5)).unwrap());
         assert_eq!(store.sweep_inbox(30).unwrap(), 1);
         assert!(store.arrival_of(id, a).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_mail_deleted_by_hand_goes_the_way_the_sweep_would_have_taken_it() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let b = store.account_for_telegram(2).unwrap();
+        let m = mail(&store, a, "re_1");
+        let kept = store.insert_attachment(m, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let loose = store.insert_attachment(m, "logo.png", "image/png", Some(&[1, 2]), None).unwrap();
+        let reading = store
+            .insert_arrival(a, m, &NewArrival { booking: false, summary: "a newsletter".into(), ..Default::default() })
+            .unwrap();
+        // The worker writes the reading and then marks the mail, in that
+        // order; a mail it has not finished with is refused below.
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Unsettled, "still being read");
+        store.mail_done(m).unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        let trip = store.add_item(trip.id, NewItem {
+            kind: "stay".into(), title: "Hotel Alfama".into(), place: None, date: "2026-10-12".into(),
+            starts_at: None, ends_at: None, notes: None, booked: true, confirmation_code: None,
+            price: None, currency: None, arrival_id: None,
+        }).unwrap();
+        store.attach_to_item(kept, trip.items[0].id).unwrap();
+        assert_eq!(store.inbox_view(a).unwrap().other.len(), 1, "it is on the page to begin with");
+        // An id from the page proves nothing: the owner is half the key.
+        assert_eq!(store.delete_mail(b, m).unwrap(), MailGone::NotFound, "not theirs");
+        assert_eq!(store.inbox_view(a).unwrap().other.len(), 1, "and nothing of it went");
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Gone);
+        assert!(store.inbox_view(a).unwrap().other.is_empty(), "off the page at once");
+        assert!(store.arrival_of(reading, a).unwrap().is_none(), "its reading went with it");
+        assert!(store.attachment(loose).unwrap().is_none(), "a loose file was only the mail's");
+        // The ticket belongs to the trip now, and is still answered for
+        // through the item — the same survival the sweep was built for.
+        assert!(store.attachment(kept).unwrap().is_some());
+        assert_eq!(store.attachment_owner(kept).unwrap(), Some(a));
+        // A second press from a tab that has not repainted: already gone.
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::NotFound);
+    }
+
+    #[test]
+    fn a_mail_whose_booking_is_still_waiting_is_refused() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        store.mail_done(m).unwrap();
+        let ticket = store.insert_attachment(m, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let id = store
+            .insert_arrival(a, m, &NewArrival { booking: true, summary: "Hotel Alfama".into(), ..Default::default() })
+            .unwrap();
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Waiting);
+        assert!(store.arrival_of(id, a).unwrap().is_some(), "nothing was deleted");
+        assert!(store.attachment(ticket).unwrap().is_some());
+        assert_eq!(store.inbox_view(a).unwrap().pending.len(), 1, "still on the timeline");
+        // Decided, it is ordinary Other mail and goes like any other.
+        assert!(store.decide_arrival(id, a, "ignored", None).unwrap());
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Gone);
+        assert!(store.attachment(ticket).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_mail_the_worker_has_not_finished_with_is_refused_until_it_has() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        // Freshly delivered, and then part-way through a read: neither has
+        // a reading yet, so the pending-booking rule says nothing about
+        // them, and deleting either would strand the row about to be
+        // written against it.
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Unsettled, "new");
+        store.mail_attempted(m).unwrap();
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Unsettled, "extracting, attempts left");
+        // Out of attempts is the worker having crashed mid-call, over and
+        // over: the mail is listed as failed and must be deletable, or the
+        // × refuses on exactly the rows most worth dismissing.
+        for _ in 1..MAIL_ATTEMPTS {
+            store.mail_attempted(m).unwrap();
+        }
+        assert_eq!(store.inbox_view(a).unwrap().other[0].reason, "failed", "it is on the page");
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Gone);
+        // The other two ends: read, and refused outright.
+        let read = mail(&store, a, "re_2");
+        store.mail_done(read).unwrap();
+        assert_eq!(store.delete_mail(a, read).unwrap(), MailGone::Gone);
+        let refused = mail(&store, a, "re_3");
+        store.mail_failed(refused, "unreadable").unwrap();
+        assert_eq!(store.delete_mail(a, refused).unwrap(), MailGone::Gone);
+    }
+
+    #[test]
+    fn an_item_an_added_booking_became_outlives_the_mail_it_came_from() {
+        // The asymmetry with the refused pending case, stated: a booking
+        // still waiting holds its mail, but one that has been added has
+        // already become a trip item, and the item is the trip's — it does
+        // not depend on the mail for anything.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        store.mail_done(m).unwrap();
+        let ticket = store.insert_attachment(m, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let id = store
+            .insert_arrival(a, m, &NewArrival { booking: true, summary: "Hotel Alfama".into(), ..Default::default() })
+            .unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
+        let trip = store.add_item(trip.id, NewItem {
+            kind: "stay".into(), title: "Hotel Alfama".into(), place: None, date: "2026-10-12".into(),
+            starts_at: None, ends_at: None, notes: None, booked: true, confirmation_code: Some("ABC".into()),
+            price: None, currency: None, arrival_id: Some(id),
+        }).unwrap();
+        let item = trip.items[0].id;
+        store.attach_to_item(ticket, item).unwrap();
+        assert!(store.decide_arrival(id, a, "added", Some(item)).unwrap());
+        assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::Gone);
+        let trip = store.trip_by_id(a, trip.id).unwrap().expect("theirs");
+        assert_eq!(trip.items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(), vec!["Hotel Alfama"]);
+        assert!(trip.items[0].booked, "and still booked, with its code");
+        assert_eq!(trip.items[0].confirmation_code.as_deref(), Some("ABC"));
+        // The ticket is still downloadable: the item answers for it now.
+        assert!(store.attachment(ticket).unwrap().is_some());
+        assert_eq!(store.attachment_owner(ticket).unwrap(), Some(a));
     }
 
     #[test]

@@ -453,8 +453,13 @@ test('the legs being priced are named when the rest of the trip is already bough
   // pricing a trip and pricing what is left of it.
   const part = readinessAlert({ readiness: { state: 'ready', legs: ['segment 2 (HKG→BKK)'] }, items: flights(3) })
   assert.equal(part.headline, 'Ready to price.')
-  assert.match(part.text, /segment 2 \(HKG→BKK\)/)
-  assert.match(part.text, /already booked/)
+  assert.equal(
+    part.text,
+    'Only segment 2 (HKG→BKK) is still to buy. Ask Scout in chat to price it; the rest of this trip is already booked.',
+  )
+  // Two of them read as a sentence, not as a joined array.
+  const two = readinessAlert({ readiness: { state: 'ready', legs: ['segment 2 (HKG→BKK)', 'segment 3 (BKK→HKG)'] }, items: flights(4) })
+  assert.match(two.text, /Only segment 2 \(HKG→BKK\) and segment 3 \(BKK→HKG\) are still to buy\./)
 })
 
 test('a readiness this page cannot read says nothing rather than something false', () => {

@@ -536,9 +536,9 @@ fn readiness_notice(readiness: &Readiness, flights: usize) -> (&'static str, Str
         Readiness::Ready { legs } if legs.len() < flights => (
             "Ready to price.",
             format!(
-                "{} {} not booked yet; the rest of this trip is already booked. Refresh live \
+                "Only {} {} still to buy; the rest of this trip is already booked. Refresh live \
                  fares with Scout before booking.",
-                legs.join(", "),
+                list_of(legs),
                 if legs.len() == 1 { "is" } else { "are" },
             ),
             "ok",
@@ -572,6 +572,16 @@ fn readiness_notice(readiness: &Readiness, flights: usize) -> (&'static str, Str
 /// Nothing is lost by the silence over a booked stay: `itinerary_notes` in
 /// core still reports a tight turnaround between consecutive flights
 /// whatever sits between them, and this plan prints those notes above.
+/// "a, b and c": a list in a sentence, which is where these are read.
+/// The paper half of `chat.js::listOf`.
+fn list_of(items: &[String]) -> String {
+    match items.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 fn connection(
     before: &TripItem,
     after: &TripItem,

@@ -372,6 +372,13 @@ function tripFlights(trip) {
   return (trip?.items ?? []).filter((item) => item.kind === 'flight')
 }
 
+// "a, b and c": a list in a sentence, which is where these are read.
+function listOf(items) {
+  return items.length < 2
+    ? items.join('')
+    : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
+}
+
 // The alert above the timeline, from the three states `Readiness` can be
 // in — or `null` when this page cannot read the one it was sent, which is
 // a tab open across a deploy. Saying nothing is the only answer that
@@ -401,7 +408,7 @@ export function readinessAlert(trip) {
       tone: 'ready',
       headline: 'Ready to price.',
       text: rest > 0
-        ? `${legs.join(', ')} ${legs.length === 1 ? 'is' : 'are'} not booked yet. Ask Scout in chat to price ${legs.length === 1 ? 'it' : 'them'}; the rest of this trip is already booked.`
+        ? `Only ${listOf(legs)} ${legs.length === 1 ? 'is' : 'are'} still to buy. Ask Scout in chat to price ${legs.length === 1 ? 'it' : 'them'}; the rest of this trip is already booked.`
         : 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.',
     }
   }

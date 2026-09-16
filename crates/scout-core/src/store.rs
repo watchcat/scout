@@ -4250,6 +4250,26 @@ impl Store {
         Ok(())
     }
 
+    /// Hands an attempt back: the provider could not be reached, which
+    /// says nothing about the mail, and a ten-minute outage must not
+    /// spend a mail's three tries. `attempted_at` stands, so the next try
+    /// still waits `MAIL_RETRY_MINUTES` — an outage is not over in a
+    /// second, and three tries in one are one try.
+    pub fn mail_unattempted(&self, id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE inbound_mail SET attempts = greatest(attempts - 1, 0) WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    /// Whether the extractor's reading of this mail is on record: the
+    /// worker asks before it pays the model, so a mail that only owes its
+    /// forward is not read twice.
+    pub fn mail_has_arrival(&self, mail_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row("SELECT count(*) FROM arrivals WHERE mail_id = ?", params![mail_id], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
     /// Backdates the last attempt by an hour, so a test can walk a mail
     /// through its retries without waiting `MAIL_RETRY_MINUTES` between.
     #[doc(hidden)]
@@ -8220,6 +8240,39 @@ CREATE TABLE messages (
         assert!(store.mail_to_work(10).unwrap().is_empty(), "attempted a moment ago: not yet");
         store.age_attempts(m).unwrap();
         assert_eq!(store.mail_to_work(10).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(), vec![m]);
+    }
+
+    #[test]
+    fn an_attempt_handed_back_is_not_spent_but_the_wait_still_stands() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        store.mail_attempted(m).unwrap();
+        store.mail_unattempted(m).unwrap();
+        assert!(store.mail_to_work(10).unwrap().is_empty(), "handed back a moment ago: the spacing still applies");
+        store.age_attempts(m).unwrap();
+        assert_eq!(store.mail_to_work(10).unwrap()[0].attempts, 0, "the attempt was not spent");
+        store.mail_unattempted(m).unwrap();
+        store.age_attempts(m).unwrap();
+        assert_eq!(store.mail_to_work(10).unwrap()[0].attempts, 0, "and never goes below nothing");
+        // Three outages in a row leave the mail as fresh as it came.
+        for _ in 0..MAIL_ATTEMPTS {
+            store.mail_attempted(m).unwrap();
+            store.mail_unattempted(m).unwrap();
+            store.age_attempts(m).unwrap();
+        }
+        assert_eq!(store.mail_to_work(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_mail_knows_whether_it_was_read() {
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        assert!(!store.mail_has_arrival(m).unwrap());
+        store.insert_arrival(a, m, &NewArrival { booking: false, summary: "ad".into(), ..Default::default() }).unwrap();
+        assert!(store.mail_has_arrival(m).unwrap());
+        assert!(!store.mail_has_arrival(m + 1).unwrap(), "no such mail, no such reading");
     }
 
     #[test]

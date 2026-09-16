@@ -345,6 +345,18 @@ pub async fn mail_attempted(core: &Core, id: i64) -> anyhow::Result<()> {
     blocking(move || store.mail_attempted(id)).await
 }
 
+/// The attempt handed back, for a pass that never reached the mail.
+pub async fn mail_unattempted(core: &Core, id: i64) -> anyhow::Result<()> {
+    let store = core.store();
+    blocking(move || store.mail_unattempted(id)).await
+}
+
+/// Whether an earlier pass already recorded what the mail is.
+pub async fn mail_has_arrival(core: &Core, id: i64) -> anyhow::Result<bool> {
+    let store = core.store();
+    blocking(move || store.mail_has_arrival(id)).await
+}
+
 pub async fn mail_done(core: &Core, id: i64) -> anyhow::Result<()> {
     let store = core.store();
     blocking(move || store.mail_done(id)).await
@@ -1135,7 +1147,11 @@ mod tests {
         assert_eq!(due.iter().map(|m| m.id).collect::<Vec<_>>(), vec![first, second]);
         assert_eq!(due[0].text.as_deref(), Some("xxxxx"), "cut at the cap");
         mail_attempted(&core, first).await.unwrap();
+        mail_unattempted(&core, first).await.unwrap();
+        assert_eq!(mail_to_work(&core, 10).await.unwrap().len(), 1, "handed back, but not served again at once");
+        mail_attempted(&core, first).await.unwrap();
         mail_failed(&core, first, "unreadable").await.unwrap();
+        assert!(!mail_has_arrival(&core, first).await.unwrap());
         mail_attempted(&core, second).await.unwrap();
         mail_forwarded(&core, second).await.unwrap();
         mail_done(&core, second).await.unwrap();

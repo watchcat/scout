@@ -20,9 +20,16 @@ use std::time::Duration;
 /// How many characters of body-plus-attachments the model is handed. A
 /// booking confirmation is a page or two; past this it is a newsletter.
 pub const TEXT_CAP: usize = 24_000;
-/// How much of the body is kept on the row, so the page can show it. Wider
-/// than `TEXT_CAP`: what the model does not need to read, a person may.
+/// How much of the body is kept on the row: the spec's storage cap, wider
+/// than `TEXT_CAP` because what the model does not need to read, a person
+/// may. The page does not read it yet — showing the stored text is a later
+/// slice — so today the row's copy serves the retries, which read and
+/// forward from it rather than asking Resend again.
 pub const BODY_CAP: usize = 512 * 1024;
+/// The most attachment bytes one forward carries. Resend takes 40 MB a
+/// message, base64 adds a third, and a forward the provider refuses for
+/// its size is a forward nobody gets — better one without the last file.
+pub const FORWARD_CAP: usize = 25 * 1024 * 1024;
 /// The most bytes one attachment may be. Above this it is not stored and
 /// not forwarded; the mail still is.
 pub const ATTACHMENT_CAP: usize = 10 * 1024 * 1024;
@@ -81,63 +88,136 @@ pub async fn run(core: Arc<Core>, client: ResendClient, from: String) {
     }
 }
 
-/// One pass over due mail. Each step is idempotent per row: forwarding is
-/// recorded on the row so a retry never forwards twice; attachments are
-/// fetched only when the row has none yet.
+/// One pass over due mail, and another while the last one was a full
+/// batch: a burst arrives at once and should not drain one batch a tick.
+/// Each step is idempotent per row: forwarding is recorded on the row so
+/// a retry never forwards twice; attachments are fetched only when the
+/// row has none yet; the model is asked only while no reading is on
+/// record.
 pub async fn work_once(core: &Core, client: &ResendClient, from: &str, limit: usize) {
-    let due = match scout_core::inbox::mail_to_work(core, limit).await {
-        Ok(due) => due,
-        Err(e) => {
-            tracing::error!(error = %e, "could not read the inbox");
+    loop {
+        let due = match scout_core::inbox::mail_to_work(core, limit).await {
+            Ok(due) => due,
+            Err(e) => {
+                tracing::error!(error = %e, "could not read the inbox");
+                return;
+            }
+        };
+        // `limit > 0` because an empty batch of a zero limit is "full".
+        let full = limit > 0 && due.len() == limit;
+        for m in due {
+            if let Err(e) = work_one(core, client, from, &m).await {
+                // The store is not answering. It would hand the same
+                // batch back, so the pass ends here and the tick returns.
+                tracing::warn!(error = %e, id = m.id, "inbox bookkeeping");
+                return;
+            }
+        }
+        if !full {
             return;
         }
-    };
-    for m in due {
-        // Counted before the work, so a crash mid-way still spends one.
-        if let Err(e) = scout_core::inbox::mail_attempted(core, m.id).await {
-            tracing::warn!(error = %e, id = m.id, "inbox bookkeeping");
-            continue;
-        }
-        // `process` marks the mail done itself, once the arrival is on
-        // record; an `Ok` here means it did.
-        let Err(e) = process(core, client, from, &m).await else { continue };
-        let attempts = m.attempts + 1;
-        tracing::warn!(error = %e, id = m.id, attempts, "an email could not be read");
-        if attempts < ATTEMPTS {
-            continue;
-        }
-        if let Err(e) = scout_core::inbox::mail_failed(core, m.id, &format!("{e:#}")).await {
-            tracing::warn!(error = %e, id = m.id, "inbox bookkeeping");
-        }
-        let text = "An email arrived that Scout could not read. It is under Other mail on goodscout.fyi/chat.";
-        if let Err(e) = scout_core::inbox::nudge(core, m.account_id, m.id, text).await {
-            tracing::warn!(error = %e, id = m.id, "could not nudge about a failed email");
-        }
     }
+}
+
+/// Why a pass could not finish a mail. The distinction decides whether the
+/// attempt was spent: an outage says nothing about the mail.
+enum Failure {
+    /// Resend could not be reached, or said try later. The attempt is
+    /// handed back; the spacing still applies.
+    Transport(anyhow::Error),
+    /// The mail itself could not be read — the model failed, the store
+    /// refused, the provider answered no. The attempt stands.
+    Reading(anyhow::Error),
+}
+
+/// A Resend error sorted into the two.
+fn resend(e: anyhow::Error) -> Failure {
+    if crate::resend::is_transient(&e) {
+        Failure::Transport(e)
+    } else {
+        Failure::Reading(e)
+    }
+}
+
+/// One mail. `Err` is the store failing at the bookkeeping around the
+/// work; everything about the mail itself is handled here.
+async fn work_one(core: &Core, client: &ResendClient, from: &str, m: &MailToWork) -> anyhow::Result<()> {
+    // Counted before the work, so a crash mid-way still spends one.
+    scout_core::inbox::mail_attempted(core, m.id).await?;
+    // `process` settles the mail itself once the arrival is on record;
+    // an `Ok` here means it did.
+    let e = match process(core, client, from, m).await {
+        Ok(()) => return Ok(()),
+        Err(Failure::Transport(e)) => {
+            tracing::warn!(error = %e, id = m.id, "resend was not there; the attempt is handed back");
+            return scout_core::inbox::mail_unattempted(core, m.id).await;
+        }
+        Err(Failure::Reading(e)) => e,
+    };
+    let attempts = m.attempts + 1;
+    tracing::warn!(error = %e, id = m.id, attempts, "an email could not be read");
+    if attempts < ATTEMPTS {
+        return Ok(());
+    }
+    scout_core::inbox::mail_failed(core, m.id, &format!("{e:#}")).await?;
+    let text = "An email arrived that Scout could not read. It is under Other mail on goodscout.fyi/chat.";
+    if let Err(e) = scout_core::inbox::nudge(core, m.account_id, m.id, text).await {
+        tracing::warn!(error = %e, id = m.id, "could not nudge about a failed email");
+    }
+    Ok(())
+}
+
+/// What became of the forward, this pass or an earlier one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Forwarded {
+    /// Sent — now, or on a pass before this one.
+    Yes,
+    /// The account has no email identity: nowhere to send it. Asked again
+    /// on a retry, in case one was linked since.
+    NoAddress,
+    /// Resend refused it. Asking again would get the same answer.
+    Refused,
+    /// Resend was not there. Worth asking again.
+    Later,
 }
 
 /// Everything one mail needs, in the order that makes a retry safe: body,
 /// attachments, forward, then the model. The forward comes before the
 /// model on purpose — the person gets their mail even when the model is
-/// down — and a forward Resend refuses is a warning, not a reason to
-/// leave the mail unread. It is not retried: the mail is read and filed
-/// in the same pass, and the row then shows "not forwarded", which is
-/// the truth. (Only when the model also fails, and the mail comes round
-/// again, is the forward tried again with it.)
-async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork) -> anyhow::Result<()> {
-    // 1. The body, from the API: the webhook carries none.
-    let received = client.received(&m.provider_id).await?;
-    scout_core::inbox::mail_body(core, m.id, received.text.clone(), received.html.clone(), BODY_CAP).await?;
+/// down. A forward Resend refuses is a warning, not a reason to leave the
+/// mail unread; a forward Resend was not there for is owed, and `settle`
+/// leaves the mail due so a later pass sends it — that pass finds the
+/// reading on record and does nothing else.
+async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork) -> Result<(), Failure> {
+    // 0. A mail read on an earlier pass owes only its forward.
+    if scout_core::inbox::mail_has_arrival(core, m.id).await.map_err(Failure::Reading)? {
+        let forwarded = forward(core, client, from, m, &m.from, m.subject.clone(), m.text.clone(), m.html.clone()).await?;
+        return settle(core, m, forwarded).await;
+    }
+
+    // 1. The body: the row's, when an earlier pass stored it, so a retry
+    // does not depend on Resend; else the API's, since the webhook
+    // carries none. The record's sender is preferred over the row's copy:
+    // the same mail, seen in full rather than capped on the way in.
+    let (sender, subject, text, html, listed) = if m.text.is_some() || m.html.is_some() {
+        (m.from.clone(), m.subject.clone(), m.text.clone(), m.html.clone(), true)
+    } else {
+        let r = client.received(&m.provider_id).await.map_err(resend)?;
+        scout_core::inbox::mail_body(core, m.id, r.text.clone(), r.html.clone(), BODY_CAP).await.map_err(Failure::Reading)?;
+        let sender = if r.from.is_empty() { m.from.clone() } else { r.from };
+        (sender, r.subject.or_else(|| m.subject.clone()), r.text, r.html, !r.attachments.is_empty())
+    };
 
     // 2. Attachments, once. A download that fails or is over the cap
     // leaves a row with a name and no bytes, so the page can still say
-    // the mail had one.
-    let stored = scout_core::inbox::attachment_texts(core, m.id).await?;
-    let texts = if stored.is_empty() && !received.attachments.is_empty() {
-        // The record already names the attachments; the list call is the
-        // one that adds URLs, and most mail has nothing to list.
+    // the mail had one. The record already names the attachments; the
+    // list call is the one that adds URLs, and most mail has nothing to
+    // list — but a body from the row came without the record, so then
+    // the list is asked.
+    let stored = scout_core::inbox::attachment_texts(core, m.id).await.map_err(Failure::Reading)?;
+    let texts = if stored.is_empty() && listed {
         let mut texts = Vec::new();
-        for meta in client.attachments(&m.provider_id).await?.into_iter().take(ATTACHMENTS_PER_MAIL) {
+        for meta in client.attachments(&m.provider_id).await.map_err(resend)?.into_iter().take(ATTACHMENTS_PER_MAIL) {
             let bytes = match client.download(&meta.download_url, ATTACHMENT_CAP).await {
                 Ok(bytes) => Some(bytes),
                 Err(e) => {
@@ -152,7 +232,9 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
                 }
                 other => (other, None),
             };
-            scout_core::inbox::store_attachment(core, m.id, &meta.filename, &meta.content_type, bytes, text.clone()).await?;
+            scout_core::inbox::store_attachment(core, m.id, &meta.filename, &meta.content_type, bytes, text.clone())
+                .await
+                .map_err(Failure::Reading)?;
             texts.push((meta.filename, text));
         }
         texts
@@ -160,38 +242,16 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
         stored
     };
 
-    // The record's sender is preferred over the webhook's copy on the
-    // row: the same mail, seen in full rather than capped on the way in.
-    let sender = if received.from.is_empty() { m.from.clone() } else { received.from.clone() };
+    // 3. Forward, once.
+    let forwarded = forward(core, client, from, m, &sender, subject.clone(), text.clone(), html.clone()).await?;
 
-    // 3. Forward, once. An account with no email identity has nowhere to
-    // forward to; the mail is still read and filed, and a retry asks
-    // again in case one was linked since.
-    if !m.forwarded {
-        if let Some(to) = scout_core::inbox::email_of(core, m.account_id).await? {
-            let attachments = scout_core::inbox::attachment_bytes(core, m.id).await?;
-            let mail = Outgoing {
-                from: from.into(),
-                to,
-                reply_to: Some(sender.clone()),
-                subject: received.subject.clone().or_else(|| m.subject.clone()).unwrap_or_default(),
-                text: received.text.clone(),
-                html: received.html.clone(),
-                attachments,
-            };
-            match client.send(&mail).await {
-                Ok(()) => scout_core::inbox::mail_forwarded(core, m.id).await?,
-                Err(e) => tracing::warn!(error = %e, id = m.id, "the forward did not go; reading the mail anyway"),
-            }
-        }
-    }
-
-    // 4. Extract, place, record, and only then done.
+    // 4. Extract, place, record, and only then settle.
     let parts: Vec<(&str, Option<&str>)> = texts.iter().map(|(f, t)| (f.as_str(), t.as_deref())).collect();
-    let text = assemble(received.text.as_deref(), received.html.as_deref(), &parts, TEXT_CAP);
-    let extraction = scout_core::inbox::extract(core, &text).await?;
-    let (_, placement) = scout_core::inbox::record_arrival(core, m.account_id, m.id, extraction).await?;
-    scout_core::inbox::mail_done(core, m.id).await?;
+    let text = assemble(text.as_deref(), html.as_deref(), &parts, TEXT_CAP);
+    let extraction = scout_core::inbox::extract(core, &text).await.map_err(Failure::Reading)?;
+    let (_, placement) =
+        scout_core::inbox::record_arrival(core, m.account_id, m.id, extraction).await.map_err(Failure::Reading)?;
+    settle(core, m, forwarded).await?;
 
     // 5. The nudge. From here nothing fails the mail: it is filed, and a
     // line that could not be queued is not a reason to pay the model to
@@ -210,15 +270,110 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
         // Not a booking, but from a place bookings come from: worth a line,
         // since the person may be waiting on it. Anything else is just
         // mail, and mail arrives quietly.
-        None if looks_like_a_booking_site(&sender) => {
-            format!("Mail from {}: \"{}\". Forwarded to you.", domain_of(&sender), m.subject.clone().unwrap_or_default())
-        }
+        None if looks_like_a_booking_site(&sender) => other_mail_nudge(&sender, subject.as_deref().unwrap_or_default(), forwarded),
         None => return Ok(()),
     };
     if let Err(e) = scout_core::inbox::nudge(core, m.account_id, m.id, &text).await {
         tracing::warn!(error = %e, id = m.id, "could not nudge about an arrival");
     }
     Ok(())
+}
+
+/// The forward, unless the row says it went. An account with no email
+/// identity has nowhere to forward to; the mail is still read and filed.
+/// A refusal is logged and the mail goes on; an outage is `Later`, for
+/// `settle` to decide. Neither is an `Err`: the reading does not wait on
+/// the forward. The store failing is.
+#[allow(clippy::too_many_arguments)]
+async fn forward(
+    core: &Core,
+    client: &ResendClient,
+    from: &str,
+    m: &MailToWork,
+    sender: &str,
+    subject: Option<String>,
+    text: Option<String>,
+    html: Option<String>,
+) -> Result<Forwarded, Failure> {
+    if m.forwarded {
+        return Ok(Forwarded::Yes);
+    }
+    let Some(to) = scout_core::inbox::email_of(core, m.account_id).await.map_err(Failure::Reading)? else {
+        return Ok(Forwarded::NoAddress);
+    };
+    let all = scout_core::inbox::attachment_bytes(core, m.id).await.map_err(Failure::Reading)?;
+    let attachments = within_cap(all, FORWARD_CAP);
+    let mail = Outgoing {
+        from: from.into(),
+        to,
+        reply_to: Some(sender.to_string()),
+        subject: subject.unwrap_or_default(),
+        text,
+        html,
+        attachments,
+    };
+    match client.send(&mail).await {
+        Ok(()) => {
+            scout_core::inbox::mail_forwarded(core, m.id).await.map_err(Failure::Reading)?;
+            Ok(Forwarded::Yes)
+        }
+        Err(e) if crate::resend::is_transient(&e) => {
+            tracing::warn!(error = %e, id = m.id, "the forward did not go; reading the mail anyway, sending later");
+            Ok(Forwarded::Later)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, id = m.id, "the forward was refused; reading the mail anyway");
+            Ok(Forwarded::Refused)
+        }
+    }
+}
+
+/// The attachments that fit under `cap` bytes together, in order, the
+/// rest dropped with a line saying how many — not which: a filename is
+/// the sender's text.
+fn within_cap(attachments: Vec<(String, Vec<u8>)>, cap: usize) -> Vec<(String, Vec<u8>)> {
+    let mut total = 0usize;
+    let (kept, dropped): (Vec<_>, Vec<_>) = attachments.into_iter().partition(|(_, bytes)| {
+        let fits = total + bytes.len() <= cap;
+        if fits {
+            total += bytes.len();
+        }
+        fits
+    });
+    if !dropped.is_empty() {
+        tracing::warn!(dropped = dropped.len(), "attachments left off a forward to stay under the size cap");
+    }
+    kept
+}
+
+/// The mail's end state once its reading is on record. Done, unless the
+/// forward is owed and there are attempts left: then the row stays due,
+/// its attempt spent, so a later pass sends the forward alone and the
+/// count bounds how long that goes on. On the last attempt it is done
+/// regardless, and the row says "not forwarded", which is the truth.
+async fn settle(core: &Core, m: &MailToWork, forwarded: Forwarded) -> Result<(), Failure> {
+    // `work_one` counted this pass before the work.
+    let attempts = m.attempts + 1;
+    if forwarded == Forwarded::Later && attempts < ATTEMPTS {
+        tracing::info!(id = m.id, attempts, "read and filed; the forward waits for the next pass");
+        return Ok(());
+    }
+    scout_core::inbox::mail_done(core, m.id).await.map_err(Failure::Reading)
+}
+
+/// The line for a mail from a booking site that was not a booking: where
+/// it came from, what it said it was, and whether it reached the person
+/// — said only when known. The subject is the sender's text, cut so a
+/// stranger cannot fill the phone with it.
+fn other_mail_nudge(sender: &str, subject: &str, forwarded: Forwarded) -> String {
+    let subject: String = subject.chars().take(200).collect();
+    let mut line = format!("Mail from {}: \"{subject}\".", domain_of(sender));
+    match forwarded {
+        Forwarded::Yes => line.push_str(" Forwarded to you."),
+        Forwarded::NoAddress => line.push_str(" Not forwarded: no email on your account."),
+        Forwarded::Refused | Forwarded::Later => {}
+    }
+    line
 }
 
 /// The line on the phone for a booking that was placed: on a trip that
@@ -441,6 +596,26 @@ mod tests {
     }
 
     #[test]
+    fn the_other_mail_nudge_says_only_what_it_knows_about_the_forward() {
+        assert_eq!(other_mail_nudge("noreply@booking.com", "Changed", Forwarded::Yes), "Mail from booking.com: \"Changed\". Forwarded to you.");
+        assert_eq!(
+            other_mail_nudge("noreply@booking.com", "Changed", Forwarded::NoAddress),
+            "Mail from booking.com: \"Changed\". Not forwarded: no email on your account."
+        );
+        assert_eq!(other_mail_nudge("noreply@booking.com", "Changed", Forwarded::Later), "Mail from booking.com: \"Changed\".");
+        assert_eq!(other_mail_nudge("noreply@booking.com", "Changed", Forwarded::Refused), "Mail from booking.com: \"Changed\".");
+        let long = other_mail_nudge("noreply@booking.com", &"é".repeat(300), Forwarded::Yes);
+        assert_eq!(long.chars().count(), "Mail from booking.com: \"\". Forwarded to you.".len() + 200);
+    }
+
+    #[test]
+    fn a_forward_carries_what_fits_under_the_cap_in_order() {
+        let atts = vec![("a".to_string(), vec![0; 6]), ("b".to_string(), vec![0; 6]), ("c".to_string(), vec![0; 2])];
+        let kept: Vec<String> = within_cap(atts, 10).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(kept, ["a", "c"], "b did not fit; c, after it, did");
+    }
+
+    #[test]
     fn the_nudge_says_whether_the_booking_joined_a_trip_or_started_one() {
         assert_eq!(arrival_nudge(Placement::Trip(1), "Lisbon"), "A booking arrived for Lisbon. Review it on goodscout.fyi/chat.");
         assert_eq!(
@@ -509,10 +684,12 @@ mod tests {
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(forwards(&reqs), 1, "forwarded once, not per attempt");
         assert_eq!(reqs.iter().filter(|r| r.url.path() == "/dl/att_1").count(), 1, "attachments fetched once, not per attempt");
+        let fetches = |reqs: &[wiremock::Request]| reqs.iter().filter(|r| r.url.path() == "/emails/receiving/re_1").count();
+        assert_eq!(fetches(&reqs), 1, "the body fetched once: the row's copy serves the retries");
         // A fourth pass finds nothing due.
         scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
         work_once(&core, &client, FROM, 10).await;
-        assert_eq!(server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/emails/receiving/re_1").count(), 3);
+        assert_eq!(fetches(&server.received_requests().await.unwrap()), 1);
     }
 
     #[tokio::test]
@@ -555,11 +732,51 @@ mod tests {
         assert_eq!(forwards(&server.received_requests().await.unwrap()), 0);
     }
 
+    fn extractions(reqs: &[wiremock::Request]) -> usize {
+        reqs.iter().filter(|r| r.url.path() == "/chat/completions").count()
+    }
+
     #[tokio::test]
-    async fn a_forward_that_resend_refuses_does_not_stop_the_reading() {
+    async fn a_forward_resend_was_not_there_for_is_sent_on_a_later_pass_without_a_second_reading() {
         let server = MockServer::start().await;
-        // Refusing first, so it wins the tie with `resend_like`'s POST.
-        Mock::given(method("POST")).and(path("/emails")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        // Failing first, so it wins the tie with `resend_like`'s POST, and
+        // once only, so the second pass finds Resend back.
+        Mock::given(method("POST")).and(path("/emails")).respond_with(ResponseTemplate::new(500)).up_to_n_times(1).mount(&server).await;
+        resend_like(&server).await;
+        model_saying(&server, r#"{"booking":false,"summary":"A newsletter"}"#).await;
+        let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        scout_core::inbox::seed_email_identity_for_tests(&core, a, "me@example.com").await.unwrap();
+        let mail_id = scout_core::inbox::record_mail(&core, a, a_mail("re_1")).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert_eq!(view.other[0].reason, "not_booking", "the model was asked");
+        assert!(!view.other[0].forwarded, "a 500 is not a forward");
+        assert_eq!(forwards(&server.received_requests().await.unwrap()), 1, "it was tried");
+        // Read, but not done: the forward is owed, and the row waits its turn.
+        assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "attempted a moment ago");
+        scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        let due = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert_eq!(due.iter().map(|m| (m.id, m.attempts, m.forwarded)).collect::<Vec<_>>(), vec![(mail_id, 1, false)]);
+        work_once(&core, &client, FROM, 10).await;
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert!(view.other[0].forwarded, "sent on the second pass");
+        assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "done");
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(forwards(&reqs), 2, "tried, then sent");
+        assert_eq!(extractions(&reqs), 1, "read once");
+        assert_eq!(reqs.iter().filter(|r| r.url.path() == "/emails/receiving/re_1").count(), 1, "fetched once");
+        let forward: serde_json::Value = serde_json::from_slice(&reqs.iter().rfind(|r| r.url.path() == "/emails").unwrap().body).unwrap();
+        assert_eq!(forward["text"], "Check-in 12 Oct", "the second send carries the stored body");
+        assert_eq!(forward["attachments"][0]["filename"], "ticket.pdf");
+    }
+
+    #[tokio::test]
+    async fn a_forward_resend_refuses_outright_is_not_tried_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/emails")).respond_with(ResponseTemplate::new(422)).mount(&server).await;
         resend_like(&server).await;
         model_saying(&server, r#"{"booking":false,"summary":"A newsletter"}"#).await;
         let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
@@ -570,8 +787,74 @@ mod tests {
         let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
         work_once(&core, &client, FROM, 10).await;
         let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
-        assert_eq!(view.other[0].reason, "not_booking", "the model was asked");
-        assert!(!view.other[0].forwarded, "a 500 is not a forward");
-        assert_eq!(forwards(&server.received_requests().await.unwrap()), 1, "it was tried");
+        assert_eq!((view.other[0].reason.as_str(), view.other[0].forwarded), ("not_booking", false));
+        assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "done: a 422 tomorrow is a 422");
+    }
+
+    #[tokio::test]
+    async fn an_owed_forward_gives_up_after_the_attempts_and_the_row_says_so() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/emails")).respond_with(ResponseTemplate::new(503)).mount(&server).await;
+        resend_like(&server).await;
+        model_saying(&server, r#"{"booking":false,"summary":"A newsletter"}"#).await;
+        let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        scout_core::inbox::seed_email_identity_for_tests(&core, a, "me@example.com").await.unwrap();
+        let mail_id = scout_core::inbox::record_mail(&core, a, a_mail("re_1")).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        for _ in 0..ATTEMPTS {
+            work_once(&core, &client, FROM, 10).await;
+            scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        }
+        assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "done after the last attempt");
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert_eq!((view.other[0].reason.as_str(), view.other[0].forwarded), ("not_booking", false));
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(forwards(&reqs) as i64, ATTEMPTS);
+        assert_eq!(extractions(&reqs), 1, "read once, however many times the forward was tried");
+    }
+
+    #[tokio::test]
+    async fn an_outage_at_resend_spends_no_attempt_and_says_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/emails/receiving/re_1")).respond_with(ResponseTemplate::new(503)).mount(&server).await;
+        let (_app, core, _dir) = test_app().await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        core.note_address(111, "telegram", "12345".into()).await.unwrap();
+        scout_core::inbox::seed_email_identity_for_tests(&core, a, "me@example.com").await.unwrap();
+        let mail_id = scout_core::inbox::record_mail(&core, a, a_mail("re_1")).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        // Longer than the mail has attempts: an outage is not the mail's fault.
+        for pass in 0..ATTEMPTS + 2 {
+            work_once(&core, &client, FROM, 10).await;
+            assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "pass {pass}: the spacing still applies");
+            scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+            let due = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+            assert_eq!(due.iter().map(|m| (m.id, m.attempts)).collect::<Vec<_>>(), vec![(mail_id, 0)], "pass {pass}: still due, nothing spent");
+        }
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert!(view.other.is_empty(), "not given up on");
+        assert!(scout_core::mirror::pending(&core, 10).await.unwrap().is_empty(), "nothing to say yet");
+        assert_eq!(forwards(&server.received_requests().await.unwrap()), 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_batch_is_followed_by_another_in_the_same_pass() {
+        let server = MockServer::start().await;
+        resend_like(&server).await;
+        // Two mails, a batch of one: one pass drains both. The second
+        // mail's record is not on the server, and a 404 is a reading
+        // failure, which is fine — what is counted is that it was asked.
+        let (_app, core, _dir) = test_app().await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        scout_core::inbox::record_mail(&core, a, a_mail("re_1")).await.unwrap().unwrap();
+        scout_core::inbox::record_mail(&core, a, a_mail("re_2")).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 1).await;
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.iter().filter(|r| r.url.path().starts_with("/emails/receiving/re_") && !r.url.path().ends_with("/attachments")).count(), 2);
     }
 }

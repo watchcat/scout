@@ -192,6 +192,7 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
     // its own proof of who is calling — the signature — and is mounted
     // only when there is a secret to check it against, which is what
     // `inbound` being `Some` means.
+    let inbox_on = inbound.is_some();
     if let Some(state) = inbound {
         public = public.merge(inbound::routes(state));
     }
@@ -202,14 +203,20 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
         // somebody else's script. The public page has no script tag, no
         // input and nothing to steal, and a policy it does not need is a
         // policy that gets loosened for a reason that was never about it.
-        Some(auth) => public.merge(
-            routes::auth::routes(auth.clone())
+        Some(auth) => {
+            let mut signed_in = routes::auth::routes(auth.clone())
                 .merge(routes::account::routes(auth.clone()))
                 .merge(routes::chat::routes(auth.clone()))
-                .merge(routes::trips::routes(auth.clone()))
-                .merge(routes::inbox::routes(auth))
-                .layer(axum::middleware::from_fn(security_headers)),
-        ),
+                .merge(routes::trips::routes(auth.clone()));
+            // The inbox's signed-in side goes with its webhook: without
+            // one, nothing ever fills the inbox, and the page reads the
+            // 404 as "no inbox here" and draws neither the address nor
+            // the Other-mail section.
+            if inbox_on {
+                signed_in = signed_in.merge(routes::inbox::routes(auth));
+            }
+            public.merge(signed_in.layer(axum::middleware::from_fn(security_headers)))
+        }
         None => public,
     }
     // HSTS goes on everything, unlike the headers above. It is a statement

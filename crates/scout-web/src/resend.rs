@@ -236,16 +236,43 @@ impl ResendClient {
     }
 }
 
-/// The response if it was a success, else an error naming the status and
-/// only the status. Resend's error bodies are prose about the request,
-/// and this error is the thing a log line will print; the body is the one
-/// place the key could come back to us.
-fn accepted(res: reqwest::Response, what: &str) -> anyhow::Result<reqwest::Response> {
+/// A status Resend answered with that was not a success: the status and
+/// what was being asked, and only those. Resend's error bodies are prose
+/// about the request, and this error is the thing a log line will print;
+/// the body is the one place the key could come back to us.
+#[derive(Debug)]
+pub struct Answered {
+    pub status: reqwest::StatusCode,
+    what: &'static str,
+}
+
+impl std::fmt::Display for Answered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "resend answered {} while {}", self.status, self.what)
+    }
+}
+
+impl std::error::Error for Answered {}
+
+/// The response if it was a success, else an `Answered`.
+fn accepted(res: reqwest::Response, what: &'static str) -> anyhow::Result<reqwest::Response> {
     let status = res.status();
     if !status.is_success() {
-        anyhow::bail!("resend answered {status} while {what}");
+        return Err(Answered { status, what }.into());
     }
     Ok(res)
+}
+
+/// Whether an error from this client is Resend's moment rather than our
+/// request: unreachable, timed out, or a status that says try later. The
+/// worker hands an attempt back on these, since a mail is no less
+/// readable for an outage; a 4xx or a body that does not parse would come
+/// back the same tomorrow, and spends the attempt.
+pub fn is_transient(e: &anyhow::Error) -> bool {
+    if let Some(answered) = e.downcast_ref::<Answered>() {
+        return answered.status.is_server_error() || answered.status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+    }
+    e.downcast_ref::<reqwest::Error>().is_some_and(|e| !e.is_decode())
 }
 
 #[cfg(test)]
@@ -268,6 +295,24 @@ pub(crate) mod tests {
         Mock::given(method("GET")).and(path("/dl/att_1")).respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF".to_vec())).mount(server).await;
         Mock::given(method("POST")).and(path("/emails")).and(header("authorization", "Bearer k"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"sent_1"}))).mount(server).await;
+    }
+
+    #[tokio::test]
+    async fn an_outage_is_transient_and_a_refusal_is_not() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/emails/receiving/re_down")).respond_with(ResponseTemplate::new(503)).mount(&server).await;
+        Mock::given(method("GET")).and(path("/emails/receiving/re_gone")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+        Mock::given(method("GET")).and(path("/emails/receiving/re_odd")).respond_with(ResponseTemplate::new(200).set_body_string("not json")).mount(&server).await;
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        // `Received` has no `Debug` on purpose, so no `unwrap_err`.
+        let failing = |r: anyhow::Result<Received>| r.err().expect("an error");
+        assert!(is_transient(&failing(client.received("re_down").await)));
+        assert!(!is_transient(&failing(client.received("re_gone").await)), "a 404 is an answer");
+        assert!(!is_transient(&failing(client.received("re_odd").await)), "a body that does not parse is not an outage");
+        assert!(!is_transient(&failing(client.received("../x").await)), "a bad id is ours");
+        // A port nothing listens on: the connection itself fails.
+        let closed = ResendClient::new(reqwest::Client::new(), "k".into(), "http://127.0.0.1:1".into());
+        assert!(is_transient(&failing(closed.received("re_1").await)));
     }
 
     #[tokio::test]

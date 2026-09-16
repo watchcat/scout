@@ -453,9 +453,31 @@ mod tests {
         assert_eq!(safe_mime("a/b\r\nX: y"), "application/octet-stream");
     }
 
+    /// The inbox switched on — the same condition that mounts the webhook
+    /// — with a round open so a sign-in admits.
+    async fn inbox_app() -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        let (app, core, dir) = test_app_with_inbox("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw").await;
+        open_round(&core, "autumn", 5).await;
+        (app, core, dir)
+    }
+
+    #[tokio::test]
+    async fn without_the_webhook_there_is_no_inbox_to_sign_in_to() {
+        // `test_app` sets no webhook secret: the feature is off, and the
+        // page reads a 404 here as "no inbox", hiding the address and the
+        // Other-mail section rather than showing an inbox nothing fills.
+        let (app, core, _dir) = test_app_with_a_round().await;
+        let a = admitted(&core, "111").await;
+        let (session, csrf) = signed_in(a);
+        assert_eq!(get_with_cookie(&app, "/chat/inbox", &session).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(get_with_cookie(&app, "/chat/handle/check?handle=sasha", &session).await.status(), StatusCode::NOT_FOUND);
+        let res = post_json_with_cookie(&app, "/chat/handle", &session, Some(&csrf), r#"{"handle":"sasha"}"#).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn a_handle_is_chosen_once_checked_live_and_shown_with_the_domain() {
-        let (app, core, _dir) = test_app_with_a_round().await;
+        let (app, core, _dir) = inbox_app().await;
         let a = admitted(&core, "111").await;
         let (session, csrf) = signed_in(a);
         let res = get_with_cookie(&app, "/chat/handle/check?handle=Sasha", &session).await;
@@ -484,7 +506,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_claim_without_the_csrf_header_is_refused() {
-        let (app, core, _dir) = test_app_with_a_round().await;
+        let (app, core, _dir) = inbox_app().await;
         let a = admitted(&core, "111").await;
         let (session, _) = signed_in(a);
         let res = post_json_with_cookie(&app, "/chat/handle", &session, None, r#"{"handle":"sasha"}"#).await;
@@ -496,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_live_check_has_a_budget_of_its_own() {
-        let (app, core, _dir) = test_app_with_a_round().await;
+        let (app, core, _dir) = inbox_app().await;
         let a = admitted(&core, "111").await;
         let (session, _) = signed_in(a);
         for i in 0..60 {
@@ -515,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_arrival_is_added_to_its_trip_or_ignored_and_only_by_its_owner() {
-        let (app, core, _dir) = test_app_with_a_round().await;
+        let (app, core, _dir) = inbox_app().await;
         let a = admitted(&core, "111").await;
         let plan = scout_core::trips::seed_trip_for_tests(&core, a, "Lisbon").await.unwrap();
         let arrival = scout_core::inbox::seed_arrival_for_tests(&core, a, "stay", "Hotel Alfama", "2026-10-12", Some(plan.trip.id)).await.unwrap();
@@ -562,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_attachment_is_served_to_its_owner_only() {
-        let (app, core, _dir) = test_app_with_a_round().await;
+        let (app, core, _dir) = inbox_app().await;
         let a = admitted(&core, "111").await;
         let id = scout_core::inbox::seed_attachment_for_tests(&core, a, "ticket.pdf", "application/pdf", b"%PDF".to_vec()).await.unwrap();
         let (session, _) = signed_in(a);
@@ -577,7 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_strangers_name_and_type_reach_the_browser_inert() {
-        let (app, core, _dir) = test_app_with_a_round().await;
+        let (app, core, _dir) = inbox_app().await;
         let a = admitted(&core, "111").await;
         let id = scout_core::inbox::seed_attachment_for_tests(&core, a, "my \"ticket\".pdf", "application/pdf", b"%PDF".to_vec()).await.unwrap();
         let (session, _) = signed_in(a);

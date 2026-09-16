@@ -997,17 +997,34 @@ impl Tool for FinaliseTripTool {
             });
         }
         if !unpriced_items.is_empty() {
-            // Named in a note as well as listed: a total that silently
+            // Counted in a note as well as listed: a total that silently
             // leaves a hotel out reads as the whole trip.
-            notes.push(format!(
-                "{} items on this trip carry no price and are not in the totals",
-                unpriced_items.len()
-            ));
+            //
+            // "no price the totals can use" rather than "no price": an
+            // amount with no currency beside it lands here too, and a
+            // confirmation that stated 612.40 and no unit has not failed to
+            // state a price — it has failed to state what of.
+            //
+            // Singular where there is one, which a booked flight made the
+            // common case rather than the edge: a confirmation that stated
+            // no price is exactly one item, and "1 items" in front of that
+            // reads as a bug in the reply and casts doubt on the numbers
+            // beside it.
+            notes.push(match unpriced_items.len() {
+                1 => "1 item on this trip has no price the totals can use, and is not in them"
+                    .to_string(),
+                many => format!(
+                    "{many} items on this trip have no price the totals can use, and are not in \
+                     them"
+                ),
+            });
         }
 
         // quoted_price and quoted_at are never touched here — see
-        // TripCandidate's own comment. Only the status changes, to record
-        // that this trip has been priced.
+        // TripCandidate's own comment. Only the status changes, and only to
+        // record that this trip has been through here: on the all-booked
+        // route nothing was priced at all, and "finalised" is still the
+        // right word for a trip with nothing left to buy.
         let store = self.store.clone();
         let trip_id = trip.id;
         match tokio::task::spawn_blocking(move || store.set_trip_status(trip_id, "finalised")).await {
@@ -3538,7 +3555,7 @@ mod tests {
         // fetched" is about a comparison this trip never needed, so a
         // Duffel-less deployment must not report one as missing either.
         let out = FinaliseTripTool {
-            store,
+            store: store.clone(),
             account_id: 7,
             duffel: None,
             ignav: None,
@@ -3549,6 +3566,37 @@ mod tests {
         .unwrap();
         assert!(
             !out.notes.iter().any(|n| n.contains("Duffel")),
+            "notes: {:?}",
+            out.notes,
+        );
+
+        // And the same trip where the confirmation stated an amount with no
+        // currency beside it. That is one item, which a booked flight makes
+        // the ordinary case rather than the edge — "1 items" in front of a
+        // set of totals reads as a bug in the reply and casts doubt on the
+        // numbers beside it — and it has not failed to state a price, it
+        // has failed to state what of.
+        let trip = store.find_trip(7, "Japan").unwrap().unwrap();
+        store
+            .book_item(trip.items[0].id, Some("KL7788"), Some(612.40), None, None)
+            .unwrap();
+        let out = FinaliseTripTool {
+            store,
+            account_id: 7,
+            duffel: None,
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap();
+        assert!(out.fixed_costs.is_empty(), "no currency, no line in the totals");
+        assert_eq!(out.unpriced_items, vec!["AMS→NRT on 2026-09-03".to_string()]);
+        assert!(
+            out.notes.contains(
+                &"1 item on this trip has no price the totals can use, and is not in them"
+                    .to_string()
+            ),
             "notes: {:?}",
             out.notes,
         );

@@ -10,6 +10,7 @@ import {
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
+  ITINERARY_NOTE,
   CONFIRM_ARM_MS,
 } from './chat.js'
 
@@ -450,6 +451,15 @@ test('a confirmation that stated no price does not read as a lookup that failed'
 test('a booked item is marked the same way whatever kind it is', () => {
   assert.equal(bookedMark({ confirmation_code: 'KL7788' }), 'booked \u00b7 KL7788')
   assert.equal(bookedMark({ confirmation_code: null }), 'booked')
+})
+
+test('the notes core sends are headed the same way on the page and on paper', () => {
+  // Not "Connection check.": `itinerary_notes` also speaks when two legs
+  // land and leave from different airports, at any gap, and that heading
+  // over an outbound and a return a week apart claims the connection the
+  // join cards stopped claiming. The printed plan pins the same literal in
+  // `trip_pdf.rs`, which is the only thing keeping the two in step.
+  assert.equal(ITINERARY_NOTE, 'Itinerary note.')
 })
 
 test('a trip with every flight bought is called booked, not ready to price', () => {

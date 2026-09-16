@@ -520,6 +520,16 @@ fn saved_total(plan: &Plan) -> Option<String> {
     })
 }
 
+/// "a, b and c": a list in a sentence, which is where these are read.
+/// The paper half of `chat.js::listOf`.
+fn list_of(items: &[String]) -> String {
+    match items.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 /// The notice at the top of the plan, as `(headline, detail, class)`. The
 /// paper half of `chat.js::readinessAlert`, and it has to agree with it in
 /// all three states: a hand-off copy that tells its reader to go and shop
@@ -576,16 +586,6 @@ fn readiness_notice(readiness: &Readiness, flights: usize) -> (&'static str, Str
 /// Nothing is lost by the silence over a booked stay: `itinerary_notes` in
 /// core still reports a tight turnaround between consecutive flights
 /// whatever sits between them, and this plan prints those notes above.
-/// "a, b and c": a list in a sentence, which is where these are read.
-/// The paper half of `chat.js::listOf`.
-fn list_of(items: &[String]) -> String {
-    match items.split_last() {
-        Some((last, [])) => last.clone(),
-        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
-        None => String::new(),
-    }
-}
-
 fn connection(
     before: &TripItem,
     after: &TripItem,
@@ -763,7 +763,10 @@ pub fn html(plan: &Plan) -> String {
     for note in &plan.notes {
         write!(
             out,
-            "<div class=\"notice\"><strong>Connection note.</strong> {}</div>",
+            // `chat.js::ITINERARY_NOTE`, which has the long version: these
+            // notes are not all about connections, and the two surfaces
+            // were heading the same sentence two different ways.
+            "<div class=\"notice\"><strong>Itinerary note.</strong> {}</div>",
             escape(note)
         )
         .unwrap();
@@ -1032,6 +1035,10 @@ mod tests {
             "from €126.00",
             "estimate when saved",
             "Saved itinerary, not a ticket",
+            // The heading over core's notes, pinned here and in
+            // chat.test.mjs: the two surfaces headed the same sentence two
+            // different ways, and nothing else holds them together.
+            "<strong>Itinerary note.</strong> Separate tickets need extra care.",
             // The stay is on the page as its own line, escaped like the
             // rest: kind, name, place, its range, and the booking code.
             "<div class=\"number\">Stay</div>",

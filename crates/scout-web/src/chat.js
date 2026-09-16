@@ -396,6 +396,15 @@ function listOf(items) {
     : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
 }
 
+// What heads the notes core sends with a trip. It said "Connection
+// check.", which those notes outgrew: `itinerary_notes` also speaks when
+// two legs land and leave from different airports, at any gap at all, and
+// heading that "Connection check." over an outbound and a return a week
+// apart claims the connection the join cards below stopped claiming. The
+// printed plan headed the same notes "Connection note.", which was the
+// two surfaces disagreeing about one sentence; both say this now.
+export const ITINERARY_NOTE = 'Itinerary note.'
+
 // The alert above the timeline, from the three states `Readiness` can be
 // in — or `null` when this page cannot read the one it was sent, which is
 // a tab open across a deploy. Saying nothing is the only answer that
@@ -1541,7 +1550,7 @@ function start() {
     }
     for (const note of trip.notes ?? []) {
       const alert = node('div', 'trip-alert')
-      alert.append(node('strong', '', 'Connection check.'), document.createTextNode(` ${note}`))
+      alert.append(node('strong', '', ITINERARY_NOTE), document.createTextNode(` ${note}`))
       tripDetail.append(alert)
     }
 

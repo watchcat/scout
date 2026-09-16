@@ -92,8 +92,9 @@ pub struct Extraction {
     #[serde(default)] pub summary: String,
 }
 
-/// More than an email can honestly confirm; the cap is there so a model
-/// that starts repeating itself cannot fill a trip with it.
+/// More than one email can honestly confirm. The whole answer is read
+/// into JSON before this applies, so it bounds what can reach a trip, not
+/// what the parser does.
 pub const MAX_BOOKINGS: usize = 10;
 
 impl Extraction {
@@ -101,10 +102,12 @@ impl Extraction {
     /// model's text, parsed, then each entry checked.
     ///
     /// One email is one to many bookings — a return ticket confirms two —
-    /// so the answer is a `bookings` list. A bare object in the old shape
-    /// is read as a list of one, since a model that ignores the shape must
-    /// not cost the reader their booking. An empty list still yields one
-    /// reading, not none, so the mail shows under Other mail rather than
+    /// so the answer is a `bookings` list. The shapes a model drifts into
+    /// are read rather than refused, since drift must not cost the reader
+    /// their booking: a bare object in the old shape, one object where the
+    /// list goes, a null for an empty list, and a list one entry of which
+    /// is nonsense. An answer that ends up with no readings at all still
+    /// yields one, not none, so the mail shows under Other mail rather than
     /// disappearing.
     pub fn parse_many(text: &str) -> anyhow::Result<Vec<Self>> {
         let text = crate::text::strip_thinking(text);
@@ -117,12 +120,13 @@ impl Extraction {
             .ok_or_else(|| anyhow::anyhow!("no JSON in the answer"))?;
         let root: serde_json::Value = serde_json::from_str(&text[start..=end])?;
         let mut list: Vec<Self> = match root.get("bookings") {
-            Some(serde_json::Value::Array(items)) => items
-                .iter()
-                .take(MAX_BOOKINGS)
-                .map(|item| Ok(serde_json::from_value::<Self>(item.clone())?.checked()))
-                .collect::<anyhow::Result<_>>()?,
-            Some(_) => anyhow::bail!("\"bookings\" is not a list"),
+            Some(serde_json::Value::Array(items)) => readable(items.iter().take(MAX_BOOKINGS)),
+            // The old prompt asked for exactly one object, so a model that
+            // half-remembers the shape puts one where the list goes.
+            Some(one @ serde_json::Value::Object(_)) => readable(std::iter::once(one)),
+            // Nothing booked, said as null rather than as an empty list.
+            Some(serde_json::Value::Null) => Vec::new(),
+            Some(_) => anyhow::bail!("\"bookings\" is neither a list of bookings nor one booking"),
             None => vec![serde_json::from_value::<Self>(root.clone())?.checked()],
         };
         if list.is_empty() {
@@ -130,12 +134,24 @@ impl Extraction {
             list.push(Self { summary: summary.to_string(), ..Self::default() }.checked());
         }
         // Models repeat the ticket total on every leg whatever the prompt
-        // says, and a doubled price makes every trip total wrong: one price
-        // said twice under one confirmation code is one total, not money
-        // paid twice, so only the first entry keeps it.
+        // says, and a doubled price makes every trip total wrong. So an
+        // entry's price is dropped when an earlier booking states the same
+        // amount under the same confirmation code: one code is one ticket,
+        // and one ticket was paid for once.
+        //
+        // Both sides need a code for that to hold. Two entries with no code
+        // are two things booked however alike their prices, and dropping
+        // one would under-report the total as badly as a repeat
+        // over-reports it. An entry downgraded to not-a-booking anchors
+        // nothing either: it is not part of any total. Currency is not
+        // compared — under one code there is one of those, and comparing it
+        // would only let a model that labelled the legs differently put the
+        // doubled total back.
         for i in 1..list.len() {
             let repeat = list[..i].iter().any(|earlier| {
-                earlier.price.is_some()
+                earlier.booking
+                    && earlier.price.is_some()
+                    && earlier.confirmation_code.is_some()
                     && earlier.price == list[i].price
                     && earlier.confirmation_code == list[i].confirmation_code
             });
@@ -192,6 +208,24 @@ impl Extraction {
     }
 }
 
+/// The entries an answer's list could be read as, checked, in order. An
+/// entry the shape of nothing at all is left out rather than taking the
+/// rest of the mail's bookings with it: failing the whole answer would
+/// spend the mail's attempts and file it as unreadable, losing the legs
+/// that were perfectly clear. When nothing survives, `parse_many`'s empty
+/// branch still files the mail under Other mail.
+fn readable<'a>(items: impl Iterator<Item = &'a serde_json::Value>) -> Vec<Extraction> {
+    items
+        .filter_map(|item| match serde_json::from_value::<Extraction>(item.clone()) {
+            Ok(e) => Some(e.checked()),
+            Err(e) => {
+                tracing::warn!(error = %e, "a booking in the answer could not be read and was left out");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Longer than a chat turn's budget would be: the mail is read once, off
 /// any request path, and a slow answer is better than a retry.
 pub const EXTRACT_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
@@ -231,6 +265,18 @@ pub(crate) fn place_arrival(store: &Store, account_id: i64, e: &Extraction) -> a
 }
 
 fn place_by(store: &Store, account_id: i64, date: &str, place: Option<&str>) -> anyhow::Result<Placement> {
+    if let Some(id) = match_trip(store, account_id, date, place)? {
+        return Ok(Placement::Trip(id));
+    }
+    let trip = store.upsert_trip(account_id, &draft_name(place, date)?, None, None, None)?;
+    Ok(Placement::Draft(trip.id))
+}
+
+/// The trip a booking on `date` near `place` fits, or `None`. Read-only,
+/// and split out for that: a caller with several bookings off one mail can
+/// ask about each of them before deciding that none fit and a draft is
+/// owed.
+fn match_trip(store: &Store, account_id: i64, date: &str, place: Option<&str>) -> anyhow::Result<Option<i64>> {
     let needle = place.unwrap_or("").trim().to_lowercase();
     // (trip id, 0 when the trip names the place, 1 when only the dates fit)
     let mut best: Option<(i64, i64)> = None;
@@ -260,14 +306,12 @@ fn place_by(store: &Store, account_id: i64, date: &str, place: Option<&str>) -> 
             best = Some((trip.id, score));
         }
     }
-    if let Some((id, _)) = best {
-        return Ok(Placement::Trip(id));
-    }
-    let trip = store.upsert_trip(account_id, &draft_name(place, date)?, None, None, None)?;
-    Ok(Placement::Draft(trip.id))
+    Ok(best.map(|(id, _)| id))
 }
 
 /// "Lisbon, October", or "Trip, October" when the mail named no place.
+/// The month is the date's — for a ticket, the first leg's — so a trip
+/// that leaves on 28 December and comes back in January is "December".
 fn draft_name(place: Option<&str>, date: &str) -> anyhow::Result<String> {
     let month = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?.format("%B").to_string();
     Ok(match place.map(str::trim).filter(|p| !p.is_empty()) {
@@ -494,19 +538,34 @@ pub async fn record_arrivals(
 ) -> anyhow::Result<(Vec<i64>, Option<Placement>)> {
     let store = core.store();
     blocking(move || {
-        // One confirmation is one journey: the first booking with a date
-        // decides where the mail lands, and the rest of the mail's bookings
-        // go with it. Placing each on its own would put the legs of a round
-        // trip on two drafts — a draft holds no items until Add, and
-        // placement matches on the dates of a trip's items, so a return
-        // three weeks out cannot see the draft just made for the outbound.
-        let placement = readings
-            .iter()
-            .find(|e| e.booking && e.date.is_some())
-            .map(|e| place_arrival(&store, account_id, e))
-            .transpose()?;
-        let rows: Vec<NewArrival> =
-            readings.into_iter().map(|e| row_for(e, placement)).collect();
+        // One confirmation is one journey: the mail is placed once and all
+        // of its bookings go there. Placing each on its own would put the
+        // legs of a round trip on two drafts — a draft holds no items until
+        // Add, and placement matches on the dates of a trip's items, so a
+        // return three weeks out cannot see the draft just made for the
+        // outbound.
+        //
+        // Every dated booking is asked, not only the first: an outbound
+        // that names no place matches nothing on its own, and the ticket
+        // would start a bare draft beside the trip its return plainly
+        // belongs to. The first leg that fits a trip takes the mail there;
+        // when none fit, the first dated booking names the draft.
+        let placement = {
+            let dated: Vec<&Extraction> = readings.iter().filter(|e| e.booking && e.date.is_some()).collect();
+            let mut fitted = None;
+            for e in &dated {
+                let date = e.date.as_deref().unwrap_or_default();
+                if let Some(id) = match_trip(&store, account_id, date, e.place.as_deref())? {
+                    fitted = Some(Placement::Trip(id));
+                    break;
+                }
+            }
+            match fitted {
+                Some(p) => Some(p),
+                None => dated.first().map(|e| place_arrival(&store, account_id, e)).transpose()?,
+            }
+        };
+        let rows: Vec<NewArrival> = readings.into_iter().map(|e| row_for(e, placement)).collect();
         let ids = store.insert_arrivals(account_id, mail_id, &rows)?;
         Ok((ids, placement))
     })
@@ -517,26 +576,24 @@ pub async fn record_arrivals(
 /// no trip, whatever the rest of the mail booked.
 fn row_for(e: Extraction, placement: Option<Placement>) -> NewArrival {
     let trip_id = if e.booking { placement.map(|p| p.id()) } else { None };
-    {
-        NewArrival {
-            booking: e.booking,
-            kind: e.kind,
-            title: e.title,
-            place: e.place,
-            origin: e.origin,
-            destination: e.destination,
-            date: e.date,
-            starts_at: e.starts_at,
-            ends_at: e.ends_at,
-            timezone: e.timezone,
-            confirmation_code: e.confirmation_code,
-            price: e.price,
-            currency: e.currency,
-            travellers: e.travellers.map(|names| names.join(", ")),
-            confidence: e.confidence,
-            summary: e.summary,
-            trip_id,
-        }
+    NewArrival {
+        booking: e.booking,
+        kind: e.kind,
+        title: e.title,
+        place: e.place,
+        origin: e.origin,
+        destination: e.destination,
+        date: e.date,
+        starts_at: e.starts_at,
+        ends_at: e.ends_at,
+        timezone: e.timezone,
+        confirmation_code: e.confirmation_code,
+        price: e.price,
+        currency: e.currency,
+        travellers: e.travellers.map(|names| names.join(", ")),
+        confidence: e.confidence,
+        summary: e.summary,
+        trip_id,
     }
 }
 
@@ -1015,6 +1072,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!((legs[0].price, legs[1].price), (Some(520.0), Some(322.5)));
+        // No code to tie them together: two things booked that happen to
+        // cost the same are two prices, and dropping one would under-report
+        // the trip total as badly as a doubled one over-reports it.
+        let nights = Extraction::parse_many(
+            r#"{"bookings":[
+              {"booking":true,"kind":"stay","place":"Lisbon","date":"2026-10-12","price":120.0,"summary":"one night"},
+              {"booking":true,"kind":"stay","place":"Porto","date":"2026-10-13","price":120.0,"summary":"another night"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!((nights[0].price, nights[1].price), (Some(120.0), Some(120.0)));
+        // A downgraded entry is not part of any total, so it cannot take a
+        // real booking's price with it.
+        let mixed = Extraction::parse_many(
+            r#"{"bookings":[
+              {"booking":true,"kind":"cruise","confirmation_code":"KL7788","price":842.5,"summary":"not one of the four"},
+              {"booking":true,"kind":"flight","origin":"AMS","destination":"HKG","date":"2026-11-02","confirmation_code":"KL7788","price":842.5,"summary":"the flight"}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(!mixed[0].booking, "a kind outside the four is no booking");
+        assert_eq!(mixed[1].price, Some(842.5), "the flight keeps the total");
+    }
+
+    #[test]
+    fn a_shape_the_model_drifted_into_is_read_where_it_can_be() {
+        // One malformed entry is left out; the rest of the ticket stands.
+        // Failing the mail would spend its attempts and file it as
+        // unreadable with every booking in it gone.
+        let kept = Extraction::parse_many(
+            r#"{"bookings":["sorry, I could not tell",{"booking":true,"kind":"stay","title":"Hotel Alfama","place":"Lisbon","date":"2026-10-12","summary":"Hotel Alfama"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].title.as_deref(), Some("Hotel Alfama"));
+        // The old prompt asked for exactly one object, so a model that
+        // half-remembers the shape puts one where the list goes.
+        let one = Extraction::parse_many(
+            r#"{"bookings":{"booking":true,"kind":"stay","title":"Hotel Alfama","date":"2026-10-12","summary":"Hotel Alfama"}}"#,
+        )
+        .unwrap();
+        assert_eq!((one.len(), one[0].booking), (1, true));
+        // Nothing booked, said as null rather than as an empty list.
+        let none = Extraction::parse_many(r#"{"bookings":null,"summary":"A newsletter"}"#).unwrap();
+        assert_eq!((none.len(), none[0].booking, none[0].summary.as_str()), (1, false, "A newsletter"));
+        // Anything else under that key is an answer nobody can act on.
+        assert!(Extraction::parse_many(r#"{"bookings":7}"#).is_err());
     }
 
     #[test]
@@ -1338,6 +1442,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_ticket_joins_the_trip_any_of_its_legs_fits() {
+        // The outbound matches nothing and names no place, so on its own it
+        // would start a bare draft — next to the trip the return plainly
+        // belongs to. Every dated leg is asked before a draft is made.
+        let (core, _dir) = core();
+        let store = core.store();
+        let a = store.account_for_telegram(1).unwrap();
+        let home = store.upsert_trip(a, "Amsterdam, November", None, None, None).unwrap();
+        store.add_flight(home.id, "LHR", "AMS", "2026-11-22").unwrap();
+        store.add_flight(home.id, "AMS", "LHR", "2026-11-24").unwrap();
+        let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().unwrap();
+        let legs = vec![
+            Extraction {
+                origin: Some("AMS".into()),
+                destination: Some("HKG".into()),
+                ..arrival("flight", "AMS → HKG", None, "2026-11-02")
+            },
+            Extraction {
+                origin: Some("HKG".into()),
+                destination: Some("AMS".into()),
+                ..arrival("flight", "HKG → AMS", None, "2026-11-23")
+            },
+        ];
+        let (ids, placement) = record_arrivals(&core, a, mail_id, legs).await.unwrap();
+        assert_eq!(placement, Some(Placement::Trip(home.id)), "the return's trip took the ticket");
+        assert_eq!(store.list_trips(a).unwrap().len(), 1, "no draft beside the trip it belongs to");
+        for id in ids {
+            assert_eq!(store.arrival_of(id, a).unwrap().unwrap().trip_id, Some(home.id));
+        }
+    }
+
+    #[tokio::test]
     async fn a_mail_that_booked_nothing_is_still_filed() {
         let (core, _dir) = core();
         let store = core.store();
@@ -1350,6 +1486,7 @@ mod tests {
         mail_done(&core, mail_id).await.unwrap();
         let v = view(&core, a, "d").await.unwrap();
         assert!(v.pending.is_empty());
+        assert_eq!(v.other.len(), 1, "{v:?}");
         assert_eq!(
             (v.other[0].arrival_id, v.other[0].reason.as_str()),
             (Some(ids[0]), "not_booking"),

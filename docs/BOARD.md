@@ -6,7 +6,6 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## In progress
 
-- [ ] **A booking address for every account** — `<handle>@goodscout.fyi` via Resend inbound; forwarded, extracted into arrivals, reviewed inline on the trip timeline. Spec: docs/superpowers/specs/2026-09-15-trip-inbox-design.md
 
 ## Next
 
@@ -48,6 +47,7 @@ Move a card by moving its line. Add the date when a card lands in **Done**.
 
 ## Done
 
+- [x] 2026-09-16 — **A booking address for every account** (`7461465`): `<handle>@goodscout.fyi` via Resend inbound. A signed webhook stores the mail; a worker forwards it to the person's own email, reads it with one tool-less model call into an arrival, places it on the overlapping trip or a new draft, and nudges Telegram. The Trips tab shows dashed pending rows with Add / Not this trip / Ignore; Other mail lists the rest for thirty days. Off until `RESEND_WEBHOOK_SECRET`, the Resend receiving domain (MX at Porkbun) and the `email.received` webhook exist. Spec: docs/superpowers/specs/2026-09-15-trip-inbox-design.md
 - [x] 2026-09-15 — **One timeline for a trip** (`851fb62`): trip_items replaces trip_segments + segment_candidates: flights, stays, activities and transport in one date-ordered list, positions recomputed on every write; add_trip_item from chat; finalise_trip sums fixed costs. Spec: docs/superpowers/specs/2026-09-15-trip-timeline-design.md
 - [x] 2026-09-14 — **Debug trace behind every answer** (`b3708e0`): `/debug on|off` in the web chat (admins only, per account). Every run records a trace: each tool call with args, duration, status and result, nested flight-desk calls, run-level events. A Trace button under each Scout turn opens the panel; live rows stream during a run. Spec: `docs/superpowers/specs/2026-09-13-debug-trace-design.md`
 - [x] 2026-09-08 — **Crawlable front door** (`532f30e`): robots.txt, sitemap.xml, meta description and Open Graph tags on the landing page, www redirected to the apex. Google still showed Porkbun's parking page; www needs an A record at the DNS provider first.

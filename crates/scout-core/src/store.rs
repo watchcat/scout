@@ -2032,6 +2032,18 @@ impl Store {
                          (SELECT id FROM trips WHERE conversation_id = ?))",
                 params![conversation_id],
             )?;
+            // A booking Added from the inbox can land on a thread's own
+            // trip, tickets and all, so this cascade has to decide about
+            // those files exactly as removing the item by hand would —
+            // see `release_attachments_within`.
+            let mut stmt = conn.prepare(
+                "SELECT i.id FROM trip_items i JOIN trips t ON t.id = i.trip_id
+                 WHERE t.conversation_id = ?",
+            )?;
+            let items: Vec<i64> =
+                stmt.query_map(params![conversation_id], |r| r.get(0))?.collect::<duckdb::Result<_>>()?;
+            drop(stmt);
+            release_attachments_within(&conn, &items)?;
             conn.execute(
                 "DELETE FROM trip_items WHERE trip_id IN
                      (SELECT id FROM trips WHERE conversation_id = ?)",
@@ -3978,6 +3990,18 @@ fn delete_drafts_within(conn: &Connection, conversation_ids: &[i64]) -> Result<u
         ),
         duckdb::params_from_iter(conversation_ids.iter()),
     )?;
+    // Nothing reaches this today — a draft is kept the moment a booking
+    // lands on it, so a draft holding a ticket is a state only a future
+    // edit could produce. It follows the rule anyway, because this delete
+    // runs on a timer and a difference discovered later would be
+    // discovered as rows nobody can account for.
+    let mut stmt =
+        conn.prepare(&format!("SELECT id FROM trip_items WHERE trip_id IN {doomed}"))?;
+    let items: Vec<i64> = stmt
+        .query_map(duckdb::params_from_iter(conversation_ids.iter()), |r| r.get(0))?
+        .collect::<duckdb::Result<_>>()?;
+    drop(stmt);
+    release_attachments_within(conn, &items)?;
     conn.execute(
         &format!("DELETE FROM trip_items WHERE trip_id IN {doomed}"),
         duckdb::params_from_iter(conversation_ids.iter()),
@@ -9316,6 +9340,76 @@ CREATE TABLE messages (
             store.attachment(ticket).unwrap().expect("its mail is still there").1,
             None,
             "the ticket was left pointing at an item the trip took with it",
+        );
+        assert!(store.attachment(boarding).unwrap().is_none(), "a file no mail and no item can reach was kept");
+    }
+
+    #[test]
+    fn deleting_a_thread_decides_its_trips_files_the_way_removing_one_item_does() {
+        // The third path that deletes `trip_items`, and a reachable one: a
+        // booking Added from the inbox lands on whichever trip the reader
+        // chose, which can be a thread's own trip, and deleting the thread
+        // cascades to it. Same rule, because the rule is about the file,
+        // not about which button deleted the item.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let chat = store.start_conversation(a, "direct").unwrap();
+        let live = mail(&store, a, "re_1");
+        let doomed = mail(&store, a, "re_2");
+        let ticket = store.insert_attachment(live, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let boarding = store.insert_attachment(doomed, "boarding.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let trip = store.upsert_trip(a, "Lisbon", None, None, Some(chat)).unwrap();
+        let (_, hotel) = stay_with(&store, trip.id, "Hotel Alfama");
+        store.attach_to_item(ticket, hotel).unwrap();
+        store.attach_to_item(boarding, hotel).unwrap();
+        delete_mail_now(&store, a, doomed);
+
+        assert!(store.delete_conversation(a, chat).unwrap());
+
+        assert_eq!(
+            store.attachment(ticket).unwrap().expect("its mail is still there").1,
+            None,
+            "the ticket was left pointing at an item the thread's cascade took",
+        );
+        assert!(store.attachment(boarding).unwrap().is_none(), "a file no mail and no item can reach was kept");
+    }
+
+    #[test]
+    fn a_draft_collected_by_thread_expiry_decides_its_files_too() {
+        // The fourth path, and the one nothing reaches today: a draft is
+        // kept the moment a booking lands on it, so a draft holding a
+        // ticket is a state only a future edit could produce. It follows
+        // the same rule anyway — this delete is on a timer with nobody
+        // watching, and discovering the difference later would mean
+        // discovering it as rows nobody can account for.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let stale = store.start_conversation(a, "direct").unwrap();
+        let live = mail(&store, a, "re_1");
+        let doomed = mail(&store, a, "re_2");
+        let ticket = store.insert_attachment(live, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let boarding = store.insert_attachment(doomed, "boarding.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let draft = store.upsert_trip(a, "Draft loop", None, None, Some(stale)).unwrap();
+        let (_, hotel) = stay_with(&store, draft.id, "Hotel Alfama");
+        store.attach_to_item(ticket, hotel).unwrap();
+        store.attach_to_item(boarding, hotel).unwrap();
+        delete_mail_now(&store, a, doomed);
+        // A formatted literal interval, for the binding failure
+        // `expiry_deletes_the_draft_and_lets_the_kept_trip_go_free` names.
+        store
+            .conn()
+            .execute_batch(&format!(
+                "UPDATE conversations SET updated_at = CAST(current_timestamp AS TIMESTAMP) - to_seconds(72 * 3600) WHERE id = {stale};"
+            ))
+            .unwrap();
+
+        assert_eq!(store.expire_conversations(48 * 3600, &[]).unwrap(), 1);
+
+        assert!(store.find_trip(a, "Draft loop").unwrap().is_none(), "the draft must go for this test to mean anything");
+        assert_eq!(
+            store.attachment(ticket).unwrap().expect("its mail is still there").1,
+            None,
+            "the ticket was left pointing at an item the expiry took",
         );
         assert!(store.attachment(boarding).unwrap().is_none(), "a file no mail and no item can reach was kept");
     }

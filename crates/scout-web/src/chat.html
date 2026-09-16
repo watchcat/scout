@@ -547,25 +547,57 @@
     .side{display:none; border-right:0; border-bottom:1px solid #0d4a5a; max-height:40dvh; padding:0 0 8px}
     .side.open{display:block}
     .menu{display:block}
-    .trips-view{display:flex; flex-direction:column; gap:12px; overflow:hidden}
-    /* Capped and scrolling rather than free: with Other mail and the
-       address line stacked under the trip strip, a free aside took the
-       screen and left the trip itself an 80px slot. The cap only bites
-       once those sections exist — without them the aside is shorter than
-       it anyway, and this tab is as it was. */
-    .trip-side{flex:none; min-height:auto; max-height:44dvh; overflow-y:auto; padding:0; border-right:0}
-    .trip-side-head{padding:0 2px 10px}
+    /* One scroller, in reading order. The aside is a column beside the
+       trip on a wide screen and three unrelated things stacked on top of
+       it on a phone, so here it stops being a box at all: `display:
+       contents` hands its children to the column and `order` puts the
+       trip the reader opened above the mail and the address, which were
+       sitting between the list and it. The cap that used to hold the
+       aside to 44dvh goes with them — it was rationing a screen this
+       order no longer fights over — and so does the second scroller, so
+       a thumb drags the whole tab rather than whichever box it started
+       in. */
+    .trips-view{display:flex; flex-direction:column; gap:12px;
+      overflow-y:auto; overflow-x:hidden; overscroll-behavior:contain}
+    .trip-side{display:contents}
+    .trip-side-head{order:1; flex:none; padding:0 2px 10px}
     .trip-side h1{font-size:17px}
-    .trip-list{flex-direction:row; overflow-x:auto; padding:0 0 7px; scrollbar-width:thin}
-    .trip-list li{flex:0 0 164px}
-    .other-mail{margin-top:10px; padding:0}
-    .handle-line{margin-top:10px; padding:10px 0 0}
+    .trip-list{order:2; flex:none; flex-direction:row; overflow-x:auto; padding:0 0 7px; scrollbar-width:thin}
+    /* Narrow enough that the next trip shows an edge: a strip that ends
+       flush with the screen looks like the whole list. */
+    .trip-list li{flex:0 0 min(164px, 78%)}
     .trip-list button{background:rgba(7,54,66,.5)}
-    .trip-detail{padding-right:0}
+    /* `flex:none` on every one of these, or the column shrinks them to
+       fit the screen it has and their content paints straight over
+       whatever comes next: the mail section landed on top of the trip's
+       timeline. They keep their own height and the container scrolls. */
+    .trip-detail{order:3; flex:none; min-height:0; overflow:visible; padding-right:0}
+    .other-mail{order:4; flex:none; margin-top:2px; padding:0}
+    .handle-line{order:5; flex:none; margin-top:2px; padding:10px 0 0}
+    /* The head sat the title beside the date and Remove, and the actions
+       are `flex:none`, so a phone gave "Hotel Alfama Patio" about 150px
+       and it came out three words tall. The title takes a row of its own
+       and the date and the button share the next one. */
+    .segment-head{flex-wrap:wrap; gap:6px 12px}
+    .segment-head > :first-child{flex:1 1 100%; min-width:0}
+    .segment-head-actions{width:100%; justify-content:space-between}
+    /* Touch targets. These come to about 31px tall at the desktop scale,
+       and the row of them decides whether a booking joins a trip or is
+       thrown away — not a thing to mis-tap with a thumb. The circle that
+       deletes a whole trip was 28px. */
+    .pending-actions button, .pending-picker button, .other-mail-add,
+    .handle-row button, .handle-cancel, .segment-remove-button,
+    .trip-keep, .trip-download{min-height:42px; padding:10px 14px; font-size:13px}
+    .trip-delete-button{width:42px; height:42px; font-size:20px}
     .trip-overview{padding:15px 12px}
     .trip-point{min-width:64px; flex:1}
-    .trip-head{margin-bottom:14px}
-    .trip-head-actions{align-items:flex-end; flex-direction:column-reverse; gap:3px}
+    /* Same reason as the card heads below: the actions column took a
+       third of the width and pushed "Lisbon, October" onto two lines.
+       The name gets the row, the chip and the buttons get the next one. */
+    .trip-head{margin-bottom:14px; flex-wrap:wrap; gap:10px}
+    .trip-head > :first-child{flex:1 1 100%; min-width:0}
+    .trip-head-actions{width:100%; flex-direction:row; flex-wrap:wrap;
+      align-items:center; justify-content:flex-start; gap:8px}
     .trip-title{font-size:26px}
     .flight-option{grid-template-columns:24px minmax(0,1fr); gap:9px 8px; padding:14px 12px}
     .option-price{grid-column:2; min-width:0; text-align:left; display:flex; align-items:baseline; gap:5px}

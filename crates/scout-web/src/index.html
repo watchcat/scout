@@ -82,17 +82,25 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:var(--t-xs);
     overflow-x:auto; line-height:2;
   }
-  .board .row{white-space:pre; color:var(--base1); display:block;
+  /* A grid, not a run of preformatted text. Fixed columns keep the
+     numbers under one another the way the monospace run did, and let the
+     phone rule at the foot of this sheet rearrange the same cells instead
+     of scrolling them off the edge — what fell off there was the shop,
+     which is half of what is being compared. */
+  .board .row{display:grid; grid-template-columns:5.4em 6.6em 1.4em 6em 1fr;
+    align-items:baseline; gap:0 var(--s-3); margin:0; color:var(--base1);
     padding-left:var(--s-3); border-left:2px solid transparent}
+  .board .to{color:var(--base0)}
+  .board .size{color:var(--base0)}
   /* The winner is marked, not merely brighter: the eye should land on it
      before it reads a single number. `--green` because that is already the
      colour the per-unit figure is written in. */
   .board .row.win{color:var(--base2); border-left-color:var(--green)}
   .board .unit{color:var(--unit); font-weight:600}
   .board .ship{color:var(--ship)}
-  .board .shop{color:var(--base1)}
+  .board .shop{color:var(--base1); display:grid; grid-template-columns:9.6em auto}
   .board .hdr{color:var(--base1); border-bottom:1px solid var(--rule);
-    padding-bottom:var(--s-2); margin-bottom:var(--s-2); display:block}
+    padding-bottom:var(--s-2); margin-bottom:var(--s-2)}
   .caption{font-size:var(--t-xs); color:var(--base0); margin:0 0 var(--s-6); max-width:44em}
 
   /* The sign-in line below this reuses `.caption`, which sets no top
@@ -212,6 +220,22 @@
   }
 
   @media(max-width:680px){
+    /* The five monospace columns are wider than a phone, and the one that
+       fell off the right was the shop. Same cells, two rows each: who is
+       selling and what it costs per wash on top, what you actually hand
+       over underneath. */
+    .board{line-height:1.5; padding:var(--s-3) var(--s-3) var(--s-2)}
+    .board .hdr,.board .to{display:none}
+    .board .row{grid-template-columns:1fr auto; gap:1px var(--s-3);
+      padding:var(--s-3) 0 var(--s-3) var(--s-3)}
+    .board .row + .row{border-top:1px solid var(--rule)}
+    .board .row>:nth-child(5){grid-area:1 / 1}
+    .board .row>:nth-child(4){grid-area:1 / 2; justify-self:end; font-size:var(--t-base)}
+    .board .row>:nth-child(4)::after{content:' per wash'; font-size:.72em; color:var(--base0)}
+    .board .row>:nth-child(1){grid-area:2 / 1}
+    .board .row>:nth-child(2){grid-area:2 / 2; justify-self:end}
+    .board .shop{display:block}
+    .board .size{display:block; font-size:.92em}
     .mark{gap:var(--s-3); margin-bottom:var(--s-4)}
     .mark .logo{width:66px; height:66px}
     .cols{grid-template-columns:1fr; gap:var(--s-4)}
@@ -248,10 +272,10 @@
   </p>
 
   <div class="board">
-    <span class="row hdr">  price      shipping        per wash      shop</span>
-<span class="row win">  €18.49   + €0.00    →    <span class="unit">€0.31</span>       <span class="shop">bol.com          60 washes</span></span>
-<span class="row">  €12.95   + <span class="ship">€4.95</span>    →    €0.45       <span class="shop">123schoon.nl     40 washes</span></span>
-<span class="row">  €15.17   + <span class="ship">€16.98</span>   →    €0.53       <span class="shop">marktplaats.nl   60 washes</span></span>
+    <p class="row hdr"><span>price</span><span>shipping</span><span></span><span>per wash</span><span>shop</span></p>
+    <p class="row win"><span>€18.49</span><span>+ €0.00</span><span class="to" aria-hidden="true">→</span><span class="unit">€0.31</span><span class="shop">bol.com <span class="size">60 washes</span></span></p>
+    <p class="row"><span>€12.95</span><span>+ <span class="ship">€4.95</span></span><span class="to" aria-hidden="true">→</span><span>€0.45</span><span class="shop">123schoon.nl <span class="size">40 washes</span></span></p>
+    <p class="row"><span>€15.17</span><span>+ <span class="ship">€16.98</span></span><span class="to" aria-hidden="true">→</span><span>€0.53</span><span class="shop">marktplaats.nl <span class="size">60 washes</span></span></p>
   </div>
   <p class="caption">
     The cheapest sticker price is the worst deal of the three. Scout compares

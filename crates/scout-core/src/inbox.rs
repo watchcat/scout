@@ -497,6 +497,22 @@ pub async fn view(core: &Core, account_id: i64, domain: &str) -> anyhow::Result<
         let mut view = store.inbox_view(account_id)?;
         view.handle = store.handle_of(account_id)?;
         view.domain = domain;
+        // The same seam the two fields above use, and for the same
+        // reason: the store cannot answer this without holding a copy of
+        // the rule the worker forwards by. Derived at read time rather
+        // than stored on the mail, so there is one answer to the
+        // question and the row cannot drift from what the worker did.
+        //
+        // One residual, which storing a column would not have fixed
+        // either: this reads the sender the webhook stored, while the
+        // worker compares the one the received record carries. They are
+        // one From header read by two Resend calls, and the row's copy
+        // is the one a person can see — but if the two ever disagreed,
+        // the row would describe a mail the worker treated differently.
+        let theirs = store.emails_of(account_id)?;
+        for row in &mut view.other {
+            row.sent_by_you = sender_is_the_account(&row.from, &theirs);
+        }
         Ok(view)
     })
     .await
@@ -2448,6 +2464,30 @@ mod tests {
         let mine = emails_of(&core, a).await.unwrap();
         assert_eq!(mine, ["sasha@example.com", "sasha@work.example"]);
         assert!(sender_is_the_account("sasha@work.example", &mine));
+    }
+
+    #[tokio::test]
+    async fn an_other_mail_row_says_when_the_reader_is_the_one_who_sent_it() {
+        // Not stored on the mail: it is the same question the worker
+        // asked before deciding not to forward, and two copies of one
+        // answer are two answers waiting to disagree. The row is drawn
+        // from the identities as they are now, which is also what makes
+        // it right for mail that arrived before an address was linked.
+        let (core, _dir) = core();
+        let a = core.store().account_for_telegram(1).unwrap();
+        seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
+        let theirs = record_mail(&core, a, MailIn { from: "Sasha Q <SASHA+hotels@example.com>".into(), ..mail_in("re_1") })
+            .await
+            .unwrap()
+            .unwrap();
+        let hotels = record_mail(&core, a, mail_in("re_2")).await.unwrap().unwrap();
+        for id in [theirs, hotels] {
+            mail_attempted(&core, id).await.unwrap();
+            mail_failed(&core, id, "unreadable").await.unwrap();
+        }
+        let v = view(&core, a, "d").await.unwrap();
+        let said: Vec<(i64, bool)> = v.other.iter().map(|r| (r.mail_id, r.sent_by_you)).collect();
+        assert_eq!(said, vec![(hotels, false), (theirs, true)], "newest first: the hotel's mail, then their own");
     }
 
     #[test]

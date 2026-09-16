@@ -1544,7 +1544,12 @@ mod tests {
         // account holds, not against the destination alone.
         scout_core::inbox::seed_email_identity_for_tests(&core, a, "a.work@elsewhere.example").await.unwrap();
         scout_core::inbox::seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
-        let mail_id = scout_core::inbox::record_mail(&core, a, a_mail("re_1")).await.unwrap().unwrap();
+        // The webhook said the same sender the record does: it is one
+        // From header read by two calls to Resend, and the row's copy is
+        // what the drawn row is judged by while the worker prefers the
+        // record's.
+        let theirs = MailIn { from: "Sasha Q <SASHA+hotels@Example.com>".into(), ..a_mail("re_1") };
+        let mail_id = scout_core::inbox::record_mail(&core, a, theirs).await.unwrap().unwrap();
         let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
         work_once(&core, &client, FROM, 10).await;
 
@@ -1554,6 +1559,7 @@ mod tests {
         let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
         assert_eq!(view.other[0].reason, "not_booking", "the model was still asked");
         assert!(!view.other[0].forwarded, "nothing was sent, so nothing is recorded as sent");
+        assert!(view.other[0].sent_by_you, "and the row says why, rather than leaving it to read as a failed forward");
         assert_eq!(
             scout_core::inbox::attachment_texts(&core, mail_id).await.unwrap().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
             ["ticket.pdf"],

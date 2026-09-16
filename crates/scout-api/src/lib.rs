@@ -304,6 +304,16 @@ pub struct MailRow {
     /// `not_booking` | `failed` | `ignored`
     pub reason: String,
     pub forwarded: bool,
+    /// Whether this mail came from the account itself — the person
+    /// forwarding something out of their own inbox rather than a hotel
+    /// writing to their booking address. Such a mail is deliberately not
+    /// forwarded, and the row says that rather than leaving `forwarded:
+    /// false` to read as a failure.
+    ///
+    /// Not a column on the mail: it is `sender_is_the_account` asked of
+    /// the row's sender, and `scout_core::inbox::view` fills it in, so
+    /// the page and the worker cannot come to disagree about one mail.
+    pub sent_by_you: bool,
     /// The first decided reading of that mail. One mail can hold several —
     /// a return ticket is two — and this row stands for the mail, so this
     /// names one of them rather than all.

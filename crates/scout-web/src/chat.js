@@ -540,7 +540,10 @@ export function otherMailLines(rows, locale = undefined) {
     subject: row.subject?.trim() ? row.subject : '(no subject)',
     when: dateLabel(String(row.received_at ?? '').slice(0, 10), true, locale),
     reason: MAIL_REASONS[row.reason] ?? row.reason ?? '',
-    note: row.forwarded ? 'forwarded to you' : 'not forwarded',
+    // Three states, and the reader's own mail is checked first: it is
+    // never forwarded, and "not forwarded" on a mail they sent reads as
+    // a failure when nothing failed — they hold the mail already.
+    note: row.sent_by_you ? 'you sent this to Scout' : row.forwarded ? 'forwarded to you' : 'not forwarded',
     attachments: row.attachments ?? [],
     // The one reason that gets a button; kept as a flag so the page does
     // not compare against its own display text.

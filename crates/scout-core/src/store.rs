@@ -4799,9 +4799,10 @@ impl Store {
     }
 
     /// What the Trips tab shows of the inbox: bookings still waiting, then
-    /// the last month of everything that is not one. `handle` and `domain`
-    /// are the caller's — the store knows neither the address's domain nor
-    /// how the handle should read.
+    /// the last month of everything that is not one. `handle`, `domain`
+    /// and each row's `sent_by_you` are the caller's — the store knows
+    /// neither the address's domain, nor how the handle should read, nor
+    /// which senders are the account's own.
     pub fn inbox_view(&self, account_id: i64) -> Result<scout_api::InboxView> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -4849,6 +4850,11 @@ impl Store {
                 Ok(scout_api::MailRow {
                     mail_id: r.get(0)?, from: r.get(1)?, subject: r.get(2)?, received_at: r.get(3)?,
                     forwarded: r.get(4)?, arrival_id: r.get(5)?, reason: r.get(6)?, attachments: Vec::new(),
+                    // Like `handle` and `domain` below: the caller's to
+                    // fill. Whether a sender is one of the account's own
+                    // addresses is a rule, not a query, and this module
+                    // is the wrong side of the layering to hold it.
+                    sent_by_you: false,
                 })
             })?
             .collect::<duckdb::Result<_>>()?;

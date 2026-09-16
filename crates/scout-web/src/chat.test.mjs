@@ -588,6 +588,20 @@ test('other mail reads as sender, subject, when, reason', () => {
   assert.equal(lines[1].attachments.length, 1)
 })
 
+test('an other-mail row the reader sent says so rather than reading as a failure', () => {
+  // Three states, three notes. "not forwarded" on a mail the person
+  // forwarded to Scout themselves reads as something that went wrong,
+  // when what happened is that they already hold the mail.
+  const [sent, forwarded, not] = otherMailLines([
+    { mail_id: 1, from: 'Sasha <sasha@example.com>', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking', forwarded: false, sent_by_you: true },
+    { mail_id: 2, from: 'news@flytap.com', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking', forwarded: true, sent_by_you: false },
+    { mail_id: 3, from: 'news@flytap.com', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking', forwarded: false, sent_by_you: false },
+  ])
+  assert.equal(sent.note, 'you sent this to Scout')
+  assert.equal(forwarded.note, 'forwarded to you')
+  assert.equal(not.note, 'not forwarded')
+})
+
 test('the delete button on an other-mail row names what it would delete', () => {
   // Every × in the list is the same glyph. Read on its own — which is how
   // a screen reader offers it — only the label tells them apart.

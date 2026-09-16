@@ -13,7 +13,7 @@
 
 use crate::resend::{AttachmentMeta, Meta, Outgoing, ResendClient};
 use scout_core::core::Core;
-use scout_core::inbox::{MailToWork, Placement};
+use scout_core::inbox::{MailPart, MailToWork, Placement};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -201,20 +201,18 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
     // carries none. The record's sender is preferred over the row's copy:
     // the same mail, seen in full rather than capped on the way in.
     //
-    // The record's own part list comes out with the body, because it is
-    // the only thing that says which parts are the mail's furniture — see
-    // `winnow`.
+    // The record's own part list comes out with the body. It is no longer
+    // the only thing that says which parts are furniture — the webhook
+    // said so at ingest and the row keeps it — but Resend documents
+    // neither field on this endpoint, so the record is the weaker source
+    // and is read only for mail that predates the row. `parts_of` is
+    // where the two meet; `winnow` is what does something with them.
     //
-    // Which means the retry path does without it, deliberately: a retry
-    // reuses the body off the row precisely so it does not depend on
-    // Resend being up, and fetching the record only for the winnowing
-    // would spend that call back. So on a retry the list is empty, the
-    // name rule is the only one left, and a mail whose attachments are
-    // first stored on a second pass can keep decoration a first pass
-    // would have dropped. The window is narrow — the webhook stores no
-    // body (`inbound.rs`), so a first pass always has the record, and a
-    // retry only reaches here when the listing itself failed earlier —
-    // and the cost of being wrong is a tidier card, not a lost ticket.
+    // A retry still does without the record, deliberately: it reuses the
+    // body off the row precisely so it does not depend on Resend being
+    // up, and fetching the record only for the winnowing would spend that
+    // call back. That path used to have no winnowing at all beyond the
+    // name rule; now it winnows from the row, which costs it nothing.
     let (sender, subject, text, html, listed, record) = if m.text.is_some() || m.html.is_some() {
         (m.from.clone(), m.subject.clone(), m.text.clone(), m.html.clone(), true, Vec::new())
     } else {
@@ -235,7 +233,20 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
         let mut texts = Vec::new();
         let all = client.attachments(&m.provider_id).await.map_err(resend)?;
         let listed_parts = all.len();
-        let (keep, skipped) = winnow(&record, all);
+        let stored_parts = scout_core::inbox::mail_parts(core, m.id).await.map_err(Failure::Reading)?;
+        if ids_never_met(&stored_parts, &all) {
+            // Counts only, like the lines below. This is the one that says
+            // the two calls number a part differently, which would make
+            // everything above inert while looking like a quiet mail.
+            tracing::info!(
+                id = m.id,
+                stored = stored_parts.len(),
+                listed = listed_parts,
+                "no part the webhook described was named in the attachment listing; nothing could be winnowed"
+            );
+        }
+        let parts = parts_of(record, stored_parts);
+        let (keep, skipped) = winnow(&parts, all);
         if skipped.any() {
             // Once per mail, counts only — a filename is the sender's
             // text. `info` rather than `debug`: the only subscriber in the
@@ -371,9 +382,9 @@ async fn forward(
 /// the sender's text and the log is not the place for it.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Skipped {
-    /// Parts the received record marks as the mail's own furniture.
+    /// Parts marked as the mail's own furniture.
     decoration: usize,
-    /// Parts with no filename, whatever the record says about them.
+    /// Parts with no filename, whatever else is said about them.
     nameless: usize,
 }
 
@@ -383,12 +394,111 @@ impl Skipped {
     }
 }
 
+/// What one part of a mail says about itself, from whichever source said
+/// it. Two can: the record `GET /emails/receiving/{id}` returns, which
+/// documents neither field, and the row the webhook wrote at ingest,
+/// which is where both are known to arrive. The rule below does not care
+/// which, so it is written against this rather than against either.
+///
+/// The id and the two fields, and no filename: the attachment listing is
+/// the authority on what a part is called, and a second copy here could
+/// only disagree with it.
+///
+/// `Debug` for the tests' sake, as on `MailPart`, and on the same terms:
+/// nothing here is a body or a filename, a Content-ID is still the
+/// sender's text, and the lines this module writes carry counts of these
+/// and never one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Part {
+    id: String,
+    content_disposition: Option<String>,
+    content_id: Option<String>,
+}
+
+impl From<Meta> for Part {
+    fn from(m: Meta) -> Self {
+        Self { id: m.id, content_disposition: m.content_disposition, content_id: m.content_id }
+    }
+}
+
+impl From<MailPart> for Part {
+    fn from(p: MailPart) -> Self {
+        Self { id: p.provider_id, content_disposition: p.content_disposition, content_id: p.content_id }
+    }
+}
+
+/// Whether this mail's stored parts and its listing name nothing in
+/// common — the one way this whole feature can be inert without anything
+/// looking wrong.
+///
+/// The webhook and the attachment listing are two calls to Resend, and
+/// nothing here can check that they number a part the same way; only
+/// production ever sees both for one real mail. If they do not, every
+/// stored part misses, `winnow` keeps everything, and the inbox looks
+/// exactly as it did before the rule existed. That is the question the
+/// card started from, so the answer belongs in the log rather than in
+/// another round of guessing.
+///
+/// Both halves are required. A mail stored before the parts were kept has
+/// nothing to match with, and a listing with nothing in it says nothing
+/// about anyone's ids; neither is evidence of a disagreement.
+fn ids_never_met(stored: &[MailPart], listed: &[AttachmentMeta]) -> bool {
+    !stored.is_empty()
+        && !listed.is_empty()
+        && !stored.iter().any(|p| listed.iter().any(|a| a.id == p.provider_id))
+}
+
+/// The parts to winnow by: the received record's, with the store's laid
+/// over them field by field.
+///
+/// Stored wins wherever it says anything, because it is the source we
+/// have watched arrive — the webhook payload carries both fields per
+/// part, and the record endpoint documents neither. The record is still
+/// read, because a mail that arrived before the parts were kept has
+/// nothing stored, and a rule that ignored the record would be no rule at
+/// all for those.
+///
+/// Field by field rather than part by part, and this is the whole of the
+/// care here. Every field of a stored part is optional: the webhook lists
+/// a part whatever headers the mailer put on it. Replace the part
+/// wholesale and a row that is silent about the disposition buries an
+/// `attachment` the record did state, the Content-ID is left deciding,
+/// and the ticket goes before its bytes are fetched.
+///
+/// And never the two verdicts together, in either direction: a part the
+/// store calls `attachment` beside a record carrying only a Content-ID
+/// keeps its file, because the stronger field is read from the stronger
+/// source and the weaker one never gets a vote of its own. Unioning two
+/// verdicts would drop that file, which is precisely the loss
+/// `is_decoration` exists to avoid.
+fn parts_of(record: Vec<Meta>, stored: Vec<MailPart>) -> Vec<Part> {
+    // Keyed by id, which is the only thing that ties the two sources —
+    // and ties either of them to the listing. A `BTreeMap` because
+    // nothing downstream observes the order (`winnow` collects these into
+    // a set), and one that is the same on every run is easier to read in
+    // a debugger than one that is not.
+    let mut by_id: std::collections::BTreeMap<String, Part> =
+        record.into_iter().map(Part::from).map(|p| (p.id.clone(), p)).collect();
+    for part in stored.into_iter().map(Part::from) {
+        match by_id.get_mut(&part.id) {
+            Some(known) => {
+                known.content_disposition = part.content_disposition.or(known.content_disposition.take());
+                known.content_id = part.content_id.or(known.content_id.take());
+            }
+            None => {
+                by_id.insert(part.id.clone(), part);
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
 /// The `Content-Disposition` type — the token before the first `;` —
 /// lowercased, or `None` when the part states none. A real header is
 /// `inline; filename="logo.png"`, so the parameters have to come off
 /// before the token means anything; comparing the whole field made this
 /// rule inert on most real mail.
-fn disposition(m: &Meta) -> Option<String> {
+fn disposition(m: &Part) -> Option<String> {
     let stated = m.content_disposition.as_deref()?;
     let token = stated.split(';').next().unwrap_or("").trim();
     // A field present but empty states nothing, which is not the same as
@@ -396,7 +506,7 @@ fn disposition(m: &Meta) -> Option<String> {
     (!token.is_empty()).then(|| token.to_ascii_lowercase())
 }
 
-/// Whether the record marks this part as the mail's own furniture.
+/// Whether a part is the mail's own furniture, by what it says of itself.
 ///
 /// The part gets to say so itself where it says anything at all: an
 /// explicit `attachment` is believed even when a Content-ID sits beside
@@ -412,12 +522,11 @@ fn disposition(m: &Meta) -> Option<String> {
 /// states no disposition at all but carries a Content-ID is dropped. An
 /// unstated disposition beside a Content-ID is the body-referenced image,
 /// which is the case this exists for, so the weaker signal decides when
-/// there is no stronger one. If the received record turns out to carry
-/// Content-IDs and never dispositions, every identified ticket would go
-/// that way — the `warn!` when winnowing leaves nothing is what would say
-/// so, and the fix then is to read both fields off the webhook at ingest,
-/// where Resend is known to send them.
-fn is_decoration(m: &Meta) -> bool {
+/// there is no stronger one. That residual is now bounded by where the
+/// fields come from: `parts_of` prefers the row the webhook wrote, and
+/// the webhook is known to send a disposition per part, so the case above
+/// is the record's to produce and only for mail that predates the row.
+fn is_decoration(m: &Part) -> bool {
     match disposition(m) {
         Some(token) => token == "inline",
         None => m.content_id.as_deref().is_some_and(|c| !c.trim().is_empty()),
@@ -428,25 +537,25 @@ fn is_decoration(m: &Meta) -> bool {
 ///
 /// Two rules, and the order matters only to the counting:
 ///
-/// A part the `record` marks as furniture goes — see `is_decoration` for
-/// what marks it and why the part's own word wins. Neither field is
-/// documented on `GET /emails/receiving/{id}`, so a record that marks
-/// nothing leaves this set empty and every part survives: the behaviour
-/// before this rule existed, which is the safe way to be wrong about a
-/// provider. The listing is the authority on what exists and the record
-/// only on what those parts are for, so a listed part the record does not
-/// mention is kept.
+/// A part `parts` marks as furniture goes — see `is_decoration` for what
+/// marks it and why the part's own word wins, and `parts_of` for where
+/// the two fields come from. A part that marks nothing survives, and so
+/// does a mail nothing describes at all: that is the behaviour before
+/// this rule existed, which is the safe way to be wrong. The listing is
+/// the authority on which parts exist, and `parts` only on what they are
+/// for, so a listed part nothing describes is kept.
 ///
-/// A part with no filename goes regardless of what the record says. The
+/// A part with no filename goes regardless of what anything says about
+/// it — neither source gets a vote against a part nobody can name. The
 /// page renders it as "attachment 12" — its provider id — which tells the
 /// reader nothing they can act on, and a real attachment has a name.
 ///
 /// Winnowing happens before `ATTACHMENTS_PER_MAIL`, which is the point:
 /// the cap must be spent on files, not on four logos and a ticket that
 /// did not fit.
-fn winnow(record: &[Meta], listed: Vec<AttachmentMeta>) -> (Vec<AttachmentMeta>, Skipped) {
+fn winnow(parts: &[Part], listed: Vec<AttachmentMeta>) -> (Vec<AttachmentMeta>, Skipped) {
     let decoration: std::collections::HashSet<&str> =
-        record.iter().filter(|m| is_decoration(m)).map(|m| m.id.as_str()).collect();
+        parts.iter().filter(|m| is_decoration(m)).map(|m| m.id.as_str()).collect();
     let mut skipped = Skipped::default();
     let kept = listed
         .into_iter()
@@ -682,18 +791,33 @@ mod tests {
     use super::*;
     use crate::resend::tests::resend_like;
     use crate::tests::{admitted, open_round, test_app, test_app_with_model};
-    use scout_core::inbox::MailIn;
+    use scout_core::inbox::{MailIn, MailPart};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A part as the received record lists it.
-    fn part(id: &str, filename: Option<&str>, disposition: Option<&str>, cid: Option<&str>) -> Meta {
+    /// A part as `winnow` sees it, whichever source described it.
+    fn part(id: &str, disposition: Option<&str>, cid: Option<&str>) -> Part {
+        Part { id: id.into(), content_disposition: disposition.map(Into::into), content_id: cid.map(Into::into) }
+    }
+
+    /// The same part as the received record lists it, with the fields
+    /// Resend documents on that endpoint and the two it does not.
+    fn record_part(id: &str, filename: Option<&str>, disposition: Option<&str>, cid: Option<&str>) -> Meta {
         Meta {
             id: id.into(),
             filename: filename.map(Into::into),
             content_type: Some("application/octet-stream".into()),
             size: Some(1),
+            content_disposition: disposition.map(Into::into),
+            content_id: cid.map(Into::into),
+        }
+    }
+
+    /// The same part as the webhook described it and the store kept it.
+    fn stored_part(id: &str, disposition: Option<&str>, cid: Option<&str>) -> MailPart {
+        MailPart {
+            provider_id: id.into(),
             content_disposition: disposition.map(Into::into),
             content_id: cid.map(Into::into),
         }
@@ -711,15 +835,15 @@ mod tests {
     }
 
     #[test]
-    fn the_mails_decoration_is_left_off_and_a_record_that_says_nothing_leaves_everything_on() {
+    fn the_mails_decoration_is_left_off_and_a_source_that_says_nothing_leaves_everything_on() {
         // The four shapes one leg actually arrived with: a logo the body
         // draws, a calendar invite the mailer marked inline, a part sent
         // with no filename at all, and the one thing the traveller wants.
-        let record = [
-            part("att_logo", Some("logo.png"), Some("inline"), Some("<logo@mailer>")),
-            part("att_cal", Some("Add_to_your_calendar.ics"), Some("INLINE"), None),
-            part("att_12", None, None, None),
-            part("att_tkt", Some("Electronic_ticket.pdf"), Some("attachment"), None),
+        let described = [
+            part("att_logo", Some("inline"), Some("<logo@mailer>")),
+            part("att_cal", Some("INLINE"), None),
+            part("att_12", None, None),
+            part("att_tkt", Some("attachment"), None),
         ];
         let all = vec![
             listed("att_logo", "logo.png"),
@@ -730,20 +854,22 @@ mod tests {
             listed("att_12", ""),
             listed("att_tkt", "Electronic_ticket.pdf"),
         ];
-        let (kept, skipped) = winnow(&record, all.clone());
+        let (kept, skipped) = winnow(&described, all.clone());
         assert_eq!(kept.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["att_tkt"]);
         assert_eq!(skipped, Skipped { decoration: 2, nameless: 1 });
 
-        // A record that carries neither field — which is every record
-        // Resend is documented to send — changes nothing. Only the part
-        // with no name goes, because a real attachment has one.
-        let silent: Vec<Meta> = record.iter().map(|m| part(&m.id, m.filename.as_deref(), None, None)).collect();
+        // Parts that carry neither field — which is every part of a mail
+        // that arrived before the webhook's list was kept, described only
+        // by a record Resend documents neither field on — change nothing.
+        // Only the part with no name goes, because a real attachment has
+        // one.
+        let silent: Vec<Part> = described.iter().map(|p| part(&p.id, None, None)).collect();
         let (kept, skipped) = winnow(&silent, all.clone());
         assert_eq!(kept.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["att_logo", "att_cal", "att_tkt"]);
         assert_eq!(skipped, Skipped { decoration: 0, nameless: 1 });
 
-        // And no record at all — the retry path, where the body came off
-        // the row and Resend was never asked — is the same again.
+        // And nothing describing the parts at all — a mail stored before
+        // this change, retried off its own body — is the same again.
         let (kept, _) = winnow(&[], all);
         assert_eq!(kept.len(), 3);
     }
@@ -755,7 +881,7 @@ mod tests {
         // own loses the ticket — and loses it before the bytes are even
         // fetched, which is worse than the crowding the rule exists to
         // fix. A part that says what it is gets to say it.
-        let ticket = part("att_tkt", Some("Electronic_ticket.pdf"), Some("attachment"), Some("<tkt@mailer>"));
+        let ticket = part("att_tkt", Some("attachment"), Some("<tkt@mailer>"));
         let (kept, skipped) = winnow(&[ticket], vec![listed("att_tkt", "Electronic_ticket.pdf")]);
         assert_eq!(kept.len(), 1, "a stated `attachment` was overruled by a Content-ID");
         assert_eq!(skipped, Skipped::default());
@@ -765,7 +891,7 @@ mod tests {
         // never the whole field. Comparing the whole string made this
         // half inert on real mail, leaving the rule resting entirely on
         // the half above.
-        let logo = part("att_logo", Some("logo.png"), Some("inline; filename=\"logo.png\""), None);
+        let logo = part("att_logo", Some("inline; filename=\"logo.png\""), None);
         let (kept, skipped) = winnow(&[logo], vec![listed("att_logo", "logo.png")]);
         assert!(kept.is_empty(), "a parameterised `inline` was not recognised");
         assert_eq!(skipped, Skipped { decoration: 1, nameless: 0 });
@@ -774,7 +900,7 @@ mod tests {
         // meaning. And an `inline` that also carries a Content-ID is
         // still inline — the two agree, so nothing subtle happens.
         for d in ["  INLINE  ", "Inline ;filename=x", "inline"] {
-            let (kept, _) = winnow(&[part("a", Some("x.png"), Some(d), Some("<c@m>"))], vec![listed("a", "x.png")]);
+            let (kept, _) = winnow(&[part("a", Some(d), Some("<c@m>"))], vec![listed("a", "x.png")]);
             assert!(kept.is_empty(), "{d:?} is inline");
         }
     }
@@ -783,21 +909,107 @@ mod tests {
     fn a_content_id_only_decides_when_the_part_states_no_disposition() {
         // No disposition stated: the Content-ID is all there is, and a
         // part the HTML body references by one is a part the body draws.
-        let (kept, _) = winnow(&[part("a", Some("logo.png"), None, Some("<logo@mailer>"))], vec![listed("a", "logo.png")]);
+        let (kept, _) = winnow(&[part("a", None, Some("<logo@mailer>"))], vec![listed("a", "logo.png")]);
         assert!(kept.is_empty());
 
         // An empty Content-ID is not a Content-ID. Neither is one of
         // spaces: both are a provider filling a field rather than saying
         // something, and neither may cost a traveller their ticket.
         for cid in ["", "   "] {
-            let (kept, _) = winnow(&[part("a", Some("t.pdf"), None, Some(cid))], vec![listed("a", "t.pdf")]);
+            let (kept, _) = winnow(&[part("a", None, Some(cid))], vec![listed("a", "t.pdf")]);
             assert_eq!(kept.len(), 1, "{cid:?} is not a Content-ID");
         }
 
         // A disposition stated but empty says nothing either, so the
         // Content-ID gets to decide after all.
-        let (kept, _) = winnow(&[part("a", Some("logo.png"), Some("  "), Some("<logo@m>"))], vec![listed("a", "logo.png")]);
+        let (kept, _) = winnow(&[part("a", Some("  "), Some("<logo@m>"))], vec![listed("a", "logo.png")]);
         assert!(kept.is_empty(), "an empty disposition is not a statement");
+    }
+
+    #[test]
+    fn what_a_part_says_of_itself_reads_the_same_from_either_source() {
+        // Two shapes for one thing, under different names for the id. The
+        // rule is written against neither, so both have to arrive at it
+        // carrying the same two fields.
+        let expected = part("att_1", Some("attachment"), Some("<tkt@mailer>"));
+        assert_eq!(Part::from(record_part("att_1", Some("ticket.pdf"), Some("attachment"), Some("<tkt@mailer>"))), expected);
+        assert_eq!(Part::from(stored_part("att_1", Some("attachment"), Some("<tkt@mailer>"))), expected);
+    }
+
+    #[test]
+    fn the_stored_word_on_a_part_beats_the_records_and_is_never_added_to_it() {
+        // Resend documents neither field on the received record and sends
+        // both on the webhook, so where the two describe the same part the
+        // stored one is the word we have actually watched arrive.
+        //
+        // Per part, and never the two verdicts together: a record that
+        // carries a Content-ID and no disposition is the shape plenty of
+        // mailers send, ticket included. Add that to the stored
+        // `attachment` and the ticket goes — which is the loss this whole
+        // rule was rewritten to avoid.
+        let record = vec![record_part("att_tkt", Some("ticket.pdf"), None, Some("<tkt@mailer>"))];
+        let stored = vec![stored_part("att_tkt", Some("attachment"), None)];
+        let (kept, skipped) = winnow(&parts_of(record.clone(), stored), vec![listed("att_tkt", "ticket.pdf")]);
+        assert_eq!(kept.len(), 1, "a stored `attachment` was overruled by the record's Content-ID");
+        assert_eq!(skipped, Skipped::default());
+
+        // With nothing stored for it the record still decides: a mail that
+        // arrived before the parts were kept has only that to go on.
+        let (kept, _) = winnow(&parts_of(record, vec![]), vec![listed("att_tkt", "ticket.pdf")]);
+        assert!(kept.is_empty(), "the record was ignored for a part nothing else describes");
+
+        // And the mirror of the case above, which is the one a per-part
+        // merge gets wrong: the stored row is silent about a field the
+        // record states. Every field of a stored part is optional — the
+        // webhook omits what the mailer did not send — so "stored wins"
+        // has to mean field by field. Replacing the whole part would let
+        // the row's silence bury the record's explicit `attachment`,
+        // leave the Content-ID deciding, and lose the ticket before its
+        // bytes were ever fetched.
+        let record = vec![record_part("att_tkt", Some("ticket.pdf"), Some("attachment"), None)];
+        let stored = vec![stored_part("att_tkt", None, Some("<tkt@mailer>"))];
+        let (kept, skipped) = winnow(&parts_of(record, stored), vec![listed("att_tkt", "ticket.pdf")]);
+        assert_eq!(kept.len(), 1, "a stored silence buried the record's `attachment`");
+        assert_eq!(skipped, Skipped::default());
+
+        // And the preference is a preference, not a bias towards keeping:
+        // the store is believed when it calls a part inline and the record
+        // says nothing at all.
+        let quiet = vec![record_part("att_logo", Some("logo.png"), None, None)];
+        let parts = parts_of(quiet, vec![stored_part("att_logo", Some("inline"), None)]);
+        let (kept, _) = winnow(&parts, vec![listed("att_logo", "logo.png")]);
+        assert!(kept.is_empty());
+
+        // A part only one source mentions is described by that source, and
+        // a part neither mentions is kept.
+        let parts = parts_of(
+            vec![record_part("att_a", Some("a.png"), Some("inline"), None)],
+            vec![stored_part("att_b", Some("inline"), None)],
+        );
+        let listing = vec![listed("att_a", "a.png"), listed("att_b", "b.png"), listed("att_c", "c.pdf")];
+        let (kept, skipped) = winnow(&parts, listing);
+        assert_eq!(kept.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["att_c"]);
+        assert_eq!(skipped, Skipped { decoration: 2, nameless: 0 });
+    }
+
+    #[test]
+    fn stored_parts_that_meet_none_of_the_listed_ones_are_worth_saying_out_loud() {
+        // The whole rule rests on the webhook and the attachment listing
+        // naming a part the same way, and nothing in this repo can check
+        // that — the two calls are Resend's, and only production sees
+        // both for one real mail. If they disagree the rule is inert and
+        // silent, which is the same failure that brought the card here.
+        // The `warn!` next door only fires when everything was winnowed
+        // out; this is the other half.
+        let stored = [stored_part("att_1", Some("inline"), None)];
+        assert!(ids_never_met(&stored, &[listed("part-0", "logo.png")]), "two namings of one part");
+        assert!(!ids_never_met(&stored, &[listed("att_1", "logo.png"), listed("att_2", "t.pdf")]), "one met");
+
+        // Neither half of "no match" is worth a line on its own. A mail
+        // stored before the parts were kept has nothing to match with,
+        // and a listing with nothing in it says nothing about the ids.
+        assert!(!ids_never_met(&[], &[listed("att_1", "logo.png")]));
+        assert!(!ids_never_met(&stored, &[]));
     }
 
     #[test]
@@ -805,8 +1017,8 @@ mod tests {
         // The list endpoint is the authority on what exists; the record
         // is only the authority on what those parts are for. A part the
         // record skipped is a part we know nothing bad about.
-        let record = [part("att_logo", Some("logo.png"), Some("inline"), None)];
-        let (kept, skipped) = winnow(&record, vec![listed("att_tkt", "Electronic_ticket.pdf")]);
+        let described = [part("att_logo", Some("inline"), None)];
+        let (kept, skipped) = winnow(&described, vec![listed("att_tkt", "Electronic_ticket.pdf")]);
         assert_eq!(kept.len(), 1);
         assert_eq!(skipped, Skipped::default());
 
@@ -814,11 +1026,8 @@ mod tests {
         // provider numbering the two calls differently — must not be read
         // as "all decoration" or as "all clean by luck". It is simply
         // silent, and silence keeps everything.
-        let record = [
-            part("part-0", Some("logo.png"), Some("inline"), None),
-            part("part-1", Some("t.pdf"), None, None),
-        ];
-        let (kept, skipped) = winnow(&record, vec![listed("att_1", "logo.png"), listed("att_2", "t.pdf")]);
+        let described = [part("part-0", Some("inline"), None), part("part-1", None, None)];
+        let (kept, skipped) = winnow(&described, vec![listed("att_1", "logo.png"), listed("att_2", "t.pdf")]);
         assert_eq!(kept.len(), 2);
         assert_eq!(skipped, Skipped::default());
     }
@@ -934,11 +1143,109 @@ mod tests {
     const FROM: &str = "scout@send.goodscout.fyi";
 
     fn a_mail(provider_id: &str) -> MailIn {
-        MailIn { provider_id: provider_id.into(), from: "hotel@example.com".into(), subject: Some("Your booking".into()), text: None, html: None, truncated: false }
+        MailIn { provider_id: provider_id.into(), from: "hotel@example.com".into(), subject: Some("Your booking".into()), text: None, html: None, truncated: false, parts: Vec::new() }
+    }
+
+    /// A mail the webhook described part by part, as it does in
+    /// production. `text` set is the other half of the retry path: it is
+    /// what makes the worker read the body off the row instead of asking
+    /// Resend for the record.
+    fn a_mail_with_parts(provider_id: &str, text: Option<&str>, parts: Vec<MailPart>) -> MailIn {
+        MailIn { text: text.map(Into::into), parts, ..a_mail(provider_id) }
     }
 
     fn forwards(reqs: &[wiremock::Request]) -> usize {
         reqs.iter().filter(|r| r.url.path() == "/emails").count()
+    }
+
+    /// The listing and the downloads for these parts, and a Resend that
+    /// takes a forward. No received record: a test that wants one mounts
+    /// its own.
+    async fn listing_of(server: &MockServer, parts: &[(&str, &str)]) {
+        let data: Vec<serde_json::Value> = parts
+            .iter()
+            .map(|(id, filename)| {
+                json!({"id": id, "filename": filename, "size": 3, "content_type": "application/pdf",
+                       "download_url": format!("{}/dl/{id}", server.uri())})
+            })
+            .collect();
+        Mock::given(method("GET")).and(path("/emails/receiving/re_1/attachments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": data})))
+            .mount(server).await;
+        for (id, _) in parts {
+            Mock::given(method("GET")).and(path(format!("/dl/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF".to_vec())).mount(server).await;
+        }
+        Mock::given(method("POST")).and(path("/emails"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "sent_1"}))).mount(server).await;
+    }
+
+    /// An account that can be forwarded to, with `mail` on its inbox.
+    async fn with_mail(core: &scout_core::core::Core, mail: MailIn) -> i64 {
+        open_round(core, "autumn", 5).await;
+        let a = admitted(core, "111").await;
+        scout_core::inbox::seed_email_identity_for_tests(core, a, "me@example.com").await.unwrap();
+        scout_core::inbox::record_mail(core, a, mail).await.unwrap().expect("a new mail")
+    }
+
+    #[tokio::test]
+    async fn the_stored_parts_winnow_a_mail_whose_record_says_nothing_about_dispositions() {
+        // The defect this closes. `GET /emails/receiving/{id}` documents
+        // neither field, so the record here carries neither — which may
+        // well be every record Resend sends, in which case the rule was
+        // inert in production and the logo crowded the ticket out anyway.
+        // The webhook did say, and what it said is on the row.
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/emails/receiving/re_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "re_1", "from": "airline@example.com", "subject": "Your booking", "text": "Row 12",
+                "attachments": [
+                    {"id": "att_logo", "filename": "logo.png", "content_type": "image/png", "size": 9},
+                    {"id": "att_tkt", "filename": "ticket.pdf", "content_type": "application/pdf", "size": 3},
+                ],
+            })))
+            .mount(&server).await;
+        listing_of(&server, &[("att_logo", "logo.png"), ("att_tkt", "ticket.pdf")]).await;
+
+        let (_app, core, _dir) = test_app().await;
+        let mail_id = with_mail(&core, a_mail_with_parts("re_1", None, vec![
+            stored_part("att_logo", Some("inline; filename=\"logo.png\""), Some("<logo@mailer>")),
+            stored_part("att_tkt", Some("attachment"), None),
+        ])).await;
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+
+        let stored = scout_core::inbox::attachment_texts(&core, mail_id).await.unwrap();
+        assert_eq!(stored.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["ticket.pdf"]);
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.iter().filter(|r| r.url.path().starts_with("/dl/")).count(), 1, "the logo was fetched anyway");
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_reads_the_body_off_the_row_still_knows_which_part_is_decoration() {
+        // The path that had no winnowing at all: the body is on the row,
+        // so the worker deliberately does not fetch the record — the point
+        // of storing the body is not to depend on Resend being up. The
+        // parts are on the row too now, so the rule costs that path
+        // nothing and applies to it all the same.
+        let server = MockServer::start().await;
+        listing_of(&server, &[("att_logo", "logo.png"), ("att_tkt", "ticket.pdf")]).await;
+
+        let (_app, core, _dir) = test_app().await;
+        let mail_id = with_mail(&core, a_mail_with_parts("re_1", Some("Row 12"), vec![
+            stored_part("att_logo", Some("inline"), Some("<logo@mailer>")),
+            stored_part("att_tkt", Some("attachment"), Some("<tkt@mailer>")),
+        ])).await;
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+
+        let stored = scout_core::inbox::attachment_texts(&core, mail_id).await.unwrap();
+        assert_eq!(stored.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["ticket.pdf"]);
+        // And it is still a path that never asks Resend for the record —
+        // no mock is mounted for it, so a request would be a 404 and the
+        // mail would fail rather than quietly cost a call.
+        let reqs = server.received_requests().await.unwrap();
+        assert!(reqs.iter().all(|r| r.url.path() != "/emails/receiving/re_1"), "the retry path paid for a record");
     }
 
     #[tokio::test]

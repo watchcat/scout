@@ -1,11 +1,13 @@
 //! `POST /inbound/resend`: Resend telling us a mail arrived for one of our
 //! addresses.
 //!
-//! The webhook carries who wrote, to whom, the subject and the attachment
-//! names — never the body; the worker fetches that later through the API.
-//! So the only thing this route decides is whether the mail is somebody's:
-//! the signature says Resend sent it, the `to` address says whose it is,
-//! and one row goes into the store. Everything else is 200 and nothing,
+//! The webhook carries who wrote, to whom, the subject and a line per
+//! MIME part — never the body; the worker fetches that later through the
+//! API. So the only thing this route decides is whether the mail is
+//! somebody's: the signature says Resend sent it, the `to` address says
+//! whose it is, and one mail row and its parts go into the store. The
+//! parts are kept because this is the only place they are known to
+//! arrive; see `Attachment`. Everything else is 200 and nothing,
 //! because a 4xx makes Resend retry, and a retry cannot make an unknown
 //! address known.
 
@@ -21,7 +23,7 @@ use axum::Router;
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
 use scout_core::core::Core;
-use scout_core::inbox::{self, MailIn};
+use scout_core::inbox::{self, MailIn, MailPart};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -165,6 +167,41 @@ struct Data {
     received_for: Vec<String>,
     #[serde(default)]
     subject: Option<String>,
+    #[serde(default)]
+    attachments: Vec<Attachment>,
+}
+
+/// One MIME part, as `email.received` lists it. Only the three fields the
+/// decoration rule needs: the name and the type are the attachment
+/// listing's to answer for, and a second copy here could only disagree
+/// with it.
+///
+/// Every field optional and an absent list empty, like the rest of `Data`:
+/// the shape is Resend's to change, and a mail dropped because one part
+/// omitted a key is a mail nobody gets.
+#[derive(Deserialize)]
+struct Attachment {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    content_disposition: Option<String>,
+    #[serde(default)]
+    content_id: Option<String>,
+}
+
+impl Attachment {
+    /// The part as the store keeps it, unless it has no id — which is the
+    /// only thing that could ever tie it to a row of the attachment
+    /// listing, so a part without one describes nothing.
+    ///
+    /// Stored as the trim leaves it, not as it came. The same padding that
+    /// would make an id blank makes a padded one match nothing, and the
+    /// check and the value have to agree or the row is one the worker can
+    /// never use.
+    fn stored(self) -> Option<MailPart> {
+        let provider_id = self.id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty())?;
+        Some(MailPart { provider_id, content_disposition: self.content_disposition, content_id: self.content_id })
+    }
 }
 
 /// `addr` out of `Name <addr>`, or the string itself when there are no
@@ -263,6 +300,14 @@ async fn receive(State(state): State<InboundState>, headers: HeaderMap, body: By
     };
     // No body yet: the webhook does not carry one, and the worker fetches
     // it through the API when it picks the row up.
+    //
+    // The parts do come with it, though, and this is the only place they
+    // are known to: Resend documents neither `content_disposition` nor
+    // `content_id` on the record the worker fetches later. Kept here, the
+    // rule that tells a ticket from a signature logo rests on data we
+    // have watched arrive, and costs the worker no extra call — the retry
+    // path, which reads the body off the row rather than asking Resend
+    // again, gets them too.
     let mail = MailIn {
         provider_id: data.email_id,
         from: data.from,
@@ -270,6 +315,7 @@ async fn receive(State(state): State<InboundState>, headers: HeaderMap, body: By
         text: None,
         html: None,
         truncated: false,
+        parts: data.attachments.into_iter().filter_map(Attachment::stored).collect(),
     };
     match inbox::record_mail(&state.core, account, mail).await {
         // `None` is a redelivery already on file; 200 either way, or
@@ -423,6 +469,112 @@ mod tests {
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].account_id, a);
         assert_eq!(work[0].provider_id, "re_9");
+    }
+
+    /// The handle `received_payload` addresses, on a fresh app.
+    async fn app_with_sasha() -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir, i64) {
+        let (app, core, dir) = inbound_app(SECRET).await;
+        let a = admitted(&core, "111").await;
+        assert_eq!(
+            scout_core::inbox::set_handle(&core, a, "sasha").await.unwrap(),
+            scout_core::inbox::Claim::Claimed("sasha".into())
+        );
+        (app, core, dir, a)
+    }
+
+    /// The id of the one mail on file.
+    async fn only_mail(core: &scout_core::core::Core) -> i64 {
+        let work = scout_core::inbox::mail_to_work(core, 10).await.unwrap();
+        assert_eq!(work.len(), 1);
+        work[0].id
+    }
+
+    #[tokio::test]
+    async fn the_webhook_stores_what_the_mail_said_each_of_its_parts_is() {
+        // This is the one place those two fields are known to arrive:
+        // Resend documents neither on the record the worker fetches later,
+        // so a rule that read them there might be reading nothing at all.
+        // Stored here, it rests on the payload above, which is what a real
+        // `email.received` looks like.
+        let (app, core, _dir, _a) = app_with_sasha().await;
+        let body = received_payload("re_1", "sasha@goodscout.fyi");
+        assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200);
+        let id = only_mail(&core).await;
+        assert_eq!(
+            scout_core::inbox::mail_parts(&core, id).await.unwrap(),
+            vec![MailPart {
+                provider_id: "att_1".into(),
+                content_disposition: Some("attachment".into()),
+                // Sent as an explicit `null`, which is a part that has no
+                // Content-ID and not one whose Content-ID is "null".
+                content_id: None,
+            }]
+        );
+        // A redelivery stores no mail, so it must store no parts either:
+        // Resend retries a webhook freely, and the second copy would say
+        // the same thing twice.
+        assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200, "a redelivery");
+        assert_eq!(scout_core::inbox::mail_parts(&core, id).await.unwrap().len(), 1, "stored once");
+    }
+
+    #[tokio::test]
+    async fn a_part_list_that_says_less_than_we_expect_is_read_for_what_it_says() {
+        // Read leniently, like the rest of this payload: the shape is
+        // Resend's to change, and a mail that failed to parse because one
+        // part omitted a key is a mail nobody gets. A part with no id is
+        // dropped rather than stored, because the id is the only thing
+        // that could ever tie it to a listed attachment.
+        let (app, core, _dir, _a) = app_with_sasha().await;
+        let body = serde_json::json!({
+            "type": "email.received",
+            "data": {
+                "email_id": "re_1",
+                "from": "Hotel <hotel@example.com>",
+                "to": ["sasha@goodscout.fyi"],
+                "attachments": [
+                    {"id": "att_logo", "content_disposition": "inline; filename=\"logo.png\"", "content_id": "<logo@mailer>"},
+                    {"id": "att_bare"},
+                    {"filename": "nameless.pdf"},
+                    {"id": "   "},
+                    // Padded rather than blank: an id kept as it came
+                    // would match nothing in the attachment listing, and
+                    // a row that can never match is a row that describes
+                    // nothing. The same trim that decides it is kept is
+                    // the one whose answer is stored.
+                    {"id": "  att_padded  ", "content_disposition": "inline"},
+                ],
+            },
+        })
+        .to_string();
+        assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200);
+        assert_eq!(
+            scout_core::inbox::mail_parts(&core, only_mail(&core).await).await.unwrap(),
+            vec![
+                MailPart {
+                    provider_id: "att_logo".into(),
+                    content_disposition: Some("inline; filename=\"logo.png\"".into()),
+                    content_id: Some("<logo@mailer>".into()),
+                },
+                MailPart { provider_id: "att_bare".into(), content_disposition: None, content_id: None },
+                MailPart {
+                    provider_id: "att_padded".into(),
+                    content_disposition: Some("inline".into()),
+                    content_id: None,
+                },
+            ],
+        );
+
+        // And a webhook with no `attachments` key at all is a mail with no
+        // parts, not a webhook that failed to parse.
+        let none = serde_json::json!({
+            "type": "email.received",
+            "data": {"email_id": "re_2", "from": "hotel@example.com", "to": ["sasha@goodscout.fyi"]},
+        })
+        .to_string();
+        assert_eq!(post_signed(&app, SECRET, &none).await.status(), 200);
+        let work = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        let second = work.iter().find(|m| m.provider_id == "re_2").expect("the second mail was not stored");
+        assert!(scout_core::inbox::mail_parts(&core, second.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]

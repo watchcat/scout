@@ -33,9 +33,11 @@ const MAX_CANDIDATES_PER_ITEM: usize = 64;
 /// prints is bounded by this file. One mail could carry a hundred files.
 const MAX_ATTACHMENTS_PER_ITEM: usize = 32;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
-/// How many calendar days apart two legs have to be before they stop being
-/// a join. Three, not one, because `days_apart` is coarse in the direction
-/// that would go quiet — see there. The page holds the same number.
+/// The largest calendar gap that still counts as a join: two days here, so
+/// three or more is a stay. Not one day, because `days_apart` is coarse
+/// and one of the two ways it is coarse goes quiet — see there. The page
+/// holds the same number, and `connection_gaps.json` fails on both sides
+/// if either moves.
 const DAYS_APART: i64 = 2;
 
 static PDF_SLOTS: OnceLock<Semaphore> = OnceLock::new();

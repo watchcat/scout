@@ -282,9 +282,9 @@ export function durationLabel(minutes) {
 }
 
 const DAY_MINUTES = 24 * 60
-// How many calendar days apart two legs have to be before they stop being
-// a join. Three, not one, because `daysApart` is coarse in the direction
-// that would go quiet — see there.
+// The largest calendar gap that still counts as a join: two days here, so
+// three or more is a stay. Not one day, because `daysApart` is coarse and
+// one of the two ways it is coarse goes quiet — see there.
 const DAYS_APART = 2
 
 // Whole days from the day one leg leaves to the day the next one leaves.
@@ -298,13 +298,19 @@ const DAYS_APART = 2
 // leaves and so is its chosen option's stamp, so the date alone says it
 // with nothing to mix up.
 //
-// What that costs is precision, in one direction: a departure-to-departure
-// gap is longer than the join by the first leg's own flight time, and two
-// local calendars can be up to 26 hours out of step with each other. Both
-// errors make two legs look further apart than they are, which is the
-// silent side, so the threshold carries two days of slack. The residual is
-// a genuine transfer more than two days out going unremarked — which is
-// the gap the traveller has most obviously planned around.
+// What that costs is precision, two ways. A departure-to-departure gap is
+// longer than the join by the first leg's own flight time, always: that
+// one makes two legs look further apart than they are, which is the side
+// that goes quiet. Two local calendars can also be up to 26 hours out of
+// step, and that one goes either way — an eastward crossing looks further
+// apart, a westward one closer. So the threshold carries two days of
+// slack, which covers a long-haul plus a date line; a pair that are still
+// three days apart after all that really are three days apart.
+//
+// The residual is a genuine transfer more than two days out going
+// unremarked. That is the gap the traveller has most obviously planned
+// around, and core's `itinerary_notes` names a change of airport between
+// consecutive flights at any gap, so it is not the only thing saying so.
 //
 // Only reached where the minutes are not available: the two legs leave
 // from different airports, so their clocks are local to different places

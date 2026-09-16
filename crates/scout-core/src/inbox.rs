@@ -10,7 +10,7 @@ use crate::core::{blocking, Core};
 use crate::store::{NewArrival, NewItem, Store, Trip};
 use crate::trips::Plan;
 
-pub use crate::store::{MailGone, MailToWork, MAIL_ATTEMPTS};
+pub use crate::store::{MailGone, MailPart, MailToWork, MAIL_ATTEMPTS};
 
 /// Local parts nobody may claim: the ones mail software and people expect
 /// to reach an operator, and the product's own name.
@@ -567,6 +567,10 @@ pub struct MailIn {
     pub text: Option<String>,
     pub html: Option<String>,
     pub truncated: bool,
+    /// What the webhook said each of the mail's parts is. The only place
+    /// those two header fields are known to arrive, which is why they are
+    /// kept here rather than asked for later.
+    pub parts: Vec<MailPart>,
 }
 
 /// Stores a mail and wakes the worker; `None` when the provider has
@@ -582,6 +586,7 @@ pub async fn record_mail(core: &Core, account_id: i64, mail: MailIn) -> anyhow::
             mail.text.as_deref(),
             mail.html.as_deref(),
             mail.truncated,
+            &mail.parts,
         )
     })
     .await?;
@@ -589,6 +594,14 @@ pub async fn record_mail(core: &Core, account_id: i64, mail: MailIn) -> anyhow::
         core.wake_inbox();
     }
     Ok(id)
+}
+
+/// What the webhook said this mail's parts are. Empty for a mail that
+/// came with no attachments, and for one stored before the parts were
+/// kept at all.
+pub async fn mail_parts(core: &Core, mail_id: i64) -> anyhow::Result<Vec<MailPart>> {
+    let store = core.store();
+    blocking(move || store.mail_parts_of(mail_id)).await
 }
 
 pub async fn mail_to_work(core: &Core, limit: usize) -> anyhow::Result<Vec<MailToWork>> {
@@ -1159,7 +1172,7 @@ pub async fn seed_arrival_for_tests(
     let title = title.to_string();
     blocking(move || {
         let mail_id = store
-            .insert_mail(account_id, &seed_provider_id(), "seed@example.com", Some(&title), None, None, false)?
+            .insert_mail(account_id, &seed_provider_id(), "seed@example.com", Some(&title), None, None, false, &[])?
             .expect("a seed id is never repeated");
         let id = store.insert_arrival(account_id, mail_id, &row)?;
         // In the worker's order: the reading is written and then the mail
@@ -1194,7 +1207,7 @@ pub async fn seed_unread_mail_for_tests(core: &Core, account_id: i64) -> anyhow:
     let store = core.store();
     blocking(move || {
         Ok(store
-            .insert_mail(account_id, &seed_provider_id(), "seed@example.com", Some("Unread"), None, None, false)?
+            .insert_mail(account_id, &seed_provider_id(), "seed@example.com", Some("Unread"), None, None, false, &[])?
             .expect("a seed id is never repeated"))
     })
     .await
@@ -1213,7 +1226,7 @@ pub async fn seed_attachment_for_tests(
     let (filename, mime) = (filename.to_string(), mime.to_string());
     blocking(move || {
         let mail_id = store
-            .insert_mail(account_id, &seed_provider_id(), "seed@example.com", Some(&filename), None, None, false)?
+            .insert_mail(account_id, &seed_provider_id(), "seed@example.com", Some(&filename), None, None, false, &[])?
             .expect("a seed id is never repeated");
         store.insert_attachment(mail_id, &filename, &mime, Some(&bytes), None)
     })
@@ -1294,6 +1307,7 @@ mod tests {
             text: Some("Check-in 13 Oct".into()),
             html: None,
             truncated: false,
+            parts: Vec::new(),
         }
     }
 

@@ -934,7 +934,7 @@ mod tests {
     const FROM: &str = "scout@send.goodscout.fyi";
 
     fn a_mail(provider_id: &str) -> MailIn {
-        MailIn { provider_id: provider_id.into(), from: "hotel@example.com".into(), subject: Some("Your booking".into()), text: None, html: None, truncated: false }
+        MailIn { provider_id: provider_id.into(), from: "hotel@example.com".into(), subject: Some("Your booking".into()), text: None, html: None, truncated: false, parts: Vec::new() }
     }
 
     fn forwards(reqs: &[wiremock::Request]) -> usize {

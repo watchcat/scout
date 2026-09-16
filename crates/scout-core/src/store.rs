@@ -384,6 +384,23 @@ CREATE TABLE IF NOT EXISTS attachments (
     bytes    BLOB,
     text     TEXT
 );
+CREATE SEQUENCE IF NOT EXISTS mail_parts_id_seq;
+-- What the inbound webhook said each of a mail's MIME parts is: the two
+-- header fields that tell a ticket from the sender's furniture, and
+-- nothing else. The attachment listing is the authority on which parts
+-- exist and what they are called, so neither name nor type is copied
+-- here; a second copy could only disagree with it. Unlike an attachment,
+-- a part is never anything but its mail's, so it is deleted with the mail
+-- and has no `item_id` to spare it.
+CREATE TABLE IF NOT EXISTS mail_parts (
+    id                  BIGINT PRIMARY KEY DEFAULT nextval('mail_parts_id_seq'),
+    mail_id             BIGINT NOT NULL,
+    -- The provider's id for the part, which is what ties it to a row of
+    -- the attachment listing.
+    provider_id         TEXT NOT NULL,
+    content_disposition TEXT,
+    content_id          TEXT
+);
 CREATE SEQUENCE IF NOT EXISTS arrivals_id_seq;
 -- What the extractor read out of a mail. A booking waits here as `pending`
 -- until its owner adds it to a trip or ignores it; a non-booking is only
@@ -1193,6 +1210,23 @@ ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS flight_number TEXT;
 ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS stops TEXT;
 "#;
 
+/// What the inbound webhook says each part of a mail is. Resend sends
+/// `content_disposition` and `content_id` per part on `email.received` and
+/// documents neither on the record the worker fetches later, so this is
+/// where the decoration rule gets data it has actually seen arrive. Mail
+/// already on file gains no rows: nothing kept the fields at the time, and
+/// there is nowhere to read them back from. The column list and its order
+/// match `mail_parts` in `MIGRATIONS`, which is what keeps a migrated
+/// table the same shape as a fresh one.
+const STEP_18_MAIL_PARTS: &str = r#"
+CREATE SEQUENCE IF NOT EXISTS mail_parts_id_seq;
+CREATE TABLE IF NOT EXISTS mail_parts (
+    id BIGINT PRIMARY KEY DEFAULT nextval('mail_parts_id_seq'),
+    mail_id BIGINT NOT NULL, provider_id TEXT NOT NULL,
+    content_disposition TEXT, content_id TEXT
+);
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -1212,6 +1246,7 @@ fn steps() -> Vec<(i64, Step)> {
         (15, Step::Code(step_15_reorder_items)),
         (16, Step::Sql(STEP_16_INBOX)),
         (17, Step::Sql(STEP_17_ARRIVAL_FLIGHT)),
+        (18, Step::Sql(STEP_18_MAIL_PARTS)),
     ]
 }
 
@@ -1333,6 +1368,22 @@ pub struct MailToWork {
     pub html: Option<String>,
     pub attempts: i64,
     pub forwarded: bool,
+}
+
+/// What a mail said one of its parts is, as the inbound webhook described
+/// it: the provider's id for the part, and the two header fields that
+/// separate a ticket from a signature logo. `provider_id` is what ties it
+/// to a row of the attachment listing, which stays the authority on what
+/// exists and what it is called.
+///
+/// `content_disposition` is the whole header value, parameters and all
+/// (`inline; filename="logo.png"`), because that is what arrived; reading
+/// the token out of it is the worker's business.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailPart {
+    pub provider_id: String,
+    pub content_disposition: Option<String>,
+    pub content_id: Option<String>,
 }
 
 /// The extractor's reading of one mail: everything `arrivals` takes from
@@ -4297,10 +4348,19 @@ impl Store {
             .optional()?)
     }
 
-    /// Stores a delivered mail; `None` when this `provider_id` has been
-    /// seen, which a provider's retry makes routine. Checked under the lock
-    /// rather than caught from the UNIQUE index, because a redelivery is
-    /// not an error and should not read like one.
+    /// Stores a delivered mail and what the webhook said its parts are;
+    /// `None` when this `provider_id` has been seen, which a provider's
+    /// retry makes routine. Checked under the lock rather than caught from
+    /// the UNIQUE index, because a redelivery is not an error and should
+    /// not read like one — and a redelivery that returns `None` here has
+    /// written no parts either, so the table grows with the mail and not
+    /// with Resend's retries.
+    ///
+    /// The mail and its parts go in one transaction: a part whose mail is
+    /// not there describes nothing, and a mail whose parts were lost would
+    /// have the worker keep the decoration it was told about. Only a crash
+    /// between the two statements could do either, which is exactly what a
+    /// transaction is for.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_mail(
         &self,
@@ -4311,6 +4371,7 @@ impl Store {
         text: Option<&str>,
         html: Option<&str>,
         truncated: bool,
+        parts: &[MailPart],
     ) -> Result<Option<i64>> {
         let conn = self.conn();
         let seen: Option<i64> = conn
@@ -4319,13 +4380,61 @@ impl Store {
         if seen.is_some() {
             return Ok(None);
         }
-        let id = conn.query_row(
-            "INSERT INTO inbound_mail (account_id, provider_id, from_address, subject, text, html, truncated)
-             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
-            params![account_id, provider_id, from, subject, text, html, truncated],
-            |r| r.get(0),
+        conn.execute_batch("BEGIN")?;
+        let written = (|| -> Result<i64> {
+            let id: i64 = conn.query_row(
+                "INSERT INTO inbound_mail (account_id, provider_id, from_address, subject, text, html, truncated)
+                 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                params![account_id, provider_id, from, subject, text, html, truncated],
+                |r| r.get(0),
+            )?;
+            for part in parts {
+                conn.execute(
+                    "INSERT INTO mail_parts (mail_id, provider_id, content_disposition, content_id)
+                     VALUES (?, ?, ?, ?)",
+                    params![
+                        id,
+                        part.provider_id,
+                        part.content_disposition.as_deref(),
+                        part.content_id.as_deref()
+                    ],
+                )?;
+            }
+            Ok(id)
+        })();
+        match written {
+            // A `COMMIT` that fails leaves the transaction open, and DuckDB
+            // will not start another inside it — the next caller on this
+            // connection would fail for a reason that was never theirs.
+            // `delete_mail` says the same at more length.
+            Ok(id) => match conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(Some(id)),
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// What the webhook said this mail's parts are, in the order they
+    /// arrived in. Empty for a mail stored before `mail_parts` existed,
+    /// and for one that came with no attachments at all — the two are the
+    /// same answer because there is nothing to tell them apart with, and
+    /// the worker treats silence the same way either way.
+    pub fn mail_parts_of(&self, mail_id: i64) -> Result<Vec<MailPart>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT provider_id, content_disposition, content_id FROM mail_parts WHERE mail_id = ? ORDER BY id",
         )?;
-        Ok(Some(id))
+        let rows = stmt.query_map(params![mail_id], |r| {
+            Ok(MailPart { provider_id: r.get(0)?, content_disposition: r.get(1)?, content_id: r.get(2)? })
+        })?;
+        Ok(rows.collect::<duckdb::Result<_>>()?)
     }
 
     /// Mail the extractor has not finished with, oldest first so a burst
@@ -4722,20 +4831,23 @@ impl Store {
         Ok(scout_api::InboxView { handle: None, domain: String::new(), pending, other })
     }
 
-    /// Forgets mail older than `days`, with its reading and its loose files.
-    /// Kept regardless of age: a mail whose booking nobody has decided on
-    /// yet, and any file that has become part of a trip item. Returns the
-    /// mail rows deleted.
+    /// Forgets mail older than `days`, with its reading, its parts and its
+    /// loose files. Kept regardless of age: a mail whose booking nobody has
+    /// decided on yet, and any file that has become part of a trip item.
+    /// Returns the mail rows deleted.
     pub fn sweep_inbox(&self, days: i64) -> Result<usize> {
         let cutoff = days_ago(days);
         let conn = self.conn();
-        // The one definition of "sweepable" the three deletes share; the
+        // The one definition of "sweepable" the four deletes share; the
         // mail goes last so a crash between them leaves nothing orphaned
         // that the next sweep will not find again.
         let sweepable = format!(
             "SELECT m.id FROM inbound_mail m WHERE m.received_at < ?
                AND NOT EXISTS (SELECT 1 FROM arrivals a WHERE a.mail_id = m.id AND {UNDECIDED})"
         );
+        // Unconditionally, unlike the files below: a part describes one
+        // mail and can never come to belong to anything else.
+        conn.execute(&format!("DELETE FROM mail_parts WHERE mail_id IN ({sweepable})"), params![cutoff])?;
         conn.execute(
             &format!("DELETE FROM attachments WHERE item_id IS NULL AND mail_id IN ({sweepable})"),
             params![cutoff],
@@ -4747,13 +4859,15 @@ impl Store {
     /// Forgets one mail now, on its owner's say-so, instead of in thirty
     /// days.
     ///
-    /// The three deletes are `sweep_inbox`'s — the loose files, then the
-    /// readings, then the mail — but unlike the sweep they are in one
-    /// transaction, which is what keeps them whole: a crash takes all three
+    /// The four deletes are `sweep_inbox`'s — the parts, the loose files,
+    /// the readings, then the mail — but unlike the sweep they are in one
+    /// transaction, which is what keeps them whole: a crash takes all four
     /// back, so nothing is orphaned and the order between them decides
     /// nothing. It is kept anyway, so the two paths that delete a mail read
     /// the same. A file that has joined a trip item is the trip's now and
-    /// stays — `attachment_owner` answers for it through the item.
+    /// stays — `attachment_owner` answers for it through the item. A part
+    /// has no such escape: it says what one mail's part was and is worth
+    /// nothing once that mail is gone.
     ///
     /// Two refusals, both about rows this delete would strand:
     ///
@@ -4800,6 +4914,7 @@ impl Store {
         }
         conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<()> {
+            conn.execute("DELETE FROM mail_parts WHERE mail_id = ?", params![mail_id])?;
             conn.execute(
                 "DELETE FROM attachments WHERE item_id IS NULL AND mail_id = ?",
                 params![mail_id],
@@ -5329,7 +5444,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 17);
+        assert_eq!(s.schema_version().unwrap(), 18);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -5393,7 +5508,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 17);
+        assert_eq!(store.schema_version().unwrap(), 18);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -7301,7 +7416,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 17);
+        assert_eq!(store.schema_version().unwrap(), 18);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -7959,7 +8074,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 17, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 18, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -8000,7 +8115,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 17);
+        assert_eq!(s.schema_version().unwrap(), 18);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -8499,7 +8614,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 17);
+        assert_eq!(store.schema_version().unwrap(), 18);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -8603,7 +8718,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 17);
+        assert_eq!(store.schema_version().unwrap(), 18);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -8644,7 +8759,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 17);
+        assert_eq!(store.schema_version().unwrap(), 18);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -8665,6 +8780,59 @@ CREATE TABLE messages (
         assert_eq!(got.stops, vec!["CDG".to_string()]);
     }
 
+    /// A database in the shape step 17 left it: no `mail_parts` at all.
+    /// Built by dropping the table from the finished shape rather than by
+    /// restating the old DDL, so it cannot drift from what `MIGRATIONS`
+    /// says the rest of the database is.
+    fn version_seventeen_db() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v17.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS).unwrap();
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS mail_parts;
+             DROP SEQUENCE IF EXISTS mail_parts_id_seq;
+             CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
+             DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES (17);
+             INSERT INTO accounts (id) VALUES (1);",
+        )
+        .unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    #[test]
+    fn the_step_that_adds_mail_parts_builds_the_table_a_fresh_database_has() {
+        // Two descriptions of one table — `MIGRATIONS` and step 18 — and
+        // nothing but this keeps them in step. Comparing a fresh database
+        // with a migrated one, the way the `arrivals` test above does,
+        // would not: `Store::open` runs `MIGRATIONS` before the steps, so
+        // on a database that has no `mail_parts` the fresh DDL creates it
+        // and step 18 finds it there. That is what makes a new table safe
+        // to add — and exactly why a step whose DDL had drifted would
+        // never be caught by opening anything. So run the step by itself,
+        // against a database that has never seen `MIGRATIONS`.
+        let (fresh, _d1) = test_store();
+        let dir = TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("step18.duckdb")).unwrap();
+        conn.execute_batch(STEP_18_MAIL_PARTS).unwrap();
+        assert_eq!(shape(&fresh.conn(), "mail_parts"), shape(&conn, "mail_parts"));
+    }
+
+    #[test]
+    fn a_version_17_database_gains_mail_parts_and_takes_a_mails_parts() {
+        let (_dir, path) = version_seventeen_db();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 18);
+        let part = mail_part("att_1", Some("inline"), None);
+        let m = store
+            .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))
+            .unwrap()
+            .expect("new");
+        assert_eq!(store.mail_parts_of(m).unwrap(), vec![part]);
+    }
+
     #[test]
     fn a_handle_is_unique_and_can_be_retired() {
         let (store, _dir) = test_store();
@@ -8680,7 +8848,44 @@ CREATE TABLE messages (
     }
 
     fn mail(store: &Store, account: i64, provider_id: &str) -> i64 {
-        store.insert_mail(account, provider_id, "hotel@example.com", Some("Your booking"), Some("Check-in 12 Oct"), None, false).unwrap().expect("new")
+        store.insert_mail(account, provider_id, "hotel@example.com", Some("Your booking"), Some("Check-in 12 Oct"), None, false, &[]).unwrap().expect("new")
+    }
+
+    /// One part as the webhook described it.
+    fn mail_part(provider_id: &str, disposition: Option<&str>, cid: Option<&str>) -> MailPart {
+        MailPart {
+            provider_id: provider_id.into(),
+            content_disposition: disposition.map(Into::into),
+            content_id: cid.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn a_mails_parts_are_stored_with_it_and_a_redelivery_adds_none() {
+        // The two fields arrive with the mail and nowhere else, so they
+        // are written in the same breath as the row they belong to. A
+        // redelivery stores no mail, and so must store no parts: Resend
+        // retries a webhook freely, and a second copy of every part would
+        // be a table that grows with the retries rather than the mail.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let parts =
+            [mail_part("att_tkt", Some("attachment"), None), mail_part("att_logo", Some("inline"), Some("<logo@m>"))];
+        let m = store
+            .insert_mail(a, "re_1", "hotel@example.com", None, None, None, false, &parts)
+            .unwrap()
+            .expect("new");
+        assert_eq!(store.mail_parts_of(m).unwrap(), parts.to_vec());
+        assert_eq!(
+            store.insert_mail(a, "re_1", "x", None, None, None, false, &[mail_part("att_x", None, None)]).unwrap(),
+            None,
+            "a redelivery is a no-op",
+        );
+        assert_eq!(store.mail_parts_of(m).unwrap(), parts.to_vec(), "the redelivery wrote parts of its own");
+        // Another mail's parts are its own, and a mail that arrived with
+        // none reads back as none rather than as everyone's.
+        let n = mail(&store, a, "re_2");
+        assert!(store.mail_parts_of(n).unwrap().is_empty());
     }
 
     #[test]
@@ -8688,7 +8893,7 @@ CREATE TABLE messages (
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
         let first = mail(&store, a, "re_1");
-        assert_eq!(store.insert_mail(a, "re_1", "x", None, None, None, false).unwrap(), None, "a redelivery is a no-op");
+        assert_eq!(store.insert_mail(a, "re_1", "x", None, None, None, false, &[]).unwrap(), None, "a redelivery is a no-op");
         let second = mail(&store, a, "re_2");
         let due = store.mail_to_work(10).unwrap();
         assert_eq!(due.iter().map(|m| m.id).collect::<Vec<_>>(), vec![first, second]);
@@ -8884,6 +9089,33 @@ CREATE TABLE messages (
         assert!(store.attachment(kept).unwrap().is_some());
         assert!(store.attachment(loose).unwrap().is_none());
         assert_eq!(store.attachment_owner(kept).unwrap(), Some(a), "owned through the item once the mail is gone");
+    }
+
+    #[test]
+    fn a_mails_parts_go_with_it_whether_the_sweep_or_its_owner_takes_it() {
+        // A part is never anything but its mail's — there is no `item_id`
+        // to make it a trip's, the way a ticket becomes one — so both
+        // paths that delete a mail take its parts with it. Left behind,
+        // they would be rows describing a mail nobody can name, growing
+        // by one mail a day forever.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let parts = [mail_part("att_tkt", Some("attachment"), None)];
+        let swept = store
+            .insert_mail(a, "re_1", "hotel@example.com", None, None, None, false, &parts)
+            .unwrap()
+            .expect("new");
+        let by_hand = store
+            .insert_mail(a, "re_2", "hotel@example.com", None, None, None, false, &parts)
+            .unwrap()
+            .expect("new");
+        store.conn().execute("UPDATE inbound_mail SET received_at = received_at - INTERVAL 40 DAY WHERE id = ?", params![swept]).unwrap();
+        assert_eq!(store.sweep_inbox(30).unwrap(), 1);
+        assert!(store.mail_parts_of(swept).unwrap().is_empty(), "the sweep left the parts of a mail it forgot");
+
+        store.mail_done(by_hand).unwrap();
+        assert_eq!(store.delete_mail(a, by_hand).unwrap(), MailGone::Gone);
+        assert!(store.mail_parts_of(by_hand).unwrap().is_empty(), "the x on the row left the parts behind");
     }
 
     #[test]
@@ -9319,7 +9551,7 @@ CREATE TABLE messages (
     fn a_mail_body_is_cut_at_the_cap_and_says_so() {
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
-        let m = store.insert_mail(a, "re_1", "x", None, None, None, false).unwrap().unwrap();
+        let m = store.insert_mail(a, "re_1", "x", None, None, None, false, &[]).unwrap().unwrap();
         store.mail_body(m, Some("héllo wörld"), Some("<p>hi</p>"), 5).unwrap();
         let row = &store.mail_to_work(1).unwrap()[0];
         assert_eq!((row.text.as_deref(), row.html.as_deref()), (Some("héllo"), Some("<p>hi")), "chars, not bytes");
@@ -9327,7 +9559,7 @@ CREATE TABLE messages (
         assert!(truncated);
         // Within the cap nothing is cut, and a body that was already marked
         // truncated on the way in stays so.
-        let n = store.insert_mail(a, "re_2", "x", None, None, None, true).unwrap().unwrap();
+        let n = store.insert_mail(a, "re_2", "x", None, None, None, true, &[]).unwrap().unwrap();
         store.mail_body(n, Some("short"), None, 50).unwrap();
         let row = &store.mail_to_work(2).unwrap()[1];
         assert_eq!((row.text.as_deref(), row.html.as_deref()), (Some("short"), None));

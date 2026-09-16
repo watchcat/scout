@@ -50,9 +50,10 @@ same way, each marked when it is booked and with its confirmation code.
 Every account also has a booking address, `you@goodscout.fyi`. Give it to a
 hotel or a museum shop at checkout, or forward a confirmation to it. Each
 message is forwarded to your own email first, so nothing is ever only in
-Scout, and then read into a pending row on the trip it belongs to — the one
-whose dates it overlaps, or a draft trip started for it. Nothing lands on a
-trip until you click Add. Everything else — newsletters, mail Scout could not
+Scout; one that arrives from your own address is not sent back, since you
+hold it already. Then it is read into a pending row on the trip it belongs
+to — the one whose dates it overlaps, or a draft trip started for it.
+Nothing lands on a trip until you click Add. Everything else — newsletters, mail Scout could not
 read, arrivals you ignored — sits under Other mail for thirty days.
 
 <p align="center">
@@ -225,8 +226,9 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - **A booking address of your own.** Every account gets `you@goodscout.fyi`.
   Give it to a hotel or a museum shop at checkout, or forward a confirmation
   to it. Each message is forwarded to your real inbox first — nothing is ever
-  only in Scout — and then read into a pending row on the trip whose dates it
-  overlaps, or on a draft trip started for it. The row waits there, dashed,
+  only in Scout — unless it arrives from your own address, which you already
+  hold a copy of. Then it is read into a pending row on the trip whose dates
+  it overlaps, or on a draft trip started for it. The row waits there, dashed,
   until you press Add: mail never changes an itinerary on its own. Tickets
   come with it, PDFs included. Newsletters, mail Scout could not read and
   arrivals you ignored sit under Other mail for thirty days, then go

@@ -4354,18 +4354,21 @@ impl Store {
             .optional()?)
     }
 
-    /// The address this person signed in with, if they ever did — where a
-    /// forwarded mail goes.
-    pub fn email_of(&self, account_id: i64) -> Result<Option<String>> {
+    /// Every address this person signed in with, oldest first — the first
+    /// of them is where a forwarded mail goes, and the rest matter because
+    /// a mail this person sent themselves may come from any of them.
+    ///
+    /// Ordered by the address as well as the time, so two identities
+    /// linked in the same instant still come back in one order and the
+    /// destination of a forward does not change from read to read.
+    pub fn emails_of(&self, account_id: i64) -> Result<Vec<String>> {
         let conn = self.conn();
-        Ok(conn
-            .query_row(
-                "SELECT external_id FROM identities WHERE account_id = ? AND kind = 'email'
-                 ORDER BY created_at, external_id LIMIT 1",
-                params![account_id],
-                |r| r.get(0),
-            )
-            .optional()?)
+        let mut stmt = conn.prepare(
+            "SELECT external_id FROM identities WHERE account_id = ? AND kind = 'email'
+             ORDER BY created_at, external_id",
+        )?;
+        let rows = stmt.query_map(params![account_id], |r| r.get(0))?.collect::<duckdb::Result<Vec<String>>>()?;
+        Ok(rows)
     }
 
     /// Stores a delivered mail and what the webhook said its parts are;
@@ -4572,7 +4575,14 @@ impl Store {
     /// them, and a 4 MB newsletter is not a booking — and `truncated`
     /// records that a cut happened, here or on the way in, so the page can
     /// say the reading is of a part.
-    pub fn mail_body(&self, id: i64, text: Option<&str>, html: Option<&str>, cap_chars: usize) -> Result<()> {
+    ///
+    /// The sender comes with the body, because it comes from the same
+    /// call: the webhook's `from` is optional and the record's is the
+    /// same header seen in full. Writing it here is what makes every
+    /// later pass — and the drawn row — judge the one string the pass
+    /// that fetched it judged. A blank is not an answer and never
+    /// overwrites the one the row already has.
+    pub fn mail_fetched(&self, id: i64, sender: Option<&str>, text: Option<&str>, html: Option<&str>, cap_chars: usize) -> Result<()> {
         let cut = |s: Option<&str>| -> (Option<String>, bool) {
             match s {
                 Some(s) if s.chars().count() > cap_chars => (Some(s.chars().take(cap_chars).collect()), true),
@@ -4582,10 +4592,12 @@ impl Store {
         };
         let (text, text_cut) = cut(text);
         let (html, html_cut) = cut(html);
+        let sender = sender.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn();
         conn.execute(
-            "UPDATE inbound_mail SET text = ?, html = ?, truncated = truncated OR ? WHERE id = ?",
-            params![text, html, text_cut || html_cut, id],
+            "UPDATE inbound_mail SET from_address = COALESCE(?, from_address), text = ?, html = ?,
+                    truncated = truncated OR ? WHERE id = ?",
+            params![sender, text, html, text_cut || html_cut, id],
         )?;
         Ok(())
     }
@@ -4796,9 +4808,10 @@ impl Store {
     }
 
     /// What the Trips tab shows of the inbox: bookings still waiting, then
-    /// the last month of everything that is not one. `handle` and `domain`
-    /// are the caller's — the store knows neither the address's domain nor
-    /// how the handle should read.
+    /// the last month of everything that is not one. `handle`, `domain`
+    /// and each row's `sent_by_you` are the caller's — the store knows
+    /// neither the address's domain, nor how the handle should read, nor
+    /// which senders are the account's own.
     pub fn inbox_view(&self, account_id: i64) -> Result<scout_api::InboxView> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -4846,6 +4859,11 @@ impl Store {
                 Ok(scout_api::MailRow {
                     mail_id: r.get(0)?, from: r.get(1)?, subject: r.get(2)?, received_at: r.get(3)?,
                     forwarded: r.get(4)?, arrival_id: r.get(5)?, reason: r.get(6)?, attachments: Vec::new(),
+                    // Like `handle` and `domain` below: the caller's to
+                    // fill. Whether a sender is one of the account's own
+                    // addresses is a rule, not a query, and this module
+                    // is the wrong side of the layering to hold it.
+                    sent_by_you: false,
                 })
             })?
             .collect::<duckdb::Result<_>>()?;
@@ -9574,30 +9592,51 @@ CREATE TABLE messages (
     }
 
     #[test]
-    fn email_of_is_the_address_the_account_signed_in_with() {
+    fn emails_of_are_the_addresses_the_account_signed_in_with_oldest_first() {
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
-        assert_eq!(store.email_of(a).unwrap(), None);
+        assert_eq!(store.emails_of(a).unwrap(), Vec::<String>::new());
         let b = store.account_for_identity("email", "sasha@example.com").unwrap();
-        assert_eq!(store.email_of(b).unwrap().as_deref(), Some("sasha@example.com"));
+        assert_eq!(store.emails_of(b).unwrap(), ["sasha@example.com"]);
+        // A second address on the same account: both are read, and the
+        // first stays first so a forward keeps going where it went.
+        store.link_identity(b, "email", "sasha@work.example").unwrap();
+        assert_eq!(store.emails_of(b).unwrap(), ["sasha@example.com", "sasha@work.example"]);
+        // A third, linked last and sorting first by address: only the
+        // time can put it where it belongs, so the order is the order
+        // they were linked in and not the alphabet's. The address the
+        // account has always been forwarded at stays the destination.
+        store.link_identity(b, "email", "a.later@example.com").unwrap();
+        // Aged by hand rather than by the clock: `current_timestamp` is
+        // the transaction's, and three links in one millisecond could
+        // tie and leave the alphabet deciding after all.
+        store
+            .conn()
+            .execute("UPDATE identities SET created_at = created_at + INTERVAL 1 HOUR WHERE external_id = ?", params!["a.later@example.com"])
+            .unwrap();
+        assert_eq!(store.emails_of(b).unwrap(), ["sasha@example.com", "sasha@work.example", "a.later@example.com"]);
     }
 
     #[test]
-    fn a_mail_body_is_cut_at_the_cap_and_says_so() {
+    fn a_fetched_mail_is_cut_at_the_cap_and_the_sender_that_came_with_it_is_kept() {
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
         let m = store.insert_mail(a, "re_1", "x", None, None, None, false, &[]).unwrap().unwrap();
-        store.mail_body(m, Some("héllo wörld"), Some("<p>hi</p>"), 5).unwrap();
+        store.mail_fetched(m, Some("airline@example.com"), Some("héllo wörld"), Some("<p>hi</p>"), 5).unwrap();
         let row = &store.mail_to_work(1).unwrap()[0];
         assert_eq!((row.text.as_deref(), row.html.as_deref()), (Some("héllo"), Some("<p>hi")), "chars, not bytes");
+        assert_eq!(row.from.as_str(), "airline@example.com", "the record's sender is what the row now says");
         let truncated: bool = store.conn().query_row("SELECT truncated FROM inbound_mail WHERE id = ?", params![m], |r| r.get(0)).unwrap();
         assert!(truncated);
         // Within the cap nothing is cut, and a body that was already marked
         // truncated on the way in stays so.
         let n = store.insert_mail(a, "re_2", "x", None, None, None, true, &[]).unwrap().unwrap();
-        store.mail_body(n, Some("short"), None, 50).unwrap();
+        store.mail_fetched(n, Some("   "), Some("short"), None, 50).unwrap();
         let row = &store.mail_to_work(2).unwrap()[1];
         assert_eq!((row.text.as_deref(), row.html.as_deref()), (Some("short"), None));
+        // A blank sender is not an answer: it leaves the one the webhook
+        // stored alone rather than emptying the row.
+        assert_eq!(row.from.as_str(), "x", "a blank from the record overwrote the webhook's sender");
         let truncated: bool = store.conn().query_row("SELECT truncated FROM inbound_mail WHERE id = ?", params![n], |r| r.get(0)).unwrap();
         assert!(truncated, "the webhook's verdict is not undone");
     }

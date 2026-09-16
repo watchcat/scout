@@ -497,6 +497,20 @@ pub async fn view(core: &Core, account_id: i64, domain: &str) -> anyhow::Result<
         let mut view = store.inbox_view(account_id)?;
         view.handle = store.handle_of(account_id)?;
         view.domain = domain;
+        // The same seam the two fields above use, and for the same
+        // reason: the store cannot answer this without holding a copy of
+        // the rule the worker forwards by. Derived at read time rather
+        // than stored on the mail, so there is one answer to the
+        // question and the row cannot drift from what the worker did.
+        //
+        // The sender this reads is the sender the worker judged: the
+        // pass that fetches the record writes it onto the row with the
+        // body, so there is one string and not two copies of one header
+        // to disagree. See `Store::mail_fetched`.
+        let theirs = store.emails_of(account_id)?;
+        for row in &mut view.other {
+            row.sent_by_you = sender_is_the_account(&row.from, &theirs);
+        }
         Ok(view)
     })
     .await
@@ -642,16 +656,19 @@ pub async fn mail_forwarded(core: &Core, id: i64) -> anyhow::Result<()> {
     blocking(move || store.mail_forwarded(id)).await
 }
 
-/// The body fetched from the provider, cut at `cap_chars` characters.
-pub async fn mail_body(
+/// The body fetched from the provider, cut at `cap_chars` characters,
+/// and the sender that came with it — see `Store::mail_fetched` for why the
+/// two are written together and why a blank sender changes nothing.
+pub async fn mail_fetched(
     core: &Core,
     id: i64,
+    sender: Option<String>,
     text: Option<String>,
     html: Option<String>,
     cap_chars: usize,
 ) -> anyhow::Result<()> {
     let store = core.store();
-    blocking(move || store.mail_body(id, text.as_deref(), html.as_deref(), cap_chars)).await
+    blocking(move || store.mail_fetched(id, sender.as_deref(), text.as_deref(), html.as_deref(), cap_chars)).await
 }
 
 pub async fn store_attachment(
@@ -694,10 +711,92 @@ pub async fn attachment_for(core: &Core, id: i64, account_id: i64) -> anyhow::Re
     .await
 }
 
-/// The address the account signed in with, where a forward goes.
-pub async fn email_of(core: &Core, account_id: i64) -> anyhow::Result<Option<String>> {
+/// Every address the account signed in with, oldest first. The first is
+/// where a forward goes; the whole list is what a sender is compared
+/// against, because a person who signed in twice writes to Scout from
+/// either of their addresses and only one of them is the destination.
+pub async fn emails_of(core: &Core, account_id: i64) -> anyhow::Result<Vec<String>> {
     let store = core.store();
-    blocking(move || store.email_of(account_id)).await
+    blocking(move || store.emails_of(account_id)).await
+}
+
+/// `addr` out of `Name <addr>`, or the string itself when there are no
+/// angle brackets.
+pub fn bare_address(raw: &str) -> &str {
+    // Both from the right: a display name may itself contain a `<`, and
+    // the address is always the last bracketed thing.
+    match (raw.rfind('<'), raw.rfind('>')) {
+        (Some(open), Some(close)) if open < close => &raw[open + 1..close],
+        _ => raw,
+    }
+    .trim()
+}
+
+/// Whether this mail came from the account itself — the person forwarding
+/// something out of their own inbox rather than a hotel writing to the
+/// booking address. Forwarding such a mail back hands them a copy of what
+/// they just sent, and the Other-mail row says so rather than reading as
+/// a failure.
+///
+/// The one place this is decided. The worker asks it before sending and
+/// `view` asks it again when it draws the row, and the two must agree —
+/// which is why the row's flag is derived here rather than stored beside
+/// the mail or written a second time in SQL.
+pub fn sender_is_the_account(sender: &str, theirs: &[String]) -> bool {
+    let Some(sender) = mailbox(sender) else {
+        return false;
+    };
+    theirs.iter().filter_map(|t| mailbox(t)).any(|t| t == sender)
+}
+
+/// The mailbox an address names, as addresses are compared here:
+/// lowercased whole, with any `+tag` off the local part, and `None` when
+/// what is left cannot identify anybody.
+///
+/// Lowercased as ASCII, because an address is case-insensitive to
+/// everyone who types one — the local part is the sender's to case as
+/// they like, and no provider we forward for treats two spellings as two
+/// people. ASCII rather than Unicode on purpose: `to_lowercase` folds
+/// U+212A, the Kelvin sign, to a plain `k`, which would make two
+/// different mailboxes one and silently withhold a confirmation from
+/// whoever owns the plain one. It also matches how `our_handle` compares
+/// our own domain. (Turkish costs nothing either way here: Rust
+/// lowercases `İ` to two code points and leaves `ı` alone, so neither
+/// spelling of an `i` was ever going to fold onto the other.)
+///
+/// The residual of that choice runs the other way: a genuinely
+/// non-ASCII address written in two cases stops being one mailbox, so
+/// the person's own mail is forwarded back to them. A copy they did not
+/// need is the cheaper of the two mistakes.
+///
+/// The tag comes off both sides: `sasha+hotel@…` is the mailbox
+/// `sasha@…`, and either side may be the one carrying it. That costs
+/// something, and it is worth saying what: `+` is a legal local-part
+/// character, so at a provider that does not do plus-addressing
+/// `sasha+news@example.com` is a different person from `sasha@…`, and
+/// their mail to the booking address is now quietly not forwarded.
+/// Plus-addressing is near-universal at the providers a booking address
+/// meets, and a person tagging their own forwards is exactly the case
+/// this exists for, so the trade stands.
+///
+/// Dots in the local part are left alone on purpose. Folding them is
+/// Gmail's convention and is wrong at most other providers, where
+/// `s.q@` and `sq@` are two people — and being wrong here means not
+/// forwarding a stranger's confirmation to the person waiting for it.
+///
+/// The domain is compared whole, so `example.com.evil.example` is a
+/// stranger's host and not ours: a suffix is not a domain.
+///
+/// `None` for a local part or a domain that is empty once that is done —
+/// an address nobody can be reached at is not evidence that two mails
+/// came from the same person, and without this a blank sender would
+/// match a blank identity.
+fn mailbox(raw: &str) -> Option<String> {
+    let (local, domain) = bare_address(raw).rsplit_once('@')?;
+    let local = local.split('+').next().unwrap_or_default().trim();
+    let domain = domain.trim();
+    (!local.is_empty() && !domain.is_empty())
+        .then(|| format!("{}@{}", local.to_ascii_lowercase(), domain.to_ascii_lowercase()))
 }
 
 /// Stores the extractor's reading. A booking is placed on a trip (or a
@@ -2353,7 +2452,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let first = record_mail(&core, a, MailIn { text: None, ..mail_in("re_1") }).await.unwrap().unwrap();
         let second = record_mail(&core, a, mail_in("re_2")).await.unwrap().unwrap();
-        mail_body(&core, first, Some("x".repeat(20)), None, 5).await.unwrap();
+        mail_fetched(&core, first, None, Some("x".repeat(20)), None, 5).await.unwrap();
         let due = mail_to_work(&core, 10).await.unwrap();
         assert_eq!(due.iter().map(|m| m.id).collect::<Vec<_>>(), vec![first, second]);
         assert_eq!(due[0].text.as_deref(), Some("xxxxx"), "cut at the cap");
@@ -2369,9 +2468,100 @@ mod tests {
         assert!(mail_to_work(&core, 10).await.unwrap().is_empty());
         let v = view(&core, a, "d").await.unwrap();
         assert_eq!(v.other.iter().map(|r| (r.mail_id, r.reason.as_str(), r.forwarded)).collect::<Vec<_>>(), vec![(first, "failed", false)]);
-        assert_eq!(email_of(&core, a).await.unwrap(), None);
+        assert_eq!(emails_of(&core, a).await.unwrap(), Vec::<String>::new());
         seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
-        assert_eq!(email_of(&core, a).await.unwrap().as_deref(), Some("sasha@example.com"));
+        assert_eq!(emails_of(&core, a).await.unwrap(), ["sasha@example.com"]);
+    }
+
+    #[tokio::test]
+    async fn an_account_is_read_with_every_address_it_signed_in_with_and_forwards_go_to_the_first() {
+        // The forward has one destination and the comparison has a set:
+        // a person who signed in twice writes to Scout from either
+        // address, and only the list sees both.
+        let (core, _dir) = core();
+        let a = core.store().account_for_telegram(1).unwrap();
+        seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
+        seed_email_identity_for_tests(&core, a, "sasha@work.example").await.unwrap();
+        let mine = emails_of(&core, a).await.unwrap();
+        assert_eq!(mine, ["sasha@example.com", "sasha@work.example"]);
+        assert!(sender_is_the_account("sasha@work.example", &mine));
+    }
+
+    #[tokio::test]
+    async fn an_other_mail_row_says_when_the_reader_is_the_one_who_sent_it() {
+        // Not stored on the mail: it is the same question the worker
+        // asked before deciding not to forward, and two copies of one
+        // answer are two answers waiting to disagree. The row is drawn
+        // from the identities as they are now, which is also what makes
+        // it right for mail that arrived before an address was linked.
+        let (core, _dir) = core();
+        let a = core.store().account_for_telegram(1).unwrap();
+        seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
+        let theirs = record_mail(&core, a, MailIn { from: "Sasha Q <SASHA+hotels@example.com>".into(), ..mail_in("re_1") })
+            .await
+            .unwrap()
+            .unwrap();
+        let hotels = record_mail(&core, a, mail_in("re_2")).await.unwrap().unwrap();
+        for id in [theirs, hotels] {
+            mail_attempted(&core, id).await.unwrap();
+            mail_failed(&core, id, "unreadable").await.unwrap();
+        }
+        let v = view(&core, a, "d").await.unwrap();
+        let said: Vec<(i64, bool)> = v.other.iter().map(|r| (r.mail_id, r.sent_by_you)).collect();
+        assert_eq!(said, vec![(hotels, false), (theirs, true)], "newest first: the hotel's mail, then their own");
+    }
+
+    #[test]
+    fn an_address_is_the_accounts_own_by_mailbox_and_by_nothing_looser_than_that() {
+        let mine = ["sasha@example.com".to_string(), "s.q@work.example".to_string()];
+        assert!(sender_is_the_account("sasha@example.com", &mine));
+        assert!(sender_is_the_account("Sasha Q <sasha@example.com>", &mine), "a display name is not part of the address");
+        assert!(sender_is_the_account("\"Q <the hotel>\" <sasha@example.com>", &mine), "a name may hold a bracket of its own");
+        assert!(sender_is_the_account("SASHA@Example.COM", &mine), "an address is case-insensitive to everyone who types one");
+        assert!(sender_is_the_account("sasha+hotel@example.com", &mine), "a plus tag is the same mailbox");
+        assert!(sender_is_the_account("bo@x.example", &["Bo <bo+scout@x.example>".to_string()]), "and the tag may be on the stored side");
+        assert!(sender_is_the_account("S.Q@Work.Example", &mine), "the match may be on any identity, not the first");
+
+        assert!(!sender_is_the_account("hotel@example.com", &mine), "a stranger at a shared domain");
+        assert!(
+            !sender_is_the_account("sasha@example.com.evil.example", &mine),
+            "a suffix is not a domain: this is a stranger's host that merely starts with ours"
+        );
+        assert!(
+            !sender_is_the_account("s.a.s.h.a@example.com", &mine),
+            "dots in the local part are Gmail's convention and wrong almost everywhere else"
+        );
+        assert!(!sender_is_the_account("sasha@example.com", &[]), "an account with no address of its own sent nothing");
+
+        // Nothing left to compare is not a match, however the two sides
+        // arrive at nothing: an account whose identity is unusable must
+        // not swallow every unusable sender with it.
+        assert!(!sender_is_the_account("+tag@example.com", &["+tag@example.com".to_string()]));
+        assert!(!sender_is_the_account("", &[String::new()]));
+        assert!(!sender_is_the_account("   ", &["  ".to_string()]));
+        assert!(!sender_is_the_account("sasha@", &["sasha@".to_string()]));
+
+        // Folded as ASCII, not as Unicode: U+212A, the Kelvin sign,
+        // lowercases to a plain `k` under `to_lowercase`, which would
+        // make `kelvin@` and `KELVIN@` with that sign one mailbox and
+        // so withhold somebody's confirmation from them. Reaching it
+        // needs an address at the victim's own domain, which is a narrow
+        // door — but over-matching is the direction that loses mail.
+        assert!(!sender_is_the_account("\u{212a}elvin@example.com", &["kelvin@example.com".to_string()]));
+        assert!(sender_is_the_account("KELVIN@EXAMPLE.COM", &["kelvin@example.com".to_string()]), "ASCII still folds");
+    }
+
+    #[test]
+    fn an_address_is_read_out_of_a_display_name_however_the_name_is_written() {
+        assert_eq!(bare_address("sasha@example.com"), "sasha@example.com");
+        assert_eq!(bare_address("Sasha Q <sasha@example.com>"), "sasha@example.com");
+        assert_eq!(bare_address(" <sasha@example.com> "), "sasha@example.com");
+        assert_eq!(bare_address("\"Q <the hotel>\" <sasha@example.com>"), "sasha@example.com", "the last bracketed span");
+        // A string with no pair of brackets is left as it came rather
+        // than half-parsed: a caller gets a whole address or the whole
+        // string, never a fragment of one.
+        assert_eq!(bare_address("Sasha <sasha@example.com"), "Sasha <sasha@example.com");
+        assert_eq!(bare_address("  "), "");
     }
 
     #[tokio::test]

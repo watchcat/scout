@@ -4,7 +4,9 @@
 //! The webhook (`inbound.rs`) stores an envelope and wakes this loop. For
 //! each due mail the loop fetches the body from Resend, keeps the
 //! attachments (a PDF's text pulled out for the model), forwards the whole
-//! thing once to the address the account signed in with, asks the
+//! thing once to the address the account signed in with — unless the
+//! account is who sent it, in which case the person has their own copy
+//! already and only the reading is owed — asks the
 //! tool-less extractor what it is, records the arrival where it belongs,
 //! and says one line on Telegram. Every step is idempotent per row, so a
 //! retry after a crash mid-way does the remaining work and repeats none
@@ -176,6 +178,12 @@ enum Forwarded {
     /// settled as done on this pass; only a retry of a failed reading asks
     /// again, in case one was linked since.
     NoAddress,
+    /// The account sent this mail itself — the person forwarded it out
+    /// of their own inbox rather than a hotel writing to their booking
+    /// address. Sending it on would hand them back a copy of what they
+    /// had just sent. Settled, not owed: there is nothing to send later,
+    /// and `forwarded_at` stays unset because nothing was sent.
+    TheirOwn,
     /// Resend refused it. Asking again would get the same answer.
     Refused,
     /// Resend was not there. Worth asking again.
@@ -217,7 +225,14 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
         (m.from.clone(), m.subject.clone(), m.text.clone(), m.html.clone(), true, Vec::new())
     } else {
         let r = client.received(&m.provider_id).await.map_err(resend)?;
-        scout_core::inbox::mail_body(core, m.id, r.text.clone(), r.html.clone(), BODY_CAP).await.map_err(Failure::Reading)?;
+        // The record's sender is stored with its body, so the passes
+        // after this one read the same sender this one is about to judge.
+        // Without that, a mail held back here for coming from the account
+        // is forwarded by the next pass off the row's weaker copy, and the
+        // row then says the opposite of what was decided.
+        scout_core::inbox::mail_fetched(core, m.id, Some(r.from.clone()), r.text.clone(), r.html.clone(), BODY_CAP)
+            .await
+            .map_err(Failure::Reading)?;
         let sender = if r.from.is_empty() { m.from.clone() } else { r.from };
         (sender, r.subject.or_else(|| m.subject.clone()), r.text, r.html, !r.attachments.is_empty(), r.attachments)
     };
@@ -329,8 +344,11 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
     Ok(())
 }
 
-/// The forward, unless the row says it went. An account with no email
-/// identity has nowhere to forward to; the mail is still read and filed.
+/// The forward, unless the row says it went, or the account is who sent
+/// it: a mail the person forwarded out of their own inbox is one they
+/// already hold, and sending it on hands them a copy of what they just
+/// sent. An account with no email identity has nowhere to forward to.
+/// In both of those the mail is still read and filed.
 /// A refusal is logged and the mail goes on; an outage is `Later`, for
 /// `settle` to decide. Neither is an `Err`: the reading does not wait on
 /// the forward. The store failing is.
@@ -348,7 +366,19 @@ async fn forward(
     if m.forwarded {
         return Ok(Forwarded::Yes);
     }
-    let Some(to) = scout_core::inbox::email_of(core, m.account_id).await.map_err(Failure::Reading)? else {
+    // Every address the account holds, of which the first is where a
+    // forward goes — as it went when this read one address and no more.
+    // The rest are here for the comparison below: a mail is the person's
+    // own whichever of their addresses they sent it from, and only one
+    // of those is the destination.
+    let theirs = scout_core::inbox::emails_of(core, m.account_id).await.map_err(Failure::Reading)?;
+    if scout_core::inbox::sender_is_the_account(sender, &theirs) {
+        // The id and nothing else: the address this is about is the
+        // person's own, and the log is not the place for it.
+        tracing::info!(id = m.id, "a mail the account sent itself; reading it without sending it back");
+        return Ok(Forwarded::TheirOwn);
+    }
+    let Some(to) = theirs.first().cloned() else {
         return Ok(Forwarded::NoAddress);
     };
     let all = scout_core::inbox::attachment_bytes(core, m.id).await.map_err(Failure::Reading)?;
@@ -617,7 +647,10 @@ fn other_mail_nudge(sender: &str, subject: &str, forwarded: Forwarded) -> String
     match forwarded {
         Forwarded::Yes => line.push_str(" Forwarded to you."),
         Forwarded::NoAddress => line.push_str(" Not forwarded: no email on your account."),
-        Forwarded::Refused | Forwarded::Later => {}
+        // Where their own copy of their own mail is is not news to
+        // them. The line itself stays: that Scout read it and saw no
+        // booking is something the sender did not know either.
+        Forwarded::TheirOwn | Forwarded::Refused | Forwarded::Later => {}
     }
     line
 }
@@ -1099,6 +1132,10 @@ mod tests {
             "Mail from booking.com: \"Changed\". Not forwarded: no email on your account."
         );
         assert_eq!(other_mail_nudge("noreply@booking.com", "Changed", Forwarded::Later), "Mail from booking.com: \"Changed\".");
+        // Silent about the forward, like the two below it: the person
+        // sent this mail, so where their own copy is is not news. The
+        // line itself stays — that Scout read it and saw no booking is.
+        assert_eq!(other_mail_nudge("noreply@booking.com", "Changed", Forwarded::TheirOwn), "Mail from booking.com: \"Changed\".");
         assert_eq!(other_mail_nudge("noreply@booking.com", "Changed", Forwarded::Refused), "Mail from booking.com: \"Changed\".");
         let long = other_mail_nudge("noreply@booking.com", &"é".repeat(300), Forwarded::Yes);
         assert_eq!(long.chars().count(), "Mail from booking.com: \"\". Forwarded to you.".len() + 200);
@@ -1482,6 +1519,132 @@ mod tests {
         assert_eq!(view.other[0].reason, "not_booking", "the model was asked");
         assert!(!view.other[0].forwarded, "nothing went, so nothing is recorded as gone");
         assert_eq!(forwards(&server.received_requests().await.unwrap()), 0);
+    }
+
+    /// Resend as `resend_like` has it, with the mail coming from `from`
+    /// rather than from a hotel. Mounted before it, so this record wins
+    /// the tie for the one mail the two of them both describe.
+    async fn resend_like_from(server: &MockServer, from: &str) {
+        Mock::given(method("GET")).and(path("/emails/receiving/re_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "re_1", "from": from, "to": ["sasha@goodscout.fyi"], "subject": "Your booking",
+                "text": "Check-in 12 Oct", "html": "<p>Check-in 12 Oct</p>",
+                "attachments": [{"id": "att_1", "filename": "ticket.pdf", "content_type": "application/pdf", "size": 3}],
+            })))
+            .mount(server).await;
+        resend_like(server).await;
+    }
+
+    #[tokio::test]
+    async fn a_mail_the_person_sent_themselves_is_read_and_filed_and_never_handed_back() {
+        let server = MockServer::start().await;
+        // Their own address as a mailer writes it on the way out: a
+        // display name, a capital, and the tag they file their bookings
+        // under. Same mailbox, so this is Scout's own forward coming back.
+        resend_like_from(&server, "Sasha Q <SASHA+hotels@Example.com>").await;
+        model_saying(&server, r#"{"booking":false,"summary":"A newsletter"}"#).await;
+        let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        // Two addresses, and the sender is the one a forward would not
+        // have gone to: the comparison is against every identity the
+        // account holds, not against the destination alone.
+        scout_core::inbox::seed_email_identity_for_tests(&core, a, "a.work@elsewhere.example").await.unwrap();
+        scout_core::inbox::seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
+        // The webhook said the same sender the record does: it is one
+        // From header read by two calls to Resend, and the row's copy is
+        // what the drawn row is judged by while the worker prefers the
+        // record's.
+        let theirs = MailIn { from: "Sasha Q <SASHA+hotels@Example.com>".into(), ..a_mail("re_1") };
+        let mail_id = scout_core::inbox::record_mail(&core, a, theirs).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(forwards(&reqs), 0, "the person was sent back the mail they had just sent");
+        // Everything else about the mail happens as it always did.
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert_eq!(view.other[0].reason, "not_booking", "the model was still asked");
+        assert!(!view.other[0].forwarded, "nothing was sent, so nothing is recorded as sent");
+        assert!(view.other[0].sent_by_you, "and the row says why, rather than leaving it to read as a failed forward");
+        assert_eq!(
+            scout_core::inbox::attachment_texts(&core, mail_id).await.unwrap().iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["ticket.pdf"],
+        );
+        // Aged first, and only then asked: a row attempted a moment ago is
+        // out of `mail_to_work` whatever `settle` decided, so asking
+        // before the backoff had passed would have said "settled" about a
+        // mail that was merely waiting.
+        scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        assert!(
+            scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(),
+            "held for a forward that is never coming"
+        );
+        // And a pass over it now finds nothing to do rather than sending late.
+        work_once(&core, &client, FROM, 10).await;
+        assert_eq!(forwards(&server.received_requests().await.unwrap()), 0);
+    }
+
+    #[tokio::test]
+    async fn the_sender_the_record_named_is_the_one_every_later_pass_reads() {
+        // The guarantee has to survive a retry, and the two passes read
+        // the sender from different places: the first from the record it
+        // fetched, every later one from the row. The webhook's `from` is
+        // optional — a payload without the key stores an empty string —
+        // so the row can be silent about a sender the record names, and
+        // then a mail suppressed on the first pass is forwarded on the
+        // second, with the row claiming the opposite of what was decided.
+        let server = MockServer::start().await;
+        resend_like_from(&server, "Sasha Q <sasha@example.com>").await;
+        // The model fails once, which is what buys the second pass: the
+        // mail is not settled, so it comes round again with its body — and
+        // its sender — read off the row.
+        Mock::given(method("POST")).and(path("/chat/completions")).respond_with(ResponseTemplate::new(500)).up_to_n_times(1).mount(&server).await;
+        model_saying(&server, r#"{"booking":false,"summary":"A newsletter"}"#).await;
+        let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        scout_core::inbox::seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
+        // The webhook said nothing about who wrote, as `Data::from`'s
+        // default allows. Only the record knows, and only on pass one.
+        let silent = MailIn { from: String::new(), ..a_mail("re_1") };
+        let mail_id = scout_core::inbox::record_mail(&core, a, silent).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+        assert_eq!(forwards(&server.received_requests().await.unwrap()), 0, "pass one held it back");
+
+        scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        work_once(&core, &client, FROM, 10).await;
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(forwards(&reqs), 0, "the retry read a sender the first pass had already judged, and sent the mail anyway");
+        assert_eq!(extractions(&reqs), 2, "and it was the reading that brought it round again");
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert!(view.other[0].sent_by_you, "the row is drawn from the same sender the worker judged");
+        assert!(!view.other[0].forwarded);
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_only_resembles_the_account_is_forwarded_like_any_stranger() {
+        // The trap the rule is written around: a host that begins with
+        // theirs is somebody else's host, and mail from it is mail they
+        // would otherwise never see.
+        let server = MockServer::start().await;
+        resend_like_from(&server, "sasha@example.com.evil.example").await;
+        model_saying(&server, r#"{"booking":false,"summary":"A newsletter"}"#).await;
+        let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        scout_core::inbox::seed_email_identity_for_tests(&core, a, "sasha@example.com").await.unwrap();
+        scout_core::inbox::record_mail(&core, a, a_mail("re_1")).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(forwards(&reqs), 1);
+        let forward: serde_json::Value = serde_json::from_slice(&reqs.iter().find(|r| r.url.path() == "/emails").unwrap().body).unwrap();
+        assert_eq!(forward["to"], json!(["sasha@example.com"]));
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert!(view.other[0].forwarded);
     }
 
     fn extractions(reqs: &[wiremock::Request]) -> usize {

@@ -588,6 +588,27 @@ test('other mail reads as sender, subject, when, reason', () => {
   assert.equal(lines[1].attachments.length, 1)
 })
 
+test('an other-mail row the reader sent says so rather than reading as a failure', () => {
+  // Three states, three notes. "not forwarded" on a mail the person
+  // forwarded to Scout themselves reads as something that went wrong,
+  // when what happened is that they already hold the mail.
+  const [sent, forwarded, not, both] = otherMailLines([
+    { mail_id: 1, from: 'Sasha <sasha@example.com>', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking', forwarded: false, sent_by_you: true },
+    { mail_id: 2, from: 'news@flytap.com', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking', forwarded: true, sent_by_you: false },
+    { mail_id: 3, from: 'news@flytap.com', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking', forwarded: false, sent_by_you: false },
+    // Both, which the server can say: the mail was forwarded, and an
+    // address matching its sender was linked to the account afterwards.
+    // `forwarded` is what happened to this mail and `sent_by_you` is
+    // recomputed from the identities as they are now, so the fact wins
+    // over the derivation.
+    { mail_id: 4, from: 'Sasha <sasha@example.com>', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking', forwarded: true, sent_by_you: true },
+  ])
+  assert.equal(sent.note, 'you sent this to Scout')
+  assert.equal(forwarded.note, 'forwarded to you')
+  assert.equal(not.note, 'not forwarded')
+  assert.equal(both.note, 'forwarded to you', 'a mail that was forwarded says so, whoever the sender turns out to be today')
+})
+
 test('the delete button on an other-mail row names what it would delete', () => {
   // Every × in the list is the same glyph. Read on its own — which is how
   // a screen reader offers it — only the label tells them apart.

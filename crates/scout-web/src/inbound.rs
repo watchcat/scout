@@ -23,7 +23,7 @@ use axum::Router;
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
 use scout_core::core::Core;
-use scout_core::inbox::{self, MailIn, MailPart};
+use scout_core::inbox::{self, bare_address, MailIn, MailPart};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -202,18 +202,6 @@ impl Attachment {
         let provider_id = self.id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty())?;
         Some(MailPart { provider_id, content_disposition: self.content_disposition, content_id: self.content_id })
     }
-}
-
-/// `addr` out of `Name <addr>`, or the string itself when there are no
-/// angle brackets.
-fn bare_address(raw: &str) -> &str {
-    // Both from the right: a display name may itself contain a `<`, and
-    // the address is always the last bracketed thing.
-    match (raw.rfind('<'), raw.rfind('>')) {
-        (Some(open), Some(close)) if open < close => &raw[open + 1..close],
-        _ => raw,
-    }
-    .trim()
 }
 
 /// The local part of the first address whose domain is ours, as written:

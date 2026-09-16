@@ -349,13 +349,16 @@ pub struct FinalisedTrip {
     /// equal `currency`: a single ticket for the same itinerary can price
     /// in a currency none of the separate segments do.
     pub one_ticket_currency: Option<String>,
-    /// The stays, activities and transport with a recorded price. Not in
-    /// `separate_total`: that is a sum of live fares in one currency, and
-    /// these are figures the traveller typed in, possibly in several. The
-    /// reply adds them in words.
+    /// The items whose price is already settled: the stays, activities and
+    /// transport with a recorded price, and the flights the traveller has
+    /// already bought. Not in `separate_total`: that is a sum of live fares
+    /// in one currency, and these are figures the traveller typed in or
+    /// paid, possibly in several. The reply adds them in words.
     pub fixed_costs: Vec<FixedCost>,
-    /// The non-flight items with no price at all, by title, so the reply
-    /// can say what the totals leave out.
+    /// The settled items with no price at all, named as `cost_label` names
+    /// them, so the reply can say what the totals leave out. A ticket whose
+    /// confirmation never stated a price belongs here for the same reason
+    /// an unpriced hotel does.
     pub unpriced_items: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -595,36 +598,60 @@ pub fn ready_to_price(items: &[TripItem]) -> Pricing<'_> {
     Pricing::Ready(ready)
 }
 
-/// A non-flight item with a price, for the finalised total.
+/// An item whose price is already settled, for the finalised total.
 ///
-/// Its price is what the traveller recorded, not something re-fetched:
-/// nothing here can re-price a hotel, so it goes into the reply as a fixed
-/// cost beside the live flight totals rather than folded into them.
+/// Its price is what the traveller recorded or paid, not something
+/// re-fetched: nothing here can re-price a hotel, and a flight they are
+/// already holding a ticket for has no fare left to look up. Both go into
+/// the reply as fixed costs beside the live flight totals rather than
+/// folded into them.
 #[derive(Debug, PartialEq, serde::Serialize)]
 pub struct FixedCost {
     pub position: i64,
+    /// What to call this line: a booking's own name, or a flight's route
+    /// and day — see `cost_label`.
     pub title: String,
     pub price: f64,
     pub currency: String,
 }
 
-/// Priced non-flights, and the titles of the ones with no price.
+/// What the totals call an item.
+///
+/// A stay's title is the name its booking came with. A flight's is the
+/// route it was stored under, "AMS → LIS", which says nothing about which
+/// of two identical legs it is — an out-and-back has two of them — so a
+/// flight is named by its route and the day it leaves.
+fn cost_label(item: &TripItem) -> String {
+    match item.is_flight() {
+        true => format!("{} on {}", item.route(), item.date),
+        false => item.title.clone(),
+    }
+}
+
+/// The settled prices, and the names of the settled items with no price.
+///
+/// A booked flight belongs here and an unbooked one does not. The fare on
+/// a ticket the traveller holds is a cost of this trip like any other, and
+/// filtering flights out wholesale kept it out of every total there is; an
+/// unbooked flight is what the pricing path is for, and counting it here
+/// as well would count it twice.
 ///
 /// The unpriced ones are returned by name rather than dropped, so the reply
 /// can say the total is missing them: a hotel with no price is still a
-/// cost, and a total that quietly leaves it out reads as the whole trip.
+/// cost, and so is a ticket whose confirmation never stated one. A total
+/// that quietly leaves either out reads as the whole trip.
 pub fn fixed_costs(items: &[TripItem]) -> (Vec<FixedCost>, Vec<String>) {
     let mut fixed = Vec::new();
     let mut unpriced = Vec::new();
-    for i in items.iter().filter(|i| !i.is_flight()) {
+    for i in items.iter().filter(|i| !i.is_flight() || i.booked) {
         match (i.price, &i.currency) {
             (Some(price), Some(currency)) => fixed.push(FixedCost {
                 position: i.position,
-                title: i.title.clone(),
+                title: cost_label(i),
                 price,
                 currency: currency.clone(),
             }),
-            _ => unpriced.push(i.title.clone()),
+            _ => unpriced.push(cost_label(i)),
         }
     }
     (fixed, unpriced)
@@ -850,12 +877,22 @@ impl Tool for FinaliseTripTool {
             });
         }
 
-        let (separate_total, currency) = match separate_total(&segments) {
-            Ok((total, currency)) => (Some(total), Some(currency)),
-            Err(problem) => {
-                notes.push(problem);
-                (None, None)
-            }
+        // Whether anything was shopped at all. A trip with every flight
+        // already bought searched nothing, and none of the notes about a
+        // missing total or a missing comparison apply to it: there is no
+        // total missing, because there was nothing to total. Reporting one
+        // would be the thing this whole change is against — a failure
+        // announced where nothing failed.
+        let shopped = !segments.is_empty();
+        let (separate_total, currency) = match shopped {
+            false => (None, None),
+            true => match separate_total(&segments) {
+                Ok((total, currency)) => (Some(total), Some(currency)),
+                Err(problem) => {
+                    notes.push(problem);
+                    (None, None)
+                }
+            },
         };
         // Prefers a single-ticket offer in the currency the segments were
         // actually summed in — the only one this figure could honestly be
@@ -870,7 +907,7 @@ impl Tool for FinaliseTripTool {
             separate_total.zip(currency.as_deref()),
             one_ticket_total.zip(one_ticket_currency.as_deref()),
         ));
-        if self.duffel.is_none() {
+        if self.duffel.is_none() && shopped {
             notes.push(
                 "Duffel is not configured here, so no single-ticket price could be fetched at \
                  all — this trip can only be compared against itself"
@@ -878,6 +915,31 @@ impl Tool for FinaliseTripTool {
             );
         }
         let (fixed_costs, unpriced_items) = fixed_costs(&trip.items);
+        // Said here, not left to be inferred from a shorter list of
+        // segments than the trip has legs. A total over the legs still to
+        // buy, presented as the trip's total, is the same lie as a total
+        // that quietly leaves a hotel out.
+        let booked_flights: Vec<&TripItem> =
+            trip.items.iter().filter(|i| i.is_flight() && i.booked).collect();
+        if !booked_flights.is_empty() {
+            let named = booked_flights.iter().map(|f| cost_label(f)).collect::<Vec<_>>().join(", ");
+            let (they, are) = match booked_flights.len() {
+                1 => ("it", "is"),
+                _ => ("they", "are"),
+            };
+            notes.push(match shopped {
+                true => format!(
+                    "the flight totals here cover only the legs still to buy: {named} {are} \
+                     already booked, and what {they} cost is in fixed_costs, at the price paid \
+                     where the confirmation stated one"
+                ),
+                false => format!(
+                    "every flight on this trip is already booked, so nothing was searched and \
+                     there is no live total to give: {named} {are} in fixed_costs, at the price \
+                     paid where the confirmation stated one"
+                ),
+            });
+        }
         if !unpriced_items.is_empty() {
             // Named in a note as well as listed: a total that silently
             // leaves a hotel out reads as the whole trip.
@@ -3265,6 +3327,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_trip_with_every_flight_bought_is_totalled_rather_than_searched() {
+        // `expect(0)`, verified when the server drops: a route the traveller
+        // has already bought must cost nothing to re-price, and going to
+        // Duffel for it is both a fee and an answer nobody can act on.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(duffel_offer("640.00", &["KL861"])))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
+            .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap();
+        // What a forwarded confirmation leaves behind: the leg is bought,
+        // at the price the mail stated.
+        let trip = store.find_trip(7, "Japan").unwrap().unwrap();
+        store
+            .book_item(trip.items[0].id, Some("KL7788"), Some(612.40), Some("EUR"), None)
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store,
+            account_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap();
+
+        assert!(out.segments.is_empty(), "nothing was shopped: {:?}", out.segments);
+        assert_eq!(
+            out.fixed_costs,
+            vec![FixedCost { position: 1, title: "AMS→NRT on 2026-09-03".into(), price: 612.40, currency: "EUR".into() }],
+            "what the trip cost is what the traveller paid",
+        );
+        let notes = out.notes.join(" ");
+        assert!(notes.contains("already booked"), "got: {notes}");
+        // Nothing here failed, so nothing here may read as a failure: the
+        // empty search has no missing total and no missing comparison.
+        assert!(!notes.contains("no total"), "got: {notes}");
+        assert!(!notes.contains("could not"), "got: {notes}");
+    }
+
+    #[tokio::test]
     async fn a_flight_that_is_no_longer_sold_is_reported_not_substituted() {
         // The traveller chose a flight, not a price band. Quietly swapping it
         // is how a 06:00 departure turns up in an itinerary nobody agreed to.
@@ -4086,6 +4216,40 @@ mod tests {
             vec![FixedCost { position: 1, title: "Hotel".into(), price: 320.0, currency: "EUR".into() }]
         );
         assert_eq!(unpriced, vec!["Museum".to_string()]);
+    }
+
+    #[test]
+    fn a_booked_flights_fare_counts_towards_the_trip_and_an_unbooked_one_does_not() {
+        // The fare on a ticket the traveller holds is what they paid, not
+        // something to fetch — and it was reaching no total at all, because
+        // this looked at non-flights only. An unbooked leg stays out: it is
+        // what the pricing path is for, and would otherwise be counted
+        // twice.
+        let mut items = vec![
+            flight_item(1, "AMS", "HKG", "2026-10-12", Some(chosen_departing("2026-10-12T07:15:00"))),
+            flight_item(2, "HKG", "AMS", "2026-10-19", Some(chosen_departing("2026-10-19T18:40:00"))),
+            stay_item_priced(3, "Hotel", "2026-10-13", Some((320.0, "EUR"))),
+        ];
+        items[0].booked = true;
+        items[0].price = Some(612.40);
+        items[0].currency = Some("EUR".to_string());
+
+        let (fixed, unpriced) = fixed_costs(&items);
+        assert_eq!(
+            fixed,
+            vec![
+                FixedCost { position: 1, title: "AMS→HKG on 2026-10-12".into(), price: 612.40, currency: "EUR".into() },
+                FixedCost { position: 3, title: "Hotel".into(), price: 320.0, currency: "EUR".into() },
+            ],
+            "a flight is named by its route and its day: two legs can share a title",
+        );
+        assert!(unpriced.is_empty(), "an unbooked leg is neither a cost nor missing one: {unpriced:?}");
+
+        // A confirmation that stated no price leaves a cost nobody can see
+        // unless the reply names it.
+        items[1].booked = true;
+        let (_, unpriced) = fixed_costs(&items);
+        assert_eq!(unpriced, vec!["HKG→AMS on 2026-10-19".to_string()]);
     }
 
     #[tokio::test]

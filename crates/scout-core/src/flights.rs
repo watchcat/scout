@@ -436,7 +436,9 @@ it is not evidence that separate booking is better. A trip may hold stays, \
 activities and transport beside its flights; present them in the order \
 given, and say when an item is booked and its confirmation code. \
 finalise_trip's fixed_costs are those items' prices as recorded; add them \
-to the flight totals in words, never silently.";
+to the flight totals in words, never silently. A flight the traveller \
+already holds a ticket for is one of those fixed costs, at what they paid: \
+it is never searched again, and never offer to re-shop it.";
 
 #[cfg(test)]
 mod tests {

@@ -4087,11 +4087,21 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
 
     // Every ticket on the trip in one query, joined to its item in memory
     // below — the same shape as the candidates above, and for a harder
-    // reason. `list_trips` reads every trip of an account, and it sits on
-    // the placement path that runs for every booking of every incoming
-    // mail; a query per item would be an N+1 there, felt on the one read
-    // that has to stay cheap. `item_id IN (…)` also drops a file that is
-    // still only the mail's: a NULL `item_id` matches nothing.
+    // reason. `list_trips` reads every trip of an account with all of its
+    // items, and it sits on the placement path — once per incoming mail,
+    // as `inbox::Trips::load` is careful to keep it. A query per item would
+    // make that read grow with the size of the account's trips rather than
+    // with the number of them, which is the one thing that read must not
+    // do. `item_id IN (…)` also drops a file that is still only the mail's:
+    // a NULL `item_id` matches nothing.
+    //
+    // The `size` is not free and nothing reads it here: measured on a trip
+    // holding 40 tickets of 250 KB, the scan projects `bytes` and the plan
+    // computes `octet_length` above the join, costing ~13 ms cold and ~1 ms
+    // warm per trip read against the same query without it. It is in the
+    // wire type, so it is filled rather than faked; a `size` column written
+    // at insert would take `bytes` out of both this query and
+    // `attachments_of`, and is a migration waiting for a reason.
     let mut stmt = conn.prepare(
         "SELECT item_id, id, filename, mime, CAST(coalesce(octet_length(bytes), 0) AS BIGINT)
          FROM attachments
@@ -8813,8 +8823,11 @@ CREATE TABLE messages (
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
         let m = mail(&store, a, "re_1");
-        let boarding = store.insert_attachment(m, "boarding.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
-        let receipt = store.insert_attachment(m, "receipt.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        // Named so that the order they were written in is not the order
+        // their names sort in: the read has to be pinned to one of them,
+        // and it is the ids — the order the mail carried them in.
+        let boarding = store.insert_attachment(m, "zulu-boarding.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        let receipt = store.insert_attachment(m, "alpha-receipt.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
         let loose = store.insert_attachment(m, "logo.png", "image/png", Some(&[1, 2]), None).unwrap();
         let trip = store.upsert_trip(a, "Lisbon", None, None, None).unwrap();
         let trip = store.add_item(trip.id, NewItem {
@@ -8835,13 +8848,15 @@ CREATE TABLE messages (
 
         let got = store.trip_by_id(a, trip.id).unwrap().expect("theirs");
         let stay = got.items.iter().find(|i| i.title == "Hotel Alfama").expect("the stay");
+        assert!(boarding < receipt, "the ids are the order the mail carried them in");
         assert_eq!(
             stay.attachments.iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(),
-            vec!["boarding.pdf", "receipt.pdf"],
+            vec!["zulu-boarding.pdf", "alpha-receipt.pdf"],
+            "read back in id order, not by name and not by when they were attached",
         );
         assert_eq!(
             stay.attachments[0],
-            scout_api::AttachmentRef { id: boarding, filename: "boarding.pdf".into(), mime: "application/pdf".into(), size: 4 },
+            scout_api::AttachmentRef { id: boarding, filename: "zulu-boarding.pdf".into(), mime: "application/pdf".into(), size: 4 },
         );
         let museum = got.items.iter().find(|i| i.title == "Museu do Azulejo").expect("the activity");
         assert!(museum.attachments.is_empty(), "nobody attached anything to it");

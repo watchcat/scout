@@ -29,6 +29,9 @@ const MIN_PDF_BYTES: u64 = 1024;
 const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ITEMS: usize = 64;
 const MAX_CANDIDATES_PER_ITEM: usize = 64;
+/// Beside the candidate bound, and for the same reason: what this file
+/// prints is bounded by this file. One mail could carry a hundred files.
+const MAX_ATTACHMENTS_PER_ITEM: usize = 32;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
 
 static PDF_SLOTS: OnceLock<Semaphore> = OnceLock::new();
@@ -232,6 +235,7 @@ fn validate_plan(plan: &Plan) -> Result<(), Error> {
     };
     for item in &plan.trip.items {
         if item.candidates.len() > MAX_CANDIDATES_PER_ITEM
+            || item.attachments.len() > MAX_ATTACHMENTS_PER_ITEM
             || item.title.len() > MAX_FIELD_BYTES
             || item.date.len() > MAX_FIELD_BYTES
             || too_long(&item.origin)
@@ -335,6 +339,14 @@ fn booked_mark(item: &TripItem) -> String {
 ///
 /// Names only: there is nothing a piece of paper can do with a link, and
 /// the bytes are behind a session anyway.
+///
+/// A real airline names its file `eTicket_Receipt_ABC123_SURNAME_..._LIS.pdf`
+/// — one unbreakable token wider than the column. `.segment-head` is a flex
+/// row, so its left div needs `min-width:0` and this div needs
+/// `overflow-wrap:anywhere`, or the name refuses to shrink and pushes the
+/// `<time>` out of a `.segment` that clips its overflow: the date, silently,
+/// which is the one thing a traveller reads off paper. Both rules are in the
+/// stylesheet above, and `.attachment-links a` does the same on the page.
 fn tickets(item: &TripItem) -> String {
     if item.attachments.is_empty() {
         return String::new();
@@ -566,7 +578,7 @@ pub fn html(plan: &Plan) -> String {
     out.push_str(
         r#"</title>
 <style>
-@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .booked{margin-top:.7mm;color:#4f5d10;font-size:7.5pt;font-weight:700}.segment-head .tickets{margin-top:.7mm;color:#50666b;font-size:7.5pt}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
+@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head>div{min-width:0}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .booked{margin-top:.7mm;color:#4f5d10;font-size:7.5pt;font-weight:700}.segment-head .tickets{margin-top:.7mm;color:#50666b;font-size:7.5pt;overflow-wrap:anywhere}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
 </style></head><body>"#,
     );
     write!(
@@ -845,7 +857,18 @@ mod tests {
 
     #[test]
     fn the_document_contains_every_detail_and_escapes_stored_text() {
-        let html = html(&plan());
+        let mut plan = plan();
+        // A leg bought by forwarding a confirmation carries its ticket too,
+        // and the flight head prints it from its own call — this leg is not
+        // booked, so a head that printed `booked_mark` here instead would
+        // show nothing at all.
+        plan.trip.items[0].attachments = vec![scout_api::AttachmentRef {
+            id: 9,
+            filename: "eTicket <KL1579>.pdf".to_string(),
+            mime: "application/pdf".to_string(),
+            size: 12,
+        }];
+        let html = html(&plan);
         for expected in [
             "October &lt;escape&gt;",
             "AMS → LIS → FCO",
@@ -871,6 +894,8 @@ mod tests {
             // Escaped like everything else that came out of a stranger's
             // mail.
             "ticket · voucher &lt;1&gt;.pdf",
+            // And on a flight head, which prints it from its own call.
+            "ticket · eTicket &lt;KL1579&gt;.pdf",
         ] {
             assert!(html.contains(expected), "missing `{expected}`");
         }
@@ -919,6 +944,32 @@ mod tests {
             validate_plan(&oversized),
             Err(Error::InputTooLarge)
         ));
+
+        // A filename is stranger-supplied bytes off an email like the rest,
+        // and this file bounds what it prints rather than trusting whoever
+        // stored it.
+        let mut named = plan();
+        named.trip.items[1].attachments[0].filename = "x".repeat(MAX_FIELD_BYTES + 1);
+        assert!(matches!(validate_plan(&named), Err(Error::InputTooLarge)));
+
+        // Short names, but a great many of them: bounded on its own here,
+        // beside the candidate count, rather than through whatever limit
+        // the ingest path happens to keep.
+        let mut many = plan();
+        many.trip.items[1].attachments = std::iter::repeat_n(
+            scout_api::AttachmentRef {
+                id: 1,
+                filename: "t.pdf".to_string(),
+                mime: "application/pdf".to_string(),
+                size: 1,
+            },
+            MAX_ATTACHMENTS_PER_ITEM + 1,
+        )
+        .collect();
+        assert!(matches!(validate_plan(&many), Err(Error::InputTooLarge)));
+
+        // And the fixture as it stands, with its one ticket, is fine.
+        assert!(validate_plan(&plan()).is_ok());
     }
 
     /// Shaped like what Chromium writes: a header, a body comfortably over the

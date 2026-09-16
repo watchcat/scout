@@ -1588,13 +1588,55 @@ function start() {
     }
   }
 
+  // A page with its corner turned. Inline SVG rather than a `::before`
+  // glyph like `.trip-download`'s arrow, because this one sits beside
+  // text the sender wrote: a pseudo-element cannot be marked
+  // `aria-hidden`, and a screen reader would read the glyph into the
+  // filename that is the link's whole accessible name.
+  function fileIcon() {
+    const ns = 'http://www.w3.org/2000/svg'
+    const svg = document.createElementNS(ns, 'svg')
+    svg.setAttribute('viewBox', '0 0 24 24')
+    svg.setAttribute('width', '13')
+    svg.setAttribute('height', '13')
+    svg.setAttribute('fill', 'none')
+    svg.setAttribute('stroke', 'currentColor')
+    svg.setAttribute('stroke-width', '2')
+    svg.setAttribute('stroke-linecap', 'round')
+    svg.setAttribute('stroke-linejoin', 'round')
+    svg.setAttribute('aria-hidden', 'true')
+    for (const d of ['M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z', 'M14 3v5h5']) {
+      const path = document.createElementNS(ns, 'path')
+      path.setAttribute('d', d)
+      svg.append(path)
+    }
+    return svg
+  }
+
   // Plain anchors: the route sets `Content-Disposition` and that is what
   // decides whether a click renders the file or saves it. Nothing for the
   // page to do either way.
+  //
+  // Chips rather than bare links. They shipped as 12px cyan text with no
+  // underline, under an address line and a confirmation code that are
+  // small muted text too, and the owner twice reported there was no way
+  // to view the files — a filename at that size in that company reads as
+  // one more label about the booking, not as something to press. The
+  // border, the radius and the glyph are `.trip-download`'s, the other
+  // control on this card that opens a file, so the card gains no new
+  // visual language for this.
+  //
+  // The name goes in its own span: the chip is a flex row, and a real
+  // airline's `eTicket_Receipt_ABC123_SURNAME_LIS.pdf` is one unbreakable
+  // token that has to be allowed to shrink and wrap inside the border
+  // rather than push it out of the card.
   function attachmentLinks(attachments) {
     const list = node('p', 'attachment-links')
     for (const file of attachments) {
-      const link = node('a', '', file.filename || `attachment ${file.id}`)
+      const link = node('a')
+      // The glyph is built node by node and carries no data; only the
+      // name is the sender's text, and it arrives as `textContent`.
+      link.append(fileIcon(), node('span', '', file.filename || `attachment ${file.id}`))
       link.href = `/chat/attachments/${encodeURIComponent(file.id)}`
       // One behaviour here, and the server decides what it means: no
       // `download`, so a ticket that came back `inline` — a PDF, an image,

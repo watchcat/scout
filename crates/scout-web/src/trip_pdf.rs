@@ -346,7 +346,9 @@ fn booked_mark(item: &TripItem) -> String {
 /// `overflow-wrap:anywhere`, or the name refuses to shrink and pushes the
 /// `<time>` out of a `.segment` that clips its overflow: the date, silently,
 /// which is the one thing a traveller reads off paper. Both rules are in the
-/// stylesheet above, and `.attachment-links a` does the same on the page.
+/// stylesheet above; the page keeps the same pair on its chip, `min-width:0`
+/// on the `.attachment-links a` and `overflow-wrap:anywhere` on the span
+/// inside it that holds the name.
 fn tickets(item: &TripItem) -> String {
     if item.attachments.is_empty() {
         return String::new();

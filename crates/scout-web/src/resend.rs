@@ -25,6 +25,17 @@ pub struct ResendClient {
 
 /// An attachment as the received-mail record lists it: a name and a type,
 /// but no way to fetch it. `attachments` is the call that adds the URL.
+///
+/// `content_disposition` and `content_id` are the two fields that tell an
+/// attachment from the mail's own furniture — a signature logo, a tracking
+/// pixel, an image the HTML body draws. Resend sends both on the inbound
+/// webhook, per part: the payload pinned in `inbound.rs` carries them. What
+/// is unknown is this endpoint, which documents neither, so both are
+/// optional here and an absent one means nothing — see
+/// `inbox_worker::winnow`, which keeps every part the record does not mark.
+/// `content_disposition` arrives as a full header value, parameters and
+/// all (`inline; filename="logo.png"`); `inbox_worker::disposition` is what
+/// reads the token out of it.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Meta {
     pub id: String,
@@ -34,6 +45,10 @@ pub struct Meta {
     pub content_type: Option<String>,
     #[serde(default)]
     pub size: Option<u64>,
+    #[serde(default)]
+    pub content_disposition: Option<String>,
+    #[serde(default)]
+    pub content_id: Option<String>,
 }
 
 /// A mail Resend received for us, body included. Only what the worker
@@ -420,5 +435,32 @@ pub(crate) mod tests {
         let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
         let atts = client.attachments("re_1").await.unwrap();
         assert_eq!(atts.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["att_1", "att_2"]);
+    }
+
+    #[test]
+    fn a_part_says_whether_it_is_inline_when_the_record_says_so_and_nothing_when_it_does_not() {
+        // Resend does not document either field on the received record, so
+        // the worker has to read a payload with them and one without and
+        // be right both times. Absent is not `inline`: a record that says
+        // nothing must leave every part alone.
+        let told: Meta = serde_json::from_value(json!({
+            "id": "att_1", "filename": "logo.png", "content_type": "image/png", "size": 9,
+            "content_disposition": "inline", "content_id": "<logo@mailer>",
+        }))
+        .unwrap();
+        assert_eq!(told.content_disposition.as_deref(), Some("inline"));
+        assert_eq!(told.content_id.as_deref(), Some("<logo@mailer>"));
+
+        let silent: Meta =
+            serde_json::from_value(json!({"id": "att_2", "filename": "ticket.pdf", "content_type": "application/pdf", "size": 3})).unwrap();
+        assert_eq!(silent.content_disposition, None);
+        assert_eq!(silent.content_id, None);
+
+        // And an explicit null is the same as absent — Resend has been seen
+        // to send one rather than omit the key, see `Received`.
+        let nulled: Meta =
+            serde_json::from_value(json!({"id": "att_3", "content_disposition": null, "content_id": null})).unwrap();
+        assert_eq!(nulled.content_disposition, None);
+        assert_eq!(nulled.content_id, None);
     }
 }

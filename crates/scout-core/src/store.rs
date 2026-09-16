@@ -4582,7 +4582,7 @@ impl Store {
     /// later pass — and the drawn row — judge the one string the pass
     /// that fetched it judged. A blank is not an answer and never
     /// overwrites the one the row already has.
-    pub fn mail_body(&self, id: i64, sender: Option<&str>, text: Option<&str>, html: Option<&str>, cap_chars: usize) -> Result<()> {
+    pub fn mail_fetched(&self, id: i64, sender: Option<&str>, text: Option<&str>, html: Option<&str>, cap_chars: usize) -> Result<()> {
         let cut = |s: Option<&str>| -> (Option<String>, bool) {
             match s {
                 Some(s) if s.chars().count() > cap_chars => (Some(s.chars().take(cap_chars).collect()), true),
@@ -9618,11 +9618,11 @@ CREATE TABLE messages (
     }
 
     #[test]
-    fn a_mail_body_is_cut_at_the_cap_and_the_sender_that_came_with_it_is_kept() {
+    fn a_fetched_mail_is_cut_at_the_cap_and_the_sender_that_came_with_it_is_kept() {
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
         let m = store.insert_mail(a, "re_1", "x", None, None, None, false, &[]).unwrap().unwrap();
-        store.mail_body(m, Some("airline@example.com"), Some("héllo wörld"), Some("<p>hi</p>"), 5).unwrap();
+        store.mail_fetched(m, Some("airline@example.com"), Some("héllo wörld"), Some("<p>hi</p>"), 5).unwrap();
         let row = &store.mail_to_work(1).unwrap()[0];
         assert_eq!((row.text.as_deref(), row.html.as_deref()), (Some("héllo"), Some("<p>hi")), "chars, not bytes");
         assert_eq!(row.from.as_str(), "airline@example.com", "the record's sender is what the row now says");
@@ -9631,7 +9631,7 @@ CREATE TABLE messages (
         // Within the cap nothing is cut, and a body that was already marked
         // truncated on the way in stays so.
         let n = store.insert_mail(a, "re_2", "x", None, None, None, true, &[]).unwrap().unwrap();
-        store.mail_body(n, Some("   "), Some("short"), None, 50).unwrap();
+        store.mail_fetched(n, Some("   "), Some("short"), None, 50).unwrap();
         let row = &store.mail_to_work(2).unwrap()[1];
         assert_eq!((row.text.as_deref(), row.html.as_deref()), (Some("short"), None));
         // A blank sender is not an answer: it leaves the one the webhook

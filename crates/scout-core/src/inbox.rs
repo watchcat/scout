@@ -506,7 +506,7 @@ pub async fn view(core: &Core, account_id: i64, domain: &str) -> anyhow::Result<
         // The sender this reads is the sender the worker judged: the
         // pass that fetches the record writes it onto the row with the
         // body, so there is one string and not two copies of one header
-        // to disagree. See `Store::mail_body`.
+        // to disagree. See `Store::mail_fetched`.
         let theirs = store.emails_of(account_id)?;
         for row in &mut view.other {
             row.sent_by_you = sender_is_the_account(&row.from, &theirs);
@@ -657,9 +657,9 @@ pub async fn mail_forwarded(core: &Core, id: i64) -> anyhow::Result<()> {
 }
 
 /// The body fetched from the provider, cut at `cap_chars` characters,
-/// and the sender that came with it — see `Store::mail_body` for why the
+/// and the sender that came with it — see `Store::mail_fetched` for why the
 /// two are written together and why a blank sender changes nothing.
-pub async fn mail_body(
+pub async fn mail_fetched(
     core: &Core,
     id: i64,
     sender: Option<String>,
@@ -668,7 +668,7 @@ pub async fn mail_body(
     cap_chars: usize,
 ) -> anyhow::Result<()> {
     let store = core.store();
-    blocking(move || store.mail_body(id, sender.as_deref(), text.as_deref(), html.as_deref(), cap_chars)).await
+    blocking(move || store.mail_fetched(id, sender.as_deref(), text.as_deref(), html.as_deref(), cap_chars)).await
 }
 
 pub async fn store_attachment(
@@ -2452,7 +2452,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let first = record_mail(&core, a, MailIn { text: None, ..mail_in("re_1") }).await.unwrap().unwrap();
         let second = record_mail(&core, a, mail_in("re_2")).await.unwrap().unwrap();
-        mail_body(&core, first, None, Some("x".repeat(20)), None, 5).await.unwrap();
+        mail_fetched(&core, first, None, Some("x".repeat(20)), None, 5).await.unwrap();
         let due = mail_to_work(&core, 10).await.unwrap();
         assert_eq!(due.iter().map(|m| m.id).collect::<Vec<_>>(), vec![first, second]);
         assert_eq!(due[0].text.as_deref(), Some("xxxxx"), "cut at the cap");

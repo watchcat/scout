@@ -230,7 +230,7 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
         // Without that, a mail held back here for coming from the account
         // is forwarded by the next pass off the row's weaker copy, and the
         // row then says the opposite of what was decided.
-        scout_core::inbox::mail_body(core, m.id, Some(r.from.clone()), r.text.clone(), r.html.clone(), BODY_CAP)
+        scout_core::inbox::mail_fetched(core, m.id, Some(r.from.clone()), r.text.clone(), r.html.clone(), BODY_CAP)
             .await
             .map_err(Failure::Reading)?;
         let sender = if r.from.is_empty() { m.from.clone() } else { r.from };

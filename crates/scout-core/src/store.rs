@@ -4414,24 +4414,39 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
-    /// A retry replaces the undecided reading of the same mail, so a mail
-    /// worked twice shows once; a reading the owner has already decided on
-    /// is history and stays.
-    pub fn insert_arrival(&self, account_id: i64, mail_id: i64, a: &NewArrival) -> Result<i64> {
+    /// Every reading of one mail, written together. A retry replaces the
+    /// undecided readings of that mail, so a mail worked twice shows once;
+    /// readings the owner has already decided on are history and stay.
+    ///
+    /// The delete runs once for the batch rather than once per row: one
+    /// email can confirm a round trip, and a delete per insert would leave
+    /// only the last leg standing.
+    pub fn insert_arrivals(&self, account_id: i64, mail_id: i64, rows: &[NewArrival]) -> Result<Vec<i64>> {
         let conn = self.conn();
         conn.execute("DELETE FROM arrivals WHERE mail_id = ? AND status = 'pending'", params![mail_id])?;
-        Ok(conn.query_row(
-            "INSERT INTO arrivals (account_id, mail_id, booking, kind, title, place, origin, destination,
-                                   date, starts_at, ends_at, timezone, confirmation_code, price, currency,
-                                   travellers, confidence, summary, trip_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-            params![
-                account_id, mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
-                a.date, a.starts_at, a.ends_at, a.timezone, a.confirmation_code, a.price, a.currency,
-                a.travellers, a.confidence, a.summary, a.trip_id
-            ],
-            |r| r.get(0),
-        )?)
+        rows.iter()
+            .map(|a| {
+                Ok(conn.query_row(
+                    "INSERT INTO arrivals (account_id, mail_id, booking, kind, title, place, origin, destination,
+                                           date, starts_at, ends_at, timezone, confirmation_code, price, currency,
+                                           travellers, confidence, summary, trip_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                    params![
+                        account_id, mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
+                        a.date, a.starts_at, a.ends_at, a.timezone, a.confirmation_code, a.price, a.currency,
+                        a.travellers, a.confidence, a.summary, a.trip_id
+                    ],
+                    |r| r.get(0),
+                )?)
+            })
+            .collect()
+    }
+
+    /// The one-reading case, for the seeds and the tests that want a row
+    /// and its id rather than a batch.
+    pub fn insert_arrival(&self, account_id: i64, mail_id: i64, a: &NewArrival) -> Result<i64> {
+        let mut ids = self.insert_arrivals(account_id, mail_id, std::slice::from_ref(a))?;
+        Ok(ids.remove(0))
     }
 
     /// The arrival, if it is this account's. The owner is part of the key
@@ -4499,16 +4514,20 @@ impl Store {
     pub fn inbox_view(&self, account_id: i64) -> Result<scout_api::InboxView> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
+            // Newest mail first, but the readings of one mail in the order
+            // they were read: the legs of a ticket belong in the ticket's
+            // order, out before back.
             "SELECT {ARRIVAL_SELECT} WHERE a.account_id = ? AND {UNDECIDED}
-             ORDER BY m.received_at DESC, a.id DESC"
+             ORDER BY m.received_at DESC, a.id ASC"
         ))?;
         let mut pending: Vec<scout_api::Arrival> =
             stmt.query_map(params![account_id], arrival_row)?.collect::<duckdb::Result<_>>()?;
         for arrival in &mut pending {
             arrival.attachments = attachments_of(&conn, arrival.mail_id)?;
         }
-        // One undecided arrival per mail is `insert_arrival`'s invariant; the
-        // join leans on it. A mail that spent its attempts without a verdict
+        // One mail can hold several readings — a return ticket is two — so
+        // the join can name a mail once per reading of it that is not
+        // waiting. A mail that spent its attempts without a verdict
         // — the worker died mid-call — is as failed as one the model
         // refused. The reasons are ranked: unreadable mail comes first (a
         // failed mail with an undecided arrival cannot be produced by the
@@ -8461,6 +8480,33 @@ CREATE TABLE messages (
         assert!(store.decide_arrival(second, a, "ignored", None).unwrap());
         store.insert_arrival(a, m, &reading).unwrap();
         assert!(store.arrival_of(second, a).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_several_readings_of_one_mail_are_written_together_and_replaced_together() {
+        // One email can confirm a round trip. The delete that keeps a retry
+        // from doubling the rows has to run once for the batch, or each
+        // insert wipes the one before it and a leg is lost.
+        let (store, _dir) = test_store();
+        let a = store.account_for_telegram(1).unwrap();
+        let m = mail(&store, a, "re_1");
+        let legs = |tag: &str| {
+            vec![
+                NewArrival { booking: true, date: Some("2026-11-02".into()), summary: format!("out {tag}"), ..Default::default() },
+                NewArrival { booking: true, date: Some("2026-11-23".into()), summary: format!("back {tag}"), ..Default::default() },
+            ]
+        };
+        let first = store.insert_arrivals(a, m, &legs("first")).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(store.inbox_view(a).unwrap().pending.len(), 2, "both legs are on the page");
+        let second = store.insert_arrivals(a, m, &legs("second")).unwrap();
+        let view = store.inbox_view(a).unwrap();
+        assert_eq!(view.pending.len(), 2, "a retry replaces the two, it does not add two more");
+        assert_eq!(
+            view.pending.iter().map(|p| p.id).collect::<std::collections::HashSet<_>>(),
+            second.iter().copied().collect::<std::collections::HashSet<_>>()
+        );
+        assert!(first.iter().all(|id| store.arrival_of(*id, a).unwrap().is_none()));
     }
 
     #[test]

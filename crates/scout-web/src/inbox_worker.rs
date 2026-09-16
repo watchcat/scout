@@ -249,9 +249,10 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
     // 4. Extract, place, record, and only then settle.
     let parts: Vec<(&str, Option<&str>)> = texts.iter().map(|(f, t)| (f.as_str(), t.as_deref())).collect();
     let text = assemble(text.as_deref(), html.as_deref(), &parts, TEXT_CAP);
-    let extraction = scout_core::inbox::extract(core, &text).await.map_err(Failure::Reading)?;
+    let readings = scout_core::inbox::extract(core, &text).await.map_err(Failure::Reading)?;
+    let bookings = readings.iter().filter(|e| e.booking).count();
     let (_, placement) =
-        scout_core::inbox::record_arrival(core, m.account_id, m.id, extraction).await.map_err(Failure::Reading)?;
+        scout_core::inbox::record_arrivals(core, m.account_id, m.id, readings).await.map_err(Failure::Reading)?;
     settle(core, m, forwarded).await?;
 
     // 5. The nudge. From here nothing fails the mail: it is filed, and a
@@ -266,7 +267,7 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
                     None
                 }
             };
-            arrival_nudge(p, name.as_deref().unwrap_or("a trip"))
+            arrival_nudge(p, name.as_deref().unwrap_or("a trip"), bookings)
         }
         // Not a booking, but from a place bookings come from: worth a line,
         // since the person may be waiting on it. Anything else is just
@@ -377,14 +378,19 @@ fn other_mail_nudge(sender: &str, subject: &str, forwarded: Forwarded) -> String
     line
 }
 
-/// The line on the phone for a booking that was placed: on a trip that
-/// was already there, or on a draft made for it.
-fn arrival_nudge(placement: Placement, name: &str) -> String {
+/// The line on the phone for the bookings that were placed: on a trip that
+/// was already there, or on a draft made for them. `count` is how many the
+/// one mail confirmed — a return ticket is two — and they share a trip, so
+/// they share a line.
+fn arrival_nudge(placement: Placement, name: &str, count: usize) -> String {
+    let (what, review) = if count > 1 {
+        (format!("{count} bookings arrived"), "Review them")
+    } else {
+        ("A booking arrived".to_string(), "Review it")
+    };
     match placement {
-        Placement::Trip(_) => format!("A booking arrived for {name}. Review it on goodscout.fyi/chat."),
-        Placement::Draft(_) => {
-            format!("A booking arrived and started a draft trip, {name}. Review it on goodscout.fyi/chat.")
-        }
+        Placement::Trip(_) => format!("{what} for {name}. {review} on goodscout.fyi/chat."),
+        Placement::Draft(_) => format!("{what} and started a draft trip, {name}. {review} on goodscout.fyi/chat."),
     }
 }
 
@@ -618,10 +624,17 @@ mod tests {
 
     #[test]
     fn the_nudge_says_whether_the_booking_joined_a_trip_or_started_one() {
-        assert_eq!(arrival_nudge(Placement::Trip(1), "Lisbon"), "A booking arrived for Lisbon. Review it on goodscout.fyi/chat.");
+        assert_eq!(arrival_nudge(Placement::Trip(1), "Lisbon", 1), "A booking arrived for Lisbon. Review it on goodscout.fyi/chat.");
         assert_eq!(
-            arrival_nudge(Placement::Draft(1), "Lisbon, October"),
+            arrival_nudge(Placement::Draft(1), "Lisbon, October", 1),
             "A booking arrived and started a draft trip, Lisbon, October. Review it on goodscout.fyi/chat."
+        );
+        // A round trip is two bookings off one mail, and the line counts
+        // them rather than saying "a booking" twice or once.
+        assert_eq!(arrival_nudge(Placement::Trip(1), "Lisbon", 2), "2 bookings arrived for Lisbon. Review them on goodscout.fyi/chat.");
+        assert_eq!(
+            arrival_nudge(Placement::Draft(1), "Hong Kong, November", 2),
+            "2 bookings arrived and started a draft trip, Hong Kong, November. Review them on goodscout.fyi/chat."
         );
     }
 
@@ -714,6 +727,31 @@ mod tests {
         assert_eq!(forwards(&server.received_requests().await.unwrap()), 1);
         let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
         assert_eq!(queued.iter().map(|q| q.body.as_str()).collect::<Vec<_>>(), ["A booking arrived and started a draft trip, Lisbon, October. Review it on goodscout.fyi/chat."]);
+    }
+
+    #[tokio::test]
+    async fn a_round_trip_in_one_mail_is_two_bookings_on_one_trip() {
+        let server = MockServer::start().await;
+        resend_like(&server).await;
+        model_saying(&server, r#"{"bookings":[{"booking":true,"kind":"flight","title":"AMS → HKG","place":"Hong Kong","origin":"AMS","destination":"HKG","date":"2026-11-02","confirmation_code":"KL7788","price":842.5,"currency":"EUR","summary":"AMS → HKG, 2 Nov"},{"booking":true,"kind":"flight","title":"HKG → AMS","place":"Amsterdam","origin":"HKG","destination":"AMS","date":"2026-11-23","confirmation_code":"KL7788","currency":"EUR","summary":"HKG → CDG → AMS, 23 Nov"}]}"#).await;
+        let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        core.note_address(111, "telegram", "12345".into()).await.unwrap();
+        scout_core::inbox::record_mail(&core, a, a_mail("re_1")).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert_eq!(view.pending.len(), 2, "{view:?}");
+        let trips: std::collections::HashSet<Option<i64>> = view.pending.iter().map(|p| p.trip_id).collect();
+        assert_eq!(trips.len(), 1, "one ticket, one journey, one draft");
+        assert!(trips.iter().all(|t| t.is_some()), "and both legs were placed on it");
+        assert_eq!(view.pending.iter().map(|p| p.price).collect::<Vec<_>>(), vec![Some(842.5), None], "the total once");
+        let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
+        assert_eq!(
+            queued.iter().map(|q| q.body.as_str()).collect::<Vec<_>>(),
+            ["2 bookings arrived and started a draft trip, Hong Kong, November. Review them on goodscout.fyi/chat."]
+        );
     }
 
     #[tokio::test]

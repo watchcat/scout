@@ -310,6 +310,20 @@ fn selected(item: &TripItem) -> Option<&TripCandidate> {
         .or_else(|| (item.candidates.len() == 1).then(|| &item.candidates[0]))
 }
 
+/// The booked mark, or nothing when the item is not booked. The paper
+/// half of `chat.js::bookedMark`, and one function for every kind of item
+/// for the same reason it is one there: a card that marked a flight
+/// differently from a stay would read as two different states.
+fn booked_mark(item: &TripItem) -> String {
+    if !item.booked {
+        return String::new();
+    }
+    match item.confirmation_code.as_deref() {
+        Some(code) => format!("<div class=\"booked\">booked · {}</div>", escape(code)),
+        None => "<div class=\"booked\">booked</div>".to_string(),
+    }
+}
+
 /// What a leg with no option says, as `(headline, detail)`. The paper
 /// half of `chat.js::noFlightLine`, and it has to agree with it: a ticket
 /// the traveller holds must not be printed as a route still to be
@@ -601,14 +615,7 @@ pub fn html(plan: &Plan) -> String {
                 .as_deref()
                 .map(|place| format!("<div class=\"place\">{}</div>", escape(place)))
                 .unwrap_or_default();
-            let booked = if segment.booked {
-                match segment.confirmation_code.as_deref() {
-                    Some(code) => format!("<div class=\"booked\">booked · {}</div>", escape(code)),
-                    None => "<div class=\"booked\">booked</div>".to_string(),
-                }
-            } else {
-                String::new()
-            };
+            let booked = booked_mark(segment);
             write!(
                 out,
                 "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}{}</div><time>{}</time></div></section>",
@@ -623,10 +630,14 @@ pub fn html(plan: &Plan) -> String {
         }
         write!(
             out,
-            "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">Segment {}</div><h2>{} → {}</h2></div><time>{}</time></div>",
+            "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">Segment {}</div><h2>{} → {}</h2>{}</div><time>{}</time></div>",
             segment.position,
             escape(airport(&segment.origin)),
             escape(airport(&segment.destination)),
+            // The mark a stay carries, on a leg: a leg bought by forwarding
+            // a confirmation has a code, and the code is the one thing a
+            // traveller reads off a printed itinerary at a desk.
+            booked_mark(segment),
             escape(&date(&segment.date))
         )
         .unwrap();
@@ -838,9 +849,13 @@ mod tests {
         let leg = &mut booked.trip.items[0];
         leg.candidates.clear();
         leg.booked = true;
+        leg.confirmation_code = Some("KL<7788>".to_string());
         let page = html(&booked);
         assert!(page.contains("The confirmation did not say which flight."), "{page}");
         assert!(!page.contains("No flight saved yet."));
+        // And the code, on a leg as on a stay: it is the one thing read off
+        // a printed itinerary at a desk. Escaped like everything stored.
+        assert!(page.contains("booked · KL&lt;7788&gt;"), "{page}");
         // A leg nobody has bought still says what it needs.
         let mut unbooked = plan();
         unbooked.trip.items[0].candidates.clear();

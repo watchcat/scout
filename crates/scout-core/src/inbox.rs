@@ -111,6 +111,13 @@ pub struct Extraction {
     #[serde(default)] pub summary: String,
 }
 
+/// A stop the mail named but did not code. It holds the place in the
+/// itinerary so the card counts the stop, and says nothing it cannot
+/// stand behind about where that stop is. Deliberately not text from the
+/// mail: the strip is split on " ✈ ", and a stranger's words in it could
+/// draw a hop nobody booked.
+pub const UNNAMED_STOP: &str = "—";
+
 /// More than one email can honestly confirm. The whole answer is read
 /// into JSON before this applies, so it bounds what can reach a trip, not
 /// what the parser does.
@@ -219,15 +226,28 @@ impl Extraction {
             names.into_iter().filter_map(|n| cut(Some(n), 100)).take(10).collect::<Vec<_>>()
         });
         // Held to real codes, not merely capped: a stop goes into the
-        // itinerary strip the page splits on " ✈ ", so anything that is not
-        // an airport code is dropped rather than drawn.
+        // itinerary strip the page splits on " ✈ ", and unvalidated text
+        // there could fabricate a hop. A stop the mail named rather than
+        // coded ("Paris Charles de Gaulle") keeps its place as
+        // `UNNAMED_STOP` instead of being dropped: the count is the honest
+        // part — the ticket does change planes once — and a dropped stop
+        // would draw the ticket as direct, which is the same falsehood in
+        // miniature.
         e.stops = e.stops.map(|airports| {
             airports
                 .into_iter()
-                .filter_map(|a| crate::tools::trips::iata("stop", &a).ok())
+                .map(|a| {
+                    crate::tools::trips::iata("stop", &a).unwrap_or_else(|_| UNNAMED_STOP.to_string())
+                })
                 .take(5)
                 .collect::<Vec<_>>()
         });
+        // Only a flight has stops. Anything else that answered the key was
+        // answering about something the question was not asked of, and the
+        // wire type says these are empty for everything but a flight.
+        if e.kind.as_deref() != Some("flight") {
+            e.stops = None;
+        }
         let kind_ok = matches!(e.kind.as_deref(), Some("flight" | "stay" | "activity" | "transport"));
         let date_ok = e
             .date
@@ -238,11 +258,24 @@ impl Extraction {
         // stranger's text: it reaches `add_flight`, and it now reaches the
         // itinerary strip, which the page splits on " ✈ ". An "origin"
         // carrying that sequence would fabricate a hop on the card.
-        let route_ok = e.kind.as_deref() != Some("flight")
-            || matches!(
-                (e.origin.as_deref(), e.destination.as_deref()),
-                (Some(o), Some(d)) if crate::tools::trips::leg_ends(o, d).is_ok()
-            );
+        // The normalised pair is kept, not just consulted: the code that
+        // reaches the leg, the card and the itinerary is then the same
+        // spelling every other route in the system uses, rather than
+        // "ams" beside the uppercase stops written next to it.
+        let route_ok = match (e.kind.as_deref(), e.origin.as_deref(), e.destination.as_deref()) {
+            (Some("flight"), Some(origin), Some(destination)) => {
+                match crate::tools::trips::leg_ends(origin, destination) {
+                    Ok((origin, destination)) => {
+                        e.origin = Some(origin);
+                        e.destination = Some(destination);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            (Some("flight"), _, _) => false,
+            _ => true,
+        };
         if e.booking && !(kind_ok && date_ok && route_ok) {
             e.booking = false;
         }
@@ -1273,16 +1306,27 @@ mod tests {
     }
 
     #[test]
-    fn the_stops_of_a_connection_are_read_as_codes_and_anything_else_is_dropped() {
+    fn the_stops_of_a_connection_are_read_as_codes_and_anything_else_holds_its_place() {
         // They go into the itinerary strip, which the page splits on
         // " ✈ ": text that is not an airport code would draw a hop that
-        // was never booked.
+        // was never booked. Dropping it instead would draw the ticket as
+        // direct, which is the same falsehood the other way round.
         let e = one(
             r#"{"booking":true,"kind":"flight","origin":"HKG","destination":"AMS","date":"2026-11-23",
                 "stops":[" cdg ","Paris Charles de Gaulle","AMS ✈ LHR","DXB","x","y","z","w"],"summary":"back"}"#,
         )
         .unwrap();
-        assert_eq!(e.stops, Some(vec!["CDG".to_string(), "DXB".to_string()]), "codes only, uppercased");
+        assert_eq!(
+            e.stops,
+            Some(vec![
+                "CDG".to_string(),
+                UNNAMED_STOP.to_string(),
+                UNNAMED_STOP.to_string(),
+                "DXB".to_string(),
+                UNNAMED_STOP.to_string(),
+            ]),
+            "codes uppercased; anything else holds its place without saying where"
+        );
         let many = one(&format!(
             r#"{{"booking":true,"kind":"flight","origin":"HKG","destination":"AMS","date":"2026-11-23",
                 "stops":[{}],"summary":"back"}}"#,
@@ -1290,6 +1334,13 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(many.stops.map(|s| s.len()), Some(5), "a runaway list is cut");
+        // Only a flight changes planes. Anything else that answered the
+        // key was answering a question nobody asked it.
+        let stay = one(
+            r#"{"booking":true,"kind":"stay","place":"Lisbon","date":"2026-10-12","stops":["CDG"],"summary":"a room"}"#,
+        )
+        .unwrap();
+        assert_eq!(stay.stops, None);
     }
 
     #[test]
@@ -1307,10 +1358,12 @@ mod tests {
             .unwrap();
             assert!(!e.booking, "{bad} is not a leg anybody can build");
         }
-        // Lower case is a code all the same, the way every other route the
-        // model states is read.
-        let e = one(r#"{"booking":true,"kind":"flight","date":"2026-11-02","origin":"ams","destination":"hkg","summary":"x"}"#).unwrap();
+        // Lower case is a code all the same, and it is stored the way
+        // every other route in the system is spelled — not left as the
+        // mail typed it beside the uppercase stops written next to it.
+        let e = one(r#"{"booking":true,"kind":"flight","date":"2026-11-02","origin":" ams ","destination":"hkg","summary":"x"}"#).unwrap();
         assert!(e.booking);
+        assert_eq!((e.origin.as_deref(), e.destination.as_deref()), (Some("AMS"), Some("HKG")));
     }
 
     #[test]
@@ -1770,6 +1823,54 @@ mod tests {
         };
         let leg = plan.trip.items.iter().find(|i| i.arrival_id == Some(id)).expect("the leg is on the trip");
         assert_eq!(leg.candidates[0].itinerary, "HKG 23:55 23.11 ✈ CDG ✈ AMS 10:20 24.11");
+    }
+
+    #[tokio::test]
+    async fn a_stop_the_mail_named_rather_than_coded_still_counts_as_a_stop() {
+        // "Paris Charles de Gaulle" cannot go on the strip — the page
+        // splits it on " ✈ " — but leaving the stop out would draw a
+        // one-stop ticket as direct. The marker says a plane was changed
+        // and says nothing about where.
+        let (core, _dir) = core();
+        let store = core.store();
+        let a = store.account_for_telegram(1).unwrap();
+        let mail_id = seed_mail(&core, a, "re_named").await;
+        let readings = Extraction::parse_many(
+            r#"{"bookings":[{"booking":true,"kind":"flight","place":"Amsterdam","origin":"HKG","destination":"AMS",
+                "date":"2026-11-23","starts_at":"2026-11-23T23:55:00","ends_at":"2026-11-24T10:20:00",
+                "airline":"Air France","flight_number":"AF185","stops":["Paris Charles de Gaulle"],
+                "summary":"HKG → CDG → AMS"}]}"#,
+        )
+        .unwrap();
+        let (ids, _) = record_arrivals(&core, a, mail_id, readings).await.unwrap();
+        let plan = match add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap() {
+            Outcome::Done(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        let leg = plan.trip.items.iter().find(|i| i.arrival_id == Some(ids[0])).expect("the leg is on the trip");
+        assert_eq!(leg.candidates[0].itinerary, "HKG 23:55 23.11 ✈ — ✈ AMS 10:20 24.11");
+        assert!(!leg.candidates[0].itinerary.contains("Paris"), "no unvalidated text on the strip");
+    }
+
+    #[tokio::test]
+    async fn a_draft_a_mail_was_just_placed_on_is_not_swept_from_under_it() {
+        // The window the grace exists for. `record_arrivals` makes the
+        // draft and then writes the arrivals, and `add_arrival` claims the
+        // arrival before it builds the item; in both gaps the draft is
+        // empty with nothing pending on it, and any Add or Ignore on the
+        // account — or the hourly pass — sweeps. A draft made seconds ago
+        // is never collectable, whatever zone the machine is in.
+        let (core, _dir) = core();
+        let store = core.store();
+        let a = store.account_for_telegram(1).unwrap();
+        let mail_id = record_mail(&core, a, mail_in("re_hotel")).await.unwrap().unwrap();
+        let stay = arrival("stay", "Hotel Panorama", Some("Hong Kong"), "2026-11-04");
+        let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay]).await.unwrap();
+        let draft = placed.expect("the stay was placed").id();
+        assert_eq!(store.sweep_all_empty_drafts().unwrap(), 0, "swept out from under the mail that made it");
+        assert!(store.trip_by_id(a, draft).unwrap().is_some());
+        // And the booking it was made for still knows where it is going.
+        assert_eq!(store.arrival_of(ids[0], a).unwrap().unwrap().trip_id, Some(draft));
     }
 
     #[tokio::test]

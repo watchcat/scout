@@ -4317,8 +4317,19 @@ impl Store {
     /// Backdates the last attempt by an hour, so a test can walk a mail
     /// through its retries without waiting `MAIL_RETRY_MINUTES` between.
     #[doc(hidden)]
+    pub fn age_attempts(&self, id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE inbound_mail SET attempted_at = ? WHERE id = ?", params![minutes_ago(60), id])?;
+        Ok(())
+    }
+
     /// Backdates a trip's creation past `DRAFT_GRACE_MINUTES`, so a test
     /// can sweep a draft the grace would otherwise spare.
+    ///
+    /// Written by the same bare `current_timestamp` the column's default
+    /// uses, for the reason `collectable_draft` gives at length: a value
+    /// from `chrono::Utc` would land hours off the rows it has to compare
+    /// with, and the test would pass or fail on the host's zone.
     ///
     /// `#[cfg(test)]` rather than `#[doc(hidden)] pub` like `age_attempts`,
     /// which the web crate's tests need from outside: nothing outside this
@@ -4328,15 +4339,11 @@ impl Store {
     pub(crate) fn age_trip(&self, trip_id: i64) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "UPDATE trips SET created_at = ? WHERE id = ?",
-            params![minutes_ago(DRAFT_GRACE_MINUTES + 60), trip_id],
+            "UPDATE trips SET created_at =
+                 CAST(current_timestamp AS TIMESTAMP) - to_minutes(CAST(? AS INTEGER))
+             WHERE id = ?",
+            params![DRAFT_GRACE_MINUTES + 60, trip_id],
         )?;
-        Ok(())
-    }
-
-    pub fn age_attempts(&self, id: i64) -> Result<()> {
-        let conn = self.conn();
-        conn.execute("UPDATE inbound_mail SET attempted_at = ? WHERE id = ?", params![minutes_ago(60), id])?;
         Ok(())
     }
 
@@ -4729,9 +4736,23 @@ const DRAFT_GRACE_MINUTES: i64 = 5;
 /// waiting" that makes a trip matchable in `inbox::Trips::matching`, and a
 /// collection rule that drifted from the matching rule would delete a draft
 /// the next mail could still have joined.
+///
+/// **Both sides of the age test are on the clock that writes the column.**
+/// `trips.created_at` defaults to bare `current_timestamp`, which DuckDB
+/// resolves in the session's zone — measured on this build with
+/// `SET TimeZone = 'America/New_York'`: a trip written at 10:54 UTC stores
+/// `06:54`, while `current_timestamp AT TIME ZONE 'UTC'` and
+/// `chrono::Utc::now()` both read `10:54`. A cutoff taken from either of
+/// those sits hours ahead of every row west of UTC, which makes the floor a
+/// no-op and silently reopens the two windows it exists to close. So the
+/// cutoff is derived in SQL from the same bare `current_timestamp`, and
+/// `age_trip` writes on it too. A daylight-saving shift moves both sides
+/// together; the worst it can do inside the shifted hour is collect an
+/// empty draft an hour early.
 fn collectable_draft() -> String {
     format!(
-        "NOT kept AND conversation_id IS NULL AND created_at < ?
+        "NOT kept AND conversation_id IS NULL
+         AND created_at < CAST(current_timestamp AS TIMESTAMP) - to_minutes(CAST(? AS INTEGER))
          AND NOT EXISTS (SELECT 1 FROM trip_items i WHERE i.trip_id = trips.id)
          AND NOT EXISTS (SELECT 1 FROM arrivals a WHERE a.trip_id = trips.id AND {UNDECIDED})"
     )
@@ -4746,16 +4767,22 @@ fn collectable_draft() -> String {
 /// same transaction, so nothing is left naming a trip that is gone.
 fn sweep_drafts_within(conn: &Connection, account_id: Option<i64>) -> Result<usize> {
     let mine = if account_id.is_some() { "account_id = ? AND " } else { "" };
-    let cutoff = minutes_ago(DRAFT_GRACE_MINUTES);
-    // The account first when there is one, then the cutoff: the order the
-    // `?`s appear in the statement.
+    // The account first when there is one, then the grace: the order the
+    // `?`s appear in the statement. The grace is a number of minutes, not a
+    // timestamp — see `collectable_draft` for why the cutoff cannot come
+    // from Rust.
     let mut args: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
     if let Some(id) = account_id {
         args.push(Box::new(id));
     }
-    args.push(Box::new(cutoff));
-    let mut stmt =
-        conn.prepare(&format!("SELECT id, account_id, name FROM trips WHERE {mine}{}", collectable_draft()))?;
+    args.push(Box::new(DRAFT_GRACE_MINUTES));
+    // Bounded: the hourly pass over every account must not build an
+    // unbounded id list out of a database nobody has swept in a year. What
+    // it leaves behind the next pass takes.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, account_id, name FROM trips WHERE {mine}{} LIMIT 500",
+        collectable_draft()
+    ))?;
     let doomed: Vec<(i64, i64, String)> = stmt
         .query_map(duckdb::params_from_iter(args.iter()), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<duckdb::Result<_>>()?;
@@ -8884,6 +8911,17 @@ CREATE TABLE messages (
     #[test]
     fn a_draft_with_nothing_on_it_and_nothing_waiting_is_collected() {
         let (store, _dir) = test_store();
+        // Pinned off UTC, the way `a_spent_token_is_stamped_on_the_clock_
+        // that_expires_it` is: the grace compares `created_at` — written by
+        // the column's own default — against a cutoff, and two clocks in
+        // that comparison agree only on a UTC machine. A test that ran in
+        // the host's zone would agree with the host and prove nothing.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("SET TimeZone = 'America/New_York'", [])
+            .expect("the session's zone can be set");
         let a = store.account_for_telegram(1).unwrap();
         let b = store.account_for_telegram(2).unwrap();
         let m = mail(&store, a, "re_1");

@@ -1215,9 +1215,24 @@ ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS stops TEXT;
 /// documents neither on the record the worker fetches later, so this is
 /// where the decoration rule gets data it has actually seen arrive. Mail
 /// already on file gains no rows: nothing kept the fields at the time, and
-/// there is nowhere to read them back from. The column list and its order
-/// match `mail_parts` in `MIGRATIONS`, which is what keeps a migrated
-/// table the same shape as a fresh one.
+/// there is nowhere to read them back from.
+///
+/// This DDL will not create the table on any database that has been opened
+/// since, and is not meant to. `Store::open` runs `MIGRATIONS` before it
+/// applies a step, and `MIGRATIONS` carries this table as CREATE TABLE IF
+/// NOT EXISTS, so it is already there by the time the step runs — which is
+/// what makes a new table safe to add at all. The step is here for the
+/// version bump, and for what the bump does: a pending step is what makes
+/// the migration runner back the database up before touching it, and the
+/// recorded version is how a pod says which shape it is running. Steps 6
+/// and 16 are inert in exactly this way and are kept for the same reason.
+///
+/// It still has to be right. The column list and its order match
+/// `mail_parts` in `MIGRATIONS`, because a step that ever did run — on a
+/// database restored from before this table, say — must build the table
+/// the rest of the code expects. Nothing but
+/// `the_step_that_adds_mail_parts_builds_the_table_a_fresh_database_has`
+/// keeps the two in step, and it has to run the step by itself to do it.
 const STEP_18_MAIL_PARTS: &str = r#"
 CREATE SEQUENCE IF NOT EXISTS mail_parts_id_seq;
 CREATE TABLE IF NOT EXISTS mail_parts (
@@ -1379,6 +1394,11 @@ pub struct MailToWork {
 /// `content_disposition` is the whole header value, parameters and all
 /// (`inline; filename="logo.png"`), because that is what arrived; reading
 /// the token out of it is the worker's business.
+///
+/// `Debug` is here for the tests, which compare these, and it is safe
+/// only because of what is missing: no body, no filename. A Content-ID is
+/// still the sender's own text, so this goes in an `assert_eq!` and never
+/// in a log line — the worker logs counts of these, never one of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailPart {
     pub provider_id: String,
@@ -4421,11 +4441,15 @@ impl Store {
         }
     }
 
-    /// What the webhook said this mail's parts are, in the order they
-    /// arrived in. Empty for a mail stored before `mail_parts` existed,
-    /// and for one that came with no attachments at all — the two are the
-    /// same answer because there is nothing to tell them apart with, and
-    /// the worker treats silence the same way either way.
+    /// What the webhook said this mail's parts are. Empty for a mail
+    /// stored before `mail_parts` existed, and for one that came with no
+    /// attachments at all — the two are the same answer because there is
+    /// nothing to tell them apart with, and the worker treats silence the
+    /// same way either way.
+    ///
+    /// `ORDER BY id` so that two reads of one mail agree; no caller
+    /// depends on the order, and the worker keys these by `provider_id`
+    /// the moment it has them.
     pub fn mail_parts_of(&self, mail_id: i64) -> Result<Vec<MailPart>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -8821,7 +8845,18 @@ CREATE TABLE messages (
     }
 
     #[test]
-    fn a_version_17_database_gains_mail_parts_and_takes_a_mails_parts() {
+    fn a_migrated_database_comes_up_at_18_and_takes_a_mails_parts_too() {
+        // `test_store` opens a fresh file; production opens one at schema
+        // 17. This covers the second, and it is named for what it checks
+        // rather than for step 18, which is not what puts the table there:
+        // `Store::open` runs `MIGRATIONS` unconditionally before applying
+        // any step, and `MIGRATIONS` is all CREATE TABLE IF NOT EXISTS, so
+        // `mail_parts` appears either way — `Step::Sql("")` leaves this
+        // green. What step 18 earns is the version bump, which this does
+        // pin, and the backup that a pending step makes the runner take
+        // before it touches anything. The same as step 6; see
+        // `a_migrated_database_gets_login_tokens_too_not_just_a_fresh_one`.
+        // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), 18);

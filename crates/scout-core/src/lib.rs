@@ -17,6 +17,7 @@ pub mod core;
 pub mod debug;
 pub mod describe;
 pub mod identity;
+pub mod inbox;
 pub mod ids;
 pub mod invites;
 pub mod links;

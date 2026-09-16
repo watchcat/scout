@@ -11,9 +11,12 @@
 // same items two paths in from outside.
 mod cache;
 mod email;
+mod inbound;
+mod inbox_worker;
 mod page;
 mod pages;
 mod ratelimit;
+mod resend;
 mod routes;
 mod session;
 mod telegram_login;
@@ -38,6 +41,16 @@ pub struct AuthConfig {
     pub resend_api_key: String,
     pub mail_from: String,
     pub base_url: String,
+    /// The signing secret Resend shows for the `email.received` webhook.
+    /// Optional, unlike the rest: the inbox is a feature a deployment may
+    /// not have set up — no receiving domain, no secret — and sign-in must
+    /// not go dark because of it. The route is mounted only when this is
+    /// set.
+    pub resend_webhook_secret: Option<String>,
+    /// Where the Resend API lives, so a test can stand in for it.
+    pub resend_base_url: String,
+    /// The domain after the `@` in every account's address.
+    pub inbox_domain: String,
 }
 
 /// The router's state for the signed-in half. The limiters live here, in
@@ -60,6 +73,11 @@ pub struct AuthState {
     /// PDF rendering starts Chromium and is CPU-heavy even though it makes no
     /// paid model call, so it has its own smaller per-account budget.
     pub pdf_by_account: Arc<ratelimit::Limiter>,
+    /// The live handle check fires as a person types, so it gets a budget
+    /// sized for keystrokes rather than for model calls: a minute of
+    /// typing at one check a second, and a bound on a script that walks
+    /// the namespace asking which names are somebody's.
+    pub handle_by_account: Arc<ratelimit::Limiter>,
     pub mailer: email::Mailer,
 }
 
@@ -81,6 +99,7 @@ impl AuthState {
             by_ip: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(3600))),
             by_account: Arc::new(ratelimit::Limiter::new(10, Duration::from_secs(300))),
             pdf_by_account: Arc::new(ratelimit::Limiter::new(6, Duration::from_secs(60))),
+            handle_by_account: Arc::new(ratelimit::Limiter::new(60, Duration::from_secs(60))),
         }
     }
 }
@@ -119,6 +138,19 @@ impl AuthConfig {
             resend_api_key: set("RESEND_API_KEY")?,
             mail_from: set("SCOUT_MAIL_FROM")?,
             base_url: set("SCOUT_BASE_URL")?,
+            resend_webhook_secret: set("RESEND_WEBHOOK_SECRET"),
+            // Trimmed of a trailing slash because the client joins paths
+            // onto it, and `https://api.resend.com//emails` is a different
+            // request from the one Resend documents.
+            resend_base_url: set("RESEND_BASE_URL")
+                .map(|u| u.trim().trim_end_matches('/').to_string())
+                .unwrap_or_else(|| "https://api.resend.com".to_string()),
+            // Lowercased so the value printed on the account page and in
+            // links is one spelling; the webhook's comparison is
+            // case-insensitive regardless.
+            inbox_domain: set("INBOX_DOMAIN")
+                .map(|d| d.trim().to_lowercase())
+                .unwrap_or_else(|| "goodscout.fyi".to_string()),
         })
     }
 }
@@ -131,7 +163,7 @@ impl AuthConfig {
 /// page needs a cached admission and nothing else, and giving it a `Core`
 /// it does not use would be an invitation to query the database from the
 /// one path that exists to avoid doing that.
-fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
+fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inbound::InboundState>) -> Router {
     let session_key = auth.as_ref().map(|a| a.cfg.session_key.clone());
     // Only when we know an https address to send people to. A deployment
     // configured with an http base URL is a local one, and redirecting it
@@ -142,7 +174,7 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         .as_ref()
         .and_then(|a| routes::origin_of(&a.cfg.base_url))
         .filter(|u| u.starts_with("https://"));
-    let public = Router::new()
+    let mut public = Router::new()
         .route("/", get(index))
         // Liveness only. Deliberately says nothing about the database: a
         // health check that fails when DuckDB is busy would take the site
@@ -154,6 +186,16 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         .route("/robots.txt", get(robots))
         .route("/sitemap.xml", get(sitemap))
         .with_state(Public { cache, session_key });
+    // On the public side, not the signed-in one: Resend posts here with no
+    // cookie, no `Origin` and no form token, so the CSRF layer would turn
+    // it away and the security headers would be sent to nobody. It has
+    // its own proof of who is calling — the signature — and is mounted
+    // only when there is a secret to check it against, which is what
+    // `inbound` being `Some` means.
+    let inbox_on = inbound.is_some();
+    if let Some(state) = inbound {
+        public = public.merge(inbound::routes(state));
+    }
 
     match auth {
         // The headers go on here rather than on the whole site because
@@ -161,13 +203,20 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>) -> Router {
         // somebody else's script. The public page has no script tag, no
         // input and nothing to steal, and a policy it does not need is a
         // policy that gets loosened for a reason that was never about it.
-        Some(auth) => public.merge(
-            routes::auth::routes(auth.clone())
+        Some(auth) => {
+            let mut signed_in = routes::auth::routes(auth.clone())
                 .merge(routes::account::routes(auth.clone()))
                 .merge(routes::chat::routes(auth.clone()))
-                .merge(routes::trips::routes(auth))
-                .layer(axum::middleware::from_fn(security_headers)),
-        ),
+                .merge(routes::trips::routes(auth.clone()));
+            // The inbox's signed-in side goes with its webhook: without
+            // one, nothing ever fills the inbox, and the page reads the
+            // 404 as "no inbox here" and draws neither the address nor
+            // the Other-mail section.
+            if inbox_on {
+                signed_in = signed_in.merge(routes::inbox::routes(auth));
+            }
+            public.merge(signed_in.layer(axum::middleware::from_fn(security_headers)))
+        }
         None => public,
     }
     // HSTS goes on everything, unlike the headers above. It is a statement
@@ -539,10 +588,24 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
     // a cache no reader will ever consult, on the one path where nobody is
     // reading: a bind that failed.
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tokio::spawn(refresh_forever(core, cache.clone()));
+    tokio::spawn(refresh_forever(core.clone(), cache.clone()));
+
+    // The inbox worker runs only where the webhook does: the same secret
+    // gates both, and a worker with nothing feeding it would tick every
+    // minute against an empty table for the life of the process.
+    let inbound = auth.as_ref().and_then(inbound::state_from);
+    if let Some(state) = auth.as_ref().filter(|_| inbound.is_some()) {
+        let client = resend::ResendClient::new(
+            inbox_worker::client(),
+            state.cfg.resend_api_key.clone(),
+            state.cfg.resend_base_url.clone(),
+        );
+        tokio::spawn(inbox_worker::run(core, client, state.cfg.mail_from.clone()));
+        tracing::info!("the inbox worker is running");
+    }
 
     tracing::info!(bind, "the front door is open");
-    axum::serve(listener, router(cache, auth))
+    axum::serve(listener, router(cache, auth, inbound))
         .with_graceful_shutdown(closing_time())
         .await?;
     Ok(())
@@ -659,6 +722,35 @@ mod tests {
         panic!("nothing was mailed");
     }
 
+    /// `test_app`, with the inbox switched on: `RESEND_WEBHOOK_SECRET` set
+    /// to this, so `POST /inbound/resend` is mounted.
+    pub(crate) async fn test_app_with_inbox(
+        secret: &str,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        build_app_full("https://example.com", None, crate::email::Mailer::Discard, Some(secret), None).await
+    }
+
+    /// `test_app`, with the model at `model_url` instead of the closed
+    /// port, for the tests that need an answer from it — a wiremock that
+    /// plays MiniMax, never the real thing.
+    pub(crate) async fn test_app_with_model(
+        model_url: &str,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        build_app_full("https://example.com", None, crate::email::Mailer::Discard, None, Some(model_url)).await
+    }
+
+    /// Signs in a Telegram id against an open round and returns the
+    /// account id, panicking if the round had no room — every test that
+    /// calls this one wants a member, not a queued visitor.
+    pub(crate) async fn admitted(core: &scout_core::core::Core, telegram_id: &str) -> i64 {
+        let scout_core::identity::SignIn::In { account_id } =
+            scout_core::identity::sign_in(core, "telegram", telegram_id).await.unwrap()
+        else {
+            panic!("the round has room, so this should have admitted");
+        };
+        account_id
+    }
+
     async fn build_app(
         return_url: Option<&str>,
         mailer: crate::email::Mailer,
@@ -673,6 +765,19 @@ mod tests {
         return_url: Option<&str>,
         mailer: crate::email::Mailer,
     ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
+        build_app_full(base_url, return_url, mailer, None, None).await
+    }
+
+    /// The whole harness, every knob exposed. The named wrappers above are
+    /// what tests call; this exists so there is one place that builds a
+    /// `Core` and an `AuthConfig` for all of them.
+    async fn build_app_full(
+        base_url: &str,
+        return_url: Option<&str>,
+        mailer: crate::email::Mailer,
+        webhook_secret: Option<&str>,
+        model_url: Option<&str>,
+    ) -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("test.duckdb");
         // Not `Config::for_test`: that is `#[cfg(test)]`, which means it
@@ -684,11 +789,11 @@ mod tests {
             "TELEGRAM_BOT_TOKEN" => Some("123456:test-bot-token".to_string()),
             "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
             "MINIMAX_API_KEY" => Some("mk".to_string()),
-            // A port nothing listens on, as `Config::for_test` does. A
-            // route that reaches the model under test fails at once with a
-            // connection error instead of putting a request with a bogus
-            // key on the wire.
-            "MINIMAX_BASE_URL" => Some("http://127.0.0.1:1".to_string()),
+            // A port nothing listens on, as `Config::for_test` does, unless
+            // the test brought a stand-in. A route that reaches the model
+            // under test fails at once with a connection error instead of
+            // putting a request with a bogus key on the wire.
+            "MINIMAX_BASE_URL" => Some(model_url.unwrap_or("http://127.0.0.1:1").to_string()),
             "KAGI_API_KEY" => Some("kk".to_string()),
             "SCOUT_DB_PATH" => Some(db.to_str().unwrap().to_string()),
             _ => None,
@@ -704,6 +809,9 @@ mod tests {
             resend_api_key: "test-key".to_string(),
             mail_from: "Scout <hello@example.com>".to_string(),
             base_url: base_url.to_string(),
+            resend_webhook_secret: webhook_secret.map(str::to_string),
+            resend_base_url: "https://api.resend.com".to_string(),
+            inbox_domain: "goodscout.fyi".to_string(),
         };
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
         // Never Resend: with the real mailer the sign-in tests fire an
@@ -714,7 +822,8 @@ mod tests {
         // of that promise, and it points at a closed port.
         let mut state = crate::AuthState::new(auth, core.clone());
         state.mailer = mailer;
-        let app = crate::router(cache, Some(state));
+        let inbound = crate::inbound::state_from(&state);
+        let app = crate::router(cache, Some(state), inbound);
         (app, core, dir)
     }
 
@@ -864,7 +973,7 @@ mod tests {
         assert_eq!(other.status(), StatusCode::OK);
 
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let local = router(cache, None);
+        let local = router(cache, None, None);
         let res = get_with_headers(
             &local,
             "/healthz",
@@ -982,10 +1091,64 @@ mod tests {
         String::from_utf8_lossy(&bytes).to_string()
     }
 
+    pub(crate) const DAY: i64 = 86_400;
+
+    /// `test_app`, with a round open so a sign-in can actually admit
+    /// someone rather than queuing them.
+    pub(crate) async fn test_app_with_a_round()
+        -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir)
+    {
+        let (app, core, dir) = test_app().await;
+        open_round(&core, "autumn", 5).await;
+        (app, core, dir)
+    }
+
+    /// The session cookie and CSRF token a signed-in page would carry.
+    pub(crate) fn signed_in(account_id: i64) -> (String, String) {
+        (
+            crate::session::mint(TEST_KEY, account_id, DAY),
+            crate::session::csrf_for(TEST_KEY, account_id),
+        )
+    }
+
+    /// A JSON `POST`, carrying a session cookie and — when given — the
+    /// `X-Scout-Csrf` header a real page would attach from its `<meta>` tag.
+    pub(crate) async fn post_json_with_cookie(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+        csrf: Option<&str>,
+        body: &str,
+    ) -> Response {
+        post_json_from_origin_opt(app, uri, session, csrf, "https://example.com", body).await
+    }
+
+    /// The same JSON `POST`, naming the `Origin` a caller wants sent — so a
+    /// test can exercise `only_from_our_own_pages` from outside it.
+    pub(crate) async fn post_json_from_origin_opt(
+        app: &axum::Router,
+        uri: &str,
+        session: &str,
+        csrf: Option<&str>,
+        origin: &str,
+        body: &str,
+    ) -> Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("origin", origin)
+            .header("cookie", format!("{}={session}", crate::session::COOKIE));
+        if let Some(csrf) = csrf {
+            req = req.header("x-scout-csrf", csrf);
+        }
+        app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap()
+    }
+
     #[tokio::test]
     async fn the_root_serves_the_page_and_an_unknown_path_does_not() {
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let app = router(cache, None);
+        let app = router(cache, None, None);
 
         let res = app.clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1058,6 +1221,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_inbox_keys_are_optional_and_defaulted() {
+        // The three inbox keys must not join the all-or-nothing rule: a
+        // deployment without a receiving domain still signs people in.
+        let required = |k: &str| {
+            Some(match k {
+                "SCOUT_SESSION_KEY" => "a session key of at least 32 bytes".to_string(),
+                "TELEGRAM_BOT_TOKEN" | "RESEND_API_KEY" | "SCOUT_MAIL_FROM" | "SCOUT_BASE_URL" => "value".to_string(),
+                _ => return None,
+            })
+        };
+        let cfg = AuthConfig::from_lookup(required).expect("the inbox keys are not required");
+        assert_eq!(cfg.resend_webhook_secret, None);
+        assert_eq!(cfg.resend_base_url, "https://api.resend.com");
+        assert_eq!(cfg.inbox_domain, "goodscout.fyi");
+
+        let cfg = AuthConfig::from_lookup(|k: &str| match k {
+            "RESEND_WEBHOOK_SECRET" => Some("whsec_abc".to_string()),
+            // A trailing slash would double up against the paths the
+            // client joins on; a capital in the domain would never match
+            // the lowercased address the webhook compares it with.
+            "RESEND_BASE_URL" => Some("http://127.0.0.1:9/".to_string()),
+            "INBOX_DOMAIN" => Some("GoodScout.FYI".to_string()),
+            _ => required(k),
+        })
+        .unwrap();
+        assert_eq!(cfg.resend_webhook_secret.as_deref(), Some("whsec_abc"));
+        assert_eq!(cfg.resend_base_url, "http://127.0.0.1:9");
+        assert_eq!(cfg.inbox_domain, "goodscout.fyi");
+
+        // And blank means unset here as everywhere else.
+        let cfg = AuthConfig::from_lookup(|k: &str| match k {
+            "RESEND_WEBHOOK_SECRET" => Some("  ".to_string()),
+            _ => required(k),
+        })
+        .unwrap();
+        assert_eq!(cfg.resend_webhook_secret, None);
+    }
+
     #[tokio::test]
     async fn every_response_tells_the_browser_to_stay_on_https() {
         // On the public page too, not only the signed-in half. Somebody who
@@ -1077,7 +1279,7 @@ mod tests {
         // And when sign-in is not configured at all, so the whole
         // signed-in half is absent along with its header layer.
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let bare = crate::router(cache, None);
+        let bare = crate::router(cache, None, None);
         let res = bare
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1095,7 +1297,7 @@ mod tests {
         // Booting with a generated default would sign sessions that a
         // restart could not verify, and nobody would notice until someone
         // forged one.
-        let app = router(cache, None);
+        let app = router(cache, None, None);
         let res = app
             .oneshot(Request::builder().uri("/sign-in").body(Body::empty()).unwrap())
             .await.unwrap();

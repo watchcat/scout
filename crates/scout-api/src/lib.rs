@@ -243,6 +243,58 @@ pub struct Thread {
     pub current: bool,
 }
 
+/// A booking read out of a forwarded email, waiting on the Trips tab.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Arrival {
+    pub id: i64,
+    pub mail_id: i64,
+    pub booking: bool,
+    pub kind: Option<String>,
+    pub title: Option<String>,
+    pub place: Option<String>,
+    pub origin: Option<String>,
+    pub destination: Option<String>,
+    pub date: Option<String>,
+    pub starts_at: Option<String>,
+    pub ends_at: Option<String>,
+    pub confirmation_code: Option<String>,
+    pub price: Option<f64>,
+    pub currency: Option<String>,
+    pub confidence: Option<f64>,
+    pub summary: String,
+    pub trip_id: Option<i64>,
+    /// The trip's name when `trip_id` is set, for the row.
+    pub trip_name: Option<String>,
+    pub status: String,
+    pub received_at: String,
+    pub attachments: Vec<AttachmentRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AttachmentRef { pub id: i64, pub filename: String, pub mime: String, pub size: i64 }
+
+/// A message under Other mail: not a booking, unreadable, or ignored.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MailRow {
+    pub mail_id: i64,
+    pub from: String,
+    pub subject: Option<String>,
+    pub received_at: String,
+    /// `not_booking` | `failed` | `ignored`
+    pub reason: String,
+    pub forwarded: bool,
+    pub arrival_id: Option<i64>,
+    pub attachments: Vec<AttachmentRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct InboxView {
+    pub handle: Option<String>,
+    pub domain: String,
+    pub pending: Vec<Arrival>,
+    pub other: Vec<MailRow>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +442,20 @@ mod tests {
         // Turns saved before run ids existed, and every You turn.
         let t: Turn = serde_json::from_str(r#"{"role":"You","text":"hi"}"#).unwrap();
         assert_eq!(t.run_id, None);
+    }
+
+    #[test]
+    fn an_arrival_survives_a_round_trip() {
+        let a = Arrival {
+            id: 1, mail_id: 2, booking: true, kind: Some("stay".into()), title: Some("Hotel Alfama".into()),
+            place: Some("Lisbon".into()), origin: None, destination: None, date: Some("2026-10-12".into()),
+            starts_at: None, ends_at: Some("2026-10-15".into()), confirmation_code: Some("ABC".into()),
+            price: Some(320.0), currency: Some("EUR".into()), confidence: Some(0.9),
+            summary: "Hotel Alfama, 12–15 Oct".into(), trip_id: Some(3), trip_name: Some("Lisbon".into()),
+            status: "pending".into(), received_at: "2026-09-15 10:00:00".into(),
+            attachments: vec![AttachmentRef { id: 4, filename: "ticket.pdf".into(), mime: "application/pdf".into(), size: 12 }],
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<Arrival>(&json).unwrap(), a);
     }
 }

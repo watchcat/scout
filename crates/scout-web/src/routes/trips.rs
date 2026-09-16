@@ -341,8 +341,6 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    const DAY: i64 = 86_400;
-
     async fn setup() -> (
         axum::Router,
         std::sync::Arc<scout_core::core::Core>,

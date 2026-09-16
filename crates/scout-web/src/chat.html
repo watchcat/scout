@@ -476,6 +476,61 @@
   .join-card.warning::before{background:var(--yellow)}
   .join-card.danger{border-color:var(--red); color:#ff817a}
   .join-card.danger::before{background:var(--red)}
+  /* An arrival waiting on the timeline: the item's own box, dashed and in
+     the warning colour, because it is not on the trip until the reader
+     says so — a solid card would read as already added. */
+  .item-card.pending{border-style:dashed; border-color:var(--yellow); background:rgba(181,137,0,.06)}
+  .pending-mark{width:26px; height:26px; display:grid; place-items:center; border:1px dashed var(--yellow);
+    border-radius:50%; color:#d1c27e; font-size:13px; font-weight:800}
+  .pending-facts{margin:5px 0 0; color:var(--base0); font-size:12.5px}
+  .attachment-links{margin:6px 0 0; display:flex; flex-wrap:wrap; gap:4px 10px; font-size:12px}
+  .attachment-links a{color:var(--cyan); min-width:0; overflow-wrap:anywhere}
+  .pending-actions{display:flex; gap:6px; flex-wrap:wrap; padding:0 16px 14px}
+  .pending-actions button, .pending-picker button, .other-mail-add, .handle-row button, .handle-cancel{
+    background:transparent; border:1px solid var(--line); border-radius:8px; color:var(--base1);
+    font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
+  .pending-actions button:hover, .pending-picker button:hover, .other-mail-add:hover,
+  .handle-row button:hover, .handle-cancel:hover{color:var(--base2); border-color:var(--base01)}
+  .pending-actions button:focus-visible, .pending-picker button:focus-visible, .other-mail-add:focus-visible,
+  .handle-row button:focus-visible, .handle-cancel:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  .pending-actions .pending-add{background:var(--blue); border-color:var(--blue); color:var(--base03)}
+  .pending-actions .pending-add:hover{background:#3196d8; color:var(--base03)}
+  .pending-picker{display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:0 16px 14px;
+    padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--base03)}
+  .pending-picker-label{color:var(--base01); font-size:12px; margin-right:4px}
+  /* Under the trip list, in the aside's own type sizes: this is the mail
+     that did not make a timeline, and it must not compete with the trips. */
+  .other-mail{margin-top:18px; padding:0 10px}
+  .other-mail-title{margin:0 0 8px; color:var(--base01); font-size:11px; font-weight:800;
+    letter-spacing:.1em; text-transform:uppercase}
+  .other-mail-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px}
+  .other-mail-row{padding:9px 10px; border:1px solid var(--line); border-radius:10px; font-size:12px}
+  .other-mail-top{display:flex; justify-content:space-between; gap:8px}
+  .other-mail-sender{color:var(--base2); font-weight:700; min-width:0; overflow-wrap:anywhere}
+  .other-mail-address{display:block; color:var(--base01); font-weight:400; font-size:11px}
+  .other-mail-when{flex:none; color:var(--base01)}
+  .other-mail-subject{margin:3px 0 0; color:var(--base1); overflow-wrap:anywhere}
+  .other-mail-meta{margin:3px 0 0; color:var(--base01); font-size:11px}
+  .other-mail-add{margin-top:7px}
+  /* The address line closes the aside. The form is one row — input,
+     domain, Save — and its hint is a sentence under it in the same place
+     whether it is the mirrored rule, the live check, or the server's no. */
+  .handle-line{margin-top:18px; padding:12px 10px 0; border-top:1px solid var(--line)}
+  .handle-label{margin:0 0 6px; color:var(--base01); font-size:12px}
+  .handle-address{margin:0 0 8px; color:var(--base2); font-size:14px; font-weight:700; overflow-wrap:anywhere;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .handle-row{display:flex; gap:6px}
+  .handle-form-row{display:flex; flex-wrap:wrap; align-items:center; gap:6px}
+  .handle-form-row input{flex:1; min-width:90px; font:inherit; font-size:13px; padding:7px 9px;
+    border:1px solid var(--line); border-radius:9px; background:var(--base03); color:var(--base2)}
+  .handle-form-row input:focus{outline:2px solid var(--blue); outline-offset:-1px}
+  .handle-suffix{color:var(--base01); font-size:13px}
+  .handle-save{flex:none; background:var(--blue); color:var(--base03); border:0; border-radius:9px;
+    font:inherit; font-size:12.5px; font-weight:700; padding:8px 12px; cursor:pointer}
+  .handle-save:hover{background:#3196d8}
+  .handle-save:disabled{opacity:.6; cursor:default}
+  .handle-hint{min-height:1.3em; margin:6px 0 0; color:#b8c76a; font-size:12px}
+  .handle-hint.problem{color:#d1c27e}
   .trip-toast{position:sticky; bottom:8px; z-index:4; width:max-content; max-width:calc(100% - 16px);
     margin:12px auto 0; padding:9px 13px; border:1px solid var(--line); border-radius:10px;
     background:#001f27; color:var(--base1); box-shadow:0 8px 24px rgba(0,0,0,.35); font-size:13px}
@@ -493,11 +548,18 @@
     .side.open{display:block}
     .menu{display:block}
     .trips-view{display:flex; flex-direction:column; gap:12px; overflow:hidden}
-    .trip-side{min-height:auto; overflow:visible; padding:0; border-right:0}
+    /* Capped and scrolling rather than free: with Other mail and the
+       address line stacked under the trip strip, a free aside took the
+       screen and left the trip itself an 80px slot. The cap only bites
+       once those sections exist — without them the aside is shorter than
+       it anyway, and this tab is as it was. */
+    .trip-side{flex:none; min-height:auto; max-height:44dvh; overflow-y:auto; padding:0; border-right:0}
     .trip-side-head{padding:0 2px 10px}
     .trip-side h1{font-size:17px}
     .trip-list{flex-direction:row; overflow-x:auto; padding:0 0 7px; scrollbar-width:thin}
     .trip-list li{flex:0 0 164px}
+    .other-mail{margin-top:10px; padding:0}
+    .handle-line{margin-top:10px; padding:10px 0 0}
     .trip-list button{background:rgba(7,54,66,.5)}
     .trip-detail{padding-right:0}
     .trip-overview{padding:15px 12px}
@@ -569,6 +631,11 @@
       </div>
     </div>
     <ol id="trip-list" class="trip-list"></ol>
+    <!-- Both filled by the client from /chat/inbox and left hidden when
+         that route is not there: the tab without the inbox feature is
+         the tab as it was. -->
+    <section id="other-mail" class="other-mail" aria-labelledby="other-mail-title" hidden></section>
+    <div id="handle-line" class="handle-line" hidden></div>
   </aside>
   <main id="trip-detail" class="trip-detail" aria-live="polite">
     <div class="trip-empty">

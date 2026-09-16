@@ -458,7 +458,7 @@ const NO_CLIENT_ADDRESS: &str = "no-forwarded-for";
 /// client got to write with nothing in front of it — falls through to the
 /// shared bucket rather than becoming a key of its own, or junk would buy
 /// one bucket per junk string.
-fn client_bucket(headers: &HeaderMap) -> String {
+pub(crate) fn client_bucket(headers: &HeaderMap) -> String {
     client_ip(headers).unwrap_or_else(|| NO_CLIENT_ADDRESS.to_string())
 }
 

@@ -8,6 +8,7 @@ import {
   tripPdfFilename, tripRoute, itemDateLabel,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
+  pendingRowsFor, otherMailLines, handleProblem,
 } from './chat.js'
 
 test('a Replace clears what was shown rather than extending it', () => {
@@ -515,4 +516,76 @@ test('durations read as seconds under a minute and minutes above', () => {
   assert.equal(traceDuration(42000), '42.0s')
   assert.equal(traceDuration(90000), '1m 30s')
   assert.equal(traceDuration(undefined), '')
+})
+
+test('pending arrivals slot into the timeline at their date, after items on the same day', () => {
+  // A Plan carries no id, so an arrival is matched to its trip by the
+  // name the server put on both; the ids in the fixture are the mail
+  // side's and play no part.
+  const trip = { id: 5, name: 'Lisbon', items: [
+    { position: 1, kind: 'flight', date: '2026-10-12' },
+    { position: 2, kind: 'flight', date: '2026-10-19' },
+  ] }
+  const arrivals = [
+    // Listed first but the latest by id: on its day it goes after 9, which
+    // pins the order within a day to arrival rather than to the list.
+    { id: 12, trip_id: 5, trip_name: 'Lisbon', kind: 'activity', title: 'Fado', date: '2026-10-12', status: 'pending', booking: true },
+    { id: 9, trip_id: 5, trip_name: 'Lisbon', kind: 'stay', title: 'Hotel Alfama', date: '2026-10-12', ends_at: '2026-10-15', status: 'pending', booking: true },
+    { id: 10, trip_id: 6, trip_name: 'Porto', kind: 'activity', title: 'Elsewhere', date: '2026-10-13', status: 'pending', booking: true },
+    { id: 11, trip_id: 5, trip_name: 'Lisbon', kind: 'activity', title: 'Azulejo', date: '2026-10-13', status: 'pending', booking: true },
+  ]
+  const rows = pendingRowsFor(trip, arrivals)
+  assert.deepEqual(rows.map(r => [r.kind, r.kind === 'item' ? r.item.position : r.arrival.id]), [
+    ['item', 1], ['pending', 9], ['pending', 12], ['pending', 11], ['item', 2],
+  ])
+})
+
+test('a decided or non-booking arrival never reaches the timeline', () => {
+  const trip = { name: 'Lisbon', items: [] }
+  const rows = pendingRowsFor(trip, [
+    { id: 1, trip_name: 'Lisbon', kind: 'stay', date: '2026-10-12', status: 'added', booking: true },
+    { id: 2, trip_name: 'Lisbon', kind: null, date: '2026-10-12', status: 'pending', booking: false },
+    { id: 3, trip_name: 'Lisbon', kind: 'stay', date: '2026-10-12', status: 'pending', booking: true },
+  ])
+  assert.deepEqual(rows.map(r => r.arrival.id), [3])
+})
+
+test('other mail reads as sender, subject, when, reason', () => {
+  const lines = otherMailLines([
+    { mail_id: 1, from: 'TAP <news@flytap.com>', subject: 'Autumn sale', received_at: '2026-10-01T10:00:00Z', reason: 'not_booking', forwarded: true, attachments: [] },
+    { mail_id: 2, from: 'x@y.z', subject: null, received_at: '2026-10-02T10:00:00Z', reason: 'failed', forwarded: false, attachments: [{ id: 3, filename: 'a.pdf', mime: 'application/pdf', size: 10 }] },
+  ], 'en-US')
+  assert.equal(lines[0].sender, 'TAP')
+  assert.equal(lines[0].address, 'news@flytap.com')
+  assert.equal(lines[0].reason, 'not a booking')
+  assert.equal(lines[0].note, 'forwarded to you')
+  assert.equal(lines[0].when, 'Oct 1')
+  assert.equal(lines[1].sender, 'x@y.z')
+  assert.equal(lines[1].address, 'x@y.z')
+  assert.equal(lines[1].subject, '(no subject)')
+  assert.equal(lines[1].reason, 'could not read')
+  assert.equal(lines[1].note, 'not forwarded')
+  assert.equal(lines[1].attachments.length, 1)
+})
+
+test('a quoted display name and a bare bracketed address both yield the address', () => {
+  const [quoted, bare] = otherMailLines([
+    { mail_id: 1, from: '"Booking, Team" <hi@booking.example>', received_at: '2026-10-01T10:00:00Z', reason: 'ignored' },
+    { mail_id: 2, from: '<hi@booking.example>', received_at: '2026-10-01T10:00:00Z', reason: 'ignored' },
+  ])
+  assert.equal(quoted.sender, 'Booking, Team')
+  assert.equal(quoted.address, 'hi@booking.example')
+  assert.equal(bare.sender, 'hi@booking.example')
+  assert.equal(bare.address, 'hi@booking.example')
+})
+
+test('the handle form explains the rules before the server does', () => {
+  assert.equal(handleProblem('sasha.k'), null)
+  assert.equal(handleProblem('  Sasha.K '), null)
+  assert.equal(handleProblem('ab'), 'a handle is 3 to 30 characters')
+  assert.equal(handleProblem('sa sha'), 'letters, digits and dots only')
+  assert.equal(handleProblem('.sasha'), 'a handle cannot start or end with a dot')
+  // The Kelvin sign lowercases to an ASCII k in JS; the server sees a
+  // non-ASCII byte and refuses, so the charset is checked before the case.
+  assert.equal(handleProblem('sasha\u212a'), 'letters, digits and dots only')
 })

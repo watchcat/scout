@@ -436,6 +436,101 @@ export function composerTarget(trip) {
   return { thread: chat.id, label: chat.title ? `to "${chat.title}"` : 'to an unnamed thread' }
 }
 
+// The trip's timeline with the mail that has arrived for it laid in. An
+// arrival waits as a dashed row where its booking would sit, so the
+// reader sees the trip as it will be once they say Add — not a separate
+// inbox to cross-reference against the timeline. Only what is still
+// undecided and was actually read as a booking gets a row; the rest is
+// "Other mail".
+//
+// Matched to the trip by name, not id: a Plan on `/chat/trips` carries no
+// id — trips are named everywhere on this page (`keepBody`, `removeItemBody`)
+// — and the server puts the same `trip_name` on the arrival. An arrival's
+// `trip_id` is the mail side's key and plays no part here.
+//
+// Ordered by date, a pending row after the items of its day: the items
+// already there are what the reader chose, and something that just arrived
+// waits behind them rather than pushing in front. Pendings on one day keep
+// their id order, which is arrival order — a stable read on every repaint.
+export function pendingRowsFor(trip, arrivals) {
+  const rows = trip.items.map((item) => ({ kind: 'item', item }))
+  const mine = (arrivals ?? [])
+    .filter((a) => a.status === 'pending' && a.booking && a.trip_name === trip.name)
+    .sort((a, b) => a.id - b.id)
+  for (const arrival of mine) {
+    // The first row on a later day is where this one goes; none means the
+    // end. `>` rather than `>=` is the "after same-day items" rule. The
+    // server guarantees a date on anything it read as a booking; the
+    // fallback only keeps a malformed row from throwing, at the front.
+    let at = rows.findIndex((row) => rowDate(row) > (arrival.date ?? ''))
+    if (at < 0) at = rows.length
+    rows.splice(at, 0, { kind: 'pending', arrival })
+  }
+  return rows
+}
+
+function rowDate(row) {
+  return (row.kind === 'item' ? row.item.date : row.arrival.date) ?? ''
+}
+
+// One line per mail that did not become a pending row: what the reader
+// needs to recognise it (who, what, when) and why it is here rather than
+// on a timeline. `sender` is the display name when the address carried
+// one — "TAP" is recognisable where "news@flytap.com" is a squint — and
+// `address` is always the bare address, shown beside it: a display name
+// is whatever the sender typed, and a mail calling itself "Booking.com"
+// from elsewhere must not be the only thing on screen. `locale` exists
+// for the tests, as on `dateLabel`; the page passes none.
+const MAIL_REASONS = {
+  not_booking: 'not a booking',
+  failed: 'could not read',
+  ignored: 'ignored',
+}
+
+export function otherMailLines(rows, locale = undefined) {
+  return (rows ?? []).map((row) => ({
+    mail_id: row.mail_id,
+    sender: sender(row.from).name,
+    address: sender(row.from).address,
+    subject: row.subject?.trim() ? row.subject : '(no subject)',
+    when: dateLabel(String(row.received_at ?? '').slice(0, 10), true, locale),
+    reason: MAIL_REASONS[row.reason] ?? row.reason ?? '',
+    note: row.forwarded ? 'forwarded to you' : 'not forwarded',
+    attachments: row.attachments ?? [],
+    // The one reason that gets a button; kept as a flag so the page does
+    // not compare against its own display text.
+    failed: row.reason === 'failed',
+  }))
+}
+
+// `Name <addr>`, `"Name, quoted" <addr>`, `<addr>` or a bare address:
+// the name is the part before the brackets, unquoted, and the address is
+// the part inside them — or the whole thing when there are none. A name
+// that is empty falls back to the address, so `sender` is never blank.
+function sender(from) {
+  const text = String(from ?? '').trim()
+  const match = text.match(/^"?([^"<]*?)"?\s*<([^>]*)>$/)
+  if (!match) return { name: text, address: text }
+  const address = match[2].trim()
+  return { name: match[1].trim() || address, address }
+}
+
+// Mirrors `scout_core::inbox::normalise_handle` — the same checks, in the
+// same order, with the server's own sentences — so the form can say what
+// is wrong as the reader types instead of after a round trip. The reserved
+// list is deliberately not copied: it is the server's to keep, and the
+// live check asks it. `null` means nothing to say.
+export function handleProblem(raw) {
+  const trimmed = String(raw ?? '').trim()
+  // Checked before lowercasing: JS folds the Kelvin sign to an ASCII k
+  // where the server, lowercasing bytes, sees something it refuses.
+  if (!/^[A-Za-z0-9.]*$/.test(trimmed)) return 'letters, digits and dots only'
+  const h = trimmed.toLowerCase()
+  if (h.length < 3 || h.length > 30) return 'a handle is 3 to 30 characters'
+  if (h.startsWith('.') || h.endsWith('.')) return 'a handle cannot start or end with a dot'
+  return null
+}
+
 // The trace panel's model. Pure so it can be tested without a DOM, and
 // shared by the saved trace (rows from the server) and the live one (rows
 // built from frames), which must read identically.
@@ -534,6 +629,8 @@ function start() {
   const tripCount = document.getElementById('trip-count')
   const tripList = document.getElementById('trip-list')
   const tripDetail = document.getElementById('trip-detail')
+  const otherMailEl = document.getElementById('other-mail')
+  const handleLineEl = document.getElementById('handle-line')
   // The thread the page is showing. Every message names it, so a thread
   // the phone started meanwhile cannot swallow a message meant for this one.
   //
@@ -555,6 +652,16 @@ function start() {
   let tripsLoaded = false
   let tripLoadSeq = 0
   let tripChoicePending = false
+  // The booking inbox as `/chat/inbox` last described it: `null` until the
+  // route has answered once, and left alone when a refresh fails — a
+  // stale inbox is the pending rows the reader already saw, a cleared one
+  // is those rows vanishing for no reason. Stays `null` for good when the
+  // route is not there (the feature off), and then nothing of it is drawn:
+  // the Trips tab is exactly what it was before.
+  let inbox = null
+  // Set by Change on a saved address and cleared by Save or Cancel, so the
+  // form can stand in for the address line without forgetting the handle.
+  let handleEditing = false
 
   // Enter sends, Shift+Enter is a newline. `requestSubmit` rather than
   // `submit` because it runs the form's own validation — so Enter on an
@@ -846,20 +953,29 @@ function start() {
     if (tripChoicePending) return
     const seq = ++tripLoadSeq
     tripDetail.setAttribute('aria-busy', 'true')
+    // Asked for in the same breath as the trips, not after them: the
+    // pending rows are drawn into the timeline, and a second repaint once
+    // the inbox arrived would show the trip twice — once without the mail
+    // that is waiting for it, then with. `fetchInbox` never rejects, so an
+    // inbox that fails leaves the trips loading exactly as before.
+    const inboxReq = fetchInbox()
     try {
       const res = await fetch('/chat/trips')
       if (!res.ok) throw new Error('refused')
       const loaded = await res.json()
+      const loadedInbox = await inboxReq
       // Two loads can overlap when a hidden tab wakes as Trips is opened.
       // Only the latest response may redraw the page.
       if (!tripLoadIsCurrent(seq, tripLoadSeq, tripChoicePending)) return
       trips = loaded
+      if (loadedInbox) inbox = loadedInbox
       tripsLoaded = true
       tripCount.textContent = String(trips.length)
       tripCount.hidden = trips.length === 0
       if (!trips.some((trip) => trip.name === currentTrip)) currentTrip = trips[0]?.name ?? null
       renderTripList()
       renderTripDetail()
+      renderInboxSide()
     } catch {
       if (!tripLoadIsCurrent(seq, tripLoadSeq, tripChoicePending)) return
       showTripEmpty(
@@ -879,6 +995,23 @@ function start() {
     inner.append(node('h2', '', title), node('p', '', copy))
     empty.append(inner)
     tripDetail.append(empty)
+  }
+
+  // The inbox, or `null` on any failure — a 404 (the feature is off), a
+  // 500, a dead network — so a caller keeps what it had. Never throws.
+  async function fetchInbox() {
+    try {
+      const res = await fetch('/chat/inbox')
+      if (!res.ok) return null
+      return await res.json()
+    } catch {
+      return null
+    }
+  }
+
+  function renderInboxSide() {
+    renderOtherMail()
+    renderHandle()
   }
 
   function renderTripList() {
@@ -1185,15 +1318,27 @@ function start() {
       tripDetail.append(alert)
     }
 
+    // Items and the mail waiting to become one, in one timeline — see
+    // `pendingRowsFor`. Drawn even when the trip has no items yet: a draft
+    // an arrival started holds nothing but its pending row, and that row
+    // is the whole reason the trip is on the list.
     const stack = node('div', 'segment-stack')
-    for (let i = 0; i < trip.items.length; i++) {
-      const item = trip.items[i]
+    // Counts item rows as they pass: the join below looks past this item
+    // in `trip.items`, and pending rows are not in that list.
+    let itemIndex = 0
+    for (const row of pendingRowsFor(trip, inbox?.pending ?? [])) {
+      if (row.kind === 'pending') {
+        stack.append(renderPendingRow(trip, row.arrival))
+        continue
+      }
+      const item = row.item
+      itemIndex++
       stack.append(renderItem(trip, item))
       // The join is checked from one flight to the next flight, whatever
       // sits between them: a stay does not change when the second leg
       // leaves. The PDF draws it in the same place, under the first flight.
       if (item.kind !== 'flight') continue
-      const next = trip.items.slice(i + 1).find((later) => later.kind === 'flight')
+      const next = trip.items.slice(itemIndex).find((later) => later.kind === 'flight')
       if (next) {
         const check = connectionCheck(item, next)
         stack.append(node('div', `join-card ${check.tone}`, check.text))
@@ -1201,6 +1346,380 @@ function start() {
     }
     tripDetail.append(stack)
     tripDetail.append(renderAddLegForm(trip))
+  }
+
+  // An arrival on the timeline: the card its booking would become, drawn
+  // dashed, with the three things the reader can say about it. Nothing on
+  // it is editable — a wrong guess is "Not this trip" or "Ignore" — and
+  // what it shows is what the extractor read from the mail, put in front
+  // of the reader so they can check it before it becomes an item. The `?`
+  // sits where an item's Remove button does: this card has no place on
+  // the trip yet, and that is the one thing the head has to say.
+  function renderPendingRow(trip, arrival) {
+    const card = node('article', 'item-card pending')
+    const head = node('header', 'segment-head')
+    const about = node('div')
+    const flight = arrival.kind === 'flight' && arrival.origin && arrival.destination
+    about.append(
+      node('p', 'segment-kicker', `Arrived · ${arrival.kind ? kindLabel(arrival) : 'Booking'}`),
+      node('h3', 'item-title', flight ? `${arrival.origin} → ${arrival.destination}` : arrival.title || arrival.summary || 'Booking'),
+    )
+    if (arrival.place) about.append(node('p', 'item-place', arrival.place))
+    const facts = []
+    if (arrival.confirmation_code) facts.push(`confirmation ${arrival.confirmation_code}`)
+    if (Number.isFinite(arrival.price)) facts.push(moneyLabel(arrival.price, arrival.currency))
+    if (facts.length) about.append(node('p', 'pending-facts', facts.join(' · ')))
+    if (arrival.attachments?.length) about.append(attachmentLinks(arrival.attachments))
+    const actions = node('div', 'segment-head-actions')
+    actions.append(node('time', 'segment-date', itemDateLabel(arrival)))
+    const mark = node('span', 'pending-mark', '?')
+    mark.setAttribute('title', 'Not on the trip yet')
+    mark.setAttribute('aria-label', 'Not on the trip yet')
+    actions.append(mark)
+    head.append(about, actions)
+    card.append(head)
+
+    const row = node('div', 'pending-actions')
+    // Adding to a draft keeps it — the store does that in one write — and
+    // the label says so, because "Add" alone would put a booking into a
+    // trip that then reads "Clears with its chat unless kept".
+    const add = node('button', 'pending-add', trip.kept ? 'Add' : 'Keep this trip and add')
+    add.type = 'button'
+    add.addEventListener('click', () => {
+      decideArrival(arrival, 'add', {}, (plan) => `Added to ${plan.name}.`).catch(() => {})
+    })
+    const elsewhere = node('button', '', 'Not this trip')
+    elsewhere.type = 'button'
+    const ignore = node('button', '', 'Ignore')
+    ignore.type = 'button'
+    ignore.addEventListener('click', () => {
+      decideArrival(arrival, 'ignore', {}, () => 'Ignored. It is under Other mail.').catch(() => {})
+    })
+    row.append(add, elsewhere, ignore)
+    card.append(row)
+    // The picker opens under the buttons rather than replacing them, so
+    // Ignore stays reachable while it is open; a second press, or Escape
+    // anywhere on the card while it is open, closes it and puts focus
+    // back on the button. On the card, not the slot: right after the
+    // click that opened it, focus is still on the button.
+    const pickerSlot = node('div', 'pending-picker-slot')
+    pickerSlot.id = `arrival-${arrival.id}-picker`
+    card.append(pickerSlot)
+    function setPicker(open) {
+      elsewhere.setAttribute('aria-expanded', String(open))
+      pickerSlot.replaceChildren(...(open ? [tripPicker(trip, arrival)] : []))
+    }
+    elsewhere.setAttribute('aria-expanded', 'false')
+    elsewhere.setAttribute('aria-controls', pickerSlot.id)
+    elsewhere.addEventListener('click', () => setPicker(!pickerSlot.firstChild))
+    card.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape' || !pickerSlot.firstChild) return
+      e.stopPropagation()
+      setPicker(false)
+      elsewhere.focus()
+    })
+    return card
+  }
+
+  // The other trips by name, then a new one: the body the server takes is
+  // `{"trip": name}` or `{"new": true}`, and a Plan has no id to send
+  // instead. The trip the card is on is left out — that is what Add is.
+  function tripPicker(trip, arrival) {
+    const picker = node('div', 'pending-picker')
+    picker.setAttribute('role', 'group')
+    picker.setAttribute('aria-label', 'Which trip is this for?')
+    picker.append(node('span', 'pending-picker-label', 'Add it to'))
+    for (const other of trips) {
+      if (other.name === trip.name) continue
+      const button = node('button', '', other.name)
+      button.type = 'button'
+      button.addEventListener('click', () => {
+        decideArrival(arrival, 'add', { trip: other.name }, (plan) => `Added to ${plan.name}.`).catch(() => {})
+      })
+      picker.append(button)
+    }
+    const fresh = node('button', '', 'New trip')
+    fresh.type = 'button'
+    fresh.addEventListener('click', () => {
+      decideArrival(arrival, 'add', { new: true }, (plan) => `Started ${plan.name} with it.`).catch(() => {})
+    })
+    picker.append(fresh)
+    return picker
+  }
+
+  // Add or Ignore, the shape `addLeg` has: guard against an overlapping
+  // write, invalidate the load sequence before the request goes out. Both
+  // trips and inbox are then reloaded rather than patched from the
+  // response — an add changes one trip and removes one pending row, and
+  // `loadTrips` fetches both in one go. A 409 is not an error: the phone
+  // or another tab decided this one first, and the reload shows what
+  // stands. `done(result)` words the toast; the result is the Plan for an
+  // add and `{}` for an ignore.
+  async function decideArrival(arrival, verb, body, done) {
+    if (tripChoicePending) return
+    tripChoicePending = true
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    // Every button on this card, picker included, is off until the answer:
+    // `tripChoicePending` already drops a second press on the floor, but
+    // a button that still looks live invites it. Any reload repaints the
+    // card; the `finally` is for the refusals that leave it standing.
+    const card = document.getElementById(`arrival-${arrival.id}-picker`)?.closest('.item-card')
+    const buttons = [...(card?.querySelectorAll('.pending-actions button, .pending-picker button') ?? [])]
+    for (const button of buttons) button.disabled = true
+    try {
+      const res = await post(`/chat/arrivals/${encodeURIComponent(arrival.id)}/${verb}`, body)
+      if (res.status === 409) {
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        return
+      }
+      if (!res.ok) {
+        const reason = await refusalReason(res)
+        showTripToast(reason ? `Could not do that: ${reason}.` : 'Could not do that. Try again.')
+        return
+      }
+      const result = await res.json()
+      // An add answers with the trip it landed in. Selecting it is how a
+      // "Not this trip" or "New trip" shows where the booking went rather
+      // than leaving the reader on the card that just vanished.
+      if (typeof result?.name === 'string') currentTrip = result.name
+      tripChoicePending = false
+      tripsLoaded = false
+      await loadTrips()
+      showTripToast(done(result))
+    } catch {
+      showTripToast('Could not reach Scout. Try again.')
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+      for (const button of buttons) button.disabled = false
+    }
+  }
+
+  // Every refusal from the inbox routes is `{"ok":false,"reason"}` under
+  // its status; this reads the reason out and gives up quietly on a body
+  // that is anything else.
+  async function refusalReason(res) {
+    try {
+      const body = await res.json()
+      return typeof body?.reason === 'string' && body.reason ? body.reason : null
+    } catch {
+      return null
+    }
+  }
+
+  // Plain anchors: the route sets `Content-Disposition`, and a click on
+  // one is a download with nothing for the page to do.
+  function attachmentLinks(attachments) {
+    const list = node('p', 'attachment-links')
+    for (const file of attachments) {
+      const link = node('a', '', file.filename || `attachment ${file.id}`)
+      link.href = `/chat/attachments/${encodeURIComponent(file.id)}`
+      link.setAttribute('download', '')
+      list.append(link)
+    }
+    return list
+  }
+
+  // The mail that did not become a pending row, under the trip list: one
+  // line each, see `otherMailLines`. Hidden outright when there is none —
+  // an empty "Other mail" heading is a question the reader did not ask.
+  // "Add by hand" for a mail Scout could not read points at chat, where
+  // the item can be described; a form for it is not in this slice.
+  function renderOtherMail() {
+    if (!otherMailEl) return
+    const lines = otherMailLines(inbox?.other ?? [])
+    otherMailEl.replaceChildren()
+    otherMailEl.hidden = !lines.length
+    if (!lines.length) return
+    const title = node('h2', 'other-mail-title', 'Other mail')
+    title.id = 'other-mail-title'
+    otherMailEl.append(title)
+    const list = node('ul', 'other-mail-list')
+    for (const line of lines) {
+      const li = node('li', 'other-mail-row')
+      const top = node('div', 'other-mail-top')
+      const who = node('span', 'other-mail-sender', line.sender)
+      // The bare address beside the name, always — see `otherMailLines`.
+      // Omitted only when it is the name, which would print it twice.
+      if (line.address !== line.sender) who.append(node('span', 'other-mail-address', line.address))
+      top.append(who, node('span', 'other-mail-when', line.when))
+      li.append(top, node('p', 'other-mail-subject', line.subject))
+      li.append(node('p', 'other-mail-meta', `${line.reason} · ${line.note}`))
+      if (line.attachments.length) li.append(attachmentLinks(line.attachments))
+      if (line.failed) {
+        const byHand = node('button', 'other-mail-add', 'Add by hand')
+        byHand.type = 'button'
+        byHand.addEventListener('click', () => {
+          showTripToast("Ask Scout in chat: 'I've booked …'")
+        })
+        li.append(byHand)
+      }
+      list.append(li)
+    }
+    otherMailEl.append(list)
+  }
+
+  // The address line at the foot of the aside. Three states: nothing
+  // (the inbox has not answered, or never will), the form (no handle yet,
+  // or Change pressed), and the address with Copy and Change.
+  //
+  // Called on every reload — a tab waking, every arrival verb — and a
+  // form the reader is in the middle of is left alone then: a rebuild
+  // would wipe the half-typed handle and the hint under it. "In the
+  // middle of" is the input focused or holding something other than the
+  // saved handle; Save and Cancel go through `renderHandle` with the
+  // form's own state settled, so those still repaint.
+  function renderHandle() {
+    if (!handleLineEl) return
+    const input = handleLineEl.querySelector('.handle-form input')
+    if (input && inbox && (document.activeElement === input || input.value !== (inbox.handle ?? ''))) return
+    handleLineEl.replaceChildren()
+    handleLineEl.hidden = !inbox
+    if (!inbox) return
+    if (!inbox.handle || handleEditing) {
+      handleLineEl.append(handleForm())
+      return
+    }
+    const address = `${inbox.handle}@${inbox.domain}`
+    handleLineEl.append(node('p', 'handle-label', 'Your booking address'))
+    handleLineEl.append(node('p', 'handle-address', address))
+    const row = node('div', 'handle-row')
+    const copy = node('button', '', 'Copy')
+    copy.type = 'button'
+    copy.addEventListener('click', () => {
+      navigator.clipboard.writeText(address)
+        .then(() => showTripToast('Copied'))
+        .catch(() => showTripToast('Could not copy. Select the address and copy it by hand.'))
+    })
+    const change = node('button', '', 'Change')
+    change.type = 'button'
+    change.addEventListener('click', () => {
+      handleEditing = true
+      renderHandle()
+    })
+    row.append(copy, change)
+    handleLineEl.append(row)
+  }
+
+  // `handleProblem` speaks on every keystroke — the rules are the
+  // server's, mirrored — and only a handle that passes them is sent to
+  // `/chat/handle/check`, 400 ms after the last key. A 429 from the check
+  // says nothing: the reader is still typing, and "slow down" under an
+  // input is a complaint about the page, not the handle. Save posts
+  // whatever is typed and shows the server's reason on a 409 or 422.
+  function handleForm() {
+    const form = document.createElement('form')
+    form.className = 'handle-form'
+    form.append(node('p', 'handle-label', inbox.handle
+      ? 'Change your booking address'
+      : 'Forward bookings to an address of your own'))
+    const row = node('div', 'handle-form-row')
+    const input = document.createElement('input')
+    input.type = 'text'
+    // No `maxLength`: a pasted 31-character handle should get the "3 to
+    // 30" sentence, not a silent cut to something the reader did not type.
+    input.autocomplete = 'off'
+    input.spellcheck = false
+    input.placeholder = 'yourname'
+    input.value = inbox.handle ?? ''
+    input.setAttribute('aria-label', 'Handle')
+    input.setAttribute('aria-describedby', 'handle-hint')
+    const save = node('button', 'handle-save', 'Save')
+    save.type = 'submit'
+    row.append(input, node('span', 'handle-suffix', `@${inbox.domain}`), save)
+    const hint = node('p', 'handle-hint')
+    hint.id = 'handle-hint'
+    form.append(row, hint)
+    function say(text, problem) {
+      hint.className = problem ? 'handle-hint problem' : 'handle-hint'
+      hint.textContent = text
+    }
+
+    // A check that answers after the input moved on is about a handle
+    // nobody is looking at any more; the timer is the one not yet sent.
+    let checkSeq = 0
+    let checkTimer = null
+
+    if (inbox.handle) {
+      const cancel = node('button', 'handle-cancel', 'Cancel')
+      cancel.type = 'button'
+      cancel.addEventListener('click', () => {
+        clearTimeout(checkTimer)
+        checkSeq++
+        handleEditing = false
+        // Back to the saved handle first, or `renderHandle` reads the
+        // abandoned edit as one still in progress and keeps the form.
+        input.value = inbox.handle
+        renderHandle()
+      })
+      row.append(cancel)
+    }
+    async function checkHandle(raw, seq) {
+      try {
+        const res = await fetch(`/chat/handle/check?handle=${encodeURIComponent(raw)}`)
+        if (seq !== checkSeq || !res.ok) return
+        const answer = await res.json()
+        if (seq !== checkSeq) return
+        if (answer.ok) say(`${answer.handle}@${inbox.domain} is free`, false)
+        else if (typeof answer.reason === 'string') say(answer.reason, true)
+      } catch {
+        // Silence, as for a 429: the Save will say what the check could not.
+      }
+    }
+
+    input.addEventListener('input', () => {
+      clearTimeout(checkTimer)
+      checkSeq++
+      const raw = input.value
+      if (!raw.trim()) return say('', false)
+      const problem = handleProblem(raw)
+      say(problem ?? '', Boolean(problem))
+      if (problem) return
+      const seq = checkSeq
+      checkTimer = setTimeout(() => checkHandle(raw, seq).catch(() => {}), 400)
+    })
+
+    form.addEventListener('submit', (event) => {
+      event.preventDefault()
+      const raw = input.value
+      const problem = handleProblem(raw)
+      if (problem) {
+        say(problem, true)
+        input.focus()
+        return
+      }
+      clearTimeout(checkTimer)
+      checkSeq++
+      save.disabled = true
+      saveHandle(raw).catch(() => {}).finally(() => {
+        save.disabled = false
+      })
+    })
+
+    async function saveHandle(raw) {
+      try {
+        const res = await post('/chat/handle', { handle: raw })
+        if (!res.ok) {
+          say(await refusalReason(res) ?? 'Could not save that. Try again.', true)
+          return
+        }
+        const saved = await res.json()
+        handleEditing = false
+        inbox = { ...inbox, handle: saved.handle }
+        // The form's own state is settled: value and focus both cleared
+        // so `renderHandle` does not read a finished edit as one in flight.
+        input.value = saved.handle
+        input.blur()
+        renderHandle()
+        showTripToast(`Your booking address is ${saved.handle}@${inbox.domain}.`)
+      } catch {
+        say('Could not reach Scout. Try again.', true)
+      }
+    }
+    return form
   }
 
   // A second press, not `window.confirm`, for the reason `removeConfirmRow`

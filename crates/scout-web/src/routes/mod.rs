@@ -8,6 +8,7 @@
 pub mod account;
 pub mod auth;
 pub mod chat;
+pub mod inbox;
 pub mod trips;
 
 use crate::{pages, session, AuthState};

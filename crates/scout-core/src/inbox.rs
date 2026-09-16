@@ -463,12 +463,17 @@ pub async fn trip_name(core: &Core, account_id: i64, trip_id: i64) -> anyhow::Re
 }
 
 /// Where the person asked an arrival to go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddTarget {
     /// The trip the reading was placed on; placed afresh if that is gone.
     Matched,
-    /// One of their trips, by id.
+    /// One of their trips, by id — for callers inside the crate that hold
+    /// one. A trip's id never crosses the wire (`Trip` skips it), so the
+    /// page cannot say this.
     Trip(i64),
+    /// One of their trips, by the name they gave it — how every other
+    /// route on the page addresses a trip.
+    Named(String),
     /// A draft named for the booking's place and month — an upsert by
     /// name, so a draft already called that (the one `record_arrival`
     /// made, typically) is landed on rather than doubled.
@@ -517,6 +522,12 @@ pub async fn add_arrival(
         // the claim is no worse than the one `record_arrival` makes.
         let trip = match target {
             AddTarget::Trip(id) => match store.trip_by_id(account_id, id)? {
+                Some(t) => t,
+                None => return Ok(Outcome::NotFound),
+            },
+            // `find_trip` is scoped to the account, so somebody else's
+            // trip and a name nobody used are the same `NotFound`.
+            AddTarget::Named(name) => match store.find_trip(account_id, &name)? {
                 Some(t) => t,
                 None => return Ok(Outcome::NotFound),
             },
@@ -1016,6 +1027,21 @@ mod tests {
         };
         assert_eq!(plan.trip.id, porto.id);
         assert!(plan.trip.kept);
+
+        // By name, as the page says it: theirs adds, a stranger's is not there.
+        let third = seed_arrival_for_tests(&core, a, "activity", "Livraria Lello", "2026-11-04", None).await.unwrap();
+        assert_eq!(
+            add_arrival(&core, a, third, AddTarget::Named("Theirs".into())).await.unwrap(),
+            Outcome::NotFound,
+            "somebody else's trip, by name"
+        );
+        assert_eq!(add_arrival(&core, a, third, AddTarget::Named("Nowhere".into())).await.unwrap(), Outcome::NotFound);
+        let plan = match add_arrival(&core, a, third, AddTarget::Named(" porto ".into())).await.unwrap() {
+            Outcome::Done(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(plan.trip.id, porto.id, "the name is matched the way `find_trip` matches it");
+        assert!(plan.trip.items.iter().any(|i| i.title == "Livraria Lello" && i.booked));
     }
 
     #[tokio::test]

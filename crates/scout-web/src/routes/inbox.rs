@@ -146,31 +146,31 @@ async fn set_handle(
     }
 }
 
-/// Where the person asked an arrival to go, as the page spells it: a
-/// trip's id, the word `new`, or nothing for the trip the reading matched.
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum TripPick {
-    Id(i64),
-    Word(String),
-}
-
+/// Where the person asked an arrival to go, as the page spells it:
+/// nothing for the trip the reading matched, `trip` naming one of theirs
+/// the way every other route on the page names a trip, or `new: true`
+/// for a draft.
+///
+/// Both fields are read loosely and checked by hand rather than typed,
+/// so that `{"trip": 5}` or `{"new": "yes"}` gets this module's `422`
+/// with a reason the page can show, not the extractor's plain-text one.
 #[derive(serde::Deserialize)]
 struct AddIn {
     #[serde(default)]
-    trip: Option<TripPick>,
+    trip: Option<serde_json::Value>,
+    #[serde(default)]
+    new: Option<serde_json::Value>,
 }
 
+const ADD_SHAPE: &str = "trip is a name, or new is true";
+
 impl AddIn {
-    /// `None` for a word that is not `new`: the only strings this field
-    /// takes are the one keyword, and a client sending a trip's *name*
-    /// here would otherwise be read as asking for a draft.
     fn target(&self) -> Option<AddTarget> {
-        match &self.trip {
-            None => Some(AddTarget::Matched),
-            Some(TripPick::Id(id)) => Some(AddTarget::Trip(*id)),
-            Some(TripPick::Word(w)) if w == "new" => Some(AddTarget::New),
-            Some(TripPick::Word(_)) => None,
+        match (&self.trip, &self.new) {
+            (None, None) => Some(AddTarget::Matched),
+            (Some(serde_json::Value::String(name)), None) => Some(AddTarget::Named(name.clone())),
+            (None, Some(serde_json::Value::Bool(true))) => Some(AddTarget::New),
+            _ => None,
         }
     }
 }
@@ -192,7 +192,7 @@ async fn add(
         return refused(StatusCode::BAD_REQUEST, "reload the page");
     }
     let Some(target) = body.target() else {
-        return refused(StatusCode::UNPROCESSABLE_ENTITY, "trip is an id or \"new\"");
+        return refused(StatusCode::UNPROCESSABLE_ENTITY, ADD_SHAPE);
     };
     match inbox::add_arrival(&auth.core, account_id, arrival_id, target).await {
         Ok(Outcome::Done(plan)) => Json(plan).into_response(),
@@ -518,8 +518,7 @@ mod tests {
         let (app, core, _dir) = test_app_with_a_round().await;
         let a = admitted(&core, "111").await;
         let plan = scout_core::trips::seed_trip_for_tests(&core, a, "Lisbon").await.unwrap();
-        let lisbon = plan.trip.id;
-        let arrival = scout_core::inbox::seed_arrival_for_tests(&core, a, "stay", "Hotel Alfama", "2026-10-12", Some(lisbon)).await.unwrap();
+        let arrival = scout_core::inbox::seed_arrival_for_tests(&core, a, "stay", "Hotel Alfama", "2026-10-12", Some(plan.trip.id)).await.unwrap();
         let (session, csrf) = signed_in(a);
         let res = get_with_cookie(&app, "/chat/inbox", &session).await;
         let v: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
@@ -539,14 +538,20 @@ mod tests {
         assert_eq!(body_of(res).await, r#"{"ok":false,"reason":"not yours or not there"}"#);
         let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{other}/add"), &session_b, Some(&csrf_b), r#"{}"#).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "a stranger cannot add it either");
-        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{other}/add"), &session, Some(&csrf), r#"{"trip":"5"}"#).await;
-        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "an id is a number, not a string");
-        assert_eq!(body_of(res).await, r#"{"ok":false,"reason":"trip is an id or \"new\""}"#);
-        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{other}/add"), &session, Some(&csrf), r#"{"trip":"new"}"#).await;
+        for bad in [r#"{"trip":5}"#, r#"{"new":false}"#, r#"{"new":"yes"}"#, r#"{"trip":"Lisbon","new":true}"#] {
+            let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{other}/add"), &session, Some(&csrf), bad).await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+            assert_eq!(body_of(res).await, r#"{"ok":false,"reason":"trip is a name, or new is true"}"#);
+        }
+        scout_core::trips::seed_trip_for_tests(&core, b, "Theirs").await.unwrap();
+        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{other}/add"), &session, Some(&csrf), r#"{"trip":"Theirs"}"#).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "a stranger's trip name is not there");
+        assert_eq!(body_of(res).await, r#"{"ok":false,"reason":"not yours or not there"}"#);
+        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{other}/add"), &session, Some(&csrf), r#"{"new":true}"#).await;
         assert_eq!(res.status(), StatusCode::OK, "a new draft is made and kept for it");
         let museum = scout_core::inbox::seed_arrival_for_tests(&core, a, "activity", "Tram 28", "2026-10-14", None).await.unwrap();
-        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{museum}/add"), &session, Some(&csrf), &format!(r#"{{"trip":{lisbon}}}"#)).await;
-        assert_eq!(res.status(), StatusCode::OK, "by id");
+        let res = post_json_with_cookie(&app, &format!("/chat/arrivals/{museum}/add"), &session, Some(&csrf), r#"{"trip":"lisbon"}"#).await;
+        assert_eq!(res.status(), StatusCode::OK, "by name, as the page spells it");
         let plan: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
         assert_eq!(plan["name"], "Lisbon");
         assert!(plan["items"].as_array().unwrap().iter().any(|i| i["title"] == "Tram 28"));

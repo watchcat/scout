@@ -454,6 +454,20 @@ export function tripLoadIsCurrent(request, current, choicePending) {
   return request === current && !choicePending
 }
 
+// Lifted out of the page's closure so `savedFareLine` can be a pure
+// function the tests can reach: it does nothing but format.
+export function moneyLabel(price, currency) {
+  if (!Number.isFinite(price)) return 'Price unavailable'
+  if (!currency) return price.toFixed(2)
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency', currency, minimumFractionDigits: 0, maximumFractionDigits: 2,
+    }).format(price)
+  } catch {
+    return `${price.toFixed(2)} ${currency}`
+  }
+}
+
 export function savedFareQualifier(source) {
   const from = String(source).toLowerCase()
   // A fare off a forwarded confirmation is not a quote that may have
@@ -463,6 +477,28 @@ export function savedFareQualifier(source) {
   return from === 'ignav'
     ? { prefix: 'from ', note: 'estimate when saved' }
     : { prefix: '', note: 'when saved' }
+}
+
+// The price line on a parked option: what goes where the money is, and
+// the qualifier under it.
+//
+// An option that came off a forwarded confirmation and carries no number
+// is not a lookup that failed — the mail simply did not state a price, and
+// "Price unavailable" beside "paid" sends the reader hunting for a fault
+// that is not there. `noFlightLine` draws the same distinction one field
+// along. A fare missing from a search keeps the old wording, because there
+// something really did fail to come back.
+export function savedFareLine(candidate) {
+  const qualifier = savedFareQualifier(candidate?.source)
+  if (!Number.isFinite(candidate?.quoted_price)) {
+    return String(candidate?.source).toLowerCase() === 'email'
+      ? { amount: 'Price not stated', note: 'on the confirmation' }
+      : { amount: 'Price unavailable', note: qualifier.note }
+  }
+  return {
+    amount: qualifier.prefix + moneyLabel(candidate.quoted_price, candidate.quoted_currency),
+    note: qualifier.note,
+  }
 }
 
 // The mark a booked item carries: the confirmation code where there is
@@ -1069,18 +1105,6 @@ function start() {
     return el
   }
 
-  function moneyLabel(price, currency) {
-    if (!Number.isFinite(price)) return 'Price unavailable'
-    if (!currency) return price.toFixed(2)
-    try {
-      return new Intl.NumberFormat(undefined, {
-        style: 'currency', currency, minimumFractionDigits: 0, maximumFractionDigits: 2,
-      }).format(price)
-    } catch {
-      return `${price.toFixed(2)} ${currency}`
-    }
-  }
-
   // Shown wherever a draft is marked — the list row and the trip's own
   // header. "Draft" alone was tried in production and told the traveller
   // nothing about what would happen to it; this says the actual
@@ -1261,11 +1285,8 @@ function start() {
     main.append(top, line)
 
     const price = node('span', 'option-price')
-    const qualifier = savedFareQualifier(candidate.source)
-    price.append(
-      node('strong', '', qualifier.prefix + moneyLabel(candidate.quoted_price, candidate.quoted_currency)),
-      node('span', '', qualifier.note),
-    )
+    const fare = savedFareLine(candidate)
+    price.append(node('strong', '', fare.amount), node('span', '', fare.note))
     label.append(input, radio, main, price)
     label.addEventListener('click', (event) => {
       event.preventDefault()

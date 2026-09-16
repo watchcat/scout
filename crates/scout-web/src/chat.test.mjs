@@ -4,7 +4,7 @@ import {
   applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow,
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
-  connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
+  connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier, savedFareLine,
   tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
@@ -401,6 +401,27 @@ test('Ignav saved fares stay visibly approximate', () => {
   // A fare off a forwarded confirmation is the total paid, not a quote
   // that may have moved since it was parked.
   assert.deepEqual(savedFareQualifier('email'), { prefix: '', note: 'paid' })
+})
+
+test('a confirmation that stated no price does not read as a lookup that failed', () => {
+  // "Price unavailable" beside "paid" says something went wrong fetching a
+  // number. Nothing went wrong: the airline's mail did not state one. Same
+  // distinction `noFlightLine` draws one field along.
+  assert.deepEqual(savedFareLine({ source: 'email', quoted_price: null }), {
+    amount: 'Price not stated', note: 'on the confirmation',
+  })
+  // A fare that really is missing from a search stays as it was: there,
+  // something did fail.
+  assert.deepEqual(savedFareLine({ source: 'duffel', quoted_price: null }), {
+    amount: 'Price unavailable', note: 'when saved',
+  })
+  // And a stated one is unchanged, qualifier and all.
+  const paid = savedFareLine({ source: 'email', quoted_price: 612.4, quoted_currency: 'EUR' })
+  assert.match(paid.amount, /612/)
+  assert.equal(paid.note, 'paid')
+  const estimate = savedFareLine({ source: 'ignav', quoted_price: 184, quoted_currency: 'EUR' })
+  assert.match(estimate.amount, /^from /)
+  assert.equal(estimate.note, 'estimate when saved')
 })
 
 test('a booked item is marked the same way whatever kind it is', () => {

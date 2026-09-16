@@ -442,9 +442,33 @@ fn item_when(item: &TripItem) -> String {
     }
 }
 
-fn fare(candidate: &TripCandidate) -> String {
+/// The price line on a parked option, as `(amount, qualifier)`. The paper
+/// half of `chat.js::savedFareLine`, and it has to agree with it.
+///
+/// An option that came off a forwarded confirmation and carries no number
+/// is not a lookup that failed: the mail did not state a price, and
+/// "Price unavailable" sends the reader hunting for a fault that is not
+/// there. A fare a search never returned keeps that wording, because there
+/// something really did fail to come back.
+///
+/// The qualifier on a stated fare says what kind of number it is. "paid"
+/// for one off a confirmation: that is the total actually paid, and "when
+/// saved" hedges a number there is nothing tentative about — this printed
+/// "when saved" for it while the page said "paid", which is the two
+/// surfaces disagreeing about one leg.
+fn fare(candidate: &TripCandidate) -> (String, &'static str) {
+    let from_mail = candidate.source.as_deref() == Some("email");
+    let from_ignav = candidate.source.as_deref() == Some("ignav");
+    let qualifier = match (from_mail, from_ignav) {
+        (true, _) => "paid",
+        (_, true) => "estimate when saved",
+        _ => "when saved",
+    };
     let Some(price) = candidate.quoted_price else {
-        return "Price unavailable".to_string();
+        return match from_mail {
+            true => ("Price not stated".to_string(), "on the confirmation"),
+            false => ("Price unavailable".to_string(), qualifier),
+        };
     };
     let amount = match candidate.quoted_currency.as_deref() {
         Some("EUR") => format!("€{price:.2}"),
@@ -454,10 +478,9 @@ fn fare(candidate: &TripCandidate) -> String {
         Some(currency) => format!("{price:.2} {currency}"),
         None => format!("{price:.2}"),
     };
-    if candidate.source.as_deref() == Some("ignav") {
-        format!("from {amount}")
-    } else {
-        amount
+    match from_ignav {
+        true => (format!("from {amount}"), qualifier),
+        false => (amount, qualifier),
     }
 }
 
@@ -787,6 +810,7 @@ pub fn html(plan: &Plan) -> String {
         let picked = selected(segment).map(|candidate| candidate.candidate);
         for candidate in &segment.candidates {
             let is_selected = picked == Some(candidate.candidate);
+            let (amount, qualifier) = fare(candidate);
             write!(
                 out,
                 "<div class=\"option {}\"><div class=\"mark\"></div><div><div><span class=\"airline\">{}</span> <span class=\"numbers\">{}</span>{}</div><div class=\"itinerary\">{}</div><div class=\"meta\">{} → {} · {}{} </div></div><div class=\"price\">{}<small>{}</small></div></div>",
@@ -803,12 +827,8 @@ pub fn html(plan: &Plan) -> String {
                 escape(clock(candidate.arriving_at_local.as_deref())),
                 escape(&duration(candidate.duration_minutes)),
                 if is_selected { " · Selected" } else { " · Alternative" },
-                escape(&fare(candidate)),
-                if candidate.source.as_deref() == Some("ignav") {
-                    "estimate when saved"
-                } else {
-                    "when saved"
-                },
+                escape(&amount),
+                qualifier,
             )
             .unwrap();
         }
@@ -1028,6 +1048,40 @@ mod tests {
         let mut unbooked = plan();
         unbooked.trip.items[0].candidates.clear();
         assert!(html(&unbooked).contains("Ask Scout in chat to search this route."));
+    }
+
+    #[test]
+    fn a_confirmation_that_stated_no_price_is_not_printed_as_a_failed_lookup() {
+        // The paper half of `chat.js::savedFareLine`. Nothing failed here:
+        // the airline's mail did not state a price, and "Price unavailable"
+        // sends the reader hunting for a fault that is not there.
+        let mut plan = plan();
+        let option = &mut plan.trip.items[0].candidates[0];
+        option.quoted_price = None;
+        option.quoted_currency = None;
+        option.source = Some("email".to_string());
+        let page = html(&plan);
+        assert!(page.contains("Price not stated"), "{page}");
+        assert!(page.contains("on the confirmation"), "{page}");
+        assert!(!page.contains("Price unavailable"), "{page}");
+
+        // A fare a search never returned still says so: there, something
+        // really did fail to come back.
+        let mut searched = plan.clone();
+        searched.trip.items[0].candidates[0].source = Some("duffel".to_string());
+        assert!(html(&searched).contains("Price unavailable"));
+    }
+
+    #[test]
+    fn a_fare_off_a_confirmation_is_printed_as_paid_here_too() {
+        // The page says "paid" for a fare that came off a forwarded
+        // confirmation, because it is the total actually paid rather than a
+        // quote that may have moved. This said "when saved", which hedges a
+        // number there is nothing tentative about.
+        let mut plan = plan();
+        plan.trip.items[0].candidates[0].source = Some("email".to_string());
+        let page = html(&plan);
+        assert!(page.contains("<small>paid</small>"), "{page}");
     }
 
     #[test]

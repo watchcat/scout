@@ -281,29 +281,105 @@ export function durationLabel(minutes) {
   return rest === 0 ? `${hours}h` : `${hours}h ${String(rest).padStart(2, '0')}m`
 }
 
-// Checks the join between two independently stored flights. The two
-// timestamps are comparable only when they name the same airport: both clocks
-// are local to that place. This is the same boundary core uses.
-export function connectionCheck(before, after) {
+const DAY_MINUTES = 24 * 60
+// The largest calendar gap that still counts as a join: two days here, so
+// three or more is a stay. Not one day, because `daysApart` is coarse and
+// one of the two ways it is coarse goes quiet — see there.
+const DAYS_APART = 2
+
+// Whole days from the day one leg leaves to the day the next one leaves.
+//
+// Both sides are the same kind of day on purpose. An earlier version took
+// the arrival stamp on the left and fell back to the leg's date, which is
+// its *departure*: the same pair then landed on either side of the
+// threshold depending only on whether an option had been chosen, and
+// "Choose both flights to check this connection" disappeared on exactly
+// the overnight long-hauls that need it. A leg's `date` is the day it
+// leaves and so is its chosen option's stamp, so the date alone says it
+// with nothing to mix up.
+//
+// What that costs is precision, two ways. A departure-to-departure gap is
+// longer than the join by the first leg's own flight time, always: that
+// one makes two legs look further apart than they are, which is the side
+// that goes quiet. Two local calendars can also be up to 26 hours out of
+// step, and that one goes either way — an eastward crossing looks further
+// apart, a westward one closer. So the threshold carries two days of
+// slack, which covers a long-haul plus a date line; a pair that are still
+// three days apart after all that really are three days apart.
+//
+// The residual is a genuine transfer more than two days out going
+// unremarked. That is the gap the traveller has most obviously planned
+// around, and core's `itinerary_notes` names a change of airport between
+// consecutive flights at any gap, so it is not the only thing saying so.
+//
+// Only reached where the minutes are not available: the two legs leave
+// from different airports, so their clocks are local to different places
+// and subtracting them would be meaningless, or one of them has no flight
+// decided to take a time from.
+function daysApart(before, after) {
+  const day = (item) => String(item?.date ?? '').slice(0, 10)
+  const days = (Date.parse(`${day(after)}T00:00:00Z`) - Date.parse(`${day(before)}T00:00:00Z`)) / 86400000
+  // A date this page cannot read leaves the two legs treated as adjacent,
+  // so the check still runs. Silence is what costs somebody a connection.
+  return Number.isFinite(days) ? days : 0
+}
+
+// Checks the join between two independently stored flights, or `null` when
+// there is no join to check. The two timestamps are comparable only when
+// they name the same airport: both clocks are local to that place. This is
+// the same boundary core uses.
+//
+// Two flights far enough apart are not a connection, and neither is a
+// pair with something planned between them — the renderer pairs a flight
+// with the *next* flight, whatever sits between, so seven days in Hong
+// Kong between an outbound and a return was announced as a connection
+// with "168h at HKG" on it. Whether an item sits between is the
+// renderer's knowledge, not this function's, so it is passed in rather
+// than guessed at from two legs that cannot see the trip they are on.
+//
+// One thing survives both silences: a flight scheduled to leave before the
+// previous one lands is impossible however long the gap and whatever is
+// booked in it — that is an error in the itinerary, not information about
+// a join. The airport-transfer warning does not survive them, because it
+// is only ever advice about making a connection: told a week ahead, or
+// over a hotel booking, "travel between them is not included" describes
+// the trip the traveller deliberately planned.
+//
+// The risk in going quiet over a booked item is a genuinely tight
+// turnaround with something small booked inside it — an airport lounge on
+// the same day would read here as a stay. It is not lost: core's
+// `itinerary_notes` still reports a tight or impossible turnaround between
+// consecutive flights whatever sits between them, and this page draws
+// those notes above the timeline.
+export function connectionCheck(before, after, { itemBetween = false } = {}) {
   const arrival = selectedCandidate(before)
   const departure = selectedCandidate(after)
+  const sameAirport = before.destination === after.origin
+  const landed = arrival ? localMinutes(arrival.arriving_at_local) : null
+  const leaves = departure ? localMinutes(departure.departing_at_local) : null
+  const minutes = sameAirport && landed !== null && leaves !== null ? leaves - landed : null
+
+  if (minutes !== null && minutes < 0) {
+    return { tone: 'danger', text: `Impossible connection at ${before.destination}: the next flight leaves before arrival.` }
+  }
+  if (itemBetween) return null
+  // Minutes where they are real — one airport, two decided flights, two
+  // clocks that mean the same thing — and calendar days where they are
+  // all there is.
+  const apart = minutes !== null ? minutes > DAY_MINUTES : daysApart(before, after) > DAYS_APART
+  if (apart) return null
+
   if (!arrival || !departure) {
     return { tone: 'warning', text: 'Choose both flights to check this connection.' }
   }
-  if (before.destination !== after.origin) {
+  if (!sameAirport) {
     return {
       tone: 'warning',
       text: `Airport transfer: arrive at ${before.destination}, continue from ${after.origin}. Travel between them is not included.`,
     }
   }
-  const landed = localMinutes(arrival.arriving_at_local)
-  const leaves = localMinutes(departure.departing_at_local)
-  if (landed === null || leaves === null) {
+  if (minutes === null) {
     return { tone: 'warning', text: `Connection at ${before.destination}: timing unavailable.` }
-  }
-  const minutes = leaves - landed
-  if (minutes < 0) {
-    return { tone: 'danger', text: `Impossible connection at ${before.destination}: the next flight leaves before arrival.` }
   }
   const wait = durationLabel(minutes)
   if (minutes < 180) {
@@ -317,6 +393,61 @@ export function connectionCheck(before, after) {
 // none: it sits between legs without being one.
 function tripFlights(trip) {
   return (trip?.items ?? []).filter((item) => item.kind === 'flight')
+}
+
+// "a, b and c": a list in a sentence, which is where these are read.
+function listOf(items) {
+  return items.length < 2
+    ? items.join('')
+    : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
+}
+
+// What heads the notes core sends with a trip. It said "Connection
+// check.", which those notes outgrew: `itinerary_notes` also speaks when
+// two legs land and leave from different airports, at any gap at all, and
+// heading that "Connection check." over an outbound and a return a week
+// apart claims the connection the join cards below stopped claiming. The
+// printed plan headed the same notes "Connection note.", which was the
+// two surfaces disagreeing about one sentence; both say this now.
+export const ITINERARY_NOTE = 'Itinerary note.'
+
+// The alert above the timeline, from the three states `Readiness` can be
+// in — or `null` when this page cannot read the one it was sent, which is
+// a tab open across a deploy. Saying nothing is the only answer that
+// cannot be wrong about whether a trip has been bought.
+//
+// "Ready to price" on a trip whose flights are all already ticketed is the
+// bug this answers: it reads as an invitation to go and shop seats the
+// reader is holding. "Needs a decision" would be the opposite mistake,
+// asking for a decision nobody owes. So booked is its own state, and the
+// wording of the other two is unchanged where it still fits.
+export function readinessAlert(trip) {
+  const readiness = trip?.readiness
+  if (readiness?.state === 'booked') {
+    return {
+      tone: 'ready',
+      headline: 'Booked.',
+      text: 'Every flight on this trip is a ticket you already hold. Nothing here is waiting on you.',
+    }
+  }
+  if (readiness?.state === 'ready') {
+    const legs = readiness.legs ?? []
+    // Comparing the named legs against the trip's own flights is what
+    // tells "price this trip" from "price what is left of it". The server
+    // names the legs; only the page knows how many flights are drawn.
+    const rest = tripFlights(trip).length - legs.length
+    return {
+      tone: 'ready',
+      headline: 'Ready to price.',
+      text: rest > 0
+        ? `Only ${listOf(legs)} ${legs.length === 1 ? 'is' : 'are'} still to buy. Ask Scout in chat to price ${legs.length === 1 ? 'it' : 'them'}; the rest of this trip is already booked.`
+        : 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.',
+    }
+  }
+  if (readiness?.state === 'not_ready') {
+    return { tone: 'alert', headline: 'Needs a decision.', text: readiness.reason ?? '' }
+  }
+  return null
 }
 
 export function tripTimelinePoints(trip) {
@@ -362,6 +493,20 @@ export function tripLoadIsCurrent(request, current, choicePending) {
   return request === current && !choicePending
 }
 
+// Lifted out of the page's closure so `savedFareLine` can be a pure
+// function the tests can reach: it does nothing but format.
+export function moneyLabel(price, currency) {
+  if (!Number.isFinite(price)) return 'Price unavailable'
+  if (!currency) return price.toFixed(2)
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency', currency, minimumFractionDigits: 0, maximumFractionDigits: 2,
+    }).format(price)
+  } catch {
+    return `${price.toFixed(2)} ${currency}`
+  }
+}
+
 export function savedFareQualifier(source) {
   const from = String(source).toLowerCase()
   // A fare off a forwarded confirmation is not a quote that may have
@@ -371,6 +516,28 @@ export function savedFareQualifier(source) {
   return from === 'ignav'
     ? { prefix: 'from ', note: 'estimate when saved' }
     : { prefix: '', note: 'when saved' }
+}
+
+// The price line on a parked option: what goes where the money is, and
+// the qualifier under it.
+//
+// An option that came off a forwarded confirmation and carries no number
+// is not a lookup that failed — the mail simply did not state a price, and
+// "Price unavailable" beside "paid" sends the reader hunting for a fault
+// that is not there. `noFlightLine` draws the same distinction one field
+// along. A fare missing from a search keeps the old wording, because there
+// something really did fail to come back.
+export function savedFareLine(candidate) {
+  const qualifier = savedFareQualifier(candidate?.source)
+  if (!Number.isFinite(candidate?.quoted_price)) {
+    return String(candidate?.source).toLowerCase() === 'email'
+      ? { amount: 'Price not stated', note: 'on the confirmation' }
+      : { amount: 'Price unavailable', note: qualifier.note }
+  }
+  return {
+    amount: qualifier.prefix + moneyLabel(candidate.quoted_price, candidate.quoted_currency),
+    note: qualifier.note,
+  }
 }
 
 // The mark a booked item carries: the confirmation code where there is
@@ -977,18 +1144,6 @@ function start() {
     return el
   }
 
-  function moneyLabel(price, currency) {
-    if (!Number.isFinite(price)) return 'Price unavailable'
-    if (!currency) return price.toFixed(2)
-    try {
-      return new Intl.NumberFormat(undefined, {
-        style: 'currency', currency, minimumFractionDigits: 0, maximumFractionDigits: 2,
-      }).format(price)
-    } catch {
-      return `${price.toFixed(2)} ${currency}`
-    }
-  }
-
   // Shown wherever a draft is marked — the list row and the trip's own
   // header. "Draft" alone was tried in production and told the traveller
   // nothing about what would happen to it; this says the actual
@@ -1169,11 +1324,8 @@ function start() {
     main.append(top, line)
 
     const price = node('span', 'option-price')
-    const qualifier = savedFareQualifier(candidate.source)
-    price.append(
-      node('strong', '', qualifier.prefix + moneyLabel(candidate.quoted_price, candidate.quoted_currency)),
-      node('span', '', qualifier.note),
-    )
+    const fare = savedFareLine(candidate)
+    price.append(node('strong', '', fare.amount), node('span', '', fare.note))
     label.append(input, radio, main, price)
     label.addEventListener('click', (event) => {
       event.preventDefault()
@@ -1393,15 +1545,18 @@ function start() {
     })
     if (trip.items.length) tripDetail.append(renderOverview(trip))
 
-    const readiness = node('div', trip.not_ready ? 'trip-alert' : 'trip-alert ready')
-    readiness.append(
-      node('strong', '', trip.not_ready ? 'Needs a decision.' : 'Ready to price.'),
-      document.createTextNode(` ${trip.not_ready ?? 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.'}`),
-    )
-    tripDetail.append(readiness)
+    const alert = readinessAlert(trip)
+    if (alert) {
+      const readiness = node('div', alert.tone === 'ready' ? 'trip-alert ready' : 'trip-alert')
+      readiness.append(
+        node('strong', '', alert.headline),
+        document.createTextNode(` ${alert.text}`),
+      )
+      tripDetail.append(readiness)
+    }
     for (const note of trip.notes ?? []) {
       const alert = node('div', 'trip-alert')
-      alert.append(node('strong', '', 'Connection check.'), document.createTextNode(` ${note}`))
+      alert.append(node('strong', '', ITINERARY_NOTE), document.createTextNode(` ${note}`))
       tripDetail.append(alert)
     }
 
@@ -1423,12 +1578,15 @@ function start() {
       stack.append(renderItem(trip, item))
       // The join is checked from one flight to the next flight, whatever
       // sits between them: a stay does not change when the second leg
-      // leaves. The PDF draws it in the same place, under the first flight.
+      // leaves. But what sits between changes whether there is a join to
+      // check at all, and only this loop can see it, so it is passed down.
+      // The PDF draws it in the same place, under the first flight.
       if (item.kind !== 'flight') continue
-      const next = trip.items.slice(itemIndex).find((later) => later.kind === 'flight')
-      if (next) {
-        const check = connectionCheck(item, next)
-        stack.append(node('div', `join-card ${check.tone}`, check.text))
+      const rest = trip.items.slice(itemIndex)
+      const nextIndex = rest.findIndex((later) => later.kind === 'flight')
+      if (nextIndex >= 0) {
+        const check = connectionCheck(item, rest[nextIndex], { itemBetween: nextIndex > 0 })
+        if (check) stack.append(node('div', `join-card ${check.tone}`, check.text))
       }
     }
     tripDetail.append(stack)

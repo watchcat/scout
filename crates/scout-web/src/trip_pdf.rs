@@ -5,7 +5,7 @@
 //! self-contained HTML page that Chromium can print without network access.
 
 use chrono::{NaiveDate, NaiveDateTime, Utc};
-use scout_core::trips::{Plan, TripCandidate, TripItem};
+use scout_core::trips::{Plan, Readiness, TripCandidate, TripItem};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -33,6 +33,12 @@ const MAX_CANDIDATES_PER_ITEM: usize = 64;
 /// prints is bounded by this file. One mail could carry a hundred files.
 const MAX_ATTACHMENTS_PER_ITEM: usize = 32;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
+/// The largest calendar gap that still counts as a join: two days here, so
+/// three or more is a stay. Not one day, because `days_apart` is coarse
+/// and one of the two ways it is coarse goes quiet — see there. The page
+/// holds the same number, and `connection_gaps.json` fails on both sides
+/// if either moves.
+const DAYS_APART: i64 = 2;
 
 static PDF_SLOTS: OnceLock<Semaphore> = OnceLock::new();
 
@@ -442,9 +448,33 @@ fn item_when(item: &TripItem) -> String {
     }
 }
 
-fn fare(candidate: &TripCandidate) -> String {
+/// The price line on a parked option, as `(amount, qualifier)`. The paper
+/// half of `chat.js::savedFareLine`, and it has to agree with it.
+///
+/// An option that came off a forwarded confirmation and carries no number
+/// is not a lookup that failed: the mail did not state a price, and
+/// "Price unavailable" sends the reader hunting for a fault that is not
+/// there. A fare a search never returned keeps that wording, because there
+/// something really did fail to come back.
+///
+/// The qualifier on a stated fare says what kind of number it is. "paid"
+/// for one off a confirmation: that is the total actually paid, and "when
+/// saved" hedges a number there is nothing tentative about — this printed
+/// "when saved" for it while the page said "paid", which is the two
+/// surfaces disagreeing about one leg.
+fn fare(candidate: &TripCandidate) -> (String, &'static str) {
+    let from_mail = candidate.source.as_deref() == Some("email");
+    let from_ignav = candidate.source.as_deref() == Some("ignav");
+    let qualifier = match (from_mail, from_ignav) {
+        (true, _) => "paid",
+        (_, true) => "estimate when saved",
+        _ => "when saved",
+    };
     let Some(price) = candidate.quoted_price else {
-        return "Price unavailable".to_string();
+        return match from_mail {
+            true => ("Price not stated".to_string(), "on the confirmation"),
+            false => ("Price unavailable".to_string(), qualifier),
+        };
     };
     let amount = match candidate.quoted_currency.as_deref() {
         Some("EUR") => format!("€{price:.2}"),
@@ -454,10 +484,9 @@ fn fare(candidate: &TripCandidate) -> String {
         Some(currency) => format!("{price:.2} {currency}"),
         None => format!("{price:.2}"),
     };
-    if candidate.source.as_deref() == Some("ignav") {
-        format!("from {amount}")
-    } else {
-        amount
+    match from_ignav {
+        true => (format!("from {amount}"), qualifier),
+        false => (amount, qualifier),
     }
 }
 
@@ -493,61 +522,168 @@ fn saved_total(plan: &Plan) -> Option<String> {
     })
 }
 
-fn connection(before: &TripItem, after: &TripItem) -> (String, &'static str) {
-    let Some(arrival) = selected(before) else {
-        return (
+/// "a, b and c": a list in a sentence, which is where these are read.
+/// The paper half of `chat.js::listOf`.
+fn list_of(items: &[String]) -> String {
+    match items.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// The notice at the top of the plan, as `(headline, detail, class)`. The
+/// paper half of `chat.js::readinessAlert`, and it has to agree with it in
+/// all three states: a hand-off copy that tells its reader to go and shop
+/// fares for seats they are already holding is the complaint this answers,
+/// and two surfaces describing one trip differently is worse than either
+/// wording alone.
+///
+/// `flights` is how many flights the plan draws, which is what tells
+/// "pricing this trip" from "pricing what is left of it" — `legs` names
+/// only the ones still to buy.
+fn readiness_notice(readiness: &Readiness, flights: usize) -> (&'static str, String, &'static str) {
+    match readiness {
+        Readiness::Booked => (
+            "Booked.",
+            "Every flight on this trip is a ticket the traveller already holds.".to_string(),
+            "ok",
+        ),
+        Readiness::Ready { legs } if legs.len() < flights => (
+            "Ready to price.",
+            format!(
+                "Only {} {} still to buy; the rest of this trip is already booked. Refresh live \
+                 fares with Scout before booking.",
+                list_of(legs),
+                if legs.len() == 1 { "is" } else { "are" },
+            ),
+            "ok",
+        ),
+        Readiness::Ready { .. } => (
+            "Ready to price.",
+            "Every segment has a flight selected. Refresh live fares with Scout before booking."
+                .to_string(),
+            "ok",
+        ),
+        Readiness::NotReady { reason } => ("Needs a decision.", reason.clone(), ""),
+    }
+}
+
+/// The join between two legs, or `None` where there is no join to draw.
+///
+/// The paper half of `chat.js::connectionCheck`, and it has to agree with
+/// it: two flights a week apart are not a connection, and neither is a
+/// pair with something booked between them — the traveller planned that
+/// stay, and a card counting the hours of it as a layover is the bug this
+/// answers. `item_between` is the caller's knowledge, because only the
+/// loop below can see what sits in the gap.
+///
+/// A departure scheduled before the previous arrival survives both
+/// silences: that is an error in the itinerary rather than advice about a
+/// join, and no amount of time or hotel nights makes it flyable. The
+/// transfer warning does not survive them — a week ahead, or over a
+/// booking, "ground travel is not included" describes the trip the
+/// traveller deliberately planned.
+///
+/// Nothing is lost by the silence over a booked stay: `itinerary_notes` in
+/// core still reports a tight turnaround between consecutive flights
+/// whatever sits between them, and this plan prints those notes above.
+fn connection(
+    before: &TripItem,
+    after: &TripItem,
+    item_between: bool,
+) -> Option<(String, &'static str)> {
+    let at = airport(&before.destination);
+    let same_airport = before.destination == after.origin;
+    let parse = |value: Option<&str>| {
+        value.and_then(|value| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").ok())
+    };
+    let arrival = selected(before);
+    let departure = selected(after);
+    // Only comparable at one airport: both clocks are local to the place
+    // they are stated in, so two ends of a transfer cannot be subtracted.
+    let minutes = match (same_airport, arrival, departure) {
+        (true, Some(arrival), Some(departure)) => parse(arrival.arriving_at_local.as_deref())
+            .zip(parse(departure.departing_at_local.as_deref()))
+            .map(|(arrival, departure)| (departure - arrival).num_minutes()),
+        _ => None,
+    };
+    if minutes.is_some_and(|minutes| minutes < 0) {
+        return Some((
+            format!("Impossible connection at {at}: the next flight leaves before arrival."),
+            "danger",
+        ));
+    }
+    if item_between {
+        return None;
+    }
+    // Minutes where they are real — one airport, two decided flights, two
+    // clocks that mean the same thing — and calendar days where they are
+    // all there is. See `days_apart` for why that threshold is two.
+    let apart = match minutes {
+        Some(minutes) => minutes > 24 * 60,
+        None => days_apart(before, after) > DAYS_APART,
+    };
+    if apart {
+        return None;
+    }
+    if arrival.is_none() {
+        return Some((
             "Choose the arriving flight to check this connection.".to_string(),
             "warn",
-        );
-    };
-    let Some(departure) = selected(after) else {
-        return (
+        ));
+    }
+    if departure.is_none() {
+        return Some((
             "Choose the departing flight to check this connection.".to_string(),
             "warn",
-        );
-    };
-    let at = airport(&before.destination);
-    if before.destination != after.origin {
-        return (
+        ));
+    }
+    if !same_airport {
+        return Some((
             format!(
                 "Airport transfer: arrive at {at}, continue from {}. Ground travel is not included.",
                 airport(&after.origin)
             ),
             "warn",
-        );
+        ));
     }
-    let parse = |value: Option<&str>| {
-        value.and_then(|value| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").ok())
+    let Some(minutes) = minutes else {
+        return Some((format!("Connection at {at}: timing unavailable."), "warn"));
     };
-    let (Some(arrival), Some(departure)) = (
-        parse(arrival.arriving_at_local.as_deref()),
-        parse(departure.departing_at_local.as_deref()),
-    ) else {
-        return (format!("Connection at {at}: timing unavailable."), "warn");
-    };
-    let minutes = (departure - arrival).num_minutes();
-    if minutes < 0 {
-        return (
-            format!("Impossible connection at {at}: the next flight leaves before arrival."),
-            "danger",
-        );
-    }
     if minutes < 180 {
-        return (
+        return Some((
             format!(
                 "{} at {at} — tight connection; allow at least 3 hours between separate tickets.",
                 duration(Some(minutes)),
             ),
             "danger",
-        );
+        ));
     }
-    (
+    Some((
         format!(
             "{} at {at} between the selected flights.",
             duration(Some(minutes)),
         ),
         "ok",
-    )
+    ))
+}
+
+/// Whole days from the day one leg leaves to the day the next one leaves.
+/// The paper half of `chat.js::daysApart`, and the comment there is the
+/// long version: both sides are the same kind of day on purpose, the
+/// measure errs only towards looking further apart than the legs are, and
+/// `DAYS_APART` is the slack that buys back. A date that will not parse
+/// leaves the two treated as adjacent, so the check still runs — silence
+/// is what costs somebody a connection.
+fn days_apart(before: &TripItem, after: &TripItem) -> i64 {
+    let day = |item: &TripItem| {
+        NaiveDate::parse_from_str(item.date.get(..10).unwrap_or(""), "%Y-%m-%d").ok()
+    };
+    match day(before).zip(day(after)) {
+        Some((from, to)) => (to - from).num_days(),
+        None => 0,
+    }
 }
 
 pub fn html(plan: &Plan) -> String {
@@ -619,25 +755,20 @@ pub fn html(plan: &Plan) -> String {
     }
     out.push_str("</div></header>");
 
-    let readiness = plan.not_ready.as_deref().unwrap_or(
-        "Every segment has a flight selected. Refresh live fares with Scout before booking.",
-    );
+    let (headline, detail, tone) = readiness_notice(&plan.readiness, flights.len());
     write!(
         out,
-        "<div class=\"notice {}\"><strong>{}</strong> {}</div>",
-        if plan.not_ready.is_some() { "" } else { "ok" },
-        if plan.not_ready.is_some() {
-            "Needs a decision."
-        } else {
-            "Ready to price."
-        },
-        escape(readiness)
+        "<div class=\"notice {tone}\"><strong>{headline}</strong> {}</div>",
+        escape(&detail)
     )
     .unwrap();
     for note in &plan.notes {
         write!(
             out,
-            "<div class=\"notice\"><strong>Connection note.</strong> {}</div>",
+            // `chat.js::ITINERARY_NOTE`, which has the long version: these
+            // notes are not all about connections, and the two surfaces
+            // were heading the same sentence two different ways.
+            "<div class=\"notice\"><strong>Itinerary note.</strong> {}</div>",
             escape(note)
         )
         .unwrap();
@@ -690,6 +821,7 @@ pub fn html(plan: &Plan) -> String {
         let picked = selected(segment).map(|candidate| candidate.candidate);
         for candidate in &segment.candidates {
             let is_selected = picked == Some(candidate.candidate);
+            let (amount, qualifier) = fare(candidate);
             write!(
                 out,
                 "<div class=\"option {}\"><div class=\"mark\"></div><div><div><span class=\"airline\">{}</span> <span class=\"numbers\">{}</span>{}</div><div class=\"itinerary\">{}</div><div class=\"meta\">{} → {} · {}{} </div></div><div class=\"price\">{}<small>{}</small></div></div>",
@@ -706,27 +838,27 @@ pub fn html(plan: &Plan) -> String {
                 escape(clock(candidate.arriving_at_local.as_deref())),
                 escape(&duration(candidate.duration_minutes)),
                 if is_selected { " · Selected" } else { " · Alternative" },
-                escape(&fare(candidate)),
-                if candidate.source.as_deref() == Some("ignav") {
-                    "estimate when saved"
-                } else {
-                    "when saved"
-                },
+                escape(&amount),
+                qualifier,
             )
             .unwrap();
         }
         out.push_str("</section>");
         // The connection is to the next *flight*, whatever sits between:
         // a stay between two legs does not change when the second departs.
-        if let Some(after) = trip.items[index + 1..].iter().find(|item| item.is_flight()) {
-            let (message, tone) = connection(segment, after);
-            write!(
-                out,
-                "<div class=\"connection {}\"><strong>Connection:</strong> {}</div>",
-                tone,
-                escape(&message)
-            )
-            .unwrap();
+        // What sits between does change whether there is a join to draw at
+        // all, and only this loop can see it, so it is passed down.
+        let rest = &trip.items[index + 1..];
+        if let Some(gap) = rest.iter().position(|item| item.is_flight()) {
+            if let Some((message, tone)) = connection(segment, &rest[gap], gap > 0) {
+                write!(
+                    out,
+                    "<div class=\"connection {}\"><strong>Connection:</strong> {}</div>",
+                    tone,
+                    escape(&message)
+                )
+                .unwrap();
+            }
         }
     }
 
@@ -742,6 +874,24 @@ pub fn html(plan: &Plan) -> String {
 mod tests {
     use super::*;
     use scout_core::trips::{Plan, Trip, TripCandidate, TripItem};
+
+    /// A chosen option with nothing on it but the fact of being chosen:
+    /// a base for the cases that care only about times and airports.
+    fn candidate() -> TripCandidate {
+        TripCandidate {
+            candidate: 1,
+            chosen: true,
+            airline: "KLM".to_string(),
+            flight_numbers: "KL1579".to_string(),
+            itinerary: "somewhere".to_string(),
+            departing_at_local: None,
+            arriving_at_local: None,
+            duration_minutes: None,
+            quoted_price: None,
+            quoted_currency: None,
+            source: None,
+        }
+    }
 
     /// A flight leg as `load_trip` reads one: its time of day comes from
     /// the chosen option, the columns a stay uses are empty.
@@ -850,6 +1000,12 @@ mod tests {
                 // a trip in their list before they can ask for its PDF.
                 kept: true,
             },
+            readiness: Readiness::Ready {
+                legs: vec!["segment 1 (AMS→LIS)".to_string(), "segment 3 (LIS→FCO)".to_string()],
+            },
+            // The field one release of open tabs still reads. Nothing in
+            // this file touches it: the printed plan is built from
+            // `readiness` like the page's own renderer.
             not_ready: None,
             notes: vec!["Separate tickets need extra care.".to_string()],
             chat: None,
@@ -878,11 +1034,13 @@ mod tests {
             "KLM &amp; friends",
             "KL1579",
             "AMS 08:20 12.10 ✈ LIS 10:25 12.10",
-            "1h 35m at LIS",
-            "tight connection",
             "from €126.00",
             "estimate when saved",
             "Saved itinerary, not a ticket",
+            // The heading over core's notes, pinned here and in
+            // chat.test.mjs: the two surfaces headed the same sentence two
+            // different ways, and nothing else holds them together.
+            "<strong>Itinerary note.</strong> Separate tickets need extra care.",
             // The stay is on the page as its own line, escaped like the
             // rest: kind, name, place, its range, and the booking code.
             "<div class=\"number\">Stay</div>",
@@ -927,6 +1085,147 @@ mod tests {
         let mut unbooked = plan();
         unbooked.trip.items[0].candidates.clear();
         assert!(html(&unbooked).contains("Ask Scout in chat to search this route."));
+    }
+
+    #[test]
+    fn a_confirmation_that_stated_no_price_is_not_printed_as_a_failed_lookup() {
+        // The paper half of `chat.js::savedFareLine`. Nothing failed here:
+        // the airline's mail did not state a price, and "Price unavailable"
+        // sends the reader hunting for a fault that is not there.
+        let mut plan = plan();
+        let option = &mut plan.trip.items[0].candidates[0];
+        option.quoted_price = None;
+        option.quoted_currency = None;
+        option.source = Some("email".to_string());
+        let page = html(&plan);
+        assert!(page.contains("Price not stated"), "{page}");
+        assert!(page.contains("on the confirmation"), "{page}");
+        assert!(!page.contains("Price unavailable"), "{page}");
+
+        // A fare a search never returned still says so: there, something
+        // really did fail to come back.
+        let mut searched = plan.clone();
+        searched.trip.items[0].candidates[0].source = Some("duffel".to_string());
+        assert!(html(&searched).contains("Price unavailable"));
+    }
+
+    #[test]
+    fn a_fare_off_a_confirmation_is_printed_as_paid_here_too() {
+        // The page says "paid" for a fare that came off a forwarded
+        // confirmation, because it is the total actually paid rather than a
+        // quote that may have moved. This said "when saved", which hedges a
+        // number there is nothing tentative about.
+        let mut plan = plan();
+        plan.trip.items[0].candidates[0].source = Some("email".to_string());
+        let page = html(&plan);
+        assert!(page.contains("<small>paid</small>"), "{page}");
+    }
+
+    #[test]
+    fn the_shared_connection_cases_decide_the_same_way_here_as_on_the_page() {
+        // `connection_gaps.json` is read by this test and by the matching
+        // one in chat.test.mjs. The page and this plan draw the same card
+        // in the same places from two implementations, and that file is
+        // the only thing that makes one of them go red when the other's
+        // threshold moves — the calendar-day fallback in particular is
+        // reached by none of the hand-written cases on either side.
+        let gaps: serde_json::Value =
+            serde_json::from_str(include_str!("connection_gaps.json")).unwrap();
+        let cases = gaps["cases"].as_array().unwrap();
+        assert!(cases.len() >= 12, "the shared cases went missing");
+        let leg = |side: &serde_json::Value| {
+            let stamp = |key: &str| side[key].as_str().map(str::to_string);
+            let (arriving, departing) = (stamp("arriving_at_local"), stamp("departing_at_local"));
+            let decided = arriving.is_some() || departing.is_some() || side["chosen"] == true;
+            TripItem {
+                origin: side["origin"].as_str().map(str::to_string),
+                destination: side["destination"].as_str().map(str::to_string),
+                date: side["date"].as_str().unwrap().to_string(),
+                candidates: match decided {
+                    false => Vec::new(),
+                    true => vec![TripCandidate {
+                        arriving_at_local: arriving,
+                        departing_at_local: departing,
+                        ..candidate()
+                    }],
+                },
+                ..flight(1, "AAA", "BBB", candidate())
+            }
+        };
+        for case in cases {
+            let drawn = connection(
+                &leg(&case["before"]),
+                &leg(&case["after"]),
+                case["item_between"] == true,
+            );
+            let got = match &drawn {
+                None => "none",
+                Some((_, "ok")) => "fine",
+                Some((_, "warn")) => "warning",
+                Some((_, tone)) => tone,
+            };
+            assert_eq!(got, case["expect"].as_str().unwrap(), "{}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn the_printed_plan_draws_a_join_only_where_the_page_would() {
+        // The paper half of `chat.js::connectionCheck`. This plan's two
+        // legs are a same-day connection with a hotel booked between them,
+        // which is where the page now says nothing at all: the traveller
+        // booked the stay and knows they are staying.
+        let mut joined = plan();
+        assert!(!html(&joined).contains("Connection:"), "{}", html(&joined));
+
+        // Nothing between them, and it is a join again — saying how long
+        // it is and where, which is the whole use of the card. The shared
+        // cases pin which card appears; only this pins what it reads.
+        joined.trip.items.remove(1);
+        let page = html(&joined);
+        assert!(
+            page.contains("1h 35m at LIS — tight connection; allow at least 3 hours between separate tickets."),
+            "{page}",
+        );
+
+        // A week apart is not a connection however little sits between.
+        let mut apart = joined.clone();
+        apart.trip.items[1].date = "2026-10-19".to_string();
+        apart.trip.items[1].candidates[0].departing_at_local = Some("2026-10-19T12:00:00".to_string());
+        assert!(!html(&apart).contains("Connection:"), "{}", html(&apart));
+
+        // An itinerary that cannot be flown is an error, not information
+        // about a join, so it survives both silences.
+        let mut impossible = plan();
+        impossible.trip.items[2].candidates[0].departing_at_local =
+            Some("2026-10-12T09:00:00".to_string());
+        assert!(html(&impossible).contains("Impossible connection"), "{}", html(&impossible));
+    }
+
+    #[test]
+    fn the_printed_plan_says_the_same_three_things_about_pricing_the_page_does() {
+        // The page and the paper describing one trip differently is worse
+        // than either wording alone, and a hand-off copy telling its reader
+        // to go and shop flights they have already bought is the complaint
+        // this whole change comes from.
+        let mut booked = plan();
+        booked.readiness = Readiness::Booked;
+        let page = html(&booked);
+        assert!(page.contains("Booked."), "{page}");
+        assert!(!page.contains("Ready to price."), "{page}");
+        assert!(!page.contains("Needs a decision."), "{page}");
+
+        let mut part = plan();
+        part.readiness = Readiness::Ready { legs: vec!["segment 3 (LIS→FCO)".to_string()] };
+        let page = html(&part);
+        assert!(page.contains("Ready to price."), "{page}");
+        assert!(page.contains("segment 3 (LIS→FCO)"), "{page}");
+        assert!(page.contains("already booked"), "the bought leg is not in that total: {page}");
+
+        let mut undecided = plan();
+        undecided.readiness = Readiness::NotReady { reason: "segment 1 has no flight".to_string() };
+        let page = html(&undecided);
+        assert!(page.contains("Needs a decision."), "{page}");
+        assert!(page.contains("segment 1 has no flight"), "{page}");
     }
 
     #[test]

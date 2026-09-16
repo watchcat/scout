@@ -428,7 +428,8 @@ mod tests {
                 .len(),
             2
         );
-        assert!(body[0]["not_ready"].as_str().unwrap().contains("2 options"));
+        assert_eq!(body[0]["readiness"]["state"], "not_ready");
+        assert!(body[0]["readiness"]["reason"].as_str().unwrap().contains("2 options"));
     }
 
     #[tokio::test]
@@ -786,7 +787,11 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
         assert_eq!(body["items"][0]["candidates"][1]["chosen"], true);
-        assert!(body["not_ready"].is_null());
+        assert_eq!(
+            body["readiness"],
+            serde_json::json!({"state": "ready", "legs": ["segment 1 (AMS→LIS)"]}),
+            "the one leg on this trip is the one the page says it would price",
+        );
     }
 
     #[tokio::test]

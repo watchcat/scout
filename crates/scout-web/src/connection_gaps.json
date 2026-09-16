@@ -1,0 +1,83 @@
+{
+  "why": [
+    "The cases both halves of the connection check have to agree on: chat.js::connectionCheck draws this card on the page and trip_pdf.rs::connection draws it on paper, in the same places, from two implementations with nothing else holding them together. Both test suites read this file, so neither threshold can move without the other going red.",
+    "`expect` is a neutral vocabulary, because the two sides name their tones differently: none means no card is drawn at all, and fine/warning/danger are the three the page calls ready/warning/danger and the plan calls ok/warn/danger.",
+    "A leg with neither a stamp nor `chosen` has no option chosen on it. The wording of each card is tested on its own side; what is shared here is which card, if any, appears."
+  ],
+  "cases": [
+    {
+      "name": "a week in Hong Kong between an outbound and a return, both flights chosen",
+      "before": { "destination": "HKG", "date": "2026-10-12", "arriving_at_local": "2026-10-12T16:00:00" },
+      "after": { "origin": "HKG", "date": "2026-10-19", "departing_at_local": "2026-10-19T23:40:00" },
+      "expect": "none"
+    },
+    {
+      "name": "the same week with neither flight decided yet, where only the dates can say",
+      "before": { "destination": "HKG", "date": "2026-10-12" },
+      "after": { "origin": "HKG", "date": "2026-10-19" },
+      "expect": "none"
+    },
+    {
+      "name": "an overnight long-haul into a morning connection, neither flight decided yet",
+      "before": { "destination": "HKG", "date": "2026-10-12" },
+      "after": { "origin": "HKG", "date": "2026-10-13" },
+      "expect": "warning"
+    },
+    {
+      "name": "an airport change over the date line, a real one-hour gap two calendar days apart",
+      "before": { "destination": "PPG", "date": "2026-10-12", "arriving_at_local": "2026-10-12T23:30:00" },
+      "after": { "origin": "APW", "date": "2026-10-14", "departing_at_local": "2026-10-14T00:30:00" },
+      "expect": "warning"
+    },
+    {
+      "name": "an airport change three days later, which is a stay however it is spelled",
+      "before": { "destination": "FCO", "date": "2026-10-12", "arriving_at_local": "2026-10-12T10:00:00" },
+      "after": { "origin": "FLR", "date": "2026-10-15", "departing_at_local": "2026-10-15T16:00:00" },
+      "expect": "none"
+    },
+    {
+      "name": "an airport change the same afternoon, which is a transfer somebody has to make",
+      "before": { "destination": "FCO", "date": "2026-10-12", "arriving_at_local": "2026-10-12T10:00:00" },
+      "after": { "origin": "FLR", "date": "2026-10-12", "departing_at_local": "2026-10-12T16:00:00" },
+      "expect": "warning"
+    },
+    {
+      "name": "twenty-five hours at one airport, which is a day somewhere rather than a layover",
+      "before": { "destination": "LIS", "date": "2026-10-12", "arriving_at_local": "2026-10-12T10:00:00" },
+      "after": { "origin": "LIS", "date": "2026-10-13", "departing_at_local": "2026-10-13T11:00:00" },
+      "expect": "none"
+    },
+    {
+      "name": "twenty-three hours at one airport, which is still a join to sit through",
+      "before": { "destination": "LIS", "date": "2026-10-12", "arriving_at_local": "2026-10-12T10:00:00" },
+      "after": { "origin": "LIS", "date": "2026-10-13", "departing_at_local": "2026-10-13T09:00:00" },
+      "expect": "fine"
+    },
+    {
+      "name": "an hour and a quarter at one airport",
+      "before": { "destination": "LIS", "date": "2026-10-12", "arriving_at_local": "2026-10-12T10:00:00" },
+      "after": { "origin": "LIS", "date": "2026-10-12", "departing_at_local": "2026-10-12T11:15:00" },
+      "expect": "danger"
+    },
+    {
+      "name": "a decided pair at one airport whose confirmation named no times",
+      "before": { "destination": "LIS", "date": "2026-10-12", "chosen": true },
+      "after": { "origin": "LIS", "date": "2026-10-12", "chosen": true },
+      "expect": "warning"
+    },
+    {
+      "name": "a stay between two flights on one day",
+      "before": { "destination": "LIS", "date": "2026-10-12", "arriving_at_local": "2026-10-12T10:00:00" },
+      "after": { "origin": "LIS", "date": "2026-10-12", "departing_at_local": "2026-10-12T22:00:00" },
+      "item_between": true,
+      "expect": "none"
+    },
+    {
+      "name": "a departure before the previous arrival, with a stay booked in between",
+      "before": { "destination": "LIS", "date": "2026-10-12", "arriving_at_local": "2026-10-12T22:00:00" },
+      "after": { "origin": "LIS", "date": "2026-10-12", "departing_at_local": "2026-10-12T20:00:00" },
+      "item_between": true,
+      "expect": "danger"
+    }
+  ]
+}

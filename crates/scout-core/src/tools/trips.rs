@@ -143,7 +143,8 @@ pub fn dates_run_forwards(items: &[TripItem]) -> Result<(), String> {
 #[derive(Debug, PartialEq, serde::Serialize)]
 pub struct TripView {
     pub trip: Trip,
-    /// Why this trip could not be priced yet, or absent when it could be.
+    /// Where this trip stands with pricing: booked outright, ready to
+    /// price named legs, or not ready with the reason why.
     ///
     /// Computed by the same functions `finalise_trip` refuses on, so the
     /// two can never disagree about whether a trip is finished. It rides on
@@ -153,7 +154,14 @@ pub struct TripView {
     /// reply. A model can forget an instruction to check; it cannot easily
     /// assert "all four are booked" in the same breath as data saying
     /// segment 2 has no flight on it.
-    pub not_ready: Option<String>,
+    ///
+    /// Three states rather than a reason that is present or absent. This
+    /// was `not_ready: Option<String>`, and an absent reason is defined by
+    /// the guidance as "the trip is complete" — so a trip whose flights
+    /// were all already bought arrived here byte-identical to one waiting
+    /// to be shopped, which is this card's own bug reachable through chat
+    /// while the browser had been fixed.
+    pub readiness: Readiness,
     /// What the call that produced this view actually did.
     ///
     /// The trip below is a snapshot, and when a turn makes two edits the
@@ -185,12 +193,9 @@ impl TripView {
         for item in &mut trip.items {
             item.attachments.clear();
         }
-        // Exactly what finalisation checks, in the order it checks it.
-        let not_ready = ready_to_price(&trip.items)
-            .err()
-            .or_else(|| dates_run_forwards(&trip.items).err());
+        let readiness = Readiness::of(&trip.items);
         let notes = itinerary_notes(&trip.items);
-        Self { trip, not_ready, changed: None, notes }
+        Self { trip, readiness, changed: None, notes }
     }
 
     /// The same view, with a note of what this call did to get it.
@@ -345,13 +350,16 @@ pub struct FinalisedTrip {
     /// equal `currency`: a single ticket for the same itinerary can price
     /// in a currency none of the separate segments do.
     pub one_ticket_currency: Option<String>,
-    /// The stays, activities and transport with a recorded price. Not in
-    /// `separate_total`: that is a sum of live fares in one currency, and
-    /// these are figures the traveller typed in, possibly in several. The
-    /// reply adds them in words.
+    /// The items whose price is already settled: the stays, activities and
+    /// transport with a recorded price, and the flights the traveller has
+    /// already bought. Not in `separate_total`: that is a sum of live fares
+    /// in one currency, and these are figures the traveller typed in or
+    /// paid, possibly in several. The reply adds them in words.
     pub fixed_costs: Vec<FixedCost>,
-    /// The non-flight items with no price at all, by title, so the reply
-    /// can say what the totals leave out.
+    /// The settled items with no price at all, named as `cost_label` names
+    /// them, so the reply can say what the totals leave out. A ticket whose
+    /// confirmation never stated a price belongs here for the same reason
+    /// an unpriced hotel does.
     pub unpriced_items: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -481,12 +489,20 @@ pub fn comparison_notes(
         // A missing comparison must never read as a verdict either way —
         // that silence is exactly what would cost somebody money, whichever
         // side turns out to be the one that is actually missing.
-        (Some(_), None) => notes.push(
+        //
+        // Gated on the segment count for the reason the connection warning
+        // above is: with one segment left to buy there is no comparison to
+        // miss, because a single ticket for one leg is that same leg's
+        // ticket, and the multi-city search is deliberately never made.
+        // Announcing a failure nobody attempted costs the rest of the
+        // output its credibility as surely as missing a real one.
+        (Some(_), None) if segment_count >= 2 => notes.push(
             "the single-ticket comparison could not be made, so nothing here says whether \
              booking the whole trip on one ticket would be better — this is a missing \
              answer, not an argument for separate bookings"
                 .to_string(),
         ),
+        (Some(_), None) => {}
         (None, Some(_)) => notes.push(
             "the separate-booking total could not be given, so nothing here says whether \
              booking each segment apart would be better — this is a missing answer, not an \
@@ -498,26 +514,120 @@ pub fn comparison_notes(
     notes
 }
 
-/// Each flight paired with the option that will be priced, or why the trip
-/// is not ready.
+/// What pricing a trip would actually mean right now.
+///
+/// Three states rather than a `Result`, because a ticket the traveller
+/// already holds is neither a segment waiting for a fare nor a reason to
+/// refuse: the trip is finished, and the only honest thing left to do with
+/// it is report what it cost. Two booleans would let a caller hold the
+/// contradiction this enum cannot express — a trip both bought outright and
+/// waiting on a decision.
+#[derive(Debug, PartialEq)]
+pub enum Pricing<'a> {
+    /// The legs still to buy, each with the option that would be priced.
+    /// Legs the traveller already holds tickets for are not among them,
+    /// however many of them the trip has.
+    Ready(Vec<(&'a TripItem, &'a TripCandidate)>),
+    /// Every flight on this trip is already bought. There is nothing to
+    /// search and no decision outstanding.
+    Booked,
+    /// Why nothing on this trip can be priced yet.
+    NotReady(String),
+}
+
+/// Where a trip stands with pricing, as every view of a trip says it: the
+/// page, the printed plan, and the specialist's own tools.
+///
+/// One field naming one of three states rather than a pair of flags,
+/// because the states exclude each other: a trip cannot be both bought
+/// outright and waiting on a decision, and two booleans could claim it
+/// was. `Pricing` is the same three states carrying the borrowed legs;
+/// this is the owned, serialisable shape the views hand on.
+///
+/// A wire type twice over — `chat.js` switches on `state`, and the model
+/// reads it as JSON — so the three names here and the branches that read
+/// them move together.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Readiness {
+    /// Every flight on this trip is a ticket the traveller already holds.
+    /// Nothing to shop and nothing to decide.
+    Booked,
+    /// The legs that pricing would actually cover, named as
+    /// `ready_to_price`'s own refusals name them. A trip where nothing is
+    /// booked lists all of its flights; a reader compares that against the
+    /// trip to know whether "the whole trip" is what is being priced.
+    Ready { legs: Vec<String> },
+    /// Why this trip cannot be priced yet, in the words the flight agent
+    /// would refuse in.
+    NotReady { reason: String },
+}
+
+impl Readiness {
+    /// Everything `finalise_trip` would refuse on, in the order it checks
+    /// it: what is on the trip, then whether its dates run forwards.
+    ///
+    /// Dates that run backwards block a booked trip as well as a shoppable
+    /// one. Only reachable by a caller that bypassed the store — every
+    /// write reorders items by date — but leaving it out would let a view
+    /// call a trip finished that the tool still turns away, and
+    /// disagreeing with the tool is the older bug here.
+    pub fn of(items: &[TripItem]) -> Self {
+        match (ready_to_price(items), dates_run_forwards(items)) {
+            (Pricing::NotReady(reason), _) | (_, Err(reason)) => Readiness::NotReady { reason },
+            (Pricing::Booked, Ok(())) => Readiness::Booked,
+            (Pricing::Ready(legs), Ok(())) => Readiness::Ready {
+                legs: legs
+                    .iter()
+                    .map(|(segment, _)| format!("segment {} ({})", segment.position, segment.route()))
+                    .collect(),
+            },
+        }
+    }
+
+    /// Why this trip cannot be priced, for a reader that wants one string.
+    /// `Booked` is deliberately not one: a trip with nothing left to buy is
+    /// finished, not blocked.
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            Readiness::NotReady { reason } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Each flight still to buy, paired with the option that will be priced —
+/// or that there is nothing left to buy, or why the trip is not ready.
 ///
 /// A flight holding exactly one undecided option needs no decision: it is
 /// the pick by elimination. Two or more without one is a question, so the
 /// refusal lists them and asks it. Stays and activities have no options to
 /// decide and no fare to fetch, so they are neither ready nor not: a trip
 /// that is only a hotel has nothing here to price at all.
-pub fn ready_to_price(items: &[TripItem]) -> Result<Vec<(&TripItem, &TripCandidate)>, String> {
+///
+/// A booked flight is skipped entirely. Its fare is not something to shop
+/// for — it is what the traveller paid, and `fixed_costs` reports it. This
+/// walked every flight until a fully ticketed trip reached production and
+/// was told it was ready to price, which read as an invitation to go and
+/// re-shop seats the reader was already holding.
+pub fn ready_to_price(items: &[TripItem]) -> Pricing<'_> {
     let flights: Vec<&TripItem> = items.iter().filter(|i| i.is_flight()).collect();
     if flights.is_empty() {
-        return Err("this trip has no flights yet, so there is nothing to price".to_string());
+        return Pricing::NotReady(
+            "this trip has no flights yet, so there is nothing to price".to_string(),
+        );
+    }
+    let to_buy: Vec<&TripItem> = flights.into_iter().filter(|i| !i.booked).collect();
+    if to_buy.is_empty() {
+        return Pricing::Booked;
     }
     let mut ready = Vec::new();
-    for segment in flights {
+    for segment in to_buy {
         let chosen = match segment.candidates.iter().find(|c| c.chosen) {
             Some(chosen) => chosen,
             None => match segment.candidates.as_slice() {
                 [] => {
-                    return Err(format!(
+                    return Pricing::NotReady(format!(
                         "segment {} ({}→{} on {}) has no flight on it yet — search that route \
                          and add one before pricing the trip",
                         segment.position, segment.origin.as_deref().unwrap_or(""), segment.destination.as_deref().unwrap_or(""), segment.date
@@ -527,7 +637,7 @@ pub fn ready_to_price(items: &[TripItem]) -> Result<Vec<(&TripItem, &TripCandida
                 many => {
                     let options: Vec<String> =
                         many.iter().map(|c| format!("{} ({})", c.candidate, c.flight_numbers)).collect();
-                    return Err(format!(
+                    return Pricing::NotReady(format!(
                         "segment {} ({}→{}) still has {} options and none chosen: {}. \
                          Ask which one before pricing the trip.",
                         segment.position,
@@ -541,39 +651,63 @@ pub fn ready_to_price(items: &[TripItem]) -> Result<Vec<(&TripItem, &TripCandida
         };
         ready.push((segment, chosen));
     }
-    Ok(ready)
+    Pricing::Ready(ready)
 }
 
-/// A non-flight item with a price, for the finalised total.
+/// An item whose price is already settled, for the finalised total.
 ///
-/// Its price is what the traveller recorded, not something re-fetched:
-/// nothing here can re-price a hotel, so it goes into the reply as a fixed
-/// cost beside the live flight totals rather than folded into them.
+/// Its price is what the traveller recorded or paid, not something
+/// re-fetched: nothing here can re-price a hotel, and a flight they are
+/// already holding a ticket for has no fare left to look up. Both go into
+/// the reply as fixed costs beside the live flight totals rather than
+/// folded into them.
 #[derive(Debug, PartialEq, serde::Serialize)]
 pub struct FixedCost {
     pub position: i64,
+    /// What to call this line: a booking's own name, or a flight's route
+    /// and day — see `cost_label`.
     pub title: String,
     pub price: f64,
     pub currency: String,
 }
 
-/// Priced non-flights, and the titles of the ones with no price.
+/// What the totals call an item.
+///
+/// A stay's title is the name its booking came with. A flight's is the
+/// route it was stored under, "AMS → LIS", which says nothing about which
+/// of two identical legs it is — an out-and-back has two of them — so a
+/// flight is named by its route and the day it leaves.
+fn cost_label(item: &TripItem) -> String {
+    match item.is_flight() {
+        true => format!("{} on {}", item.route(), item.date),
+        false => item.title.clone(),
+    }
+}
+
+/// The settled prices, and the names of the settled items with no price.
+///
+/// A booked flight belongs here and an unbooked one does not. The fare on
+/// a ticket the traveller holds is a cost of this trip like any other, and
+/// filtering flights out wholesale kept it out of every total there is; an
+/// unbooked flight is what the pricing path is for, and counting it here
+/// as well would count it twice.
 ///
 /// The unpriced ones are returned by name rather than dropped, so the reply
 /// can say the total is missing them: a hotel with no price is still a
-/// cost, and a total that quietly leaves it out reads as the whole trip.
+/// cost, and so is a ticket whose confirmation never stated one. A total
+/// that quietly leaves either out reads as the whole trip.
 pub fn fixed_costs(items: &[TripItem]) -> (Vec<FixedCost>, Vec<String>) {
     let mut fixed = Vec::new();
     let mut unpriced = Vec::new();
-    for i in items.iter().filter(|i| !i.is_flight()) {
+    for i in items.iter().filter(|i| !i.is_flight() || i.booked) {
         match (i.price, &i.currency) {
             (Some(price), Some(currency)) => fixed.push(FixedCost {
                 position: i.position,
-                title: i.title.clone(),
+                title: cost_label(i),
                 price,
                 currency: currency.clone(),
             }),
-            _ => unpriced.push(i.title.clone()),
+            _ => unpriced.push(cost_label(i)),
         }
     }
     (fixed, unpriced)
@@ -665,9 +799,19 @@ impl Tool for FinaliseTripTool {
 
         // Everything that can refuse, refuses before a single paid search: a
         // trip that cannot be priced must cost nothing to discover.
-        let ready = ready_to_price(&trip.items).map_err(StoreToolError)?;
+        //
+        // A trip with every flight bought is not a refusal and not a search
+        // either: there is no route left to shop, so `ready` is empty and
+        // everything below falls through to the fixed costs, which are what
+        // the traveller actually paid.
+        let ready = match ready_to_price(&trip.items) {
+            Pricing::NotReady(why) => return Err(StoreToolError(why)),
+            Pricing::Booked => Vec::new(),
+            Pricing::Ready(legs) => legs,
+        };
         dates_run_forwards(&trip.items).map_err(StoreToolError)?;
-        // Granted per flight, not per item: a stay costs no search.
+        // Granted per flight still to buy, not per item: a stay costs no
+        // search, and neither does a leg already in hand.
         self.budget.grant_trip(ready.len());
 
         let adults = u32::try_from(trip.adults).unwrap_or(1).max(1);
@@ -789,12 +933,22 @@ impl Tool for FinaliseTripTool {
             });
         }
 
-        let (separate_total, currency) = match separate_total(&segments) {
-            Ok((total, currency)) => (Some(total), Some(currency)),
-            Err(problem) => {
-                notes.push(problem);
-                (None, None)
-            }
+        // Whether anything was shopped at all. A trip with every flight
+        // already bought searched nothing, and none of the notes about a
+        // missing total or a missing comparison apply to it: there is no
+        // total missing, because there was nothing to total. Reporting one
+        // would be the thing this whole change is against — a failure
+        // announced where nothing failed.
+        let shopped = !segments.is_empty();
+        let (separate_total, currency) = match shopped {
+            false => (None, None),
+            true => match separate_total(&segments) {
+                Ok((total, currency)) => (Some(total), Some(currency)),
+                Err(problem) => {
+                    notes.push(problem);
+                    (None, None)
+                }
+            },
         };
         // Prefers a single-ticket offer in the currency the segments were
         // actually summed in — the only one this figure could honestly be
@@ -809,7 +963,7 @@ impl Tool for FinaliseTripTool {
             separate_total.zip(currency.as_deref()),
             one_ticket_total.zip(one_ticket_currency.as_deref()),
         ));
-        if self.duffel.is_none() {
+        if self.duffel.is_none() && shopped {
             notes.push(
                 "Duffel is not configured here, so no single-ticket price could be fetched at \
                  all — this trip can only be compared against itself"
@@ -817,18 +971,60 @@ impl Tool for FinaliseTripTool {
             );
         }
         let (fixed_costs, unpriced_items) = fixed_costs(&trip.items);
+        // Said here, not left to be inferred from a shorter list of
+        // segments than the trip has legs. A total over the legs still to
+        // buy, presented as the trip's total, is the same lie as a total
+        // that quietly leaves a hotel out.
+        let booked_flights: Vec<&TripItem> =
+            trip.items.iter().filter(|i| i.is_flight() && i.booked).collect();
+        if !booked_flights.is_empty() {
+            let named = booked_flights.iter().map(|f| cost_label(f)).collect::<Vec<_>>().join(", ");
+            let (they, are) = match booked_flights.len() {
+                1 => ("it", "is"),
+                _ => ("they", "are"),
+            };
+            notes.push(match shopped {
+                true => format!(
+                    "the flight totals here cover only the legs still to buy: {named} {are} \
+                     already booked, and what {they} cost is in fixed_costs, at the price paid \
+                     where the confirmation stated one"
+                ),
+                false => format!(
+                    "every flight on this trip is already booked, so nothing was searched and \
+                     there is no live total to give: {named} {are} in fixed_costs, at the price \
+                     paid where the confirmation stated one"
+                ),
+            });
+        }
         if !unpriced_items.is_empty() {
-            // Named in a note as well as listed: a total that silently
+            // Counted in a note as well as listed: a total that silently
             // leaves a hotel out reads as the whole trip.
-            notes.push(format!(
-                "{} items on this trip carry no price and are not in the totals",
-                unpriced_items.len()
-            ));
+            //
+            // "no price the totals can use" rather than "no price": an
+            // amount with no currency beside it lands here too, and a
+            // confirmation that stated 612.40 and no unit has not failed to
+            // state a price — it has failed to state what of.
+            //
+            // Singular where there is one, which a booked flight made the
+            // common case rather than the edge: a confirmation that stated
+            // no price is exactly one item, and "1 items" in front of that
+            // reads as a bug in the reply and casts doubt on the numbers
+            // beside it.
+            notes.push(match unpriced_items.len() {
+                1 => "1 item on this trip has no price the totals can use, and is not in them"
+                    .to_string(),
+                many => format!(
+                    "{many} items on this trip have no price the totals can use, and are not in \
+                     them"
+                ),
+            });
         }
 
         // quoted_price and quoted_at are never touched here — see
-        // TripCandidate's own comment. Only the status changes, to record
-        // that this trip has been priced.
+        // TripCandidate's own comment. Only the status changes, and only to
+        // record that this trip has been through here: on the all-booked
+        // route nothing was priced at all, and "finalised" is still the
+        // right word for a trip with nothing left to buy.
         let store = self.store.clone();
         let trip_id = trip.id;
         match tokio::task::spawn_blocking(move || store.set_trip_status(trip_id, "finalised")).await {
@@ -2380,7 +2576,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let waiting = view.not_ready.expect("a segment with no flight is not ready");
+        let waiting = view.readiness.refusal().expect("a segment with no flight is not ready");
         assert!(waiting.contains("segment 1"), "and it says which: {waiting}");
 
         let view = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
@@ -2392,7 +2588,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(view.not_ready.is_none(), "every segment decided, so it is ready: {view:?}");
+        assert!(
+            matches!(view.readiness, Readiness::Ready { .. }),
+            "every segment decided, so it is ready: {view:?}",
+        );
 
         // A second segment with nothing on it puts it back to not-ready, so
         // "the trip is done" cannot survive adding a leg to it.
@@ -2407,8 +2606,54 @@ mod tests {
             })
             .await
             .unwrap();
-        let waiting = view.not_ready.expect("the new leg has no flight");
+        let waiting = view.readiness.refusal().expect("the new leg has no flight");
         assert!(waiting.contains("segment 2"), "got: {waiting}");
+    }
+
+    #[tokio::test]
+    async fn the_model_is_told_a_bought_trip_is_bought_rather_than_shown_nothing() {
+        // The page and the printed plan got three states; this view is what
+        // the specialist reads, and it had two. An absent reason is what
+        // the guidance defines as "the trip is complete, go and price it",
+        // so a fully ticketed trip was byte-identical here to one waiting
+        // to be shopped — the original failure, still reachable through
+        // chat while the browser was fixed.
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "HKG", "2026-09-15", &["EY78"])], Instant::now());
+        AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "HKG".into(),
+                departure_date: "2026-09-15".into(),
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
+            .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap();
+        let trip = store.find_trip(7, "Japan").unwrap().unwrap();
+        store
+            .book_item(trip.items[0].id, Some("EY7788"), Some(612.40), Some("EUR"), None)
+            .unwrap();
+
+        let view = ShowTripTool { store, account_id: 7 }
+            .call(ShowTripArgs { trip: Some("Japan".into()) })
+            .await
+            .unwrap();
+        let view = &view.trips[0];
+        assert_eq!(view.readiness, Readiness::Booked);
+        // It has to survive serialization: what reaches the model is the
+        // JSON, and a state that does not appear there is a state it
+        // cannot act on.
+        assert_eq!(
+            serde_json::to_value(view).unwrap()["readiness"],
+            serde_json::json!({"state": "booked"}),
+        );
     }
 
     #[test]
@@ -2932,6 +3177,23 @@ mod tests {
     }
 
     #[test]
+    fn a_single_segment_trip_is_not_told_a_comparison_it_never_needed_is_missing() {
+        // Reachable now that booked legs are left out of the shopping: a
+        // trip with one leg still to buy skips the multi-city search,
+        // because a single ticket for one leg is that same ticket. The
+        // reply then said "the single-ticket comparison could not be made"
+        // — a failure announced where nothing was attempted and nothing
+        // was owed. Same reasoning that already gates the sentence above.
+        let notes = comparison_notes(1, Some((640.0, "EUR")), None);
+        assert!(notes.is_empty(), "nothing is missing from a one-leg trip: {notes:?}");
+
+        // With two legs there really is a comparison to make, and its
+        // absence really is a missing answer.
+        let notes = comparison_notes(2, Some((640.0, "EUR")), None).join(" ");
+        assert!(notes.contains("could not be made"), "got: {notes}");
+    }
+
+    #[test]
     fn every_combination_of_the_two_totals_reads_unambiguously() {
         // Both present, same currency: a stated comparison.
         let both = comparison_notes(2, Some((100.0, "EUR")), Some((142.0, "EUR"))).join(" ");
@@ -2982,7 +3244,9 @@ mod tests {
     #[test]
     fn a_trip_that_cannot_be_priced_is_refused_before_anything_is_bought() {
         let empty = vec![segment(1, "AMS", "NRT", "2026-09-03")];
-        let problem = ready_to_price(&empty).unwrap_err();
+        let Pricing::NotReady(problem) = ready_to_price(&empty) else {
+            panic!("a segment with no flight cannot be priced");
+        };
         assert!(problem.contains("segment 1"), "got: {problem}");
         assert!(problem.contains("no flight"), "got: {problem}");
 
@@ -2992,7 +3256,9 @@ mod tests {
             TripCandidate { candidate: 1, chosen: false, ..parked("KL861", 940.0) },
             TripCandidate { candidate: 2, chosen: false, ..parked("CX270,CX500", 780.0) },
         ];
-        let problem = ready_to_price(&undecided).unwrap_err();
+        let Pricing::NotReady(problem) = ready_to_price(&undecided) else {
+            panic!("two options and no decision cannot be priced");
+        };
         assert!(problem.contains("KL861"), "the options are listed: {problem}");
         assert!(problem.contains("CX270,CX500"), "got: {problem}");
 
@@ -3000,18 +3266,20 @@ mod tests {
         // choice nobody has is ceremony.
         let mut lone = empty.clone();
         lone[0].candidates = vec![TripCandidate { candidate: 1, chosen: false, ..parked("KL861", 940.0) }];
-        assert!(ready_to_price(&lone).is_ok());
+        assert!(matches!(ready_to_price(&lone), Pricing::Ready(_)));
 
         let mut decided = undecided.clone();
         decided[0].candidates[1].chosen = true;
-        let chosen = ready_to_price(&decided).unwrap();
+        let Pricing::Ready(chosen) = ready_to_price(&decided) else {
+            panic!("a decided segment is ready to price");
+        };
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].1.flight_numbers, "CX270,CX500");
     }
 
     #[test]
     fn a_trip_with_no_segments_is_refused() {
-        assert!(ready_to_price(&[]).is_err());
+        assert!(matches!(ready_to_price(&[]), Pricing::NotReady(_)));
     }
 
     #[tokio::test]
@@ -3184,11 +3452,18 @@ mod tests {
         assert_eq!(chosen.price_now_currency.as_deref(), Some("EUR"), "the currency the fresh price is actually in");
         assert_eq!(chosen.moved, Some(40.0));
         assert!(chosen.still_offered);
-        // One segment, so there is no single-ticket comparison to make, and
-        // the output has to say so rather than let the separate total stand
-        // alone.
+        // One segment, so no single-ticket comparison was attempted: a
+        // single ticket for one leg is that leg's ticket. This used to
+        // report the comparison as one that "could not be made", which is
+        // a failure announced where nothing was tried and nothing is
+        // owed — the same thing the connection-risk warning beside it is
+        // already gated against claiming on a one-leg trip.
         assert!(out.one_ticket_total.is_none());
-        assert!(out.notes.iter().any(|n| n.contains("could not")), "notes: {:?}", out.notes);
+        assert!(
+            !out.notes.iter().any(|n| n.contains("could not")),
+            "notes: {:?}",
+            out.notes,
+        );
 
         // Priced means priced: the trip records it, and the parked price is
         // left exactly as it was.
@@ -3198,6 +3473,222 @@ mod tests {
             trip.items[0].candidates[0].quoted_price,
             Some(940.0),
             "quoted_price is never overwritten by a re-price"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trip_with_every_flight_bought_is_totalled_rather_than_searched() {
+        // `expect(0)`, verified when the server drops: a route the traveller
+        // has already bought must cost nothing to re-price, and going to
+        // Duffel for it is both a fee and an answer nobody can act on.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(duffel_offer("640.00", &["KL861"])))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(99, vec![one_way("a", "AMS", "NRT", "2026-09-03", &["KL861"])], Instant::now());
+        AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 }
+            .call(AddSegmentArgs {
+                trip: "Japan".into(),
+                origin: "AMS".into(),
+                destination: "NRT".into(),
+                departure_date: "2026-09-03".into(),
+                adults: None,
+                cabin_class: None,
+            })
+            .await
+            .unwrap();
+        AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 }
+            .call(AddOptionArgs { trip: "Japan".into(), position: 1, offer_id: "a".into(), decided: None })
+            .await
+            .unwrap();
+        // What a forwarded confirmation leaves behind: the leg is bought,
+        // at the price the mail stated.
+        let trip = store.find_trip(7, "Japan").unwrap().unwrap();
+        store
+            .book_item(trip.items[0].id, Some("KL7788"), Some(612.40), Some("EUR"), None)
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store: store.clone(),
+            account_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap();
+
+        assert!(out.segments.is_empty(), "nothing was shopped: {:?}", out.segments);
+        assert_eq!(
+            out.fixed_costs,
+            vec![FixedCost { position: 1, title: "AMS→NRT on 2026-09-03".into(), price: 612.40, currency: "EUR".into() }],
+            "what the trip cost is what the traveller paid",
+        );
+        // The whole note set, not a substring of it. Nothing here failed,
+        // so nothing here may read as a failure — and the note that would
+        // have appeared is `separate_total`'s "no segment states a
+        // currency", which says neither "no total" nor "could not" and so
+        // slipped past every looser assertion.
+        assert_eq!(
+            out.notes,
+            vec![
+                "every flight on this trip is already booked, so nothing was searched and there \
+                 is no live total to give: AMS→NRT on 2026-09-03 is in fixed_costs, at the price \
+                 paid where the confirmation stated one"
+                    .to_string(),
+            ],
+        );
+
+        // And with no Duffel at all: "no single-ticket price could be
+        // fetched" is about a comparison this trip never needed, so a
+        // Duffel-less deployment must not report one as missing either.
+        let out = FinaliseTripTool {
+            store: store.clone(),
+            account_id: 7,
+            duffel: None,
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap();
+        assert!(
+            !out.notes.iter().any(|n| n.contains("Duffel")),
+            "notes: {:?}",
+            out.notes,
+        );
+
+        // And the same trip where the confirmation stated an amount with no
+        // currency beside it. That is one item, which a booked flight makes
+        // the ordinary case rather than the edge — "1 items" in front of a
+        // set of totals reads as a bug in the reply and casts doubt on the
+        // numbers beside it — and it has not failed to state a price, it
+        // has failed to state what of.
+        let trip = store.find_trip(7, "Japan").unwrap().unwrap();
+        store
+            .book_item(trip.items[0].id, Some("KL7788"), Some(612.40), None, None)
+            .unwrap();
+        let out = FinaliseTripTool {
+            store,
+            account_id: 7,
+            duffel: None,
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Japan".into() })
+        .await
+        .unwrap();
+        assert!(out.fixed_costs.is_empty(), "no currency, no line in the totals");
+        assert_eq!(out.unpriced_items, vec!["AMS→NRT on 2026-09-03".to_string()]);
+        assert!(
+            out.notes.contains(
+                &"1 item on this trip has no price the totals can use, and is not in them"
+                    .to_string()
+            ),
+            "notes: {:?}",
+            out.notes,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_part_booked_trip_does_not_present_the_shopped_leg_as_the_whole_total() {
+        // One leg bought, one still to buy. The flight totals cover the
+        // second only, and a total over half a trip presented as the trip's
+        // total is the same lie as one that quietly leaves a hotel out —
+        // so the reply has to say which legs it is for, in words, beside
+        // the number.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/air/offer_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(duffel_offer("640.00", &["TP676"])))
+            .mount(&server)
+            .await;
+
+        let (store, _d) = setup();
+        let shown = Arc::new(ShownFlights::default());
+        shown.remember(
+            99,
+            vec![
+                one_way("a", "AMS", "LIS", "2026-09-03", &["TP675"]),
+                one_way("b", "LIS", "AMS", "2026-09-07", &["TP676"]),
+            ],
+            Instant::now(),
+        );
+        let add_seg = AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 };
+        for (origin, destination, date) in
+            [("AMS", "LIS", "2026-09-03"), ("LIS", "AMS", "2026-09-07")]
+        {
+            add_seg
+                .call(AddSegmentArgs {
+                    trip: "Lisbon".into(),
+                    origin: origin.into(),
+                    destination: destination.into(),
+                    departure_date: date.into(),
+                    adults: None,
+                    cabin_class: None,
+                })
+                .await
+                .unwrap();
+        }
+        let add_option = AddTripOptionTool { store: store.clone(), account_id: 7, shown, conversation_id: 99 };
+        for (position, offer) in [(1, "a"), (2, "b")] {
+            add_option
+                .call(AddOptionArgs { trip: "Lisbon".into(), position, offer_id: offer.into(), decided: None })
+                .await
+                .unwrap();
+        }
+        let trip = store.find_trip(7, "Lisbon").unwrap().unwrap();
+        store
+            .book_item(trip.items[0].id, Some("TP9911"), Some(188.50), Some("EUR"), None)
+            .unwrap();
+
+        let duffel = crate::tools::duffel::DuffelClient::new(
+            reqwest::Client::new(),
+            "test".to_string(),
+            server.uri(),
+        );
+        let out = FinaliseTripTool {
+            store,
+            account_id: 7,
+            duffel: Some(duffel),
+            ignav: None,
+            budget: Arc::new(crate::tools::budget::FlightBudget::default()),
+        }
+        .call(FinaliseArgs { trip: "Lisbon".into() })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out.segments.iter().map(|s| s.position).collect::<Vec<_>>(),
+            vec![2],
+            "the bought leg is not shopped again",
+        );
+        assert_eq!(out.separate_total, Some(640.0), "the live total is the one leg it covers");
+        assert_eq!(
+            out.fixed_costs,
+            vec![FixedCost { position: 1, title: "AMS→LIS on 2026-09-03".into(), price: 188.50, currency: "EUR".into() }],
+        );
+        assert!(
+            out.notes.contains(
+                &"the flight totals here cover only the legs still to buy: AMS→LIS on 2026-09-03 \
+                  is already booked, and what it cost is in fixed_costs, at the price paid where \
+                  the confirmation stated one"
+                    .to_string()
+            ),
+            "the reply must say what the total is not: {:?}",
+            out.notes,
         );
     }
 
@@ -3970,9 +4461,53 @@ mod tests {
             flight_item(1, "AMS", "LIS", "2026-10-12", Some(chosen_departing("2026-10-12T07:15:00"))),
             stay_item(2, "Hotel", "2026-10-12"),
         ];
-        assert_eq!(ready_to_price(&items).unwrap().len(), 1);
+        let Pricing::Ready(legs) = ready_to_price(&items) else {
+            panic!("a decided flight beside a stay is ready: {:?}", ready_to_price(&items));
+        };
+        assert_eq!(legs.len(), 1);
         let only_a_stay = vec![stay_item(1, "Hotel", "2026-10-12")];
-        assert!(ready_to_price(&only_a_stay).unwrap_err().contains("no flights"));
+        let Pricing::NotReady(problem) = ready_to_price(&only_a_stay) else {
+            panic!("a trip of one hotel has no flights to price");
+        };
+        assert!(problem.contains("no flights"), "got: {problem}");
+    }
+
+    #[test]
+    fn a_trip_whose_flights_are_all_bought_is_booked_rather_than_ready_to_price() {
+        // The bug from production: an AMS→HKG→AMS trip with both legs
+        // ticketed and imported came back ready, and the page invited the
+        // traveller to go and shop fares for seats they were holding.
+        let mut items = vec![
+            flight_item(1, "AMS", "HKG", "2026-10-12", Some(chosen_departing("2026-10-12T07:15:00"))),
+            stay_item(2, "Hotel", "2026-10-12"),
+            flight_item(3, "HKG", "AMS", "2026-10-19", Some(chosen_departing("2026-10-19T18:40:00"))),
+        ];
+        items[0].booked = true;
+        items[2].booked = true;
+        assert_eq!(ready_to_price(&items), Pricing::Booked);
+        // And it is not a refusal. `Readiness::refusal` is what every view
+        // carrying one reason string reads, and a reason there is what
+        // makes a reader ask for a decision nobody owes — the mirror of
+        // the "ready to price" the page was showing.
+        assert_eq!(Readiness::of(&items).refusal(), None);
+
+        // A booked leg is skipped whatever state its options are in, so a
+        // confirmation that never named a flight cannot hold up a trip the
+        // traveller has already paid for.
+        items[0].candidates.clear();
+        assert_eq!(ready_to_price(&items), Pricing::Booked);
+
+        // One leg still to buy is not a booked trip: that leg, and only
+        // that leg, is what pricing this trip now means.
+        items[2].booked = false;
+        let Pricing::Ready(legs) = ready_to_price(&items) else {
+            panic!("one unbooked leg is a leg to price: {:?}", ready_to_price(&items));
+        };
+        assert_eq!(
+            legs.iter().map(|(s, _)| s.position).collect::<Vec<_>>(),
+            vec![3],
+            "the bought leg must not be shopped again",
+        );
     }
 
     #[test]
@@ -3987,6 +4522,40 @@ mod tests {
             vec![FixedCost { position: 1, title: "Hotel".into(), price: 320.0, currency: "EUR".into() }]
         );
         assert_eq!(unpriced, vec!["Museum".to_string()]);
+    }
+
+    #[test]
+    fn a_booked_flights_fare_counts_towards_the_trip_and_an_unbooked_one_does_not() {
+        // The fare on a ticket the traveller holds is what they paid, not
+        // something to fetch — and it was reaching no total at all, because
+        // this looked at non-flights only. An unbooked leg stays out: it is
+        // what the pricing path is for, and would otherwise be counted
+        // twice.
+        let mut items = vec![
+            flight_item(1, "AMS", "HKG", "2026-10-12", Some(chosen_departing("2026-10-12T07:15:00"))),
+            flight_item(2, "HKG", "AMS", "2026-10-19", Some(chosen_departing("2026-10-19T18:40:00"))),
+            stay_item_priced(3, "Hotel", "2026-10-13", Some((320.0, "EUR"))),
+        ];
+        items[0].booked = true;
+        items[0].price = Some(612.40);
+        items[0].currency = Some("EUR".to_string());
+
+        let (fixed, unpriced) = fixed_costs(&items);
+        assert_eq!(
+            fixed,
+            vec![
+                FixedCost { position: 1, title: "AMS→HKG on 2026-10-12".into(), price: 612.40, currency: "EUR".into() },
+                FixedCost { position: 3, title: "Hotel".into(), price: 320.0, currency: "EUR".into() },
+            ],
+            "a flight is named by its route and its day: two legs can share a title",
+        );
+        assert!(unpriced.is_empty(), "an unbooked leg is neither a cost nor missing one: {unpriced:?}");
+
+        // A confirmation that stated no price leaves a cost nobody can see
+        // unless the reply names it.
+        items[1].booked = true;
+        let (_, unpriced) = fixed_costs(&items);
+        assert_eq!(unpriced, vec!["HKG→AMS on 2026-10-19".to_string()]);
     }
 
     #[tokio::test]

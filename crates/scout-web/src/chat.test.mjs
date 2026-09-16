@@ -1,14 +1,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
   applyUpdate, escapeHtml, finalAnswer, linkify, parseFrame, shouldFollow,
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
-  connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier,
+  connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier, savedFareLine,
   tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
-  pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem,
+  pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
+  ITINERARY_NOTE,
   CONFIRM_ARM_MS,
 } from './chat.js'
 
@@ -260,6 +262,90 @@ test('the join between selected flights is checked on the shared local clock', (
   })
 })
 
+test('the shared connection cases decide the same way here as on paper', () => {
+  // `connection_gaps.json` is read by this test and by the printed plan's
+  // tests in trip_pdf.rs. The page and the plan draw this card in the same
+  // places from two implementations, and this file is the only thing that
+  // makes one of them go red when the other's threshold moves.
+  const gaps = JSON.parse(readFileSync(new URL('./connection_gaps.json', import.meta.url), 'utf8'))
+  const tones = { ready: 'fine', warning: 'warning', danger: 'danger' }
+  const leg = (side) => ({
+    destination: side.destination,
+    origin: side.origin,
+    date: side.date,
+    candidates: side.arriving_at_local || side.departing_at_local || side.chosen
+      ? [{ chosen: true, arriving_at_local: side.arriving_at_local, departing_at_local: side.departing_at_local }]
+      : [],
+  })
+  assert.ok(gaps.cases.length >= 12, 'the shared cases went missing')
+  for (const gap of gaps.cases) {
+    const check = connectionCheck(leg(gap.before), leg(gap.after), { itemBetween: gap.item_between ?? false })
+    assert.equal(check === null ? 'none' : tones[check.tone], gap.expect, gap.name)
+  }
+})
+
+test('a week in Hong Kong is not a connection', () => {
+  // The renderer pairs a flight with the next flight, whatever sits
+  // between, so the outbound and the return of a two-week trip were drawn
+  // as a join with "336h at HKG" on it.
+  const before = {
+    destination: 'HKG', date: '2026-10-12',
+    candidates: [{ chosen: true, arriving_at_local: '2026-10-12T16:00:00' }],
+  }
+  const after = {
+    origin: 'HKG', date: '2026-10-19',
+    candidates: [{ chosen: true, departing_at_local: '2026-10-19T23:40:00' }],
+  }
+  assert.equal(connectionCheck(before, after), null)
+  // A day is still a connection, however uncomfortable: an overnight at
+  // the airport is a join somebody has to make.
+  const overnight = { ...after, date: '2026-10-13', candidates: [{ chosen: true, departing_at_local: '2026-10-13T09:00:00' }] }
+  assert.equal(connectionCheck(before, overnight).tone, 'ready')
+})
+
+test('a stay between two flights is not a connection either', () => {
+  // The reader booked the hotel; they know they are staying. Nothing at
+  // all is the answer here, not a card saying the same thing differently.
+  const before = {
+    destination: 'LIS', date: '2026-10-12',
+    candidates: [{ chosen: true, arriving_at_local: '2026-10-12T10:00:00' }],
+  }
+  const after = {
+    origin: 'LIS', date: '2026-10-12',
+    candidates: [{ chosen: true, departing_at_local: '2026-10-12T22:00:00' }],
+  }
+  assert.equal(connectionCheck(before, after, { itemBetween: true }), null)
+  assert.equal(connectionCheck(before, after).tone, 'ready', 'with nothing between, it is a join')
+})
+
+test('an itinerary that cannot be flown is reported however far apart its legs are', () => {
+  // No gap and no hotel makes a departure before the previous arrival
+  // possible, so this one survives both silences.
+  const before = {
+    destination: 'LIS', date: '2026-10-12',
+    candidates: [{ chosen: true, arriving_at_local: '2026-10-12T22:00:00' }],
+  }
+  const after = {
+    origin: 'LIS', date: '2026-10-12',
+    candidates: [{ chosen: true, departing_at_local: '2026-10-12T20:00:00' }],
+  }
+  const impossible = { tone: 'danger', text: 'Impossible connection at LIS: the next flight leaves before arrival.' }
+  assert.deepEqual(connectionCheck(before, after), impossible)
+  assert.deepEqual(connectionCheck(before, after, { itemBetween: true }), impossible)
+})
+
+test('an undecided pair far apart says nothing rather than asking for a choice', () => {
+  // "Choose both flights to check this connection" is about a join. There
+  // is no join between a flight in October and one the week after.
+  const before = { destination: 'HKG', date: '2026-10-12', candidates: [] }
+  const after = { origin: 'HKG', date: '2026-10-19', candidates: [] }
+  assert.equal(connectionCheck(before, after), null)
+  assert.equal(
+    connectionCheck(before, { ...after, date: '2026-10-12' }).text,
+    'Choose both flights to check this connection.',
+  )
+})
+
 test('a change of airport is reported instead of subtracting unrelated clocks', () => {
   const before = {
     destination: 'FCO',
@@ -341,9 +427,83 @@ test('Ignav saved fares stay visibly approximate', () => {
   assert.deepEqual(savedFareQualifier('email'), { prefix: '', note: 'paid' })
 })
 
+test('a confirmation that stated no price does not read as a lookup that failed', () => {
+  // "Price unavailable" beside "paid" says something went wrong fetching a
+  // number. Nothing went wrong: the airline's mail did not state one. Same
+  // distinction `noFlightLine` draws one field along.
+  assert.deepEqual(savedFareLine({ source: 'email', quoted_price: null }), {
+    amount: 'Price not stated', note: 'on the confirmation',
+  })
+  // A fare that really is missing from a search stays as it was: there,
+  // something did fail.
+  assert.deepEqual(savedFareLine({ source: 'duffel', quoted_price: null }), {
+    amount: 'Price unavailable', note: 'when saved',
+  })
+  // And a stated one is unchanged, qualifier and all.
+  const paid = savedFareLine({ source: 'email', quoted_price: 612.4, quoted_currency: 'EUR' })
+  assert.match(paid.amount, /612/)
+  assert.equal(paid.note, 'paid')
+  const estimate = savedFareLine({ source: 'ignav', quoted_price: 184, quoted_currency: 'EUR' })
+  assert.match(estimate.amount, /^from /)
+  assert.equal(estimate.note, 'estimate when saved')
+})
+
 test('a booked item is marked the same way whatever kind it is', () => {
   assert.equal(bookedMark({ confirmation_code: 'KL7788' }), 'booked \u00b7 KL7788')
   assert.equal(bookedMark({ confirmation_code: null }), 'booked')
+})
+
+test('the notes core sends are headed the same way on the page and on paper', () => {
+  // Not "Connection check.": `itinerary_notes` also speaks when two legs
+  // land and leave from different airports, at any gap, and that heading
+  // over an outbound and a return a week apart claims the connection the
+  // join cards stopped claiming. The printed plan pins the same literal in
+  // `trip_pdf.rs`, which is the only thing keeping the two in step.
+  assert.equal(ITINERARY_NOTE, 'Itinerary note.')
+})
+
+test('a trip with every flight bought is called booked, not ready to price', () => {
+  // The bug from production: a fully ticketed AMS→HKG→AMS trip told its
+  // owner it was ready to price, which reads as an invitation to go and
+  // shop fares for seats they were already holding. "Needs a decision"
+  // would be the other wrong answer — there is no decision left.
+  const trip = { readiness: { state: 'booked' }, items: [] }
+  const alert = readinessAlert(trip)
+  assert.equal(alert.tone, 'ready')
+  assert.equal(alert.headline, 'Booked.')
+  assert.doesNotMatch(alert.text, /price|decision/i)
+})
+
+test('the legs being priced are named when the rest of the trip is already bought', () => {
+  const flights = (count) => Array.from({ length: count }, () => ({ kind: 'flight' }))
+  // Nothing booked: every segment is being priced, so the copy that has
+  // always said so still fits.
+  assert.equal(
+    readinessAlert({ readiness: { state: 'ready', legs: ['segment 1 (AMS→HKG)', 'segment 2 (HKG→AMS)'] }, items: flights(2) }).text,
+    'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.',
+  )
+  // One of three bought: naming the other two is the difference between
+  // pricing a trip and pricing what is left of it.
+  const part = readinessAlert({ readiness: { state: 'ready', legs: ['segment 2 (HKG→BKK)'] }, items: flights(3) })
+  assert.equal(part.headline, 'Ready to price.')
+  assert.equal(
+    part.text,
+    'Only segment 2 (HKG→BKK) is still to buy. Ask Scout in chat to price it; the rest of this trip is already booked.',
+  )
+  // Two of them read as a sentence, not as a joined array.
+  const two = readinessAlert({ readiness: { state: 'ready', legs: ['segment 2 (HKG→BKK)', 'segment 3 (BKK→HKG)'] }, items: flights(4) })
+  assert.match(two.text, /Only segment 2 \(HKG→BKK\) and segment 3 \(BKK→HKG\) are still to buy\./)
+})
+
+test('a readiness this page cannot read says nothing rather than something false', () => {
+  // An older server, or a tab open across a deploy. Silence is the only
+  // answer that cannot be wrong about whether a trip was bought.
+  assert.equal(readinessAlert({ items: [] }), null)
+  assert.equal(readinessAlert({ readiness: { state: 'something-new' }, items: [] }), null)
+  const undecided = readinessAlert({ readiness: { state: 'not_ready', reason: 'segment 1 still has 2 options' }, items: [] })
+  assert.deepEqual(undecided, {
+    tone: 'alert', headline: 'Needs a decision.', text: 'segment 1 still has 2 options',
+  })
 })
 
 test('a flight card with no option says which of the two silences it is', () => {

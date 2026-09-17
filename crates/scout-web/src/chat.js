@@ -498,6 +498,132 @@ export function readinessAlert(trip) {
   return null
 }
 
+// One day of the trip, top to bottom: what happens on it, in the order it
+// happens. The strip above this drew flights and nothing else, so a trip
+// without them had no overview at all, a hotel appeared nowhere on it,
+// and a free day — the thing a traveller looks for first — was invisible.
+//
+// The day is the local day of whatever the entry is: a leg that leaves
+// Amsterdam on the 21st and lands in Hong Kong on the 22nd is on both
+// rows, because a reader who sees only the departure has been told the
+// traveller teleported. Both rows point at the same card.
+//
+// A run of empty days is counted rather than drawn: an item dated a week
+// before departure — an eSIM, a visa — is real and must not vanish, but
+// eight blank rows between it and the trip would push the trip itself off
+// the screen. One empty day stays a row of its own, because "nothing on
+// the 23rd" is the answer to a question somebody is asking.
+export function tripDayRows(trip, locale = undefined) {
+  const items = trip?.items ?? []
+  if (!items.length) return []
+  const onDay = new Map()
+  const put = (date, entry) => {
+    if (!isDay(date)) return
+    if (!onDay.has(date)) onDay.set(date, [])
+    onDay.get(date).push(entry)
+  }
+  for (const item of items) {
+    const held = Boolean(item.booked)
+    if (item.kind === 'flight') {
+      const chosen = selectedCandidate(item)
+      put(item.date, {
+        type: 'flight',
+        time: clockLabel(chosen?.departing_at_local),
+        text: `${item.origin ?? ''} → ${item.destination ?? ''}`,
+        position: item.position,
+        held,
+      })
+      // Only where the option says so. An undecided leg has no arrival
+      // anybody can name, and inventing one would put a day on the grid
+      // that nothing on the trip supports.
+      const lands = dayOf(chosen?.arriving_at_local)
+      if (lands && lands !== item.date) {
+        put(lands, {
+          type: 'arrival',
+          time: clockLabel(chosen?.arriving_at_local),
+          text: `Lands at ${item.destination ?? ''}`,
+          position: item.position,
+          held,
+        })
+      }
+      continue
+    }
+    const ends = dayOf(item.ends_at)
+    if (item.kind === 'stay' && ends && ends !== item.date) {
+      put(item.date, { type: 'stay', time: '', text: item.title, nights: nightsBetween(item.date, ends), position: item.position, held })
+      put(ends, { type: 'stay-end', time: '', text: item.title, position: item.position, held })
+      continue
+    }
+    put(item.date, { type: 'item', time: clockLabel(item.starts_at), text: item.title, position: item.position, held })
+  }
+  const days = [...onDay.keys()].sort()
+  if (!days.length) return []
+  const rows = []
+  let free = 0
+  for (const date of eachDay(days[0], days[days.length - 1])) {
+    const entries = (onDay.get(date) ?? []).sort(byTime)
+    if (!entries.length) {
+      free++
+      continue
+    }
+    // A single empty day is worth a row; two or more are worth a count.
+    if (free === 1) rows.push({ kind: 'day', date: dayBefore(date), label: dayLabel(dayBefore(date), locale), entries: [] })
+    else if (free > 1) rows.push({ kind: 'free', days: free })
+    free = 0
+    rows.push({ kind: 'day', date, label: dayLabel(date, locale), entries })
+  }
+  return rows
+}
+
+function isDay(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+}
+
+// The local day an ISO stamp falls on, or '' — read off the string, never
+// through `Date`, which would resolve it in the reader's zone and move a
+// 23:40 arrival in Hong Kong to the previous day in Amsterdam.
+function dayOf(stamp) {
+  return typeof stamp === 'string' && /^\d{4}-\d{2}-\d{2}/.test(stamp) ? stamp.slice(0, 10) : ''
+}
+
+function utcDay(date) {
+  const [y, m, d] = date.split('-').map(Number)
+  return Date.UTC(y, m - 1, d)
+}
+
+const DAY_MS = 86400000
+
+function nightsBetween(from, to) {
+  return Math.max(1, Math.round((utcDay(to) - utcDay(from)) / DAY_MS))
+}
+
+function dayBefore(date) {
+  return new Date(utcDay(date) - DAY_MS).toISOString().slice(0, 10)
+}
+
+// Every day from first to last, inclusive. Built in UTC on purpose: these
+// are calendar days the traveller wrote down, not moments, and arithmetic
+// in a zone with a summer-time jump would drop or repeat one.
+function eachDay(first, last) {
+  const out = []
+  for (let at = utcDay(first); at <= utcDay(last); at += DAY_MS) {
+    out.push(new Date(at).toISOString().slice(0, 10))
+  }
+  return out
+}
+
+function dayLabel(date, locale) {
+  return new Intl.DateTimeFormat(locale, { weekday: 'short', day: 'numeric', timeZone: 'UTC' }).format(new Date(utcDay(date)))
+}
+
+// Ordered by the clock, and anything without one last: a stay has no time
+// of day worth printing, and it is context for the day rather than an
+// appointment in it.
+function byTime(a, b) {
+  const clock = (entry) => (/^\d{2}:\d{2}$/.test(entry.time) ? entry.time : '99:99')
+  return clock(a).localeCompare(clock(b))
+}
+
 export function tripTimelinePoints(trip) {
   const flights = tripFlights(trip)
   if (!flights.length) return []
@@ -1397,19 +1523,82 @@ function start() {
   function renderOverview(trip) {
     const card = node('section', 'trip-overview')
     const label = node('div', 'trip-overview-label')
-    label.append(node('span', '', 'Trip timeline'), node('span', '', `${trip.items.length} ${trip.items.length === 1 ? 'item' : 'items'}`))
-    const timeline = node('div', 'trip-timeline')
-    for (const point of tripTimelinePoints(trip)) {
-      const item = node('div', point.gap ? 'trip-point gap' : 'trip-point')
-      item.append(
-        node('span', 'point-dot'),
-        node('span', 'point-code', point.code),
-        node('span', 'point-date', point.date ? dateLabel(point.date, true) : ''),
-      )
-      timeline.append(item)
+    const held = trip.items.filter((item) => item.booked).length
+    const toBook = trip.items.length - held
+    label.append(
+      node('span', '', 'Trip timeline'),
+      node('span', '', toBook ? `${held} held · ${toBook} to book` : `${trip.items.length} ${trip.items.length === 1 ? 'item' : 'items'}`),
+    )
+    card.append(label)
+    // The route, kept: it is the trip's identity — the thing the reader
+    // names it by — and it is where a connection shows itself. The days
+    // below say what happens; this says where the trip goes.
+    const points = tripTimelinePoints(trip)
+    if (points.length) {
+      const timeline = node('div', 'trip-timeline')
+      for (const point of points) {
+        const item = node('div', point.gap ? 'trip-point gap' : 'trip-point')
+        item.append(
+          node('span', 'point-dot'),
+          node('span', 'point-code', point.code),
+          node('span', 'point-date', point.date ? dateLabel(point.date, true) : ''),
+        )
+        timeline.append(item)
+      }
+      card.append(timeline)
     }
-    card.append(label, timeline)
+    const days = node('div', 'trip-days')
+    for (const row of tripDayRows(trip)) {
+      if (row.kind === 'free') {
+        days.append(node('p', 'day-free', `${row.days} free days`))
+        continue
+      }
+      const line = node('div', 'day-row')
+      line.append(node('span', 'day-label', row.label))
+      const entries = node('div', 'day-entries')
+      if (!row.entries.length) entries.append(node('span', 'day-empty', 'Nothing planned'))
+      for (const entry of row.entries) entries.append(dayChip(entry))
+      line.append(entries)
+      days.append(line)
+    }
+    card.append(days)
     return card
+  }
+
+  // What a day chip points at. `tabindex="-1"` so the card can take focus
+  // from a link without becoming a tab stop of its own: the timeline is
+  // the way into the list, not a second copy of it.
+  function nameCard(card, item) {
+    card.id = `trip-item-${item.position}`
+    card.tabIndex = -1
+  }
+
+  // One thing on one day, as a link to the card that holds it. An anchor
+  // rather than a button: it is navigation, it should say where it goes
+  // in the status bar, and a reader who opens it in a new tab gets the
+  // trip rather than nothing.
+  function dayChip(entry) {
+    const chip = node('a', entry.held ? 'day-chip held' : 'day-chip')
+    chip.href = `#trip-item-${entry.position}`
+    const time = /^\d{2}:\d{2}$/.test(entry.time) ? `${entry.time} ` : ''
+    const tail = entry.type === 'stay'
+      ? ` · ${entry.nights} ${entry.nights === 1 ? 'night' : 'nights'}`
+      : entry.type === 'stay-end'
+        ? ' · check out'
+        : ''
+    chip.textContent = `${time}${entry.text}${tail}`
+    chip.addEventListener('click', (event) => {
+      const target = document.getElementById(`trip-item-${entry.position}`)
+      if (!target) return
+      event.preventDefault()
+      const still = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
+      target.scrollIntoView({ behavior: still ? 'auto' : 'smooth', block: 'start' })
+      // Moved, not just scrolled to: a reader on a keyboard or a screen
+      // reader would otherwise be left where they were, with the page
+      // having quietly changed under them.
+      target.focus({ preventScroll: true })
+    })
+    return chip
   }
 
   function stopLabel(candidate) {
@@ -1556,6 +1745,7 @@ function start() {
   // clocks to its options.
   function renderOtherItem(trip, item) {
     const card = node('article', 'item-card')
+    nameCard(card, item)
     const head = node('header', 'segment-head')
     const about = node('div')
     about.append(
@@ -1587,6 +1777,7 @@ function start() {
   function renderItem(trip, segment) {
     if (segment.kind !== 'flight') return renderOtherItem(trip, segment)
     const card = node('article', 'segment-card')
+    nameCard(card, segment)
     const head = node('header', 'segment-head')
     const route = node('div')
     route.append(

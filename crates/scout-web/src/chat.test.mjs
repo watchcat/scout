@@ -6,7 +6,7 @@ import {
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier, savedFareLine,
-  tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark, itemState,
+  tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark, itemState, tripDayRows,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   noteParts, noteBody,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
@@ -938,4 +938,69 @@ test('the note body names the item the card drew, as a removal does', () => {
   // omitting the key: the route reads both the same way, and a body that
   // says what it means is the one worth sending.
   assert.equal(flight.note, null)
+})
+
+test('the trip reads as a row of days, and every day of it is accounted for', () => {
+  // The strip this replaces drew flights only, so a trip with none had no
+  // overview at all, a hotel appeared nowhere, and a free day — the thing
+  // a traveller most wants to spot — was invisible.
+  const trip = {
+    items: [
+      { position: 1, kind: 'activity', title: 'eSIM', date: '2026-09-12', booked: true },
+      {
+        position: 2, kind: 'flight', origin: 'AMS', destination: 'HKG', date: '2026-09-21', booked: true,
+        candidates: [{ chosen: true, departing_at_local: '2026-09-21T21:25:00', arriving_at_local: '2026-09-22T15:25:00' }],
+      },
+      { position: 3, kind: 'stay', title: 'B P International', date: '2026-09-22', ends_at: '2026-09-25', booked: true },
+      { position: 4, kind: 'activity', title: 'Lunch with Stanley', date: '2026-09-24', starts_at: '2026-09-24T14:30:00', booked: false },
+    ],
+  }
+  const rows = tripDayRows(trip, 'en-GB')
+  const shape = rows.map((row) => row.kind === 'free' ? `free ${row.days}` : `${row.date}:${row.entries.map((e) => e.type).join(',')}`)
+  assert.deepEqual(shape, [
+    '2026-09-12:item',
+    'free 8',
+    '2026-09-21:flight',
+    '2026-09-22:arrival,stay',
+    '2026-09-23:',
+    '2026-09-24:item',
+    '2026-09-25:stay-end',
+  ])
+
+  // A leg that lands the next day is on both days: the strip showed only
+  // its departure, which read as though the traveller had teleported.
+  const [departs] = rows.find((row) => row.date === '2026-09-21').entries
+  assert.equal(departs.text, 'AMS → HKG')
+  assert.equal(departs.time, '21:25')
+  assert.equal(departs.position, 2)
+  const lands = rows.find((row) => row.date === '2026-09-22').entries[0]
+  assert.equal(lands.type, 'arrival')
+  assert.equal(lands.text, 'Lands at HKG')
+  assert.equal(lands.time, '15:25')
+  assert.equal(lands.position, 2, 'the arrival points at the leg it belongs to')
+
+  // The stay says how long it is, on the day it starts, and marks the
+  // day it ends so the last morning is not a surprise.
+  const stay = rows.find((row) => row.date === '2026-09-22').entries[1]
+  assert.equal(stay.type, 'stay')
+  assert.equal(stay.text, 'B P International')
+  assert.equal(stay.nights, 3)
+  assert.equal(rows.find((row) => row.date === '2026-09-25').entries[0].type, 'stay-end')
+
+  // One empty day is a day with nothing on it; a run of them is counted,
+  // so an item dated a week before departure cannot push the trip itself
+  // off the screen.
+  assert.equal(rows.find((row) => row.kind === 'free').days, 8)
+  assert.deepEqual(rows.find((row) => row.date === '2026-09-23').entries, [])
+
+  // Every row carries a label the page can print without re-deriving it.
+  assert.equal(rows.find((row) => row.date === '2026-09-24').label, 'Thu 24')
+
+  // What is held and what is not travels with the entry, so the row can
+  // say it the way the card does.
+  assert.equal(rows.find((row) => row.date === '2026-09-24').entries[0].held, false)
+  assert.equal(departs.held, true)
+
+  assert.deepEqual(tripDayRows({ items: [] }), [])
+  assert.deepEqual(tripDayRows(null), [])
 })

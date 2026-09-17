@@ -369,6 +369,34 @@
   .trip-point.gap .point-dot{border-color:var(--yellow); color:var(--yellow)}
   .point-code{display:block; color:var(--base2); font-size:14px; font-weight:800; letter-spacing:.05em}
   .point-date{display:block; margin-top:1px; color:var(--base01); font-size:11px}
+  /* The days of the trip, one row each. The route above says where the
+     trip goes; this says what happens on it, and it is the half a trip
+     with no flights never had at all. Rows stay rows on a phone: the date
+     gutter is what makes the column scannable, and stacking the date over
+     its chips would take that away in exchange for room the chips do not
+     need. */
+  .trip-days{margin-top:14px; padding-top:12px; border-top:1px solid var(--line);
+    display:grid; grid-template-columns:auto 1fr; gap:4px 12px; align-items:baseline}
+  .day-row{display:contents}
+  .day-label{color:var(--base1); font-size:12px; font-weight:650; white-space:nowrap;
+    font-variant-numeric:tabular-nums}
+  .day-entries{display:flex; flex-wrap:wrap; gap:6px; min-width:0; padding:2px 0}
+  .day-chip{display:inline-block; max-width:100%; border:1px dashed var(--base01); border-radius:7px;
+    padding:4px 8px; color:var(--base0); font-size:12px; text-decoration:none; overflow-wrap:anywhere}
+  .day-chip.held{border-style:solid; border-color:#3f682f; color:#b8c76a}
+  .day-chip:hover{border-color:var(--cyan); color:var(--base2)}
+  .day-chip:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
+  /* A day with nothing on it is worth a row — "nothing on the 23rd" is an
+     answer somebody is looking for — but a run of them is worth a count,
+     or an item dated a week before departure would push the trip itself
+     off the screen. */
+  .day-empty{color:var(--base01); font-size:12px}
+  .day-free{grid-column:1 / -1; margin:2px 0; padding:3px 0; color:var(--base01); font-size:12px;
+    border-top:1px dashed var(--line)}
+  /* The card a day chip jumps to: clear of the top edge, and no outline
+     of its own until a keyboard put the reader there. */
+  .segment-card, .item-card{scroll-margin-top:14px}
+  .segment-card:focus-visible, .item-card:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
   .trip-alert{display:block; margin:0 0 14px; padding:11px 13px;
     border:1px solid #6c5b1d; border-radius:12px; background:rgba(181,137,0,.09);
     color:#d1c27e; font-size:13px; line-height:1.45}
@@ -689,6 +717,10 @@
     .trip-delete-button{width:42px; height:42px; font-size:20px}
     .trip-overview{padding:15px 12px}
     .trip-point{min-width:64px; flex:1}
+    /* Rows, still: the gutter narrows and the chips wrap under it,
+       which keeps one column to run the eye down. */
+    .trip-days{gap:5px 9px}
+    .day-chip{font-size:12.5px; padding:6px 9px}
     /* Same reason as the card heads below: the actions column took a
        third of the width and pushed "Lisbon, October" onto two lines.
        The name gets the row, the chip and the buttons get the next one. */

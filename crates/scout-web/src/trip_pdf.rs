@@ -6,6 +6,7 @@
 
 use chrono::{NaiveDate, NaiveDateTime, Utc};
 use scout_core::trips::{Plan, Readiness, TripCandidate, TripItem};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -335,13 +336,207 @@ fn selected(item: &TripItem) -> Option<&TripCandidate> {
 /// page you carry, which is the complaint this answers on screen. The
 /// word does the work here, since a printed plan may well be black and
 /// white by the time anybody reads it.
+/// Where a card's supporting facts live: its place, whether it is held,
+/// and the files that came with it, on one line separated by dots.
+///
+/// They were three stacked lines, which cost about 8mm a card — a page of
+/// a long trip spent on line breaks between four words. Empty pieces are
+/// dropped rather than printed as an empty line, which is what made the
+/// stack look tidy on a fixture and ragged on a real trip.
+fn meta_line(parts: &[String]) -> String {
+    let said: Vec<&str> = parts.iter().map(String::as_str).filter(|part| !part.is_empty()).collect();
+    if said.is_empty() {
+        return String::new();
+    }
+    format!("<div class=\"meta-line\">{}</div>", said.join("<span class=\"sep\">·</span>"))
+}
+
+/// One day of the trip and what falls on it — the paper half of
+/// `chat.js::tripDayRows`, held to it by `day_rows.json`, which both test
+/// suites read.
+///
+/// A printed plan is carried, so the days come first on it: the question
+/// it is opened on is what Thursday holds, and answering that used to
+/// mean reading every card. The rules are the page's, for the page's
+/// reasons: a leg that lands the next day is on both days, a stay says
+/// its nights where it starts and marks where it ends, one empty day
+/// keeps its line and a run of them is counted.
+enum DayRow {
+    Day { date: String, entries: Vec<DayEntry> },
+    /// A counted run of days with nothing on them.
+    Free(usize),
+}
+
+struct DayEntry {
+    kind: &'static str,
+    time: String,
+    text: String,
+    nights: i64,
+}
+
+fn day_rows(items: &[TripItem]) -> Vec<DayRow> {
+    let mut on_day: BTreeMap<String, Vec<DayEntry>> = BTreeMap::new();
+    let mut put = |date: &str, entry: DayEntry| {
+        if is_day(date) {
+            on_day.entry(date.to_string()).or_default().push(entry);
+        }
+    };
+    for item in items {
+        if item.is_flight() {
+            let chosen = selected(item);
+            put(
+                &item.date,
+                DayEntry {
+                    kind: "flight",
+                    time: clock_of(chosen.and_then(|c| c.departing_at_local.as_deref())),
+                    text: format!("{} → {}", airport(&item.origin), airport(&item.destination)),
+                    nights: 0,
+                },
+            );
+            // Only where the chosen option says so: an undecided leg has
+            // no arrival anybody can name, and inventing one would put a
+            // day on the plan that nothing on the trip supports.
+            let lands = day_of(chosen.and_then(|c| c.arriving_at_local.as_deref()));
+            if !lands.is_empty() && lands != item.date {
+                put(
+                    &lands,
+                    DayEntry {
+                        kind: "arrival",
+                        time: clock_of(chosen.and_then(|c| c.arriving_at_local.as_deref())),
+                        text: format!("lands at {}", airport(&item.destination)),
+                        nights: 0,
+                    },
+                );
+            }
+            continue;
+        }
+        let ends = day_of(item.ends_at.as_deref());
+        if item.kind == "stay" && !ends.is_empty() && ends != item.date {
+            let nights = (parse_day(&ends) - parse_day(&item.date)).num_days().max(1);
+            put(&item.date, DayEntry { kind: "stay", time: String::new(), text: item.title.clone(), nights });
+            put(&ends, DayEntry { kind: "stay-end", time: String::new(), text: item.title.clone(), nights: 0 });
+            continue;
+        }
+        put(
+            &item.date,
+            DayEntry { kind: "item", time: clock_of(item.starts_at.as_deref()), text: item.title.clone(), nights: 0 },
+        );
+    }
+    let Some(first) = on_day.keys().next().cloned() else {
+        return Vec::new();
+    };
+    let last = on_day.keys().next_back().cloned().unwrap_or_else(|| first.clone());
+    let mut rows = Vec::new();
+    let mut free = 0usize;
+    let mut at = parse_day(&first);
+    let end = parse_day(&last);
+    while at <= end {
+        let date = at.format("%Y-%m-%d").to_string();
+        at += chrono::Duration::days(1);
+        let Some(mut entries) = on_day.remove(&date) else {
+            free += 1;
+            continue;
+        };
+        // By the clock, and whatever has none last: a stay is context for
+        // the day rather than an appointment in it.
+        entries.sort_by_key(|entry| sort_clock(&entry.time));
+        match free {
+            0 => {}
+            // One empty day keeps its line — "nothing on the 23rd" is an
+            // answer somebody is looking for — and a run of them is
+            // counted, or an item dated a week before departure would push
+            // the trip itself off the page.
+            1 => rows.push(DayRow::Day {
+                date: (parse_day(&date) - chrono::Duration::days(1)).format("%Y-%m-%d").to_string(),
+                entries: Vec::new(),
+            }),
+            many => rows.push(DayRow::Free(many)),
+        }
+        free = 0;
+        rows.push(DayRow::Day { date, entries });
+    }
+    rows
+}
+
+fn is_day(value: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+}
+
+fn parse_day(value: &str) -> chrono::NaiveDate {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap_or_default()
+}
+
+/// The local day a stamp falls on, read off the string as the page reads
+/// it: parsing it as a moment would resolve it in whatever zone the
+/// printer sits in and move a late arrival to the day before.
+fn day_of(stamp: Option<&str>) -> String {
+    stamp.filter(|s| s.len() >= 10 && is_day(&s[..10])).map(|s| s[..10].to_string()).unwrap_or_default()
+}
+
+fn clock_of(stamp: Option<&str>) -> String {
+    stamp.filter(|s| s.len() >= 16).map(|s| s[11..16].to_string()).unwrap_or_default()
+}
+
+fn sort_clock(time: &str) -> String {
+    if time.len() == 5 { time.to_string() } else { "99:99".to_string() }
+}
+
+/// The day list as it is printed: a date, then what falls on it.
+fn days_html(items: &[TripItem]) -> String {
+    let rows = day_rows(items);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<div class=\"days\">");
+    for row in &rows {
+        match row {
+            DayRow::Free(days) => {
+                write!(out, "<div class=\"day free\"><span></span><span>{days} free days</span></div>").unwrap()
+            }
+            DayRow::Day { date, entries } if entries.is_empty() => write!(
+                out,
+                "<div class=\"day\"><span class=\"when\">{}</span><span class=\"nothing\">Nothing planned</span></div>",
+                escape(&day_label(date))
+            )
+            .unwrap(),
+            DayRow::Day { date, entries } => {
+                let said: Vec<String> = entries
+                    .iter()
+                    .map(|entry| {
+                        let clock = if entry.time.is_empty() { String::new() } else { format!("{} ", entry.time) };
+                        let nights = match entry.kind {
+                            "stay" => format!(" · {} night{}", entry.nights, if entry.nights == 1 { "" } else { "s" }),
+                            "stay-end" => " · check out".to_string(),
+                            _ => String::new(),
+                        };
+                        format!("{}{}{}", escape(&clock), escape(&entry.text), nights)
+                    })
+                    .collect();
+                write!(
+                    out,
+                    "<div class=\"day\"><span class=\"when\">{}</span><span>{}</span></div>",
+                    escape(&day_label(date)),
+                    said.join("<span class=\"sep\">·</span>")
+                )
+                .unwrap()
+            }
+        }
+    }
+    out.push_str("</div>");
+    out
+}
+
+fn day_label(date: &str) -> String {
+    parse_day(date).format("%a %-d").to_string()
+}
+
 fn booked_mark(item: &TripItem) -> String {
     if !item.booked {
-        return "<div class=\"state\">To book</div>".to_string();
+        return "<span class=\"state\">To book</span>".to_string();
     }
     match item.confirmation_code.as_deref() {
-        Some(code) => format!("<div class=\"state held\">Held · {}</div>", escape(code)),
-        None => "<div class=\"state held\">Held</div>".to_string(),
+        Some(code) => format!("<span class=\"state held\">Held · {}</span>", escape(code)),
+        None => "<span class=\"state held\">Held</span>".to_string(),
     }
 }
 
@@ -374,7 +569,7 @@ fn tickets(item: &TripItem) -> String {
         .map(|file| escape(&file.filename))
         .collect::<Vec<_>>()
         .join(" · ");
-    format!("<div class=\"tickets\">{label} · {names}</div>")
+    format!("<span>{label} · {names}</span>")
 }
 
 /// The traveller's own note about this item, or nothing when they wrote
@@ -787,16 +982,17 @@ pub fn html(plan: &Plan) -> String {
     out.push_str(
         r#"</title>
 <style>
-@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head>div{min-width:0}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .state{display:inline-block;margin-top:1mm;padding:.5mm 1.8mm;border:.3mm dashed #789196;border-radius:99mm;color:#50666b;font-size:7pt;font-weight:700}.segment-head .state.held{border-style:solid;border-color:#859900;color:#4f5d10}.segment-head .tickets{margin-top:.7mm;color:#50666b;font-size:7.5pt;overflow-wrap:anywhere}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.note{padding:2.4mm 3mm;border-top:1px solid #dbe6e4;color:#50666b;font-size:8pt;overflow-wrap:anywhere}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
+@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9pt/1.3 Arial,"Liberation Sans",sans-serif}header{border-bottom:1.5px solid #2aa198;padding-bottom:2.6mm;margin-bottom:3mm}.brand{color:#2aa198;font-size:8pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1mm 0 .4mm;color:#50666b;font-size:8pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:16pt;line-height:1.05}.facts{margin:1.4mm 0 0;color:#50666b;font-size:8pt}.facts b{color:#002b36;font-weight:700}.days{margin:2.2mm 0 0;display:grid;grid-template-columns:auto 1fr;gap:.35mm 3mm;font-size:7.6pt;color:#50666b}.day{display:contents}.day .when{color:#17343b;font-weight:700;white-space:nowrap}.day .nothing{color:#8ea3a1}.day.free span:last-child{color:#8ea3a1;font-style:italic}.notice{margin:0 0 2.2mm;padding:1.7mm 2.4mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.segment{break-inside:avoid;margin:0 0 1.8mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:4mm;padding:2.1mm 2.4mm;background:#eaf3f2}.segment-head>div{min-width:0}.segment-head .number{color:#61767a;font-size:6.6pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.4mm 0 0;color:#002b36;font-size:11.5pt;line-height:1.15}.segment-head time{flex:none;color:#50666b;font-size:7.8pt;text-align:right}.meta-line{margin-top:.6mm;color:#50666b;font-size:7.8pt;overflow-wrap:anywhere}.sep{color:#9bb0ae;padding:0 .6mm}.state{display:inline-block;padding:.2mm 1.4mm;border:.3mm dashed #789196;border-radius:99mm;color:#50666b;font-size:6.8pt;font-weight:700;white-space:nowrap}.state.held{border-style:solid;border-color:#859900;color:#4f5d10}.option{display:grid;grid-template-columns:5mm 1fr 26mm;gap:2mm;padding:1.5mm 2.4mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.option.alt{padding:1.2mm 2.4mm;color:#50666b}.option.alt .price{font-size:8.5pt;font-weight:700}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:.7mm 0 .4mm;color:#002b36;font:8pt/1.3 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.4pt}.price{text-align:right;color:#002b36;font-size:10pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.note{padding:1.3mm 2.4mm;border-top:1px solid #dbe6e4;color:#50666b;font-size:7.4pt;overflow-wrap:anywhere}.connection{break-inside:avoid;margin:-1mm 2.4mm 2mm;padding:1.4mm 2mm;font-size:8pt;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:3mm;padding-top:2mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
 </style></head><body>"#,
     );
     write!(
         out,
-        "<header><div class=\"brand\">Scout · Planned trip</div><div class=\"route\">{}</div><h1 class=\"title\">{}</h1><div class=\"summary\">",
+        "<header><div class=\"brand\">Scout · Planned trip</div><div class=\"route\">{}</div><h1 class=\"title\">{}</h1><div class=\"facts\">",
         escape(&route),
         escape(&trip.name)
     )
     .unwrap();
+    let mut first = true;
     for (label, value) in [
         ("Travellers", trip.adults.to_string()),
         (
@@ -816,15 +1012,21 @@ pub fn html(plan: &Plan) -> String {
             saved_total(plan).unwrap_or_else(|| "Not available".to_string()),
         ),
     ] {
-        write!(
-            out,
-            "<div class=\"fact\"><b>{}</b><span>{}</span></div>",
-            escape(label),
-            escape(&value)
-        )
-        .unwrap();
+        // One line rather than five tiles across the page. The tiles cost
+        // a fifth of the first page to say five short things, and a
+        // printed plan is read for what happens, not for its metadata.
+        if !first {
+            out.push_str("<span class=\"sep\">·</span>");
+        }
+        first = false;
+        write!(out, "{} <b>{}</b>", escape(label), escape(&value)).unwrap();
     }
-    out.push_str("</div></header>");
+    out.push_str("</div>");
+    // The days first, because a printed plan is carried: the question it
+    // is opened on is "what happens on Thursday", and answering it used
+    // to mean reading every card on it.
+    out.push_str(&days_html(&trip.items));
+    out.push_str("</header>");
 
     let (headline, detail, tone) = readiness_notice(&plan.readiness, flights.len(), &plan.to_book);
     write!(
@@ -844,7 +1046,6 @@ pub fn html(plan: &Plan) -> String {
         )
         .unwrap();
     }
-    out.push_str("<p class=\"page-note\">Times are local to each airport. Flight options not marked Selected are saved alternatives.</p>");
 
     for (index, segment) in trip.items.iter().enumerate() {
         if !segment.is_flight() {
@@ -854,17 +1055,15 @@ pub fn html(plan: &Plan) -> String {
             let place = segment
                 .place
                 .as_deref()
-                .map(|place| format!("<div class=\"place\">{}</div>", escape(place)))
+                .map(|place| format!("<span>{}</span>", escape(place)))
                 .unwrap_or_default();
             let booked = booked_mark(segment);
             write!(
                 out,
-                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}{}{}</div><time>{}</time></div>{}</section>",
+                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}</div><time>{}</time></div>{}</section>",
                 escape(&kind_label(&segment.kind)),
                 escape(&segment.title),
-                place,
-                booked,
-                tickets(segment),
+                meta_line(&[place.clone(), booked.clone(), tickets(segment)]),
                 escape(&item_when(segment)),
                 note(segment)
             )
@@ -873,15 +1072,14 @@ pub fn html(plan: &Plan) -> String {
         }
         write!(
             out,
-            "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">Segment {}</div><h2>{} → {}</h2>{}{}</div><time>{}</time></div>{}",
+            "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">Segment {}</div><h2>{} → {}</h2>{}</div><time>{}</time></div>{}",
             segment.position,
             escape(airport(&segment.origin)),
             escape(airport(&segment.destination)),
             // The mark a stay carries, on a leg: a leg bought by forwarding
             // a confirmation has a code, and the code is the one thing a
             // traveller reads off a printed itinerary at a desk.
-            booked_mark(segment),
-            tickets(segment),
+            meta_line(&[booked_mark(segment), tickets(segment)]),
             escape(&date(&segment.date)),
             note(segment)
         )
@@ -895,6 +1093,24 @@ pub fn html(plan: &Plan) -> String {
         for candidate in &segment.candidates {
             let is_selected = picked == Some(candidate.candidate);
             let (amount, qualifier) = fare(candidate);
+            // An alternative is one line: airline, numbers, times, fare.
+            // The flight the traveller is taking keeps the full block,
+            // because that is what a printed plan is carried for; a
+            // shortlist nobody chose is there to be remembered, not read
+            // at a desk, and three lines each is a page of a long trip.
+            if !is_selected {
+                write!(
+                    out,
+                    "<div class=\"option alt\"><div></div><div><span class=\"airline\">{}</span> <span class=\"numbers\">{}</span> · {} → {} · alternative</div><div class=\"price\">{}</div></div>",
+                    escape(&candidate.airline),
+                    escape(&candidate.flight_numbers.replace(',', " ·")),
+                    escape(clock(candidate.departing_at_local.as_deref())),
+                    escape(clock(candidate.arriving_at_local.as_deref())),
+                    escape(&amount),
+                )
+                .unwrap();
+                continue;
+            }
             write!(
                 out,
                 "<div class=\"option {}\"><div class=\"mark\"></div><div><div><span class=\"airline\">{}</span> <span class=\"numbers\">{}</span>{}</div><div class=\"itinerary\">{}</div><div class=\"meta\">{} → {} · {}{} </div></div><div class=\"price\">{}<small>{}</small></div></div>",
@@ -937,7 +1153,7 @@ pub fn html(plan: &Plan) -> String {
 
     write!(
         out,
-        "<footer class=\"foot\"><strong>Saved itinerary, not a ticket.</strong> Prices shown are the amounts recorded when these options were saved and may have changed. Refresh live fares with Scout before booking. Generated {generated}.</footer></body></html>"
+        "<footer class=\"foot\"><strong>Saved itinerary, not a ticket.</strong> Prices shown are the amounts recorded when these options were saved and may have changed. Refresh live fares with Scout before booking. Times are local to each airport; flight options not marked Selected are saved alternatives. Generated {generated}.</footer></body></html>"
     )
     .unwrap();
     out
@@ -1137,6 +1353,88 @@ mod tests {
         );
         assert!(!html.contains("October <escape>"));
         assert!(!html.contains("Hotel <Roma>"));
+    }
+
+    #[test]
+    fn the_printed_days_are_the_days_the_page_draws() {
+        // Two implementations of one rule — `chat.js::tripDayRows` and
+        // `day_rows` here — with nothing else holding them together.
+        // `day_rows.json` is read by both suites, so neither can change
+        // what a day holds without the other going red: moving the
+        // free-day threshold reddens this test and the node one alike,
+        // which is the thing that was actually checked before shipping.
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            items: Vec<serde_json::Value>,
+            rows: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Cases {
+            cases: Vec<Case>,
+        }
+        let cases: Cases = serde_json::from_str(include_str!("day_rows.json")).unwrap();
+        for case in cases.cases {
+            let items: Vec<TripItem> = case.items.iter().map(item_from_json).collect();
+            let shape: Vec<String> = day_rows(&items)
+                .iter()
+                .map(|row| match row {
+                    DayRow::Free(days) => format!("free {days}"),
+                    DayRow::Day { date, entries } => format!(
+                        "{date}:{}",
+                        entries
+                            .iter()
+                            .map(|entry| if entry.time.is_empty() {
+                                entry.kind.to_string()
+                            } else {
+                                format!("{}@{}", entry.kind, entry.time)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                })
+                .collect();
+            assert_eq!(shape, case.rows, "{}", case.name);
+        }
+    }
+
+    /// One item of a `day_rows.json` case. Only the fields the day rules
+    /// read: the fixture is about which days exist, not about a trip.
+    fn item_from_json(value: &serde_json::Value) -> TripItem {
+        let text = |key: &str| value[key].as_str().map(str::to_string);
+        TripItem {
+            id: value["position"].as_i64().unwrap_or(1),
+            position: value["position"].as_i64().unwrap_or(1),
+            kind: text("kind").unwrap_or_default(),
+            title: text("title").unwrap_or_default(),
+            place: None,
+            origin: text("origin"),
+            destination: text("destination"),
+            date: text("date").unwrap_or_default(),
+            starts_at: text("starts_at"),
+            ends_at: text("ends_at"),
+            booked: value["booked"].as_bool().unwrap_or(false),
+            confirmation_code: None,
+            price: None,
+            currency: None,
+            notes: None,
+            arrival_id: None,
+            candidates: value["candidates"]
+                .as_array()
+                .map(|options| {
+                    options
+                        .iter()
+                        .map(|option| TripCandidate {
+                            chosen: option["chosen"].as_bool().unwrap_or(false),
+                            departing_at_local: option["departing_at_local"].as_str().map(str::to_string),
+                            arriving_at_local: option["arriving_at_local"].as_str().map(str::to_string),
+                            ..candidate()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            attachments: Vec::new(),
+        }
     }
 
     #[test]

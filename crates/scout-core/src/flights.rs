@@ -11,6 +11,7 @@ use crate::specialist::{Finding, Specialist, SPECIALIST_BUDGET};
 use crate::tools::trips::{
     AddTripItemTool, AddTripOptionTool, AddTripSegmentTool, ChooseTripOptionTool, DeleteTripTool,
     DropTripSegmentTool, FinaliseTripTool, KeepTripTool, NoteTripItemTool, ShowTripTool,
+    UpdateTripItemTool,
     UpdateTripSegmentTool,
 };
 use rig::client::CompletionClient;
@@ -29,6 +30,7 @@ const TRIP_TOOLS: &[&str] = &[
     "add_trip_segment",
     "add_trip_item",
     "note_trip_item",
+    "update_trip_item",
     "add_trip_option",
     "choose_trip_option",
     "show_trip",
@@ -105,6 +107,12 @@ something already on the trip, call note_trip_item on that item. Never add \
 a second item to carry one and never drop and re-add an item to give it \
 one: both leave the traveller a duplicate day or a renumbered trip for the \
 sake of a sentence. Sending no note clears the note that is there.
+- When the brief corrects something already on the trip — the time of a \
+lunch, the branch of a restaurant, a name that reads badly, a stay that \
+now runs a day longer — call update_trip_item with only the fields that \
+change. Dropping the item and adding it again loses the tickets that came \
+with it and the confirmation it was read from, and renumbers the trip. A \
+leg's date or route is update_trip_segment's.
 - When the brief asks to keep a named trip, call keep_trip with that name \
 and report that it is kept. Such a brief comes back after the traveller \
 was shown the draft and said yes, so there is nothing left to ask and \
@@ -200,6 +208,7 @@ pub fn build_flight_agent(
         .tool(AddTripSegmentTool { store: d.store.clone(), account_id, conversation_id })
         .tool(AddTripItemTool { store: d.store.clone(), account_id, conversation_id })
         .tool(NoteTripItemTool { store: d.store.clone(), account_id })
+        .tool(UpdateTripItemTool { store: d.store.clone(), account_id })
         .tool(AddTripOptionTool {
             store: d.store.clone(),
             account_id,
@@ -610,6 +619,28 @@ mod tests {
         // The desk is the half that holds the tool, so the rule that stops
         // it building a duplicate item to carry a link lives in its prompt.
         assert!(FLIGHT_PREAMBLE.contains("note_trip_item"), "the desk was never told it can note an item");
+    }
+
+    #[test]
+    fn correcting_an_item_is_a_trip_edit_and_the_desk_knows_the_tool_exists() {
+        // The gap this closes was found live: with no tool to change an
+        // item, the desk's only honest offer was a second activity on the
+        // same day carrying the correction. The rule that stops it doing
+        // that again is in the prompt, not in the tool, because by the
+        // time a tool is called the choice has been made.
+        let view = json!({
+            "trip": {"name": "Hong Kong", "adults": 1, "status": "planning", "items": [], "kept": true},
+            "readiness": {"state": "ready", "legs": []},
+            "changed": "item 2 is Lunch with Stanley on 2026-09-24",
+            "notes": [],
+        });
+        let text = guidance(&[ran("update_trip_item", view)], 0.0).join("\n");
+        assert!(text.contains("A trip may hold stays"), "the trip rules are missing: {text}");
+        assert!(FLIGHT_PREAMBLE.contains("update_trip_item"), "the desk was never told it can correct an item");
+        assert!(
+            FLIGHT_PREAMBLE.contains("update_trip_segment's"),
+            "nothing sends a leg's date to the tool that can move one",
+        );
     }
 
     #[test]

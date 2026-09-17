@@ -1864,6 +1864,159 @@ impl Tool for UpdateTripSegmentTool {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UpdateItemArgs {
+    pub trip: String,
+    pub position: i64,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Empty clears it.
+    #[serde(default)]
+    pub place: Option<String>,
+    #[serde(default)]
+    pub date: Option<String>,
+    /// `HH:MM`; empty clears it.
+    #[serde(default)]
+    pub time: Option<String>,
+    /// Empty clears it.
+    #[serde(default)]
+    pub end_date: Option<String>,
+}
+
+/// Changes a stay, an activity or a transport booking that is already on
+/// the trip.
+///
+/// The gap this fills was found in production: asked to put a maps link on
+/// a lunch already on the trip, the desk had no tool that could change an
+/// item, so the only thing it could offer was a second activity on the
+/// same day. `note_trip_item` answered the note; this answers the rest.
+pub struct UpdateTripItemTool {
+    pub store: Store,
+    pub account_id: i64,
+}
+
+impl Tool for UpdateTripItemTool {
+    const NAME: &'static str = "update_trip_item";
+    type Error = StoreToolError;
+    type Args = UpdateItemArgs;
+    type Output = TripView;
+
+    fn description(&self) -> String {
+        "Change a stay, an activity or a transport booking already on the trip - its \
+         title, place, date, time or end date. This is how you honour \"the lunch is \
+         at half two\" or \"it is the Kowloon branch\": do NOT remove the item and add \
+         it again, which loses the tickets that came with it and the confirmation it \
+         was read from. Send only what changes; an empty string clears a place, a \
+         time or an end date. A flight's date or route goes through \
+         update_trip_segment, and a note through note_trip_item."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "trip": {"type": "string", "description": "the trip's name"},
+                "position": {"type": "integer", "description": "which item, 1-based"},
+                "title": {"type": "string", "description": "what it is called; cannot be emptied"},
+                "place": {"type": "string", "description": "where it is; empty clears it"},
+                "date": {"type": "string", "description": "YYYY-MM-DD; the item moves to where its date puts it"},
+                "time": {"type": "string", "description": "HH:MM local; empty clears it"},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD for a stay's check-out; empty clears it"}
+            },
+            "required": ["trip", "position"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Everything is checked before anything is written, as on the add
+        // path: a mistyped date must not leave half an edit behind.
+        // Owned, because `args` is moved into the blocking closure below
+        // and a borrow of it could not live that long.
+        let title = match args.title.as_deref().map(str::trim) {
+            Some("") => {
+                return Err(StoreToolError(
+                    "an item needs a title — send the new one, or leave it out to keep the old".to_string(),
+                ))
+            }
+            other => other.map(str::to_string),
+        };
+        let date = args.date.as_deref().map(|d| calendar_date("date", d)).transpose()?;
+        // A blank stays blank: it is how the model clears the field.
+        let time = match args.time.as_deref().map(str::trim) {
+            Some("") => Some(String::new()),
+            Some(t) => Some(local_time(t)?),
+            None => None,
+        };
+        let end_date = match args.end_date.as_deref().map(str::trim) {
+            Some("") => Some(String::new()),
+            Some(d) => Some(calendar_date("end_date", d)?),
+            None => None,
+        };
+        let place = args.place.as_deref().map(str::trim).map(str::to_string);
+        if title.is_none() && place.is_none() && date.is_none() && time.is_none() && end_date.is_none() {
+            return Err(StoreToolError(
+                "say what to change: title, place, date, time or end_date".to_string(),
+            ));
+        }
+        let store = self.store.clone();
+        let account_id = self.account_id;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(Trip, bool)> {
+            let trip = find_trip_or_list(&store, account_id, &args.trip)?;
+            // The end is compared against the date the item will have, not
+            // the one it was sent with: an edit that moves only the start
+            // must not be allowed to leave a stay checking out before it
+            // begins. Read under the same lock the write takes.
+            let existing = trip.items.iter().find(|item| item.position == args.position);
+            // Named for the model rather than left to the store's own
+            // words: the store says `update_flight`, which is a function
+            // nobody on the other end of this can call.
+            if existing.is_some_and(|item| item.is_flight()) {
+                anyhow::bail!(
+                    "item {} is a flight — update_trip_segment changes a leg's date or route, \
+                     and this tool is for stays, activities and transport",
+                    args.position
+                );
+            }
+            let start = date.clone().or_else(|| existing.map(|item| item.date.clone())).unwrap_or_default();
+            if let Some(end) = end_date.as_deref().filter(|end| !end.is_empty() && **end < *start.as_str()) {
+                anyhow::bail!("end_date {end} is before date {start}");
+            }
+            store
+                .update_item(
+                    trip.id,
+                    args.position,
+                    crate::store::ItemEdit {
+                        title: title.as_deref(),
+                        place: place.as_deref(),
+                        date: date.as_deref(),
+                        time: time.as_deref(),
+                        end_date: end_date.as_deref(),
+                    },
+                )
+                .map_err(lost_trip_race)
+        })
+        .await
+        .map_err(internal)?
+        .map(|(trip, changed)| {
+            // Named by what the traveller calls it and where it now sits,
+            // because a date change moves it and the model is holding the
+            // old number.
+            let at = trip.items.iter().find(|item| item.position == args.position);
+            let now = at.map_or_else(
+                || format!("item {}", args.position),
+                |item| format!("item {} is {} on {}", item.position, item.title, item.date),
+            );
+            let said = match changed {
+                true => now,
+                false => format!("{now} already — nothing to change"),
+            };
+            TripView::after(trip, said)
+        })
+        .map_err(internal)
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct NoteItemArgs {
     pub trip: String,
     pub position: i64,
@@ -2963,6 +3116,94 @@ mod tests {
             .unwrap();
         let said = again.changed.expect("a no-op still reports");
         assert!(said.contains("already"), "a no-op is not a failure: {said}");
+    }
+
+    #[tokio::test]
+    async fn an_item_already_on_a_trip_can_be_corrected_without_being_rebuilt() {
+        // Asked to put a maps link on a lunch already on the trip, Scout
+        // could only offer a second activity on the same day: nothing
+        // could change an item once it existed. `note_trip_item` answered
+        // the note; this answers the rest — a wrong time, a corrected
+        // place, a title that reads badly.
+        let (store, _d) = setup();
+        let add = AddTripItemTool { store: store.clone(), account_id: 7, conversation_id: 99 };
+        add.call(AddItemArgs {
+            trip: "Hong Kong".into(), kind: "activity".into(), title: "Lunch".into(),
+            place: None, date: "2026-09-24".into(), time: Some("12:00".into()),
+            end_date: None, notes: None, adults: None, cabin_class: None,
+        })
+        .await
+        .unwrap();
+        let edit = UpdateTripItemTool { store: store.clone(), account_id: 7 };
+
+        let view = edit
+            .call(UpdateItemArgs {
+                trip: "Hong Kong".into(), position: 1,
+                title: Some("Lunch with Stanley".into()),
+                place: Some("Queen's Cafe, North Point".into()),
+                time: Some("14:30".into()),
+                date: None, end_date: None,
+            })
+            .await
+            .unwrap();
+        let said = view.changed.expect("an edit says what it did");
+        assert!(said.contains("Lunch with Stanley"), "got: {said}");
+        assert_eq!(view.trip.items[0].title, "Lunch with Stanley");
+        assert_eq!(view.trip.items[0].place.as_deref(), Some("Queen's Cafe, North Point"));
+
+        // Asking for what is already true is not a failure, and must not
+        // read as one — the same answer the segment edit gives.
+        let again = edit
+            .call(UpdateItemArgs {
+                trip: "Hong Kong".into(), position: 1, title: Some("Lunch with Stanley".into()),
+                place: None, date: None, time: None, end_date: None,
+            })
+            .await
+            .unwrap();
+        assert!(again.changed.as_deref().expect("a no-op still reports").contains("already"), "{:?}", again.changed);
+
+        // Nothing named is a question, not an edit.
+        assert!(edit
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: None, date: None, time: None, end_date: None })
+            .await
+            .is_err());
+
+        // A blank clears; a blank title does not, because the item is
+        // drawn by it.
+        assert!(edit
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: Some("  ".into()), place: None, date: None, time: None, end_date: None })
+            .await
+            .is_err());
+        let cleared = edit
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: Some("".into()), date: None, time: None, end_date: None })
+            .await
+            .unwrap();
+        assert_eq!(cleared.trip.items[0].place, None);
+
+        // The same validation the add path does, and before anything is
+        // written: a date that is not a date, and an end before its start.
+        assert!(edit
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: None, date: Some("the 24th".into()), time: None, end_date: None })
+            .await
+            .is_err());
+        assert!(edit
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: None, date: Some("2026-09-24".into()), time: None, end_date: Some("2026-09-20".into()) })
+            .await
+            .is_err());
+
+        // And a flight is sent to the tool that knows how to move one.
+        AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 }
+            .call(AddSegmentArgs {
+                trip: "Hong Kong".into(), origin: "AMS".into(), destination: "HKG".into(),
+                departure_date: "2026-09-21".into(), adults: None, cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let err = edit
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: Some("Nope".into()), place: None, date: None, time: None, end_date: None })
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("update_trip_segment"), "the model is sent somewhere: {}", err.0);
     }
 
     #[tokio::test]

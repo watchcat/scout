@@ -27,6 +27,7 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/trips/choice", post(choose))
         .route("/chat/trips/segment", post(add_leg).delete(remove_leg))
         .route("/chat/trips/item-note", post(note_item))
+        .route("/chat/trips/item-held", post(hold_item))
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             super::only_from_our_own_pages,
@@ -319,6 +320,55 @@ struct NoteItemIn {
     #[serde(alias = "departure_date")]
     date: Option<String>,
     note: Option<String>,
+}
+
+/// What the page sends to mark an item held, or let it go. The item is
+/// named the way `NoteItemIn` names one, and guarded the same way.
+#[derive(serde::Deserialize)]
+struct HoldItemIn {
+    trip: String,
+    position: i64,
+    origin: Option<String>,
+    destination: Option<String>,
+    title: Option<String>,
+    #[serde(alias = "departure_date")]
+    date: Option<String>,
+    held: bool,
+}
+
+async fn hold_item(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<HoldItemIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match scout_core::trips::hold_item(
+        &auth.core,
+        account_id,
+        &body.trip,
+        body.position,
+        scout_core::trips::ItemExpectation {
+            origin: body.origin,
+            destination: body.destination,
+            title: body.title,
+            date: body.date,
+        },
+        body.held,
+    )
+    .await
+    {
+        Ok(out) => leg_response(out),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not mark a trip item held");
+            sorry()
+        }
+    }
 }
 
 async fn note_item(
@@ -1010,6 +1060,61 @@ mod tests {
             line.contains(&scout_core::trips::MAX_NOTE_CHARS.to_string()),
             "the page offers a different length than the store accepts: {line}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_item_is_marked_held_from_the_page_and_a_stale_card_is_a_conflict() {
+        // The gap the owner hit in chat, on the page: a lunch arranged
+        // over WhatsApp is held, and nothing could say so.
+        let (app, core, _dir, account_id, cookie, csrf) = setup().await;
+        scout_core::trips::seed_item_for_tests(&core, account_id, "October", "activity", "Lunch with Stanley", "2026-10-12")
+            .await
+            .unwrap();
+
+        let stale = post_json(
+            &app,
+            "/chat/trips/item-held",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":2,"title":"Dinner with Stanley","date":"2026-10-12","held":true}"#,
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let res = post_json(
+            &app,
+            "/chat/trips/item-held",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","held":true}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(response["items"][1]["booked"], true);
+
+        // And off again, because plans fall through.
+        let res = post_json(
+            &app,
+            "/chat/trips/item-held",
+            &cookie,
+            Some(&csrf),
+            r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","held":false}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(response["items"][1]["booked"], false);
+
+        let bare = post_json(
+            &app,
+            "/chat/trips/item-held",
+            &cookie,
+            None,
+            r#"{"trip":"October","position":2,"title":"Lunch with Stanley","held":true}"#,
+        )
+        .await;
+        assert_eq!(bare.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

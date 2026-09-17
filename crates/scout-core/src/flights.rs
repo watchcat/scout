@@ -110,7 +110,11 @@ sake of a sentence. Sending no note clears the note that is there.
 - When the brief corrects something already on the trip — the time of a \
 lunch, the branch of a restaurant, a name that reads badly, a stay that \
 now runs a day longer — call update_trip_item with only the fields that \
-change. Dropping the item and adding it again loses the tickets that came \
+change. That tool also holds whether the traveller has the thing: set \
+booked true when the brief says they do, whether it came from a \
+confirmation, a phone call or a friend saying yes, and false when \
+something falls through. A booking with no reference number is ordinary; \
+never invent one to justify the flag. Dropping the item and adding it again loses the tickets that came \
 with it and the confirmation it was read from, and renumbers the trip. A \
 leg's date or route is update_trip_segment's.
 - When the brief asks to keep a named trip, call keep_trip with that name \
@@ -640,6 +644,18 @@ mod tests {
         assert!(
             FLIGHT_PREAMBLE.contains("update_trip_segment's"),
             "nothing sends a leg's date to the tool that can move one",
+        );
+        // The gap the owner hit: a lunch arranged over WhatsApp could not
+        // be marked held, and the desk — truthful about its own tools —
+        // said so three times. Holding is the traveller's word, and the
+        // desk has to know it may take it.
+        assert!(
+            FLIGHT_PREAMBLE.contains("booked true when the brief says they do"),
+            "the desk was never told it may mark something held on the traveller's word",
+        );
+        assert!(
+            FLIGHT_PREAMBLE.contains("never invent one"),
+            "nothing stops a reference number being made up to justify the flag",
         );
     }
 

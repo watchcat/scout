@@ -580,6 +580,19 @@ pub struct NewItem {
     pub arrival_id: Option<i64>,
 }
 
+/// The fields of an item an edit may touch, each one optional. See
+/// `Store::update_item` for what a blank means and why a title cannot be
+/// one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ItemEdit<'a> {
+    pub title: Option<&'a str>,
+    pub place: Option<&'a str>,
+    pub date: Option<&'a str>,
+    /// `HH:MM`, local to wherever the item is.
+    pub time: Option<&'a str>,
+    pub end_date: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TripCandidate {
     pub candidate: i64,
@@ -3516,6 +3529,75 @@ impl Store {
     ///
     /// A change that changes nothing keeps them — restating a date must not
     /// cost the traveller their shortlist.
+    /// What an edit asks to change on an item. `None` leaves the field as
+    /// it is; `Some("")` clears it, which is how a place typed by mistake
+    /// or a time that turned out not to be fixed comes off again.
+    ///
+    /// `title` is the exception: an item is drawn by its title, so there
+    /// is nothing for a blank one to mean. The tool refuses it before it
+    /// reaches here.
+    pub fn update_item(&self, trip_id: i64, position: i64, edit: ItemEdit<'_>) -> Result<(Trip, bool)> {
+        let conn = self.conn();
+        let Some((item_id, kind)) = item_at(&conn, trip_id, position)? else {
+            anyhow::bail!("this trip has no item {position}");
+        };
+        // A leg's date and route belong to `update_flight`, which also
+        // drops the options quoted for the old ones. Changing them here
+        // would leave a flight described as one journey and priced as
+        // another.
+        if kind == "flight" {
+            anyhow::bail!("item {position} is a flight; its date and route go through update_flight");
+        }
+        let (title, place, date, starts_at, ends_at) = conn.query_row(
+            "SELECT title, place, date, starts_at, ends_at FROM trip_items WHERE id = ?",
+            params![item_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )?;
+        let keep = |asked: Option<&str>, current: Option<String>| -> Option<String> {
+            match asked {
+                Some("") => None,
+                Some(value) => Some(value.to_string()),
+                None => current,
+            }
+        };
+        let wanted_title = edit.title.unwrap_or(&title).to_string();
+        let wanted_date = edit.date.unwrap_or(&date).to_string();
+        let wanted_place = keep(edit.place, place.clone());
+        let wanted_ends = keep(edit.end_date, ends_at.clone());
+        // The clock hangs off the item's own day, so moving the day moves
+        // the time with it: a lunch at 14:30 on the 24th that becomes the
+        // 20th is still at 14:30, and a `starts_at` left on the old date
+        // would sort the item by a day it is no longer on.
+        let wanted_time = keep(edit.time, starts_at.as_deref().map(|at| at[11..16].to_string()));
+        let wanted_starts = wanted_time.map(|clock| format!("{wanted_date}T{clock}:00"));
+        if (&wanted_title, &wanted_place, &wanted_date, &wanted_starts, &wanted_ends)
+            == (&title, &place, &date, &starts_at, &ends_at)
+        {
+            // Asking for what is already true is not a failure, and the
+            // caller has to be able to tell the two apart — as on a leg.
+            return Ok((load_trip(&conn, trip_id)?, false));
+        }
+        conn.execute(
+            "UPDATE trip_items SET title = ?, place = ?, date = ?, starts_at = ?, ends_at = ?,
+                 updated_at = current_timestamp
+             WHERE id = ?",
+            params![wanted_title, wanted_place, wanted_date, wanted_starts, wanted_ends, item_id],
+        )?;
+        // Positions follow dates on every write, and a date is one of the
+        // things this changes.
+        reorder_items(&conn, trip_id)?;
+        touch(&conn, trip_id)?;
+        Ok((load_trip(&conn, trip_id)?, true))
+    }
+
     pub fn update_flight(
         &self,
         trip_id: i64,
@@ -7915,6 +7997,61 @@ CREATE TABLE trips (
         // Clearing and never having had one end in the same place.
         assert!(store.note_item_checked(trip.id, 1, seen("Lunch with Stanley"), None).unwrap());
         assert_eq!(store.trip_by_id(account, trip.id).unwrap().unwrap().items[0].notes, None);
+    }
+
+    #[test]
+    fn an_item_can_be_changed_where_it_stands_and_moves_if_its_date_does() {
+        // Until this, the only way to fix a wrong time was to remove the
+        // item and add it again — which loses its files, its link back to
+        // the confirmation it came from, and renumbers everything after
+        // it. From chat the model's only honest offer was a duplicate.
+        let (store, _dir) = test_store();
+        let account = store.account_for_telegram(1).unwrap();
+        let trip = store.upsert_trip(account, "Hong Kong", None, None, None).unwrap();
+        store.add_item(trip.id, stay("Lunch", "2026-09-24", "2026-09-24")).unwrap();
+        store.add_item(trip.id, stay("Hotel", "2026-09-22", "2026-09-29")).unwrap();
+        let unchanged = ItemEdit::default();
+        assert!(!store.update_item(trip.id, 1, unchanged).unwrap().1, "asking for what is already true is not a change");
+
+        // The hotel is position 1 — it starts first — and the lunch 2.
+        let by_title = |trip: &Trip| trip.items.iter().map(|i| i.title.clone()).collect::<Vec<_>>();
+        assert_eq!(by_title(&store.trip_by_id(account, trip.id).unwrap().unwrap()), ["Hotel", "Lunch"]);
+
+        let (trip_after, changed) = store
+            .update_item(
+                trip.id,
+                2,
+                ItemEdit { title: Some("Lunch with Stanley"), place: Some("Queen's Cafe"), time: Some("14:30"), ..Default::default() },
+            )
+            .unwrap();
+        assert!(changed);
+        let lunch = trip_after.items.iter().find(|i| i.position == 2).unwrap();
+        assert_eq!(lunch.title, "Lunch with Stanley");
+        assert_eq!(lunch.place.as_deref(), Some("Queen's Cafe"));
+        assert_eq!(lunch.starts_at.as_deref(), Some("2026-09-24T14:30:00"), "the clock hangs off the item's own day");
+
+        // A date that moves the item past its neighbour renumbers the
+        // trip, the way every other write does.
+        let (moved, _) = store.update_item(trip.id, 2, ItemEdit { date: Some("2026-09-20"), ..Default::default() }).unwrap();
+        assert_eq!(by_title(&moved), ["Lunch with Stanley", "Hotel"]);
+        let lunch = moved.items.iter().find(|i| i.title == "Lunch with Stanley").unwrap();
+        assert_eq!(lunch.date, "2026-09-20");
+        assert_eq!(lunch.starts_at.as_deref(), Some("2026-09-20T14:30:00"), "the time followed its day rather than being left on the old one");
+
+        // A blank clears what it names; the title is the one field that
+        // cannot be cleared, since the item is drawn by it.
+        let (cleared, _) = store.update_item(trip.id, 1, ItemEdit { place: Some(""), time: Some(""), ..Default::default() }).unwrap();
+        let lunch = cleared.items.iter().find(|i| i.title == "Lunch with Stanley").unwrap();
+        assert_eq!(lunch.place, None);
+        assert_eq!(lunch.starts_at, None);
+
+        // A flight is not this tool's business: its route and date belong
+        // to `update_flight`, which drops the options that were quoted for
+        // the old one.
+        store.add_flight(trip.id, "AMS", "HKG", "2026-09-21").unwrap();
+        let leg = store.trip_by_id(account, trip.id).unwrap().unwrap();
+        let position = leg.items.iter().find(|i| i.kind == "flight").unwrap().position;
+        assert!(store.update_item(trip.id, position, ItemEdit { title: Some("Anything"), ..Default::default() }).is_err());
     }
 
     // ---- invite rounds, membership, waitlist ----

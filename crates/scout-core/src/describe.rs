@@ -61,7 +61,7 @@ pub fn describe(tool: &str, args: &serde_json::Value) -> String {
         "flight_booking_links" | "create_booking_link" => "🔗 fetching booking links".to_string(),
         "finalise_trip" => "✈️ pricing the trip".to_string(),
         "show_trip" => "🗺️ reading the trip".to_string(),
-        "add_trip_segment" | "add_trip_item" | "note_trip_item" | "add_trip_option"
+        "add_trip_segment" | "add_trip_item" | "note_trip_item" | "update_trip_item" | "add_trip_option"
         | "choose_trip_option" | "update_trip_segment" | "drop_trip_segment" | "delete_trip" => {
             "🗺️ updating the trip".to_string()
         }
@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(describe("create_booking_link", &json!({})), "🔗 fetching booking links");
         assert_eq!(describe("finalise_trip", &json!({"trip": "Lisbon"})), "✈️ pricing the trip");
         assert_eq!(describe("show_trip", &json!({})), "🗺️ reading the trip");
-        for tool in ["add_trip_segment", "add_trip_item", "note_trip_item", "add_trip_option", "choose_trip_option", "update_trip_segment", "drop_trip_segment", "delete_trip"] {
+        for tool in ["add_trip_segment", "add_trip_item", "note_trip_item", "update_trip_item", "add_trip_option", "choose_trip_option", "update_trip_segment", "drop_trip_segment", "delete_trip"] {
             assert_eq!(describe(tool, &json!({})), "🗺️ updating the trip", "{tool}");
         }
     }

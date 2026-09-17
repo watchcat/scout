@@ -376,7 +376,11 @@
      its chips would take that away in exchange for room the chips do not
      need. */
   .trip-days{margin-top:14px; padding-top:12px; border-top:1px solid var(--line);
-    display:grid; grid-template-columns:auto 1fr; gap:4px 12px; align-items:baseline}
+    /* `minmax(0, 1fr)`, not `1fr`: a grid column's default minimum is its
+       content, so one long chip — a hotel name and its nights — made the
+       whole overview wider than a phone and took the card's right edge
+       off the screen with it. */
+    display:grid; grid-template-columns:auto minmax(0, 1fr); gap:4px 12px; align-items:baseline}
   .day-row{display:contents}
   .day-label{color:var(--base1); font-size:12px; font-weight:650; white-space:nowrap;
     font-variant-numeric:tabular-nums}

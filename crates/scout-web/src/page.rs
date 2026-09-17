@@ -207,7 +207,14 @@ mod tests {
         assert!(page.contains(r#"srcset="/assets/trips-mobile.webp""#));
         assert!(page.contains(r#"width="1360" height="960""#));
         assert!(page.contains(r#"width="390" height="844""#));
-        assert!(page.contains("alt=\"Scout trip planner showing Amsterdam"));
+        // The alt text says what the shot actually shows, and the shot is
+        // re-rendered from the client whenever the client changes — so
+        // this pins the shape of the sentence rather than its nouns: a
+        // reader who cannot see the image is owed the day rows and the
+        // two states, which are what the picture is of.
+        assert!(page.contains("alt=\"Scout trip planner"), "the shot lost its description");
+        assert!(page.contains("a row for each day"), "the alt text does not say what the shot shows");
+        assert!(page.contains("still to book"), "the alt text does not say the two states apart");
     }
 
     #[test]

@@ -40,6 +40,15 @@ pub struct Plan {
     /// re-shop seats they are holding. Delete this field, and the sentence
     /// with it, one release after `readiness` ships.
     pub not_ready: Option<String>,
+    /// What the traveller still has to book, by name — everything on the
+    /// trip that is not a flight and not held.
+    ///
+    /// Separate from `readiness` because they are separate questions, and
+    /// running them together is how the banner came to tell somebody with
+    /// three unbooked activities that nothing was waiting on them.
+    /// `readiness` is about what Scout can still price, which is about
+    /// flights; this is about what the person still has to go and get.
+    pub to_book: Vec<String>,
     pub notes: Vec<String>,
     /// The chat this trip belongs to. `None` is orphaned — an ordinary
     /// state, reached by outliving the chat that made it.
@@ -59,11 +68,16 @@ impl Plan {
                     .to_string(),
             ),
             Readiness::Ready { .. } => None,
+            // An old tab reads the absence of this as "nothing is wrong",
+            // which for a trip with no flights on it is exactly right.
+            Readiness::NoFlights => None,
         };
+        let to_book = crate::tools::trips::still_to_book(&trip.items);
         Self {
             trip,
             readiness,
             not_ready,
+            to_book,
             notes,
             chat,
         }

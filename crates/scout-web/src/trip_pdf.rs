@@ -560,30 +560,75 @@ fn list_of(items: &[String]) -> String {
 /// `flights` is how many flights the plan draws, which is what tells
 /// "pricing this trip" from "pricing what is left of it" — `legs` names
 /// only the ones still to buy.
-fn readiness_notice(readiness: &Readiness, flights: usize) -> (&'static str, String, &'static str) {
+/// The banner's two questions, printed. `to_book` is the second of them —
+/// what the traveller still has to go and get — and it is why "Booked."
+/// no longer speaks for a trip with three unbooked activities on it. The
+/// page's `chat.js::readinessAlert` says the same things in the same
+/// cases; the two must not disagree on paper and on screen.
+/// What is still to book, as a sentence, or empty when nothing is. The
+/// paper half of `chat.js::bookingLine`, down to where it stops naming
+/// and starts counting: a banner is a glance, and the items below say it
+/// each for themselves.
+fn booking_line(to_book: &[String]) -> String {
+    let names: Vec<&str> = to_book.iter().map(|name| name.trim()).filter(|name| !name.is_empty()).collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    let owned: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+    if owned.len() <= 3 {
+        return format!("{} {} not booked yet.", list_of(&owned), if owned.len() == 1 { "is" } else { "are" });
+    }
+    format!("{}, and {} more, are not booked yet.", list_of(&owned[..3]), owned.len() - 3)
+}
+
+fn readiness_notice(
+    readiness: &Readiness,
+    flights: usize,
+    to_book: &[String],
+) -> (&'static str, String, &'static str) {
+    let booking = booking_line(to_book);
+    let joined = |first: String| {
+        if booking.is_empty() { first } else { format!("{first} {booking}") }
+    };
     match readiness {
-        Readiness::Booked => (
+        Readiness::Booked if booking.is_empty() => (
             "Booked.",
-            "Every flight on this trip is a ticket the traveller already holds.".to_string(),
+            "Everything on this trip is held. Nothing is waiting on the traveller.".to_string(),
             "ok",
         ),
+        Readiness::Booked => (
+            "Flights booked.",
+            joined("Every flight on this trip is a ticket the traveller already holds.".to_string()),
+            "ok",
+        ),
+        // A trip with no flights is not a trip with a problem: pricing has
+        // nothing to do here, and the refusal the pricing tool gives such a
+        // trip was being printed as though something were wrong with it.
+        Readiness::NoFlights if booking.is_empty() => (
+            "Booked.",
+            "Everything on this trip is held. Nothing is waiting on the traveller.".to_string(),
+            "ok",
+        ),
+        Readiness::NoFlights => ("Nothing to price.", format!("This trip has no flights. {booking}"), "ok"),
         Readiness::Ready { legs } if legs.len() < flights => (
             "Ready to price.",
-            format!(
+            joined(format!(
                 "Only {} {} still to buy; the rest of this trip is already booked. Refresh live \
                  fares with Scout before booking.",
                 list_of(legs),
                 if legs.len() == 1 { "is" } else { "are" },
-            ),
+            )),
             "ok",
         ),
         Readiness::Ready { .. } => (
             "Ready to price.",
-            "Every segment has a flight selected. Refresh live fares with Scout before booking."
-                .to_string(),
+            joined(
+                "Every segment has a flight selected. Refresh live fares with Scout before booking."
+                    .to_string(),
+            ),
             "ok",
         ),
-        Readiness::NotReady { reason } => ("Needs a decision.", reason.clone(), ""),
+        Readiness::NotReady { reason } => ("Needs a decision.", joined(reason.clone()), ""),
     }
 }
 
@@ -773,7 +818,7 @@ pub fn html(plan: &Plan) -> String {
     }
     out.push_str("</div></header>");
 
-    let (headline, detail, tone) = readiness_notice(&plan.readiness, flights.len());
+    let (headline, detail, tone) = readiness_notice(&plan.readiness, flights.len(), &plan.to_book);
     write!(
         out,
         "<div class=\"notice {tone}\"><strong>{headline}</strong> {}</div>",
@@ -1027,6 +1072,7 @@ mod tests {
             // this file touches it: the printed plan is built from
             // `readiness` like the page's own renderer.
             not_ready: None,
+            to_book: Vec::new(),
             notes: vec!["Separate tickets need extra care.".to_string()],
             chat: None,
         }
@@ -1083,6 +1129,35 @@ mod tests {
         );
         assert!(!html.contains("October <escape>"));
         assert!(!html.contains("Hotel <Roma>"));
+    }
+
+    #[test]
+    fn the_printed_banner_says_what_is_still_to_book_the_way_the_page_does() {
+        // The two surfaces have to agree: a trip whose flights are held
+        // but whose activities are not must not be headed "Booked." on
+        // paper while the page says otherwise — and "nothing is waiting
+        // on you" is the sentence the live report was about.
+        let mut held = plan();
+        held.readiness = Readiness::Booked;
+        held.to_book = vec!["Silver workshop".to_string(), "Dolphin tour".to_string()];
+        let page = html(&held);
+        assert!(page.contains("Flights booked."), "{page}");
+        assert!(page.contains("Silver workshop and Dolphin tour are not booked yet."), "{page}");
+        assert!(!page.contains("Nothing is waiting"), "{page}");
+
+        held.to_book = Vec::new();
+        let page = html(&held);
+        assert!(page.contains("Booked."));
+        assert!(page.contains("Nothing is waiting on the traveller."), "{page}");
+
+        // A trip with no flights is not a trip with a problem.
+        let mut city = plan();
+        city.readiness = Readiness::NoFlights;
+        city.to_book = vec!["Hotel Alfama".to_string()];
+        let page = html(&city);
+        assert!(page.contains("Nothing to price."), "{page}");
+        assert!(page.contains("Hotel Alfama is not booked yet."), "{page}");
+        assert!(!page.contains("no flights yet"), "a flightless trip was printed as a fault: {page}");
     }
 
     #[test]

@@ -421,14 +421,50 @@ export const ITINERARY_NOTE = 'Itinerary note.'
 // reader is holding. "Needs a decision" would be the opposite mistake,
 // asking for a decision nobody owes. So booked is its own state, and the
 // wording of the other two is unchanged where it still fits.
+// What is still to book, as a sentence, or '' when nothing is.
+//
+// Named up to three and counted after that: this line is read at a
+// glance above the timeline, and a trip with nine loose activities would
+// otherwise put the whole list where the reader is looking for a state.
+// The items themselves are right below, each one saying for itself.
+function bookingLine(toBook) {
+  const names = (toBook ?? []).filter((name) => String(name ?? '').trim())
+  if (!names.length) return ''
+  if (names.length <= 3) {
+    return `${listOf(names)} ${names.length === 1 ? 'is' : 'are'} not booked yet.`
+  }
+  return `${listOf(names.slice(0, 3))}, and ${names.length - 3} more, are not booked yet.`
+}
+
+// Two questions, and the banner used to answer only one of them: what
+// Scout can still price is about flights, and what the traveller still
+// has to book is about everything. Answering the first and speaking for
+// the whole trip is how a fully ticketed itinerary came to say "nothing
+// here is waiting on you" to somebody with three unbooked activities on
+// the screen below it.
 export function readinessAlert(trip) {
   const readiness = trip?.readiness
+  const booking = bookingLine(trip?.to_book)
   if (readiness?.state === 'booked') {
-    return {
-      tone: 'ready',
-      headline: 'Booked.',
-      text: 'Every flight on this trip is a ticket you already hold. Nothing here is waiting on you.',
-    }
+    return booking
+      ? {
+          tone: 'ready',
+          headline: 'Flights booked.',
+          text: `Every flight on this trip is a ticket you already hold. ${booking}`,
+        }
+      : {
+          tone: 'ready',
+          headline: 'Booked.',
+          text: 'Everything on this trip is held. Nothing is waiting on you.',
+        }
+  }
+  // No flights is not a problem to fix. A week in one city is a whole
+  // trip; pricing simply has nothing to do with it, and the refusal the
+  // pricing tool gives such a trip used to be drawn here as a blocker.
+  if (readiness?.state === 'no_flights') {
+    return booking
+      ? { tone: 'ready', headline: 'Nothing to price.', text: `This trip has no flights. ${booking}` }
+      : { tone: 'ready', headline: 'Booked.', text: 'Everything on this trip is held. Nothing is waiting on you.' }
   }
   if (readiness?.state === 'ready') {
     const legs = readiness.legs ?? []
@@ -439,13 +475,25 @@ export function readinessAlert(trip) {
     return {
       tone: 'ready',
       headline: 'Ready to price.',
-      text: rest > 0
-        ? `Only ${listOf(legs)} ${legs.length === 1 ? 'is' : 'are'} still to buy. Ask Scout in chat to price ${legs.length === 1 ? 'it' : 'them'}; the rest of this trip is already booked.`
-        : 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.',
+      text: [
+        rest > 0
+          ? `Only ${listOf(legs)} ${legs.length === 1 ? 'is' : 'are'} still to buy. Ask Scout in chat to price ${legs.length === 1 ? 'it' : 'them'}; the rest of this trip is already booked.`
+          : 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.',
+        booking,
+      ]
+        .filter(Boolean)
+        .join(' '),
     }
   }
   if (readiness?.state === 'not_ready') {
-    return { tone: 'alert', headline: 'Needs a decision.', text: readiness.reason ?? '' }
+    // The decision comes first — it is the thing holding the trip up —
+    // and what is still to book is said after it rather than waiting for
+    // the decision to be made.
+    return {
+      tone: 'alert',
+      headline: 'Needs a decision.',
+      text: [readiness.reason ?? '', booking].filter(Boolean).join(' '),
+    }
   }
   return null
 }

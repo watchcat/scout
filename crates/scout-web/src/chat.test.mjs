@@ -475,6 +475,54 @@ test('a trip with every flight bought is called booked, not ready to price', () 
   assert.doesNotMatch(alert.text, /price|decision/i)
 })
 
+test('the banner says what is still to book, not only what is still to price', () => {
+  // The live report: a fully ticketed trip said "nothing here is waiting
+  // on you" while three activities on it were unbooked. Two questions,
+  // two sentences — what Scout can price is about flights, what the
+  // reader still has to go and get is about everything else.
+  const flights = (count) => Array.from({ length: count }, () => ({ kind: 'flight' }))
+  const held = readinessAlert({ readiness: { state: 'booked' }, items: flights(2), to_book: [] })
+  assert.equal(held.headline, 'Booked.')
+  assert.match(held.text, /Nothing is waiting on you/)
+
+  const partly = readinessAlert({
+    readiness: { state: 'booked' },
+    items: flights(2),
+    to_book: ['Lunch with Stanley', 'Obellery silver workshop', 'Pink dolphin tour'],
+  })
+  assert.equal(partly.headline, 'Flights booked.')
+  assert.doesNotMatch(partly.text, /Nothing is waiting on you/)
+  assert.match(partly.text, /Lunch with Stanley, Obellery silver workshop and Pink dolphin tour are not booked yet/)
+
+  // A long list stops naming and starts counting: the banner is a glance,
+  // not an inventory.
+  const many = readinessAlert({
+    readiness: { state: 'booked' },
+    items: flights(1),
+    to_book: ['One', 'Two', 'Three', 'Four', 'Five'],
+  })
+  assert.match(many.text, /One, Two and Three, and 2 more, are not booked yet/)
+
+  // A city break is not a broken trip: no flights, nothing to price, and
+  // the only thing worth saying is what is left to book.
+  const city = readinessAlert({ readiness: { state: 'no_flights' }, items: [{ kind: 'stay' }], to_book: ['Hotel Alfama'] })
+  assert.equal(city.tone, 'ready')
+  assert.doesNotMatch(city.text, /no flights yet|nothing to price/i)
+  assert.match(city.text, /Hotel Alfama is not booked yet/)
+  const cityHeld = readinessAlert({ readiness: { state: 'no_flights' }, items: [{ kind: 'stay' }], to_book: [] })
+  assert.equal(cityHeld.headline, 'Booked.')
+
+  // The pricing half keeps its own sentence, and the booking half is
+  // added to it rather than replacing it.
+  const both = readinessAlert({
+    readiness: { state: 'ready', legs: ['segment 1 (AMS→HKG)'] },
+    items: flights(1),
+    to_book: ['Hotel Alfama'],
+  })
+  assert.match(both.text, /refresh live fares/)
+  assert.match(both.text, /Hotel Alfama is not booked yet/)
+})
+
 test('the legs being priced are named when the rest of the trip is already bought', () => {
   const flights = (count) => Array.from({ length: count }, () => ({ kind: 'flight' }))
   // Nothing booked: every segment is being priced, so the copy that has

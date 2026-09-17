@@ -592,6 +592,12 @@ pub enum Readiness {
     /// Why this trip cannot be priced yet, in the words the flight agent
     /// would refuse in.
     NotReady { reason: String },
+    /// This trip has no flights on it. Not a refusal and not a state to
+    /// fix: a week in one city with a hotel and two activities is a whole
+    /// trip, and `finalise_trip` turning it away is about pricing, which
+    /// is a thing this trip has no use for. A view that drew that refusal
+    /// as a blocker was telling the traveller their trip was broken.
+    NoFlights,
 }
 
 impl Readiness {
@@ -604,6 +610,18 @@ impl Readiness {
     /// call a trip finished that the tool still turns away, and
     /// disagreeing with the tool is the older bug here.
     pub fn of(items: &[TripItem]) -> Self {
+        // Dates first, and before the flightless answer below: an
+        // itinerary that cannot be travelled as written is worth saying
+        // whether or not there is a fare to fetch.
+        if let Err(reason) = dates_run_forwards(items) {
+            return Readiness::NotReady { reason };
+        }
+        // No flights is its own answer rather than `ready_to_price`'s
+        // refusal. The tool is right to turn such a trip away — there is
+        // nothing to price — but the reader is not looking at a problem.
+        if !items.iter().any(|item| item.is_flight()) {
+            return Readiness::NoFlights;
+        }
         match (ready_to_price(items), dates_run_forwards(items)) {
             (Pricing::NotReady(reason), _) | (_, Err(reason)) => Readiness::NotReady { reason },
             (Pricing::Booked, Ok(())) => Readiness::Booked,
@@ -713,6 +731,27 @@ fn cost_label(item: &TripItem) -> String {
         true => format!("{} on {}", item.route(), item.date),
         false => item.title.clone(),
     }
+}
+
+/// What the traveller still has to book, by the name they gave it.
+///
+/// Flights are left out on purpose, and it is not an oversight: a flight
+/// that is not booked is named by the pricing half of the banner, which
+/// says which legs are still to buy. Listing it here as well would ask
+/// the same person to book the same seat twice, in two sentences sitting
+/// one above the other.
+///
+/// Everything else — a stay, an activity, a transfer — has no shopping
+/// step in Scout, so the only thing worth saying about it is whether it
+/// is held. This is the half the banner never had, which is how a trip
+/// with three unbooked activities came to say nothing was waiting on the
+/// reader.
+pub fn still_to_book(items: &[TripItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| !item.is_flight() && !item.booked)
+        .map(|item| item.title.clone())
+        .collect()
 }
 
 /// The settled prices, and the names of the settled items with no price.
@@ -4717,6 +4756,10 @@ mod tests {
         }
     }
 
+    fn activity_item(position: i64, title: &str, date: &str) -> TripItem {
+        TripItem { kind: "activity".to_string(), ..stay_item(position, title, date) }
+    }
+
     fn chosen_departing(departing: &str) -> TripCandidate {
         TripCandidate { arriving_at_local: None, ..chosen("KL1", "", departing) }
     }
@@ -4752,6 +4795,43 @@ mod tests {
             panic!("a trip of one hotel has no flights to price");
         };
         assert!(problem.contains("no flights"), "got: {problem}");
+    }
+
+    #[test]
+    fn readiness_reports_a_trip_with_no_flights_and_names_what_is_still_to_book() {
+        // Two facts, and the banner conflated them: what Scout can still
+        // price is about flights, and what the traveller still has to book
+        // is about everything. A trip whose flights are all held said
+        // "nothing here is waiting on you" while three activities were
+        // unbooked, which is plainly false to the person reading it.
+        let mut items = vec![
+            flight_item(1, "AMS", "HKG", "2026-10-12", Some(chosen_departing("2026-10-12T07:15:00"))),
+            stay_item(2, "Hotel", "2026-10-12"),
+            activity_item(3, "Silver workshop", "2026-10-13"),
+        ];
+        items[0].booked = true;
+        items[1].booked = true;
+        assert_eq!(Readiness::of(&items), Readiness::Booked, "the flights are all held");
+        assert_eq!(still_to_book(&items), vec!["Silver workshop".to_string()]);
+
+        // Nothing unbooked anywhere is the only state that may say the
+        // trip is waiting on nobody.
+        items[2].booked = true;
+        assert!(still_to_book(&items).is_empty());
+
+        // A city break is not a broken trip. Pricing has nothing to do
+        // here, and saying "this trip has no flights yet" as a refusal
+        // reads as an error about a trip that is simply not a flying one.
+        let city = vec![stay_item(1, "Hotel", "2026-10-12"), activity_item(2, "Silver workshop", "2026-10-13")];
+        assert_eq!(Readiness::of(&city), Readiness::NoFlights);
+        assert_eq!(Readiness::of(&city).refusal(), None, "a trip without flights is not blocked");
+        assert_eq!(still_to_book(&city), vec!["Hotel".to_string(), "Silver workshop".to_string()]);
+
+        // A flight still keeps its own sentence: it is named by the
+        // pricing half, so listing it here too would ask the traveller to
+        // book it twice.
+        let unbooked_leg = vec![flight_item(1, "AMS", "HKG", "2026-10-12", Some(chosen_departing("2026-10-12T07:15:00")))];
+        assert!(still_to_book(&unbooked_leg).is_empty());
     }
 
     #[test]

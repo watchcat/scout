@@ -404,7 +404,21 @@
   .item-card .segment-head{border-bottom:0}
   .item-title{margin:0; color:var(--base2); font-size:18px; line-height:1.2}
   .item-place{margin:3px 0 0; color:var(--base1); font-size:13px}
-  .item-booked{display:inline-block; margin-top:6px; color:var(--green); font-size:12px; font-weight:650}
+  /* The confirmation code, which used to carry the word "booked" in the
+     same green and so read as the state itself. The state is the pill
+     below; this is a reference number and looks like one. */
+  .item-code{margin:6px 0 0; color:var(--base01); font-size:12px; font-weight:650;
+    font-variant-numeric:tabular-nums; letter-spacing:.02em}
+  /* Held or still to book, in the head's own column beside the date, so
+     one glance down the timeline answers it for every card. A word and a
+     shape, not only a colour: the mark this replaces was a green line
+     that a reader who cannot tell green from grey could not read at all,
+     and whose position moved with whatever else the card carried. */
+  .item-state{display:inline-flex; align-items:center; gap:5px; flex:none;
+    border:1px dashed var(--base01); border-radius:999px; padding:3px 9px;
+    color:var(--base0); font-size:12px; font-weight:650; white-space:nowrap}
+  .item-state svg{flex:none}
+  .item-state.held{border-style:solid; border-color:var(--green); color:var(--green)}
   .segment-head{display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
     padding:15px 16px 13px; border-bottom:1px solid rgba(13,74,90,.75)}
   .segment-kicker{margin:0 0 4px; color:var(--base01); font-size:11px; font-weight:800;
@@ -412,7 +426,7 @@
   .segment-route{margin:0; color:var(--base2); font-size:22px; line-height:1.15}
   .route-arrow{padding:0 7px; color:var(--cyan); font-weight:400}
   .segment-date{flex:none; margin-top:2px; color:var(--base1); font-size:13px}
-  .segment-head-actions{flex:none; display:flex; align-items:center; gap:10px}
+  .segment-head-actions{flex:none; display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end}
   .segment-remove-button{background:transparent; border:1px solid var(--line); border-radius:8px;
     color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
   .segment-remove-button:hover{color:#ff817a; border-color:var(--red)}
@@ -661,6 +675,10 @@
        editor goes to one column so the box is not a slot between two
        buttons on a phone. */
     .item-note-button, .item-note-editor button{min-height:42px; padding:10px 14px; font-size:13px}
+    /* The pill is read, not pressed, so it keeps its size; it goes
+       first in the wrap so the state is still the thing the eye
+       meets before the date and the × on a narrow screen. */
+    .item-state{order:-1}
     .item-note-editor input{flex:1 1 100%; min-height:42px; font-size:16px}
     /* Listed apart from the rule above, not inside it: a media query adds
        no specificity, so this has to come after the desktop

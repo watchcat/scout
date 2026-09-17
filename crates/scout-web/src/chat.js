@@ -421,14 +421,50 @@ export const ITINERARY_NOTE = 'Itinerary note.'
 // reader is holding. "Needs a decision" would be the opposite mistake,
 // asking for a decision nobody owes. So booked is its own state, and the
 // wording of the other two is unchanged where it still fits.
+// What is still to book, as a sentence, or '' when nothing is.
+//
+// Named up to three and counted after that: this line is read at a
+// glance above the timeline, and a trip with nine loose activities would
+// otherwise put the whole list where the reader is looking for a state.
+// The items themselves are right below, each one saying for itself.
+function bookingLine(toBook) {
+  const names = (toBook ?? []).filter((name) => String(name ?? '').trim())
+  if (!names.length) return ''
+  if (names.length <= 3) {
+    return `${listOf(names)} ${names.length === 1 ? 'is' : 'are'} not booked yet.`
+  }
+  return `${listOf(names.slice(0, 3))}, and ${names.length - 3} more, are not booked yet.`
+}
+
+// Two questions, and the banner used to answer only one of them: what
+// Scout can still price is about flights, and what the traveller still
+// has to book is about everything. Answering the first and speaking for
+// the whole trip is how a fully ticketed itinerary came to say "nothing
+// here is waiting on you" to somebody with three unbooked activities on
+// the screen below it.
 export function readinessAlert(trip) {
   const readiness = trip?.readiness
+  const booking = bookingLine(trip?.to_book)
   if (readiness?.state === 'booked') {
-    return {
-      tone: 'ready',
-      headline: 'Booked.',
-      text: 'Every flight on this trip is a ticket you already hold. Nothing here is waiting on you.',
-    }
+    return booking
+      ? {
+          tone: 'ready',
+          headline: 'Flights booked.',
+          text: `Every flight on this trip is a ticket you already hold. ${booking}`,
+        }
+      : {
+          tone: 'ready',
+          headline: 'Booked.',
+          text: 'Everything on this trip is held. Nothing is waiting on you.',
+        }
+  }
+  // No flights is not a problem to fix. A week in one city is a whole
+  // trip; pricing simply has nothing to do with it, and the refusal the
+  // pricing tool gives such a trip used to be drawn here as a blocker.
+  if (readiness?.state === 'no_flights') {
+    return booking
+      ? { tone: 'ready', headline: 'Nothing to price.', text: `This trip has no flights. ${booking}` }
+      : { tone: 'ready', headline: 'Booked.', text: 'Everything on this trip is held. Nothing is waiting on you.' }
   }
   if (readiness?.state === 'ready') {
     const legs = readiness.legs ?? []
@@ -439,13 +475,25 @@ export function readinessAlert(trip) {
     return {
       tone: 'ready',
       headline: 'Ready to price.',
-      text: rest > 0
-        ? `Only ${listOf(legs)} ${legs.length === 1 ? 'is' : 'are'} still to buy. Ask Scout in chat to price ${legs.length === 1 ? 'it' : 'them'}; the rest of this trip is already booked.`
-        : 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.',
+      text: [
+        rest > 0
+          ? `Only ${listOf(legs)} ${legs.length === 1 ? 'is' : 'are'} still to buy. Ask Scout in chat to price ${legs.length === 1 ? 'it' : 'them'}; the rest of this trip is already booked.`
+          : 'Every segment has a flight selected. Ask Scout in chat to refresh live fares and compare one ticket with separate bookings.',
+        booking,
+      ]
+        .filter(Boolean)
+        .join(' '),
     }
   }
   if (readiness?.state === 'not_ready') {
-    return { tone: 'alert', headline: 'Needs a decision.', text: readiness.reason ?? '' }
+    // The decision comes first — it is the thing holding the trip up —
+    // and what is still to book is said after it rather than waiting for
+    // the decision to be made.
+    return {
+      tone: 'alert',
+      headline: 'Needs a decision.',
+      text: [readiness.reason ?? '', booking].filter(Boolean).join(' '),
+    }
   }
   return null
 }
@@ -545,7 +593,22 @@ export function savedFareLine(candidate) {
 // everything else say it the same way, and a card that said it two ways
 // would read as two different states.
 export function bookedMark(item) {
-  return item.confirmation_code ? `booked · ${item.confirmation_code}` : 'booked'
+  return item.confirmation_code ? String(item.confirmation_code) : ''
+}
+
+// Whether this is a ticket the traveller holds or a plan they have still
+// to book, as a word.
+//
+// A word rather than a colour, and in the head's own column rather than
+// inline under the title: the mark it replaces was a 12px green line
+// whose position moved with whatever else the card carried — a place, a
+// code, a note — so there was no column for the eye to run down, and the
+// only difference between a held booking and an idea was a hue. Colour
+// on its own is not a state a reader can rely on, and this one was
+// carrying the confirmation code in the same green, which made a
+// reference number and a fact about the trip look like one thing.
+export function itemState(item) {
+  return item?.booked ? { label: 'Held', held: true } : { label: 'To book', held: false }
 }
 
 // What a flight card says where its options would be when it has none.
@@ -1500,15 +1563,18 @@ function start() {
       node('h3', 'item-title', item.title),
     )
     if (item.place) about.append(node('p', 'item-place', item.place))
-    if (item.booked) {
-      about.append(node('span', 'item-booked', bookedMark(item)))
+    // The code, and only the code: what this item *is* — held, or still to
+    // book — is said by the pill in the actions column, so a reference
+    // number no longer has to carry a state as well.
+    if (item.booked && bookedMark(item)) {
+      about.append(node('p', 'item-code', bookedMark(item)))
     }
     // Last in the head, where the pending row puts it: the ticket forwarded
     // with the confirmation sits in the same place before and after Add,
     // so pressing Add does not look like it took the file away.
     if (item.attachments?.length) about.append(attachmentLinks(item.attachments))
     const actions = node('div', 'segment-head-actions')
-    actions.append(node('time', 'segment-date', itemDateLabel(item)))
+    actions.append(statePill(item), node('time', 'segment-date', itemDateLabel(item)))
     const removeSlot = node('span', 'segment-remove')
     removeSlot.append(segmentRemoveButton(trip, item, removeSlot))
     actions.append(removeSlot)
@@ -1535,13 +1601,13 @@ function start() {
     // The same mark a stay or an activity carries, for the same reason: a
     // leg bought by forwarding a confirmation has a code on it, and the
     // card said nothing about either.
-    if (segment.booked) {
-      route.append(node('span', 'item-booked', bookedMark(segment)))
+    if (segment.booked && bookedMark(segment)) {
+      route.append(node('p', 'item-code', bookedMark(segment)))
     }
     // As on a stay, and as on the pending row this leg was added from.
     if (segment.attachments?.length) route.append(attachmentLinks(segment.attachments))
     const actions = node('div', 'segment-head-actions')
-    actions.append(node('time', 'segment-date', dateLabel(segment.date)))
+    actions.append(statePill(segment), node('time', 'segment-date', dateLabel(segment.date)))
     const removeSlot = node('span', 'segment-remove')
     removeSlot.append(segmentRemoveButton(trip, segment, removeSlot))
     actions.append(removeSlot)
@@ -1834,6 +1900,47 @@ function start() {
   // text the sender wrote: a pseudo-element cannot be marked
   // `aria-hidden`, and a screen reader would read the glyph into the
   // filename that is the link's whole accessible name.
+  // The state, as a pill in the head's own column. Built here rather than
+  // beside the title because the point of it is that every card says this
+  // in the same place: the eye runs down one column instead of reading
+  // each card to find out whether the thing is held.
+  function statePill(item) {
+    const state = itemState(item)
+    const pill = node('span', state.held ? 'item-state held' : 'item-state')
+    pill.append(stateIcon(state.held), node('span', '', state.label))
+    return pill
+  }
+
+  // A tick for what is held, an open ring for what is not — shape as well
+  // as colour, so the two are still different in greyscale and to a
+  // reader who cannot tell the green from the grey.
+  function stateIcon(held) {
+    const ns = 'http://www.w3.org/2000/svg'
+    const svg = document.createElementNS(ns, 'svg')
+    svg.setAttribute('viewBox', '0 0 24 24')
+    svg.setAttribute('width', '12')
+    svg.setAttribute('height', '12')
+    svg.setAttribute('fill', 'none')
+    svg.setAttribute('stroke', 'currentColor')
+    svg.setAttribute('stroke-width', '2.4')
+    svg.setAttribute('stroke-linecap', 'round')
+    svg.setAttribute('stroke-linejoin', 'round')
+    svg.setAttribute('aria-hidden', 'true')
+    if (held) {
+      const path = document.createElementNS(ns, 'path')
+      path.setAttribute('d', 'M4 12.5 9.5 18 20 6')
+      svg.append(path)
+    } else {
+      const ring = document.createElementNS(ns, 'circle')
+      ring.setAttribute('cx', '12')
+      ring.setAttribute('cy', '12')
+      ring.setAttribute('r', '8')
+      ring.setAttribute('stroke-dasharray', '3 3')
+      svg.append(ring)
+    }
+    return svg
+  }
+
   function fileIcon() {
     const ns = 'http://www.w3.org/2000/svg'
     const svg = document.createElementNS(ns, 'svg')

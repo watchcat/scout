@@ -327,13 +327,21 @@ fn selected(item: &TripItem) -> Option<&TripCandidate> {
 /// half of `chat.js::bookedMark`, and one function for every kind of item
 /// for the same reason it is one there: a card that marked a flight
 /// differently from a stay would read as two different states.
+/// Held, or still to book, and the code where there is one — the paper
+/// half of `chat.js::statePill` and `bookedMark`.
+///
+/// Paper says it for an unbooked item too, which the old mark did not:
+/// printing nothing at all left the two states looking identical on the
+/// page you carry, which is the complaint this answers on screen. The
+/// word does the work here, since a printed plan may well be black and
+/// white by the time anybody reads it.
 fn booked_mark(item: &TripItem) -> String {
     if !item.booked {
-        return String::new();
+        return "<div class=\"state\">To book</div>".to_string();
     }
     match item.confirmation_code.as_deref() {
-        Some(code) => format!("<div class=\"booked\">booked · {}</div>", escape(code)),
-        None => "<div class=\"booked\">booked</div>".to_string(),
+        Some(code) => format!("<div class=\"state held\">Held · {}</div>", escape(code)),
+        None => "<div class=\"state held\">Held</div>".to_string(),
     }
 }
 
@@ -560,30 +568,75 @@ fn list_of(items: &[String]) -> String {
 /// `flights` is how many flights the plan draws, which is what tells
 /// "pricing this trip" from "pricing what is left of it" — `legs` names
 /// only the ones still to buy.
-fn readiness_notice(readiness: &Readiness, flights: usize) -> (&'static str, String, &'static str) {
+/// The banner's two questions, printed. `to_book` is the second of them —
+/// what the traveller still has to go and get — and it is why "Booked."
+/// no longer speaks for a trip with three unbooked activities on it. The
+/// page's `chat.js::readinessAlert` says the same things in the same
+/// cases; the two must not disagree on paper and on screen.
+/// What is still to book, as a sentence, or empty when nothing is. The
+/// paper half of `chat.js::bookingLine`, down to where it stops naming
+/// and starts counting: a banner is a glance, and the items below say it
+/// each for themselves.
+fn booking_line(to_book: &[String]) -> String {
+    let names: Vec<&str> = to_book.iter().map(|name| name.trim()).filter(|name| !name.is_empty()).collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    let owned: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+    if owned.len() <= 3 {
+        return format!("{} {} not booked yet.", list_of(&owned), if owned.len() == 1 { "is" } else { "are" });
+    }
+    format!("{}, and {} more, are not booked yet.", list_of(&owned[..3]), owned.len() - 3)
+}
+
+fn readiness_notice(
+    readiness: &Readiness,
+    flights: usize,
+    to_book: &[String],
+) -> (&'static str, String, &'static str) {
+    let booking = booking_line(to_book);
+    let joined = |first: String| {
+        if booking.is_empty() { first } else { format!("{first} {booking}") }
+    };
     match readiness {
-        Readiness::Booked => (
+        Readiness::Booked if booking.is_empty() => (
             "Booked.",
-            "Every flight on this trip is a ticket the traveller already holds.".to_string(),
+            "Everything on this trip is held. Nothing is waiting on the traveller.".to_string(),
             "ok",
         ),
+        Readiness::Booked => (
+            "Flights booked.",
+            joined("Every flight on this trip is a ticket the traveller already holds.".to_string()),
+            "ok",
+        ),
+        // A trip with no flights is not a trip with a problem: pricing has
+        // nothing to do here, and the refusal the pricing tool gives such a
+        // trip was being printed as though something were wrong with it.
+        Readiness::NoFlights if booking.is_empty() => (
+            "Booked.",
+            "Everything on this trip is held. Nothing is waiting on the traveller.".to_string(),
+            "ok",
+        ),
+        Readiness::NoFlights => ("Nothing to price.", format!("This trip has no flights. {booking}"), "ok"),
         Readiness::Ready { legs } if legs.len() < flights => (
             "Ready to price.",
-            format!(
+            joined(format!(
                 "Only {} {} still to buy; the rest of this trip is already booked. Refresh live \
                  fares with Scout before booking.",
                 list_of(legs),
                 if legs.len() == 1 { "is" } else { "are" },
-            ),
+            )),
             "ok",
         ),
         Readiness::Ready { .. } => (
             "Ready to price.",
-            "Every segment has a flight selected. Refresh live fares with Scout before booking."
-                .to_string(),
+            joined(
+                "Every segment has a flight selected. Refresh live fares with Scout before booking."
+                    .to_string(),
+            ),
             "ok",
         ),
-        Readiness::NotReady { reason } => ("Needs a decision.", reason.clone(), ""),
+        Readiness::NotReady { reason } => ("Needs a decision.", joined(reason.clone()), ""),
     }
 }
 
@@ -734,7 +787,7 @@ pub fn html(plan: &Plan) -> String {
     out.push_str(
         r#"</title>
 <style>
-@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head>div{min-width:0}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .booked{margin-top:.7mm;color:#4f5d10;font-size:7.5pt;font-weight:700}.segment-head .tickets{margin-top:.7mm;color:#50666b;font-size:7.5pt;overflow-wrap:anywhere}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.note{padding:2.4mm 3mm;border-top:1px solid #dbe6e4;color:#50666b;font-size:8pt;overflow-wrap:anywhere}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
+@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head>div{min-width:0}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .state{display:inline-block;margin-top:1mm;padding:.5mm 1.8mm;border:.3mm dashed #789196;border-radius:99mm;color:#50666b;font-size:7pt;font-weight:700}.segment-head .state.held{border-style:solid;border-color:#859900;color:#4f5d10}.segment-head .tickets{margin-top:.7mm;color:#50666b;font-size:7.5pt;overflow-wrap:anywhere}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.note{padding:2.4mm 3mm;border-top:1px solid #dbe6e4;color:#50666b;font-size:8pt;overflow-wrap:anywhere}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
 </style></head><body>"#,
     );
     write!(
@@ -773,7 +826,7 @@ pub fn html(plan: &Plan) -> String {
     }
     out.push_str("</div></header>");
 
-    let (headline, detail, tone) = readiness_notice(&plan.readiness, flights.len());
+    let (headline, detail, tone) = readiness_notice(&plan.readiness, flights.len(), &plan.to_book);
     write!(
         out,
         "<div class=\"notice {tone}\"><strong>{headline}</strong> {}</div>",
@@ -1027,6 +1080,7 @@ mod tests {
             // this file touches it: the printed plan is built from
             // `readiness` like the page's own renderer.
             not_ready: None,
+            to_book: Vec::new(),
             notes: vec!["Separate tickets need extra care.".to_string()],
             chat: None,
         }
@@ -1066,7 +1120,7 @@ mod tests {
             "<div class=\"number\">Stay</div>",
             "Hotel &lt;Roma&gt;",
             "Rome",
-            "booked · ABC123",
+            "Held · ABC123",
             // Beside the code: which ticket belongs to this booking, for a
             // traveller holding the printed plan and a folder of PDFs.
             // Escaped like everything else that came out of a stranger's
@@ -1083,6 +1137,35 @@ mod tests {
         );
         assert!(!html.contains("October <escape>"));
         assert!(!html.contains("Hotel <Roma>"));
+    }
+
+    #[test]
+    fn the_printed_banner_says_what_is_still_to_book_the_way_the_page_does() {
+        // The two surfaces have to agree: a trip whose flights are held
+        // but whose activities are not must not be headed "Booked." on
+        // paper while the page says otherwise — and "nothing is waiting
+        // on you" is the sentence the live report was about.
+        let mut held = plan();
+        held.readiness = Readiness::Booked;
+        held.to_book = vec!["Silver workshop".to_string(), "Dolphin tour".to_string()];
+        let page = html(&held);
+        assert!(page.contains("Flights booked."), "{page}");
+        assert!(page.contains("Silver workshop and Dolphin tour are not booked yet."), "{page}");
+        assert!(!page.contains("Nothing is waiting"), "{page}");
+
+        held.to_book = Vec::new();
+        let page = html(&held);
+        assert!(page.contains("Booked."));
+        assert!(page.contains("Nothing is waiting on the traveller."), "{page}");
+
+        // A trip with no flights is not a trip with a problem.
+        let mut city = plan();
+        city.readiness = Readiness::NoFlights;
+        city.to_book = vec!["Hotel Alfama".to_string()];
+        let page = html(&city);
+        assert!(page.contains("Nothing to price."), "{page}");
+        assert!(page.contains("Hotel Alfama is not booked yet."), "{page}");
+        assert!(!page.contains("no flights yet"), "a flightless trip was printed as a fault: {page}");
     }
 
     #[test]
@@ -1120,7 +1203,7 @@ mod tests {
         assert!(!page.contains("No flight saved yet."));
         // And the code, on a leg as on a stay: it is the one thing read off
         // a printed itinerary at a desk. Escaped like everything stored.
-        assert!(page.contains("booked · KL&lt;7788&gt;"), "{page}");
+        assert!(page.contains("Held · KL&lt;7788&gt;"), "{page}");
         // A leg nobody has bought still says what it needs.
         let mut unbooked = plan();
         unbooked.trip.items[0].candidates.clear();

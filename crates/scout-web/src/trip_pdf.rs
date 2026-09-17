@@ -327,13 +327,21 @@ fn selected(item: &TripItem) -> Option<&TripCandidate> {
 /// half of `chat.js::bookedMark`, and one function for every kind of item
 /// for the same reason it is one there: a card that marked a flight
 /// differently from a stay would read as two different states.
+/// Held, or still to book, and the code where there is one — the paper
+/// half of `chat.js::statePill` and `bookedMark`.
+///
+/// Paper says it for an unbooked item too, which the old mark did not:
+/// printing nothing at all left the two states looking identical on the
+/// page you carry, which is the complaint this answers on screen. The
+/// word does the work here, since a printed plan may well be black and
+/// white by the time anybody reads it.
 fn booked_mark(item: &TripItem) -> String {
     if !item.booked {
-        return String::new();
+        return "<div class=\"state\">To book</div>".to_string();
     }
     match item.confirmation_code.as_deref() {
-        Some(code) => format!("<div class=\"booked\">booked · {}</div>", escape(code)),
-        None => "<div class=\"booked\">booked</div>".to_string(),
+        Some(code) => format!("<div class=\"state held\">Held · {}</div>", escape(code)),
+        None => "<div class=\"state held\">Held</div>".to_string(),
     }
 }
 
@@ -779,7 +787,7 @@ pub fn html(plan: &Plan) -> String {
     out.push_str(
         r#"</title>
 <style>
-@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head>div{min-width:0}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .booked{margin-top:.7mm;color:#4f5d10;font-size:7.5pt;font-weight:700}.segment-head .tickets{margin-top:.7mm;color:#50666b;font-size:7.5pt;overflow-wrap:anywhere}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.note{padding:2.4mm 3mm;border-top:1px solid #dbe6e4;color:#50666b;font-size:8pt;overflow-wrap:anywhere}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
+@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9.5pt/1.35 Arial,"Liberation Sans",sans-serif}header{border-bottom:2px solid #2aa198;padding-bottom:5mm;margin-bottom:5mm}.brand{color:#2aa198;font-size:9pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1.5mm 0 .5mm;color:#50666b;font-size:9pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:24pt;line-height:1.05}.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:2mm;margin:4mm 0 0}.fact{padding:2.3mm;background:#f2f7f6;border-radius:2mm}.fact b{display:block;color:#61767a;font-size:6.8pt;text-transform:uppercase;letter-spacing:.08em}.fact span{display:block;margin-top:.7mm;color:#002b36;font-size:9.5pt;font-weight:700}.notice{margin:0 0 3.5mm;padding:2.4mm 3mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.page-note{margin:-1mm 0 4mm;color:#61767a;font-size:8pt}.segment{break-inside:avoid;margin:0 0 4mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:5mm;padding:3mm;background:#eaf3f2}.segment-head>div{min-width:0}.segment-head .number{color:#61767a;font-size:7pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.7mm 0 0;color:#002b36;font-size:14pt}.segment-head time{color:#50666b;font-size:8pt}.segment-head .place{margin-top:.7mm;color:#50666b;font-size:8.5pt}.segment-head .state{display:inline-block;margin-top:1mm;padding:.5mm 1.8mm;border:.3mm dashed #789196;border-radius:99mm;color:#50666b;font-size:7pt;font-weight:700}.segment-head .state.held{border-style:solid;border-color:#859900;color:#4f5d10}.segment-head .tickets{margin-top:.7mm;color:#50666b;font-size:7.5pt;overflow-wrap:anywhere}.option{display:grid;grid-template-columns:6mm 1fr 30mm;gap:2.5mm;padding:3mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:1.3mm 0 .7mm;color:#002b36;font:8.5pt/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.8pt}.price{text-align:right;color:#002b36;font-size:11.5pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.note{padding:2.4mm 3mm;border-top:1px solid #dbe6e4;color:#50666b;font-size:8pt;overflow-wrap:anywhere}.connection{break-inside:avoid;margin:-1.5mm 3mm 3mm;padding:2mm 2.5mm;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:4mm;padding-top:3mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
 </style></head><body>"#,
     );
     write!(
@@ -1112,7 +1120,7 @@ mod tests {
             "<div class=\"number\">Stay</div>",
             "Hotel &lt;Roma&gt;",
             "Rome",
-            "booked · ABC123",
+            "Held · ABC123",
             // Beside the code: which ticket belongs to this booking, for a
             // traveller holding the printed plan and a folder of PDFs.
             // Escaped like everything else that came out of a stranger's
@@ -1195,7 +1203,7 @@ mod tests {
         assert!(!page.contains("No flight saved yet."));
         // And the code, on a leg as on a stay: it is the one thing read off
         // a printed itinerary at a desk. Escaped like everything stored.
-        assert!(page.contains("booked · KL&lt;7788&gt;"), "{page}");
+        assert!(page.contains("Held · KL&lt;7788&gt;"), "{page}");
         // A leg nobody has bought still says what it needs.
         let mut unbooked = plan();
         unbooked.trip.items[0].candidates.clear();

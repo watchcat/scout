@@ -6,7 +6,7 @@ import {
   composerHeight, threadLabel, whenLabel, sendBody, resolveCurrent,
   threadVanished, parseItinerary, selectedCandidate, durationLabel,
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier, savedFareLine,
-  tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark,
+  tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark, itemState,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   noteParts, noteBody,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
@@ -450,8 +450,23 @@ test('a confirmation that stated no price does not read as a lookup that failed'
 })
 
 test('a booked item is marked the same way whatever kind it is', () => {
-  assert.equal(bookedMark({ confirmation_code: 'KL7788' }), 'booked \u00b7 KL7788')
-  assert.equal(bookedMark({ confirmation_code: null }), 'booked')
+  assert.equal(bookedMark({ confirmation_code: 'KL7788' }), 'KL7788')
+  assert.equal(bookedMark({ confirmation_code: null }), '')
+})
+
+test('every item says whether it is held or still to book, in words', () => {
+  // The live complaint: a ticket you hold and a plan you typed looked
+  // almost the same — one 12px green line under the title, in a position
+  // that moved with whatever else the card had on it. The state is its
+  // own word now, in the column beside the date, and it survives
+  // greyscale: colour alone is not a state anybody can rely on.
+  assert.deepEqual(itemState({ booked: true, confirmation_code: 'EVN140982' }), { label: 'Held', held: true })
+  assert.deepEqual(itemState({ booked: false }), { label: 'To book', held: false })
+  // The code is no longer the state signal. It stayed the same green as
+  // the word "booked", so a reference number and a fact about the trip
+  // read as one thing.
+  assert.equal(bookedMark({ booked: true, confirmation_code: 'EVN140982' }), 'EVN140982')
+  assert.equal(bookedMark({ booked: true }), '')
 })
 
 test('the notes core sends are headed the same way on the page and on paper', () => {

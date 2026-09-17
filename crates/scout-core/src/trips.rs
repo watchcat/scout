@@ -404,6 +404,87 @@ pub async fn remove_item(
 /// together — has a public door to the one number.
 pub const MAX_NOTE_CHARS: usize = crate::tools::trips::MAX_NOTE_CHARS;
 
+/// Mark an item held, or let it go again — the page's half of the flag
+/// `update_trip_item` sets from chat.
+///
+/// The same stale-tab guard the note and the removal carry, and for the
+/// reason the note's comment gives: positions renumber, and a flag
+/// written onto the wrong item is a mistake nothing on the page
+/// announces. A code is optional and never gates the flag: most of what
+/// a traveller holds — a table, a friend expecting them — has no
+/// reference number, and that was the assumption that left a lunch
+/// unmarkable in the first place.
+pub async fn hold_item(
+    core: &Core,
+    account_id: i64,
+    trip_name: &str,
+    position: i64,
+    expected: ItemExpectation,
+    held: bool,
+) -> anyhow::Result<LegEdit> {
+    let (origin, destination, date, title) = match checked_expectation(expected) {
+        Ok(parts) => parts,
+        Err(message) => return Ok(LegEdit::Invalid(message)),
+    };
+    let store = core.store();
+    let trip_name = trip_name.to_string();
+    blocking(move || {
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(LegEdit::TripNotFound);
+        };
+        let expected = ExpectedItem {
+            origin: origin.as_deref(),
+            destination: destination.as_deref(),
+            title: title.as_deref(),
+            date: date.as_deref(),
+        };
+        if !store.hold_item_checked(trip.id, position, expected, held)? {
+            return Ok(LegEdit::SegmentChanged);
+        }
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(LegEdit::TripNotFound);
+        };
+        let chat = store.trip_chat(trip.id)?;
+        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+    })
+    .await
+}
+
+/// The route and date of an expectation, put through the same checks the
+/// flight tools use so a value no client could have drawn is refused
+/// rather than silently failing to match. Shared by the three writes that
+/// take one.
+#[allow(clippy::type_complexity)]
+fn checked_expectation(
+    expected: ItemExpectation,
+) -> Result<(Option<String>, Option<String>, Option<String>, Option<String>), String> {
+    let (origin, destination) = match (expected.origin, expected.destination) {
+        (Some(origin), Some(destination)) => match crate::tools::trips::leg_ends(&origin, &destination) {
+            Ok((origin, destination)) => (Some(origin), Some(destination)),
+            Err(e) => return Err(e.0),
+        },
+        (origin, destination) => {
+            let end = |label, value: Option<String>| {
+                value.map(|v| crate::tools::trips::iata(label, &v)).transpose()
+            };
+            match (end("origin", origin), end("destination", destination)) {
+                (Ok(origin), Ok(destination)) => (origin, destination),
+                (Err(e), _) | (_, Err(e)) => return Err(e.0),
+            }
+        }
+    };
+    let date = match expected
+        .date
+        .as_deref()
+        .map(|d| crate::tools::trips::calendar_date("date", d))
+        .transpose()
+    {
+        Ok(date) => date,
+        Err(e) => return Err(e.0),
+    };
+    Ok((origin, destination, date, expected.title))
+}
+
 /// Write, replace or clear the traveller's note on one item.
 ///
 /// The same guard `remove_item` carries, for a reason that is stronger

@@ -543,6 +543,12 @@
     color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
   .item-note-button:hover{color:var(--base1); border-color:var(--cyan); border-style:solid}
   .item-note-button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  .item-actions{display:flex; flex-wrap:wrap; gap:7px}
+  .item-hold-button{background:transparent; border:1px dashed var(--line); border-radius:8px;
+    color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
+  .item-hold-button:hover{color:var(--base1); border-color:var(--green); border-style:solid}
+  .item-hold-button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  .item-hold-button:disabled{opacity:.6; cursor:default}
   .item-note-editor{display:flex; flex-wrap:wrap; gap:6px; width:100%}
   .item-note-editor input{flex:1 1 15em; min-width:0; background:var(--base03); color:var(--base1);
     border:1px solid var(--line); border-radius:8px; font:inherit; font-size:12.5px; padding:7px 9px}
@@ -702,7 +708,7 @@
     /* A thumb's worth, like every other control down here — and the
        editor goes to one column so the box is not a slot between two
        buttons on a phone. */
-    .item-note-button, .item-note-editor button{min-height:42px; padding:10px 14px; font-size:13px}
+    .item-note-button, .item-hold-button, .item-note-editor button{min-height:42px; padding:10px 14px; font-size:13px}
     /* The pill is read, not pressed, so it keeps its size; it goes
        first in the wrap so the state is still the thing the eye
        meets before the date and the × on a narrow screen. */

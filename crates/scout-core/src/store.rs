@@ -591,6 +591,14 @@ pub struct ItemEdit<'a> {
     /// `HH:MM`, local to wherever the item is.
     pub time: Option<&'a str>,
     pub end_date: Option<&'a str>,
+    /// Whether the traveller holds it. Theirs to say: a lunch arranged
+    /// over WhatsApp is as held as a hotel that sent a confirmation, and
+    /// leaving this out of an edit meant the only way to mark one was to
+    /// forward an email about it.
+    pub booked: Option<bool>,
+    /// Empty clears it. A booking with no code is ordinary — most
+    /// restaurants give none — so this never gates `booked`.
+    pub confirmation_code: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -3548,8 +3556,9 @@ impl Store {
         if kind == "flight" {
             anyhow::bail!("item {position} is a flight; its date and route go through update_flight");
         }
-        let (title, place, date, starts_at, ends_at) = conn.query_row(
-            "SELECT title, place, date, starts_at, ends_at FROM trip_items WHERE id = ?",
+        let (title, place, date, starts_at, ends_at, booked, code) = conn.query_row(
+            "SELECT title, place, date, starts_at, ends_at, booked, confirmation_code
+             FROM trip_items WHERE id = ?",
             params![item_id],
             |row| {
                 Ok((
@@ -3558,6 +3567,8 @@ impl Store {
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )?;
@@ -3578,8 +3589,10 @@ impl Store {
         // would sort the item by a day it is no longer on.
         let wanted_time = keep(edit.time, starts_at.as_deref().map(|at| at[11..16].to_string()));
         let wanted_starts = wanted_time.map(|clock| format!("{wanted_date}T{clock}:00"));
-        if (&wanted_title, &wanted_place, &wanted_date, &wanted_starts, &wanted_ends)
-            == (&title, &place, &date, &starts_at, &ends_at)
+        let wanted_booked = edit.booked.unwrap_or(booked);
+        let wanted_code = keep(edit.confirmation_code, code.clone());
+        if (&wanted_title, &wanted_place, &wanted_date, &wanted_starts, &wanted_ends, wanted_booked, &wanted_code)
+            == (&title, &place, &date, &starts_at, &ends_at, booked, &code)
         {
             // Asking for what is already true is not a failure, and the
             // caller has to be able to tell the two apart — as on a leg.
@@ -3587,9 +3600,18 @@ impl Store {
         }
         conn.execute(
             "UPDATE trip_items SET title = ?, place = ?, date = ?, starts_at = ?, ends_at = ?,
-                 updated_at = current_timestamp
+                 booked = ?, confirmation_code = ?, updated_at = current_timestamp
              WHERE id = ?",
-            params![wanted_title, wanted_place, wanted_date, wanted_starts, wanted_ends, item_id],
+            params![
+                wanted_title,
+                wanted_place,
+                wanted_date,
+                wanted_starts,
+                wanted_ends,
+                wanted_booked,
+                wanted_code,
+                item_id
+            ],
         )?;
         // Positions follow dates on every write, and a date is one of the
         // things this changes.
@@ -3699,6 +3721,27 @@ impl Store {
     /// to be able to tell the two apart.
     ///
     /// The lookup and the write share the one `self.conn()` for the reason
+    /// Held, or not, on the item the caller still says it is looking at.
+    /// `note_item_checked`'s guard, for the same reason.
+    pub fn hold_item_checked(
+        &self,
+        trip_id: i64,
+        position: i64,
+        expected: ExpectedItem<'_>,
+        held: bool,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let Some(item_id) = item_still_seen(&conn, trip_id, position, expected)? else {
+            return Ok(false);
+        };
+        conn.execute(
+            "UPDATE trip_items SET booked = ?, updated_at = current_timestamp WHERE id = ?",
+            params![held, item_id],
+        )?;
+        conn.execute("UPDATE trips SET updated_at = current_timestamp WHERE id = ?", params![trip_id])?;
+        Ok(true)
+    }
+
     /// The traveller's note, but only on the item the caller still says it
     /// is looking at — `remove_item_checked`'s guard, and worth more here
     /// rather than less. A stale tab that removes the wrong item shows the
@@ -8044,6 +8087,24 @@ CREATE TABLE trips (
         let lunch = cleared.items.iter().find(|i| i.title == "Lunch with Stanley").unwrap();
         assert_eq!(lunch.place, None);
         assert_eq!(lunch.starts_at, None);
+
+        // Held is the traveller's to say. A lunch arranged over WhatsApp
+        // is as held as a hotel that sent a confirmation, and before this
+        // the only way to mark one was to forward an email about it.
+        let (marked, changed) = store
+            .update_item(trip.id, 1, ItemEdit { booked: Some(true), confirmation_code: Some("WA-STANLEY"), ..Default::default() })
+            .unwrap();
+        assert!(changed);
+        let lunch = marked.items.iter().find(|i| i.title == "Lunch with Stanley").unwrap();
+        assert!(lunch.booked);
+        assert_eq!(lunch.confirmation_code.as_deref(), Some("WA-STANLEY"));
+        // And unsaid again, because plans fall through.
+        let (off, _) = store
+            .update_item(trip.id, 1, ItemEdit { booked: Some(false), confirmation_code: Some(""), ..Default::default() })
+            .unwrap();
+        let lunch = off.items.iter().find(|i| i.title == "Lunch with Stanley").unwrap();
+        assert!(!lunch.booked);
+        assert_eq!(lunch.confirmation_code, None);
 
         // A flight is not this tool's business: its route and date belong
         // to `update_flight`, which drops the options that were quoted for

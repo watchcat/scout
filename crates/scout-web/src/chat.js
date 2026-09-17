@@ -810,6 +810,23 @@ export function noteParts(note) {
   return parts
 }
 
+// What the page sends to mark an item held or let it go. The item is
+// named the way `removeItemBody` and `noteBody` name one, for the reason
+// they give: positions renumber, and a flag written onto the wrong item
+// is a mistake nothing on the page announces.
+export function holdBody(tripName, item, held) {
+  const flight = item.kind === 'flight'
+  return JSON.stringify({
+    trip: tripName,
+    position: item.position,
+    origin: flight ? item.origin ?? null : null,
+    destination: flight ? item.destination ?? null : null,
+    title: flight ? null : item.title ?? null,
+    date: item.date ?? null,
+    held: Boolean(held),
+  })
+}
+
 // What the page sends to write or clear a note. The item is named the way
 // `removeItemBody` names one and for the same reason: positions renumber
 // on every write, so `position` alone cannot say which item was meant, and
@@ -2201,6 +2218,20 @@ function start() {
   }
 
   function drawNote(trip, item, slot) {
+    const hold = document.createElement('button')
+    hold.type = 'button'
+    hold.className = 'item-hold-button'
+    // Said as the thing it will do, not as the state it is in: a button
+    // labelled with the current state is the oldest way to make somebody
+    // press it and get the opposite of what they read.
+    hold.textContent = item.booked ? 'Mark as not held' : 'Mark as held'
+    hold.setAttribute('aria-label', `${hold.textContent}: ${itemName(item)}`)
+    hold.addEventListener('click', () => {
+      hold.disabled = true
+      holdItem(trip, item, !item.booked).finally(() => {
+        hold.disabled = false
+      })
+    })
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'item-note-button'
@@ -2210,7 +2241,51 @@ function start() {
       slot.replaceChildren(noteEditor(trip, item, slot))
       slot.querySelector('input')?.focus()
     })
-    slot.replaceChildren(...(item.notes ? [noteLine(item), button] : [button]))
+    slot.replaceChildren(...(item.notes ? [noteLine(item), row(button, hold)] : [row(button, hold)]))
+  }
+
+  // The two buttons under a card, side by side.
+  function row(...buttons) {
+    const line = node('div', 'item-actions')
+    line.append(...buttons)
+    return line
+  }
+
+  // Held is the traveller's word — a table booked by phone, a friend
+  // expecting them — so the page has to be able to say it. Before this
+  // the only path to the flag was forwarding a confirmation email, which
+  // left anything arranged in a chat app permanently "to book".
+  async function holdItem(trip, item, held) {
+    if (tripChoicePending) return
+    tripChoicePending = true
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    try {
+      const res = await fetch('/chat/trips/item-held', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body: holdBody(trip.name, item, held),
+      })
+      if (res.status === 409) {
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        showTripToast('This trip changed elsewhere. Showing the current itinerary.')
+        return
+      }
+      if (!res.ok) throw new Error('refused')
+      const updated = await res.json()
+      trips = [updated, ...trips.filter((other) => other.name !== updated.name)]
+      currentTrip = updated.name
+      renderTripList()
+      renderTripDetail()
+      showTripToast(held ? `${itemName(item)} is held.` : `${itemName(item)} is back to being a plan.`)
+    } catch {
+      showTripToast('Could not change that. Try again.')
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+    }
   }
 
   // A box, a save and a way out. Deliberately plain: this field exists so

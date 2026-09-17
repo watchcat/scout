@@ -8,7 +8,7 @@ import {
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier, savedFareLine,
   tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark, itemState, tripDayRows,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
-  noteParts, noteBody,
+  noteParts, noteBody, holdBody,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   ITINERARY_NOTE,
@@ -972,4 +972,27 @@ test('the trip reads as a row of days, and every day of it is accounted for', ()
 
   assert.deepEqual(tripDayRows({ items: [] }), [])
   assert.deepEqual(tripDayRows(null), [])
+})
+
+test('the page can say a thing is held, and names the item it means', () => {
+  // The owner's case: a lunch arranged over WhatsApp. Held is their word,
+  // and until this the only path to the flag was forwarding a
+  // confirmation email — so anything agreed in a chat app stayed "to
+  // book" for good.
+  const held = JSON.parse(holdBody('Hong Kong', { position: 5, kind: 'activity', title: 'Lunch with Stanley', date: '2026-09-24' }, true))
+  assert.deepEqual(held, {
+    trip: 'Hong Kong',
+    position: 5,
+    origin: null,
+    destination: null,
+    title: 'Lunch with Stanley',
+    date: '2026-09-24',
+    held: true,
+  })
+  // A leg names its route instead, the way every other write from this
+  // page does, so a renumbered position cannot land the flag elsewhere.
+  const leg = JSON.parse(holdBody('Hong Kong', { position: 1, kind: 'flight', origin: 'AMS', destination: 'HKG', date: '2026-09-21' }, false))
+  assert.equal(leg.title, null)
+  assert.equal(leg.origin, 'AMS')
+  assert.equal(leg.held, false)
 })

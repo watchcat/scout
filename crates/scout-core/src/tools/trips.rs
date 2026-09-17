@@ -1880,6 +1880,12 @@ pub struct UpdateItemArgs {
     /// Empty clears it.
     #[serde(default)]
     pub end_date: Option<String>,
+    /// Whether the traveller holds it.
+    #[serde(default)]
+    pub booked: Option<bool>,
+    /// Empty clears it.
+    #[serde(default)]
+    pub confirmation_code: Option<String>,
 }
 
 /// Changes a stay, an activity or a transport booking that is already on
@@ -1902,12 +1908,16 @@ impl Tool for UpdateTripItemTool {
 
     fn description(&self) -> String {
         "Change a stay, an activity or a transport booking already on the trip - its \
-         title, place, date, time or end date. This is how you honour \"the lunch is \
+         title, place, date, time, end date, or whether the traveller holds it. This is how you honour \"the lunch is \
          at half two\" or \"it is the Kowloon branch\": do NOT remove the item and add \
          it again, which loses the tickets that came with it and the confirmation it \
          was read from. Send only what changes; an empty string clears a place, a \
-         time or an end date. A flight's date or route goes through \
-         update_trip_segment, and a note through note_trip_item."
+         time or an end date. Set booked true when the traveller says they have it - a \
+         table booked over the phone or a friend expecting them is held, and no \
+         confirmation number is needed for it; pass confirmation_code only when they \
+         give you one, and never invent one. Set booked false when something falls \
+         through. A flight's date or route goes through update_trip_segment, and a \
+         note through note_trip_item."
             .to_string()
     }
 
@@ -1921,7 +1931,9 @@ impl Tool for UpdateTripItemTool {
                 "place": {"type": "string", "description": "where it is; empty clears it"},
                 "date": {"type": "string", "description": "YYYY-MM-DD; the item moves to where its date puts it"},
                 "time": {"type": "string", "description": "HH:MM local; empty clears it"},
-                "end_date": {"type": "string", "description": "YYYY-MM-DD for a stay's check-out; empty clears it"}
+                "end_date": {"type": "string", "description": "YYYY-MM-DD for a stay's check-out; empty clears it"},
+                "booked": {"type": "boolean", "description": "true when the traveller holds it, false when it fell through"},
+                "confirmation_code": {"type": "string", "description": "only a code the traveller gave you; empty clears it"}
             },
             "required": ["trip", "position"]
         })
@@ -1953,9 +1965,18 @@ impl Tool for UpdateTripItemTool {
             None => None,
         };
         let place = args.place.as_deref().map(str::trim).map(str::to_string);
-        if title.is_none() && place.is_none() && date.is_none() && time.is_none() && end_date.is_none() {
+        let code = args.confirmation_code.as_deref().map(str::trim).map(str::to_string);
+        if title.is_none()
+            && place.is_none()
+            && date.is_none()
+            && time.is_none()
+            && end_date.is_none()
+            && args.booked.is_none()
+            && code.is_none()
+        {
             return Err(StoreToolError(
-                "say what to change: title, place, date, time or end_date".to_string(),
+                "say what to change: title, place, date, time, end_date, booked or confirmation_code"
+                    .to_string(),
             ));
         }
         let store = self.store.clone();
@@ -1991,6 +2012,8 @@ impl Tool for UpdateTripItemTool {
                         date: date.as_deref(),
                         time: time.as_deref(),
                         end_date: end_date.as_deref(),
+                        booked: args.booked,
+                        confirmation_code: code.as_deref(),
                     },
                 )
                 .map_err(lost_trip_race)
@@ -2004,7 +2027,15 @@ impl Tool for UpdateTripItemTool {
             let at = trip.items.iter().find(|item| item.position == args.position);
             let now = at.map_or_else(
                 || format!("item {}", args.position),
-                |item| format!("item {} is {} on {}", item.position, item.title, item.date),
+                |item| {
+                    format!(
+                        "item {} is {} on {}{}",
+                        item.position,
+                        item.title,
+                        item.date,
+                        if item.booked { ", held" } else { "" }
+                    )
+                },
             );
             let said = match changed {
                 true => now,
@@ -3142,7 +3173,7 @@ mod tests {
                 title: Some("Lunch with Stanley".into()),
                 place: Some("Queen's Cafe, North Point".into()),
                 time: Some("14:30".into()),
-                date: None, end_date: None,
+                date: None, end_date: None, booked: None, confirmation_code: None,
             })
             .await
             .unwrap();
@@ -3156,7 +3187,7 @@ mod tests {
         let again = edit
             .call(UpdateItemArgs {
                 trip: "Hong Kong".into(), position: 1, title: Some("Lunch with Stanley".into()),
-                place: None, date: None, time: None, end_date: None,
+                place: None, date: None, time: None, end_date: None, booked: None, confirmation_code: None,
             })
             .await
             .unwrap();
@@ -3164,18 +3195,18 @@ mod tests {
 
         // Nothing named is a question, not an edit.
         assert!(edit
-            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: None, date: None, time: None, end_date: None })
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: None, date: None, time: None, end_date: None , booked: None, confirmation_code: None})
             .await
             .is_err());
 
         // A blank clears; a blank title does not, because the item is
         // drawn by it.
         assert!(edit
-            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: Some("  ".into()), place: None, date: None, time: None, end_date: None })
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: Some("  ".into()), place: None, date: None, time: None, end_date: None , booked: None, confirmation_code: None})
             .await
             .is_err());
         let cleared = edit
-            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: Some("".into()), date: None, time: None, end_date: None })
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: Some("".into()), date: None, time: None, end_date: None , booked: None, confirmation_code: None})
             .await
             .unwrap();
         assert_eq!(cleared.trip.items[0].place, None);
@@ -3183,13 +3214,41 @@ mod tests {
         // The same validation the add path does, and before anything is
         // written: a date that is not a date, and an end before its start.
         assert!(edit
-            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: None, date: Some("the 24th".into()), time: None, end_date: None })
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: None, date: Some("the 24th".into()), time: None, end_date: None , booked: None, confirmation_code: None})
             .await
             .is_err());
         assert!(edit
-            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: None, date: Some("2026-09-24".into()), time: None, end_date: Some("2026-09-20".into()) })
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: None, place: None, date: Some("2026-09-24".into()), time: None, end_date: Some("2026-09-20".into()) , booked: None, confirmation_code: None})
             .await
             .is_err());
+
+        // Held is the traveller's word, not a system's. This is the gap
+        // the owner hit: a lunch arranged over WhatsApp could never be
+        // marked, because the only path to `booked` was forwarding a
+        // confirmation email, and the desk — truthfully, about its own
+        // tools — kept saying it could not do it.
+        let held = edit
+            .call(UpdateItemArgs {
+                trip: "Hong Kong".into(), position: 1, title: None, place: None, date: None,
+                time: None, end_date: None, booked: Some(true), confirmation_code: None,
+            })
+            .await
+            .unwrap();
+        assert!(held.trip.items[0].booked);
+        assert!(held.changed.as_deref().expect("it says what it did").contains("held"), "{:?}", held.changed);
+        // A code is optional — most restaurants give none — and saying so
+        // is not what makes a thing held.
+        assert_eq!(held.trip.items[0].confirmation_code, None);
+
+        // And it comes off again, because plans fall through.
+        let off = edit
+            .call(UpdateItemArgs {
+                trip: "Hong Kong".into(), position: 1, title: None, place: None, date: None,
+                time: None, end_date: None, booked: Some(false), confirmation_code: None,
+            })
+            .await
+            .unwrap();
+        assert!(!off.trip.items[0].booked);
 
         // And a flight is sent to the tool that knows how to move one.
         AddTripSegmentTool { store: store.clone(), account_id: 7, conversation_id: 99 }
@@ -3200,7 +3259,7 @@ mod tests {
             .await
             .unwrap();
         let err = edit
-            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: Some("Nope".into()), place: None, date: None, time: None, end_date: None })
+            .call(UpdateItemArgs { trip: "Hong Kong".into(), position: 1, title: Some("Nope".into()), place: None, date: None, time: None, end_date: None , booked: None, confirmation_code: None})
             .await
             .unwrap_err();
         assert!(err.0.contains("update_trip_segment"), "the model is sent somewhere: {}", err.0);

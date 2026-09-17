@@ -57,11 +57,11 @@ Nothing lands on a trip until you click Add. Everything else — newsletters, ma
 read, arrivals you ignored — sits under Other mail for thirty days.
 
 <p align="center">
-  <img src="crates/scout-web/src/assets/trips-desktop.webp" alt="Scout trip planner on desktop, with an airport timeline, flight choices, saved fares and a tight connection warning" width="900">
+  <img src="crates/scout-web/src/assets/trips-desktop.webp" alt="Scout trip planner on desktop: the route across the top, then a row for each day of the trip with what falls on it, a booking address in the sidebar, and each item marked held or still to book" width="900">
 </p>
 
 <p align="center">
-  <img src="crates/scout-web/src/assets/trips-mobile.webp" alt="Scout trip planner on a mobile screen" width="320">
+  <img src="crates/scout-web/src/assets/trips-mobile.webp" alt="The same trip on a phone: the day rows keep their date column, and each day&apos;s items wrap beneath it" width="320">
 </p>
 
 Built in Rust with [teloxide](https://github.com/teloxide/teloxide),

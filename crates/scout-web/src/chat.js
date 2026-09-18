@@ -1,6 +1,8 @@
 // The chat page's client. Pure helpers first (exported for
 // `chat.test.mjs`), then the DOM wiring that uses them.
 
+import { settleIntoTelegram, clearExchanged, openOutside } from './telegram.js'
+
 /// Moves accumulated text forward by one `TextUpdate`. The counterpart of
 /// `TextUpdate::apply` in scout-api, and the reason it exists at all: a
 /// `</think>` with no opener retracts everything already sent by replacing
@@ -1127,6 +1129,8 @@ export function keepFailedTurn(end, debugOn, rowCount) {
 
 function start() {
   const csrfToken = document.querySelector('meta[name="csrf"]').content
+  // Set by the server on `/chat?in=telegram`, the page the Mini App opens.
+  const inTelegram = document.documentElement.dataset.surface === 'telegram'
   const turnsEl = document.getElementById('turns')
   const statusEl = document.getElementById('status')
   const noticeEl = document.getElementById('notice')
@@ -2445,6 +2449,9 @@ function start() {
       // name is the sender's text, and it arrives as `textContent`.
       link.append(fileIcon(), node('span', '', file.filename || `attachment ${file.id}`))
       link.href = `/chat/attachments/${encodeURIComponent(file.id)}`
+      // Which file, for the Mini App: its links leave Telegram for a
+      // browser with no session, so it asks for a link that carries one.
+      link.dataset.attachment = String(file.id)
       // One behaviour here, and the server decides what it means: no
       // `download`, so a ticket that came back `inline` — a PDF, an image,
       // plain text — opens in the new tab, and a type the browser cannot
@@ -3024,6 +3031,20 @@ function start() {
 
   async function downloadTripPdf(trip, button) {
     if (button.disabled) return
+    // A blob saved from inside Telegram's web view goes nowhere on a
+    // phone. The browser Telegram hands the link to can save it.
+    if (inTelegram) {
+      button.disabled = true
+      try {
+        await openFileOutside({ trip: trip.name })
+        showTripToast('The PDF opens in your browser.')
+      } catch {
+        showTripToast('Could not create the PDF. Try again in a moment.')
+      } finally {
+        button.disabled = false
+      }
+      return
+    }
     const label = button.textContent
     button.disabled = true
     button.setAttribute('aria-busy', 'true')
@@ -3171,6 +3192,27 @@ function start() {
   // Every thread route is a POST behind the CSRF header, and most carry no
   // body at all — so the header set lives here once rather than at each of
   // the eight call sites.
+  // Every link that would open a tab, opened by Telegram instead — see
+  // `openOutside`. A ticket goes out as a file link, because the browser
+  // it lands in holds no session.
+  function leaveTelegramByLink(event) {
+    const link = event.target.closest?.('a[target="_blank"]')
+    if (!link || event.defaultPrevented) return
+    event.preventDefault()
+    if (link.dataset.attachment) {
+      openFileOutside({ attachment: Number(link.dataset.attachment) })
+        .catch(() => showTripToast('Could not open that file. Try again.'))
+    } else {
+      openOutside(link.href)
+    }
+  }
+
+  async function openFileOutside(what) {
+    const res = await post('/chat/file-link', what)
+    if (!res.ok) throw new Error('refused')
+    openOutside((await res.json()).url)
+  }
+
   async function post(path, body) {
     return fetch(path, {
       method: 'POST',
@@ -3863,6 +3905,18 @@ function start() {
 
   chatTab.addEventListener('click', () => switchView('chat'))
   tripsTab.addEventListener('click', () => switchView('trips'))
+
+  // Inside Telegram the bot is the chat, so the page is the trips alone:
+  // no history to load, no model switch to read, and the trip a button
+  // named — "Open trip" under a reply — chosen before the list arrives.
+  if (inTelegram) {
+    settleIntoTelegram()
+    try { clearExchanged(window.sessionStorage) } catch { /* no loop guard to clear */ }
+    currentTrip = new URLSearchParams(location.search).get('trip') || null
+    document.addEventListener('click', leaveTelegramByLink)
+    switchView('trips')
+    return
+  }
 
   // Through `newThread`, which posts `/chat/threads`: the sidebar has to
   // learn the new thread's id, and the threads route is what hands it back.

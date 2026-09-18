@@ -52,10 +52,17 @@ async fn pdf(
     if !csrf_header_ok(&auth, &headers, account_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    pdf_response(&auth, account_id, &body.trip).await
+}
+
+/// A trip's PDF for an account already proven, by cookie or by file link.
+/// The throttle is in here rather than in either caller, so a link cannot
+/// be the way round it.
+pub(crate) async fn pdf_response(auth: &AuthState, account_id: i64, trip: &str) -> Response {
     if !auth.pdf_by_account.allow(&account_id.to_string()) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    let plan = match scout_core::trips::find(&auth.core, account_id, &body.trip).await {
+    let plan = match scout_core::trips::find(&auth.core, account_id, trip).await {
         Ok(Some(plan)) => plan,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {

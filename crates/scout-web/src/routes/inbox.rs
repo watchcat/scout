@@ -300,6 +300,13 @@ async fn attachment(
         Ok(id) => id,
         Err(response) => return response,
     };
+    attachment_response(&auth, account_id, id).await
+}
+
+/// One account's file, as the response that serves it. Shared with the
+/// Mini App's file links, which prove the account another way; everything
+/// about how a stranger's file is sent stays in one place.
+pub(crate) async fn attachment_response(auth: &AuthState, account_id: i64, id: i64) -> Response {
     match inbox::attachment_for(&auth.core, id, account_id).await {
         Ok(Some((filename, mime, bytes))) => {
             // The sanitised type decides both what is sent and whether it

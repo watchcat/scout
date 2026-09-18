@@ -207,7 +207,8 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
             let mut signed_in = routes::auth::routes(auth.clone())
                 .merge(routes::account::routes(auth.clone()))
                 .merge(routes::chat::routes(auth.clone()))
-                .merge(routes::trips::routes(auth.clone()));
+                .merge(routes::trips::routes(auth.clone()))
+                .merge(routes::telegram_app::routes(auth.clone()));
             // The inbox's signed-in side goes with its webhook: without
             // one, nothing ever fills the inbox, and the page reads the
             // 404 as "no inbox here" and draws neither the address nor
@@ -426,7 +427,17 @@ async fn security_headers(
     // nameless request instead of waving it through.
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin"));
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    // Unless the policy names who may frame the page: a browser that reads
+    // `frame-ancestors` ignores this header anyway, but one that does not
+    // would obey `DENY` and show the Mini App inside Telegram Web as a
+    // blank frame. Every page that sets no such policy still gets it.
+    let names_its_framers = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|csp| csp.contains("frame-ancestors"));
+    if !names_its_framers {
+        headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    }
     // Nothing this half serves is worth keeping a copy of. `/account`
     // renders whether you hold a seat and a form token that is live for
     // fifteen minutes, and `/auth/email` renders a page whose own URL

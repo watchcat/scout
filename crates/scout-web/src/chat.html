@@ -459,6 +459,34 @@
   .route-arrow{padding:0 7px; color:var(--cyan); font-weight:400}
   .segment-date{flex:none; margin-top:2px; color:var(--base1); font-size:13px}
   .segment-head-actions{flex:none; display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end}
+  /* The ⋯ in the corner. No border at rest: it is the quietest thing in
+     the head, there for whoever looks for it, and a boxed button there
+     would pull the eye off the pill and the date beside it. The negative
+     margin lines the dots up with the head's padding, not the box's. */
+  .item-menu{flex:none; margin:-5px -8px 0 -4px}
+  .item-menu-button{display:grid; place-items:center; width:32px; height:30px; padding:0;
+    background:transparent; border:1px solid transparent; border-radius:8px; color:var(--base01); cursor:pointer}
+  .item-menu-button:hover, .item-menu-button[aria-expanded="true"]{color:var(--base1);
+    border-color:var(--line); background:rgba(0,43,54,.55)}
+  .item-menu-button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  /* A popover, so the UA's centred dialog box has to be undone: `inset`
+     and `margin` go, and `placeMenu` writes `top` and `right`. */
+  .item-menu-list{position:fixed; inset:auto; margin:0; min-width:180px; max-width:calc(100vw - 16px);
+    padding:5px; border:1px solid var(--line); border-radius:12px; background:var(--panel);
+    color:var(--base1); box-shadow:0 14px 32px rgba(0,0,0,.45)}
+  .item-menu-list:popover-open{display:flex; flex-direction:column; gap:2px}
+  .item-menu-list button{text-align:left; background:transparent; border:0; border-radius:8px;
+    color:var(--base1); font:inherit; font-size:13px; font-weight:650; padding:8px 11px; cursor:pointer}
+  .item-menu-list button:hover{background:var(--base02); color:var(--base2)}
+  .item-menu-list button:focus-visible{background:var(--base02); color:var(--base2);
+    outline:2px solid var(--blue); outline-offset:-2px}
+  .item-menu-list button:disabled{opacity:.6; cursor:default}
+  /* `#ff817a` for the reason `.segment-remove-confirm button.danger` gives. */
+  .item-menu-list button.danger{color:#ff817a}
+  .item-menu-ask{margin:5px 11px 7px; color:#d1c27e; font-size:12px; font-weight:650}
+  .item-menu-confirm{display:flex; gap:6px; padding:0 3px 3px}
+  .item-menu-confirm button{flex:1; text-align:center; border:1px solid var(--line)}
+  .item-menu-confirm button.danger{border-color:var(--red)}
   .segment-remove-button{background:transparent; border:1px solid var(--line); border-radius:8px;
     color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
   .segment-remove-button:hover{color:#ff817a; border-color:var(--red)}
@@ -547,12 +575,6 @@
     color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
   .item-note-button:hover{color:var(--base1); border-color:var(--cyan); border-style:solid}
   .item-note-button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
-  .item-actions{display:flex; flex-wrap:wrap; gap:7px}
-  .item-hold-button{background:transparent; border:1px dashed var(--line); border-radius:8px;
-    color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
-  .item-hold-button:hover{color:var(--base1); border-color:var(--green); border-style:solid}
-  .item-hold-button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
-  .item-hold-button:disabled{opacity:.6; cursor:default}
   .item-note-editor{display:flex; flex-wrap:wrap; gap:6px; width:100%}
   .item-note-editor input{flex:1 1 15em; min-width:0; background:var(--base03); color:var(--base1);
     border:1px solid var(--line); border-radius:8px; font:inherit; font-size:12.5px; padding:7px 9px}
@@ -690,11 +712,15 @@
     .handle-line{order:5; flex:none; margin-top:2px; padding:10px 0 0}
     /* The head sat the title beside the date and Remove, and the actions
        are `flex:none`, so a phone gave "Hotel Alfama Patio" about 150px
-       and it came out three words tall. The title takes a row of its own
-       and the date and the button share the next one. */
+       and it came out three words tall. The title keeps the first row
+       with only the ⋯ beside it, in the corner where it is on a desktop,
+       and the pill and the date take the next row between them. */
     .segment-head{flex-wrap:wrap; gap:6px 12px}
-    .segment-head > :first-child{flex:1 1 100%; min-width:0}
-    .segment-head-actions{width:100%; justify-content:space-between}
+    .segment-head > :first-child{flex:1 1 0; min-width:0}
+    .item-menu{order:1; margin:-9px -10px 0 0}
+    .segment-head-actions{order:2; width:100%; justify-content:space-between}
+    .item-menu-button{width:42px; height:42px}
+    .item-menu-list button{min-height:42px; font-size:14px}
     /* Touch targets. These come to about 31px tall at the desktop scale,
        and the row of them decides whether a booking joins a trip or is
        thrown away — not a thing to mis-tap with a thumb. The circle that
@@ -712,10 +738,10 @@
     /* A thumb's worth, like every other control down here — and the
        editor goes to one column so the box is not a slot between two
        buttons on a phone. */
-    .item-note-button, .item-hold-button, .item-note-editor button{min-height:42px; padding:10px 14px; font-size:13px}
+    .item-note-button, .item-note-editor button{min-height:42px; padding:10px 14px; font-size:13px}
     /* The pill is read, not pressed, so it keeps its size; it goes
        first in the wrap so the state is still the thing the eye
-       meets before the date and the × on a narrow screen. */
+       meets before the date on a narrow screen. */
     .item-state{order:-1}
     .item-note-editor input{flex:1 1 100%; min-height:42px; font-size:16px}
     /* Listed apart from the rule above, not inside it: a media query adds

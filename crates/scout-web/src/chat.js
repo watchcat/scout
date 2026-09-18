@@ -810,6 +810,15 @@ export function noteParts(note) {
   return parts
 }
 
+// What a card's ⋯ menu offers, in order. Held only on something still to
+// book: on a booking the traveller already has, the entry could do
+// nothing but take the state off by mistake, and it sat next to Remove.
+// Undoing a held by hand is a thing to say to Scout, not a control every
+// confirmed card carries.
+export function itemMenuEntries(item) {
+  return item.booked ? ['remove'] : ['hold', 'remove']
+}
+
 // What the page sends to mark an item held or let it go. The item is
 // named the way `removeItemBody` and `noteBody` name one, for the reason
 // they give: positions renumber, and a flag written onto the wrong item
@@ -1700,60 +1709,152 @@ function start() {
     setTimeout(() => { button.disabled = false }, CONFIRM_ARM_MS)
   }
 
-  // The plain "Remove" button an item starts with. Kept as its own
-  // function so `removeConfirmRow`'s Cancel can rebuild exactly this and put
-  // the card back the way it found it.
-  function segmentRemoveButton(trip, item, slot) {
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.className = 'segment-remove-button'
-    button.textContent = 'Remove'
-    button.setAttribute(
-      'aria-label',
-      item.kind === 'flight'
-        ? `Remove segment ${item.position}, ${item.origin} to ${item.destination}`
-        : `Remove ${item.kind}, ${item.title}`,
-    )
-    button.addEventListener('click', () => {
-      slot.replaceChildren(removeConfirmRow(trip, item, slot))
+  // The ⋯ in a card's top-right corner, holding what is done *to* an
+  // item rather than read off it. Remove and Mark as held used to sit on
+  // the card as buttons, which made every card look like a form and put
+  // the destructive one beside the date the eye goes to first.
+  //
+  // A popover, not a box positioned inside the card: the card clips its
+  // overflow for its rounded corners, and the last card's menu would be
+  // cut off by its own bottom edge. The top layer also brings the
+  // light-dismiss and Escape a menu needs, and the invoker link keeps a
+  // click on ⋯ closing what it opened instead of reopening it.
+  function itemMenu(trip, item) {
+    const wrap = node('div', 'item-menu')
+    const trigger = document.createElement('button')
+    trigger.type = 'button'
+    trigger.className = 'item-menu-button'
+    trigger.setAttribute('aria-label', `More for ${itemName(item)}`)
+    trigger.setAttribute('aria-haspopup', 'menu')
+    trigger.setAttribute('aria-expanded', 'false')
+    trigger.append(dotsIcon())
+    const menu = node('div', 'item-menu-list')
+    menu.id = `item-menu-${item.position}`
+    menu.popover = 'auto'
+    menu.setAttribute('role', 'menu')
+    trigger.setAttribute('aria-controls', menu.id)
+    trigger.popoverTargetElement = menu
+
+    const entry = (label, onPick, danger) => {
+      const button = node('button', danger ? 'danger' : '', label)
+      button.type = 'button'
+      button.setAttribute('role', 'menuitem')
+      button.addEventListener('click', onPick)
+      return button
+    }
+    const drawEntries = () => {
+      menu.setAttribute('aria-label', itemName(item))
+      menu.replaceChildren(...itemMenuEntries(item).map((name) => name === 'hold'
+        ? entry('Mark as held', () => {
+          menu.hidePopover()
+          holdItem(trip, item, true)
+        })
+        : entry('Remove', () => {
+          drawConfirm()
+          menu.querySelector('button')?.focus()
+        }, true)))
+    }
+    // A second click, not `window.confirm`: a dialog blocks the whole page
+    // for one item on one card, and this is destructive enough to ask
+    // about but not rare enough to justify that. The ask replaces the
+    // list it was chosen from, and closing the menu any way at all is the
+    // Cancel. Only a response that rewrote the trip lets the
+    // card go, through the repaint that path already does.
+    const drawConfirm = () => {
+      menu.setAttribute('aria-label', `Remove this ${itemNoun(item)}?`)
+      const cancel = entry('Cancel', () => {
+        drawEntries()
+        menu.querySelector('button')?.focus()
+      })
+      const confirm = entry('Remove', () => {
+        confirm.disabled = true
+        cancel.disabled = true
+        removeItem(trip, item).then((restore) => {
+          if (restore) menu.hidePopover()
+        }).catch(() => menu.hidePopover())
+      }, true)
+      confirm.setAttribute('aria-label', `Remove ${itemName(item)}`)
+      // A double-click on Remove in the list would otherwise land its
+      // second half here and take the item on one gesture.
+      armConfirm(confirm)
+      const row = node('div', 'item-menu-confirm')
+      row.append(cancel, confirm)
+      menu.replaceChildren(node('p', 'item-menu-ask', `Remove this ${itemNoun(item)}?`), row)
+      menu.firstChild.setAttribute('role', 'none')
+    }
+
+    // Placed before it paints, not after: `toggle` fires a task later, and
+    // for that frame the menu stood in the window's top-left corner.
+    menu.addEventListener('beforetoggle', (event) => {
+      if (event.newState === 'open') placeMenu(menu, trigger)
     })
-    return button
+    let closing = null
+    menu.addEventListener('toggle', (event) => {
+      const open = event.newState === 'open'
+      trigger.setAttribute('aria-expanded', String(open))
+      closing?.abort()
+      closing = null
+      if (!open) {
+        drawEntries()
+        return
+      }
+      flipMenu(menu, trigger)
+      menu.querySelector('button')?.focus()
+      // Pinned to where ⋯ was when it opened, so a scroll or a resize
+      // would leave it floating over some other card. Closing is the
+      // honest answer; chasing the button is not worth it.
+      closing = new AbortController()
+      const close = () => { if (menu.matches(':popover-open')) menu.hidePopover() }
+      window.addEventListener('scroll', close, { capture: true, signal: closing.signal })
+      window.addEventListener('resize', close, { signal: closing.signal })
+    })
+    menu.addEventListener('keydown', (event) => {
+      const items = [...menu.querySelectorAll('button:not(:disabled)')]
+      const at = items.indexOf(document.activeElement)
+      const to = { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: items.length - 1 }[event.key]
+      if (to === undefined || !items.length) return
+      event.preventDefault()
+      items[(to + items.length) % items.length].focus()
+    })
+    drawEntries()
+    wrap.append(trigger, menu)
+    return wrap
   }
 
-  // A second click, not `window.confirm`: a dialog blocks the whole page for
-  // one item on one card, and this is destructive enough to ask about but
-  // not rare enough to justify that. The row swaps in over the button it
-  // replaced and swaps back on Cancel or on a failed request — only a
-  // response that actually rewrote the trip (200, or the reload a 409
-  // triggers) is allowed to leave it gone for good, via the full repaint
-  // those paths already do.
-  function removeConfirmRow(trip, item, slot) {
-    const row = node('span', 'segment-remove-confirm')
-    row.append(node('span', '', `Remove this ${itemNoun(item)}?`))
-    const cancel = document.createElement('button')
-    cancel.type = 'button'
-    cancel.textContent = 'Cancel'
-    cancel.addEventListener('click', () => {
-      slot.replaceChildren(segmentRemoveButton(trip, item, slot))
-    })
-    const confirm = document.createElement('button')
-    confirm.type = 'button'
-    confirm.className = 'danger'
-    confirm.textContent = 'Remove'
-    // A double-click on Remove would otherwise take the leg on one gesture,
-    // the confirm never seen.
-    armConfirm(confirm)
-    confirm.addEventListener('click', () => {
-      confirm.disabled = true
-      cancel.disabled = true
-      removeItem(trip, item).then((restore) => {
-        if (restore) slot.replaceChildren(segmentRemoveButton(trip, item, slot))
-      }).catch(() => {
-        slot.replaceChildren(segmentRemoveButton(trip, item, slot))
-      })
-    })
-    row.append(cancel, confirm)
-    return row
+  // Under ⋯, right edges aligned.
+  function placeMenu(menu, trigger) {
+    const at = trigger.getBoundingClientRect()
+    const width = document.documentElement.clientWidth
+    menu.style.right = `${Math.max(8, width - at.right)}px`
+    menu.style.top = `${at.bottom + 4}px`
+  }
+
+  // Or above it, where the card sits low enough that below would run off
+  // the bottom of the window — which can only be measured once it shows.
+  function flipMenu(menu, trigger) {
+    const at = trigger.getBoundingClientRect()
+    const height = menu.getBoundingClientRect().height
+    if (at.bottom + 4 + height > window.innerHeight - 8) {
+      menu.style.top = `${Math.max(8, at.top - 4 - height)}px`
+    }
+  }
+
+  function dotsIcon() {
+    const ns = 'http://www.w3.org/2000/svg'
+    const svg = document.createElementNS(ns, 'svg')
+    svg.setAttribute('viewBox', '0 0 24 24')
+    svg.setAttribute('width', '18')
+    svg.setAttribute('height', '18')
+    svg.setAttribute('fill', 'currentColor')
+    svg.setAttribute('aria-hidden', 'true')
+    for (const cx of ['5', '12', '19']) {
+      const dot = document.createElementNS(ns, 'circle')
+      dot.setAttribute('cx', cx)
+      dot.setAttribute('cy', '12')
+      dot.setAttribute('r', '1.9')
+      svg.append(dot)
+    }
+    return svg
   }
 
   // A stay, an activity or a transport: one card, nothing to choose on it.
@@ -1782,10 +1883,7 @@ function start() {
     if (item.attachments?.length) about.append(attachmentLinks(item.attachments))
     const actions = node('div', 'segment-head-actions')
     actions.append(statePill(item), node('time', 'segment-date', itemDateLabel(item)))
-    const removeSlot = node('span', 'segment-remove')
-    removeSlot.append(segmentRemoveButton(trip, item, removeSlot))
-    actions.append(removeSlot)
-    head.append(about, actions)
+    head.append(about, actions, itemMenu(trip, item))
     card.append(head)
     card.append(noteSlot(trip, item))
     return card
@@ -1816,10 +1914,7 @@ function start() {
     if (segment.attachments?.length) route.append(attachmentLinks(segment.attachments))
     const actions = node('div', 'segment-head-actions')
     actions.append(statePill(segment), node('time', 'segment-date', dateLabel(segment.date)))
-    const removeSlot = node('span', 'segment-remove')
-    removeSlot.append(segmentRemoveButton(trip, segment, removeSlot))
-    actions.append(removeSlot)
-    head.append(route, actions)
+    head.append(route, actions, itemMenu(trip, segment))
     card.append(head)
     card.append(noteSlot(trip, segment))
 
@@ -1878,7 +1973,7 @@ function start() {
     // kept-trips spec declined this feature over, so the shape has to be
     // the thing that tells them apart, not just a colour. It opens
     // `deleteSlot` below rather than swapping itself out in place, the way
-    // `segmentRemoveButton` does — the confirm needs room for a full
+    // an Other-mail row's × does — the confirm needs room for a full
     // sentence, and a header pill's worth of space is not that.
     const deleteButton = node('button', 'trip-delete-button', '×')
     deleteButton.type = 'button'
@@ -2218,20 +2313,6 @@ function start() {
   }
 
   function drawNote(trip, item, slot) {
-    const hold = document.createElement('button')
-    hold.type = 'button'
-    hold.className = 'item-hold-button'
-    // Said as the thing it will do, not as the state it is in: a button
-    // labelled with the current state is the oldest way to make somebody
-    // press it and get the opposite of what they read.
-    hold.textContent = item.booked ? 'Mark as not held' : 'Mark as held'
-    hold.setAttribute('aria-label', `${hold.textContent}: ${itemName(item)}`)
-    hold.addEventListener('click', () => {
-      hold.disabled = true
-      holdItem(trip, item, !item.booked).finally(() => {
-        hold.disabled = false
-      })
-    })
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'item-note-button'
@@ -2241,14 +2322,7 @@ function start() {
       slot.replaceChildren(noteEditor(trip, item, slot))
       slot.querySelector('input')?.focus()
     })
-    slot.replaceChildren(...(item.notes ? [noteLine(item), row(button, hold)] : [row(button, hold)]))
-  }
-
-  // The two buttons under a card, side by side.
-  function row(...buttons) {
-    const line = node('div', 'item-actions')
-    line.append(...buttons)
-    return line
+    slot.replaceChildren(...(item.notes ? [noteLine(item), button] : [button]))
   }
 
   // Held is the traveller's word — a table booked by phone, a friend
@@ -2447,8 +2521,8 @@ function start() {
     slot.closest('.other-mail-row')?.classList.toggle('confirming', wide)
   }
 
-  // The × a row starts with. Its own function, as `segmentRemoveButton` is,
-  // so the confirm's Cancel and a refusal can both rebuild exactly this.
+  // The × a row starts with. Its own function so the confirm's Cancel and
+  // a refusal can both rebuild exactly this.
   function mailRemoveButton(line, slot) {
     const button = node('button', 'segment-remove-button other-mail-remove-button', '×')
     button.type = 'button'
@@ -2465,8 +2539,8 @@ function start() {
     return button
   }
 
-  // A second press rather than `window.confirm`, for the reason
-  // `removeConfirmRow` gives — and the same swap-in-place: the ask stands
+  // A second press rather than `window.confirm`, for the reason the item
+  // menu's confirm in `itemMenu` gives — and a swap-in-place: the ask stands
   // where the × was and puts the × back on Cancel or on a failure. Only a
   // delete that happened leaves it gone, and that repaints the whole list
   // anyway.
@@ -2731,8 +2805,8 @@ function start() {
     return form
   }
 
-  // A second press, not `window.confirm`, for the reason `removeConfirmRow`
-  // gives — but built as its own block below the header rather than in
+  // A second press, not `window.confirm`, for the reason `itemMenu`'s
+  // confirm gives — but built as its own block below the header rather than in
   // place of the × that opened it: `tripDeleteConsequence` can run to a full
   // sentence ("Its 2 legs and 5 saved flight options go with it."), and that
   // needs a paragraph, not the width of one header pill. Styled like

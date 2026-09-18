@@ -215,6 +215,19 @@ mod tests {
         res.headers().get(name).and_then(|v| v.to_str().ok())
     }
 
+    #[test]
+    fn the_telegram_shape_hides_the_page_header_and_not_the_cards_heads() {
+        // The cards are `<header class="segment-head">` too. Hiding every
+        // header shipped once and left each item as a bare "Add note".
+        let page = include_str!("../chat.html");
+        assert!(page.contains(r#"html[data-surface="telegram"] .wrap > header"#));
+        for line in page.lines().filter(|l| l.contains(r#"html[data-surface="telegram"]"#)) {
+            for selector in line.split([',', '{']) {
+                assert_ne!(selector.trim(), r#"html[data-surface="telegram"] header"#, "a bare header selector: {line}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn the_launch_page_may_be_framed_by_telegram_web_and_nobody_else() {
         let (app, _core, _dir) = test_app().await;

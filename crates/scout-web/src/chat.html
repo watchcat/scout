@@ -19,7 +19,10 @@
   /* Inside Telegram the bot is the chat, and Telegram draws the frame:
      what is left is the trips. Hidden by the stylesheet rather than
      removed, so the one page stays one page for every test that reads it. */
-  html[data-surface="telegram"] header, html[data-surface="telegram"] #chat-workspace,
+  /* `.wrap > header`, the page's own, and not `header`: every card on the
+     timeline heads itself with one, and the bare selector took the title,
+     the date, the state and the ⋯ off all of them. */
+  html[data-surface="telegram"] .wrap > header, html[data-surface="telegram"] #chat-workspace,
   html[data-surface="telegram"] #ask, html[data-surface="telegram"] #compose-target,
   html[data-surface="telegram"] #status{display:none}
   html[data-surface="telegram"] .trips-view{padding-top:16px}

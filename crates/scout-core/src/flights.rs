@@ -42,9 +42,12 @@ const TRIP_TOOLS: &[&str] = &[
 ];
 
 pub const FLIGHT_PREAMBLE: &str = "\
-You are Scout's flight desk. Another agent hands you a brief - a route, \
-dates, passengers, sometimes an offer id - and you search, book or plan \
-with the tools you have, then report back. You never speak to the \
+You are Scout's flight and trip desk. Another agent hands you a brief - a \
+route, dates, passengers, sometimes an offer id, or a trip to read or \
+change: what it holds, an activity, shop or stay to add, a note, what is \
+booked - and you search, book or plan with the tools you have, then report \
+back. You are the only one who can see a trip, so when asked what a trip \
+holds, report its dates and every item as show_trip gives them. You never speak to the \
 traveller and you never buy anything.
 
 Rules:
@@ -258,8 +261,11 @@ pub fn ask_flights(
     let markup = crate::agent::markup_rate(d);
     Specialist {
         name: "ask_flights",
-        description: "Scout's flight desk. Send it every question about flights, fares, \
-                      airport codes, booking a flight, or a trip being planned. It sees nothing \
+        description: "Scout's flight and trip desk, the only one that can read or change \
+                      a trip. Send it every question about flights, fares, airport codes, \
+                      booking a flight, and every question about a trip: what it holds and \
+                      on which days, and adding, changing or removing anything on it - an \
+                      activity, a shop, a stay, a note or map link, what is booked. It sees nothing \
                       of the conversation, so the brief must be self-contained: route, \
                       dates, passengers, cabin, whether the dates are flexible, and any \
                       offer id the user is pointing at. Naming a trip is itself a \
@@ -782,6 +788,10 @@ mod tests {
         // for a route the parent does not have: in production it went and
         // asked the traveller to recite legs that were already on the trip.
         assert!(d.contains("Naming a trip is itself a complete brief"), "got: {d}");
+        // Not only flights: the parent sent a shop and a church nowhere,
+        // having been told the desk was for flights and trips "being planned".
+        assert!(d.contains("the only one that can read or change"), "got: {d}");
+        assert!(d.contains("an activity, a shop, a stay"), "got: {d}");
         let p = rig::tool::Tool::parameters(&tool);
         assert_eq!(p["required"], serde_json::json!(["brief"]));
     }

@@ -102,6 +102,18 @@ trip at all: asked to save a trip it answered 'already saved as purchase id \
 This ask usually lands the turn AFTER the flight report, with no guidance \
 in front of you, so nothing will remind you then: the trip meant is the one \
 that report named.
+- When ask_flights is available, a trip itself is that desk's too, not only \
+its flights: what the trip holds and on which days, and adding, moving, \
+changing or removing anything on it - an activity, a visit, a shop, a meal, \
+a stay, a note (a map link belongs in a note), whether something is booked. \
+Only the desk can read or change a trip; you see none of it. So never say \
+something is in the trip or already in the plan unless the desk said so in \
+this turn: a plan you wrote in chat is not the trip. When the traveller asks \
+to add or change something, send it to the desk at once with the trip's \
+name and every detail they gave - date with the year, time, place, link - \
+and do not ask whether to pass it on. Before planning days of a trip, ask \
+the desk what the trip already holds, its dates first, and offer to add \
+what the traveller picks.
 - Some users list favourite shops below, each with the kind of product it \
 is for. When what you are searching for falls in that kind - judge it \
 sensibly, a stain remover is a cleaning product - spend one of search_web's \
@@ -722,6 +734,7 @@ mod tests {
         let f = preamble_with_profile(&[], &without_flights);
         assert!(!f.contains("ask_flights"), "an absent desk is not mentioned at all: {f}");
         assert!(!f.contains("keep the trip by name"), "the keep rule went with it: {f}");
+        assert!(!f.contains("a trip itself is that desk's too"), "and so did the trip rule: {f}");
     }
 
     #[test]
@@ -747,6 +760,15 @@ mod tests {
         // id 11. The routing has to be durable, not carried by a report.
         assert!(p.contains("keep the trip by name"), "got: {p}");
         assert!(p.contains("record_purchase records something the traveller BOUGHT"), "got: {p}");
+        // Everything about a trip, not only its flights. Measured in
+        // production: asked to add a Moomin shop, the parent answered that
+        // it was "already in the plan" - its own chat plan, never saved -
+        // planned four days of a trip it did not know ran to the 29th, and
+        // asked "shall I pass it to the desk?" of a request to add a church.
+        assert!(p.contains("a trip itself is that desk's too"), "got: {p}");
+        assert!(p.contains("a plan you wrote in chat is not the trip"), "got: {p}");
+        assert!(p.contains("do not ask whether to pass it on"), "got: {p}");
+        assert!(p.contains("its dates first"), "got: {p}");
     }
 
     #[test]

@@ -272,7 +272,13 @@ pub async fn run(bot: Bot, app: Arc<App>, listener: Option<crate::webhook::Liste
 }
 
 fn is_member(app: &App, msg: &Message) -> bool {
-    sender_id(msg).is_some_and(|id| is_member_id(app, id))
+    let member = sender_id(msg).is_some_and(|id| is_member_id(app, id));
+    if !member {
+        // Dropped without a word, by design — so said here, or a stranger
+        // and a founder the gate stopped recognising look the same.
+        tracing::info!(user_id = sender_id(msg), chat_id = msg.chat.id.0, "not a member; ignored");
+    }
+    member
 }
 
 /// The gate: founders from `ALLOWED_TELEGRAM_USER_IDS`, plus everyone
@@ -980,6 +986,7 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
     match result {
         Ok(scout_core::run::RunOutcome::Answered(reply)) => {
             let button = open_trip_button(&app, chat_id, &touched);
+            tracing::info!(chat_id = chat_id.0, chars = reply.len(), trip_button = button.is_some(), "answered");
             deliver(&bot, &app, &mut live, chat_id, &reply, button).await?;
             record_own_turn(&app.core, account_id, chat_id.0).await;
         }
@@ -1218,6 +1225,7 @@ async fn handle_reaction(
     match result {
         Ok(scout_core::run::RunOutcome::Answered(reply)) => {
             let button = open_trip_button(&app, chat_id, &touched);
+            tracing::info!(chat_id = chat_id.0, chars = reply.len(), trip_button = button.is_some(), "answered");
             deliver(&bot, &app, &mut live, chat_id, &reply, button).await?;
             record_own_turn(&app.core, account_id, chat_id.0).await;
         }

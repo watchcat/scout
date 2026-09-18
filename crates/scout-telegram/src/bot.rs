@@ -15,6 +15,9 @@ pub struct App {
     /// Everything that is Scout rather than Telegram. Shared, never owned:
     /// in 2b-2 it lives in another process entirely.
     pub core: Arc<scout_core::core::Core>,
+    /// Where the trip page's Mini App starts, when the site is served over
+    /// https. `None` in a local run, and then no reply carries a button.
+    pub mini_app: Option<url::Url>,
     /// One entry per (chat_id, sender_id). In a 1:1 chat a single user always
     /// hits the same slot; in a group/supergroup, each allowed user has
     /// their own history, draft and last_seen, isolating conversation
@@ -970,13 +973,14 @@ async fn handle_text(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()
         reply_to: Some(scout_api::ReplyTo::telegram(chat_id.0)),
         title_source: Some(said),
     };
-    let (result, mut live) = tokio::join!(
+    let (result, (mut live, touched)) = tokio::join!(
         scout_core::run::run_agent(&app.core, events, &run, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {
         Ok(scout_core::run::RunOutcome::Answered(reply)) => {
-            deliver(&bot, &app, &mut live, chat_id, &reply).await?;
+            let button = open_trip_button(&app, chat_id, &touched);
+            deliver(&bot, &app, &mut live, chat_id, &reply, button).await?;
             record_own_turn(&app.core, account_id, chat_id.0).await;
         }
         Ok(scout_core::run::RunOutcome::Busy) => {
@@ -1207,13 +1211,14 @@ async fn handle_reaction(
         // thread stays nameless until their next message names it.
         title_source: None,
     };
-    let (result, mut live) = tokio::join!(
+    let (result, (mut live, touched)) = tokio::join!(
         scout_core::run::run_agent(&app.core, events, &run, &prompt),
         crate::progress::render_events(live, incoming),
     );
     match result {
         Ok(scout_core::run::RunOutcome::Answered(reply)) => {
-            deliver(&bot, &app, &mut live, chat_id, &reply).await?;
+            let button = open_trip_button(&app, chat_id, &touched);
+            deliver(&bot, &app, &mut live, chat_id, &reply, button).await?;
             record_own_turn(&app.core, account_id, chat_id.0).await;
         }
         Ok(scout_core::run::RunOutcome::Busy) => {
@@ -1287,18 +1292,31 @@ async fn record_own_turn(core: &scout_core::core::Core, account_id: i64, chat_id
 /// Puts the finished answer where the progress message already is: the first
 /// chunk replaces it, any remainder follows as new messages. Every chunk is
 /// remembered so a later 👍 resolves to its text.
+/// "Open <trip>" under a reply that changed one, in a private chat, when
+/// the site is somewhere Telegram can open. A group gets none: Telegram
+/// allows web-app buttons only in a chat with the bot itself.
+fn open_trip_button(app: &App, chat_id: ChatId, touched: &crate::mini_app::TouchedTrips) -> Option<InlineKeyboardMarkup> {
+    if chat_id.0 <= 0 {
+        return None;
+    }
+    let launch = app.mini_app.as_ref()?;
+    Some(crate::mini_app::open_trip_markup(launch, touched.last()?))
+}
+
 async fn deliver(
     bot: &Bot,
     app: &App,
     live: &mut Live,
     chat_id: ChatId,
     text: &str,
+    button: Option<InlineKeyboardMarkup>,
 ) -> ResponseResult<()> {
     let mut chunks = split_message(text, TELEGRAM_LIMIT).into_iter();
     let Some(first) = chunks.next() else {
         live.show("(no answer - please try again)", true).await;
         return Ok(());
     };
+    let mut last = None;
     // The answer goes into the progress message when it can. When it
     // cannot — flood control, most often, after a long run has been editing
     // the same message for minutes — `Live` swallows the failure, so
@@ -1308,12 +1326,23 @@ async fn deliver(
     if live.show(&first, true).await {
         if let Some(id) = live.message_id() {
             remember_chat_reply(&app.replies, chat_id.0, id.0, live.shown());
+            last = Some(id);
         }
     } else {
         tracing::warn!(chat_id = chat_id.0, "could not edit the answer in; sending it instead");
-        send_chunked(bot, app, chat_id, &first).await?;
+        last = send_chunked(bot, app, chat_id, &first).await?.or(last);
     }
-    send_chunked(bot, app, chat_id, &chunks.collect::<Vec<_>>().join("\n")).await
+    last = send_chunked(bot, app, chat_id, &chunks.collect::<Vec<_>>().join("\n")).await?.or(last);
+    // On the reply's last message, where the reader finishes, and added
+    // after it is sent rather than with it: the first part is the progress
+    // message being edited, and which message ends up last is only known
+    // here. A failure costs the button and nothing else.
+    if let (Some(markup), Some(id)) = (button, last) {
+        if let Err(e) = bot.edit_message_reply_markup(chat_id, id).reply_markup(markup).await {
+            tracing::warn!(error = %e, chat_id = chat_id.0, "could not add the open-trip button");
+        }
+    }
+    Ok(())
 }
 
 /// A guess at how long to wait before trying a failed send again.
@@ -1349,8 +1378,10 @@ fn retry_delay(error: &teloxide::RequestError) -> Option<std::time::Duration> {
 /// Send in <=4096-char chunks; each chunk gets one retry. Sent chunks are
 /// remembered per chat so a later reaction on one can be resolved to its
 /// text.
-async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> ResponseResult<()> {
+/// Sends `text` in as many messages as it takes, and says which was last.
+async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> ResponseResult<Option<teloxide::types::MessageId>> {
     let chunks = split_message(text, TELEGRAM_LIMIT);
+    let mut last = None;
     for chunk in chunks {
         let sent = match bot.send_message(chat_id, chunk.clone()).await {
             Ok(sent) => sent,
@@ -1365,8 +1396,9 @@ async fn send_chunked(bot: &Bot, app: &App, chat_id: ChatId, text: &str) -> Resp
             }
         };
         remember_chat_reply(&app.replies, chat_id.0, sent.id.0, &chunk);
+        last = Some(sent.id);
     }
-    Ok(())
+    Ok(last)
 }
 
 /// Parses a Telegram invite command and hands the request to core.

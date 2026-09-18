@@ -8,7 +8,7 @@ import {
   connectionCheck, tripTimelinePoints, tripLoadIsCurrent, savedFareQualifier, savedFareLine,
   tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark, itemState, tripDayRows,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
-  noteParts, noteBody, holdBody,
+  noteParts, noteBody, holdBody, itemMenuEntries,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   ITINERARY_NOTE,
@@ -995,4 +995,15 @@ test('the page can say a thing is held, and names the item it means', () => {
   assert.equal(leg.title, null)
   assert.equal(leg.origin, 'AMS')
   assert.equal(leg.held, false)
+})
+
+// The card's ⋯ menu. Held is not offered on something already held: the
+// traveller who confirmed it has nothing to do with that entry but press
+// it by mistake, and "Mark as not held" beside Remove read as a second
+// way to throw the booking away.
+test('the item menu offers Mark as held only on something still to book', () => {
+  assert.deepEqual(itemMenuEntries({ kind: 'activity', title: 'Lunch with Stanley', booked: false }), ['hold', 'remove'])
+  assert.deepEqual(itemMenuEntries({ kind: 'stay', title: 'Harbour View Rooms', booked: true }), ['remove'])
+  assert.deepEqual(itemMenuEntries({ kind: 'flight', origin: 'AMS', destination: 'HKG', booked: false }), ['hold', 'remove'])
+  assert.deepEqual(itemMenuEntries({ kind: 'flight', origin: 'AMS', destination: 'HKG', booked: true }), ['remove'])
 })

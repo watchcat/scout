@@ -1,6 +1,7 @@
 mod bot;
 mod draft;
 mod membership;
+mod mini_app;
 mod mirror;
 mod progress;
 mod scheduler;
@@ -100,6 +101,30 @@ async fn register_webhook(bot: Bot, url: url::Url) {
     }
 }
 
+/// The "Trips" button beside the input, for every private chat.
+///
+/// Set on every start rather than once by hand in BotFather, so the button
+/// follows the domain the deployment serves. Retried the way the webhook
+/// is, and not fatal: the button a previous start set is still there.
+async fn install_menu_button(bot: Bot, launch: url::Url) {
+    use teloxide::payloads::SetChatMenuButtonSetters;
+    use teloxide::prelude::Requester;
+    let mut wait = std::time::Duration::from_secs(2);
+    loop {
+        match bot.set_chat_menu_button().menu_button(mini_app::menu_button(&launch)).await {
+            Ok(_) => {
+                tracing::info!(url = %launch, "the Trips button opens the Mini App");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, retry_in = wait.as_secs(), "could not set the Trips button");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(300));
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -175,8 +200,19 @@ async fn main() -> Result<()> {
         }
     });
 
+    // From the site's own address, which the front door already reads, so
+    // the button and the page cannot point at two different hosts.
+    let mini_app = std::env::var("SCOUT_BASE_URL").ok().and_then(|b| mini_app::launch_url(&b));
+    match &mini_app {
+        Some(launch) => {
+            tokio::spawn(install_menu_button(telegram.clone(), launch.clone()));
+        }
+        None => tracing::info!("no https SCOUT_BASE_URL; the trips Mini App has no button"),
+    }
+
     let app = Arc::new(bot::App {
         core,
+        mini_app,
         chats: DashMap::new(),
         replies: DashMap::new(),
         streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

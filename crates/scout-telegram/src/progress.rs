@@ -341,14 +341,17 @@ impl Renderer for Live {
     }
 }
 
-/// Draws every event the run produces, then hands the renderer back.
+/// Draws every event the run produces, then hands the renderer back, with
+/// the trips the run changed — read off the trace this loop is already
+/// the only reader of in a chat.
 ///
 /// Ends when the channel closes, which happens when `run_agent` returns and
 /// drops its sink — so the loop needs no shutdown signal of its own.
 pub async fn render_events<R: Renderer>(
     mut renderer: R,
     mut events: tokio::sync::mpsc::UnboundedReceiver<scout_api::AgentEvent>,
-) -> R {
+) -> (R, crate::mini_app::TouchedTrips) {
+    let mut touched = crate::mini_app::TouchedTrips::default();
     use scout_api::AgentEvent;
     // What the answer has grown to. `Tool` and `Notice` deliberately do not
     // touch it: each is a one-off sentence that momentarily replaces the
@@ -370,11 +373,11 @@ pub async fn render_events<R: Renderer>(
                 renderer.render_thinking(&thinking).await;
             }
             // Traces are for the browser's debug panel; a chat has nowhere
-            // to put a table.
-            AgentEvent::Trace(_) => {}
+            // to put a table. It does want to know which trip changed.
+            AgentEvent::Trace(frame) => touched.see(&frame),
         }
     }
-    renderer
+    (renderer, touched)
 }
 
 #[cfg(test)]
@@ -410,7 +413,7 @@ mod render_tests {
         scout_api::emit(&tx, AgentEvent::Notice("wrapping up".into()));
         drop(tx);
 
-        let rec = render_events(Recorder::default(), rx).await;
+        let (rec, _) = render_events(Recorder::default(), rx).await;
         assert_eq!(
             rec.frames,
             vec![
@@ -430,7 +433,7 @@ mod render_tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         scout_api::emit(&tx, AgentEvent::Answer(TextUpdate::Append("done".into())));
         drop(tx);
-        let rec = render_events(Recorder::default(), rx).await;
+        let (rec, _) = render_events(Recorder::default(), rx).await;
         assert_eq!(rec.frames.len(), 1);
     }
 
@@ -438,7 +441,7 @@ mod render_tests {
     async fn a_run_that_says_nothing_still_returns() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         drop(tx);
-        let rec = render_events(Recorder::default(), rx).await;
+        let (rec, _) = render_events(Recorder::default(), rx).await;
         assert!(rec.frames.is_empty());
     }
 
@@ -453,7 +456,7 @@ mod render_tests {
         scout_api::emit(&tx, AgentEvent::Answer(TextUpdate::Append("The answer".into())));
         drop(tx);
 
-        let rec = render_events(Recorder::default(), rx).await;
+        let (rec, _) = render_events(Recorder::default(), rx).await;
         assert_eq!(
             rec.frames,
             vec![
@@ -463,5 +466,23 @@ mod render_tests {
             ],
             "a Replace must clear what was shown, not extend it"
         );
+    }
+
+    #[tokio::test]
+    async fn the_trips_a_run_changed_come_back_with_the_renderer() {
+        use scout_api::TraceFrame;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        scout_api::emit(&tx, AgentEvent::Trace(TraceFrame::Started {
+            seq: 4,
+            tool: "update_trip_item".into(),
+            args: serde_json::json!({ "trip": "Hong Kong", "position": 5, "booked": true }),
+            nested: false,
+        }));
+        scout_api::emit(&tx, AgentEvent::Trace(TraceFrame::Finished { seq: 4, duration_ms: 3, status: "ok".into(), detail: None }));
+        scout_api::emit(&tx, AgentEvent::Answer(TextUpdate::Append("Marked as held.".into())));
+        drop(tx);
+        let (rec, touched) = render_events(Recorder::default(), rx).await;
+        assert_eq!(touched.last(), Some("Hong Kong"));
+        assert_eq!(rec.frames.last().map(|f| f.0.as_str()), Some("Marked as held."), "the trace draws nothing");
     }
 }

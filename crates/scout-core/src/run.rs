@@ -275,6 +275,28 @@ async fn run_with(
     if reply.is_empty() {
         reply = strip_thinking(&streamed);
     }
+    // A run that finished on its own and answered with reasoning alone has
+    // not run out of anything: its tools are still there, and often its
+    // reasoning is a decision it never carried out. Asked to put a church on
+    // day 3, the model settled on it in a <think> block and stopped, and the
+    // tool-less wrap-up below then described a Thursday with the church in
+    // it while nothing was added to the trip. So the agent that can still act
+    // is asked once, under the wrap-up's deadline; only if that also comes
+    // back as nothing is the run written up from its notes. A run whose
+    // history did not come back is not asked: the turn it would be
+    // correcting is not in the history it would be asked against.
+    if reply.is_empty() && salvage.is_none() && history_returned && has_notes(&thinking, &streamed) {
+        tracing::warn!(conversation_id, "the reply was all reasoning; asking the model to act on it");
+        observer.event("the reply was all reasoning; asking the model to act on it", false);
+        reply = match tokio::time::timeout(WRAP_UP_BUDGET, agent.chat(REASONING_ONLY_NOTE, &mut history)).await {
+            Ok(Ok(text)) => strip_thinking(&text),
+            Ok(Err(e)) => {
+                observer.event("the model call failed", true);
+                return Err(e.into());
+            }
+            Err(_) => String::new(),
+        };
+    }
     // A reply that was reasoning from its first character to its last.
     // MiniMax wrapped a whole answer — Scout asking a traveller which
     // segments they meant — in one `<think>` block; `strip_thinking` took
@@ -521,6 +543,13 @@ pub fn agent_error_message(e: &anyhow::Error) -> &'static str {
         "Sorry, something went wrong on my side. Please try again."
     }
 }
+
+/// The follow-up handed to the agent when its whole reply was reasoning.
+/// Opens with the marker so `session::turns_of` never renders it as
+/// something the reader said.
+const REASONING_ONLY_NOTE: &str = "[system note] Your last reply was all reasoning: none of it \
+reached the user, and no tool ran. Do what it decided now - make any tool calls it needs - then \
+give the user the answer. Reply with the answer only - no apology, and no explanation of this note.";
 
 /// Whether the run left anything a write-up could be built from.
 ///
@@ -983,6 +1012,95 @@ mod tests {
         Ran { outcome, shown, core, account_id, conversation_id, _dir: dir }
     }
 
+    /// `minimax`, with the corrective turn an all-reasoning reply gets
+    /// mounted in front: told apart by the note it carries, as the wrap-up
+    /// is by the notes it is handed.
+    async fn minimax_correcting(streamed: String, corrected: &str, wrap_up: Option<&str>) -> wiremock::MockServer {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let reply = |id: &str, content: &str| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": id,
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }))
+        };
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("\"stream\":true"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(streamed, "text/event-stream"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("Your last reply was all reasoning"))
+            .respond_with(reply("r1", corrected))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let wrap_up_mount = Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("Your research notes so far"))
+            .respond_with(reply("w1", wrap_up.unwrap_or("a write-up nobody should have asked for")));
+        match wrap_up {
+            Some(_) => wrap_up_mount.mount(&server).await,
+            None => wrap_up_mount.expect(0).mount(&server).await,
+        }
+        server
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_was_all_reasoning_gets_one_more_turn_with_its_tools() {
+        // Production, 2026-09-18: asked to put a church on day 3 of a trip,
+        // the model decided to — in its reasoning — and ended the turn there,
+        // with no tool call and no text. The run had not run out of anything,
+        // yet it was written up by the tool-less wrap-up agent, told it
+        // "cannot call any more tools". The reader got a tidy plan for
+        // Thursday, an apology for notes they never saw, and no item on the
+        // trip. The agent that can still act is the one to ask.
+        let llm = minimax_correcting(
+            streamed_text(&["<think>Day 3 it is. Add the church to the trip at 15:00.</think>"]),
+            "Added the church to Thursday 24/9 at 15:00.",
+            None,
+        )
+        .await;
+
+        let ran = a_run_against(&llm).await;
+
+        match ran.outcome.as_ref().expect("a run with a corrected answer must not fail") {
+            RunOutcome::Answered(reply) => assert_eq!(reply, "Added the church to Thursday 24/9 at 15:00."),
+            _ => panic!("a run that produced an answer must answer"),
+        }
+        // The turn went to the agent with its tools, not a write-up without.
+        let requests = llm.received_requests().await.unwrap_or_default();
+        let corrective = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .find(|b| b.contains("Your last reply was all reasoning"))
+            .expect("no corrective turn was asked for");
+        assert!(corrective.contains("\"tools\""), "the corrective turn was asked without tools");
+        // Nothing ran short, so nothing is recorded as cut short — but the
+        // trace says what happened.
+        let (run, rows) = ran.saved();
+        assert_eq!(run.outcome.as_deref(), Some("answered"));
+        assert!(
+            rows.iter().any(|r| r.kind == "event"
+                && r.detail.as_deref() == Some("the reply was all reasoning; asking the model to act on it")),
+            "the corrective turn is not in the trace: {rows:?}"
+        );
+        assert!(
+            !ran.shown.iter().any(|e| matches!(e, scout_api::AgentEvent::Notice(n) if n.contains("wrapping up"))),
+            "the reader was told the answer was being written up from notes: {:?}",
+            ran.shown
+        );
+    }
+
     #[tokio::test]
     async fn a_reply_that_was_all_reasoning_is_written_up_instead_of_delivered_as_silence() {
         // Production: MiniMax wrapped a complete reply — Scout asking a
@@ -990,11 +1108,15 @@ mod tests {
         // `strip_thinking` took all of it, the empty string went out as the
         // answer, and the log held no error to say why the chat had gone
         // quiet. The content was there the whole time.
-        let llm = minimax(
+        //
+        // The corrective turn comes first now; this is the case where it
+        // too comes back as nothing but reasoning.
+        let llm = minimax_correcting(
             streamed_text(&[
                 "<think>They gave me Fukuoka to HKG but never the dates. ",
                 "Ask which segments they meant.</think>",
             ]),
+            "<think>Still weighing which segments they meant.</think>",
             Some("Which segments did you mean? Give me the dates and I'll price them."),
         )
         .await;
@@ -1052,6 +1174,12 @@ mod tests {
         assert!(err.to_string().contains("no answer and no notes"), "got: {err}");
         // That no wrap-up was bought is checked by the mount above when the
         // server drops at the end of this test.
+    }
+
+    #[test]
+    fn the_reasoning_note_is_never_shown_as_something_the_reader_said() {
+        assert!(REASONING_ONLY_NOTE.starts_with(crate::text::SYSTEM_NOTE));
+        assert_eq!(crate::text::said_by_person(REASONING_ONLY_NOTE), "");
     }
 
     #[test]
@@ -1267,6 +1395,7 @@ mod tests {
         let body = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         for wording in [
             "run interrupted; writing up from notes",
+            "the reply was all reasoning; asking the model to act on it",
             "the model wrote a tool call as text; asking it to answer",
             "dead links in reply; asking the agent to correct it",
             "dead links survived the correction; stripping",

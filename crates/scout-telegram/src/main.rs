@@ -6,6 +6,7 @@ mod progress;
 mod scheduler;
 mod scope;
 mod text;
+mod webhook;
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -34,6 +35,71 @@ fn telegram_token() -> Result<String> {
 /// racing it to the SIGKILL.
 const WEB_DRAIN: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Where Telegram should deliver updates, when it should. Unset means a
+/// local run, which Telegram cannot reach, so the bot asks instead.
+///
+/// A URL whose path is not the one we serve is refused here rather than
+/// registered: Telegram would accept it, post every update to a 404, and
+/// the only sign would be a bot that had gone quiet.
+fn webhook_url() -> Option<url::Url> {
+    parse_webhook_url(std::env::var("TELEGRAM_WEBHOOK_URL").ok())
+}
+
+fn parse_webhook_url(raw: Option<String>) -> Option<url::Url> {
+    let raw = raw.filter(|v| !v.trim().is_empty())?;
+    match url::Url::parse(raw.trim()) {
+        Ok(url) if url.scheme() == "https" && url.path() == webhook::PATH => Some(url),
+        _ => {
+            tracing::error!(url = %raw, path = webhook::PATH, "TELEGRAM_WEBHOOK_URL must be https and end in the webhook path; polling instead");
+            None
+        }
+    }
+}
+
+/// Tells Telegram where to deliver, and keeps trying until it has listened.
+///
+/// Not fatal on failure, and not awaited before the bot starts: a webhook
+/// set by the previous pod is still set, so a Telegram API hiccup at
+/// start-up leaves updates flowing to the right place regardless. What
+/// this call changes is only the address and the secret, and both are the
+/// same every time unless the domain or the token moved.
+///
+/// `allowed_updates` said out loud: over polling the dispatcher asks for
+/// what its handlers read, but a webhook takes whatever it was registered
+/// with, and Telegram's default leaves out reactions.
+async fn register_webhook(bot: Bot, url: url::Url) {
+    use teloxide::payloads::SetWebhookSetters;
+    use teloxide::prelude::Requester;
+    use teloxide::types::AllowedUpdate;
+    let secret = webhook::secret(bot.token());
+    let mut wait = std::time::Duration::from_secs(2);
+    loop {
+        let request = bot
+            .set_webhook(url.clone())
+            .secret_token(secret.clone())
+            .allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::MessageReaction]);
+        match request.await {
+            Ok(_) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, retry_in = wait.as_secs(), "could not register the webhook");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(300));
+            }
+        }
+    }
+    // What Telegram thinks, once: a backlog or a last error here is the
+    // first thing to read when the bot seems to have stopped hearing.
+    match bot.get_webhook_info().await {
+        Ok(info) => tracing::info!(
+            url = %url,
+            pending = info.pending_update_count,
+            last_error = info.last_error_message.as_deref().unwrap_or("none"),
+            "Telegram delivers here"
+        ),
+        Err(e) => tracing::warn!(error = %e, "webhook registered; could not read it back"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -42,7 +108,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    let telegram = Bot::new(telegram_token()?);
+    let token = telegram_token()?;
+    let telegram = Bot::new(token.clone());
 
     // Duffel Links needs somewhere to send the traveller afterwards, and
     // the bot's own chat is the only address Scout owns. Asked for at
@@ -84,10 +151,26 @@ async fn main() -> Result<()> {
     // single-writer; W4 is where it moves out. A failure here must not stop
     // the bot: the page going dark is worse than nothing, but a bot that
     // will not start because a port is taken is worse than that.
+    //
+    // With a webhook the front door is also how Telegram reaches the bot,
+    // so a front door that did not open is a deaf bot. Nothing extra is
+    // needed for that: `/healthz` is served by the same server, the
+    // liveness probe fails, and Kubernetes restarts the pod.
+    let (telegram_routes, listener) = match webhook_url() {
+        Some(url) => {
+            let (routes, listener) = webhook::intake(webhook::secret(&token));
+            tokio::spawn(register_webhook(telegram.clone(), url));
+            (routes, Some(listener))
+        }
+        None => {
+            tracing::info!("no TELEGRAM_WEBHOOK_URL; asking Telegram for updates instead");
+            (axum::Router::new(), None)
+        }
+    };
     let web_core = core.clone();
     let bind = std::env::var("SCOUT_WEB_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let front_door = tokio::spawn(async move {
-        if let Err(e) = scout_web::serve(web_core, &bind).await {
+        if let Err(e) = scout_web::serve(web_core, &bind, telegram_routes).await {
             tracing::error!(error = %e, "the front door did not open");
         }
     });
@@ -101,7 +184,7 @@ async fn main() -> Result<()> {
     });
 
     tracing::info!("scout is up");
-    bot::run(telegram, app).await;
+    bot::run(telegram, app, listener).await;
 
     // The dispatcher drains Telegram's handlers and returns. Returning from
     // here would drop the runtime and kill the front door's in-flight
@@ -124,6 +207,21 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_webhook_url;
+
+    #[test]
+    fn only_an_https_address_at_our_path_is_registered() {
+        let ok = parse_webhook_url(Some("https://goodscout.fyi/telegram/webhook".into()));
+        assert_eq!(ok.unwrap().as_str(), "https://goodscout.fyi/telegram/webhook");
+        assert!(parse_webhook_url(None).is_none());
+        assert!(parse_webhook_url(Some("  ".into())).is_none());
+        // Telegram refuses plain http itself; refusing it here says why.
+        assert!(parse_webhook_url(Some("http://goodscout.fyi/telegram/webhook".into())).is_none());
+        // Accepted by Telegram, a 404 for every update: the quiet failure.
+        assert!(parse_webhook_url(Some("https://goodscout.fyi/".into())).is_none());
+        assert!(parse_webhook_url(Some("https://goodscout.fyi/telegram/webhook/".into())).is_none());
+    }
+
     #[test]
     fn the_gate_is_actually_told_when_the_web_admits_someone() {
         // Same shape as the mirror check below: `membership::watch` is
@@ -168,7 +266,7 @@ mod tests {
         // the string it is written with — measured: deleting the drain
         // entirely left this test green.
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
-        let dispatcher = src.find("bot::run(telegram, app).await").expect("the bot must run");
+        let dispatcher = src.find("bot::run(telegram, app, listener).await").expect("the bot must run");
         let drained = src.rfind("front_door").expect("the front door must be awaited");
         assert!(
             drained > dispatcher,

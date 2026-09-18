@@ -326,6 +326,7 @@ compiles from source.
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | **yes** | — | bot token from @BotFather |
+| `TELEGRAM_WEBHOOK_URL` | no | — (poll) | `https://<domain>/telegram/webhook`: Telegram posts updates there instead of the bot asking. The k3s deployment sets it from `SCOUT_DOMAIN`; leave it unset for a local run, which Telegram cannot reach. The secret Telegram sends back is derived from the bot token |
 | `ALLOWED_TELEGRAM_USER_IDS` | **yes** | — | comma-separated numeric ids |
 | `SCOUT_ADMIN_USER_IDS` | no | first allowed id | who sees everyone's numbers in `/stat` and may run `/advert`, `/invite` and `/kick`; everyone else sees only their own |
 | `INVITE_DAILY_REQUESTS` | no | `20` | messages per day for someone admitted through `/invite`. Founders are exempt |

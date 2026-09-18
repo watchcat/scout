@@ -6878,16 +6878,22 @@ name = "scout-telegram"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "dashmap",
  "dotenvy",
+ "futures-util",
+ "hmac",
  "scout-api",
  "scout-core",
  "scout-web",
  "serde_json",
+ "sha2 0.11.0",
  "teloxide",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

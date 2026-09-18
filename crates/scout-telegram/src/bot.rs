@@ -195,7 +195,9 @@ const ACCESS_REMOVED: &str = "Your access was removed.";
 const CLAIM_FAILED: &str = "Sorry, something went wrong on my side. \
 Please try that link again in a minute.";
 
-pub async fn run(bot: Bot, app: Arc<App>) {
+/// `listener` is the webhook's intake when there is one; without it the
+/// dispatcher polls, as it always did.
+pub async fn run(bot: Bot, app: Arc<App>, listener: Option<crate::webhook::Listener>) {
     // `/start` is a sibling of the gate, not a child of it: the join path
     // has to reach people the gate would reject. The branch owns the whole
     // `/start` surface — payload or not — because splitting it would leave
@@ -257,7 +259,13 @@ pub async fn run(bot: Bot, app: Arc<App>) {
         });
     }
 
-    dispatcher.dispatch().await;
+    match listener {
+        Some(listener) => {
+            let errors = teloxide::error_handlers::LoggingErrorHandler::with_custom_text("the webhook intake");
+            dispatcher.dispatch_with_listener(listener, errors).await
+        }
+        None => dispatcher.dispatch().await,
+    }
 }
 
 fn is_member(app: &App, msg: &Message) -> bool {

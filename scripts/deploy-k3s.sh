@@ -44,6 +44,18 @@ done
 : "${SCOUT_ACME_EMAIL:?set SCOUT_ACME_EMAIL — in .env or the environment}"
 : "${SCOUT_SSH:?set SCOUT_SSH to the node, e.g. root@203.0.113.4 — in .env or the environment}"
 
+# Before anything is built: a malformed R2 key pair is not an error until restic
+# runs at 03:30, and then only in a pod nobody reads. It shipped once and the
+# off-site copy failed nine nights running.
+. scripts/r2-keys.sh
+if grep -qE '^AWS_' .env 2>/dev/null; then
+    if ! why=$(r2_keys_problem "$(env_file_value AWS_ACCESS_KEY_ID)" "$(env_file_value AWS_SECRET_ACCESS_KEY)"); then
+        echo "  refusing: $why" >&2
+        echo "  (R2 → Manage API tokens shows the Access Key ID and Secret Access Key once, when the token is created)" >&2
+        exit 1
+    fi
+fi
+
 SSH=(ssh -o BatchMode=yes "$SCOUT_SSH")
 REMOTE_SRC=/opt/scout
 

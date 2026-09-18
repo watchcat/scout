@@ -61,6 +61,18 @@ pub(crate) async fn admitted_account(auth: &AuthState, headers: &HeaderMap) -> R
     let Some(account_id) = signed_in_as(auth, headers) else {
         return Err(see_other("/sign-in"));
     };
+    if !is_admitted(auth, account_id).await? {
+        // The chat costs real model calls, and a queued account has not
+        // been admitted to spend them. `/account` already explains where
+        // they stand, so it does the explaining.
+        return Err(see_other("/account"));
+    }
+    Ok(account_id)
+}
+
+/// Whether an account may use the signed-in pages at all. Its own
+/// function because the Mini App asks it before it hands out a cookie.
+pub(crate) async fn is_admitted(auth: &AuthState, account_id: i64) -> Result<bool, Response> {
     let standing = match identity::standing(&auth.core, account_id).await {
         Ok(standing) => standing,
         Err(e) => {
@@ -80,18 +92,36 @@ pub(crate) async fn admitted_account(auth: &AuthState, headers: &HeaderMap) -> R
             return Err(sorry());
         }
     };
-    if !standing.member && !founder {
-        // The chat costs real model calls, and a queued account has not
-        // been admitted to spend them. `/account` already explains where
-        // they stand, so it does the explaining.
-        return Err(see_other("/account"));
-    }
-    Ok(account_id)
+    Ok(standing.member || founder)
 }
 
-async fn chat(axum::extract::State(auth): axum::extract::State<AuthState>, headers: HeaderMap) -> Response {
+#[derive(serde::Deserialize)]
+struct ChatQuery {
+    #[serde(rename = "in")]
+    surface: Option<String>,
+    trip: Option<String>,
+}
+
+async fn chat(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ChatQuery>,
+) -> Response {
+    let in_telegram = query.surface.as_deref() == Some("telegram");
     let account_id = match admitted_account(&auth, &headers).await {
         Ok(id) => id,
+        // Inside Telegram there is no sign-in page to send anyone to: the
+        // launch page is how a Mini App signs in, and it has the launch
+        // data to do it again with. Queued accounts go there too, and it
+        // says why they cannot come in.
+        Err(_) if in_telegram => {
+            let mut back = form_urlencoded::Serializer::new(String::new());
+            if let Some(trip) = &query.trip {
+                back.append_pair("trip", trip);
+            }
+            let back = back.finish();
+            return see_other(&if back.is_empty() { "/tg".to_string() } else { format!("/tg?{back}") });
+        }
         Err(response) => return response,
     };
     let csrf = session::csrf_for(&auth.cfg.session_key, account_id);
@@ -105,6 +135,13 @@ async fn chat(axum::extract::State(auth): axum::extract::State<AuthState>, heade
     } else {
         strip_mirror_toggle(&page)
     };
+    if in_telegram {
+        // The same page, told where it is: the script reads this to open
+        // on the trips and leave the chat to the bot, and the policy lets
+        // Telegram Web frame it.
+        let page = page.replacen("<html lang=\"en\">", "<html lang=\"en\" data-surface=\"telegram\">", 1);
+        return crate::routes::telegram_app::framable(Html(page).into_response());
+    }
     Html(page).into_response()
 }
 

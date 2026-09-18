@@ -155,6 +155,69 @@ pub fn clear_cookie() -> String {
     format!("{COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0")
 }
 
+/// The session cookie for a page Telegram opens as a Mini App.
+///
+/// The same cookie, sent differently. Telegram Web opens a Mini App in an
+/// iframe under `web.telegram.org`, where a `SameSite=Lax` cookie is a
+/// third-party one and never comes back — the page would sign in, reload
+/// and find itself signed out. `SameSite=None` lets it through;
+/// `Partitioned` keeps it in a jar of its own, keyed to the site that
+/// framed us, so it is not a cookie any other site's page can make a
+/// browser send. The phone and desktop apps open the page top-level,
+/// where the partition is our own site and nothing changes.
+///
+/// What `Lax` did for cross-site requests is done without it here: every
+/// request that changes something carries the account-bound token in a
+/// header, which a page on another site cannot read and a cross-site
+/// request cannot set without a preflight we never answer.
+pub fn set_embedded_cookie(value: &str, max_age: i64) -> String {
+    format!("{COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age={max_age}")
+}
+
+/// How long a file link works. Long enough for a phone to hand it to a
+/// browser and the browser to fetch it; short enough that one pasted
+/// somewhere is dead before anyone else reads it.
+pub const FILE_LINK_TTL_SECS: i64 = 300;
+
+/// A link that opens one file of one account without a cookie.
+///
+/// A Mini App's links leave Telegram's web view for a browser that holds
+/// no session — so a ticket opened from the trip page there would ask its
+/// reader to sign in. This carries exactly one file's worth of the
+/// session, briefly: `what` names the file, and nothing else verifies.
+///
+/// Over its own key, for the reason `csrf` gives: signed with the session
+/// key, a file link would be a session.
+pub fn file_link(key: &[u8], account_id: i64, what: &str, ttl_secs: i64) -> String {
+    use base64::Engine;
+    let expires = chrono::Utc::now().timestamp() + ttl_secs;
+    let what = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(what.as_bytes());
+    let payload = format!("{account_id}.{expires}.{what}");
+    let sig = sign(&file_link_key(key), &payload);
+    format!("{payload}.{sig}")
+}
+
+/// The account and the file a link names, or `None` — every failure alike.
+pub fn file_link_ok(key: &[u8], token: &str) -> Option<(i64, String)> {
+    use base64::Engine;
+    let (payload, sig) = token.rsplit_once('.')?;
+    if !constant_time_eq(sig.as_bytes(), sign(&file_link_key(key), payload).as_bytes()) {
+        return None;
+    }
+    let mut parts = payload.split('.');
+    let account_id: i64 = parts.next()?.parse().ok()?;
+    let expires: i64 = parts.next()?.parse().ok()?;
+    let what = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts.next()?).ok()?;
+    if parts.next().is_some() || chrono::Utc::now().timestamp() >= expires {
+        return None;
+    }
+    Some((account_id, String::from_utf8(what).ok()?))
+}
+
+fn file_link_key(key: &[u8]) -> Vec<u8> {
+    [key, b".file-link"].concat()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +367,29 @@ mod tests {
             assert!(header.contains("; Path=/;"), "__Host- requires Path=/: {header}");
             assert!(!header.contains("Domain"), "__Host- forbids Domain: {header}");
         }
+    }
+
+    #[test]
+    fn the_embedded_cookie_is_still_a_host_cookie_and_is_partitioned() {
+        let c = set_embedded_cookie("v", 60);
+        assert!(c.starts_with("__Host-scout_session=v;"));
+        for part in ["Path=/", "HttpOnly", "Secure", "SameSite=None", "Partitioned"] {
+            assert!(c.split("; ").any(|p| p == part), "{part} missing from {c}");
+        }
+        assert!(!c.contains("Domain"), "a __Host- cookie naming a domain is not stored at all");
+    }
+
+    #[test]
+    fn a_file_link_opens_its_one_file_and_is_nothing_else() {
+        let link = file_link(KEY, 42, "trip:Hong Kong", 60);
+        assert_eq!(file_link_ok(KEY, &link), Some((42, "trip:Hong Kong".to_string())));
+        // Not a session, and a session is not a link.
+        assert_eq!(verify(KEY, &link), None);
+        assert_eq!(file_link_ok(KEY, &mint(KEY, 42, 60)), None);
+        // Not another key's, not edited, not expired.
+        assert_eq!(file_link_ok(b"another key entirely, also long", &link), None);
+        let edited = link.replacen("42.", "43.", 1);
+        assert_eq!(file_link_ok(KEY, &edited), None);
+        assert_eq!(file_link_ok(KEY, &file_link(KEY, 42, "attachment:1", -1)), None);
     }
 }

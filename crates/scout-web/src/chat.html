@@ -16,6 +16,13 @@
     --cyan:#2aa198; --red:#dc322f; --green:#859900; --yellow:#b58900;
     --line:#0d4a5a; --panel:#062f3a}
   *{box-sizing:border-box}
+  /* Inside Telegram the bot is the chat, and Telegram draws the frame:
+     what is left is the trips. Hidden by the stylesheet rather than
+     removed, so the one page stays one page for every test that reads it. */
+  html[data-surface="telegram"] header, html[data-surface="telegram"] #chat-workspace,
+  html[data-surface="telegram"] #ask, html[data-surface="telegram"] #compose-target,
+  html[data-surface="telegram"] #status{display:none}
+  html[data-surface="telegram"] .trips-view{padding-top:16px}
   body{margin:0; background:var(--base03); color:var(--base0);
     font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
     -webkit-font-smoothing:antialiased;

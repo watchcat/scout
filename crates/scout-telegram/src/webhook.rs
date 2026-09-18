@@ -79,6 +79,15 @@ async fn receive(State(intake): State<Intake>, headers: HeaderMap, body: Bytes) 
             return StatusCode::OK;
         }
     };
+    // One line per update, naming what it is and never what it says: the
+    // only record that Telegram reached us at all, which is the first
+    // question when the bot seems to have gone quiet.
+    let kind = match &update.kind {
+        teloxide::types::UpdateKind::Message(_) => "message",
+        teloxide::types::UpdateKind::MessageReaction(_) => "reaction",
+        _ => "other",
+    };
+    tracing::info!(update_id = update.id.0, kind, "update in");
     match intake.queue.try_send(update) {
         Ok(()) => StatusCode::OK,
         // Full, or closed because the dispatcher is shutting down. Either
@@ -208,5 +217,46 @@ mod tests {
             assert_eq!(post(&router, Some("right"), UPDATE).await, StatusCode::OK);
         }
         assert_eq!(post(&router, Some("right"), UPDATE).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_real_dispatcher_hands_a_delivered_update_to_its_handler() {
+        use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
+        use teloxide::prelude::*;
+        let (router, listener) = intake("right".to_string());
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<String>();
+        let handler = Update::filter_message().endpoint(move |msg: Message| {
+            let seen_tx = seen_tx.clone();
+            async move {
+                seen_tx.send(msg.text().unwrap_or_default().to_string()).unwrap();
+                respond(())
+            }
+        });
+        // Telegram, as far as the dispatcher asks it anything: `getMe`.
+        let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}", api.local_addr().unwrap());
+        let me = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({"ok": true, "result": {
+                "id": 1, "is_bot": true, "first_name": "Scout", "username": "scout_test_bot",
+                "can_join_groups": false, "can_read_all_group_messages": false, "supports_inline_queries": false,
+                "can_connect_to_business": false, "has_main_web_app": false
+            }}))
+        });
+        tokio::spawn(async move { axum::serve(api, me).await.unwrap() });
+        let bot = teloxide::Bot::new("123:abc").set_api_url(api_url.parse().unwrap());
+        let mut dispatcher = Dispatcher::builder(bot, handler).build();
+        let shutdown = dispatcher.shutdown_token();
+        let run = tokio::spawn(async move {
+            dispatcher
+                .dispatch_with_listener(listener, teloxide::error_handlers::LoggingErrorHandler::new())
+                .await
+        });
+        assert_eq!(post(&router, Some("right"), UPDATE).await, StatusCode::OK);
+        let text = tokio::time::timeout(std::time::Duration::from_secs(5), seen_rx.recv()).await;
+        assert_eq!(text.ok().flatten().as_deref(), Some("hello"), "the handler never saw the update");
+        if let Ok(done) = shutdown.shutdown() {
+            done.await;
+        }
+        run.await.unwrap();
     }
 }

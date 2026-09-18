@@ -39,6 +39,10 @@ spec:
           env:
             - { name: SCOUT_DB_PATH, value: /data/scout.duckdb }
             - { name: SCOUT_WEB_BIND, value: "0.0.0.0:8080" }
+            # Telegram posts updates here rather than the bot asking for them.
+            # From the domain the ingress already serves, so there is no second
+            # place to keep in step; a local run leaves it unset and polls.
+            - { name: TELEGRAM_WEBHOOK_URL, value: "https://${SCOUT_DOMAIN}/telegram/webhook" }
           ports:
             - { name: http, containerPort: 8080 }
           # /healthz reports process liveness and deliberately says nothing

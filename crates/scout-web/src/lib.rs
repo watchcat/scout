@@ -584,7 +584,12 @@ async fn trips_mobile() -> impl IntoResponse {
 /// to open the front door over one would contradict the policy every later
 /// refresh follows. It starts at `Full`, which is the safe thing to be wrong
 /// about, and corrects itself within `REFRESH`.
-pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
+/// `extra` is routes another channel brings, mounted beside ours and
+/// outside every layer: Telegram's webhook arrives with no cookie, no
+/// `Origin` and no form token, carries its own proof in a header, and has
+/// no page for the security headers to protect. This crate does not look
+/// inside it — which is what keeps Telegram out of `scout-web`.
+pub async fn serve(core: Arc<Core>, bind: &str, extra: Router) -> anyhow::Result<()> {
     let first = core.admission().await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "could not read admission at start-up; opening as full");
         scout_core::core::Admission::Full
@@ -622,7 +627,7 @@ pub async fn serve(core: Arc<Core>, bind: &str) -> anyhow::Result<()> {
     }
 
     tracing::info!(bind, "the front door is open");
-    axum::serve(listener, router(cache, auth, inbound))
+    axum::serve(listener, router(cache, auth, inbound).merge(extra))
         .with_graceful_shutdown(closing_time())
         .await?;
     Ok(())

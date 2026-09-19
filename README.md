@@ -1,6 +1,6 @@
 # Scout
 
-**A shopping and flight researcher, on Telegram and in the browser, that doesn't make things up.**
+**A shopping and flight researcher, on Telegram, in the browser, and as a Telegram Mini App, that doesn't make things up.**
 
 ### 🟢 [goodscout.fyi](https://goodscout.fyi) — invites are open
 
@@ -55,6 +55,17 @@ hold it already. Then it is read into a pending row on the trip it belongs
 to — the one whose dates it overlaps, or a draft trip started for it.
 Nothing lands on a trip until you click Add. Everything else — newsletters, mail Scout could not
 read, arrivals you ignored — sits under Other mail for thirty days.
+
+### Trips inside Telegram
+
+The same trip page opens inside Telegram as a Mini App: a **Trips** button
+beside the input, and an **Open <trip>** button under any reply in which Scout
+changed a trip, which opens straight onto it. It is the website's own page,
+not a second client — the chat is left out because the bot is the chat — so
+the day rows, the notes, the ⋯ menu, flight choice and the booking address all
+work the same, and it signs you in with the launch data Telegram signs rather
+than asking you to log in again. Tickets and the printed plan open in your
+browser through links that expire after five minutes.
 
 <p align="center">
   <img src="crates/scout-web/src/assets/trips-desktop.webp" alt="Scout trip planner on desktop: the route across the top, then a row for each day of the trip with what falls on it, a booking address in the sidebar, and each item marked held or still to book" width="900">
@@ -193,6 +204,11 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - **You are an account, not a Telegram id.** A Telegram login is one identity
   pointing at an account, which is what will let the same purchase history,
   trips and profile answer to a web login later without a second copy of you
+- **Your trips, inside Telegram.** The **Trips** button beside the input opens
+  the trip page as a Mini App, on the account the bot already knows you by,
+  and a reply in which Scout changed a trip carries an **Open <trip>** button
+  that opens on that trip. Only Telegram Web may frame the page, only the
+  Mini App pages allow it, and Telegram's own script is never loaded
 - Purchase history: *"where did I buy this last time?"* — react 👍 to a
   suggestion and Scout offers to save it
 - Your profile: delivery country, sizes, preferred marketplaces, languages.
@@ -350,7 +366,7 @@ compiles from source.
 | `SCOUT_SESSION_KEY` | web sign-in | — | signs session cookies; 32+ bytes. All four web variables must be set or sign-in does not mount and the site serves the public page only |
 | `RESEND_API_KEY` | web sign-in | — | sends the email sign-in link |
 | `SCOUT_MAIL_FROM` | web sign-in | — | the address that link comes from, unquoted |
-| `SCOUT_BASE_URL` | web sign-in | — | the site's own https address, used in the link and to send plain http to https |
+| `SCOUT_BASE_URL` | web sign-in | — | the site's own https address, used in the link and to send plain http to https. When it is https, the bot also sets the **Trips** menu button to `<base>/tg`, the Mini App |
 | `RESEND_WEBHOOK_SECRET` | inbox | — | signing secret of the `email.received` webhook that delivers mail to `/inbound/resend`; unset means no booking address |
 | `RESEND_BASE_URL` | no | `https://api.resend.com` | where the Resend API lives; the worker fetches each message's body and attachments from it |
 | `INBOX_DOMAIN` | no | `goodscout.fyi` | the domain the booking addresses are on; must be the one Resend receives for |

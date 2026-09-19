@@ -35,6 +35,8 @@ pub struct Core {
     /// worker polls as a floor, like the mirror drain; this is what makes a
     /// forwarded booking show up while the person is still looking.
     pub(crate) inbox_wake: std::sync::Arc<tokio::sync::Notify>,
+    /// One geocoder for the process, because its pacing is per process.
+    pub(crate) geocoder: crate::geo::Geocoder,
 }
 
 /// What a reorder reminder says, wherever it is delivered.
@@ -214,9 +216,11 @@ impl Core {
             }),
         };
 
+        let geocoder = crate::geo::Geocoder::new(reqwest::Client::new(), &cfg.nominatim_base_url, cfg.nominatim_email.as_deref());
         Ok(Self {
             cfg,
             deps,
+            geocoder,
             mirror_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             membership_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             inbox_wake: std::sync::Arc::new(tokio::sync::Notify::new()),

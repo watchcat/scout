@@ -1204,6 +1204,9 @@ mod tests {
             arrival_id: None,
             candidates: vec![candidate],
             attachments: Vec::new(),
+            lat: None,
+            lng: None,
+            geocode_tried: false,
         }
     }
 
@@ -1265,6 +1268,9 @@ mod tests {
                             filename: "voucher <1>.pdf".to_string(),
                             mime: "application/pdf".to_string(),
                         }],
+                        lat: None,
+                        lng: None,
+                        geocode_tried: false,
                     },
                     flight(
                         3,
@@ -1434,6 +1440,9 @@ mod tests {
                 })
                 .unwrap_or_default(),
             attachments: Vec::new(),
+            lat: None,
+            lng: None,
+            geocode_tried: false,
         }
     }
 

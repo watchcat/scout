@@ -25,6 +25,13 @@ pub struct Config {
     /// Perplexity Search API key; without it search runs on Kagi alone.
     pub perplexity_api_key: Option<String>,
     pub db_path: String,
+    /// Where places are turned into coordinates. Nominatim by default;
+    /// `for_test` points it at a closed port so no lookup leaves the
+    /// machine, and a test that wants an answer stands a server in.
+    pub nominatim_base_url: String,
+    /// Who to name in the geocoder's User-Agent, as Nominatim's usage
+    /// policy asks. Optional: without it the agent names Scout alone.
+    pub nominatim_email: Option<String>,
     pub secondhand_sites: Vec<String>,
     /// bol.com Marketing Catalog API credentials; both set or disabled.
     pub bol_credentials: Option<(String, String)>,
@@ -75,11 +82,36 @@ impl Config {
             "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
             "MINIMAX_API_KEY" => Some("mk".to_string()),
             "MINIMAX_BASE_URL" => Some("http://127.0.0.1:1".to_string()),
+            "NOMINATIM_BASE_URL" => Some("http://127.0.0.1:1".to_string()),
             "KAGI_API_KEY" => Some("kk".to_string()),
             "SCOUT_DB_PATH" => Some(db_path.to_string()),
             _ => None,
         })
         .expect("the four required variables are all set")
+    }
+
+    /// `for_test`, with one variable pointed somewhere else — a stand-in
+    /// server for the one service the test is about.
+    #[cfg(test)]
+    pub fn for_test_with(db_path: &str, key: &'static str, value: &str) -> Self {
+        let value = value.to_string();
+        let base = Self::for_test(db_path);
+        Self::from_lookup(|k| {
+            if k == key {
+                return Some(value.clone());
+            }
+            match k {
+                "TELEGRAM_BOT_TOKEN" => Some("tok".to_string()),
+                "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
+                "MINIMAX_API_KEY" => Some("mk".to_string()),
+                "MINIMAX_BASE_URL" => Some(base.minimax_base_url.clone()),
+                "NOMINATIM_BASE_URL" => Some(base.nominatim_base_url.clone()),
+                "KAGI_API_KEY" => Some("kk".to_string()),
+                "SCOUT_DB_PATH" => Some(db_path.to_string()),
+                _ => None,
+            }
+        })
+        .expect("the same variables for_test sets")
     }
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
@@ -179,6 +211,11 @@ impl Config {
             kagi_api_key: required("KAGI_API_KEY")?,
             perplexity_api_key: non_empty("PERPLEXITY_API_KEY"),
             db_path: get("SCOUT_DB_PATH").unwrap_or_else(|| "scout.duckdb".to_string()),
+            nominatim_base_url: get("NOMINATIM_BASE_URL")
+                .filter(|v| !v.trim().is_empty())
+                .map(|u| u.trim().trim_end_matches('/').to_string())
+                .unwrap_or_else(|| "https://nominatim.openstreetmap.org".to_string()),
+            nominatim_email: get("NOMINATIM_EMAIL").filter(|v| !v.trim().is_empty()),
             secondhand_sites,
             bol_credentials,
             bol_country: get("BOL_COUNTRY").unwrap_or_else(|| "NL".to_string()),

@@ -67,6 +67,13 @@ work the same, and it signs you in with the launch data Telegram signs rather
 than asking you to log in again. Tickets and the printed plan open in your
 browser through links that expire after five minutes.
 
+Send the bot your location on a trip day and it answers with what is next,
+nearest first — how far, how long on foot, a map link — and says which days
+have nothing on them. Share a live location and it says once, as you come
+within 500 m of a place on today's plan, that you are there. Places are
+geocoded the first time this asks about them and never again; a map link
+pasted in an item's note with coordinates in it needs no lookup at all.
+
 Bookings reach the chat too. When a confirmation arrives at your booking
 address, the bot says what came and for which trip, with **Add** and
 **Ignore** under it, so a hotel booked from the phone is on the trip without
@@ -375,6 +382,8 @@ compiles from source.
 | `SCOUT_MAIL_FROM` | web sign-in | — | the address that link comes from, unquoted |
 | `SCOUT_BASE_URL` | web sign-in | — | the site's own https address, used in the link and to send plain http to https. When it is https, the bot also sets the **Trips** menu button to `<base>/tg`, the Mini App |
 | `RESEND_WEBHOOK_SECRET` | inbox | — | signing secret of the `email.received` webhook that delivers mail to `/inbound/resend`; unset means no booking address |
+| `NOMINATIM_EMAIL` | no | — | a contact for the geocoder's User-Agent, as Nominatim's usage policy asks. Places on a trip are looked up once each, when a location first asks about them |
+| `NOMINATIM_BASE_URL` | no | `https://nominatim.openstreetmap.org` | a Nominatim of your own, if you run one |
 | `RESEND_BASE_URL` | no | `https://api.resend.com` | where the Resend API lives; the worker fetches each message's body and attachments from it |
 | `INBOX_DOMAIN` | no | `goodscout.fyi` | the domain the booking addresses are on; must be the one Resend receives for |
 

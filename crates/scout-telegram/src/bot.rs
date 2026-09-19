@@ -18,6 +18,11 @@ pub struct App {
     /// Where the trip page's Mini App starts, when the site is served over
     /// https. `None` in a local run, and then no reply carries a button.
     pub mini_app: Option<url::Url>,
+    /// Accounts sharing a live location, and what they have been told
+    /// about today, so a place is said once as they come within reach.
+    /// In memory on purpose: a live location lasts hours at most, and a
+    /// restart costing one repeated line is nothing.
+    pub live: DashMap<i64, LiveWatch>,
     /// One entry per (chat_id, sender_id). In a 1:1 chat a single user always
     /// hits the same slot; in a group/supergroup, each allowed user has
     /// their own history, draft and last_seen, isolating conversation
@@ -58,6 +63,14 @@ const SENT_REPLY_CAP: usize = 30;
 /// tuple is built everywhere; in 1:1 chats the same value is reused.
 fn chat_key(chat_id: i64, user_id: i64) -> (i64, i64) {
     (chat_id, user_id)
+}
+
+/// One account's live location, as far as the bot has answered it.
+#[derive(Debug, Default)]
+pub struct LiveWatch {
+    /// The local day the nudges below are about; a new day starts over.
+    pub day: Option<chrono::NaiveDate>,
+    pub nudged: std::collections::HashSet<i64>,
 }
 
 #[derive(Default)]
@@ -147,6 +160,7 @@ I'm Scout - I research products for you.
 Just tell me what you're looking for (budget, country, must-haves help).
 Send a photo of a product and I'll draft a search from it.
 Send a PDF ticket or booking confirmation and I'll put it on your trip once you say Add.
+Send your location on a trip day and I'll list what's next, nearest first. Share a live location and I'll say when you're close to something.
 Tell me when you bought something and I'll remember where and for how much.
 I can remind you when it's time to reorder things you buy regularly.
 
@@ -225,6 +239,9 @@ pub async fn run(bot: Bot, app: Arc<App>, listener: Option<crate::webhook::Liste
                     dptree::filter(|msg: Message| msg.document().is_some()).endpoint(handle_document),
                 )
                 .branch(
+                    dptree::filter(|msg: Message| msg.location().is_some()).endpoint(handle_location),
+                )
+                .branch(
                     dptree::filter(|msg: Message| msg.text().is_some()).endpoint(handle_text),
                 ),
         );
@@ -233,10 +250,16 @@ pub async fn run(bot: Bot, app: Arc<App>, listener: Option<crate::webhook::Liste
     //
     // A button press is gated inside its handler rather than here: the
     // gate reads a `Message`'s sender, and a callback carries its own.
+    // A live location arrives as edits of the message that started it.
     let handler = dptree::entry()
         .branch(messages)
         .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction))
-        .branch(Update::filter_callback_query().endpoint(handle_callback));
+        .branch(Update::filter_callback_query().endpoint(handle_callback))
+        .branch(
+            Update::filter_edited_message()
+                .filter(|msg: Message, app: Arc<App>| msg.location().is_some() && is_member(&app, &msg))
+                .endpoint(handle_live_location),
+        );
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![app])
@@ -1134,6 +1157,92 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
         }
     }
     Ok(())
+}
+
+/// A location sent to the bot: where next, from here. A live one is also
+/// the start of being told when something on today's plan is close.
+async fn handle_location(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
+    let chat_id = msg.chat.id;
+    let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    let Some(location) = msg.location() else { return Ok(()) };
+    let account_id = match scout_core::session::account_of(&app.core, scout_core::ids::TelegramId(user_id)).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not resolve an account");
+            bot.send_message(chat_id, CLAIM_FAILED).await?;
+            return Ok(());
+        }
+    };
+    let here = here_from(location);
+    let _typing = Typing::start(bot.clone(), chat_id);
+    let answer = match scout_core::nearby::where_next(&app.core, account_id, here).await {
+        Ok(answer) => answer,
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "where-next failed");
+            bot.send_message(chat_id, "Sorry, I couldn't read your trips just now. Try again in a minute.").await?;
+            return Ok(());
+        }
+    };
+    let mut text = scout_core::nearby::render(&answer);
+    if location.live_period.is_some() {
+        // Fresh: a new share is a new day of nudges, whatever was said
+        // on the last one.
+        app.live.insert(account_id, LiveWatch::default());
+        text.push_str("
+
+While you share your location I'll say when you're within 500 m of something on today's plan.");
+    }
+    bot.send_message(chat_id, text).await?;
+    Ok(())
+}
+
+/// A live location moved. Once per place per day, as it comes within
+/// `NEAR_M`: the line, the map link, nothing else.
+async fn handle_live_location(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
+    let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    let Some(location) = msg.location() else { return Ok(()) };
+    let Ok(account_id) = scout_core::session::account_of(&app.core, scout_core::ids::TelegramId(user_id)).await else {
+        return Ok(());
+    };
+    // Only for someone who shared a live location with this bot and was
+    // told what that means; a plain edit of a plain location is nothing.
+    if !app.live.contains_key(&account_id) {
+        return Ok(());
+    }
+    let here = here_from(location);
+    let day = scout_core::nearby::local_date(here.now, here.coords.lng);
+    let answer = match scout_core::nearby::where_next(&app.core, account_id, here).await {
+        Ok(answer) => answer,
+        Err(e) => {
+            tracing::warn!(error = %e, account_id, "a live location could not be answered");
+            return Ok(());
+        }
+    };
+    let scout_core::nearby::WhereNext::Day { items, .. } = answer else { return Ok(()) };
+    let lines: Vec<(i64, String)> = {
+        let mut watch = app.live.entry(account_id).or_default();
+        if watch.day != Some(day) {
+            watch.day = Some(day);
+            watch.nudged.clear();
+        }
+        scout_core::nearby::within(&items, scout_core::nearby::NEAR_M)
+            .into_iter()
+            .filter(|n| watch.nudged.insert(n.item_id))
+            .map(|n| (n.item_id, scout_core::nearby::nudge_line(n)))
+            .collect()
+    };
+    for (item_id, line) in lines {
+        tracing::info!(account_id, item_id, "near something on the plan");
+        bot.send_message(msg.chat.id, line).await?;
+    }
+    Ok(())
+}
+
+fn here_from(location: &teloxide::types::Location) -> scout_core::nearby::Here {
+    scout_core::nearby::Here {
+        coords: scout_core::geo::Coords { lat: location.latitude, lng: location.longitude },
+        now: chrono::Utc::now(),
+    }
 }
 
 /// The file kinds the bot reads as a booking. A PDF and nothing else,

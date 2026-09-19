@@ -79,7 +79,13 @@ async fn register_webhook(bot: Bot, url: url::Url) {
         let request = bot
             .set_webhook(url.clone())
             .secret_token(secret.clone())
-            .allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::MessageReaction, AllowedUpdate::CallbackQuery]);
+            .allowed_updates(vec![
+                AllowedUpdate::Message,
+                AllowedUpdate::MessageReaction,
+                AllowedUpdate::CallbackQuery,
+                // A live location is delivered as edits of its message.
+                AllowedUpdate::EditedMessage,
+            ]);
         match request.await {
             Ok(_) => break,
             Err(e) => {
@@ -216,6 +222,7 @@ async fn main() -> Result<()> {
     let app = Arc::new(bot::App {
         core,
         mini_app,
+        live: DashMap::new(),
         chats: DashMap::new(),
         replies: DashMap::new(),
         streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

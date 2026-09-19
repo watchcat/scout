@@ -2457,6 +2457,9 @@ mod tests {
             arrival_id: None,
             candidates: Vec::new(),
             attachments: Vec::new(),
+            lat: None,
+            lng: None,
+            geocode_tried: false,
         }
     }
 
@@ -5053,6 +5056,9 @@ mod tests {
             arrival_id: None,
             candidates: Vec::new(),
             attachments: Vec::new(),
+            lat: None,
+            lng: None,
+            geocode_tried: false,
         }
     }
 

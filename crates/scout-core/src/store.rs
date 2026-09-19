@@ -177,7 +177,14 @@ CREATE TABLE IF NOT EXISTS trip_items (
     arrival_id        BIGINT,
     next_candidate    BIGINT NOT NULL DEFAULT 1,
     created_at        TIMESTAMP NOT NULL DEFAULT current_timestamp,
-    updated_at        TIMESTAMP NOT NULL DEFAULT current_timestamp
+    updated_at        TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    -- Where the place is, once looked up, so "how far is it" can be
+    -- answered from a phone. Last, in this order, matching step 19.
+    -- `geocode_tried` remembers a lookup that found nothing, so a place
+    -- no geocoder knows is not asked about on every location sent.
+    lat               DOUBLE,
+    lng               DOUBLE,
+    geocode_tried     BOOLEAN NOT NULL DEFAULT false
 );
 -- The options on a flight item; segment_candidates keyed by item id.
 CREATE TABLE IF NOT EXISTS item_candidates (
@@ -546,6 +553,16 @@ pub struct TripItem {
     /// pressed Add. Empty for an item nobody attached one to — a leg the
     /// specialist searched, or a booking whose mail carried no file.
     pub attachments: Vec<scout_api::AttachmentRef>,
+    /// Where `place` is, once a geocoder has said. Not on the wire: the
+    /// page has no use for it, and a number it does not draw is one it
+    /// would have to keep in step with.
+    #[serde(skip)]
+    pub lat: Option<f64>,
+    #[serde(skip)]
+    pub lng: Option<f64>,
+    /// A lookup happened and found nothing, so do not ask again.
+    #[serde(skip)]
+    pub geocode_tried: bool,
 }
 
 impl TripItem {
@@ -1263,6 +1280,22 @@ CREATE TABLE IF NOT EXISTS mail_parts (
 );
 "#;
 
+/// Coordinates on an item, for the location feature. Nullable and added
+/// in place: every item written before this is one nobody has looked up,
+/// and the lookup happens the first time a location asks about it.
+///
+/// Three statements for the flag where one would read better: DuckDB
+/// cannot add a column with a constraint in one go ("not yet supported"),
+/// so it is added nullable, filled, and then made NOT NULL — the same
+/// road step 8 took for `pinned`.
+const STEP_19_ITEM_COORDS: &str = r#"
+ALTER TABLE trip_items ADD COLUMN IF NOT EXISTS lat DOUBLE;
+ALTER TABLE trip_items ADD COLUMN IF NOT EXISTS lng DOUBLE;
+ALTER TABLE trip_items ADD COLUMN IF NOT EXISTS geocode_tried BOOLEAN DEFAULT false;
+UPDATE trip_items SET geocode_tried = false WHERE geocode_tried IS NULL;
+ALTER TABLE trip_items ALTER COLUMN geocode_tried SET NOT NULL;
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -1283,6 +1316,7 @@ fn steps() -> Vec<(i64, Step)> {
         (16, Step::Sql(STEP_16_INBOX)),
         (17, Step::Sql(STEP_17_ARRIVAL_FLIGHT)),
         (18, Step::Sql(STEP_18_MAIL_PARTS)),
+        (19, Step::Sql(STEP_19_ITEM_COORDS)),
     ]
 }
 
@@ -3360,6 +3394,19 @@ impl Store {
     }
 
     /// Every trip this user has, newest activity first.
+    /// What a geocoder said about an item's place: where it is, or that it
+    /// could not be found. Either way the item is not asked about again
+    /// until its place changes. No owner check: the caller holds an item
+    /// it read off the account's own trip.
+    pub fn set_item_coords(&self, item_id: i64, coords: Option<(f64, f64)>) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE trip_items SET lat = ?, lng = ?, geocode_tried = true WHERE id = ?",
+            params![coords.map(|c| c.0), coords.map(|c| c.1), item_id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_trips(&self, account_id: i64) -> Result<Vec<Trip>> {
         let conn = self.conn();
         let mut stmt = conn
@@ -3602,9 +3649,16 @@ impl Store {
             // caller has to be able to tell the two apart — as on a leg.
             return Ok((load_trip(&conn, trip_id)?, false));
         }
+        // A moved place is a place nobody has looked up: the coordinates
+        // go with the old one, or "how far" would answer for the wrong
+        // address.
+        let moved = wanted_place != place;
         conn.execute(
             "UPDATE trip_items SET title = ?, place = ?, date = ?, starts_at = ?, ends_at = ?,
-                 booked = ?, confirmation_code = ?, updated_at = current_timestamp
+                 booked = ?, confirmation_code = ?, updated_at = current_timestamp,
+                 lat = CASE WHEN ? THEN NULL ELSE lat END,
+                 lng = CASE WHEN ? THEN NULL ELSE lng END,
+                 geocode_tried = CASE WHEN ? THEN false ELSE geocode_tried END
              WHERE id = ?",
             params![
                 wanted_title,
@@ -3614,6 +3668,9 @@ impl Store {
                 wanted_ends,
                 wanted_booked,
                 wanted_code,
+                moved,
+                moved,
+                moved,
                 item_id
             ],
         )?;
@@ -4429,7 +4486,7 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
 
     let mut stmt = conn.prepare(
         "SELECT id, position, kind, title, place, origin, destination, date, starts_at, ends_at,
-                booked, confirmation_code, price, currency, notes, arrival_id
+                booked, confirmation_code, price, currency, notes, arrival_id, lat, lng, geocode_tried
          FROM trip_items WHERE trip_id = ? ORDER BY position",
     )?;
     let rows: Vec<TripItem> = stmt
@@ -4453,6 +4510,9 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
                 arrival_id: r.get(15)?,
                 candidates: Vec::new(),
                 attachments: Vec::new(),
+                lat: r.get(16)?,
+                lng: r.get(17)?,
+                geocode_tried: r.get(18)?,
             })
         })?
         .collect::<duckdb::Result<_>>()?;
@@ -5857,7 +5917,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 18);
+        assert_eq!(s.schema_version().unwrap(), 19);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -5921,7 +5981,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 18);
+        assert_eq!(store.schema_version().unwrap(), 19);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -7829,7 +7889,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 18);
+        assert_eq!(store.schema_version().unwrap(), 19);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -8655,7 +8715,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 18, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 19, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -8696,7 +8756,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 18);
+        assert_eq!(s.schema_version().unwrap(), 19);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -8762,6 +8822,16 @@ CREATE TABLE conversations (
         let (_d2, path) = version_sixteen_db();
         let migrated = Store::open(&path).unwrap();
         assert_eq!(shape(&fresh.conn(), "arrivals"), shape(&migrated.conn(), "arrivals"));
+    }
+
+    #[test]
+    fn a_migrated_trip_items_table_has_exactly_the_shape_a_fresh_one_has() {
+        // Step 19 appends the coordinates; `MIGRATIONS` lists them last
+        // and in the same order, for the reason the `arrivals` test gives.
+        let (fresh, _d1) = test_store();
+        let (_d2, path) = version_seventeen_db();
+        let migrated = Store::open(&path).unwrap();
+        assert_eq!(shape(&fresh.conn(), "trip_items"), shape(&migrated.conn(), "trip_items"));
     }
 
     #[test]
@@ -9195,7 +9265,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 18);
+        assert_eq!(store.schema_version().unwrap(), 19);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -9299,7 +9369,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 18);
+        assert_eq!(store.schema_version().unwrap(), 19);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -9340,7 +9410,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 18);
+        assert_eq!(store.schema_version().unwrap(), 19);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -9416,7 +9486,7 @@ CREATE TABLE messages (
         // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 18);
+        assert_eq!(store.schema_version().unwrap(), 19);
         let part = mail_part("att_1", Some("inline"), None);
         let m = store
             .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))

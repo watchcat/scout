@@ -67,6 +67,13 @@ work the same, and it signs you in with the launch data Telegram signs rather
 than asking you to log in again. Tickets and the printed plan open in your
 browser through links that expire after five minutes.
 
+Bookings reach the chat too. When a confirmation arrives at your booking
+address, the bot says what came and for which trip, with **Add** and
+**Ignore** under it, so a hotel booked from the phone is on the trip without
+opening anything. And a PDF ticket or confirmation sent to the bot is read
+the same way the mailed kind is: same extraction, same pending row, same
+buttons — it is not mailed back to you, since you have it already.
+
 <p align="center">
   <img src="crates/scout-web/src/assets/trips-desktop.webp" alt="Scout trip planner on desktop: the route across the top, then a row for each day of the trip with what falls on it, a booking address in the sidebar, and each item marked held or still to book" width="900">
 </p>

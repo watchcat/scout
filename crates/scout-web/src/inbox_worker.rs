@@ -313,7 +313,9 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
     let parts: Vec<(&str, Option<&str>)> = texts.iter().map(|(f, t)| (f.as_str(), t.as_deref())).collect();
     let text = assemble(text.as_deref(), html.as_deref(), &parts, TEXT_CAP);
     let readings = scout_core::inbox::extract(core, &text).await.map_err(Failure::Reading)?;
-    let bookings = readings.iter().filter(|e| e.booking).count();
+    // Named in the nudge, so the Add button under it is a button for
+    // something the reader can see. Taken before the readings move.
+    let named: Vec<String> = readings.iter().filter(|e| e.booking).filter_map(|e| e.title.clone()).collect();
     let (_, placement) =
         scout_core::inbox::record_arrivals(core, m.account_id, m.id, readings).await.map_err(Failure::Reading)?;
     settle(core, m, forwarded).await?;
@@ -330,7 +332,12 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
                     None
                 }
             };
-            arrival_nudge(p, name.as_deref().unwrap_or("a trip"), bookings)
+            arrival_nudge(p, name.as_deref().unwrap_or("a trip"), &named)
+        }
+        // A file handed to the bot in the chat is a question asked there,
+        // and "nothing" is an answer it is owed.
+        None if sender == scout_core::inbox::TELEGRAM_SENDER => {
+            no_booking_in_document(subject.as_deref().unwrap_or("that file"))
         }
         // Not a booking, but from a place bookings come from: worth a line,
         // since the person may be waiting on it. Anything else is just
@@ -656,19 +663,28 @@ fn other_mail_nudge(sender: &str, subject: &str, forwarded: Forwarded) -> String
 }
 
 /// The line on the phone for the bookings that were placed: on a trip that
-/// was already there, or on a draft made for them. `count` is how many the
-/// one mail confirmed — a return ticket is two — and they share a trip, so
-/// they share a line.
-fn arrival_nudge(placement: Placement, name: &str, count: usize) -> String {
-    let (what, review) = if count > 1 {
-        (format!("{count} bookings arrived"), "Review them")
+/// was already there, or on a draft made for them. `named` is what the
+/// one mail confirmed, by title — a return ticket is two — and they share
+/// a trip, so they share a line. The chat hangs Add and Ignore under it,
+/// which is why the bookings are named: a button for a thing the reader
+/// cannot see is a button they will not press.
+fn arrival_nudge(placement: Placement, name: &str, named: &[String]) -> String {
+    let (what, review) = if named.len() > 1 {
+        (format!("{} bookings arrived", named.len()), "Add them here, or review")
     } else {
-        ("A booking arrived".to_string(), "Review it")
+        ("A booking arrived".to_string(), "Add it here, or review")
     };
+    let titles = if named.is_empty() { String::new() } else { format!(": {}", named.join(", ")) };
     match placement {
-        Placement::Trip(_) => format!("{what} for {name}. {review} on goodscout.fyi/chat."),
-        Placement::Draft(_) => format!("{what} and started a draft trip, {name}. {review} on goodscout.fyi/chat."),
+        Placement::Trip(_) => format!("{what} for {name}{titles}. {review} on goodscout.fyi/chat."),
+        Placement::Draft(_) => format!("{what} and started a draft trip, {name}{titles}. {review} on goodscout.fyi/chat."),
     }
+}
+
+/// For a PDF sent to the bot that the extractor read and found no booking in.
+fn no_booking_in_document(filename: &str) -> String {
+    let filename: String = filename.chars().take(120).collect();
+    format!("I read {filename} and found no booking in it. It is under Other mail on goodscout.fyi/chat for thirty days.")
 }
 
 /// A PDF's text, or `None` when there is none to be had, with the buffer
@@ -680,7 +696,7 @@ fn arrival_nudge(placement: Placement, name: &str, count: usize) -> String {
 /// `PDF_BUDGET` the worker moves on without the text; the blocking thread
 /// finishes on its own and its answer is dropped. The buffer is shared
 /// with that thread, so only that late case pays for a copy.
-async fn pdf_text(mail_id: i64, bytes: Vec<u8>) -> (Vec<u8>, Option<String>) {
+pub async fn pdf_text(mail_id: i64, bytes: Vec<u8>) -> (Vec<u8>, Option<String>) {
     let shared = Arc::new(bytes);
     let theirs = shared.clone();
     let task = tokio::task::spawn_blocking(move || {
@@ -1150,18 +1166,29 @@ mod tests {
 
     #[test]
     fn the_nudge_says_whether_the_booking_joined_a_trip_or_started_one() {
-        assert_eq!(arrival_nudge(Placement::Trip(1), "Lisbon", 1), "A booking arrived for Lisbon. Review it on goodscout.fyi/chat.");
+        let one = vec!["Hotel Alfama".to_string()];
         assert_eq!(
-            arrival_nudge(Placement::Draft(1), "Lisbon, October", 1),
-            "A booking arrived and started a draft trip, Lisbon, October. Review it on goodscout.fyi/chat."
+            arrival_nudge(Placement::Trip(1), "Lisbon", &one),
+            "A booking arrived for Lisbon: Hotel Alfama. Add it here, or review on goodscout.fyi/chat."
+        );
+        assert_eq!(
+            arrival_nudge(Placement::Draft(1), "Lisbon, October", &one),
+            "A booking arrived and started a draft trip, Lisbon, October: Hotel Alfama. Add it here, or review on goodscout.fyi/chat."
         );
         // A round trip is two bookings off one mail, and the line counts
         // them rather than saying "a booking" twice or once.
-        assert_eq!(arrival_nudge(Placement::Trip(1), "Lisbon", 2), "2 bookings arrived for Lisbon. Review them on goodscout.fyi/chat.");
+        let two = vec!["AMS → LIS".to_string(), "LIS → AMS".to_string()];
         assert_eq!(
-            arrival_nudge(Placement::Draft(1), "Hong Kong, November", 2),
-            "2 bookings arrived and started a draft trip, Hong Kong, November. Review them on goodscout.fyi/chat."
+            arrival_nudge(Placement::Trip(1), "Lisbon", &two),
+            "2 bookings arrived for Lisbon: AMS → LIS, LIS → AMS. Add them here, or review on goodscout.fyi/chat."
         );
+        assert_eq!(
+            arrival_nudge(Placement::Draft(1), "Hong Kong, November", &two),
+            "2 bookings arrived and started a draft trip, Hong Kong, November: AMS → LIS, LIS → AMS. Add them here, or review on goodscout.fyi/chat."
+        );
+        // A reading with no title still gets a line, without a stray colon.
+        assert_eq!(arrival_nudge(Placement::Trip(1), "Lisbon", &[]), "A booking arrived for Lisbon. Add it here, or review on goodscout.fyi/chat.");
+        assert!(no_booking_in_document("eticket.pdf").starts_with("I read eticket.pdf and found no booking"));
     }
 
     /// A model that answers every completion with `answer`, on the same
@@ -1476,7 +1503,7 @@ mod tests {
         assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "done, not retried");
         assert_eq!(forwards(&server.received_requests().await.unwrap()), 1);
         let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
-        assert_eq!(queued.iter().map(|q| q.body.as_str()).collect::<Vec<_>>(), ["A booking arrived and started a draft trip, Lisbon, October. Review it on goodscout.fyi/chat."]);
+        assert_eq!(queued.iter().map(|q| q.body.as_str()).collect::<Vec<_>>(), ["A booking arrived and started a draft trip, Lisbon, October: Hotel Lisboa. Add it here, or review on goodscout.fyi/chat."]);
     }
 
     #[tokio::test]
@@ -1500,7 +1527,7 @@ mod tests {
         let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
         assert_eq!(
             queued.iter().map(|q| q.body.as_str()).collect::<Vec<_>>(),
-            ["2 bookings arrived and started a draft trip, Hong Kong, November. Review them on goodscout.fyi/chat."]
+            ["2 bookings arrived and started a draft trip, Hong Kong, November: AMS → HKG, HKG → AMS. Add them here, or review on goodscout.fyi/chat."]
         );
     }
 

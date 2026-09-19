@@ -610,6 +610,61 @@ pub async fn record_mail(core: &Core, account_id: i64, mail: MailIn) -> anyhow::
     Ok(id)
 }
 
+/// The sender a mail records when it came in as a file sent to the bot
+/// rather than as an email. Not an address, deliberately: nothing matches
+/// it as one, and the worker reads it to know the person is in the chat
+/// and can be told there what the file held.
+pub const TELEGRAM_SENDER: &str = "telegram";
+
+/// A PDF handed to the bot in a chat, filed as a mail so the same worker
+/// reads it, places it and nudges about it. `provider_id` is Telegram's
+/// own id for the file, so the same file sent twice is read once.
+///
+/// Recorded as already forwarded: the person has the file on their phone,
+/// and mailing it back to them would be the one thing they did not ask
+/// for. Everything else — the extraction, the placement, the pending row
+/// on the Trips tab — is exactly what a mailed ticket gets.
+pub async fn record_document(
+    core: &Core,
+    account_id: i64,
+    provider_id: &str,
+    filename: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+    text: Option<String>,
+) -> anyhow::Result<Option<i64>> {
+    let store = core.store();
+    let (provider_id, filename, mime) = (provider_id.to_string(), filename.to_string(), mime.to_string());
+    let id = blocking(move || {
+        // An empty body rather than none: the worker takes "the row has a
+        // body" as "nothing to fetch from the mail provider", which is the
+        // truth here — the text is in the attachment.
+        let Some(id) = store.insert_mail(account_id, &provider_id, TELEGRAM_SENDER, Some(&filename), Some(""), None, false, &[])? else {
+            return Ok(None);
+        };
+        store.insert_attachment(id, &filename, &mime, Some(&bytes), text.as_deref())?;
+        store.mail_forwarded(id)?;
+        Ok(Some(id))
+    })
+    .await?;
+    if id.is_some() {
+        core.wake_inbox();
+    }
+    Ok(id)
+}
+
+/// One arrival of this account's, decided or not.
+pub async fn arrival(core: &Core, account_id: i64, arrival_id: i64) -> anyhow::Result<Option<scout_api::Arrival>> {
+    let store = core.store();
+    blocking(move || store.arrival_of(arrival_id, account_id)).await
+}
+
+/// The bookings of a mail still waiting for a decision.
+pub async fn pending_of_mail(core: &Core, account_id: i64, mail_id: i64) -> anyhow::Result<Vec<scout_api::Arrival>> {
+    let store = core.store();
+    blocking(move || store.pending_arrivals_of_mail(mail_id, account_id)).await
+}
+
 /// What the webhook said this mail's parts are. Empty for a mail that
 /// came with no attachments, and for one stored before the parts were
 /// kept at all.
@@ -2585,5 +2640,40 @@ mod tests {
         let a = core.store().account_for_telegram(1).unwrap();
         let id = seed_attachment_for_tests(&core, a, "ticket.pdf", "application/pdf", b"%PDF".to_vec()).await.unwrap();
         assert_eq!(attachment_for(&core, id, a).await.unwrap().map(|(f, _, b)| (f, b)), Some(("ticket.pdf".to_string(), b"%PDF".to_vec())));
+    }
+
+    #[tokio::test]
+    async fn a_pdf_sent_to_the_bot_is_a_mail_the_worker_will_read_and_never_a_forward() {
+        let (core, _dir) = core();
+        let account_id = core.store().account_for_telegram(1).unwrap();
+        let id = record_document(&core, account_id, "telegram:AQADfile", "eticket.pdf", "application/pdf", b"%PDF".to_vec(), Some("KLM KL887 21 Sep".into()))
+            .await
+            .unwrap()
+            .expect("a first sending is recorded");
+        // The same file again is the same mail, not a second reading.
+        assert_eq!(
+            record_document(&core, account_id, "telegram:AQADfile", "eticket.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap(),
+            None
+        );
+        let due = mail_to_work(&core, 10).await.unwrap();
+        let mine = due.iter().find(|m| m.id == id).expect("the worker sees it");
+        assert!(mine.forwarded, "the person has the file already; it must not be mailed back");
+        assert_eq!(mine.from, TELEGRAM_SENDER);
+        assert!(mine.text.is_some(), "a body on the row, so nothing is fetched from the mail provider");
+        let texts = attachment_texts(&core, id).await.unwrap();
+        assert_eq!(texts, vec![("eticket.pdf".to_string(), Some("KLM KL887 21 Sep".to_string()))]);
+    }
+
+    #[tokio::test]
+    async fn a_mails_pending_bookings_are_listed_until_decided() {
+        let (core, _dir) = core();
+        let account_id = core.store().account_for_telegram(1).unwrap();
+        let arrival_id = seed_arrival_for_tests(&core, account_id, "stay", "Harbour View Rooms", "2026-10-13", None).await.unwrap();
+        let mail_id = core.store().arrival_of(arrival_id, account_id).unwrap().unwrap().mail_id;
+        let pending = pending_of_mail(&core, account_id, mail_id).await.unwrap();
+        assert_eq!(pending.iter().map(|a| a.id).collect::<Vec<_>>(), vec![arrival_id]);
+        assert!(pending_of_mail(&core, account_id + 1, mail_id).await.unwrap().is_empty(), "not another account's");
+        ignore_arrival(&core, account_id, arrival_id).await.unwrap();
+        assert!(pending_of_mail(&core, account_id, mail_id).await.unwrap().is_empty());
     }
 }

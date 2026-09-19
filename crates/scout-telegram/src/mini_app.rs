@@ -80,6 +80,11 @@ const BUTTON_NAME_CHARS: usize = 28;
 
 /// "Open <trip>", opening the Mini App on that trip.
 pub fn open_trip_markup(launch: &Url, trip: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![open_trip_button(launch, trip)]])
+}
+
+/// The button itself, for a keyboard that has other rows.
+pub fn open_trip_button(launch: &Url, trip: &str) -> InlineKeyboardButton {
     let mut url = launch.clone();
     url.query_pairs_mut().clear().append_pair("trip", trip);
     let name: String = if trip.chars().count() > BUTTON_NAME_CHARS {
@@ -87,10 +92,7 @@ pub fn open_trip_markup(launch: &Url, trip: &str) -> InlineKeyboardMarkup {
     } else {
         trip.to_string()
     };
-    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::web_app(
-        format!("Open {name}"),
-        WebAppInfo { url },
-    )]])
+    InlineKeyboardButton::web_app(format!("Open {name}"), WebAppInfo { url })
 }
 
 /// The button beside the input, for every private chat with the bot.

@@ -1378,6 +1378,9 @@ pub struct PendingMirror {
     pub account_id: i64,
     pub address: String,
     pub body: String,
+    /// What the row is about. A nudge about a mail is keyed `inbox:<id>`,
+    /// which is how the channel knows to hang Add and Ignore under it.
+    pub turn_key: String,
 }
 
 /// One row of the sidebar. `current` is not here: the store does not know
@@ -2517,7 +2520,7 @@ impl Store {
     pub fn pending_mirror(&self, channel: &str, limit: usize) -> Result<Vec<PendingMirror>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, address, body FROM outbox
+            "SELECT id, account_id, address, body, turn_key FROM outbox
              WHERE channel = ? AND sent_at IS NULL AND attempts < ?
              ORDER BY id LIMIT ?",
         )?;
@@ -2527,6 +2530,7 @@ impl Store {
                 account_id: r.get(1)?,
                 address: r.get(2)?,
                 body: r.get(3)?,
+                turn_key: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -5077,6 +5081,22 @@ impl Store {
 
     /// The arrival, if it is this account's. The owner is part of the key
     /// on purpose: an id from the page is not proof of anything.
+    /// The bookings of one mail still waiting for a decision, oldest
+    /// first: what a nudge about that mail can offer to add.
+    pub fn pending_arrivals_of_mail(&self, mail_id: i64, account_id: i64) -> Result<Vec<scout_api::Arrival>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ARRIVAL_SELECT} WHERE a.mail_id = ? AND a.account_id = ? AND a.status = 'pending' AND a.booking
+             ORDER BY a.id"
+        ))?;
+        let rows = stmt.query_map(params![mail_id, account_id], arrival_row)?;
+        let mut arrivals = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        for arrival in &mut arrivals {
+            arrival.attachments = attachments_of(&conn, arrival.mail_id)?;
+        }
+        Ok(arrivals)
+    }
+
     pub fn arrival_of(&self, id: i64, account_id: i64) -> Result<Option<scout_api::Arrival>> {
         let conn = self.conn();
         let found = conn

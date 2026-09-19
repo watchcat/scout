@@ -13,6 +13,9 @@ mod cache;
 mod email;
 mod inbound;
 mod inbox_worker;
+/// For a PDF the Telegram bot is handed: read the way a mailed one is,
+/// and kept within the same cap.
+pub use inbox_worker::{pdf_text, ATTACHMENT_CAP};
 mod page;
 mod pages;
 mod ratelimit;

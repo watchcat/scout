@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
+use teloxide::types::InlineKeyboardMarkup;
 
 /// How long to leave between messages to one chat.
 ///
@@ -31,8 +32,11 @@ const TICK: Duration = Duration::from_secs(60);
 /// A trait so the drain can be tested with no bot token and no network,
 /// exactly as `progress::Renderer` is.
 pub trait Sink {
-    async fn send(&self, address: &str, body: &str) -> anyhow::Result<()>;
+    async fn send(&self, address: &str, body: &str, buttons: Option<InlineKeyboardMarkup>) -> anyhow::Result<()>;
 }
+
+/// A queued row and the buttons to hang under it, if any.
+pub type Outgoing = (PendingMirror, Option<InlineKeyboardMarkup>);
 
 /// Somewhere to record what happened to a row.
 ///
@@ -52,15 +56,46 @@ pub struct TelegramSink {
 }
 
 impl Sink for TelegramSink {
-    async fn send(&self, address: &str, body: &str) -> anyhow::Result<()> {
+    async fn send(&self, address: &str, body: &str, buttons: Option<InlineKeyboardMarkup>) -> anyhow::Result<()> {
         let chat = address.parse::<i64>()?;
         // The same chunking every other answer gets: Telegram refuses
         // anything past 4096 characters and a price list can exceed it.
-        for chunk in crate::text::split_message(body, crate::text::TELEGRAM_LIMIT) {
-            self.bot.send_message(ChatId(chat), chunk).await?;
+        // The buttons go under the last part, where the reader finishes.
+        let chunks = crate::text::split_message(body, crate::text::TELEGRAM_LIMIT);
+        let last = chunks.len().saturating_sub(1);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let send = self.bot.send_message(ChatId(chat), chunk);
+            match (i == last, &buttons) {
+                (true, Some(markup)) => send.reply_markup(markup.clone()).await?,
+                _ => send.await?,
+            };
         }
         Ok(())
     }
+}
+
+/// Add and Ignore for a nudge about a mail whose bookings are still
+/// pending, and Open <trip> where the Mini App is on. Read at send time
+/// rather than queued with the row: a booking decided on the page between
+/// the nudge being queued and sent gets no button for a thing already done.
+///
+/// A web-app button is allowed only in a private chat, which a positive
+/// chat id is.
+async fn buttons_for(core: &Core, launch: Option<&url::Url>, row: &PendingMirror) -> Option<InlineKeyboardMarkup> {
+    let mail_id = crate::arrivals::mail_of_key(&row.turn_key)?;
+    let pending = match scout_core::inbox::pending_of_mail(core, row.account_id, mail_id).await {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::warn!(error = %e, mail_id, "could not read a nudge's bookings; sending it without buttons");
+            return None;
+        }
+    };
+    let private = row.address.parse::<i64>().is_ok_and(|chat| chat > 0);
+    let open = match (launch, pending.first().and_then(|a| a.trip_name.as_deref())) {
+        (Some(launch), Some(trip)) if private => Some(crate::mini_app::open_trip_button(launch, trip)),
+        _ => None,
+    };
+    crate::arrivals::arrival_markup(&pending, open)
 }
 
 pub struct CoreLedger<'a>(pub &'a Core);
@@ -82,16 +117,16 @@ impl Ledger for CoreLedger<'_> {
 /// reads as nonsense. The stop is per account, so one reader who has
 /// blocked the bot cannot freeze everybody else's thread behind them.
 pub async fn drain<S: Sink, L: Ledger>(
-    due: Vec<PendingMirror>,
+    due: Vec<Outgoing>,
     sink: &S,
     ledger: &L,
 ) -> anyhow::Result<()> {
     let mut blocked: HashSet<i64> = HashSet::new();
-    for row in due {
+    for (row, buttons) in due {
         if blocked.contains(&row.account_id) {
             continue;
         }
-        match sink.send(&row.address, &row.body).await {
+        match sink.send(&row.address, &row.body, buttons).await {
             Ok(()) => ledger.sent(row.id).await?,
             Err(e) => {
                 // Said separately, because "it stays queued" is false on the
@@ -117,7 +152,7 @@ pub async fn drain<S: Sink, L: Ledger>(
 }
 
 /// Drains whenever something is queued, and every `TICK` regardless.
-pub async fn run(bot: Bot, core: Arc<Core>) {
+pub async fn run(bot: Bot, core: Arc<Core>, launch: Option<url::Url>) {
     let sink = TelegramSink { bot };
     loop {
         tokio::select! {
@@ -126,7 +161,12 @@ pub async fn run(bot: Bot, core: Arc<Core>) {
         }
         match scout_core::mirror::pending(&core, BATCH).await {
             Ok(due) => {
-                if let Err(e) = drain(due, &sink, &CoreLedger(&core)).await {
+                let mut outgoing = Vec::with_capacity(due.len());
+                for row in due {
+                    let buttons = buttons_for(&core, launch.as_ref(), &row).await;
+                    outgoing.push((row, buttons));
+                }
+                if let Err(e) = drain(outgoing, &sink, &CoreLedger(&core)).await {
                     tracing::error!(error = %e, "the mirror drain failed");
                 }
             }
@@ -150,7 +190,7 @@ mod tests {
     }
 
     impl Sink for Recorder {
-        async fn send(&self, _address: &str, body: &str) -> anyhow::Result<()> {
+        async fn send(&self, _address: &str, body: &str, _buttons: Option<InlineKeyboardMarkup>) -> anyhow::Result<()> {
             if self.fail_on.as_deref() == Some(body) {
                 anyhow::bail!("telegram said no");
             }
@@ -182,14 +222,19 @@ mod tests {
             account_id,
             address: "4242".to_string(),
             body: body.to_string(),
+            turn_key: format!("turn:{id}"),
         }
+    }
+
+    fn plain(rows: Vec<PendingMirror>) -> Vec<Outgoing> {
+        rows.into_iter().map(|r| (r, None)).collect()
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_thread_goes_out_in_order() {
         let (sink, ledger) = (Recorder::default(), Book::default());
         let due = vec![row(1, 7, "> cheapest beans"), row(2, 7, "here are three")];
-        drain(due, &sink, &ledger).await.unwrap();
+        drain(plain(due), &sink, &ledger).await.unwrap();
         assert_eq!(*sink.sent.lock().unwrap(), vec!["> cheapest beans", "here are three"]);
         assert_eq!(*ledger.sent.lock().unwrap(), vec![1, 2]);
         assert!(ledger.failed.lock().unwrap().is_empty());
@@ -201,7 +246,7 @@ mod tests {
         // one. A thread out of order is worse than a thread that is late.
         let sink = Recorder { sent: Mutex::new(Vec::new()), fail_on: Some("first".to_string()) };
         let ledger = Book::default();
-        drain(vec![row(1, 7, "first"), row(2, 7, "second")], &sink, &ledger).await.unwrap();
+        drain(plain(vec![row(1, 7, "first"), row(2, 7, "second")]), &sink, &ledger).await.unwrap();
         assert!(sink.sent.lock().unwrap().is_empty(), "sent the second before the first landed");
         assert_eq!(*ledger.failed.lock().unwrap(), vec![1]);
         assert!(ledger.sent.lock().unwrap().is_empty(), "marked something sent that never went");
@@ -214,7 +259,7 @@ mod tests {
         let sink = Recorder { sent: Mutex::new(Vec::new()), fail_on: Some("blocked".to_string()) };
         let ledger = Book::default();
         let due = vec![row(1, 7, "blocked"), row(2, 7, "also seven"), row(3, 8, "another reader")];
-        drain(due, &sink, &ledger).await.unwrap();
+        drain(plain(due), &sink, &ledger).await.unwrap();
         assert_eq!(*sink.sent.lock().unwrap(), vec!["another reader"]);
     }
 }

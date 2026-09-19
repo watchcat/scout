@@ -1,5 +1,6 @@
 mod bot;
 mod draft;
+mod arrivals;
 mod membership;
 mod mini_app;
 mod mirror;
@@ -78,7 +79,7 @@ async fn register_webhook(bot: Bot, url: url::Url) {
         let request = bot
             .set_webhook(url.clone())
             .secret_token(secret.clone())
-            .allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::MessageReaction]);
+            .allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::MessageReaction, AllowedUpdate::CallbackQuery]);
         match request.await {
             Ok(_) => break,
             Err(e) => {
@@ -167,7 +168,12 @@ async fn main() -> Result<()> {
     // the table and a stranger at the gate until the next deploy.
     tokio::spawn(membership::watch(core.clone(), members.clone()));
     tokio::spawn(scheduler::run(telegram.clone(), core.clone()));
-    tokio::spawn(mirror::run(telegram.clone(), core.clone()));
+    // Before the mirror starts: a nudge about a booking carries an Open
+    // <trip> button when the Mini App is on, and the mirror is what sends it.
+    // From the site's own address, which the front door already reads, so
+    // the button and the page cannot point at two different hosts.
+    let mini_app = std::env::var("SCOUT_BASE_URL").ok().and_then(|b| mini_app::launch_url(&b));
+    tokio::spawn(mirror::run(telegram.clone(), core.clone(), mini_app.clone()));
     // Backups belong to core, not to this channel: they must keep happening
     // whether or not Telegram is running.
     tokio::spawn(core.clone().run_maintenance());
@@ -200,9 +206,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // From the site's own address, which the front door already reads, so
-    // the button and the page cannot point at two different hosts.
-    let mini_app = std::env::var("SCOUT_BASE_URL").ok().and_then(|b| mini_app::launch_url(&b));
     match &mini_app {
         Some(launch) => {
             tokio::spawn(install_menu_button(telegram.clone(), launch.clone()));

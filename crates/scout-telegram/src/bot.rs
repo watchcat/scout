@@ -146,6 +146,7 @@ I'm Scout - I research products for you.
 
 Just tell me what you're looking for (budget, country, must-haves help).
 Send a photo of a product and I'll draft a search from it.
+Send a PDF ticket or booking confirmation and I'll put it on your trip once you say Add.
 Tell me when you bought something and I'll remember where and for how much.
 I can remind you when it's time to reorder things you buy regularly.
 
@@ -221,14 +222,21 @@ pub async fn run(bot: Bot, app: Arc<App>, listener: Option<crate::webhook::Liste
                     dptree::filter(|msg: Message| msg.photo().is_some()).endpoint(handle_photo),
                 )
                 .branch(
+                    dptree::filter(|msg: Message| msg.document().is_some()).endpoint(handle_document),
+                )
+                .branch(
                     dptree::filter(|msg: Message| msg.text().is_some()).endpoint(handle_text),
                 ),
         );
     // Adding this branch makes the dispatcher request message_reaction
     // updates from Telegram automatically (allowed_updates hinting).
+    //
+    // A button press is gated inside its handler rather than here: the
+    // gate reads a `Message`'s sender, and a callback carries its own.
     let handler = dptree::entry()
         .branch(messages)
-        .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction));
+        .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction))
+        .branch(Update::filter_callback_query().endpoint(handle_callback));
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![app])
@@ -1124,6 +1132,156 @@ async fn handle_photo(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<(
             )
             .await?;
         }
+    }
+    Ok(())
+}
+
+/// The file kinds the bot reads as a booking. A PDF and nothing else,
+/// for now: a photo is a product to find, as it always was, and a
+/// screenshot of a booking would need telling apart from one.
+fn is_pdf(doc: &teloxide::types::Document) -> bool {
+    doc.mime_type.as_ref().is_some_and(|m| m.essence_str() == "application/pdf")
+        || doc.file_name.as_deref().is_some_and(|n| n.to_ascii_lowercase().ends_with(".pdf"))
+}
+
+/// A file sent to the bot: a ticket or a confirmation, read the way one
+/// forwarded to the booking address is. The reading happens in the inbox
+/// worker, off this handler; what comes back is the same nudge a mailed
+/// booking gets, with Add and Ignore under it.
+async fn handle_document(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResult<()> {
+    let chat_id = msg.chat.id;
+    let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+    let Some(doc) = msg.document() else { return Ok(()) };
+    let account_id = match scout_core::session::account_of(&app.core, scout_core::ids::TelegramId(user_id)).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, user_id, "could not resolve an account");
+            bot.send_message(chat_id, CLAIM_FAILED).await?;
+            return Ok(());
+        }
+    };
+    if !is_pdf(doc) {
+        bot.send_message(chat_id, "I can read a PDF ticket or confirmation sent here. For anything else, forward the email to your booking address.").await?;
+        return Ok(());
+    }
+    // Reading a file is a model call, like a photo.
+    if let Some(refusal) = scout_core::session::over_daily_cap(&app.core, account_id).await {
+        bot.send_message(chat_id, refusal).await?;
+        return Ok(());
+    }
+    let too_big = doc.file.size as usize > scout_web::ATTACHMENT_CAP;
+    if too_big {
+        bot.send_message(chat_id, "That file is over 10 MB, which is more than I keep. Forward the email instead, or send a smaller copy.").await?;
+        return Ok(());
+    }
+    let filename = doc.file_name.clone().unwrap_or_else(|| "document.pdf".to_string());
+    log_request(&app, account_id, "document");
+    let _typing = Typing::start(bot.clone(), chat_id);
+    let bytes = match download_photo(&bot, doc.file.id.clone()).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, "document download failed");
+            bot.send_message(chat_id, "Sorry, I couldn't download that file. Please try again.").await?;
+            return Ok(());
+        }
+    };
+    let (bytes, text) = scout_web::pdf_text(0, bytes).await;
+    // Telegram's own id for the file: the same PDF sent twice is read once.
+    let provider_id = format!("telegram:{}", doc.file.unique_id);
+    let recorded = scout_core::inbox::record_document(&app.core, account_id, &provider_id, &filename, "application/pdf", bytes, text).await;
+    let reply = match recorded {
+        Ok(Some(_)) => "Reading it now. I'll say what I found in a moment.".to_string(),
+        Ok(None) => "I've read that file already; it's on your Trips tab.".to_string(),
+        Err(e) => {
+            tracing::error!(error = %e, chat_id = chat_id.0, "could not file a document");
+            "Sorry, something went wrong on my side. Please try again in a minute.".to_string()
+        }
+    };
+    bot.send_message(chat_id, reply).await?;
+    Ok(())
+}
+
+/// Add or Ignore, pressed under a nudge. The account is the presser's, so
+/// a button forwarded to somebody else decides nothing of theirs; the
+/// store's own owner check is what enforces it.
+async fn handle_callback(bot: Bot, q: teloxide::types::CallbackQuery, app: Arc<App>) -> ResponseResult<()> {
+    use crate::arrivals::{decided_line, Decision};
+    use scout_core::inbox::{AddTarget, Outcome};
+    let answer = |text: &str| bot.answer_callback_query(q.id.clone()).text(text.to_string());
+    let Some(decision) = q.data.as_deref().and_then(crate::arrivals::parse_callback) else {
+        // A button this build does not know; answering closes the spinner.
+        bot.answer_callback_query(q.id.clone()).await?;
+        return Ok(());
+    };
+    let user_id = q.from.id.0 as i64;
+    if !is_member_id(&app, user_id) {
+        answer("Scout is invite-only right now.").await?;
+        return Ok(());
+    }
+    let account_id = match scout_core::session::account_of(&app.core, scout_core::ids::TelegramId(user_id)).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, user_id, "could not resolve an account for a button");
+            answer("Sorry, something went wrong. Try again in a minute.").await?;
+            return Ok(());
+        }
+    };
+    let arrival_id = match decision {
+        Decision::Add(id) | Decision::Ignore(id) => id,
+    };
+    let before = scout_core::inbox::arrival(&app.core, account_id, arrival_id).await.ok().flatten();
+    let title = before.as_ref().and_then(|a| a.title.clone());
+    let outcome = match decision {
+        Decision::Add(id) => scout_core::inbox::add_arrival(&app.core, account_id, id, AddTarget::Matched)
+            .await
+            .map(|o| match o {
+                Outcome::Done(plan) => Outcome::Done(Some(plan.trip.name)),
+                Outcome::NotFound => Outcome::NotFound,
+                Outcome::NotPending => Outcome::NotPending,
+            }),
+        Decision::Ignore(id) => scout_core::inbox::ignore_arrival(&app.core, account_id, id).await.map(|o| match o {
+            Outcome::Done(()) => Outcome::Done(None),
+            Outcome::NotFound => Outcome::NotFound,
+            Outcome::NotPending => Outcome::NotPending,
+        }),
+    };
+    let line = match outcome {
+        Ok(Outcome::Done(trip)) => decided_line(decision, title.as_deref(), trip.as_deref()),
+        // Somebody else's, or gone: one answer for both, as on the page.
+        Ok(Outcome::NotFound) => "That booking isn't here any more.".to_string(),
+        Ok(Outcome::NotPending) => "Already decided — on the Trips tab, or from another press.".to_string(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, arrival_id, "a button could not decide an arrival");
+            answer("Sorry, something went wrong. Try again in a minute.").await?;
+            return Ok(());
+        }
+    };
+    answer(&line).await?;
+    tracing::info!(account_id, arrival_id, add = matches!(decision, Decision::Add(_)), "a booking decided from the chat");
+
+    // The message becomes a record: the line under it, and only the
+    // buttons that still ask something. An inaccessible message — too
+    // old, or deleted — is left as it is; the answer above was seen.
+    let Some(message) = q.message.as_ref().and_then(|m| m.regular_message()) else {
+        return Ok(());
+    };
+    let remaining = match before.as_ref() {
+        Some(a) => scout_core::inbox::pending_of_mail(&app.core, account_id, a.mail_id).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let trip = before.as_ref().and_then(|a| a.trip_name.as_deref());
+    let open = match (&app.mini_app, trip) {
+        (Some(launch), Some(trip)) if message.chat.id.0 > 0 => Some(crate::mini_app::open_trip_button(launch, trip)),
+        _ => None,
+    };
+    let text = format!("{}\n\n{line}", message.text().unwrap_or_default());
+    let edit = bot.edit_message_text(message.chat.id, message.id, text);
+    let edited = match crate::arrivals::arrival_markup(&remaining, open) {
+        Some(markup) => edit.reply_markup(markup).await,
+        None => edit.await,
+    };
+    if let Err(e) = edited {
+        tracing::warn!(error = %e, "could not update the nudge after a button press");
     }
     Ok(())
 }

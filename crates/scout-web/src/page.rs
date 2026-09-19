@@ -215,6 +215,10 @@ mod tests {
         assert!(page.contains("alt=\"Scout trip planner"), "the shot lost its description");
         assert!(page.contains("a row for each day"), "the alt text does not say what the shot shows");
         assert!(page.contains("still to book"), "the alt text does not say the two states apart");
+        // The Mini App is the same page and the landing says so: a reader
+        // on a phone should learn the trips are a button away in the chat.
+        assert!(page.contains("opens as a Mini App"), "the landing lost the Mini App");
+        assert!(page.contains("<strong>Trips</strong> button"), "the landing does not name the button");
     }
 
     #[test]

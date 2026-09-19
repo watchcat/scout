@@ -182,9 +182,13 @@ CREATE TABLE IF NOT EXISTS trip_items (
     -- answered from a phone. Last, in this order, matching step 19.
     -- `geocode_tried` remembers a lookup that found nothing, so a place
     -- no geocoder knows is not asked about on every location sent.
+    -- Nullable, NULL meaning false: DuckDB cannot make a column NOT NULL
+    -- in the same transaction that filled it, and step 19 has to run on
+    -- a table with rows in it. Production crash-looped on the version
+    -- that tried.
     lat               DOUBLE,
     lng               DOUBLE,
-    geocode_tried     BOOLEAN NOT NULL DEFAULT false
+    geocode_tried     BOOLEAN DEFAULT false
 );
 -- The options on a flight item; segment_candidates keyed by item id.
 CREATE TABLE IF NOT EXISTS item_candidates (
@@ -1284,16 +1288,16 @@ CREATE TABLE IF NOT EXISTS mail_parts (
 /// in place: every item written before this is one nobody has looked up,
 /// and the lookup happens the first time a location asks about it.
 ///
-/// Three statements for the flag where one would read better: DuckDB
-/// cannot add a column with a constraint in one go ("not yet supported"),
-/// so it is added nullable, filled, and then made NOT NULL — the same
-/// road step 8 took for `pinned`.
+/// The flag stays nullable. DuckDB cannot add a column with a constraint
+/// ("not yet supported"), and cannot make one NOT NULL in a transaction
+/// that has updated the table ("outstanding updates") — which is every
+/// migration of a table with rows. Step 8's road, add-fill-constrain,
+/// worked for `pinned` only because it filled nothing; here it took the
+/// pod down. NULL reads as false, in `load_trip`.
 const STEP_19_ITEM_COORDS: &str = r#"
 ALTER TABLE trip_items ADD COLUMN IF NOT EXISTS lat DOUBLE;
 ALTER TABLE trip_items ADD COLUMN IF NOT EXISTS lng DOUBLE;
 ALTER TABLE trip_items ADD COLUMN IF NOT EXISTS geocode_tried BOOLEAN DEFAULT false;
-UPDATE trip_items SET geocode_tried = false WHERE geocode_tried IS NULL;
-ALTER TABLE trip_items ALTER COLUMN geocode_tried SET NOT NULL;
 "#;
 
 fn steps() -> Vec<(i64, Step)> {
@@ -4512,7 +4516,7 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
                 attachments: Vec::new(),
                 lat: r.get(16)?,
                 lng: r.get(17)?,
-                geocode_tried: r.get(18)?,
+                geocode_tried: r.get::<_, Option<bool>>(18)?.unwrap_or(false),
             })
         })?
         .collect::<duckdb::Result<_>>()?;
@@ -8822,6 +8826,45 @@ CREATE TABLE conversations (
         let (_d2, path) = version_sixteen_db();
         let migrated = Store::open(&path).unwrap();
         assert_eq!(shape(&fresh.conn(), "arrivals"), shape(&migrated.conn(), "arrivals"));
+    }
+
+    /// A database at 18 with a trip item in it: the shape production had
+    /// when step 19 ran. Built from `MIGRATIONS` and then stripped of the
+    /// step's columns, because a fixture that already has them makes the
+    /// step's `IF NOT EXISTS` a no-op and tests nothing.
+    fn version_eighteen_db_with_an_item() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v18.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE trip_items DROP COLUMN lat;
+             ALTER TABLE trip_items DROP COLUMN lng;
+             ALTER TABLE trip_items DROP COLUMN geocode_tried;
+             CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
+             DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES (18);
+             INSERT INTO accounts (id) VALUES (1);
+             INSERT INTO trips (id, account_id, name, name_key) VALUES (1, 1, 'Hong Kong', 'hong kong');
+             INSERT INTO trip_items (id, trip_id, position, kind, title, date) VALUES (1, 1, 1, 'activity', 'Lunch', '2026-09-24');",
+        )
+        .unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    #[test]
+    fn step_19_runs_on_a_database_that_has_items_in_it() {
+        // Production had rows, the fixture the shape test uses had none,
+        // and DuckDB refuses `SET NOT NULL` in a transaction that has just
+        // updated the table: the pod crash-looped on this step.
+        let (_dir, path) = version_eighteen_db_with_an_item();
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 19);
+        let trip = s.list_trips(1).unwrap().remove(0);
+        assert_eq!((trip.items[0].lat, trip.items[0].geocode_tried), (None, false));
+        s.set_item_coords(trip.items[0].id, None).unwrap();
+        assert!(s.list_trips(1).unwrap()[0].items[0].geocode_tried);
     }
 
     #[test]

@@ -65,7 +65,9 @@ not a second client — the chat is left out because the bot is the chat — so
 the day rows, the notes, the ⋯ menu, flight choice and the booking address all
 work the same, and it signs you in with the launch data Telegram signs rather
 than asking you to log in again. Tickets and the printed plan open in your
-browser through links that expire after five minutes.
+browser through links that expire after five minutes. Telegram's own ⋯ menu
+over the page gets a **Settings** entry that opens the booking address for
+editing.
 
 Send the bot your location on a trip day and it answers with what is next,
 nearest first — how far, how long on foot, a map link — and says which days

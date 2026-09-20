@@ -99,6 +99,28 @@ export function openOutside(url, win = globalThis.window) {
 // colour rather than the client's theme cutting across the top.
 export const TELEGRAM_GROUND = '#002b36'
 
+// Asks the client for the "Settings" entry in the ⋯ menu it draws over
+// the page. Telegram names the entry; the page only gets told it was
+// pressed, through `listenToTelegram`.
+export function showSettingsButton(win = globalThis.window) {
+  return telegramEvent('web_app_setup_settings_button', { is_visible: true }, win)
+}
+
+// Hears what the client sends back. The phone and desktop apps call
+// `window.Telegram.WebView.receiveEvent`; Telegram Web posts a message
+// from its own origin, and only that origin is listened to — a page that
+// framed us and is not Telegram gets to say nothing.
+export function listenToTelegram(handler, win = globalThis.window) {
+  if (!win) return
+  win.Telegram = { WebView: { receiveEvent: (eventType, eventData) => handler(eventType, eventData) } }
+  win.addEventListener?.('message', (event) => {
+    if (event.origin !== 'https://web.telegram.org') return
+    let body
+    try { body = JSON.parse(event.data) } catch { return }
+    if (body && typeof body.eventType === 'string') handler(body.eventType, body.eventData)
+  })
+}
+
 export function settleIntoTelegram(win = globalThis.window) {
   telegramEvent('web_app_ready', {}, win)
   telegramEvent('web_app_expand', {}, win)

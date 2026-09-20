@@ -1,7 +1,7 @@
 // The chat page's client. Pure helpers first (exported for
 // `chat.test.mjs`), then the DOM wiring that uses them.
 
-import { settleIntoTelegram, clearExchanged, openOutside } from './telegram.js'
+import { settleIntoTelegram, clearExchanged, openOutside, listenToTelegram, showSettingsButton } from './telegram.js'
 
 /// Moves accumulated text forward by one `TextUpdate`. The counterpart of
 /// `TextUpdate::apply` in scout-api, and the reason it exists at all: a
@@ -429,13 +429,18 @@ export const ITINERARY_NOTE = 'Itinerary note.'
 // glance above the timeline, and a trip with nine loose activities would
 // otherwise put the whole list where the reader is looking for a state.
 // The items themselves are right below, each one saying for itself.
-function bookingLine(toBook) {
+// `address` is the booking address, when the account has one: the banner
+// that says what is still to book is the moment the reader is about to
+// go and book it, so it is the moment to say where the confirmation
+// goes. Said nowhere else on the banner, and not at all when there is
+// nothing left to book.
+function bookingLine(toBook, address) {
   const names = (toBook ?? []).filter((name) => String(name ?? '').trim())
   if (!names.length) return ''
-  if (names.length <= 3) {
-    return `${listOf(names)} ${names.length === 1 ? 'is' : 'are'} not booked yet.`
-  }
-  return `${listOf(names.slice(0, 3))}, and ${names.length - 3} more, are not booked yet.`
+  const left = names.length <= 3
+    ? `${listOf(names)} ${names.length === 1 ? 'is' : 'are'} not booked yet.`
+    : `${listOf(names.slice(0, 3))}, and ${names.length - 3} more, are not booked yet.`
+  return address ? `${left} Forward each confirmation to ${address} and it lands on this trip.` : left
 }
 
 // Two questions, and the banner used to answer only one of them: what
@@ -444,9 +449,16 @@ function bookingLine(toBook) {
 // the whole trip is how a fully ticketed itinerary came to say "nothing
 // here is waiting on you" to somebody with three unbooked activities on
 // the screen below it.
-export function readinessAlert(trip) {
+export function readinessAlert(trip, address = null) {
   const readiness = trip?.readiness
-  const booking = bookingLine(trip?.to_book)
+  const booking = bookingLine(trip?.to_book, address)
+  // The address, for the page to make copyable, only where the text
+  // names it.
+  const alert = readinessAlertText(readiness, booking, trip)
+  return alert && booking && address ? { ...alert, address } : alert
+}
+
+function readinessAlertText(readiness, booking, trip) {
   if (readiness?.state === 'booked') {
     return booking
       ? {
@@ -1992,13 +2004,23 @@ function start() {
     })
     if (trip.items.length) tripDetail.append(renderOverview(trip))
 
-    const alert = readinessAlert(trip)
+    const alert = readinessAlert(trip, inboxAddress())
     if (alert) {
       const readiness = node('div', alert.tone === 'ready' ? 'trip-alert ready' : 'trip-alert')
-      readiness.append(
-        node('strong', '', alert.headline),
-        document.createTextNode(` ${alert.text}`),
-      )
+      readiness.append(node('strong', '', alert.headline))
+      if (alert.address) {
+        // The sentence with the address set as a thing to copy: the text
+        // before it, the address in a code, the text after, then Copy.
+        const [before, after] = alert.text.split(alert.address)
+        readiness.append(document.createTextNode(` ${before}`), node('code', '', alert.address), document.createTextNode(after ?? ''))
+        const copy = node('button', 'alert-copy', 'Copy')
+        copy.type = 'button'
+        copy.setAttribute('aria-label', `Copy ${alert.address}`)
+        copy.addEventListener('click', () => copyAddress(alert.address))
+        readiness.append(copy)
+      } else {
+        readiness.append(document.createTextNode(` ${alert.text}`))
+      }
       tripDetail.append(readiness)
     }
     for (const note of trip.notes ?? []) {
@@ -2662,6 +2684,30 @@ function start() {
   // middle of" is the input focused or holding something other than the
   // saved handle; Save and Cancel go through `renderHandle` with the
   // form's own state settled, so those still repaint.
+  // The account's booking address, or `null` before it has one.
+  function inboxAddress() {
+    return inbox?.handle ? `${inbox.handle}@${inbox.domain}` : null
+  }
+
+  function copyAddress(address) {
+    navigator.clipboard.writeText(address)
+      .then(() => showTripToast('Copied'))
+      .catch(() => showTripToast('Could not copy. Select the address and copy it by hand.'))
+  }
+
+  // Opens the address for editing and brings it on screen — the ⋯ menu
+  // Telegram draws over the Mini App is where "Settings" lives, and the
+  // address is the one setting this page has.
+  function editAddress() {
+    if (!inbox) return
+    handleEditing = true
+    renderHandle()
+    handleLineEl.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    handleLineEl.querySelector('input')?.focus()
+  }
+
+  let settingsButtonShown = false
+
   function renderHandle() {
     if (!handleLineEl) return
     const input = handleLineEl.querySelector('.handle-form input')
@@ -2669,21 +2715,23 @@ function start() {
     handleLineEl.replaceChildren()
     handleLineEl.hidden = !inbox
     if (!inbox) return
+    if (inTelegram && !settingsButtonShown) {
+      // Once there is an address to have: a deployment without the inbox
+      // has no setting for the menu to open.
+      settingsButtonShown = showSettingsButton()
+    }
     if (!inbox.handle || handleEditing) {
       handleLineEl.append(handleForm())
       return
     }
-    const address = `${inbox.handle}@${inbox.domain}`
-    handleLineEl.append(node('p', 'handle-label', 'Your booking address'))
+    const address = inboxAddress()
+    handleLineEl.append(node('p', 'handle-label', 'Booking address'))
     handleLineEl.append(node('p', 'handle-address', address))
     const row = node('div', 'handle-row')
     const copy = node('button', '', 'Copy')
     copy.type = 'button'
-    copy.addEventListener('click', () => {
-      navigator.clipboard.writeText(address)
-        .then(() => showTripToast('Copied'))
-        .catch(() => showTripToast('Could not copy. Select the address and copy it by hand.'))
-    })
+    copy.setAttribute('aria-label', `Copy ${address}`)
+    copy.addEventListener('click', () => copyAddress(address))
     const change = node('button', '', 'Change')
     change.type = 'button'
     change.addEventListener('click', () => {
@@ -2705,7 +2753,12 @@ function start() {
     form.className = 'handle-form'
     form.append(node('p', 'handle-label', inbox.handle
       ? 'Change your booking address'
-      : 'Forward bookings to an address of your own'))
+      : 'Get a booking address'))
+    if (!inbox.handle) {
+      // The first time: what it is for, in a sentence, because the form
+      // is the only place a newcomer learns the feature exists.
+      form.append(node('p', 'handle-why', 'Give it to a hotel at checkout or forward a confirmation to it, and the booking lands on the right trip.'))
+    }
     const row = node('div', 'handle-form-row')
     const input = document.createElement('input')
     input.type = 'text'
@@ -3911,6 +3964,9 @@ function start() {
   // named — "Open trip" under a reply — chosen before the list arrives.
   if (inTelegram) {
     settleIntoTelegram()
+    listenToTelegram((eventType) => {
+      if (eventType === 'settings_button_pressed') editAddress()
+    })
     try { clearExchanged(window.sessionStorage) } catch { /* no loop guard to clear */ }
     currentTrip = new URLSearchParams(location.search).get('trip') || null
     document.addEventListener('click', leaveTelegramByLink)

@@ -4,6 +4,7 @@ import {
   launchData, tripPageUrl, justExchanged, markExchanged, clearExchanged,
   telegramEvent, openOutside, LAUNCH_KEY, LOOP_WINDOW_MS,
 } from './telegram.js'
+import * as telegramExports from './telegram.js'
 
 function memory() {
   const map = new Map()
@@ -86,4 +87,26 @@ test('a link outside Telegram asks the client, or falls back to a tab', () => {
   tab.parent = tab
   openOutside('https://example.com', tab)
   assert.deepEqual(opened, [['https://example.com', '_blank', 'noopener,noreferrer']])
+})
+
+test('the settings button is asked for, and a press is heard from either bridge and no other origin', () => {
+  const { listenToTelegram, showSettingsButton } = telegramExports
+  const sent = []
+  const heard = []
+  const listeners = {}
+  const phone = {
+    TelegramWebviewProxy: { postEvent: (t, d) => sent.push([t, JSON.parse(d)]) },
+    addEventListener: (name, fn) => { listeners[name] = fn },
+  }
+  phone.parent = phone
+  assert.equal(showSettingsButton(phone), true)
+  assert.deepEqual(sent, [['web_app_setup_settings_button', { is_visible: true }]])
+  listenToTelegram((t, d) => heard.push([t, d]), phone)
+  // The native bridge.
+  phone.Telegram.WebView.receiveEvent('settings_button_pressed', {})
+  // Telegram Web, and an impostor that framed us.
+  listeners.message({ origin: 'https://web.telegram.org', data: JSON.stringify({ eventType: 'settings_button_pressed', eventData: {} }) })
+  listeners.message({ origin: 'https://evil.example', data: JSON.stringify({ eventType: 'settings_button_pressed', eventData: {} }) })
+  listeners.message({ origin: 'https://web.telegram.org', data: 'not json' })
+  assert.deepEqual(heard, [['settings_button_pressed', {}], ['settings_button_pressed', {}]])
 })

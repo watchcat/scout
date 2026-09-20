@@ -416,6 +416,12 @@
     color:#d1c27e; font-size:13px; line-height:1.45}
   .trip-alert.ready{border-color:#3f682f; background:rgba(133,153,0,.08); color:#b8c76a}
   .trip-alert strong{color:var(--base2); margin-right:.28em}
+  /* The address in the banner is a thing to copy, so it looks like one. */
+  .trip-alert code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; color:var(--base2);
+    overflow-wrap:anywhere}
+  .trip-alert .alert-copy{margin-left:6px; background:transparent; border:1px solid currentColor; border-radius:7px;
+    color:inherit; font:inherit; font-size:11.5px; font-weight:650; padding:2px 8px; cursor:pointer; vertical-align:1px}
+  .trip-alert .alert-copy:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   .segment-stack{display:flex; flex-direction:column; gap:12px}
   /* Dashed, like `.trip-empty`: this card is an invitation to add to the
      itinerary, not part of it yet. Sits after the stack rather than inside
@@ -661,11 +667,26 @@
   /* The address line closes the aside. The form is one row — input,
      domain, Save — and its hint is a sentence under it in the same place
      whether it is the mirrored rule, the live check, or the server's no. */
-  .handle-line{margin-top:18px; padding:12px 10px 0; border-top:1px solid var(--line)}
-  .handle-label{margin:0 0 6px; color:var(--base01); font-size:12px}
-  .handle-address{margin:0 0 8px; color:var(--base2); font-size:14px; font-weight:700; overflow-wrap:anywhere;
+  /* A strip, not a footnote: the address on one line with what you do
+     with it, in the panel colour so it reads as a fixture of the page and
+     not as another trip. Without an address it is a card instead — see
+     `.handle-form` — because getting one is the thing to notice. */
+  .handle-line{margin:0 10px 12px 0; padding:9px 12px; border-radius:12px; background:var(--panel)}
+  /* Label and buttons on the first line, the address under them: the
+     address is the widest thing here and the buttons are a thumb's size
+     on a phone, so side by side they wrapped into a tile three rows tall. */
+  .handle-line:not(:has(.handle-form)){display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:2px 10px}
+  .handle-label{grid-column:1; grid-row:1; margin:0; color:var(--base01); font-size:11px; font-weight:800;
+    letter-spacing:.1em; text-transform:uppercase}
+  .handle-row{grid-column:2; grid-row:1}
+  .handle-address{grid-column:1 / -1; grid-row:2; margin:0; color:var(--base2); font-size:14px; font-weight:700; overflow-wrap:anywhere;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
   .handle-row{display:flex; gap:6px}
+  /* Without an address the tile is the card: bordered, not tinted. */
+  .handle-line:has(.handle-form){padding:14px 16px 12px; border:1px solid var(--cyan); background:transparent}
+  .handle-form .handle-label{margin:0 0 2px; color:var(--base2); font-size:15px; font-weight:700;
+    letter-spacing:0; text-transform:none}
+  .handle-why{margin:0 0 10px; color:var(--base1); font-size:13px; line-height:1.45}
   .handle-form-row{display:flex; flex-wrap:wrap; align-items:center; gap:6px}
   .handle-form-row input{flex:1; min-width:90px; font:inherit; font-size:13px; padding:7px 9px;
     border:1px solid var(--line); border-radius:9px; background:var(--base03); color:var(--base2)}
@@ -708,7 +729,7 @@
     .trip-side{display:contents}
     .trip-side-head{order:1; flex:none; padding:0 2px 10px}
     .trip-side h1{font-size:17px}
-    .trip-list{order:2; flex:none; flex-direction:row; overflow-x:auto; padding:0 0 7px; scrollbar-width:thin}
+    .trip-list{order:3; flex:none; flex-direction:row; overflow-x:auto; padding:0 0 7px; scrollbar-width:thin}
     /* Narrow enough that the next trip shows an edge: a strip that ends
        flush with the screen looks like the whole list. */
     .trip-list li{flex:0 0 min(164px, 78%)}
@@ -717,9 +738,10 @@
        fit the screen it has and their content paints straight over
        whatever comes next: the mail section landed on top of the trip's
        timeline. They keep their own height and the container scrolls. */
-    .trip-detail{order:3; flex:none; min-height:0; overflow:visible; padding-right:0}
-    .other-mail{order:4; flex:none; margin-top:2px; padding:0}
-    .handle-line{order:5; flex:none; margin-top:2px; padding:10px 0 0}
+    .trip-detail{order:4; flex:none; min-height:0; overflow:visible; padding-right:0}
+    .other-mail{order:5; flex:none; margin-top:2px; padding:0}
+    /* Second, under the heading and above the trips: the first screen. */
+    .handle-line{order:2; flex:none; margin:0 0 10px}
     /* The head sat the title beside the date and Remove, and the actions
        are `flex:none`, so a phone gave "Hotel Alfama Patio" about 150px
        and it came out three words tall. The title keeps the first row
@@ -838,12 +860,15 @@
         <h1>Your trips</h1>
       </div>
     </div>
-    <ol id="trip-list" class="trip-list"></ol>
     <!-- Both filled by the client from /chat/inbox and left hidden when
          that route is not there: the tab without the inbox feature is
-         the tab as it was. -->
-    <section id="other-mail" class="other-mail" aria-labelledby="other-mail-title" hidden></section>
+         the tab as it was. The address comes before the trips because it
+         is the one thing on this page a newcomer has to find: it used to
+         close the column, and on a phone that put it under a timeline of
+         unknown length, where only people who knew it existed found it. -->
     <div id="handle-line" class="handle-line" hidden></div>
+    <ol id="trip-list" class="trip-list"></ol>
+    <section id="other-mail" class="other-mail" aria-labelledby="other-mail-title" hidden></section>
   </aside>
   <main id="trip-detail" class="trip-detail" aria-live="polite">
     <div class="trip-empty">

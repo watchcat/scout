@@ -1007,3 +1007,31 @@ test('the item menu offers Mark as held only on something still to book', () => 
   assert.deepEqual(itemMenuEntries({ kind: 'flight', origin: 'AMS', destination: 'HKG', booked: false }), ['hold', 'remove'])
   assert.deepEqual(itemMenuEntries({ kind: 'flight', origin: 'AMS', destination: 'HKG', booked: true }), ['remove'])
 })
+
+// The banner that says what is still to book is the moment to say where
+// the confirmation goes — and only then, and only when there is an
+// address to name.
+test('the to-book banner names the booking address, copyable, and only when there is something to book', () => {
+  const flights = (count) => Array.from({ length: count }, () => ({ kind: 'flight' }))
+  const partly = readinessAlert({ readiness: { state: 'booked' }, items: flights(1), to_book: ['Lunch with Stanley'] }, 'sasha@goodscout.fyi')
+  assert.match(partly.text, /Lunch with Stanley is not booked yet\. Forward each confirmation to sasha@goodscout\.fyi and it lands on this trip\./)
+  assert.equal(partly.address, 'sasha@goodscout.fyi')
+  const held = readinessAlert({ readiness: { state: 'booked' }, items: flights(1), to_book: [] }, 'sasha@goodscout.fyi')
+  assert.doesNotMatch(held.text, /goodscout/)
+  assert.equal(held.address, undefined)
+  const none = readinessAlert({ readiness: { state: 'booked' }, items: flights(1), to_book: ['Lunch'] }, null)
+  assert.doesNotMatch(none.text, /Forward/)
+  assert.equal(none.address, undefined)
+})
+
+// The address comes before the trips, in the markup and on a phone: it
+// closed the column once, under a timeline of unknown length.
+test('the booking address sits above the trips on the page and on a phone', () => {
+  const page = readFileSync(new URL('./chat.html', import.meta.url), 'utf8')
+  assert.ok(page.indexOf('id="handle-line"') < page.indexOf('id="trip-list"'), 'the address is drawn before the trip list')
+  const mobile = page.slice(page.indexOf('@media (max-width:720px)'))
+  const order = (selector) => Number(mobile.match(new RegExp(`\\${selector}\\{order:(\\d+)`))[1])
+  assert.ok(order('.trip-side-head') < order('.handle-line'), 'under the heading')
+  assert.ok(order('.handle-line') < order('.trip-list'), 'above the trips')
+  assert.ok(order('.trip-list') < order('.trip-detail') && order('.trip-detail') < order('.other-mail'))
+})

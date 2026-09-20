@@ -28,8 +28,8 @@ mod trip_pdf;
 pub use cache::{refresh_forever, AdmissionCache, REFRESH};
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap};
-use axum::response::{Html, IntoResponse};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use scout_core::core::Core;
@@ -166,7 +166,11 @@ impl AuthConfig {
 /// page needs a cached admission and nothing else, and giving it a `Core`
 /// it does not use would be an invitation to query the database from the
 /// one path that exists to avoid doing that.
-fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inbound::InboundState>) -> Router {
+/// Something the process knows about its own health that the server does
+/// not: a reason it is not, or `None`. Asked on every probe.
+pub type Unhealthy = std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inbound::InboundState>, unhealthy: Option<Unhealthy>) -> Router {
     let session_key = auth.as_ref().map(|a| a.cfg.session_key.clone());
     // Only when we know an https address to send people to. A deployment
     // configured with an http base URL is a local one, and redirecting it
@@ -182,13 +186,13 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
         // Liveness only. Deliberately says nothing about the database: a
         // health check that fails when DuckDB is busy would take the site
         // down for a reason the site does not have.
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/icon.svg", get(icon))
         .route("/assets/trips-desktop.webp", get(trips_desktop))
         .route("/assets/trips-mobile.webp", get(trips_mobile))
         .route("/robots.txt", get(robots))
         .route("/sitemap.xml", get(sitemap))
-        .with_state(Public { cache, session_key });
+        .with_state(Public { cache, session_key, unhealthy });
     // On the public side, not the signed-in one: Resend posts here with no
     // cookie, no `Origin` and no form token, so the CSRF layer would turn
     // it away and the security headers would be sent to nobody. It has
@@ -239,6 +243,18 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
     // out of date. Measured on an iPhone: Opera in a private window has no
     // HSTS memory, went to HTTP, and got exactly that.
     .layer(axum::middleware::from_fn_with_state(https_origin, canonical_address))
+}
+
+/// Liveness. Deliberately says nothing about the database — a check that
+/// failed while DuckDB was busy would restart a pod that was serving the
+/// page correctly — and everything the channel says about itself: a bot
+/// that has stopped taking Telegram's updates is a pod worth restarting,
+/// and this is the only way to ask for that.
+async fn healthz(State(public): State<Public>) -> Response {
+    match public.unhealthy.as_ref().and_then(|check| check()) {
+        None => "ok".into_response(),
+        Some(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason).into_response(),
+    }
 }
 
 /// Sends a request that arrived at the wrong address to the right one:
@@ -333,6 +349,7 @@ struct Public {
     /// `None` is a deployment with no auth keys: no sessions can exist and
     /// no sign-in route does either, so the page must link to neither.
     session_key: Option<Vec<u8>>,
+    unhealthy: Option<Unhealthy>,
 }
 
 async fn index(State(public): State<Public>, headers: HeaderMap) -> impl IntoResponse {
@@ -603,7 +620,12 @@ async fn trips_mobile() -> impl IntoResponse {
 /// `Origin` and no form token, carries its own proof in a header, and has
 /// no page for the security headers to protect. This crate does not look
 /// inside it — which is what keeps Telegram out of `scout-web`.
-pub async fn serve(core: Arc<Core>, bind: &str, extra: Router) -> anyhow::Result<()> {
+///
+/// `unhealthy` is the channel's own word on whether it is alive — the
+/// webhook intake knows when the dispatcher has stopped taking updates,
+/// and this server does not — asked on every `/healthz`. A 503 there is
+/// what makes Kubernetes restart the pod.
+pub async fn serve(core: Arc<Core>, bind: &str, extra: Router, unhealthy: Option<Unhealthy>) -> anyhow::Result<()> {
     let first = core.admission().await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "could not read admission at start-up; opening as full");
         scout_core::core::Admission::Full
@@ -641,7 +663,7 @@ pub async fn serve(core: Arc<Core>, bind: &str, extra: Router) -> anyhow::Result
     }
 
     tracing::info!(bind, "the front door is open");
-    axum::serve(listener, router(cache, auth, inbound).merge(extra))
+    axum::serve(listener, router(cache, auth, inbound, unhealthy).merge(extra))
         .with_graceful_shutdown(closing_time())
         .await?;
     Ok(())
@@ -859,7 +881,7 @@ mod tests {
         let mut state = crate::AuthState::new(auth, core.clone());
         state.mailer = mailer;
         let inbound = crate::inbound::state_from(&state);
-        let app = crate::router(cache, Some(state), inbound);
+        let app = crate::router(cache, Some(state), inbound, None);
         (app, core, dir)
     }
 
@@ -1009,7 +1031,7 @@ mod tests {
         assert_eq!(other.status(), StatusCode::OK);
 
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let local = router(cache, None, None);
+        let local = router(cache, None, None, None);
         let res = get_with_headers(
             &local,
             "/healthz",
@@ -1182,9 +1204,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthz_says_what_the_channel_says_about_itself() {
+        let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
+        let stuck: crate::Unhealthy = std::sync::Arc::new(|| Some("3 update(s) waiting and none taken for 130s".to_string()));
+        let app = router(cache.clone(), None, None, Some(stuck));
+        let res = app.oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_of(res).await, "3 update(s) waiting and none taken for 130s");
+        let fine: crate::Unhealthy = std::sync::Arc::new(|| None);
+        let app = router(cache, None, None, Some(fine));
+        let res = app.oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn the_root_serves_the_page_and_an_unknown_path_does_not() {
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let app = router(cache, None, None);
+        let app = router(cache, None, None, None);
 
         let res = app.clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1315,7 +1351,7 @@ mod tests {
         // And when sign-in is not configured at all, so the whole
         // signed-in half is absent along with its header layer.
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
-        let bare = crate::router(cache, None, None);
+        let bare = crate::router(cache, None, None, None);
         let res = bare
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1333,7 +1369,7 @@ mod tests {
         // Booting with a generated default would sign sessions that a
         // restart could not verify, and nobody would notice until someone
         // forged one.
-        let app = router(cache, None, None);
+        let app = router(cache, None, None, None);
         let res = app
             .oneshot(Request::builder().uri("/sign-in").body(Body::empty()).unwrap())
             .await.unwrap();

@@ -30,6 +30,11 @@ fn telegram_token() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN is not set"))
 }
 
+/// How often to ask Telegram what it thinks of the webhook. Ten minutes:
+/// a backlog worth a line is one that has lasted, and the call is a
+/// request to Telegram for every bot that asks.
+const WEBHOOK_WATCH: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// How long to let the front door finish what it is already serving.
 ///
 /// One run is bounded by `RUN_BUDGET` (300s), and the deployment allows 330
@@ -197,6 +202,7 @@ async fn main() -> Result<()> {
         Some(url) => {
             let (routes, listener) = webhook::intake(webhook::secret(&token));
             tokio::spawn(register_webhook(telegram.clone(), url));
+            tokio::spawn(webhook::watch(telegram.clone(), WEBHOOK_WATCH));
             (routes, Some(listener))
         }
         None => {
@@ -204,10 +210,19 @@ async fn main() -> Result<()> {
             (axum::Router::new(), None)
         }
     };
+    // The one thing `/healthz` can say beyond "the process is up": the
+    // intake's word on whether the dispatcher is still taking updates. A
+    // 503 there is what makes Kubernetes restart a bot that has gone
+    // quiet — 24 restarts in 20 minutes happened once with nothing to
+    // catch the opposite case, a bot that stopped and stayed up.
+    let unhealthy: Option<scout_web::Unhealthy> = listener.as_ref().map(|l| {
+        let health = l.health();
+        std::sync::Arc::new(move || health.stalled()) as scout_web::Unhealthy
+    });
     let web_core = core.clone();
     let bind = std::env::var("SCOUT_WEB_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let front_door = tokio::spawn(async move {
-        if let Err(e) = scout_web::serve(web_core, &bind, telegram_routes).await {
+        if let Err(e) = scout_web::serve(web_core, &bind, telegram_routes, unhealthy).await {
             tracing::error!(error = %e, "the front door did not open");
         }
     });

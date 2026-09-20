@@ -48,6 +48,9 @@ spec:
           # /healthz reports process liveness and deliberately says nothing
           # about the database: a check that failed while DuckDB was busy would
           # restart a pod that was still serving the page correctly from cache.
+          # It does say when the bot has stopped taking Telegram's updates —
+          # two minutes with one waiting — and three failed probes twenty
+          # seconds apart is then the restart nothing else would trigger.
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 5

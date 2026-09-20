@@ -11,7 +11,6 @@ _(nothing)_
 ## Next
 
 - [ ] **Show the stored mail text** — the Other-mail row's click shows the message text and attachments (stored, capped at 512 KB, not yet served)
-- [ ] **Poller liveness** — record the last successful `getUpdates`; fail `/healthz` when it is stale so k8s restarts a bot Telegram has gone quiet on (24 restarts in 20 minutes happened once with nothing to catch it)
 - [ ] **Retention for the rest** — `outbox` never deletes sent rows, `request_log` never prunes; two DELETEs in `run_maintenance` next to the thread expiry
 - [ ] **CI** — `.github/workflows`: `cargo test`, `cargo clippy -D warnings`, `cargo audit`, `node --test 'crates/scout-web/src/*.test.mjs'`, cached with `Swatinem/rust-cache`
 - [ ] **Timeout on `continues_previous`** — same shape as `TITLE_BUDGET` on `title_for`; this one runs on every Telegram message after a 10-minute gap and has no bound

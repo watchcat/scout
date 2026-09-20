@@ -18,6 +18,9 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use teloxide::stop::{mk_stop_token, StopFlag, StopToken};
 use teloxide::types::Update;
 use teloxide::update_listeners::{AsUpdateStream, UpdateListener};
@@ -46,18 +49,81 @@ pub fn secret(bot_token: &str) -> String {
     mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// How long an update may wait in the queue before the bot is declared
+/// stuck. Handlers run off the queue in their own tasks, so the queue is
+/// drained in milliseconds when the dispatcher is alive; an update still
+/// waiting after this is one nothing is going to take.
+pub const STALL: Duration = Duration::from_secs(120);
+
+/// What the intake knows about the dispatcher behind it, for `/healthz`.
+///
+/// The failure this catches is the one nothing caught before: a bot the
+/// updates reach and the dispatcher no longer takes — a wedged worker
+/// queue, a stream that ended without the process ending. Telegram keeps
+/// redelivering into a full queue, the page stays up, and from outside
+/// the bot has simply gone quiet. Telegram being unreachable is not this:
+/// then nothing arrives, the queue is empty, and a restart would change
+/// nothing, so a quiet bot is a healthy one.
+pub struct Health {
+    queued: AtomicUsize,
+    /// Since when something has been waiting: set when the queue goes
+    /// from empty to not, cleared when it empties. Measured from that and
+    /// not from the last take, or a bot quiet for an hour that then hears
+    /// one update would count the hour against it.
+    waiting_since: std::sync::Mutex<Option<tokio::time::Instant>>,
+    stall: Duration,
+}
+
+impl Health {
+    fn new(stall: Duration) -> Self {
+        Self { queued: AtomicUsize::new(0), waiting_since: std::sync::Mutex::new(None), stall }
+    }
+
+    fn accepted(&self) {
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        let mut since = self.waiting_since.lock().unwrap_or_else(|e| e.into_inner());
+        if since.is_none() {
+            *since = Some(tokio::time::Instant::now());
+        }
+    }
+
+    fn taken(&self) {
+        let left = self.queued.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        let mut since = self.waiting_since.lock().unwrap_or_else(|e| e.into_inner());
+        // The rest have waited at most since now, as far as this knows;
+        // a stall is then declared `stall` after the last take, which is
+        // the conservative side to be wrong on.
+        *since = (left > 0).then(tokio::time::Instant::now);
+    }
+
+    /// Why the bot is stuck, or `None`.
+    pub fn stalled(&self) -> Option<String> {
+        let since = (*self.waiting_since.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let waited = since.elapsed();
+        (waited >= self.stall).then(|| {
+            format!("{} update(s) waiting and none taken for {}s", self.queued.load(Ordering::Relaxed), waited.as_secs())
+        })
+    }
+}
+
 #[derive(Clone)]
 struct Intake {
     secret: String,
     queue: mpsc::Sender<Update>,
+    health: Arc<Health>,
 }
 
 /// The route to mount and the listener to hand the dispatcher.
 pub fn intake(secret: String) -> (Router, Listener) {
+    intake_with(secret, STALL)
+}
+
+fn intake_with(secret: String, stall: Duration) -> (Router, Listener) {
     let (queue, rx) = mpsc::channel(QUEUE);
     let (token, flag) = mk_stop_token();
-    let router = Router::new().route(PATH, post(receive)).with_state(Intake { secret, queue });
-    (router, Listener { rx, token, flag, closing: false })
+    let health = Arc::new(Health::new(stall));
+    let router = Router::new().route(PATH, post(receive)).with_state(Intake { secret, queue, health: health.clone() });
+    (router, Listener { rx, token, flag, closing: false, health })
 }
 
 async fn receive(State(intake): State<Intake>, headers: HeaderMap, body: Bytes) -> StatusCode {
@@ -89,7 +155,10 @@ async fn receive(State(intake): State<Intake>, headers: HeaderMap, body: Bytes) 
     };
     tracing::info!(update_id = update.id.0, kind, "update in");
     match intake.queue.try_send(update) {
-        Ok(()) => StatusCode::OK,
+        Ok(()) => {
+            intake.health.accepted();
+            StatusCode::OK
+        }
         // Full, or closed because the dispatcher is shutting down. Either
         // way the update is not ours yet, and saying so is what makes
         // Telegram keep it.
@@ -106,6 +175,14 @@ pub struct Listener {
     token: StopToken,
     flag: StopFlag,
     closing: bool,
+    health: Arc<Health>,
+}
+
+impl Listener {
+    /// For `/healthz`: shared with the intake, read by the probe.
+    pub fn health(&self) -> Arc<Health> {
+        self.health.clone()
+    }
 }
 
 impl<'a> AsUpdateStream<'a> for Listener {
@@ -125,10 +202,17 @@ impl<'a> AsUpdateStream<'a> for Listener {
                         this.closing = true;
                         this.rx.close();
                     }
-                    update = this.rx.recv() => return update.map(|u| (Ok(u), this)),
+                    update = this.rx.recv() => {
+                        if update.is_some() { this.health.taken() }
+                        return update.map(|u| (Ok(u), this))
+                    }
                 }
             }
-            this.rx.recv().await.map(|u| (Ok(u), this))
+            let update = this.rx.recv().await;
+            if update.is_some() {
+                this.health.taken();
+            }
+            update.map(|u| (Ok(u), this))
         })
         .boxed()
     }
@@ -139,6 +223,33 @@ impl UpdateListener for Listener {
 
     fn stop_token(&mut self) -> StopToken {
         self.token.clone()
+    }
+}
+
+/// What Telegram thinks of the webhook, every so often: a backlog on its
+/// side, or an error it met delivering, is the other half of "the bot
+/// has gone quiet", and it is only visible from there. Logged, not acted
+/// on — a restart here fixes nothing on Telegram's side — so the line is
+/// there when somebody asks why.
+pub async fn watch(bot: teloxide::Bot, every: Duration) {
+    use teloxide::prelude::Requester;
+    let mut tick = tokio::time::interval(every);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        match bot.get_webhook_info().await {
+            Ok(info) => {
+                let stale_error = info.last_error_date.is_some_and(|at| (chrono::Utc::now() - at).num_seconds() < every.as_secs() as i64);
+                if info.pending_update_count > 0 || stale_error {
+                    tracing::warn!(
+                        pending = info.pending_update_count,
+                        last_error = info.last_error_message.as_deref().unwrap_or("none"),
+                        "Telegram is holding updates for this bot"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not read the webhook's state from Telegram"),
+        }
     }
 }
 
@@ -258,5 +369,22 @@ mod tests {
             done.await;
         }
         run.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_nobody_takes_from_is_a_stall_and_a_quiet_bot_is_not() {
+        let (router, mut listener) = intake_with("right".to_string(), Duration::from_secs(120));
+        let health = listener.health();
+        // Nothing arriving is fine, however long ago the last one was.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert_eq!(health.stalled(), None);
+        // An update accepted and not yet taken is fine for a while.
+        assert_eq!(post(&router, Some("right"), UPDATE).await, StatusCode::OK);
+        assert_eq!(health.stalled(), None);
+        tokio::time::advance(Duration::from_secs(121)).await;
+        assert!(health.stalled().unwrap().starts_with("1 update(s) waiting"), "{:?}", health.stalled());
+        // Taken: alive again.
+        listener.as_stream().next().await.unwrap().unwrap();
+        assert_eq!(health.stalled(), None);
     }
 }

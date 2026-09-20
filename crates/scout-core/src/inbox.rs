@@ -344,9 +344,74 @@ pub async fn extract(core: &Core, text: &str) -> anyhow::Result<Vec<Extraction>>
     use rig::client::CompletionClient;
     use rig::completion::Prompt;
     let agent = core.deps.llm.agent(crate::agent::MODEL).preamble(EXTRACT_PREAMBLE).build();
-    let prompt = format!("Forwarded email follows.\n\n---\n{text}\n---\n\nThe JSON object:");
+    // Today, and what a yearless date means: a boarding pass says "21 SEP"
+    // and nothing more, and read without this it became a flight a year
+    // in the past, on its own leg beside the one it was a pass for.
+    let today = chrono::Utc::now().date_naive();
+    let prompt = format!(
+        "Today is {today}. A date stated without a year is its next occurrence from today, never a past one.\n\n\
+         Forwarded email follows.\n\n---\n{text}\n---\n\nThe JSON object:"
+    );
     let answer = tokio::time::timeout(EXTRACT_BUDGET, agent.prompt(prompt)).await??;
     Extraction::parse_many(&answer)
+}
+
+/// How far in the past a booking may be dated and still be what it says:
+/// a confirmation forwarded a couple of weeks after the stay is one that
+/// happened, not one misread.
+const PAST_GRACE_DAYS: i64 = 14;
+
+/// A booking dated further back than that, whose date one year on falls
+/// within the coming year, is read as that: a boarding pass says "21 SEP"
+/// and the model has to pick a year, and the wrong pick is the past. Every
+/// date on the reading moves together. `true` when it moved.
+///
+/// One year exactly, and only into the coming year: a stay from two
+/// summers ago forwarded for the records stays where it was.
+pub(crate) fn forward_dated(e: &mut Extraction, today: chrono::NaiveDate) -> bool {
+    use chrono::{Datelike, NaiveDate};
+    let Some(date) = e.date.as_deref().and_then(|d| NaiveDate::parse_from_str(d.get(..10).unwrap_or(d), "%Y-%m-%d").ok()) else {
+        return false;
+    };
+    if date >= today - chrono::Duration::days(PAST_GRACE_DAYS) {
+        return false;
+    }
+    let plus_year = |d: NaiveDate| d.with_year(d.year() + 1).unwrap_or(d + chrono::Duration::days(365));
+    let moved = plus_year(date);
+    if moved < today - chrono::Duration::days(PAST_GRACE_DAYS) || moved > today + chrono::Duration::days(366) {
+        return false;
+    }
+    let shift = |s: &mut Option<String>| {
+        if let Some(text) = s.as_mut() {
+            if let Ok(d) = NaiveDate::parse_from_str(text.get(..10).unwrap_or(text), "%Y-%m-%d") {
+                let rest = text.get(10..).unwrap_or("").to_string();
+                *text = format!("{}{rest}", plus_year(d));
+            }
+        }
+    };
+    shift(&mut e.date);
+    shift(&mut e.starts_at);
+    shift(&mut e.ends_at);
+    true
+}
+
+/// The item on the trip this booking is a second confirmation of, if
+/// there is one: the same flight on the same day, or anything carrying
+/// the same confirmation code on the same day. A boarding pass forwarded
+/// after the ticket is the common case, and it belongs on the leg the
+/// ticket made, with its file — not on a leg of its own beside it.
+fn same_booking<'a>(trip: &'a Trip, arrival: &scout_api::Arrival, date: &str) -> Option<&'a crate::store::TripItem> {
+    let flight = arrival.kind.as_deref() == Some("flight");
+    let code = arrival.confirmation_code.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    trip.items.iter().find(|i| {
+        if i.date != date {
+            return false;
+        }
+        if flight && i.is_flight() {
+            return i.origin.as_deref() == arrival.origin.as_deref() && i.destination.as_deref() == arrival.destination.as_deref();
+        }
+        !flight && !i.is_flight() && code.is_some() && i.confirmation_code.as_deref().map(str::trim) == code
+    })
 }
 
 /// Where a booking landed: a trip that already existed, or a draft made
@@ -864,7 +929,17 @@ pub async fn record_arrivals(
     readings: Vec<Extraction>,
 ) -> anyhow::Result<(Vec<i64>, Option<Placement>)> {
     let store = core.store();
+    let today = chrono::Utc::now().date_naive();
     blocking(move || {
+        let readings: Vec<Extraction> = readings
+            .into_iter()
+            .map(|mut e| {
+                if forward_dated(&mut e, today) {
+                    tracing::info!(mail_id, "a booking dated in the past was read as its next occurrence");
+                }
+                e
+            })
+            .collect();
         // One confirmation is one journey: the mail is placed once and all
         // of its bookings go there. Placing each on its own would put the
         // legs of a round trip on two drafts — a draft holds no items until
@@ -1065,14 +1140,15 @@ pub async fn add_arrival(
         for file in store.attachments_of_mail(arrival.mail_id)? {
             store.attach_to_item(file.id, item_id)?;
         }
-        let trip = if trip.kept {
-            trip
-        } else {
+        if !trip.kept {
             store.keep_trip(account_id, &trip.name)?;
-            store
-                .trip_by_id(account_id, trip.id)?
-                .ok_or_else(|| anyhow::anyhow!("the trip just kept is gone"))?
-        };
+        }
+        // Read again after the files moved: the page repaints from what
+        // this returns, and a ticket that only shows up on reload is a
+        // ticket the reader thinks was lost.
+        let trip = store
+            .trip_by_id(account_id, trip.id)?
+            .ok_or_else(|| anyhow::anyhow!("the trip just written is gone"))?;
         collect_drafts(&store, account_id);
         let chat = store.trip_chat(trip.id)?;
         Ok(Outcome::Done(Box::new(Plan::from_trip(trip, chat))))
@@ -1108,6 +1184,35 @@ fn build_item(
     date: &str,
 ) -> anyhow::Result<(Trip, i64)> {
     let arrival_id = arrival.id;
+    if let Some(existing) = same_booking(&trip, arrival, date) {
+        // Onto the item that is already this booking. What the new mail
+        // says fills in what the old one left blank and never blanks what
+        // it said; the arrival is recorded on the item so the file follows.
+        let had_option = existing.candidates.iter().any(|c| c.chosen);
+        let (existing_id, is_flight) = (existing.id, existing.is_flight());
+        store.book_item(
+            existing_id,
+            arrival.confirmation_code.as_deref().or(existing.confirmation_code.as_deref()),
+            arrival.price.or(existing.price),
+            arrival.currency.as_deref().or(existing.currency.as_deref()),
+            Some(arrival_id),
+        )?;
+        let trip = store
+            .trip_by_id(account_id, trip.id)?
+            .ok_or_else(|| anyhow::anyhow!("the trip just written is gone"))?;
+        let trip = match (is_flight, had_option, arrival.origin.as_deref(), arrival.destination.as_deref()) {
+            (true, false, Some(origin), Some(destination)) => match flight_candidate(store, &trip, arrival, origin, destination) {
+                Ok(Some(with_option)) => with_option,
+                Ok(None) => trip,
+                Err(e) => {
+                    tracing::warn!(error = %e, arrival_id, "the leg is booked but its flight could not be saved");
+                    trip
+                }
+            },
+            _ => trip,
+        };
+        return Ok((trip, existing_id));
+    }
     let trip = if arrival.kind.as_deref() == Some("flight") {
         let (Some(origin), Some(destination)) = (arrival.origin.as_deref(), arrival.destination.as_deref()) else {
             anyhow::bail!("arrival {arrival_id} is a flight with no route");
@@ -2675,5 +2780,96 @@ mod tests {
         assert!(pending_of_mail(&core, account_id + 1, mail_id).await.unwrap().is_empty(), "not another account's");
         ignore_arrival(&core, account_id, arrival_id).await.unwrap();
         assert!(pending_of_mail(&core, account_id, mail_id).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_booking_read_into_the_past_moves_to_its_next_occurrence_and_a_late_forward_does_not() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 19).unwrap();
+        // The boarding pass: "21 SEP", read as last year.
+        let mut e = Extraction {
+            starts_at: Some("2025-09-21T21:25:00".into()),
+            ends_at: Some("2025-09-22T15:25:00".into()),
+            ..arrival("flight", "AMS → HKG", Some("Hong Kong"), "2025-09-21")
+        };
+        assert!(forward_dated(&mut e, today));
+        assert_eq!(e.date.as_deref(), Some("2026-09-21"));
+        assert_eq!(e.starts_at.as_deref(), Some("2026-09-21T21:25:00"));
+        assert_eq!(e.ends_at.as_deref(), Some("2026-09-22T15:25:00"));
+        // A stay forwarded a week after check-out is one that happened.
+        let mut late = arrival("stay", "Hotel", None, "2026-09-10");
+        assert!(!forward_dated(&mut late, today));
+        assert_eq!(late.date.as_deref(), Some("2026-09-10"));
+        // Two summers ago is a record, not a plan.
+        let mut old = arrival("stay", "Hotel", None, "2024-07-01");
+        assert!(!forward_dated(&mut old, today));
+        // And a date already ahead is left alone.
+        let mut ahead = arrival("activity", "Lunch", None, "2026-10-01");
+        assert!(!forward_dated(&mut ahead, today));
+        assert!(!forward_dated(&mut Extraction::default(), today));
+    }
+
+    #[tokio::test]
+    async fn a_boarding_pass_for_a_leg_already_on_the_trip_joins_that_leg() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let a = store.account_for_telegram(1).unwrap();
+        // The ticket first, as a mail of its own, with the flight on it.
+        let ticket_mail = record_mail(&core, a, mail_in("re_ticket")).await.unwrap().unwrap();
+        let ticket = Extraction {
+            origin: Some("AMS".into()),
+            destination: Some("HKG".into()),
+            airline: Some("KLM".into()),
+            flight_number: Some("KL887".into()),
+            starts_at: Some("2026-09-21T21:25:00".into()),
+            ends_at: Some("2026-09-22T15:25:00".into()),
+            confirmation_code: Some("ZKVNPX".into()),
+            price: Some(612.0),
+            currency: Some("EUR".into()),
+            ..arrival("flight", "AMS → HKG", Some("Hong Kong"), "2026-09-21")
+        };
+        let (ids, _) = record_arrivals(&core, a, ticket_mail, vec![ticket]).await.unwrap();
+        let plan = match add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap() {
+            Outcome::Done(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(plan.trip.items.len(), 1);
+
+        // Then the boarding pass: same flight, same day, no price, a file.
+        let pass_mail = record_mail(&core, a, mail_in("re_pass")).await.unwrap().unwrap();
+        store_attachment(&core, pass_mail, "boarding-pass.pdf", "application/pdf", Some(b"%PDF".to_vec()), Some("KL887 21SEP".into())).await.unwrap();
+        let pass = Extraction {
+            origin: Some("AMS".into()),
+            destination: Some("HKG".into()),
+            airline: Some("KLM Royal Dutch Airlines".into()),
+            flight_number: Some("KL0887".into()),
+            confirmation_code: Some("ZKVNPX".into()),
+            ..arrival("flight", "AMS → HKG", Some("Hong Kong"), "2026-09-21")
+        };
+        let (ids, placement) = record_arrivals(&core, a, pass_mail, vec![pass]).await.unwrap();
+        assert!(matches!(placement, Some(Placement::Trip(_))), "placed on the trip the ticket made");
+        let plan = match add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap() {
+            Outcome::Done(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(plan.trip.items.len(), 1, "one leg, not a second beside it");
+        let leg = &plan.trip.items[0];
+        assert!(leg.booked);
+        assert_eq!(leg.confirmation_code.as_deref(), Some("ZKVNPX"));
+        assert_eq!(leg.price, Some(612.0), "the ticket's price is not blanked by a pass that states none");
+        assert_eq!(leg.candidates.len(), 1, "the flight the ticket named is still the one option");
+        assert_eq!(leg.attachments.iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(), vec!["boarding-pass.pdf"]);
+
+        // Something that is not a flight, sent twice with its code, joins itself too.
+        let sim_mail = record_mail(&core, a, mail_in("re_sim")).await.unwrap().unwrap();
+        let sim = Extraction { confirmation_code: Some("QUK437123".into()), ..arrival("activity", "5G eSIM", Some("Hong Kong"), "2026-09-21") };
+        let (ids, _) = record_arrivals(&core, a, sim_mail, vec![sim.clone()]).await.unwrap();
+        add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap();
+        let sim_again = record_mail(&core, a, mail_in("re_sim2")).await.unwrap().unwrap();
+        let (ids, _) = record_arrivals(&core, a, sim_again, vec![sim]).await.unwrap();
+        let plan = match add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap() {
+            Outcome::Done(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(plan.trip.items.iter().filter(|i| i.title == "5G eSIM").count(), 1);
     }
 }

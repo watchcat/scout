@@ -217,7 +217,7 @@ pub(crate) fn csrf_header_ok(auth: &AuthState, headers: &HeaderMap, account_id: 
 /// there is no Telegram identity there is nowhere at all — in which case
 /// `build_agent` does not offer the reminder tool, and the model cannot
 /// accept a promise the system would silently break.
-async fn reply_to_for(auth: &AuthState, account_id: i64) -> Option<scout_api::ReplyTo> {
+pub(crate) async fn reply_to_for(auth: &AuthState, account_id: i64) -> Option<scout_api::ReplyTo> {
     match identity::delivery_address(&auth.core, account_id, "telegram").await {
         Ok(address) => address.map(|address| scout_api::ReplyTo {
             channel: "telegram".to_string(),
@@ -865,7 +865,7 @@ async fn queue_thread(auth: &AuthState, account_id: i64) {
 /// current thread", which is the right question for a backfill and the
 /// wrong one afterwards: the run started on a particular conversation and
 /// took minutes, and the current one may since have become another.
-async fn queue_conversation(auth: &AuthState, account_id: i64, conversation_id: i64) {
+pub(crate) async fn queue_conversation(auth: &AuthState, account_id: i64, conversation_id: i64) {
     if !matches!(scout_core::mirror::is_enabled(&auth.core, account_id).await, Ok(true)) {
         return;
     }

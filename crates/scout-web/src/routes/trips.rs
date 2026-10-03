@@ -28,6 +28,8 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/trips/segment", post(add_leg).delete(remove_leg))
         .route("/chat/trips/item-note", post(note_item))
         .route("/chat/trips/item-held", post(hold_item))
+        .route("/chat/trips/item-move", post(move_item))
+        .route("/chat/trips/item-warning", post(dismiss_warning))
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             super::only_from_our_own_pages,
@@ -373,6 +375,175 @@ async fn hold_item(
         Ok(out) => leg_response(out),
         Err(e) => {
             tracing::error!(error = %e, account_id, "could not mark a trip item held");
+            sorry()
+        }
+    }
+}
+
+/// What the page sends to move an item to another day. Named and guarded
+/// as `NoteItemIn` is. `confirm` is the answer to "it is held; move it
+/// anyway?", and defaults to no.
+#[derive(serde::Deserialize)]
+struct MoveItemIn {
+    trip: String,
+    position: i64,
+    title: Option<String>,
+    date: Option<String>,
+    to: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// The trip as it is now, with what happened to the move.
+async fn move_answer(auth: &AuthState, account_id: i64, trip: &str, moved: bool, checked: bool) -> Response {
+    match scout_core::trips::find(&auth.core, account_id, trip).await {
+        Ok(Some(plan)) => axum::Json(serde_json::json!({ "trip": plan, "moved": moved, "checked": checked })).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not read a trip after a move");
+            sorry()
+        }
+    }
+}
+
+/// Moves an item, then has Scout check the move.
+///
+/// The move does not wait for the check and does not depend on it: a plan
+/// moves at once, and a held item moves once the request confirms it. The
+/// check is a request like any other — logged, counted toward the day —
+/// and when the account has none left the item moves unchecked and the
+/// answer says so.
+async fn move_item(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<MoveItemIn>,
+) -> Response {
+    use scout_core::trips::MoveEdit;
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let expected = scout_core::trips::ItemExpectation {
+        origin: None,
+        destination: None,
+        title: body.title,
+        date: body.date,
+    };
+    let moved = match scout_core::trips::move_item(&auth.core, account_id, &body.trip, body.position, expected, &body.to, body.confirm).await {
+        Ok(MoveEdit::Moved(moved)) => *moved,
+        Ok(MoveEdit::Same) => return move_answer(&auth, account_id, &body.trip, false, false).await,
+        Ok(MoveEdit::NeedsConfirm) => return axum::Json(serde_json::json!({ "needs_confirm": true })).into_response(),
+        Ok(MoveEdit::TripNotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(MoveEdit::SegmentChanged) => return StatusCode::CONFLICT.into_response(),
+        Ok(MoveEdit::Invalid(message)) => return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not move a trip item");
+            return sorry();
+        }
+    };
+    let checked = scout_core::session::over_daily_cap(&auth.core, account_id).await.is_none()
+        && auth.by_account.allow(&format!("check:{account_id}"));
+    if checked {
+        if let Err(e) = auth.core.log_request(account_id, "move_check").await {
+            tracing::warn!(error = %e, account_id, "request logging failed");
+        }
+        // Before the answer is read, so the trip it carries already says
+        // the item is being checked.
+        if let Err(e) = scout_core::move_check::begin(&auth.core, moved.item_id).await {
+            tracing::warn!(error = %e, account_id, "could not mark an item as being checked");
+        }
+        tokio::spawn(run_check(auth.clone(), moved.clone()));
+    }
+    move_answer(&auth, account_id, &moved.trip, true, checked).await
+}
+
+/// The thread a check runs in: the trip's own when the web may post into
+/// it, else a new one — `composerTarget`'s rule on the page, for the same
+/// reason. A Telegram group's thread is other people's room.
+async fn check_thread(auth: &AuthState, account_id: i64, trip: &str) -> anyhow::Result<i64> {
+    let plan = scout_core::trips::find(&auth.core, account_id, trip)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the trip is gone"))?;
+    match plan.chat.as_ref().filter(|chat| chat.scope == "direct") {
+        Some(chat) => Ok(chat.id),
+        None => scout_core::session::reset(&auth.core, account_id, "direct").await,
+    }
+}
+
+/// The check, as a background task: a run of the main agent in the trip's
+/// thread, mirrored to the phone when the thread is.
+async fn run_check(auth: AuthState, moved: scout_core::move_check::Move) {
+    let account_id = moved.account_id;
+    let thread = match check_thread(&auth, account_id, &moved.trip).await {
+        Ok(thread) => thread,
+        Err(e) => {
+            tracing::warn!(error = %e, account_id, "no thread to check a move in");
+            scout_core::move_check::abandon(&auth.core, &moved).await;
+            return;
+        }
+    };
+    let reply_to = crate::routes::chat::reply_to_for(&auth, account_id).await;
+    let verdict = scout_core::move_check::check(&auth.core, &moved, |prompt: String| {
+        let (auth, reply_to) = (auth.clone(), reply_to.clone());
+        async move {
+            let run = scout_api::RunContext {
+                account_id,
+                conversation_id: thread,
+                reply_to,
+                // The line the thread shows, which is also what names a
+                // thread started for this.
+                title_source: prompt.lines().next().map(str::to_string),
+            };
+            // Nobody is watching this run draw; the events are read so the
+            // channel has a reader and dropped.
+            let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+            let drain = tokio::spawn(async move { while seen.recv().await.is_some() {} });
+            let outcome = scout_core::run::run_agent(&auth.core, events, &run, &prompt).await;
+            let _ = drain.await;
+            if matches!(&outcome, Ok(scout_core::run::RunOutcome::Answered(_))) {
+                crate::routes::chat::queue_conversation(&auth, account_id, thread).await;
+            }
+            outcome
+        }
+    })
+    .await;
+    tracing::info!(account_id, item_id = moved.item_id, verdict = ?verdict, "a move was checked");
+}
+
+/// What the page sends to dismiss an item's warning.
+#[derive(serde::Deserialize)]
+struct WarningIn {
+    trip: String,
+    position: i64,
+    title: Option<String>,
+    date: Option<String>,
+}
+
+async fn dismiss_warning(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<WarningIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let expected = scout_core::trips::ItemExpectation {
+        origin: None,
+        destination: None,
+        title: body.title,
+        date: body.date,
+    };
+    match scout_core::trips::dismiss_warning(&auth.core, account_id, &body.trip, body.position, expected).await {
+        Ok(out) => leg_response(out),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not dismiss a warning");
             sorry()
         }
     }
@@ -1397,5 +1568,95 @@ mod tests {
             .find(|p| p.trip.name == "October")
             .unwrap();
         assert!(trip.trip.items.is_empty());
+    }
+    async fn with_lunch() -> (axum::Router, std::sync::Arc<scout_core::core::Core>, tempfile::TempDir, i64, String, String) {
+        let (app, core, dir, account_id, cookie, csrf) = setup().await;
+        scout_core::trips::seed_item_for_tests(&core, account_id, "October", "activity", "Lunch with Stanley", "2026-10-12")
+            .await
+            .unwrap();
+        (app, core, dir, account_id, cookie, csrf)
+    }
+
+    async fn json_of(res: Response) -> serde_json::Value {
+        serde_json::from_str(&body_of(res).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_plan_moves_at_once_and_is_marked_as_being_checked() {
+        let (app, _core, _dir, _account, cookie, csrf) = with_lunch().await;
+        let body = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","to":"2026-10-14"}"#;
+        let res = post_json(&app, "/chat/trips/item-move", &cookie, Some(&csrf), body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let answer = json_of(res).await;
+        assert_eq!((answer["moved"].as_bool(), answer["checked"].as_bool()), (Some(true), Some(true)));
+        let lunch = answer["trip"]["items"].as_array().unwrap().iter().find(|i| i["title"] == "Lunch with Stanley").unwrap();
+        assert_eq!(lunch["date"], "2026-10-14");
+        assert_eq!(lunch["checking"], true, "the card says so from this response, not five seconds later");
+
+        // The same request again names a day the item is no longer on.
+        let res = post_json(&app, "/chat/trips/item-move", &cookie, Some(&csrf), body).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn a_held_item_is_not_moved_until_the_request_says_so() {
+        let (app, _core, _dir, _account, cookie, csrf) = with_lunch().await;
+        let held = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","held":true}"#;
+        assert_eq!(post_json(&app, "/chat/trips/item-held", &cookie, Some(&csrf), held).await.status(), StatusCode::OK);
+
+        let ask = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","to":"2026-10-14"}"#;
+        let res = post_json(&app, "/chat/trips/item-move", &cookie, Some(&csrf), ask).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(json_of(res).await, serde_json::json!({ "needs_confirm": true }));
+        let trips = json_of(get_with_cookie(&app, "/chat/trips", &cookie).await).await;
+        assert_eq!(trips[0]["items"][1]["date"], "2026-10-12", "asking is not moving");
+
+        let sure = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","to":"2026-10-14","confirm":true}"#;
+        let answer = json_of(post_json(&app, "/chat/trips/item-move", &cookie, Some(&csrf), sure).await).await;
+        assert_eq!(answer["moved"], true);
+    }
+
+    #[tokio::test]
+    async fn what_cannot_be_moved_is_refused_and_a_move_to_the_same_day_is_nothing() {
+        let (app, _core, _dir, _account, cookie, csrf) = with_lunch().await;
+        let to = "/chat/trips/item-move";
+        let flight = r#"{"trip":"October","position":1,"title":"AMS → LIS","date":"2026-10-12","to":"2026-10-13"}"#;
+        assert_eq!(post_json(&app, to, &cookie, Some(&csrf), flight).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bad_date = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","to":"tomorrow"}"#;
+        assert_eq!(post_json(&app, to, &cookie, Some(&csrf), bad_date).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let same = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","to":"2026-10-12"}"#;
+        let answer = json_of(post_json(&app, to, &cookie, Some(&csrf), same).await).await;
+        assert_eq!((answer["moved"].as_bool(), answer["checked"].as_bool()), (Some(false), Some(false)));
+        let lost = r#"{"trip":"Nowhere","position":2,"title":"Lunch with Stanley","date":"2026-10-12","to":"2026-10-13"}"#;
+        assert_eq!(post_json(&app, to, &cookie, Some(&csrf), lost).await.status(), StatusCode::NOT_FOUND);
+        let good = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","to":"2026-10-13"}"#;
+        assert_eq!(post_json(&app, to, &cookie, None, good).await.status(), StatusCode::BAD_REQUEST, "no form token, no move");
+    }
+
+    #[tokio::test]
+    async fn over_the_daily_cap_the_item_moves_and_nothing_is_checked() {
+        let (app, core, _dir, account_id, cookie, csrf) = with_lunch().await;
+        for _ in 0..20 {
+            core.log_request(account_id, "text").await.unwrap();
+        }
+        let body = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12","to":"2026-10-14"}"#;
+        let answer = json_of(post_json(&app, "/chat/trips/item-move", &cookie, Some(&csrf), body).await).await;
+        assert_eq!((answer["moved"].as_bool(), answer["checked"].as_bool()), (Some(true), Some(false)));
+        let lunch = answer["trip"]["items"].as_array().unwrap().iter().find(|i| i["title"] == "Lunch with Stanley").unwrap();
+        assert_eq!(lunch["checking"], false);
+    }
+
+    #[tokio::test]
+    async fn a_warning_is_dismissed_from_the_page_and_a_stale_card_is_a_conflict() {
+        let (app, core, _dir, account_id, cookie, csrf) = with_lunch().await;
+        scout_core::trips::seed_warning_for_tests(&core, account_id, "October", "Lunch with Stanley", "closed that day").await.unwrap();
+        let trips = json_of(get_with_cookie(&app, "/chat/trips", &cookie).await).await;
+        assert_eq!(trips[0]["items"][1]["warning"], "closed that day");
+
+        let stale = r#"{"trip":"October","position":2,"title":"Dinner","date":"2026-10-12"}"#;
+        assert_eq!(post_json(&app, "/chat/trips/item-warning", &cookie, Some(&csrf), stale).await.status(), StatusCode::CONFLICT);
+        let mine = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12"}"#;
+        let plan = json_of(post_json(&app, "/chat/trips/item-warning", &cookie, Some(&csrf), mine).await).await;
+        assert_eq!(plan["items"][1]["warning"], serde_json::Value::Null);
     }
 }

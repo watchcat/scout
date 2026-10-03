@@ -9,6 +9,7 @@ import {
   tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark, itemState, tripDayRows,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   noteParts, noteBody, holdBody, itemMenuEntries,
+  localToday, todayInTrip, todayPositions, composeLabel,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   ITINERARY_NOTE,
@@ -1034,4 +1035,83 @@ test('the booking address sits above the trips on the page and on a phone', () =
   assert.ok(order('.trip-side-head') < order('.handle-line'), 'under the heading')
   assert.ok(order('.handle-line') < order('.trip-list'), 'above the trips')
   assert.ok(order('.trip-list') < order('.trip-detail') && order('.trip-detail') < order('.other-mail'))
+})
+
+// Today is a position in the trip, and it gets a row even where the trip
+// has nothing on it: "where am I in this" is the question on a trip day.
+const todayTrip = {
+  items: [
+    { position: 1, kind: 'activity', title: 'eSIM', date: '2026-09-12', booked: true },
+    { position: 2, kind: 'activity', title: 'Lunch', date: '2026-09-24', starts_at: '2026-09-24T14:30:00', booked: false },
+    { position: 3, kind: 'activity', title: 'Tour', date: '2026-09-26', booked: false },
+  ],
+}
+const todayShape = (rows) => rows.map((row) => row.kind === 'free'
+  ? `free ${row.days}`
+  : `${row.date}${row.today ? '*' : ''}:${row.entries.length}`)
+
+test('today inside a run of free days splits the run around a row of its own', () => {
+  assert.deepEqual(todayShape(tripDayRows(todayTrip, 'en-GB', '2026-09-18')), [
+    '2026-09-12:1', 'free 5', '2026-09-18*:0', 'free 5', '2026-09-24:1', '2026-09-25:0', '2026-09-26:1',
+  ])
+  // First day of a run: nothing before it to count.
+  assert.deepEqual(todayShape(tripDayRows(todayTrip, 'en-GB', '2026-09-13')), [
+    '2026-09-12:1', '2026-09-13*:0', 'free 10', '2026-09-24:1', '2026-09-25:0', '2026-09-26:1',
+  ])
+})
+
+test('today on a day with something on it, or on the single empty day, marks that row and adds none', () => {
+  assert.deepEqual(todayShape(tripDayRows(todayTrip, 'en-GB', '2026-09-24')), [
+    '2026-09-12:1', 'free 11', '2026-09-24*:1', '2026-09-25:0', '2026-09-26:1',
+  ])
+  assert.deepEqual(todayShape(tripDayRows(todayTrip, 'en-GB', '2026-09-25')), [
+    '2026-09-12:1', 'free 11', '2026-09-24:1', '2026-09-25*:0', '2026-09-26:1',
+  ])
+  assert.deepEqual(todayPositions(tripDayRows(todayTrip, 'en-GB', '2026-09-24')), [2])
+  assert.deepEqual(todayPositions(tripDayRows(todayTrip, 'en-GB', '2026-09-25')), [])
+})
+
+test('a today outside the trip changes nothing, and the day number counts both ends', () => {
+  assert.deepEqual(tripDayRows(todayTrip, 'en-GB', '2026-10-01'), tripDayRows(todayTrip, 'en-GB'))
+  assert.deepEqual(tripDayRows(todayTrip, 'en-GB', null), tripDayRows(todayTrip, 'en-GB'))
+  assert.deepEqual(todayInTrip(todayTrip, '2026-09-12'), { day: 1, of: 15 })
+  assert.deepEqual(todayInTrip(todayTrip, '2026-09-26'), { day: 15, of: 15 })
+  assert.equal(todayInTrip(todayTrip, '2026-09-11'), null)
+  assert.equal(todayInTrip(todayTrip, '2026-09-27'), null)
+  assert.equal(todayInTrip(todayTrip, 'yesterday'), null)
+  assert.equal(todayInTrip({ items: [] }, '2026-09-12'), null)
+})
+
+test('today is the reader\'s own calendar day, not the UTC one', () => {
+  // 23:30 local on the 3rd is the 3rd, whatever UTC says.
+  assert.equal(localToday(new Date(2026, 8, 3, 23, 30)), '2026-09-03')
+  assert.equal(localToday(new Date(2026, 0, 9, 0, 5)), '2026-01-09')
+})
+
+// The marks are CSS the script only names: lose either rule and today
+// looks like every other day while every test of the rows still passes.
+test('the page has a look for today\'s row and today\'s cards', () => {
+  const page = readFileSync(new URL('./chat.html', import.meta.url), 'utf8')
+  assert.match(page, /\.day-row\.today \.day-label\{/)
+  assert.match(page, /\.day-today\{/)
+  assert.match(page, /\[data-today\]\{/)
+  const script = readFileSync(new URL('./chat.js', import.meta.url), 'utf8')
+  assert.match(script, /card\.dataset\.today = ''/)
+  assert.match(script, /'day-row today'/)
+})
+
+test('a message carries the trip and today only when it has both', () => {
+  assert.deepEqual(JSON.parse(sendBody('hi', 7)), { text: 'hi', thread: 7 })
+  assert.deepEqual(JSON.parse(sendBody('hi', 7, null)), { text: 'hi', thread: 7 })
+  assert.deepEqual(JSON.parse(sendBody('hi', 7, { trip: 'Hong Kong', today: '2026-09-23', day: 3, of: 9 })), {
+    text: 'hi', thread: 7, trip: 'Hong Kong', today: '2026-09-23',
+  })
+  assert.deepEqual(JSON.parse(sendBody('hi', 7, { trip: 'Hong Kong' })), { text: 'hi', thread: 7 })
+})
+
+test('the line above the composer says which day of the trip it is', () => {
+  assert.equal(composeLabel('to "Hong Kong"', { day: 3, of: 9 }), 'to "Hong Kong" · today is day 3 of 9')
+  assert.equal(composeLabel('to "Hong Kong"', null), 'to "Hong Kong"')
+  // Nothing to name is still nothing to say.
+  assert.equal(composeLabel('', { day: 3, of: 9 }), '')
 })

@@ -809,6 +809,21 @@ mod tests {
     }
 
     #[test]
+    fn the_note_a_trip_day_adds_is_not_shown_as_the_persons_words() {
+        // The page sends the trip and the day; the server appends them as
+        // a note the model reads. What the thread shows is what was typed.
+        let history = vec![
+            LlmMessage::user(
+                "move the ferry to tomorrow\n\n[system note] Sent from the trip \"Hong Kong\". Today is Wed 23 Sep 2026, a day of that trip.",
+            ),
+            LlmMessage::assistant("Moved."),
+        ];
+        let turns = turns_of(&history, &vec![None; history.len()]);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].text, "move the ferry to tomorrow");
+    }
+
+    #[test]
     fn the_narration_a_run_writes_between_tool_calls_is_not_a_turn() {
         // Measured on a real transcript: a price comparison rendered as a
         // page of "Let me check Kruidvat, ShaveSavings and bol.com", then

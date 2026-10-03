@@ -400,6 +400,15 @@
   .day-chip.held{border-style:solid; border-color:#3f682f; color:#b8c76a}
   .day-chip:hover{border-color:var(--cyan); color:var(--base2)}
   .day-chip:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
+  /* Today is a position in the trip, not a state of anything on it: the
+     chips keep their held and to-book looks, and the day says it is today.
+     The row itself is `display:contents`, so the mark is on its label. */
+  .day-row.today .day-label{color:var(--base2)}
+  .day-today{display:block; color:var(--cyan); font-size:10px; font-weight:800; letter-spacing:.1em;
+    text-transform:uppercase}
+  /* An inset shadow, not a border: the card clips its corners, and a
+     border would move everything in it by three pixels on the one day. */
+  .segment-card[data-today], .item-card[data-today]{box-shadow:inset 3px 0 0 var(--cyan)}
   /* A day with nothing on it is worth a row — "nothing on the 23rd" is an
      answer somebody is looking for — but a run of them is worth a count,
      or an item dated a week before departure would push the trip itself

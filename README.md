@@ -47,6 +47,11 @@ fare caveat in one hand-off document. A trip is not only flights: tell Scout
 the timeline in date order beside the legs, with activities and trains the
 same way, each marked when it is booked and with its confirmation code.
 
+On a day of the trip the page knows it. Today gets a row of its own in the
+day rows, even inside a run of free days; the page opens on today's cards;
+and a message typed from the Trips tab tells Scout which trip it came from
+and what day it is, so "move the ferry to tomorrow" has a tomorrow.
+
 Every account also has a booking address, `you@goodscout.fyi`. Give it to a
 hotel or a museum shop at checkout, or forward a confirmation to it. Each
 message is forwarded to your own email first, so nothing is ever only in

@@ -164,8 +164,22 @@ export function whenLabel(thread, now = Date.now()) {
 
 // The composer's request body. Named rather than inlined so the one place
 // the thread id crosses the wire is the one place a test can hold.
-export function sendBody(text, thread) {
-  return JSON.stringify({ text, thread })
+// `about` is the trip the message was sent from and the reader's own
+// date, on a day of that trip — so "move the ferry to tomorrow" has a
+// tomorrow. Both or neither: half of it tells the server nothing.
+export function sendBody(text, thread, about = null) {
+  const body = { text, thread }
+  if (about?.trip && about?.today) {
+    body.trip = about.trip
+    body.today = about.today
+  }
+  return JSON.stringify(body)
+}
+
+// What the line above the composer says, with the day of the trip when
+// today is one.
+export function composeLabel(label, at) {
+  return label && at ? `${label} · today is day ${at.day} of ${at.of}` : label
 }
 
 // Which thread the composer sends into after a list refresh. The page's own
@@ -527,7 +541,12 @@ function readinessAlertText(readiness, booking, trip) {
 // eight blank rows between it and the trip would push the trip itself off
 // the screen. One empty day stays a row of its own, because "nothing on
 // the 23rd" is the answer to a question somebody is asking.
-export function tripDayRows(trip, locale = undefined) {
+// `today` is the reader's own date, when the page wants it marked. A day
+// that is today is a row even with nothing on it, and so splits a counted
+// run of free days in two: on a trip day "where am I in this" is the
+// question, and a count that swallowed today could not answer it. Left
+// out, the rows are exactly what the printed plan draws.
+export function tripDayRows(trip, locale = undefined, today = null) {
   const items = trip?.items ?? []
   if (!items.length) return []
   const onDay = new Map()
@@ -576,7 +595,8 @@ export function tripDayRows(trip, locale = undefined) {
   let free = 0
   for (const date of eachDay(days[0], days[days.length - 1])) {
     const entries = (onDay.get(date) ?? []).sort(byTime)
-    if (!entries.length) {
+    const isToday = date === today
+    if (!entries.length && !isToday) {
       free++
       continue
     }
@@ -584,9 +604,42 @@ export function tripDayRows(trip, locale = undefined) {
     if (free === 1) rows.push({ kind: 'day', date: dayBefore(date), label: dayLabel(dayBefore(date), locale), entries: [] })
     else if (free > 1) rows.push({ kind: 'free', days: free })
     free = 0
-    rows.push({ kind: 'day', date, label: dayLabel(date, locale), entries })
+    const row = { kind: 'day', date, label: dayLabel(date, locale), entries }
+    // Only where true, so a row without it is the row the shared
+    // `day_rows.json` cases describe.
+    if (isToday) row.today = true
+    rows.push(row)
   }
   return rows
+}
+
+// The reader's own calendar day, written the way the trip's days are.
+// Local on purpose: the phone is where the traveller is, and the UTC date
+// is yesterday's for the first hours of a morning in Hong Kong.
+export function localToday(now = new Date()) {
+  const two = (n) => String(n).padStart(2, '0')
+  return `${now.getFullYear()}-${two(now.getMonth() + 1)}-${two(now.getDate())}`
+}
+
+// Which day of the trip `today` is — both ends counted — or `null` when it
+// is not a day of this trip at all, which is the case that changes nothing.
+export function todayInTrip(trip, today) {
+  if (!isDay(today)) return null
+  const days = tripDayRows(trip).filter((row) => row.kind === 'day')
+  if (!days.length) return null
+  const first = days[0].date
+  const last = days[days.length - 1].date
+  if (today < first || today > last) return null
+  const between = (from, to) => Math.round((utcDay(to) - utcDay(from)) / DAY_MS)
+  return { day: between(first, today) + 1, of: between(first, last) + 1 }
+}
+
+// The items on today's row, by position: the cards the page marks and
+// opens on. Read off the rows so the cards and the overview cannot
+// disagree about what today holds.
+export function todayPositions(rows) {
+  const row = rows.find((candidate) => candidate.kind === 'day' && candidate.today)
+  return row ? [...new Set(row.entries.map((entry) => entry.position))] : []
 }
 
 function isDay(value) {
@@ -1182,6 +1235,10 @@ function start() {
   let lastList = []
   let trips = []
   let currentTrip = null
+  // The positions on today's row of the trip being drawn, and the trip the
+  // page has already opened on today for. See `openOnToday`.
+  let todayCards = new Set()
+  let openedOnToday = null
   let tripsLoaded = false
   let tripLoadSeq = 0
   let tripChoicePending = false
@@ -1420,6 +1477,14 @@ function start() {
     noticeEl.textContent = ''
   }
 
+  // The trip on screen and today's date, when today is a day of it.
+  function tripToday() {
+    const trip = trips.find((item) => item.name === currentTrip)
+    const today = localToday()
+    const at = trip ? todayInTrip(trip, today) : null
+    return at ? { trip: trip.name, today, ...at } : null
+  }
+
   // Redraws the line above the composer from `composerTarget`. Called from
   // both the places that can change its answer — `switchView`, because the
   // Chat tab has no trip to name, and `renderTripDetail`, which runs on
@@ -1436,8 +1501,9 @@ function start() {
     // An empty label means there is nothing to name yet — no trips loaded,
     // or a selection not yet resolved — so the line says nothing rather
     // than something misleading.
-    composeTargetEl.hidden = !target.label
-    composeTargetEl.textContent = target.label ? `↩ ${target.label}` : ''
+    const label = composeLabel(target.label, tripToday())
+    composeTargetEl.hidden = !label
+    composeTargetEl.textContent = label ? `↩ ${label}` : ''
   }
 
   function node(tag, className, text) {
@@ -1462,6 +1528,8 @@ function start() {
     menuButton.hidden = showingTrips
     if (mirrorButton) mirrorButton.hidden = showingTrips
     if (showingTrips && !tripsLoaded) loadTrips().catch(() => {})
+    // The trips were painted while this tab was hidden; now it can be seen.
+    if (showingTrips) openOnToday(trips.find((trip) => trip.name === currentTrip))
     // Switching tabs is the other path (besides picking a trip) that
     // changes what the line above the composer should say — a load
     // already in flight will say it again once `renderTripDetail` runs.
@@ -1562,6 +1630,27 @@ function start() {
     }
   }
 
+  // Today's date when it is a day of this trip, else `null` — the one
+  // answer every part of the page asks for.
+  function todayOf(trip) {
+    const today = localToday()
+    return todayInTrip(trip, today) ? today : null
+  }
+
+  // Opens the trip on today, once. A repaint after a note or a move must
+  // leave the reader where they were, so this remembers the trip it did it
+  // for; choosing another trip is a different name and does it again.
+  // Skipped while the Trips tab is hidden — the website paints trips in
+  // the background for the tab's count, and scrolling something nobody can
+  // see would spend the one go.
+  function openOnToday(trip) {
+    if (tripsView.hidden || !trip || openedOnToday === trip.name) return
+    openedOnToday = trip.name
+    const target = tripDetail.querySelector('[data-today]')
+      ?? tripDetail.querySelector('.day-row.today .day-label')
+    target?.scrollIntoView({ block: 'start' })
+  }
+
   function renderOverview(trip) {
     const card = node('section', 'trip-overview')
     const label = node('div', 'trip-overview-label')
@@ -1590,13 +1679,15 @@ function start() {
       card.append(timeline)
     }
     const days = node('div', 'trip-days')
-    for (const row of tripDayRows(trip)) {
+    for (const row of tripDayRows(trip, undefined, todayOf(trip))) {
       if (row.kind === 'free') {
         days.append(node('p', 'day-free', `${row.days} free days`))
         continue
       }
-      const line = node('div', 'day-row')
-      line.append(node('span', 'day-label', row.label))
+      const line = node('div', row.today ? 'day-row today' : 'day-row')
+      const label = node('span', 'day-label', row.label)
+      if (row.today) label.append(node('span', 'day-today', 'Today'))
+      line.append(label)
       const entries = node('div', 'day-entries')
       if (!row.entries.length) entries.append(node('span', 'day-empty', 'Nothing planned'))
       for (const entry of row.entries) entries.append(dayChip(entry))
@@ -1613,6 +1704,7 @@ function start() {
   function nameCard(card, item) {
     card.id = `trip-item-${item.position}`
     card.tabIndex = -1
+    if (todayCards.has(item.position)) card.dataset.today = ''
   }
 
   // One thing on one day, as a link to the card that holds it. An anchor
@@ -1961,6 +2053,10 @@ function start() {
     }
 
     tripDetail.replaceChildren()
+    todayCards = new Set(todayPositions(tripDayRows(trip, undefined, todayOf(trip))))
+    // After this function has drawn the cards, which is the rest of it:
+    // a microtask runs when the synchronous render is done.
+    queueMicrotask(() => openOnToday(trip))
     const head = node('div', 'trip-head')
     const title = node('div')
     title.append(
@@ -3659,6 +3755,9 @@ function start() {
     // painted into the one they moved to. The run carries on server-side
     // and its answer is saved to history, so switching back shows it.
     const runThread = currentThread
+    // Decided here, where the send begins: `currentTrip` is still the trip
+    // the reader was looking at, though the view has gone to Chat.
+    const about = fromTrips ? tripToday() : null
     // Whether this run's thread is still the one on screen. The run keeps
     // going server-side either way; the page only draws what belongs to the
     // thread in front of the reader. The status line and the notice are as
@@ -3704,7 +3803,7 @@ function start() {
       const res = await fetch('/chat/messages', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
-        body: sendBody(text, runThread),
+        body: sendBody(text, runThread, about),
       })
       // Both of these are plain refusals, not streams: the thread went
       // between the page loading and this send, or the page predates the

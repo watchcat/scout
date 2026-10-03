@@ -450,6 +450,107 @@ pub async fn hold_item(
     .await
 }
 
+/// What a move asked from the page came to.
+#[derive(Debug)]
+pub enum MoveEdit {
+    /// Moved; what the check that follows needs to know.
+    Moved(Box<crate::move_check::Move>),
+    Same,
+    /// Held, and the request did not say to move it anyway.
+    NeedsConfirm,
+    TripNotFound,
+    SegmentChanged,
+    Invalid(String),
+}
+
+/// Move one item to another day, if it is still the item the caller drew.
+///
+/// `to` is checked before the trip is read: a date that is not one is
+/// refused whatever it was aimed at.
+pub async fn move_item(
+    core: &Core,
+    account_id: i64,
+    trip_name: &str,
+    position: i64,
+    expected: ItemExpectation,
+    to: &str,
+    confirm: bool,
+) -> anyhow::Result<MoveEdit> {
+    if chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d").is_err() {
+        return Ok(MoveEdit::Invalid("to is a date, YYYY-MM-DD".to_string()));
+    }
+    let (origin, destination, date, title) = match checked_expectation(expected) {
+        Ok(parts) => parts,
+        Err(message) => return Ok(MoveEdit::Invalid(message)),
+    };
+    let store = core.store();
+    let (trip_name, to) = (trip_name.to_string(), to.to_string());
+    blocking(move || {
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(MoveEdit::TripNotFound);
+        };
+        let expected = ExpectedItem {
+            origin: origin.as_deref(),
+            destination: destination.as_deref(),
+            title: title.as_deref(),
+            date: date.as_deref(),
+        };
+        Ok(match store.move_item_checked(trip.id, position, expected, &to, confirm)? {
+            crate::store::Moved::Stale => MoveEdit::SegmentChanged,
+            crate::store::Moved::Flight => {
+                MoveEdit::Invalid("a flight's date is its ticket's; ask Scout to change the leg".to_string())
+            }
+            crate::store::Moved::Same => MoveEdit::Same,
+            crate::store::Moved::NeedsConfirm => MoveEdit::NeedsConfirm,
+            crate::store::Moved::Done { item_id, title, from } => MoveEdit::Moved(Box::new(crate::move_check::Move {
+                account_id,
+                item_id,
+                trip: trip.name,
+                title,
+                from,
+                to,
+            })),
+        })
+    })
+    .await
+}
+
+/// Clear the warning on one item, if it is still the item the caller drew.
+pub async fn dismiss_warning(
+    core: &Core,
+    account_id: i64,
+    trip_name: &str,
+    position: i64,
+    expected: ItemExpectation,
+) -> anyhow::Result<LegEdit> {
+    let (origin, destination, date, title) = match checked_expectation(expected) {
+        Ok(parts) => parts,
+        Err(message) => return Ok(LegEdit::Invalid(message)),
+    };
+    let store = core.store();
+    let trip_name = trip_name.to_string();
+    blocking(move || {
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(LegEdit::TripNotFound);
+        };
+        let expected = ExpectedItem {
+            origin: origin.as_deref(),
+            destination: destination.as_deref(),
+            title: title.as_deref(),
+            date: date.as_deref(),
+        };
+        if !store.dismiss_warning_checked(trip.id, position, expected)? {
+            return Ok(LegEdit::SegmentChanged);
+        }
+        let Some(trip) = store.find_trip(account_id, &trip_name)? else {
+            return Ok(LegEdit::TripNotFound);
+        };
+        let chat = store.trip_chat(trip.id)?;
+        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+    })
+    .await
+}
+
 /// The route and date of an expectation, put through the same checks the
 /// flight tools use so a value no client could have drawn is refused
 /// rather than silently failing to match. Shared by the three writes that
@@ -626,6 +727,26 @@ pub async fn seed_trip_for_tests(core: &Core, account_id: i64, name: &str) -> an
         // trip is orphaned by construction — no store round trip needed to
         // know that.
         Ok(Plan::from_trip(trip, None))
+    })
+    .await
+}
+
+/// A warning on an item, as a check would have left it, without a model.
+#[doc(hidden)]
+pub async fn seed_warning_for_tests(
+    core: &Core,
+    account_id: i64,
+    trip_name: &str,
+    title: &str,
+    warning: &str,
+) -> anyhow::Result<()> {
+    let store = core.store();
+    let (trip_name, title, warning) = (trip_name.to_string(), title.to_string(), warning.to_string());
+    blocking(move || {
+        let trip = store.find_trip(account_id, &trip_name)?.ok_or_else(|| anyhow::anyhow!("no such trip"))?;
+        let item = trip.items.iter().find(|i| i.title == title).ok_or_else(|| anyhow::anyhow!("no such item"))?;
+        store.finish_item_check(item.id, &item.date, Some(&warning))?;
+        Ok(())
     })
     .await
 }
@@ -1413,5 +1534,32 @@ mod tests {
             serde_json::to_value(orphaned).unwrap()["chat"],
             serde_json::Value::Null,
         );
+    }
+    #[tokio::test]
+    async fn a_move_from_the_page_answers_with_what_the_check_needs() {
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+        seed_item_for_tests(&core, account_id, "October", "activity", "Lunch with Stanley", "2026-10-12").await.unwrap();
+        let seen = |title: &str, date: &str| ItemExpectation { title: Some(title.into()), date: Some(date.into()), ..Default::default() };
+
+        let out = move_item(&core, account_id, "october", 2, seen("Lunch with Stanley", "2026-10-12"), "2026-10-14", false).await.unwrap();
+        let MoveEdit::Moved(m) = out else { panic!("{out:?}") };
+        // The trip's stored name, for the brief.
+        assert_eq!((m.trip.as_str(), m.title.as_str(), m.from.as_str(), m.to.as_str()), ("October", "Lunch with Stanley", "2026-10-12", "2026-10-14"));
+
+        let lunch = || seen("Lunch with Stanley", "2026-10-14");
+        let same = move_item(&core, account_id, "October", 2, lunch(), "2026-10-14", false).await.unwrap();
+        assert!(matches!(same, MoveEdit::Same), "{same:?}");
+        let bad = move_item(&core, account_id, "October", 2, lunch(), "14 Oct", false).await.unwrap();
+        assert!(matches!(bad, MoveEdit::Invalid(_)), "{bad:?}");
+        let stale = move_item(&core, account_id, "October", 2, seen("Dinner", "2026-10-14"), "2026-10-15", false).await.unwrap();
+        assert!(matches!(stale, MoveEdit::SegmentChanged), "{stale:?}");
+        let lost = move_item(&core, account_id, "Nowhere", 2, lunch(), "2026-10-15", false).await.unwrap();
+        assert!(matches!(lost, MoveEdit::TripNotFound), "{lost:?}");
+
+        seed_warning_for_tests(&core, account_id, "October", "Lunch with Stanley", "closed that day").await.unwrap();
+        let out = dismiss_warning(&core, account_id, "October", 2, seen("Lunch with Stanley", "2026-10-14")).await.unwrap();
+        let LegEdit::Done(plan) = out else { panic!("{out:?}") };
+        assert_eq!(plan.trip.items[1].warning, None);
     }
 }

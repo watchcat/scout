@@ -691,6 +691,22 @@ pub enum CandidateChoice {
     CandidateNotFound,
 }
 
+/// What became of a move asked from the page.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Moved {
+    /// Not the item the caller drew: reload and look again.
+    Stale,
+    /// A leg's date is its ticket's, and `update_flight`'s to change.
+    Flight,
+    /// Already on that day.
+    Same,
+    /// Held, and the caller has not said to move it anyway. The card
+    /// moving does not move the booking, so the question is the server's
+    /// to insist on and not only the page's to ask.
+    NeedsConfirm,
+    Done { item_id: i64, title: String, from: String },
+}
+
 /// What the caller saw when it decided to act on an item — for
 /// `add_candidate` and `remove_item_checked` to verify again inside the
 /// same lock as the write it guards; see `add_candidate`'s own comment for
@@ -3189,7 +3205,7 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT count(*) FROM request_log
-             WHERE account_id = ? AND kind IN ('text', 'photo')
+             WHERE account_id = ? AND kind IN ('text', 'photo', 'document', 'move_check')
                AND created_at >= CAST(current_timestamp AT TIME ZONE 'UTC' AS DATE)",
         )?;
         let n: i64 = stmt
@@ -3680,12 +3696,17 @@ impl Store {
         // go with the old one, or "how far" would answer for the wrong
         // address.
         let moved = wanted_place != place;
+        // A warning is about the item on a day, at a time, in a place.
+        // Change any of those and it is about something that is no longer
+        // true; a new name or a new code leaves it standing.
+        let rescheduled = moved || wanted_date != date || wanted_starts != starts_at;
         conn.execute(
             "UPDATE trip_items SET title = ?, place = ?, date = ?, starts_at = ?, ends_at = ?,
                  booked = ?, confirmation_code = ?, updated_at = current_timestamp,
                  lat = CASE WHEN ? THEN NULL ELSE lat END,
                  lng = CASE WHEN ? THEN NULL ELSE lng END,
-                 geocode_tried = CASE WHEN ? THEN false ELSE geocode_tried END
+                 geocode_tried = CASE WHEN ? THEN false ELSE geocode_tried END,
+                 warning = CASE WHEN ? THEN NULL ELSE warning END
              WHERE id = ?",
             params![
                 wanted_title,
@@ -3698,6 +3719,7 @@ impl Store {
                 moved,
                 moved,
                 moved,
+                rescheduled,
                 item_id
             ],
         )?;
@@ -3799,16 +3821,106 @@ impl Store {
         Ok(true)
     }
 
-    /// Writes one item's note, or clears it when `note` is `None` — the
-    /// traveller's own words about this booking, which is where a map link
-    /// or a "ask for the terrace" lives. Nothing here reads it.
+    /// Moves an item to another day, on the item the caller still says it
+    /// is looking at — `note_item_checked`'s guard.
     ///
-    /// Returns the trip and whether anything changed, the way
-    /// `update_flight` does: a note that already says exactly this is not a
-    /// failure, and a caller that has to tell the traveller what it did has
-    /// to be able to tell the two apart.
-    ///
-    /// The lookup and the write share the one `self.conn()` for the reason
+    /// Everything dated on the item moves by the same number of days: a
+    /// lunch at 14:30 stays at 14:30, and a stay keeps its nights, because
+    /// a check-out left behind would turn three nights into one or into
+    /// a stay that ends before it starts. The old verdict goes with the
+    /// old day.
+    pub fn move_item_checked(
+        &self,
+        trip_id: i64,
+        position: i64,
+        expected: ExpectedItem<'_>,
+        to: &str,
+        confirm: bool,
+    ) -> Result<Moved> {
+        let conn = self.conn();
+        let Some(item_id) = item_still_seen(&conn, trip_id, position, expected)? else {
+            return Ok(Moved::Stale);
+        };
+        let (kind, title, date, starts_at, ends_at, booked) = conn.query_row(
+            "SELECT kind, title, date, starts_at, ends_at, booked FROM trip_items WHERE id = ?",
+            params![item_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            },
+        )?;
+        if kind == "flight" {
+            return Ok(Moved::Flight);
+        }
+        if date == to {
+            return Ok(Moved::Same);
+        }
+        if booked && !confirm {
+            return Ok(Moved::NeedsConfirm);
+        }
+        // The day a stamp is on is its first ten characters; what follows
+        // — a clock, or nothing — is kept as it is.
+        let day = |stamp: &str| chrono::NaiveDate::parse_from_str(stamp.get(..10).unwrap_or(stamp), "%Y-%m-%d");
+        let shift = day(to)? - day(&date)?;
+        let starts = starts_at.map(|at| format!("{to}{}", at.get(10..).unwrap_or("")));
+        let ends = match ends_at {
+            Some(at) => Some(format!("{}{}", day(&at)? + shift, at.get(10..).unwrap_or(""))),
+            None => None,
+        };
+        conn.execute(
+            "UPDATE trip_items SET date = ?, starts_at = ?, ends_at = ?, warning = NULL, checking_since = NULL,
+                 updated_at = current_timestamp
+             WHERE id = ?",
+            params![to, starts, ends, item_id],
+        )?;
+        reorder_items(&conn, trip_id)?;
+        touch(&conn, trip_id)?;
+        Ok(Moved::Done { item_id, title, from: date })
+    }
+
+    /// A check of this item has begun. The same expression `load_trip`
+    /// compares against, so the two cannot disagree by a time zone.
+    pub fn start_item_check(&self, item_id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE trip_items SET checking_since = CAST(current_timestamp AS TIMESTAMP) WHERE id = ?",
+            params![item_id],
+        )?;
+        Ok(())
+    }
+
+    /// The check is over: its verdict, if it was a warning, and the end of
+    /// "Checking…" either way — but only while the item is still on the
+    /// day the check was about. One moved again in the meantime has a
+    /// check of its own, and this one has nothing to say to it. `true`
+    /// when a warning was written.
+    pub fn finish_item_check(&self, item_id: i64, on_date: &str, warning: Option<&str>) -> Result<bool> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE trip_items SET checking_since = NULL, warning = ? WHERE id = ? AND date = ?",
+            params![warning, item_id, on_date],
+        )?;
+        Ok(changed > 0 && warning.is_some())
+    }
+
+    /// The reader has read the warning and wants it gone. Guarded like
+    /// every write from a card.
+    pub fn dismiss_warning_checked(&self, trip_id: i64, position: i64, expected: ExpectedItem<'_>) -> Result<bool> {
+        let conn = self.conn();
+        let Some(item_id) = item_still_seen(&conn, trip_id, position, expected)? else {
+            return Ok(false);
+        };
+        conn.execute("UPDATE trip_items SET warning = NULL WHERE id = ?", params![item_id])?;
+        touch(&conn, trip_id)?;
+        Ok(true)
+    }
+
     /// Held, or not, on the item the caller still says it is looking at.
     /// `note_item_checked`'s guard, for the same reason.
     pub fn hold_item_checked(
@@ -3853,6 +3965,16 @@ impl Store {
         Ok(true)
     }
 
+    /// Writes one item's note, or clears it when `note` is `None` — the
+    /// traveller's own words about this booking, which is where a map link
+    /// or a "ask for the terrace" lives. Nothing here reads it.
+    ///
+    /// Returns the trip and whether anything changed, the way
+    /// `update_flight` does: a note that already says exactly this is not a
+    /// failure, and a caller that has to tell the traveller what it did has
+    /// to be able to tell the two apart.
+    ///
+    /// The lookup and the write share the one `self.conn()` for the reason
     /// `remove_item_checked` spells out: positions are recomputed on every
     /// write, so an id read under one acquisition and written under the
     /// next can be a different item by then.
@@ -8928,6 +9050,113 @@ CREATE TABLE conversations (
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
         assert_eq!(shape(&fresh.conn(), "trip_items"), shape(&s.conn(), "trip_items"));
+    }
+
+    fn moving_trip(s: &Store) -> (i64, i64) {
+        let a = s.account_for_telegram(11).unwrap();
+        let trip = s.upsert_trip(a, "Hong Kong", None, None, None).unwrap();
+        let new = |kind: &str, title: &str, date: &str, starts: Option<&str>, ends: Option<&str>, booked: bool| NewItem {
+            kind: kind.into(),
+            title: title.into(),
+            place: None,
+            date: date.into(),
+            starts_at: starts.map(Into::into),
+            ends_at: ends.map(Into::into),
+            notes: None,
+            booked,
+            confirmation_code: None,
+            price: None,
+            currency: None,
+            arrival_id: None,
+        };
+        // Flight on the 21st is item 1, the hotel 2, the lunch 3.
+        s.add_flight(trip.id, "AMS", "HKG", "2026-09-21").unwrap();
+        s.add_item(trip.id, new("stay", "Hotel", "2026-09-22", None, Some("2026-09-25T11:00:00"), true)).unwrap();
+        s.add_item(trip.id, new("activity", "Lunch", "2026-09-24", Some("2026-09-24T14:30:00"), None, false)).unwrap();
+        (a, trip.id)
+    }
+
+    fn seen<'a>(title: &'a str, date: &'a str) -> ExpectedItem<'a> {
+        ExpectedItem { origin: None, destination: None, title: Some(title), date: Some(date) }
+    }
+
+    #[test]
+    fn a_move_keeps_a_clocks_time_and_a_stays_nights_and_asks_before_moving_what_is_held() {
+        let (s, _d) = test_store();
+        let (a, trip) = moving_trip(&s);
+        let item = |title: &str| s.trip_by_id(a, trip).unwrap().unwrap().items.into_iter().find(|i| i.title == title).unwrap();
+
+        // A plan moves at once, and its clock comes with it.
+        let moved = s.move_item_checked(trip, 3, seen("Lunch", "2026-09-24"), "2026-09-23", false).unwrap();
+        assert!(matches!(&moved, Moved::Done { title, from, .. } if title == "Lunch" && from == "2026-09-24"), "{moved:?}");
+        assert_eq!(item("Lunch").date, "2026-09-23");
+        assert_eq!(item("Lunch").starts_at.as_deref(), Some("2026-09-23T14:30:00"));
+
+        // A stale tab, the same day, and a flight change nothing.
+        assert_eq!(s.move_item_checked(trip, 3, seen("Dinner", "2026-09-23"), "2026-09-26", false).unwrap(), Moved::Stale);
+        assert_eq!(s.move_item_checked(trip, 3, seen("Lunch", "2026-09-23"), "2026-09-23", false).unwrap(), Moved::Same);
+        let leg = ExpectedItem { origin: Some("AMS"), destination: Some("HKG"), title: None, date: Some("2026-09-21") };
+        assert_eq!(s.move_item_checked(trip, 1, leg, "2026-09-22", true).unwrap(), Moved::Flight);
+
+        // A held stay asks first, and then moves as a block: three nights.
+        assert_eq!(s.move_item_checked(trip, 2, seen("Hotel", "2026-09-22"), "2026-09-25", false).unwrap(), Moved::NeedsConfirm);
+        assert_eq!(item("Hotel").date, "2026-09-22");
+        assert!(matches!(s.move_item_checked(trip, 2, seen("Hotel", "2026-09-22"), "2026-09-25", true).unwrap(), Moved::Done { .. }));
+        assert_eq!(item("Hotel").date, "2026-09-25");
+        assert_eq!(item("Hotel").ends_at.as_deref(), Some("2026-09-28T11:00:00"));
+        // And the list is in date order again: the hotel is last now.
+        assert_eq!(item("Hotel").position, 3);
+    }
+
+    #[test]
+    fn a_verdict_is_written_only_on_the_day_it_was_about_and_goes_when_the_item_is_rescheduled() {
+        let (s, _d) = test_store();
+        let (a, trip) = moving_trip(&s);
+        let item = |title: &str| s.trip_by_id(a, trip).unwrap().unwrap().items.into_iter().find(|i| i.title == title).unwrap();
+        let lunch = item("Lunch").id;
+
+        s.start_item_check(lunch).unwrap();
+        assert!(item("Lunch").checking);
+        // About another day: the item moved on while the check ran.
+        assert!(!s.finish_item_check(lunch, "2026-09-23", Some("closed on Wednesdays")).unwrap());
+        assert_eq!(item("Lunch").warning, None);
+        assert!(item("Lunch").checking, "a check of another day is not this day's to end");
+        assert!(s.finish_item_check(lunch, "2026-09-24", Some("closed on Thursdays")).unwrap());
+        assert_eq!(item("Lunch").warning.as_deref(), Some("closed on Thursdays"));
+        assert!(!item("Lunch").checking);
+        // A verdict of fine writes nothing and still ends the check.
+        s.start_item_check(lunch).unwrap();
+        assert!(!s.finish_item_check(lunch, "2026-09-24", None).unwrap());
+        assert!(!item("Lunch").checking);
+
+        // A new name leaves the warning; a new time or day takes it.
+        s.finish_item_check(lunch, "2026-09-24", Some("closed on Thursdays")).unwrap();
+        s.update_item(trip, 3, ItemEdit { title: Some("Late lunch"), ..Default::default() }).unwrap();
+        assert!(item("Late lunch").warning.is_some());
+        s.update_item(trip, 3, ItemEdit { time: Some("15:00"), ..Default::default() }).unwrap();
+        assert_eq!(item("Late lunch").warning, None);
+        s.finish_item_check(lunch, "2026-09-24", Some("closed on Thursdays")).unwrap();
+        assert!(matches!(s.move_item_checked(trip, 3, seen("Late lunch", "2026-09-24"), "2026-09-26", false).unwrap(), Moved::Done { .. }));
+        assert_eq!(item("Late lunch").warning, None);
+
+        // Dismissed by the reader, under the stale-tab guard.
+        s.finish_item_check(lunch, "2026-09-26", Some("closed on Saturdays")).unwrap();
+        assert!(!s.dismiss_warning_checked(trip, 3, seen("Lunch", "2026-09-26")).unwrap());
+        assert!(s.dismiss_warning_checked(trip, 3, seen("Late lunch", "2026-09-26")).unwrap());
+        assert_eq!(item("Late lunch").warning, None);
+    }
+
+    #[test]
+    fn a_move_check_and_a_document_count_toward_the_day() {
+        // The cap counted `text` and `photo`. A PDF sent to the bot was
+        // logged as `document` and counted for nothing, and a check would
+        // have been the same.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(11).unwrap();
+        for kind in ["text", "photo", "document", "move_check", "something else"] {
+            s.log_request(a, kind).unwrap();
+        }
+        assert_eq!(s.requests_today(a).unwrap(), 4);
     }
 
     #[test]

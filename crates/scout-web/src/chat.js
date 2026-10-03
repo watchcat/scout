@@ -1306,6 +1306,14 @@ function start() {
   // somewhere else — a chip dropped on a day — and has to ask a held
   // item's question in that item's own menu. Rebuilt with every paint.
   const itemMenus = new Map()
+  // A mouse, not a finger: on touch a chip is a link to its card, and a
+  // long press that starts a drag would fight the row's own scrolling.
+  // The menu is how a phone and a keyboard move things.
+  const canDrag = Boolean(window.matchMedia?.('(hover: hover) and (pointer: fine)')?.matches)
+  // The position of the chip being dragged, or `null`. A flight's chip is
+  // an anchor and so can be dragged as a link whatever this page says;
+  // that drag leaves this `null`, and no row accepts it.
+  let dragged = null
   let openedOnToday = null
   let tripsLoaded = false
   let tripLoadSeq = 0
@@ -1756,6 +1764,29 @@ function start() {
       const label = node('span', 'day-label', row.label)
       if (row.today) label.append(node('span', 'day-today', 'Today'))
       line.append(label)
+      // A day is somewhere an item can be dropped. The row is
+      // `display:contents`, so it has no box of its own, but its children
+      // do and their events bubble to it.
+      if (canDrag) {
+        line.addEventListener('dragover', (event) => {
+          if (dragged === null) return
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'move'
+          line.classList.add('drop')
+        })
+        line.addEventListener('dragleave', (event) => {
+          if (!line.contains(event.relatedTarget)) line.classList.remove('drop')
+        })
+        line.addEventListener('drop', (event) => {
+          event.preventDefault()
+          line.classList.remove('drop')
+          const item = trip.items.find((candidate) => candidate.position === dragged)
+          dragged = null
+          if (!item || item.date === row.date) return
+          if (item.booked) itemMenus.get(item.position)?.askHeld(row.date, label)
+          else moveItem(trip, item, row.date, false)
+        })
+      }
       const entries = node('div', 'day-entries')
       if (!row.entries.length) entries.append(node('span', 'day-empty', 'Nothing planned'))
       for (const entry of row.entries) entries.append(dayChip(entry))
@@ -1806,6 +1837,18 @@ function start() {
       // having quietly changed under them.
       target.focus({ preventScroll: true })
     })
+    if (canDrag && dayChipDraggable(entry)) {
+      chip.draggable = true
+      chip.addEventListener('dragstart', (event) => {
+        dragged = entry.position
+        event.dataTransfer.effectAllowed = 'move'
+        event.dataTransfer.setData('text/plain', String(entry.position))
+      })
+      chip.addEventListener('dragend', () => {
+        dragged = null
+        for (const row of tripDetail.querySelectorAll('.day-row.drop')) row.classList.remove('drop')
+      })
+    }
     return chip
   }
 

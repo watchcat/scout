@@ -327,6 +327,40 @@ struct MessageIn {
     /// then be answered in a conversation they are not looking at, with the
     /// context of a conversation they never saw.
     thread: i64,
+    /// The trip this was sent from and the reader's own date, when that
+    /// date is a day of the trip. Optional and defaulted: an older page,
+    /// and every message typed in Chat, sends neither.
+    #[serde(default)]
+    trip: Option<String>,
+    #[serde(default)]
+    today: Option<String>,
+}
+
+/// The note a message from a trip's page carries on a day of that trip,
+/// or `None`.
+///
+/// Both halves are checked before either reaches the model: the date has
+/// to parse and the name has to be one of this account's trips, and it is
+/// the stored name that is written, not the client's string — a field of
+/// the request is not a place to put words into the prompt.
+///
+/// The model reads it; the thread does not show it. `turns_of` cuts a
+/// trailing `[system note]` from a turn, which is what Telegram's
+/// price-request note already relies on.
+async fn today_note(
+    core: &scout_core::core::Core,
+    account_id: i64,
+    trip: Option<&str>,
+    today: Option<&str>,
+) -> Option<String> {
+    let (trip, today) = (trip?, today?);
+    let today = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok()?;
+    let plan = scout_core::trips::find(core, account_id, trip).await.ok()??;
+    Some(format!(
+        "\n\n[system note] Sent from the trip \"{}\". Today is {}, a day of that trip.",
+        plan.trip.name,
+        today.format("%a %-d %b %Y")
+    ))
 }
 
 async fn send_message(
@@ -406,6 +440,7 @@ async fn send_message(
         tracing::warn!(error = %e, account_id, "request logging failed");
     }
 
+    let note = today_note(&auth.core, account_id, body.trip.as_deref(), body.today.as_deref()).await;
     let run = scout_api::RunContext {
         account_id,
         conversation_id,
@@ -414,7 +449,12 @@ async fn send_message(
         title_source: Some(body.text.clone()),
     };
     let core = auth.core.clone();
-    let text = body.text;
+    // The title above was cut from the person's own words; this is what
+    // the model is sent.
+    let text = match note {
+        Some(note) => format!("{}{note}", body.text),
+        None => body.text,
+    };
     let auth_for_mirror = auth.clone();
 
     let (agent_tx, agent_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -892,7 +932,7 @@ mod tests {
     // Named imports rather than `use super::*`: the module imports axum's
     // `get` and `post`, which would shadow the test helpers of the same
     // name that every request in here goes through.
-    use super::{end_frame, queue_thread, reply_to_for, AuthState};
+    use super::{end_frame, queue_thread, reply_to_for, today_note, AuthState};
     use crate::tests::*;
 
     #[test]
@@ -2135,5 +2175,28 @@ mod tests {
             body.contains("switchView('chat')"),
             "a trip reply never switches the page to where the answer streams"
         );
+    }
+
+    #[tokio::test]
+    async fn a_message_from_a_trip_day_carries_the_day_and_nothing_the_client_made_up() {
+        let (_app, core, _dir) = test_app_with_a_round().await;
+        let account_id = admitted(&core, "777").await;
+        scout_core::trips::seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+
+        // The trip's own name as stored, not the client's spelling of it,
+        // and the weekday worked out here.
+        let note = today_note(&core, account_id, Some("october"), Some("2026-10-12")).await;
+        assert_eq!(
+            note.as_deref(),
+            Some("\n\n[system note] Sent from the trip \"October\". Today is Mon 12 Oct 2026, a day of that trip.")
+        );
+        // Dropped whole when either half is missing or not what it says.
+        assert_eq!(today_note(&core, account_id, Some("October"), Some("12 Oct")).await, None);
+        assert_eq!(today_note(&core, account_id, Some("Nowhere"), Some("2026-10-12")).await, None);
+        assert_eq!(today_note(&core, account_id, None, Some("2026-10-12")).await, None);
+        assert_eq!(today_note(&core, account_id, Some("October"), None).await, None);
+        // Somebody else's trip is no trip.
+        let other = admitted(&core, "888").await;
+        assert_eq!(today_note(&core, other, Some("October"), Some("2026-10-12")).await, None);
     }
 }

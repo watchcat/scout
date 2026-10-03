@@ -1207,6 +1207,8 @@ mod tests {
             lat: None,
             lng: None,
             geocode_tried: false,
+            warning: None,
+            checking: false,
         }
     }
 
@@ -1271,6 +1273,8 @@ mod tests {
                         lat: None,
                         lng: None,
                         geocode_tried: false,
+                        warning: None,
+                        checking: false,
                     },
                     flight(
                         3,
@@ -1443,6 +1447,8 @@ mod tests {
             lat: None,
             lng: None,
             geocode_tried: false,
+            warning: None,
+            checking: false,
         }
     }
 

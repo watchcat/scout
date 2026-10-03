@@ -1221,6 +1221,10 @@ function start() {
   let lastList = []
   let trips = []
   let currentTrip = null
+  // The positions on today's row of the trip being drawn, and the trip the
+  // page has already opened on today for. See `openOnToday`.
+  let todayCards = new Set()
+  let openedOnToday = null
   let tripsLoaded = false
   let tripLoadSeq = 0
   let tripChoicePending = false
@@ -1501,6 +1505,8 @@ function start() {
     menuButton.hidden = showingTrips
     if (mirrorButton) mirrorButton.hidden = showingTrips
     if (showingTrips && !tripsLoaded) loadTrips().catch(() => {})
+    // The trips were painted while this tab was hidden; now it can be seen.
+    if (showingTrips) openOnToday(trips.find((trip) => trip.name === currentTrip))
     // Switching tabs is the other path (besides picking a trip) that
     // changes what the line above the composer should say — a load
     // already in flight will say it again once `renderTripDetail` runs.
@@ -1601,6 +1607,27 @@ function start() {
     }
   }
 
+  // Today's date when it is a day of this trip, else `null` — the one
+  // answer every part of the page asks for.
+  function todayOf(trip) {
+    const today = localToday()
+    return todayInTrip(trip, today) ? today : null
+  }
+
+  // Opens the trip on today, once. A repaint after a note or a move must
+  // leave the reader where they were, so this remembers the trip it did it
+  // for; choosing another trip is a different name and does it again.
+  // Skipped while the Trips tab is hidden — the website paints trips in
+  // the background for the tab's count, and scrolling something nobody can
+  // see would spend the one go.
+  function openOnToday(trip) {
+    if (tripsView.hidden || !trip || openedOnToday === trip.name) return
+    openedOnToday = trip.name
+    const target = tripDetail.querySelector('[data-today]')
+      ?? tripDetail.querySelector('.day-row.today .day-label')
+    target?.scrollIntoView({ block: 'start' })
+  }
+
   function renderOverview(trip) {
     const card = node('section', 'trip-overview')
     const label = node('div', 'trip-overview-label')
@@ -1629,13 +1656,15 @@ function start() {
       card.append(timeline)
     }
     const days = node('div', 'trip-days')
-    for (const row of tripDayRows(trip)) {
+    for (const row of tripDayRows(trip, undefined, todayOf(trip))) {
       if (row.kind === 'free') {
         days.append(node('p', 'day-free', `${row.days} free days`))
         continue
       }
-      const line = node('div', 'day-row')
-      line.append(node('span', 'day-label', row.label))
+      const line = node('div', row.today ? 'day-row today' : 'day-row')
+      const label = node('span', 'day-label', row.label)
+      if (row.today) label.append(node('span', 'day-today', 'Today'))
+      line.append(label)
       const entries = node('div', 'day-entries')
       if (!row.entries.length) entries.append(node('span', 'day-empty', 'Nothing planned'))
       for (const entry of row.entries) entries.append(dayChip(entry))
@@ -1652,6 +1681,7 @@ function start() {
   function nameCard(card, item) {
     card.id = `trip-item-${item.position}`
     card.tabIndex = -1
+    if (todayCards.has(item.position)) card.dataset.today = ''
   }
 
   // One thing on one day, as a link to the card that holds it. An anchor
@@ -2000,6 +2030,10 @@ function start() {
     }
 
     tripDetail.replaceChildren()
+    todayCards = new Set(todayPositions(tripDayRows(trip, undefined, todayOf(trip))))
+    // After this function has drawn the cards, which is the rest of it:
+    // a microtask runs when the synchronous render is done.
+    queueMicrotask(() => openOnToday(trip))
     const head = node('div', 'trip-head')
     const title = node('div')
     title.append(

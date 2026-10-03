@@ -1087,3 +1087,15 @@ test('today is the reader\'s own calendar day, not the UTC one', () => {
   assert.equal(localToday(new Date(2026, 8, 3, 23, 30)), '2026-09-03')
   assert.equal(localToday(new Date(2026, 0, 9, 0, 5)), '2026-01-09')
 })
+
+// The marks are CSS the script only names: lose either rule and today
+// looks like every other day while every test of the rows still passes.
+test('the page has a look for today\'s row and today\'s cards', () => {
+  const page = readFileSync(new URL('./chat.html', import.meta.url), 'utf8')
+  assert.match(page, /\.day-row\.today \.day-label\{/)
+  assert.match(page, /\.day-today\{/)
+  assert.match(page, /\[data-today\]\{/)
+  const script = readFileSync(new URL('./chat.js', import.meta.url), 'utf8')
+  assert.match(script, /card\.dataset\.today = ''/)
+  assert.match(script, /'day-row today'/)
+})

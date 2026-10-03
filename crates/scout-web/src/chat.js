@@ -2050,6 +2050,7 @@ function start() {
       text.setAttribute('role', 'none')
       const cancel = entry('Cancel', () => {
         drawEntries()
+        settle()
         menu.querySelector('button')?.focus()
       })
       const go = entry('Move anyway', () => {
@@ -2061,6 +2062,16 @@ function start() {
       const row = node('div', 'item-menu-confirm')
       row.append(cancel, go)
       menu.replaceChildren(text, row)
+      settle()
+    }
+    // Placed again for what it now holds. The day list is tall enough to
+    // flip the menu above its ⋯, and the short question that replaces it
+    // kept that position, floating a screen away from the card it is
+    // about — measured on a phone.
+    const settle = () => {
+      if (!menu.matches(':popover-open')) return
+      placeMenu(menu, anchor)
+      flipMenu(menu, anchor)
     }
     // A second click, not `window.confirm`: a dialog blocks the whole page
     // for one item on one card, and this is destructive enough to ask

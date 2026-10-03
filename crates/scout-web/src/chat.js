@@ -164,8 +164,22 @@ export function whenLabel(thread, now = Date.now()) {
 
 // The composer's request body. Named rather than inlined so the one place
 // the thread id crosses the wire is the one place a test can hold.
-export function sendBody(text, thread) {
-  return JSON.stringify({ text, thread })
+// `about` is the trip the message was sent from and the reader's own
+// date, on a day of that trip — so "move the ferry to tomorrow" has a
+// tomorrow. Both or neither: half of it tells the server nothing.
+export function sendBody(text, thread, about = null) {
+  const body = { text, thread }
+  if (about?.trip && about?.today) {
+    body.trip = about.trip
+    body.today = about.today
+  }
+  return JSON.stringify(body)
+}
+
+// What the line above the composer says, with the day of the trip when
+// today is one.
+export function composeLabel(label, at) {
+  return label && at ? `${label} · today is day ${at.day} of ${at.of}` : label
 }
 
 // Which thread the composer sends into after a list refresh. The page's own
@@ -1463,6 +1477,14 @@ function start() {
     noticeEl.textContent = ''
   }
 
+  // The trip on screen and today's date, when today is a day of it.
+  function tripToday() {
+    const trip = trips.find((item) => item.name === currentTrip)
+    const today = localToday()
+    const at = trip ? todayInTrip(trip, today) : null
+    return at ? { trip: trip.name, today, ...at } : null
+  }
+
   // Redraws the line above the composer from `composerTarget`. Called from
   // both the places that can change its answer — `switchView`, because the
   // Chat tab has no trip to name, and `renderTripDetail`, which runs on
@@ -1479,8 +1501,9 @@ function start() {
     // An empty label means there is nothing to name yet — no trips loaded,
     // or a selection not yet resolved — so the line says nothing rather
     // than something misleading.
-    composeTargetEl.hidden = !target.label
-    composeTargetEl.textContent = target.label ? `↩ ${target.label}` : ''
+    const label = composeLabel(target.label, tripToday())
+    composeTargetEl.hidden = !label
+    composeTargetEl.textContent = label ? `↩ ${label}` : ''
   }
 
   function node(tag, className, text) {
@@ -3732,6 +3755,9 @@ function start() {
     // painted into the one they moved to. The run carries on server-side
     // and its answer is saved to history, so switching back shows it.
     const runThread = currentThread
+    // Decided here, where the send begins: `currentTrip` is still the trip
+    // the reader was looking at, though the view has gone to Chat.
+    const about = fromTrips ? tripToday() : null
     // Whether this run's thread is still the one on screen. The run keeps
     // going server-side either way; the page only draws what belongs to the
     // thread in front of the reader. The status line and the notice are as
@@ -3777,7 +3803,7 @@ function start() {
       const res = await fetch('/chat/messages', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
-        body: sendBody(text, runThread),
+        body: sendBody(text, runThread, about),
       })
       // Both of these are plain refusals, not streams: the thread went
       // between the page loading and this send, or the page predates the

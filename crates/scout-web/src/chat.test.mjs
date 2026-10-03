@@ -9,7 +9,7 @@ import {
   tripPdfFilename, tripRoute, itemDateLabel, noFlightLine, bookedMark, itemState, tripDayRows,
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   noteParts, noteBody, holdBody, itemMenuEntries,
-  localToday, todayInTrip, todayPositions,
+  localToday, todayInTrip, todayPositions, composeLabel,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   ITINERARY_NOTE,
@@ -1098,4 +1098,20 @@ test('the page has a look for today\'s row and today\'s cards', () => {
   const script = readFileSync(new URL('./chat.js', import.meta.url), 'utf8')
   assert.match(script, /card\.dataset\.today = ''/)
   assert.match(script, /'day-row today'/)
+})
+
+test('a message carries the trip and today only when it has both', () => {
+  assert.deepEqual(JSON.parse(sendBody('hi', 7)), { text: 'hi', thread: 7 })
+  assert.deepEqual(JSON.parse(sendBody('hi', 7, null)), { text: 'hi', thread: 7 })
+  assert.deepEqual(JSON.parse(sendBody('hi', 7, { trip: 'Hong Kong', today: '2026-09-23', day: 3, of: 9 })), {
+    text: 'hi', thread: 7, trip: 'Hong Kong', today: '2026-09-23',
+  })
+  assert.deepEqual(JSON.parse(sendBody('hi', 7, { trip: 'Hong Kong' })), { text: 'hi', thread: 7 })
+})
+
+test('the line above the composer says which day of the trip it is', () => {
+  assert.equal(composeLabel('to "Hong Kong"', { day: 3, of: 9 }), 'to "Hong Kong" · today is day 3 of 9')
+  assert.equal(composeLabel('to "Hong Kong"', null), 'to "Hong Kong"')
+  // Nothing to name is still nothing to say.
+  assert.equal(composeLabel('', { day: 3, of: 9 }), '')
 })

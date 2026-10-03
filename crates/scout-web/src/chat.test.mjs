@@ -1162,3 +1162,15 @@ test('a row carries the mark of an item Scout flagged', () => {
   ] }, 'en-GB')
   assert.deepEqual(rows[0].entries.map((entry) => Boolean(entry.warn)), [true, false])
 })
+
+// The script names these and the stylesheet has to have them, or a card
+// being checked looks like any other and a warning is grey text.
+test('the page has looks for a card being checked, a warning and the day picker', () => {
+  const page = readFileSync(new URL('./chat.html', import.meta.url), 'utf8')
+  for (const rule of ['.item-checking{', '.item-warning{', '.item-menu-days{', '.day-chip.warn', '.day-row.drop .day-label']) {
+    assert.ok(page.includes(rule), `${rule} is missing from the stylesheet`)
+  }
+  const script = readFileSync(new URL('./chat.js', import.meta.url), 'utf8')
+  assert.match(script, /Moving the card won't move the booking\./)
+  assert.match(script, /'\/chat\/trips\/item-move'/)
+})

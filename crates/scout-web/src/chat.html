@@ -512,6 +512,31 @@
   .item-menu-confirm{display:flex; gap:6px; padding:0 3px 3px}
   .item-menu-confirm button{flex:1; text-align:center; border:1px solid var(--line)}
   .item-menu-confirm button.danger{border-color:var(--red)}
+  /* The day picker a move chooses from: every day of the trip, so it
+     scrolls inside the menu rather than making the menu taller than the
+     window. The date leads and what is already on the day follows it,
+     quieter, because the date is what is being chosen. */
+  .item-menu-days{display:flex; flex-direction:column; gap:2px; max-height:min(52vh, 320px); overflow-y:auto}
+  .item-menu-days button{display:flex; align-items:baseline; gap:10px}
+  .menu-day{flex:none; min-width:4.6em; color:var(--base2)}
+  .menu-day-what{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--base01);
+    font-size:12px; font-weight:400}
+  .item-menu-days button[aria-current="date"]{opacity:.55; cursor:default}
+  .item-menu-other{display:flex; align-items:center; justify-content:space-between; gap:10px; padding:8px 11px 4px;
+    border-top:1px solid var(--line); margin-top:3px; color:var(--base01); font-size:12px}
+  .item-menu-date{background:var(--base03); color:var(--base1); border:1px solid var(--line); border-radius:7px;
+    font:inherit; font-size:12px; padding:4px 6px}
+  /* Being checked: said beside the state, quietly, because nothing is
+     wrong yet. */
+  .item-checking{color:var(--base01); font-size:12px; font-style:italic; white-space:nowrap}
+  /* The verdict when it is a warning: the yellow the readiness banner
+     uses for "needs a decision", under the head where the eye already is. */
+  .item-warning{margin:0; padding:9px 16px; border-top:1px solid rgba(181,137,0,.35); background:rgba(181,137,0,.09);
+    color:#d1c27e; font-size:13px; line-height:1.45; overflow-wrap:anywhere}
+  .day-chip.warn{border-color:var(--yellow)}
+  .day-chip.warn::after{content:" !"; color:var(--yellow); font-weight:800}
+  .day-row.drop .day-label{color:var(--cyan)}
+  .day-row.drop .day-entries{outline:1px dashed var(--cyan); outline-offset:3px; border-radius:7px}
   .segment-remove-button{background:transparent; border:1px solid var(--line); border-radius:8px;
     color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
   .segment-remove-button:hover{color:#ff817a; border-color:var(--red)}
@@ -762,6 +787,7 @@
     .segment-head-actions{order:2; width:100%; justify-content:space-between}
     .item-menu-button{width:42px; height:42px}
     .item-menu-list button{min-height:42px; font-size:14px}
+    .item-menu-date{min-height:42px; font-size:16px}
     /* Touch targets. These come to about 31px tall at the desktop scale,
        and the row of them decides whether a booking joins a trip or is
        thrown away — not a thing to mis-tap with a thumb. The circle that

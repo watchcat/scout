@@ -1302,6 +1302,10 @@ function start() {
   // The positions on today's row of the trip being drawn, and the trip the
   // page has already opened on today for. See `openOnToday`.
   let todayCards = new Set()
+  // Each card's menu, by the item's position, for a move that begins
+  // somewhere else — a chip dropped on a day — and has to ask a held
+  // item's question in that item's own menu. Rebuilt with every paint.
+  const itemMenus = new Map()
   let openedOnToday = null
   let tripsLoaded = false
   let tripLoadSeq = 0
@@ -1785,6 +1789,12 @@ function start() {
         ? ' · check out'
         : ''
     chip.textContent = `${time}${entry.text}${tail}`
+    if (entry.warn) {
+      chip.classList.add('warn')
+      // The "!" is drawn by the stylesheet; this is the same thing said
+      // to somebody who is not looking at it.
+      chip.setAttribute('aria-label', `${chip.textContent}, flagged by Scout`)
+    }
     chip.addEventListener('click', (event) => {
       const target = document.getElementById(`trip-item-${entry.position}`)
       if (!target) return
@@ -1906,6 +1916,9 @@ function start() {
     menu.setAttribute('role', 'menu')
     trigger.setAttribute('aria-controls', menu.id)
     trigger.popoverTargetElement = menu
+    // Where the menu is placed. The ⋯ it belongs to, except when a chip
+    // dropped on a day opens it to ask a held item's question there.
+    let anchor = trigger
 
     const entry = (label, onPick, danger) => {
       const button = node('button', danger ? 'danger' : '', label)
@@ -1916,15 +1929,95 @@ function start() {
     }
     const drawEntries = () => {
       menu.setAttribute('aria-label', itemName(item))
-      menu.replaceChildren(...itemMenuEntries(item).map((name) => name === 'hold'
-        ? entry('Mark as held', () => {
+      const make = {
+        move: () => entry('Move to…', () => {
+          drawDays()
+          menu.querySelector('button:not(:disabled)')?.focus()
+        }),
+        hold: () => entry('Mark as held', () => {
           menu.hidePopover()
           holdItem(trip, item, true)
-        })
-        : entry('Remove', () => {
+        }),
+        dismiss: () => entry('Dismiss warning', () => {
+          menu.hidePopover()
+          dismissWarning(trip, item)
+        }),
+        remove: () => entry('Remove', () => {
           drawConfirm()
           menu.querySelector('button')?.focus()
-        }, true)))
+        }, true),
+      }
+      menu.replaceChildren(...itemMenuEntries(item).map((name) => make[name]()))
+    }
+    // The trip's days, in place of the list the entry was chosen from, as
+    // Remove's question is. Every day, the free ones too. The item's own
+    // day is there and dead: a list with a hole where today's row should
+    // be is harder to read than one that says "you are here".
+    const drawDays = () => {
+      const heading = item.kind === 'stay' ? 'Move check-in to…' : 'Move to…'
+      menu.setAttribute('aria-label', heading)
+      const title = node('p', 'item-menu-ask', heading)
+      title.setAttribute('role', 'none')
+      const list = node('div', 'item-menu-days')
+      for (const day of tripDays(trip, localToday())) {
+        const what = day.entries.length ? day.entries.map((dayEntry) => dayEntry.text).join(', ') : 'Nothing planned'
+        const button = entry('', () => pickDay(day.date))
+        button.append(
+          node('span', 'menu-day', day.today ? `${day.label} · today` : day.label),
+          node('span', 'menu-day-what', what),
+        )
+        if (day.date === item.date) {
+          button.disabled = true
+          button.setAttribute('aria-current', 'date')
+        }
+        list.append(button)
+      }
+      // A day outside the trip: the native field, which every phone has
+      // a good picker for.
+      const other = document.createElement('input')
+      other.type = 'date'
+      other.className = 'item-menu-date'
+      other.setAttribute('aria-label', 'Another date')
+      other.addEventListener('change', () => {
+        if (other.value) pickDay(other.value)
+      })
+      const otherRow = node('label', 'item-menu-other', 'Another date…')
+      otherRow.append(other)
+      menu.replaceChildren(title, list, otherRow)
+      // Taller than the list it replaced, so it may no longer fit below.
+      flipMenu(menu, anchor)
+    }
+    const pickDay = (to) => {
+      if (to === item.date) return
+      if (item.booked) {
+        drawHeld(to)
+        menu.querySelector('button')?.focus()
+        return
+      }
+      menu.hidePopover()
+      moveItem(trip, item, to, false)
+    }
+    // A held item's question. The card moving does not move the booking,
+    // and that is the whole of what there is to say — no model is asked
+    // before the move, so nothing is waited for.
+    const drawHeld = (to) => {
+      const ask = `Held for ${dateLabel(item.date, true)}. Moving the card won't move the booking.`
+      menu.setAttribute('aria-label', ask)
+      const text = node('p', 'item-menu-ask', ask)
+      text.setAttribute('role', 'none')
+      const cancel = entry('Cancel', () => {
+        drawEntries()
+        menu.querySelector('button')?.focus()
+      })
+      const go = entry('Move anyway', () => {
+        menu.hidePopover()
+        moveItem(trip, item, to, true)
+      }, true)
+      // A double-click on a day would otherwise land its second half here.
+      armConfirm(go)
+      const row = node('div', 'item-menu-confirm')
+      row.append(cancel, go)
+      menu.replaceChildren(text, row)
     }
     // A second click, not `window.confirm`: a dialog blocks the whole page
     // for one item on one card, and this is destructive enough to ask
@@ -1958,7 +2051,7 @@ function start() {
     // Placed before it paints, not after: `toggle` fires a task later, and
     // for that frame the menu stood in the window's top-left corner.
     menu.addEventListener('beforetoggle', (event) => {
-      if (event.newState === 'open') placeMenu(menu, trigger)
+      if (event.newState === 'open') placeMenu(menu, anchor)
     })
     let closing = null
     menu.addEventListener('toggle', (event) => {
@@ -1967,10 +2060,11 @@ function start() {
       closing?.abort()
       closing = null
       if (!open) {
+        anchor = trigger
         drawEntries()
         return
       }
-      flipMenu(menu, trigger)
+      flipMenu(menu, anchor)
       menu.querySelector('button')?.focus()
       // Pinned to where ⋯ was when it opened, so a scroll or a resize
       // would leave it floating over some other card. Closing is the
@@ -1987,6 +2081,15 @@ function start() {
       if (to === undefined || !items.length) return
       event.preventDefault()
       items[(to + items.length) % items.length].focus()
+    })
+    itemMenus.set(item.position, {
+      // Opens this menu on the held question, placed at `at` — the day
+      // row a chip was dropped on — or at the ⋯ when there is no `at`.
+      askHeld(to, at) {
+        anchor = at ?? trigger
+        menu.showPopover()
+        drawHeld(to)
+      },
     })
     drawEntries()
     wrap.append(trigger, menu)
@@ -2054,9 +2157,17 @@ function start() {
     // so pressing Add does not look like it took the file away.
     if (item.attachments?.length) about.append(attachmentLinks(item.attachments))
     const actions = node('div', 'segment-head-actions')
+    // While Scout is looking at a move: beside the state, since it is
+    // about the item and not yet about anything being wrong.
+    if (item.checking) actions.append(node('span', 'item-checking', 'Checking…'))
     actions.append(statePill(item), node('time', 'segment-date', itemDateLabel(item)))
     head.append(about, actions, itemMenu(trip, item))
     card.append(head)
+    if (item.warning) {
+      const warning = node('p', 'item-warning', item.warning)
+      warning.setAttribute('role', 'note')
+      card.append(warning)
+    }
     card.append(noteSlot(trip, item))
     return card
   }
@@ -2117,10 +2228,14 @@ function start() {
     }
 
     tripDetail.replaceChildren()
+    itemMenus.clear()
     todayCards = new Set(todayPositions(tripDayRows(trip, undefined, todayOf(trip))))
     // After this function has drawn the cards, which is the rest of it:
     // a microtask runs when the synchronous render is done.
-    queueMicrotask(() => openOnToday(trip))
+    queueMicrotask(() => {
+      openOnToday(trip)
+      watchChecks()
+    })
     const head = node('div', 'trip-head')
     const title = node('div')
     title.append(
@@ -2510,6 +2625,114 @@ function start() {
     })
     slot.replaceChildren(...(item.notes ? [noteLine(item), button] : [button]))
   }
+
+  // Moves an item to another day. The server moves a plan at once and
+  // asks about a held one; either way Scout's check follows the move, and
+  // this does not wait for it.
+  async function moveItem(trip, item, to, confirm) {
+    if (tripChoicePending) return
+    tripChoicePending = true
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    try {
+      const res = await fetch('/chat/trips/item-move', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body: moveBody(trip.name, item, to, confirm),
+      })
+      if (res.status === 409) {
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        showTripToast('This trip changed elsewhere. Showing the current itinerary.')
+        return
+      }
+      if (res.status === 422) {
+        showTripToast(await res.text())
+        return
+      }
+      if (!res.ok) throw new Error('refused')
+      const answer = await res.json()
+      if (answer.needs_confirm) {
+        // The page drew it as a plan and the server knows it is held:
+        // somebody marked it elsewhere. Ask, in its own menu.
+        itemMenus.get(item.position)?.askHeld(to, null)
+        return
+      }
+      const updated = answer.trip
+      trips = [updated, ...trips.filter((other) => other.name !== updated.name)]
+      currentTrip = updated.name
+      renderTripList()
+      renderTripDetail()
+      if (!answer.moved) return
+      showTripToast(answer.checked
+        ? `Moved to ${dateLabel(to, true)}.`
+        : `Moved to ${dateLabel(to, true)}. Not checked: daily limit reached.`)
+      // To where it went: its position changed with its day, and a reader
+      // left looking at the gap has to go and find it.
+      const now = updated.items.find((other) => other.kind === item.kind && other.title === item.title && other.date === to)
+      const card = now ? document.getElementById(`trip-item-${now.position}`) : null
+      card?.scrollIntoView({ block: 'start' })
+      card?.focus({ preventScroll: true })
+    } catch {
+      showTripToast('Could not move that. Try again.')
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+    }
+  }
+
+  async function dismissWarning(trip, item) {
+    if (tripChoicePending) return
+    tripChoicePending = true
+    tripLoadSeq++
+    tripDetail.setAttribute('aria-busy', 'true')
+    try {
+      const res = await fetch('/chat/trips/item-warning', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body: warningBody(trip.name, item),
+      })
+      if (res.status === 409) {
+        tripChoicePending = false
+        tripsLoaded = false
+        await loadTrips()
+        showTripToast('This trip changed elsewhere. Showing the current itinerary.')
+        return
+      }
+      if (!res.ok) throw new Error('refused')
+      const updated = await res.json()
+      trips = [updated, ...trips.filter((other) => other.name !== updated.name)]
+      currentTrip = updated.name
+      renderTripList()
+      renderTripDetail()
+    } catch {
+      showTripToast('Could not change that. Try again.')
+    } finally {
+      tripChoicePending = false
+      tripDetail.removeAttribute('aria-busy')
+    }
+  }
+
+  // Asks again while a check is running, so its verdict reaches the card
+  // without a reload. One timer, restarted by every paint; it stops
+  // itself when nothing on the trip is being checked or the tab is
+  // hidden. A tick is skipped while a menu is open or a note is being
+  // typed: a repaint would close the one and throw away the other.
+  let checkTimer = null
+  function watchChecks() {
+    clearTimeout(checkTimer)
+    checkTimer = null
+    const trip = trips.find((item) => item.name === currentTrip)
+    if (!shouldPollChecks(trip, document.hidden)) return
+    checkTimer = setTimeout(async () => {
+      checkTimer = null
+      const busy = tripChoicePending || tripDetail.querySelector(':popover-open, .item-note-editor')
+      if (!busy) await loadTrips().catch(() => {})
+      watchChecks()
+    }, CHECK_POLL_MS)
+  }
+  document.addEventListener('visibilitychange', watchChecks)
 
   // Held is the traveller's word — a table booked by phone, a friend
   // expecting them — so the page has to be able to say it. Before this

@@ -527,7 +527,12 @@ function readinessAlertText(readiness, booking, trip) {
 // eight blank rows between it and the trip would push the trip itself off
 // the screen. One empty day stays a row of its own, because "nothing on
 // the 23rd" is the answer to a question somebody is asking.
-export function tripDayRows(trip, locale = undefined) {
+// `today` is the reader's own date, when the page wants it marked. A day
+// that is today is a row even with nothing on it, and so splits a counted
+// run of free days in two: on a trip day "where am I in this" is the
+// question, and a count that swallowed today could not answer it. Left
+// out, the rows are exactly what the printed plan draws.
+export function tripDayRows(trip, locale = undefined, today = null) {
   const items = trip?.items ?? []
   if (!items.length) return []
   const onDay = new Map()
@@ -576,7 +581,8 @@ export function tripDayRows(trip, locale = undefined) {
   let free = 0
   for (const date of eachDay(days[0], days[days.length - 1])) {
     const entries = (onDay.get(date) ?? []).sort(byTime)
-    if (!entries.length) {
+    const isToday = date === today
+    if (!entries.length && !isToday) {
       free++
       continue
     }
@@ -584,9 +590,42 @@ export function tripDayRows(trip, locale = undefined) {
     if (free === 1) rows.push({ kind: 'day', date: dayBefore(date), label: dayLabel(dayBefore(date), locale), entries: [] })
     else if (free > 1) rows.push({ kind: 'free', days: free })
     free = 0
-    rows.push({ kind: 'day', date, label: dayLabel(date, locale), entries })
+    const row = { kind: 'day', date, label: dayLabel(date, locale), entries }
+    // Only where true, so a row without it is the row the shared
+    // `day_rows.json` cases describe.
+    if (isToday) row.today = true
+    rows.push(row)
   }
   return rows
+}
+
+// The reader's own calendar day, written the way the trip's days are.
+// Local on purpose: the phone is where the traveller is, and the UTC date
+// is yesterday's for the first hours of a morning in Hong Kong.
+export function localToday(now = new Date()) {
+  const two = (n) => String(n).padStart(2, '0')
+  return `${now.getFullYear()}-${two(now.getMonth() + 1)}-${two(now.getDate())}`
+}
+
+// Which day of the trip `today` is — both ends counted — or `null` when it
+// is not a day of this trip at all, which is the case that changes nothing.
+export function todayInTrip(trip, today) {
+  if (!isDay(today)) return null
+  const days = tripDayRows(trip).filter((row) => row.kind === 'day')
+  if (!days.length) return null
+  const first = days[0].date
+  const last = days[days.length - 1].date
+  if (today < first || today > last) return null
+  const between = (from, to) => Math.round((utcDay(to) - utcDay(from)) / DAY_MS)
+  return { day: between(first, today) + 1, of: between(first, last) + 1 }
+}
+
+// The items on today's row, by position: the cards the page marks and
+// opens on. Read off the rows so the cards and the overview cannot
+// disagree about what today holds.
+export function todayPositions(rows) {
+  const row = rows.find((candidate) => candidate.kind === 'day' && candidate.today)
+  return row ? [...new Set(row.entries.map((entry) => entry.position))] : []
 }
 
 function isDay(value) {

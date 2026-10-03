@@ -10,6 +10,7 @@ import {
   composerTarget, removeItemBody, keepBody, deleteTripBody, tripDeleteConsequence,
   noteParts, noteBody, holdBody, itemMenuEntries,
   localToday, todayInTrip, todayPositions, composeLabel,
+  moveBody, warningBody, tripDays, dayChipDraggable, shouldPollChecks,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   ITINERARY_NOTE,
@@ -998,13 +999,13 @@ test('the page can say a thing is held, and names the item it means', () => {
   assert.equal(leg.held, false)
 })
 
-// The card's ⋯ menu. Held is not offered on something already held: the
-// traveller who confirmed it has nothing to do with that entry but press
-// it by mistake, and "Mark as not held" beside Remove read as a second
-// way to throw the booking away.
-test('the item menu offers Mark as held only on something still to book', () => {
-  assert.deepEqual(itemMenuEntries({ kind: 'activity', title: 'Lunch with Stanley', booked: false }), ['hold', 'remove'])
-  assert.deepEqual(itemMenuEntries({ kind: 'stay', title: 'Harbour View Rooms', booked: true }), ['remove'])
+// The card's ⋯ menu, in order. Move is for anything but a flight, whose
+// date is its ticket's. Held is not offered on something already held.
+// Dismiss only where there is a warning to dismiss.
+test('the item menu offers what can be done to this item and nothing that cannot', () => {
+  assert.deepEqual(itemMenuEntries({ kind: 'activity', title: 'Lunch', booked: false }), ['move', 'hold', 'remove'])
+  assert.deepEqual(itemMenuEntries({ kind: 'stay', title: 'Hotel', booked: true }), ['move', 'remove'])
+  assert.deepEqual(itemMenuEntries({ kind: 'activity', title: 'Lunch', booked: false, warning: 'closed' }), ['move', 'hold', 'dismiss', 'remove'])
   assert.deepEqual(itemMenuEntries({ kind: 'flight', origin: 'AMS', destination: 'HKG', booked: false }), ['hold', 'remove'])
   assert.deepEqual(itemMenuEntries({ kind: 'flight', origin: 'AMS', destination: 'HKG', booked: true }), ['remove'])
 })
@@ -1114,4 +1115,50 @@ test('the line above the composer says which day of the trip it is', () => {
   assert.equal(composeLabel('to "Hong Kong"', null), 'to "Hong Kong"')
   // Nothing to name is still nothing to say.
   assert.equal(composeLabel('', { day: 3, of: 9 }), '')
+})
+
+test('a move names the item as the page drew it, and says where it goes', () => {
+  const item = { position: 3, kind: 'activity', title: 'Lunch', date: '2026-09-24' }
+  assert.deepEqual(JSON.parse(moveBody('Hong Kong', item, '2026-09-23')), {
+    trip: 'Hong Kong', position: 3, title: 'Lunch', date: '2026-09-24', to: '2026-09-23', confirm: false,
+  })
+  assert.equal(JSON.parse(moveBody('Hong Kong', item, '2026-09-23', true)).confirm, true)
+  assert.deepEqual(JSON.parse(warningBody('Hong Kong', item)), { trip: 'Hong Kong', position: 3, title: 'Lunch', date: '2026-09-24' })
+})
+
+test('the day picker lists every day of the trip, the free ones too', () => {
+  const trip = {
+    items: [
+      { position: 1, kind: 'activity', title: 'Moomin', date: '2026-09-22', booked: false },
+      { position: 2, kind: 'activity', title: 'Lunch', date: '2026-09-25', starts_at: '2026-09-25T14:30:00', booked: true },
+    ],
+  }
+  const days = tripDays(trip, '2026-09-23', 'en-GB')
+  assert.deepEqual(days.map((day) => day.date), ['2026-09-22', '2026-09-23', '2026-09-24', '2026-09-25'])
+  assert.deepEqual(days.map((day) => day.today), [false, true, false, false])
+  assert.deepEqual(days.map((day) => day.entries.map((entry) => entry.text)), [['Moomin'], [], [], ['Lunch']])
+  assert.equal(days[0].label, 'Tue 22')
+  assert.deepEqual(tripDays({ items: [] }), [])
+})
+
+test('only an item\'s own chip can be dragged, and polling stops when nothing is being checked', () => {
+  assert.equal(dayChipDraggable({ type: 'item' }), true)
+  assert.equal(dayChipDraggable({ type: 'stay' }), true)
+  // A leg's date is its ticket's; an arrival and a check-out are where
+  // another entry ends, not things of their own.
+  for (const type of ['flight', 'arrival', 'stay-end']) assert.equal(dayChipDraggable({ type }), false)
+
+  const checking = { items: [{ checking: false }, { checking: true }] }
+  assert.equal(shouldPollChecks(checking, false), true)
+  assert.equal(shouldPollChecks(checking, true), false, 'a hidden tab asks nobody')
+  assert.equal(shouldPollChecks({ items: [{ checking: false }] }, false), false)
+  assert.equal(shouldPollChecks(undefined, false), false)
+})
+
+test('a row carries the mark of an item Scout flagged', () => {
+  const rows = tripDayRows({ items: [
+    { position: 1, kind: 'activity', title: 'Moomin', date: '2026-09-22', booked: false, warning: 'closed on Tuesdays' },
+    { position: 2, kind: 'activity', title: 'Lunch', date: '2026-09-22', booked: false },
+  ] }, 'en-GB')
+  assert.deepEqual(rows[0].entries.map((entry) => Boolean(entry.warn)), [true, false])
 })

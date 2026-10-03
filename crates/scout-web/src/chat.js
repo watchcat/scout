@@ -583,11 +583,11 @@ export function tripDayRows(trip, locale = undefined, today = null) {
     }
     const ends = dayOf(item.ends_at)
     if (item.kind === 'stay' && ends && ends !== item.date) {
-      put(item.date, { type: 'stay', time: '', text: item.title, nights: nightsBetween(item.date, ends), position: item.position, held })
+      put(item.date, { type: 'stay', time: '', text: item.title, nights: nightsBetween(item.date, ends), position: item.position, held, ...flagged(item) })
       put(ends, { type: 'stay-end', time: '', text: item.title, position: item.position, held })
       continue
     }
-    put(item.date, { type: 'item', time: clockLabel(item.starts_at), text: item.title, position: item.position, held })
+    put(item.date, { type: 'item', time: clockLabel(item.starts_at), text: item.title, position: item.position, held, ...flagged(item) })
   }
   const days = [...onDay.keys()].sort()
   if (!days.length) return []
@@ -640,6 +640,12 @@ export function todayInTrip(trip, today) {
 export function todayPositions(rows) {
   const row = rows.find((candidate) => candidate.kind === 'day' && candidate.today)
   return row ? [...new Set(row.entries.map((entry) => entry.position))] : []
+}
+
+// Only where true, so an entry without it is the entry the shared
+// `day_rows.json` cases describe.
+function flagged(item) {
+  return item.warning ? { warn: true } : {}
 }
 
 function isDay(value) {
@@ -883,7 +889,65 @@ export function noteParts(note) {
 // Undoing a held by hand is a thing to say to Scout, not a control every
 // confirmed card carries.
 export function itemMenuEntries(item) {
-  return item.booked ? ['remove'] : ['hold', 'remove']
+  const entries = []
+  // Not a flight: a leg's date is its ticket's, and Scout's to change.
+  if (item.kind !== 'flight') entries.push('move')
+  if (!item.booked) entries.push('hold')
+  if (item.warning) entries.push('dismiss')
+  entries.push('remove')
+  return entries
+}
+
+// What the page sends to move an item to another day. The item is named
+// the way `noteBody` names one, for the same reason. `confirm` answers
+// "it is held; move it anyway?", which the server asks whatever the page
+// thinks the item is.
+export function moveBody(tripName, item, to, confirm = false) {
+  return JSON.stringify({
+    trip: tripName,
+    position: item.position,
+    title: item.title ?? null,
+    date: item.date ?? null,
+    to,
+    confirm: Boolean(confirm),
+  })
+}
+
+export function warningBody(tripName, item) {
+  return JSON.stringify({
+    trip: tripName,
+    position: item.position,
+    title: item.title ?? null,
+    date: item.date ?? null,
+  })
+}
+
+// Every day of the trip, first to last, for the picker a move chooses
+// from — the free ones too, which is what the overview counts rather than
+// draws and exactly where a moved item is most likely to go.
+export function tripDays(trip, today = null, locale = undefined) {
+  const drawn = tripDayRows(trip, locale).filter((row) => row.kind === 'day')
+  if (!drawn.length) return []
+  const byDate = new Map(drawn.map((row) => [row.date, row]))
+  return eachDay(drawn[0].date, drawn[drawn.length - 1].date).map((date) => ({
+    date,
+    label: dayLabel(date, locale),
+    entries: byDate.get(date)?.entries ?? [],
+    today: date === today,
+  }))
+}
+
+// Whether a chip in the day rows is the item itself. An arrival and a
+// check-out are where another entry ends, and a flight does not move.
+export function dayChipDraggable(entry) {
+  return entry.type === 'item' || entry.type === 'stay'
+}
+
+// How often the page asks whether a check has finished, and whether it
+// should be asking at all.
+export const CHECK_POLL_MS = 5000
+export function shouldPollChecks(trip, hidden) {
+  return !hidden && Boolean(trip?.items?.some((item) => item.checking))
 }
 
 // What the page sends to mark an item held or let it go. The item is

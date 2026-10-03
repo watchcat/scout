@@ -148,8 +148,9 @@ mismatch is 409 with a reload.
 | `to` equals `date` | any | nothing written, 200 with the trip |
 | `to` not a date | any | 422 |
 
-Checked in this order: the stale-tab rule, a flight, `to` not a date, `to`
-equal to `date`, then held without `confirm`.
+Checked in this order: `to` not a date, the stale-tab rule, a flight, `to`
+equal to `date`, then held without `confirm`. A malformed date is refused
+before anything is looked up, as every other route here treats a bad field.
 
 The held confirmation is the server's rule and not only the page's, so a
 client that skips the question does not skip the rule.

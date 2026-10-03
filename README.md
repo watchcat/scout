@@ -52,6 +52,14 @@ day rows, even inside a run of free days; the page opens on today's cards;
 and a message typed from the Trips tab tells Scout which trip it came from
 and what day it is, so "move the ferry to tomorrow" has a tomorrow.
 
+Anything but a flight can be moved to another day, from **Move to…** in its
+⋯ menu or, on a desktop, by dragging its chip onto another day's row. A stay
+moves as a block and keeps its nights. A plan moves at once; a held item asks
+first, because moving the card does not move the booking. Either way Scout
+then checks the move — are you in that city that day, does it clash with
+something timed, is the place open — and a problem appears as a line on the
+card and a message on your phone. The check counts as one request.
+
 Every account also has a booking address, `you@goodscout.fyi`. Give it to a
 hotel or a museum shop at checkout, or forward a confirmation to it. Each
 message is forwarded to your own email first, so nothing is ever only in

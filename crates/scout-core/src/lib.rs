@@ -23,6 +23,7 @@ pub mod ids;
 pub mod invites;
 pub mod links;
 pub mod mirror;
+pub mod move_check;
 pub mod nearby;
 pub mod retry;
 pub mod run;

@@ -119,7 +119,9 @@ confirmation, a phone call or a friend saying yes, and false when \
 something falls through. A booking with no reference number is ordinary; \
 never invent one to justify the flag. Dropping the item and adding it again loses the tickets that came \
 with it and the confirmation it was read from, and renumbers the trip. A \
-leg's date or route is update_trip_segment's.
+leg's date or route is update_trip_segment's. Asked to move something the \
+traveller holds to another day, move it and say in your report that the \
+booking itself has not moved - changing a card does not rebook anything.
 - When the brief asks to keep a named trip, call keep_trip with that name \
 and report that it is kept. Such a brief comes back after the traveller \
 was shown the draft and said yes, so there is nothing left to ask and \
@@ -847,5 +849,9 @@ mod tests {
         // Also counted as trip work, so a keep brings the same
         // presentation guidance any other trip edit does.
         assert!(TRIP_TOOLS.contains(&"keep_trip"), "keep_trip must be in TRIP_TOOLS for guidance");
+    }
+    #[test]
+    fn the_desk_moves_a_held_item_when_asked_and_says_the_booking_has_not_moved() {
+        assert!(FLIGHT_PREAMBLE.contains("the booking itself has not moved"), "the desk refuses or stays silent about a held move");
     }
 }

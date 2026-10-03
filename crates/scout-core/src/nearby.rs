@@ -315,6 +315,8 @@ mod tests {
             lat: coords.map(|c| c.0),
             lng: coords.map(|c| c.1),
             geocode_tried: coords.is_some(),
+            warning: None,
+            checking: false,
         }
     }
 

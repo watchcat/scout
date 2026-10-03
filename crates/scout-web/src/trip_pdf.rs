@@ -249,6 +249,7 @@ fn validate_plan(plan: &Plan) -> Result<(), Error> {
             || too_long(&item.destination)
             || too_long(&item.place)
             || too_long(&item.notes)
+            || too_long(&item.warning)
             || too_long(&item.confirmation_code)
             // A filename came off a stranger's mail like the rest of this,
             // and now reaches the page, so it is bounded like the rest.
@@ -570,6 +571,16 @@ fn tickets(item: &TripItem) -> String {
         .collect::<Vec<_>>()
         .join(" · ");
     format!("<span>{label} · {names}</span>")
+}
+
+/// What Scout said about this item when it was last moved, if it was a
+/// warning. Escaped like every other stored string: the reason is the
+/// model's sentence, and a model's sentence is not markup.
+fn warning(item: &TripItem) -> String {
+    match item.warning.as_deref() {
+        Some(reason) => format!("<div class=\"warn-line\">Check: {}</div>", escape(reason)),
+        None => String::new(),
+    }
 }
 
 /// The traveller's own note about this item, or nothing when they wrote
@@ -982,7 +993,7 @@ pub fn html(plan: &Plan) -> String {
     out.push_str(
         r#"</title>
 <style>
-@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9pt/1.3 Arial,"Liberation Sans",sans-serif}header{border-bottom:1.5px solid #2aa198;padding-bottom:2.6mm;margin-bottom:3mm}.brand{color:#2aa198;font-size:8pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1mm 0 .4mm;color:#50666b;font-size:8pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:16pt;line-height:1.05}.facts{margin:1.4mm 0 0;color:#50666b;font-size:8pt}.facts b{color:#002b36;font-weight:700}.days{margin:2.2mm 0 0;display:grid;grid-template-columns:auto 1fr;gap:.35mm 3mm;font-size:7.6pt;color:#50666b}.day{display:contents}.day .when{color:#17343b;font-weight:700;white-space:nowrap}.day .nothing{color:#8ea3a1}.day.free span:last-child{color:#8ea3a1;font-style:italic}.notice{margin:0 0 2.2mm;padding:1.7mm 2.4mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.segment{break-inside:avoid;margin:0 0 1.8mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:4mm;padding:2.1mm 2.4mm;background:#eaf3f2}.segment-head>div{min-width:0}.segment-head .number{color:#61767a;font-size:6.6pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.4mm 0 0;color:#002b36;font-size:11.5pt;line-height:1.15}.segment-head time{flex:none;color:#50666b;font-size:7.8pt;text-align:right}.meta-line{margin-top:.6mm;color:#50666b;font-size:7.8pt;overflow-wrap:anywhere}.sep{color:#9bb0ae;padding:0 .6mm}.state{display:inline-block;padding:.2mm 1.4mm;border:.3mm dashed #789196;border-radius:99mm;color:#50666b;font-size:6.8pt;font-weight:700;white-space:nowrap}.state.held{border-style:solid;border-color:#859900;color:#4f5d10}.option{display:grid;grid-template-columns:5mm 1fr 26mm;gap:2mm;padding:1.5mm 2.4mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.option.alt{padding:1.2mm 2.4mm;color:#50666b}.option.alt .price{font-size:8.5pt;font-weight:700}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:.7mm 0 .4mm;color:#002b36;font:8pt/1.3 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.4pt}.price{text-align:right;color:#002b36;font-size:10pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.note{padding:1.3mm 2.4mm;border-top:1px solid #dbe6e4;color:#50666b;font-size:7.4pt;overflow-wrap:anywhere}.connection{break-inside:avoid;margin:-1mm 2.4mm 2mm;padding:1.4mm 2mm;font-size:8pt;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:3mm;padding-top:2mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
+@page{size:A4;margin:11mm 13mm 13mm}*{box-sizing:border-box}body{margin:0;color:#17343b;background:#fff;font:9pt/1.3 Arial,"Liberation Sans",sans-serif}header{border-bottom:1.5px solid #2aa198;padding-bottom:2.6mm;margin-bottom:3mm}.brand{color:#2aa198;font-size:8pt;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.route{margin:1mm 0 .4mm;color:#50666b;font-size:8pt;font-weight:700;letter-spacing:.08em}.title{margin:0;color:#002b36;font-size:16pt;line-height:1.05}.facts{margin:1.4mm 0 0;color:#50666b;font-size:8pt}.facts b{color:#002b36;font-weight:700}.days{margin:2.2mm 0 0;display:grid;grid-template-columns:auto 1fr;gap:.35mm 3mm;font-size:7.6pt;color:#50666b}.day{display:contents}.day .when{color:#17343b;font-weight:700;white-space:nowrap}.day .nothing{color:#8ea3a1}.day.free span:last-child{color:#8ea3a1;font-style:italic}.notice{margin:0 0 2.2mm;padding:1.7mm 2.4mm;border-left:3px solid #b58900;background:#fff9e7;color:#6c5817}.notice.ok{border-color:#859900;background:#f6f8e8;color:#4f5d10}.segment{break-inside:avoid;margin:0 0 1.8mm;border:1px solid #cad9d7;border-radius:2.5mm;overflow:hidden}.segment-head{display:flex;justify-content:space-between;gap:4mm;padding:2.1mm 2.4mm;background:#eaf3f2}.segment-head>div{min-width:0}.segment-head .number{color:#61767a;font-size:6.6pt;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.segment-head h2{margin:.4mm 0 0;color:#002b36;font-size:11.5pt;line-height:1.15}.segment-head time{flex:none;color:#50666b;font-size:7.8pt;text-align:right}.meta-line{margin-top:.6mm;color:#50666b;font-size:7.8pt;overflow-wrap:anywhere}.sep{color:#9bb0ae;padding:0 .6mm}.state{display:inline-block;padding:.2mm 1.4mm;border:.3mm dashed #789196;border-radius:99mm;color:#50666b;font-size:6.8pt;font-weight:700;white-space:nowrap}.state.held{border-style:solid;border-color:#859900;color:#4f5d10}.option{display:grid;grid-template-columns:5mm 1fr 26mm;gap:2mm;padding:1.5mm 2.4mm;border-top:1px solid #dbe6e4;break-inside:avoid}.option.selected{background:#effaf8;border-left:3px solid #2aa198}.option.alt{padding:1.2mm 2.4mm;color:#50666b}.option.alt .price{font-size:8.5pt;font-weight:700}.mark{width:4.5mm;height:4.5mm;border:1.5px solid #789196;border-radius:50%;margin-top:.7mm}.selected .mark{border:1.5px solid #2aa198;box-shadow:inset 0 0 0 1mm #effaf8;background:#2aa198}.airline{color:#002b36;font-weight:700}.numbers,.source{color:#61767a;font-size:7.5pt}.itinerary{margin:.7mm 0 .4mm;color:#002b36;font:8pt/1.3 ui-monospace,SFMono-Regular,Menlo,monospace}.meta{color:#50666b;font-size:7.4pt}.price{text-align:right;color:#002b36;font-size:10pt;font-weight:700}.price small{display:block;color:#61767a;font-size:6.5pt;font-weight:400;text-transform:uppercase}.note{padding:1.3mm 2.4mm;border-top:1px solid #dbe6e4;color:#50666b;font-size:7.4pt;overflow-wrap:anywhere}.warn-line{padding:1.3mm 2.4mm;border-top:1px solid #dbe6e4;background:#fff9e7;color:#6c5817;font-size:7.4pt;overflow-wrap:anywhere}.connection{break-inside:avoid;margin:-1mm 2.4mm 2mm;padding:1.4mm 2mm;font-size:8pt;border-left:2px solid #859900;background:#f7f9ef;color:#4f5d10}.connection.warn{border-color:#b58900;background:#fff9e7;color:#6c5817}.connection.danger{border-color:#dc322f;background:#fff0ef;color:#8f211f}.foot{break-inside:avoid;margin-top:3mm;padding-top:2mm;border-top:1px solid #cad9d7;color:#61767a;font-size:7.5pt}.foot strong{color:#17343b}@media print{a{color:inherit;text-decoration:none}}
 </style></head><body>"#,
     );
     write!(
@@ -1060,11 +1071,12 @@ pub fn html(plan: &Plan) -> String {
             let booked = booked_mark(segment);
             write!(
                 out,
-                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}</div><time>{}</time></div>{}</section>",
+                "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}</div><time>{}</time></div>{}{}</section>",
                 escape(&kind_label(&segment.kind)),
                 escape(&segment.title),
                 meta_line(&[place.clone(), booked.clone(), tickets(segment)]),
                 escape(&item_when(segment)),
+                warning(segment),
                 note(segment)
             )
             .unwrap();
@@ -1501,6 +1513,16 @@ mod tests {
         assert!(!html(&plan()).contains("class=\"note\""));
     }
 
+    #[test]
+    fn a_warning_is_printed_under_the_item_it_is_about() {
+        // The page says it in yellow under the card's head; a plan printed
+        // the morning of the day should not be the one place it is unsaid.
+        let mut flagged = plan();
+        flagged.trip.items[1].warning = Some("closed on <Mondays>".to_string());
+        let page = html(&flagged);
+        assert!(page.contains("<div class=\"warn-line\">Check: closed on &lt;Mondays&gt;</div>"), "{page}");
+        assert!(!html(&plan()).contains("class=\"warn-line\""));
+    }
     #[test]
     fn a_booked_leg_with_no_option_is_not_printed_as_a_route_to_search() {
         // The paper half of `chat.js::noFlightLine`: a ticket the traveller

@@ -1,3 +1,15 @@
 [workspace]
 resolver = "2"
 members = ["crates/scout-api", "crates/scout-core", "crates/scout-telegram", "crates/scout-web"]
+
+# Dev profile tuned for size: the default debug=2 is what bloats duckdb-sys's
+# libduckdb.a to ~1.4 GB and every other C++-or-large-dep object file along
+# with it. Stripping dep debug info keeps our own crates readable in a
+# debugger (line tables + debug = 1) without paying the cost for the full
+# dependency closure. Adjust to debug = 2 if you actually step into axum/tokio.
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.dev.package."*"]
+debug = 0

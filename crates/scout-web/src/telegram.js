@@ -95,9 +95,37 @@ export function openOutside(url, win = globalThis.window) {
   win?.open(url, '_blank', 'noopener,noreferrer')
 }
 
-// The page's own ground, so the strip Telegram draws above it is the same
-// colour rather than the client's theme cutting across the top.
+// The ground Telegram's frame is painted when the page has none to read:
+// the dark theme's, which is what every page had before themes.
 export const TELEGRAM_GROUND = '#002b36'
+
+// Where the launch page keeps the theme Telegram's colours came to, for
+// the trip page it opens, whose address no longer carries them. `theme.js`
+// reads it under the same name.
+export const TELEGRAM_SCHEME_KEY = 'scout-telegram-scheme'
+
+// The theme Telegram's own colours call for: its background read by the
+// rule Telegram itself uses to call a theme dark — a perceived brightness
+// under 120 — and answered with the solarized pair, the site's own look.
+// `null` for anything that is not a colour. `theme.js` holds a copy of
+// this rule, and `theme.test.mjs` holds the two to each other.
+export function telegramTheme(bg) {
+  const hex = /^#?([0-9a-f]{6})$/i.exec(String(bg ?? '').trim())
+  if (!hex) return null
+  const n = parseInt(hex[1], 16)
+  const [r, g, b] = [n >> 16, (n >> 8) & 255, n & 255]
+  return Math.sqrt(0.299 * r * r + 0.587 * g * g + 0.114 * b * b) < 120 ? 'solarized-dark' : 'solarized-light'
+}
+
+// The strip Telegram draws above the page, and what shows behind it while
+// it loads, in the page's own ground — whichever theme that is — so the
+// client's colour does not cut across the top.
+export function paintTelegramFrame(win = globalThis.window) {
+  const read = win?.getComputedStyle?.(win.document?.documentElement)?.getPropertyValue?.('--base03')?.trim()
+  const ground = /^#[0-9a-f]{6}$/i.test(read ?? '') ? read : TELEGRAM_GROUND
+  telegramEvent('web_app_set_header_color', { color: ground }, win)
+  telegramEvent('web_app_set_background_color', { color: ground }, win)
+}
 
 // Asks the client for the "Settings" entry in the ⋯ menu it draws over
 // the page. Telegram names the entry; the page only gets told it was
@@ -124,6 +152,5 @@ export function listenToTelegram(handler, win = globalThis.window) {
 export function settleIntoTelegram(win = globalThis.window) {
   telegramEvent('web_app_ready', {}, win)
   telegramEvent('web_app_expand', {}, win)
-  telegramEvent('web_app_set_header_color', { color: TELEGRAM_GROUND }, win)
-  telegramEvent('web_app_set_background_color', { color: TELEGRAM_GROUND }, win)
+  paintTelegramFrame(win)
 }

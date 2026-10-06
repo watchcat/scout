@@ -733,6 +733,54 @@ mod tests {
 
     pub(crate) const TEST_KEY: &[u8] = b"a test session key of at least 32 bytes";
 
+    /// The four themes the landing page and the chat page both carry, by
+    /// the value `theme.js` writes to `data-theme`.
+    pub(crate) const THEMES: [&str; 4] = ["solarized-dark", "solarized-light", "light", "black"];
+
+    /// One theme's root rule from a page's stylesheet, token by token, as
+    /// written. Solarized dark is the bare `:root` rule, which the others
+    /// override; a token a theme leaves out falls through to the dark one.
+    pub(crate) fn theme_tokens(html: &str, theme: &str) -> std::collections::HashMap<String, String> {
+        let css = &html[html.find("<style>").expect("styles")..html.find("</style>").expect("styles")];
+        let selector = match theme {
+            "solarized-dark" => ":root{".to_string(),
+            other => format!(":root[data-theme=\"{other}\"]{{"),
+        };
+        let start = css.find(&selector).unwrap_or_else(|| panic!("no CSS rule for {theme}"));
+        let block_start = start + selector.len();
+        let block_end = block_start + css[block_start..].find('}').expect("theme rule closes");
+        // Comments go first: the landing page explains its colours inside
+        // the rule, and a declaration that follows a comment would otherwise
+        // be read as part of it.
+        let mut block = css[block_start..block_end].to_string();
+        while let Some(open) = block.find("/*") {
+            let close = block[open..].find("*/").map(|at| open + at + 2).expect("a comment closes");
+            block.replace_range(open..close, "");
+        }
+        let mut out = std::collections::HashMap::new();
+        for declaration in block.split(';') {
+            let Some((name, value)) = declaration.trim().split_once(':') else { continue };
+            if let Some(name) = name.trim().strip_prefix("--") {
+                out.insert(name.to_string(), value.trim().to_string());
+            }
+        }
+        out
+    }
+
+    /// Relative luminance, per WCAG 2.1, of a `#rrggbb`.
+    fn luminance(hex: &str) -> f64 {
+        let v = |i: usize| {
+            let c = u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
+            if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * v(1) + 0.7152 * v(3) + 0.0722 * v(5)
+    }
+
+    pub(crate) fn contrast(a: &str, b: &str) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
     /// A router over a real Core on a throwaway database.
     ///
     /// A real Core rather than a fake because what these tests are for is

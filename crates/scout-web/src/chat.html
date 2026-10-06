@@ -6,15 +6,77 @@
 <meta name="csrf" content="<!--CSRF-->">
 <title>Chat — Scout</title>
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
+<script src="/theme.js"></script>
 <style>
   /* Without this the scrollbars are drawn light-on-light, which the capped
      status box made obvious: a white bar down a dark page. Also fixes the
      composer's own scrollbar and any native control on the page. */
-  :root{color-scheme:dark}
-  :root{--base03:#002b36; --base02:#073642; --base01:#586e75; --base00:#657b83;
+  /* The four themes, as the landing page has them. Solarized dark is the
+     bare rule and the others override every colour it declares — one left
+     out would fall through to the dark value, which is what
+     `every_theme_gives_the_chat_page_every_colour_it_uses` is for.
+     `theme.js` picks one before the first paint: a reader's choice, the
+     device's light or dark, or inside Telegram, Telegram's.
+
+     The tokens past `--panel` are what the page used to write in: the
+     readable warning, success and danger texts, the washes behind them,
+     and the surfaces a card, a pressed tab or a hovered row sit on. */
+  :root{color-scheme:dark;
+    --base03:#002b36; --base02:#073642; --base01:#586e75; --base00:#657b83;
     --base0:#839496; --base1:#93a1a1; --base2:#eee8d5; --blue:#268bd2;
     --cyan:#2aa198; --red:#dc322f; --green:#859900; --yellow:#b58900;
-    --line:#0d4a5a; --panel:#062f3a}
+    --line:#0d4a5a; --panel:#062f3a;
+    --blue-hover:#3196d8; --you:#1c4f66; --toast:#001f27; --pressed:#124659;
+    --card:rgba(7,54,66,.62); --card-soft:rgba(7,54,66,.45);
+    --overview-from:rgba(7,54,66,.95); --overview-to:rgba(5,45,55,.7);
+    --row-hover:rgba(18,70,89,.5); --menu-hover:rgba(0,43,54,.55); --rule-soft:rgba(13,74,90,.65);
+    --warn-text:#d1c27e; --warn-line:#6c5b1d; --warn-edge:rgba(181,137,0,.35);
+    --warn-wash:rgba(181,137,0,.09); --warn-wash-soft:rgba(181,137,0,.06);
+    --ok-text:#b8c76a; --ok-line:#3f682f; --ok-wash:rgba(133,153,0,.08);
+    --danger-text:#ff817a; --danger-wash:rgba(220,50,47,.09);
+    --cyan-text:#6fc5bd; --cyan-wash:rgba(42,161,152,.1)}
+  :root[data-theme="solarized-light"]{color-scheme:light;
+    --base03:#fdf6e3; --base02:#eee8d5; --base01:#586e75; --base00:#657b83;
+    --base0:#526773; --base1:#526773; --base2:#073642; --blue:#006da8;
+    --cyan:#08716b; --red:#c52d2a; --green:#536800; --yellow:#8a6500;
+    --line:#d9d0b9; --panel:#f6efdb;
+    --blue-hover:#005985; --you:#e4ecea; --toast:#eee8d5; --pressed:#e6dec8;
+    --card:#fffbf0; --card-soft:#f8f1de;
+    --overview-from:#fffbf0; --overview-to:#f6efdb;
+    --row-hover:rgba(7,54,66,.05); --menu-hover:rgba(7,54,66,.06); --rule-soft:#e6dec8;
+    --warn-text:#7a5a00; --warn-line:#d8c27f; --warn-edge:rgba(138,101,0,.32);
+    --warn-wash:rgba(181,137,0,.10); --warn-wash-soft:rgba(181,137,0,.06);
+    --ok-text:#4f6200; --ok-line:#b5c27a; --ok-wash:rgba(133,153,0,.10);
+    --danger-text:#b0261f; --danger-wash:rgba(197,45,42,.07);
+    --cyan-text:#08716b; --cyan-wash:rgba(8,113,107,.08)}
+  :root[data-theme="light"]{color-scheme:light;
+    --base03:#ffffff; --base02:#f2f4f7; --base01:#667085; --base00:#475467;
+    --base0:#475467; --base1:#344054; --base2:#101828; --blue:#175cd3;
+    --cyan:#087681; --red:#b42318; --green:#4b6900; --yellow:#855500;
+    --line:#e4e7ec; --panel:#f9fafb;
+    --blue-hover:#1849a9; --you:#eaf1fb; --toast:#f2f4f7; --pressed:#e4e9f2;
+    --card:#ffffff; --card-soft:#f9fafb;
+    --overview-from:#ffffff; --overview-to:#f6f8fb;
+    --row-hover:rgba(16,24,40,.04); --menu-hover:rgba(16,24,40,.05); --rule-soft:#eaecf0;
+    --warn-text:#7a4d00; --warn-line:#efd38a; --warn-edge:rgba(133,85,0,.3);
+    --warn-wash:rgba(220,160,0,.10); --warn-wash-soft:rgba(220,160,0,.06);
+    --ok-text:#3f5a00; --ok-line:#b6cf7a; --ok-wash:rgba(75,105,0,.08);
+    --danger-text:#b42318; --danger-wash:rgba(180,35,24,.06);
+    --cyan-text:#087681; --cyan-wash:rgba(8,118,129,.08)}
+  :root[data-theme="black"]{color-scheme:dark;
+    --base03:#000000; --base02:#111315; --base01:#a4aab2; --base00:#a4aab2;
+    --base0:#c1c7d0; --base1:#e6e8eb; --base2:#f4f5f6; --blue:#63b3ff;
+    --cyan:#55d6c2; --red:#ff6b6b; --green:#b7d34b; --yellow:#f5c542;
+    --line:#2a2f35; --panel:#0b0c0e;
+    --blue-hover:#8cc9ff; --you:#1b2a3a; --toast:#16191c; --pressed:#22272d;
+    --card:#0d0f11; --card-soft:#0a0b0d;
+    --overview-from:#121417; --overview-to:#0b0c0e;
+    --row-hover:rgba(255,255,255,.04); --menu-hover:rgba(255,255,255,.06); --rule-soft:#1f2328;
+    --warn-text:#f5d77a; --warn-line:#5c4a12; --warn-edge:rgba(245,197,66,.3);
+    --warn-wash:rgba(245,197,66,.08); --warn-wash-soft:rgba(245,197,66,.05);
+    --ok-text:#c5df6a; --ok-line:#3d4a17; --ok-wash:rgba(183,211,75,.07);
+    --danger-text:#ff8a80; --danger-wash:rgba(255,107,107,.08);
+    --cyan-text:#7fe3d3; --cyan-wash:rgba(85,214,194,.08)}
   *{box-sizing:border-box}
   /* Inside Telegram the bot is the chat, and Telegram draws the frame:
      what is left is the trips. Hidden by the stylesheet rather than
@@ -39,7 +101,7 @@
   a:hover{text-decoration:underline}
   header{padding:24px 0 14px; display:flex; align-items:center; gap:14px;
     flex:none}
-  .mark{display:flex; align-items:center; gap:12px; color:var(--cyan,#2aa198)}
+  .mark{display:flex; align-items:center; gap:12px; color:var(--cyan)}
   .mark .logo{width:32px; height:32px; flex:none}
   .mark .word{font-size:18px; font-weight:700; color:var(--base2)}
   /* `min-height:0` is load-bearing: a flex child will not scroll unless it
@@ -60,7 +122,7 @@
      flex item refuses to shrink below its content without it. */
   .turns li{max-width:82%; min-width:0; padding:12px 16px; border-radius:14px;
     font-size:15px; white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.6}
-  .turns li.you{align-self:flex-end; background:#1c4f66; color:var(--base2)}
+  .turns li.you{align-self:flex-end; background:var(--you); color:var(--base2)}
   .turns li.scout{align-self:flex-start; background:var(--base02); color:var(--base1)}
   /* The trace under an answer: an admin's table, kept to the palette and
      to the bubble's width. Capped like the status box, for the same
@@ -83,9 +145,9 @@
   /* A run that failed with debug on keeps its bubble for the trace's
      sake; the words say why the bubble is otherwise empty. */
   .turns li.scout.failed .text{color:var(--base01); font-style:italic}
-  /* `#ff6e67` rather than `--red`, for the reason `.when.expiring` gives:
-     the palette's red fails at this size on a dark ground. */
-  .trace .chip.failed,.trace .row.event.failed{color:#ff6e67}
+  /* `--danger-text` rather than `--red`, for the reason `.when.expiring`
+     gives: the palette's red fails at this size on a dark ground. */
+  .trace .chip.failed,.trace .row.event.failed{color:var(--danger-text)}
   .trace .chip.running{color:var(--cyan)}
   .trace pre{margin:4px 0 8px 18px; white-space:pre-wrap; word-break:break-word; color:var(--base1)}
   /* The narration the model writes between tool calls, and it can run to
@@ -108,16 +170,16 @@
      grown past its cap.
      `color-scheme` above only swaps the browser's default light bar for
      its default grey one — this puts it in the page's own palette.
-     `#0d4a5a` is the line the composer is already drawn with, so the
+     `--line` is the line the composer is already drawn with, so the
      thumb reads as the same structural colour rather than a new one.
      Track transparent: on a page this dark a track is just a seam. */
   .turns,.status,.side,.ask textarea{scrollbar-width:thin;
-    scrollbar-color:#0d4a5a transparent}
+    scrollbar-color:var(--line) transparent}
   .notice{font-size:13.5px; color:var(--red); margin:0 0 10px; flex:none}
   .compose-target{font-size:12.5px; color:var(--base01); margin:0 0 6px; flex:none}
   .ask{flex:none; display:flex; align-items:flex-end; gap:8px;
     margin:0 0 20px; padding:8px 8px 8px 16px;
-    background:var(--base02); border:1px solid #0d4a5a; border-radius:16px;
+    background:var(--base02); border:1px solid var(--line); border-radius:16px;
     box-shadow:0 8px 28px rgba(0,0,0,.30)}
   .ask textarea{flex:1; border:0; background:transparent; color:var(--base2);
     font:inherit; padding:9px 0; resize:none; overflow-y:auto; max-height:200px}
@@ -126,7 +188,7 @@
   #send{flex:none; width:38px; height:38px; display:flex; align-items:center;
     justify-content:center; background:var(--blue); color:var(--base03);
     border:0; border-radius:11px; cursor:pointer}
-  #send:hover{background:#3196d8}
+  #send:hover{background:var(--blue-hover)}
   .controls{display:flex; align-items:center; gap:8px}
   /* One control vocabulary: the sidebar's New thread and the header's
      mirror toggle are drawn the same. */
@@ -159,21 +221,31 @@
      asks for `space-between` at all. */
   .mark{margin-right:auto}
   .view-tabs{display:flex; padding:3px; gap:2px; border:1px solid var(--line);
-    background:rgba(7,54,66,.68); border-radius:10px}
+    background:var(--card); border-radius:10px}
   .view-tabs button{border:0; border-radius:7px; padding:6px 12px; background:transparent;
     color:var(--base0); font:inherit; font-size:13px; font-weight:650; cursor:pointer}
   .view-tabs button:hover{color:var(--base2)}
-  .view-tabs button[aria-pressed="true"]{background:#124659; color:var(--base2);
+  .view-tabs button[aria-pressed="true"]{background:var(--pressed); color:var(--base2);
     box-shadow:0 1px 6px rgba(0,0,0,.22)}
   .view-tabs button:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
   .tab-count{display:inline-flex; min-width:18px; height:18px; margin-left:5px; padding:0 5px;
     align-items:center; justify-content:center; border-radius:9px; background:var(--base03);
     color:var(--base0); font-size:11px; line-height:1}
   [hidden]{display:none!important}
-  .side{min-height:0; overflow-y:auto; padding:4px 12px 16px 0; border-right:1px solid #0d4a5a}
+  .side{min-height:0; overflow-y:auto; padding:4px 12px 16px 0; border-right:1px solid var(--line)}
   .side .reset{margin:0 0 10px}
   .side .reset button{width:100%}
   .threads{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px}
+  /* The theme, at the foot of the threads: out of the header, which is
+     full on a phone, and pinned to the bottom of the column so a long
+     list of threads does not push it out of reach. The landing page has
+     the same select, and `theme.js` drives both. */
+  .theme-control{position:sticky; bottom:0; display:flex; align-items:center; justify-content:space-between;
+    gap:8px; margin-top:14px; padding:10px 10px 4px; border-top:1px solid var(--line);
+    background:var(--base03); color:var(--base0); font-size:12px; font-weight:650}
+  #theme-select{font:inherit; color:var(--base1); background:var(--base02); border:1px solid var(--line);
+    border-radius:7px; padding:5px 8px}
+  #theme-select:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   /* `min-width:0` again: without it a long title refuses to shrink and the
      row pushes the whole sidebar wider than its track. */
   .threads li{display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:8px 10px;
@@ -224,7 +296,7 @@
      the same warning and can actually be read. It also takes a line of its
      own under the row, so a warning long enough to be a sentence never
      competes with the title for the column's width. */
-  .threads .when.expiring{color:#ff6e67; font-weight:600; flex:0 0 100%; order:1}
+  .threads .when.expiring{color:var(--danger-text); font-weight:600; flex:0 0 100%; order:1}
   .threads .pin{flex:none; display:flex; color:var(--blue)}
   /* Pointing at a row trades its ambient metadata for its controls, the
      way a mail list does: 28px targets and a title cannot both fit a
@@ -292,7 +364,7 @@
   /* Allowed to wrap, unlike the name and route above it: this is the one
      line on the row that has to stay true on its own, without the Keep
      button beside it on the trip's own page to finish the sentence. */
-  .trip-list-draft{display:block; margin-top:3px; color:#d1c27e; font-size:11px; line-height:1.3}
+  .trip-list-draft{display:block; margin-top:3px; color:var(--warn-text); font-size:11px; line-height:1.3}
   .trip-detail{min-height:0; overflow-y:auto; padding:0 8px 32px 0;
     scrollbar-width:thin; scrollbar-color:var(--line) transparent}
   .trip-empty{min-height:100%; display:grid; place-items:center; text-align:center; padding:44px 24px;
@@ -310,12 +382,12 @@
     padding:6px 10px; border:1px solid var(--line); border-radius:999px; color:var(--base1);
     font-size:12px; font-weight:750; text-transform:capitalize}
   .status-chip::before{content:""; width:7px; height:7px; border-radius:50%; background:var(--yellow)}
-  .status-chip.finalised{color:#b8c76a; border-color:#596f2a}
+  .status-chip.finalised{color:var(--ok-text); border-color:var(--ok-line)}
   .status-chip.finalised::before{background:var(--green)}
   /* `.status-chip` capitalizes every word for the one-word statuses it was
      built for ("searching", "finalised"); this one is a sentence, and title
      case would make it read like a label rather than what it says. */
-  .status-chip.draft{color:#d1c27e; border-color:#6c5b1d; text-transform:none}
+  .status-chip.draft{color:var(--warn-text); border-color:var(--warn-line); text-transform:none}
   /* The control that makes the draft warning stop being true. Filled and
      blue like `.leg-add-row button` — the other place a press commits
      something to the trip, rather than the outlined, secondary look of
@@ -323,15 +395,15 @@
   .trip-keep{display:inline-flex; align-items:center; margin-top:5px;
     padding:7px 14px; border:0; border-radius:8px; background:var(--blue);
     color:var(--base03); cursor:pointer; font-size:12px; font-weight:750; white-space:nowrap}
-  .trip-keep:hover{background:#3196d8}
+  .trip-keep:hover{background:var(--blue-hover)}
   .trip-keep:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
   .trip-keep:disabled{cursor:wait; opacity:.72}
   .trip-download{display:inline-flex; align-items:center; gap:7px; margin-top:5px;
-    padding:7px 10px; border:1px solid var(--cyan); border-radius:8px; color:#6fc5bd;
+    padding:7px 10px; border:1px solid var(--cyan); border-radius:8px; color:var(--cyan-text);
     background:transparent; cursor:pointer; font-size:12px; font-weight:750;
     text-decoration:none; white-space:nowrap}
   .trip-download::before{content:"↓"; font-size:15px; line-height:1}
-  .trip-download:hover{background:rgba(42,161,152,.1); color:var(--base2); text-decoration:none}
+  .trip-download:hover{background:var(--cyan-wash); color:var(--base2); text-decoration:none}
   .trip-download:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
   .trip-download:disabled{cursor:wait; opacity:.72}
   /* Round and icon-only, unlike the two text pills beside it — see where
@@ -340,27 +412,27 @@
   .trip-delete-button{display:inline-grid; place-items:center; width:28px; height:28px;
     margin-top:5px; border:1px solid var(--line); border-radius:50%; background:transparent;
     color:var(--base01); font-size:17px; line-height:1; cursor:pointer}
-  .trip-delete-button:hover{color:#ff817a; border-color:var(--red)}
+  .trip-delete-button:hover{color:var(--danger-text); border-color:var(--red)}
   .trip-delete-button:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
   /* `.trip-alert`'s shape with `.join-card.danger`'s red border: this is a
      warning, not routine trip info, and needs to keep reading as one even
      though it sits in the same slot a routine alert could occupy. */
   .trip-delete-confirm{margin:0 0 18px; padding:12px 15px; border:1px solid var(--red);
-    border-radius:12px; background:rgba(220,50,47,.09)}
-  .trip-delete-confirm p{margin:0 0 11px; color:#ff817a; font-size:13.5px; line-height:1.5}
+    border-radius:12px; background:var(--danger-wash)}
+  .trip-delete-confirm p{margin:0 0 11px; color:var(--danger-text); font-size:13.5px; line-height:1.5}
   .trip-delete-confirm-row{display:flex; gap:8px}
   .trip-delete-confirm-row button{background:transparent; border:1px solid var(--line);
     border-radius:8px; color:var(--base1); font:inherit; font-size:12.5px; font-weight:650;
     padding:7px 12px; cursor:pointer}
   .trip-delete-confirm-row button:hover{color:var(--base2)}
   .trip-delete-confirm-row button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
-  /* `#ff817a`, not `--red`: the same shade `.segment-remove-confirm
+  /* `--danger-text`, not `--red`: the same shade `.segment-remove-confirm
      button.danger` and `.join-card.danger` already use because `--red` on
      this background fails contrast at this text size. */
-  .trip-delete-confirm-row button.danger{border-color:var(--red); color:#ff817a}
+  .trip-delete-confirm-row button.danger{border-color:var(--red); color:var(--danger-text)}
   .trip-delete-confirm-row button:disabled{opacity:.6; cursor:default}
   .trip-overview{margin-bottom:16px; padding:18px; border:1px solid var(--line); border-radius:16px;
-    background:linear-gradient(135deg,rgba(7,54,66,.95),rgba(5,45,55,.7));
+    background:linear-gradient(135deg,var(--overview-from),var(--overview-to));
     box-shadow:0 10px 32px rgba(0,0,0,.16)}
   .trip-overview-label{display:flex; justify-content:space-between; gap:12px; margin-bottom:16px;
     color:var(--base01); font-size:12px; font-weight:700; text-transform:uppercase;
@@ -397,7 +469,7 @@
   .day-entries{display:flex; flex-wrap:wrap; gap:6px; min-width:0; padding:2px 0}
   .day-chip{display:inline-block; max-width:100%; border:1px dashed var(--base01); border-radius:7px;
     padding:4px 8px; color:var(--base0); font-size:12px; text-decoration:none; overflow-wrap:anywhere}
-  .day-chip.held{border-style:solid; border-color:#3f682f; color:#b8c76a}
+  .day-chip.held{border-style:solid; border-color:var(--ok-line); color:var(--ok-text)}
   .day-chip:hover{border-color:var(--cyan); color:var(--base2)}
   .day-chip:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
   /* Today is a position in the trip, not a state of anything on it: the
@@ -421,9 +493,9 @@
   .segment-card, .item-card{scroll-margin-top:14px}
   .segment-card:focus-visible, .item-card:focus-visible{outline:2px solid var(--blue); outline-offset:2px}
   .trip-alert{display:block; margin:0 0 14px; padding:11px 13px;
-    border:1px solid #6c5b1d; border-radius:12px; background:rgba(181,137,0,.09);
-    color:#d1c27e; font-size:13px; line-height:1.45}
-  .trip-alert.ready{border-color:#3f682f; background:rgba(133,153,0,.08); color:#b8c76a}
+    border:1px solid var(--warn-line); border-radius:12px; background:var(--warn-wash);
+    color:var(--warn-text); font-size:13px; line-height:1.45}
+  .trip-alert.ready{border-color:var(--ok-line); background:var(--ok-wash); color:var(--ok-text)}
   .trip-alert strong{color:var(--base2); margin-right:.28em}
   /* The address in the banner is a thing to copy, so it looks like one. */
   .trip-alert code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; color:var(--base2);
@@ -437,7 +509,7 @@
      it — appending is the only insert this form offers, so it belongs where
      an appended leg would actually land. */
   .leg-add{margin-top:12px; padding:14px 16px; border:1px dashed var(--line); border-radius:16px;
-    background:rgba(7,54,66,.4)}
+    background:var(--card-soft)}
   .leg-add-title{margin:0 0 10px; color:var(--base01); font-size:11px; font-weight:800;
     letter-spacing:.1em; text-transform:uppercase}
   .leg-add-row{display:flex; flex-wrap:wrap; align-items:flex-end; gap:10px}
@@ -451,9 +523,9 @@
   .leg-add-row input:focus{outline:2px solid var(--blue); outline-offset:-1px}
   .leg-add-row button{flex:none; background:var(--blue); color:var(--base03); border:0;
     border-radius:9px; font:inherit; font-size:13px; font-weight:700; padding:9px 16px; cursor:pointer}
-  .leg-add-row button:hover{background:#3196d8}
+  .leg-add-row button:hover{background:var(--blue-hover)}
   .leg-add-row button:disabled{opacity:.6; cursor:default}
-  .segment-card, .item-card{border:1px solid var(--line); border-radius:16px; background:rgba(7,54,66,.62);
+  .segment-card, .item-card{border:1px solid var(--line); border-radius:16px; background:var(--card);
     overflow:hidden}
   /* A stay, an activity or a transport: the same box as a flight, but the
      head is the whole card — there are no options under it for the rule
@@ -477,7 +549,7 @@
   .item-state svg{flex:none}
   .item-state.held{border-style:solid; border-color:var(--green); color:var(--green)}
   .segment-head{display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
-    padding:15px 16px 13px; border-bottom:1px solid rgba(13,74,90,.75)}
+    padding:15px 16px 13px; border-bottom:1px solid var(--rule-soft)}
   .segment-kicker{margin:0 0 4px; color:var(--base01); font-size:11px; font-weight:800;
     letter-spacing:.1em; text-transform:uppercase}
   .segment-route{margin:0; color:var(--base2); font-size:22px; line-height:1.15}
@@ -492,7 +564,7 @@
   .item-menu-button{display:grid; place-items:center; width:32px; height:30px; padding:0;
     background:transparent; border:1px solid transparent; border-radius:8px; color:var(--base01); cursor:pointer}
   .item-menu-button:hover, .item-menu-button[aria-expanded="true"]{color:var(--base1);
-    border-color:var(--line); background:rgba(0,43,54,.55)}
+    border-color:var(--line); background:var(--menu-hover)}
   .item-menu-button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   /* A popover, so the UA's centred dialog box has to be undone: `inset`
      and `margin` go, and `placeMenu` writes `top` and `right`. */
@@ -506,9 +578,9 @@
   .item-menu-list button:focus-visible{background:var(--base02); color:var(--base2);
     outline:2px solid var(--blue); outline-offset:-2px}
   .item-menu-list button:disabled{opacity:.6; cursor:default}
-  /* `#ff817a` for the reason `.segment-remove-confirm button.danger` gives. */
-  .item-menu-list button.danger{color:#ff817a}
-  .item-menu-ask{margin:5px 11px 7px; color:#d1c27e; font-size:12px; font-weight:650}
+  /* `--danger-text` for the reason `.segment-remove-confirm button.danger` gives. */
+  .item-menu-list button.danger{color:var(--danger-text)}
+  .item-menu-ask{margin:5px 11px 7px; color:var(--warn-text); font-size:12px; font-weight:650}
   .item-menu-confirm{display:flex; gap:6px; padding:0 3px 3px}
   .item-menu-confirm button{flex:1; text-align:center; border:1px solid var(--line)}
   .item-menu-confirm button.danger{border-color:var(--red)}
@@ -531,35 +603,36 @@
   .item-checking{color:var(--base01); font-size:12px; font-style:italic; white-space:nowrap}
   /* The verdict when it is a warning: the yellow the readiness banner
      uses for "needs a decision", under the head where the eye already is. */
-  .item-warning{margin:0; padding:9px 16px; border-top:1px solid rgba(181,137,0,.35); background:rgba(181,137,0,.09);
-    color:#d1c27e; font-size:13px; line-height:1.45; overflow-wrap:anywhere}
+  .item-warning{margin:0; padding:9px 16px; border-top:1px solid var(--warn-edge); background:var(--warn-wash);
+    color:var(--warn-text); font-size:13px; line-height:1.45; overflow-wrap:anywhere}
   .day-chip.warn{border-color:var(--yellow)}
   .day-chip.warn::after{content:" !"; color:var(--yellow); font-weight:800}
   .day-row.drop .day-label{color:var(--cyan)}
   .day-row.drop .day-entries{outline:1px dashed var(--cyan); outline-offset:3px; border-radius:7px}
   .segment-remove-button{background:transparent; border:1px solid var(--line); border-radius:8px;
     color:var(--base01); font:inherit; font-size:12px; font-weight:650; padding:6px 10px; cursor:pointer}
-  .segment-remove-button:hover{color:#ff817a; border-color:var(--red)}
+  .segment-remove-button:hover{color:var(--danger-text); border-color:var(--red)}
   .segment-remove-button:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   /* The second click of the confirm-in-place flow described where
      `removeConfirmRow` is built: `window.confirm` blocks the whole page for
      one card's worth of destructive action, so the ask lives here instead,
      inline where the button it replaced was. */
-  .segment-remove-confirm{display:flex; align-items:center; gap:6px; color:#d1c27e; font-size:12px}
+  .segment-remove-confirm{display:flex; align-items:center; gap:6px; color:var(--warn-text); font-size:12px}
   .segment-remove-confirm button{background:transparent; border:1px solid var(--line); border-radius:8px;
     color:var(--base1); font:inherit; font-size:12px; font-weight:650; padding:5px 9px; cursor:pointer}
   .segment-remove-confirm button:hover{color:var(--base2)}
-  /* `#ff817a`, not `--red`: the same lighter shade `.join-card.danger` and
-     `.threads .when.expiring` already use, because `--red` on this
-     background is 2.8:1 and fails at this text size. */
-  .segment-remove-confirm button.danger{border-color:var(--red); color:#ff817a}
+  /* `--danger-text`, not `--red`: the same lighter shade `.join-card.danger`
+     and `.threads .when.expiring` already use, because `--red` on the dark
+     background is 2.8:1 and fails at this text size. Each theme gives it a
+     value that reads on its own ground. */
+  .segment-remove-confirm button.danger{border-color:var(--red); color:var(--danger-text)}
   .segment-remove-confirm button:disabled{opacity:.6; cursor:default}
   .option-list{display:flex; flex-direction:column}
   .flight-option{position:relative; display:grid; grid-template-columns:28px minmax(0,1fr) auto;
-    gap:12px; align-items:start; padding:15px 16px; cursor:pointer; border-bottom:1px solid rgba(13,74,90,.55)}
+    gap:12px; align-items:start; padding:15px 16px; cursor:pointer; border-bottom:1px solid var(--rule-soft)}
   .flight-option:last-child{border-bottom:0}
-  .flight-option:hover{background:rgba(18,70,89,.5)}
-  .flight-option.selected{background:rgba(42,161,152,.08); box-shadow:inset 3px 0 var(--cyan)}
+  .flight-option:hover{background:var(--row-hover)}
+  .flight-option.selected{background:var(--cyan-wash); box-shadow:inset 3px 0 var(--cyan)}
   .flight-option.saving{opacity:.58; pointer-events:none}
   .flight-option input{position:absolute; opacity:0; pointer-events:none}
   .option-radio{width:20px; height:20px; margin-top:2px; border:2px solid var(--base01);
@@ -586,8 +659,8 @@
   .track-rule::before{left:0}.track-rule::after{right:0}
   .flight-meta{display:flex; justify-content:center; gap:7px; flex-wrap:wrap;
     color:var(--base01); font-size:11px; line-height:1.35}
-  .stop-pill{color:#d1c27e}
-  .stop-pill.direct{color:#b8c76a}
+  .stop-pill{color:var(--warn-text)}
+  .stop-pill.direct{color:var(--ok-text)}
   .option-price{min-width:76px; text-align:right}
   .option-price strong{display:block; color:var(--base2); font-size:17px; line-height:1.2}
   .option-price span{display:block; margin-top:4px; color:var(--base01); font-size:10px;
@@ -596,16 +669,16 @@
   .join-card{display:flex; align-items:center; gap:11px; margin:0 16px; padding:10px 13px;
     border-left:2px solid var(--green); color:var(--base0); font-size:12.5px}
   .join-card::before{content:""; width:8px; height:8px; flex:none; border-radius:50%; background:var(--green)}
-  .join-card.warning{border-color:var(--yellow); color:#d1c27e}
+  .join-card.warning{border-color:var(--yellow); color:var(--warn-text)}
   .join-card.warning::before{background:var(--yellow)}
-  .join-card.danger{border-color:var(--red); color:#ff817a}
+  .join-card.danger{border-color:var(--red); color:var(--danger-text)}
   .join-card.danger::before{background:var(--red)}
   /* An arrival waiting on the timeline: the item's own box, dashed and in
      the warning colour, because it is not on the trip until the reader
      says so — a solid card would read as already added. */
-  .item-card.pending{border-style:dashed; border-color:var(--yellow); background:rgba(181,137,0,.06)}
+  .item-card.pending{border-style:dashed; border-color:var(--yellow); background:var(--warn-wash-soft)}
   .pending-mark{width:26px; height:26px; display:grid; place-items:center; border:1px dashed var(--yellow);
-    border-radius:50%; color:#d1c27e; font-size:13px; font-weight:800}
+    border-radius:50%; color:var(--warn-text); font-size:13px; font-weight:800}
   .pending-facts{margin:5px 0 0; color:var(--base0); font-size:12.5px}
   /* The files a booking arrived with. Chips, not bare text links: see
      `chat.js::attachmentLinks` for why they had to stop looking like the
@@ -636,12 +709,12 @@
   .attachment-links{margin:7px 0 0; display:flex; flex-wrap:wrap; gap:6px; font-size:12px}
   .attachment-links a{display:inline-flex; align-items:center; gap:6px; max-width:100%; min-width:0;
     padding:5px 9px; border:1px solid var(--line); border-radius:8px; background:transparent;
-    color:#6fc5bd; font-weight:650; text-decoration:none}
+    color:var(--cyan-text); font-weight:650; text-decoration:none}
   /* The glyph keeps its size while the name shrinks; the name is the one
      long unbreakable token, and it wraps inside the border. */
   .attachment-links a svg{flex:none}
   .attachment-links a span{min-width:0; overflow-wrap:anywhere}
-  .attachment-links a:hover{border-color:var(--cyan); background:rgba(42,161,152,.1); color:var(--base2);
+  .attachment-links a:hover{border-color:var(--cyan); background:var(--cyan-wash); color:var(--base2);
     text-decoration:none}
   .attachment-links a:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   .pending-actions{display:flex; gap:6px; flex-wrap:wrap; padding:0 16px 14px}
@@ -653,7 +726,7 @@
   .pending-actions button:focus-visible, .pending-picker button:focus-visible, .other-mail-add:focus-visible,
   .handle-row button:focus-visible, .handle-cancel:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   .pending-actions .pending-add{background:var(--blue); border-color:var(--blue); color:var(--base03)}
-  .pending-actions .pending-add:hover{background:#3196d8; color:var(--base03)}
+  .pending-actions .pending-add:hover{background:var(--blue-hover); color:var(--base03)}
   .pending-picker{display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:0 16px 14px;
     padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--base03)}
   .pending-picker-label{color:var(--base01); font-size:12px; margin-right:4px}
@@ -696,7 +769,7 @@
      Not a flex row like the confirm beside it: the confirm holds three
      short things that should stay on one line, this holds a sentence the
      server wrote, which has to be free to wrap at the aside's width. */
-  .other-mail-problem{min-width:0; color:#d1c27e; font-size:11px; text-align:right}
+  .other-mail-problem{min-width:0; color:var(--warn-text); font-size:11px; text-align:right}
   .other-mail-problem .other-mail-remove-button{margin-left:6px; vertical-align:middle}
   /* The address line closes the aside. The form is one row — input,
      domain, Save — and its hint is a sentence under it in the same place
@@ -728,13 +801,13 @@
   .handle-suffix{color:var(--base01); font-size:13px}
   .handle-save{flex:none; background:var(--blue); color:var(--base03); border:0; border-radius:9px;
     font:inherit; font-size:12.5px; font-weight:700; padding:8px 12px; cursor:pointer}
-  .handle-save:hover{background:#3196d8}
+  .handle-save:hover{background:var(--blue-hover)}
   .handle-save:disabled{opacity:.6; cursor:default}
-  .handle-hint{min-height:1.3em; margin:6px 0 0; color:#b8c76a; font-size:12px}
-  .handle-hint.problem{color:#d1c27e}
+  .handle-hint{min-height:1.3em; margin:6px 0 0; color:var(--ok-text); font-size:12px}
+  .handle-hint.problem{color:var(--warn-text)}
   .trip-toast{position:sticky; bottom:8px; z-index:4; width:max-content; max-width:calc(100% - 16px);
     margin:12px auto 0; padding:9px 13px; border:1px solid var(--line); border-radius:10px;
-    background:#001f27; color:var(--base1); box-shadow:0 8px 24px rgba(0,0,0,.35); font-size:13px}
+    background:var(--toast); color:var(--base1); box-shadow:0 8px 24px rgba(0,0,0,.35); font-size:13px}
   /* Below the two-column threshold the sidebar becomes a drawer: it stacks
      above the transcript rather than beside it, is out of the way until the
      menu button opens it, and is capped so it can never take the screen the
@@ -745,7 +818,7 @@
     .view-tabs{margin-right:auto}
     .mark{margin-right:0}
     .columns{display:flex; flex-direction:column; gap:0}
-    .side{display:none; border-right:0; border-bottom:1px solid #0d4a5a; max-height:40dvh; padding:0 0 8px}
+    .side{display:none; border-right:0; border-bottom:1px solid var(--line); max-height:40dvh; padding:0 0 8px}
     .side.open{display:block}
     .menu{display:block}
     /* One scroller, in reading order. The aside is a column beside the
@@ -767,7 +840,7 @@
     /* Narrow enough that the next trip shows an edge: a strip that ends
        flush with the screen looks like the whole list. */
     .trip-list li{flex:0 0 min(164px, 78%)}
-    .trip-list button{background:rgba(7,54,66,.5)}
+    .trip-list button{background:var(--card-soft)}
     /* `flex:none` on every one of these, or the column shrinks them to
        fit the screen it has and their content paints straight over
        whatever comes next: the mail section landed on top of the trip's
@@ -817,6 +890,9 @@
        the width said as well as the height — the padding alone leaves it
        38.6px against the 42px square the trip's own × keeps. */
     .other-mail-remove-button{min-height:42px; min-width:42px; padding:10px; font-size:16px}
+    /* 16px, not less: iOS zooms the page into a select whose text is
+       smaller, and leaves it zoomed. */
+    #theme-select{min-height:42px; font-size:16px}
     .trip-delete-button{width:42px; height:42px; font-size:20px}
     .trip-overview{padding:15px 12px}
     .trip-point{min-width:64px; flex:1}
@@ -882,6 +958,16 @@
       <button type="submit">New thread</button>
     </form>
     <ol id="threads" class="threads"></ol>
+    <label class="theme-control" for="theme-select">
+      Theme
+      <select id="theme-select">
+        <option value="system">System</option>
+        <option value="solarized-dark">Solarized dark</option>
+        <option value="solarized-light">Solarized light</option>
+        <option value="light">Light</option>
+        <option value="black">Black</option>
+      </select>
+    </label>
   </aside>
   <main class="main">
     <ol id="turns" class="turns"></ol>

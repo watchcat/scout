@@ -2199,4 +2199,107 @@ mod tests {
         let other = admitted(&core, "888").await;
         assert_eq!(today_note(&core, other, Some("October"), Some("2026-10-12")).await, None);
     }
+
+    /// The chat page's stylesheet, without its comments: the comments cite
+    /// the hex values they explain, and those are not colours in use.
+    fn chat_css() -> String {
+        let page = include_str!("../chat.html");
+        let mut css = page[page.find("<style>").unwrap()..page.find("</style>").unwrap()].to_string();
+        while let Some(open) = css.find("/*") {
+            let close = css[open..].find("*/").map(|at| open + at + 2).unwrap();
+            css.replace_range(open..close, "");
+        }
+        css
+    }
+
+    #[test]
+    fn every_theme_gives_the_chat_page_every_colour_it_uses() {
+        // A token a theme forgets falls through to the dark one, and a light
+        // page with one dark panel in it is the bug this exists for.
+        let page = include_str!("../chat.html");
+        let css = chat_css();
+        let mut used = std::collections::BTreeSet::new();
+        for (i, _) in css.match_indices("var(--") {
+            let rest = &css[i + 6..];
+            used.insert(rest[..rest.find([')', ',']).unwrap()].to_string());
+        }
+        for theme in THEMES {
+            let tokens = theme_tokens(page, theme);
+            for name in &used {
+                assert!(tokens.contains_key(name), "{theme} leaves --{name} to the dark theme");
+            }
+        }
+    }
+
+    #[test]
+    fn the_chat_page_has_no_colour_a_theme_cannot_reach() {
+        // Outside the theme rules, a colour is either a token or one of the
+        // two that are the same on every ground: a shadow's black, and the
+        // black a mask uses for "opaque".
+        let mut css = chat_css();
+        while let Some(start) = css.find(":root") {
+            let end = start + css[start..].find('}').unwrap() + 1;
+            css.replace_range(start..end, "");
+        }
+        let css = css.replace("rgba(0,0,0,", "").replace("#000 30px", "");
+        for (i, _) in css.match_indices('#') {
+            let hex: String = css[i + 1..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            assert!(hex.len() < 3, "a colour written in, not a token: #{hex}");
+        }
+        assert!(!css.contains("rgb("), "an rgb() colour written in, not a token");
+        assert!(!css.contains("rgba("), "an rgba() colour written in, not a token");
+    }
+
+    #[test]
+    fn the_chat_page_can_be_read_in_every_theme() {
+        let page = include_str!("../chat.html");
+        for theme in THEMES {
+            let t = theme_tokens(page, theme);
+            let c = |name: &str| t.get(name).unwrap_or_else(|| panic!("{theme} has no --{name}")).clone();
+            let bg = c("base03");
+            // (what it is, colour, behind, minimum)
+            let mut pairs = vec![
+                ("body text", c("base1"), bg.clone(), 4.5),
+                ("headings and names", c("base2"), bg.clone(), 4.5),
+                ("a warning, a draft, a stop", c("warn-text"), bg.clone(), 4.5),
+                ("held, finalised, direct", c("ok-text"), bg.clone(), 4.5),
+                ("a removal and its question", c("danger-text"), bg.clone(), 4.5),
+                ("a ticket chip and the PDF button", c("cyan-text"), bg.clone(), 4.5),
+                ("your own messages", c("base2"), c("you"), 4.5),
+                ("the toast", c("base1"), c("toast"), 4.5),
+            ];
+            // Two pairs the dark theme has always failed, and still does:
+            // the muted grey is 2.79:1 there and a button's dark label on
+            // its blue is 4.07:1. The new themes are held to the bar; the
+            // dark one is on the board to be brought up to it.
+            if theme != "solarized-dark" {
+                pairs.push(("muted text: dates, hints, counts", c("base01"), bg.clone(), 4.5));
+                pairs.push(("a button's label on its fill", c("base03"), c("blue"), 4.5));
+                pairs.push(("a button's label, hovered", c("base03"), c("blue-hover"), 4.5));
+            }
+            for (what, fg, back, need) in pairs {
+                let got = contrast(&fg, &back);
+                assert!(got >= need, "{theme} {what}: {fg} on {back} is {got:.2}:1, needs {need}:1");
+            }
+        }
+    }
+
+    #[test]
+    fn the_chat_page_takes_its_theme_before_it_paints_and_offers_the_picker() {
+        let page = include_str!("../chat.html");
+        let script = page.find(r#"<script src="/theme.js"></script>"#).expect("the chat page does not load theme.js");
+        assert!(script < page.find("<style>").unwrap(), "theme.js must run before the first paint");
+        let side = &page[page.find(r#"<aside id="side""#).unwrap()..];
+        let side = &side[..side.find("</aside>").unwrap()];
+        let system = side.find(r#"<option value="system">System</option>"#).expect("no System in the sidebar picker");
+        for theme in THEMES {
+            let at = side.find(&format!(r#"<option value="{theme}">"#)).unwrap_or_else(|| panic!("the sidebar picker has no {theme}"));
+            assert!(system < at);
+        }
+        // The Mini App's launch page follows Telegram's theme from the first
+        // frame too, which needs the same script ahead of its styles.
+        let launch = include_str!("../tg.html");
+        let script = launch.find(r#"<script src="/theme.js"></script>"#).expect("the launch page does not load theme.js");
+        assert!(script < launch.find("<style>").unwrap());
+    }
 }

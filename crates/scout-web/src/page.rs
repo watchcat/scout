@@ -201,22 +201,23 @@ mod tests {
     }
 
     #[test]
-    fn the_landing_page_offers_four_themes_and_persists_the_choice() {
+    fn the_landing_page_offers_four_themes_and_the_system_and_persists_the_choice() {
         let page = render(&Admission::Full, Visitor::NoAuth);
         assert!(page.contains(r#"<script src="/theme.js"></script>"#));
         assert!(page.contains(r#"<label class="theme-control" for="theme-select">"#));
+        // System first: it is the default, and the list should open on it.
+        let system = page.find(r#"<option value="system">System</option>"#).expect("no System option");
         for option in [
             r#"<option value="solarized-dark">Solarized dark</option>"#,
             r#"<option value="solarized-light">Solarized light</option>"#,
             r#"<option value="light">Light</option>"#,
             r#"<option value="black">Black</option>"#,
         ] {
-            assert!(page.contains(option), "the theme picker is missing {option}");
+            let at = page.find(option).unwrap_or_else(|| panic!("the theme picker is missing {option}"));
+            assert!(system < at, "System is not first");
         }
-
-        let script = include_str!("theme.js");
-        assert!(script.contains(r#"localStorage.getItem(storageKey)"#));
-        assert!(script.contains(r#"localStorage.setItem(storageKey, theme)"#));
+        // What the script does with them is `theme.test.mjs`'s to say; it
+        // runs the script the way the page does.
     }
 
     #[test]
@@ -471,6 +472,25 @@ mod tests {
                 );
             }
         }
+
+        // The pairs above prove the palettes are sound. They do not prove the
+        // rules reach for the right entries — reverting one rule to
+        // `base00` left this test green, which is the "passes for a
+        // different reason" failure. So: the two values that cannot carry
+        // text on the default ground must not be used as text.
+        let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+        assert!(
+            !css.contains("color:var(--base01)"),
+            "base01 is 2.79:1 on the solarized-dark background — it cannot carry text here"
+        );
+        // base00 is 3.37:1 there: under AA for body, over the 3:1 bar for
+        // large text. The headline's second line is the one place that holds.
+        assert_eq!(
+            css.matches("color:var(--base00)").count(),
+            1,
+            "base00 is only legible at display size; the headline is the one place for it"
+        );
     }
 
     #[test]

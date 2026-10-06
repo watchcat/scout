@@ -208,9 +208,11 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
     match auth {
         // The headers go on here rather than on the whole site because
         // this is the half that renders forms, sets cookies and embeds
-        // somebody else's script. The public page has no script tag, no
-        // input and nothing to steal, and a policy it does not need is a
-        // policy that gets loosened for a reason that was never about it.
+        // somebody else's script. The public page runs one script of its
+        // own — the theme picker, from `/theme.js` — and has one input, the
+        // picker's select; it posts nothing, sets no cookie and has nothing
+        // to steal, and a policy it does not need is a policy that gets
+        // loosened for a reason that was never about it.
         Some(auth) => {
             let mut signed_in = routes::auth::routes(auth.clone())
                 .merge(routes::account::routes(auth.clone()))
@@ -592,8 +594,10 @@ async fn icon() -> impl IntoResponse {
       (header::CACHE_CONTROL, "public, max-age=86400")], ICON)
 }
 
-/// Theme selection for the public landing page. Kept external so the page
-/// does not need to loosen the site's content security policy for inline JS.
+/// Theme selection for the public landing page. A file rather than an
+/// inline script: the landing page carries no content security policy
+/// today, and one like the signed-in half's (`script-src 'self'`, nothing
+/// inline) would leave this working unchanged.
 async fn theme_js() -> impl IntoResponse {
     const SCRIPT: &str = include_str!("theme.js");
     ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"),

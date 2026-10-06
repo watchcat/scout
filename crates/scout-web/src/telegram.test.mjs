@@ -110,3 +110,32 @@ test('the settings button is asked for, and a press is heard from either bridge 
   listeners.message({ origin: 'https://web.telegram.org', data: 'not json' })
   assert.deepEqual(heard, [['settings_button_pressed', {}], ['settings_button_pressed', {}]])
 })
+
+test('Telegram\'s colours read as light or dark by Telegram\'s own rule', () => {
+  const { telegramTheme } = telegramExports
+  assert.equal(telegramTheme('#ffffff'), 'solarized-light')
+  assert.equal(telegramTheme('17212b'), 'solarized-dark', 'with or without the #')
+  assert.equal(telegramTheme('#212121'), 'solarized-dark')
+  assert.equal(telegramTheme('#7f7f7f'), 'solarized-light', 'Telegram\'s line is a perceived brightness of 120')
+  assert.equal(telegramTheme('blue'), null)
+  assert.equal(telegramTheme(undefined), null)
+})
+
+test('Telegram\'s frame is painted the page\'s own ground, whichever theme that is', () => {
+  const { paintTelegramFrame, TELEGRAM_GROUND } = telegramExports
+  const sent = []
+  const app = {
+    TelegramWebviewProxy: { postEvent: (t, d) => sent.push([t, JSON.parse(d).color]) },
+    document: { documentElement: {} },
+    getComputedStyle: () => ({ getPropertyValue: (name) => (name === '--base03' ? ' #fdf6e3' : '') }),
+  }
+  app.parent = app
+  paintTelegramFrame(app)
+  assert.deepEqual(sent, [['web_app_set_header_color', '#fdf6e3'], ['web_app_set_background_color', '#fdf6e3']])
+  // No ground to read: the dark one, as before themes.
+  const bare = { TelegramWebviewProxy: { postEvent: (t, d) => sent.push([t, JSON.parse(d).color]) } }
+  bare.parent = bare
+  sent.length = 0
+  paintTelegramFrame(bare)
+  assert.deepEqual(sent.map(([, color]) => color), [TELEGRAM_GROUND, TELEGRAM_GROUND])
+})

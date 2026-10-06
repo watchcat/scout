@@ -10,6 +10,7 @@ _(nothing)_
 
 ## Next
 
+- [ ] **The dark theme's two failing contrasts** — on the chat page in Solarized dark, the muted grey (`--base01`, dates, hints, counts) is 2.79:1 and a button's dark label on its blue is 4.07:1; the three other themes pass both, and `the_chat_page_can_be_read_in_every_theme` exempts the dark theme from these two pairs only. Lift the two values until they read, then drop the exemption. The landing page's orange "Currently full" pill is the same kind of miss, about 3:1
 - [ ] **Show the stored mail text** — the Other-mail row's click shows the message text and attachments (stored, capped at 512 KB, not yet served)
 - [ ] **Retention for the rest** — `outbox` never deletes sent rows, `request_log` never prunes; two DELETEs in `run_maintenance` next to the thread expiry
 - [ ] **CI** — `.github/workflows`: `cargo test`, `cargo clippy -D warnings`, `cargo audit`, `node --test 'crates/scout-web/src/*.test.mjs'`, cached with `Swatinem/rust-cache`

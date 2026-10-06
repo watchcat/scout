@@ -368,51 +368,14 @@ mod tests {
         assert!(css.contains("hover:hover"), "hover is not gated to devices that have one");
     }
 
-    /// Relative luminance, per WCAG 2.1.
-    fn luminance(hex: &str) -> f64 {
-        let v = |i: usize| {
-            let c = u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0;
-            if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
-        };
-        0.2126 * v(1) + 0.7152 * v(3) + 0.0722 * v(5)
-    }
+    use crate::tests::contrast;
 
-    fn contrast(a: &str, b: &str) -> f64 {
-        let (la, lb) = (luminance(a), luminance(b));
-        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-    }
-
-    /// The color tokens declared by one theme's root rule.
+    /// The `#rrggbb` colour tokens one theme declares on the landing page.
     fn palette(theme: &str) -> std::collections::HashMap<String, String> {
-        let css = include_str!("index.html");
-        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
-        let selector = match theme {
-            "solarized-dark" => ":root{",
-            "solarized-light" => ":root[data-theme=\"solarized-light\"]{",
-            "light" => ":root[data-theme=\"light\"]{",
-            "black" => ":root[data-theme=\"black\"]{",
-            _ => panic!("unknown theme: {theme}"),
-        };
-        let start = css.find(selector).unwrap_or_else(|| panic!("no CSS rule for {theme}"));
-        let block_start = start + selector.len();
-        let block_end = block_start + css[block_start..].find('}').expect("theme rule closes");
-        let block = &css[block_start..block_end];
-        let mut out = std::collections::HashMap::new();
-        for (i, _) in block.match_indices("--") {
-            let rest = &block[i + 2..];
-            let Some(colon) = rest.find(':') else { continue };
-            let name = &rest[..colon];
-            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                continue;
-            }
-            let value = rest[colon + 1..].trim_start();
-            if value.starts_with('#') && value.len() >= 7
-                && value[1..7].chars().all(|c| c.is_ascii_hexdigit())
-            {
-                out.insert(name.to_string(), value[..7].to_string());
-            }
-        }
-        out
+        crate::tests::theme_tokens(include_str!("index.html"), theme)
+            .into_iter()
+            .filter(|(_, value)| value.len() == 7 && value.starts_with('#'))
+            .collect()
     }
 
     #[test]

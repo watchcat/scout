@@ -1,7 +1,10 @@
 // The chat page's client. Pure helpers first (exported for
 // `chat.test.mjs`), then the DOM wiring that uses them.
 
-import { settleIntoTelegram, clearExchanged, openOutside, listenToTelegram, showSettingsButton } from './telegram.js'
+import {
+  settleIntoTelegram, clearExchanged, openOutside, listenToTelegram, showSettingsButton,
+  telegramEvent, telegramTheme, paintTelegramFrame, TELEGRAM_SCHEME_KEY,
+} from './telegram.js'
 
 /// Moves accumulated text forward by one `TextUpdate`. The counterpart of
 /// `TextUpdate::apply` in scout-api, and the reason it exists at all: a
@@ -3132,6 +3135,16 @@ function start() {
       .catch(() => showTripToast('Could not copy. Select the address and copy it by hand.'))
   }
 
+  // Telegram's theme, switched while the Mini App is open: the page, the
+  // frame Telegram draws above it, and the answer kept for a reload.
+  function followTelegramTheme(params) {
+    const theme = telegramTheme(params?.bg_color)
+    if (!theme) return
+    document.documentElement.dataset.theme = theme
+    try { window.sessionStorage.setItem(TELEGRAM_SCHEME_KEY, theme) } catch { /* this page is right regardless */ }
+    paintTelegramFrame()
+  }
+
   // Opens the address for editing and brings it on screen — the ⋯ menu
   // Telegram draws over the Mini App is where "Settings" lives, and the
   // address is the one setting this page has.
@@ -4404,9 +4417,13 @@ function start() {
   // named — "Open trip" under a reply — chosen before the list arrives.
   if (inTelegram) {
     settleIntoTelegram()
-    listenToTelegram((eventType) => {
+    listenToTelegram((eventType, eventData) => {
       if (eventType === 'settings_button_pressed') editAddress()
+      if (eventType === 'theme_changed') followTelegramTheme(eventData?.theme_params)
     })
+    // Asked once, so a theme switched while the launch page was loading is
+    // not missed; Telegram answers with `theme_changed`.
+    telegramEvent('web_app_request_theme')
     try { clearExchanged(window.sessionStorage) } catch { /* no loop guard to clear */ }
     currentTrip = new URLSearchParams(location.search).get('trip') || null
     document.addEventListener('click', leaveTelegramByLink)

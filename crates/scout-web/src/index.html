@@ -10,8 +10,10 @@
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
+<script src="/theme.js"></script>
 <style>
   :root{
+    color-scheme:dark;
     --base03:#002b36; --base02:#073642; --base01:#586e75; --base00:#657b83;
     --base0:#839496; --base1:#93a1a1; --base2:#eee8d5; --base3:#fdf6e3;
     --yellow:#b58900; --orange:#cb4b16; --red:#dc322f; --magenta:#d33682;
@@ -40,6 +42,34 @@
        green and orange measure 4.06 and 2.82 on the board's surface;
        these are the same hues lifted until they read. */
     --unit:#93a800; --ship:#eb7a45;
+    --button-text:#002b36;
+  }
+  :root[data-theme="solarized-light"]{
+    color-scheme:light;
+    --base03:#fdf6e3; --base02:#eee8d5; --base01:#586e75; --base00:#657b83;
+    --base0:#526773; --base1:#526773; --base2:#073642; --base3:#002b36;
+    --yellow:#8a6500; --orange:#a13f0f; --red:#c52d2a; --magenta:#a52f70;
+    --violet:#585eaf; --blue:#006da8; --cyan:#08716b; --green:#536800;
+    --rule:#c9c1ad; --link:#006da8; --link-hover:#005985;
+    --unit:#536800; --ship:#a13f0f; --button-text:#ffffff;
+  }
+  :root[data-theme="light"]{
+    color-scheme:light;
+    --base03:#ffffff; --base02:#f2f4f7; --base01:#667085; --base00:#475467;
+    --base0:#475467; --base1:#344054; --base2:#101828; --base3:#101828;
+    --yellow:#855500; --orange:#b54708; --red:#b42318; --magenta:#a11067;
+    --violet:#6941c6; --blue:#175cd3; --cyan:#087681; --green:#4b6900;
+    --rule:#d0d5dd; --link:#175cd3; --link-hover:#1849a9;
+    --unit:#4b6900; --ship:#b54708; --button-text:#ffffff;
+  }
+  :root[data-theme="black"]{
+    color-scheme:dark;
+    --base03:#000000; --base02:#111315; --base01:#a4aab2; --base00:#a4aab2;
+    --base0:#c1c7d0; --base1:#e6e8eb; --base2:#f4f5f6; --base3:#ffffff;
+    --yellow:#f5c542; --orange:#ff8a4c; --red:#ff6b6b; --magenta:#f472b6;
+    --violet:#a5a6ff; --blue:#63b3ff; --cyan:#55d6c2; --green:#b7d34b;
+    --rule:#343a40; --link:#63b3ff; --link-hover:#8cc9ff;
+    --unit:#b7d34b; --ship:#ff9a62; --button-text:#000000;
   }
   *{box-sizing:border-box}
   body{
@@ -58,6 +88,8 @@
      brings its own 32px, and the section below brings another 32. Three
      spacings stacked to ninety-odd pixels of nothing under the gate. */
   header{padding:var(--s-8) 0 0}
+  .topbar{display:flex; align-items:center; justify-content:space-between;
+    flex-wrap:wrap; gap:var(--s-4); margin-bottom:var(--s-5)}
   /* The lockup: the mark at display size, wordmark beside it. Two things
      it deliberately does not do. It does not carry the tile the .svg ships
      with — that tile is a near-black green, and against the solarized
@@ -65,11 +97,15 @@
      does not thin its strokes for the larger size: lightening them looked
      delicate next to a 700-weight wordmark, and a mark that changes shape
      with its size is two marks. The geometry here is icon.svg's, untouched. */
-  .mark{display:flex; align-items:center; gap:var(--s-4); margin-bottom:var(--s-5);
+  .mark{display:flex; align-items:center; gap:var(--s-4);
     color:var(--cyan)}
   .mark .logo{width:96px; height:96px; flex:none}
   .mark .word{font-size:var(--t-word); font-weight:700; letter-spacing:-.01em;
     color:var(--base2)}
+  .theme-control{display:flex; align-items:center; gap:var(--s-2);
+    color:var(--base0); font-size:var(--t-xs); font-weight:600}
+  #theme-select{font:inherit; color:var(--base1); background:var(--base02);
+    border:1px solid var(--rule); border-radius:4px; padding:var(--s-2) var(--s-3)}
   h1{font-size:var(--t-display); line-height:1.15; margin:0 0 var(--s-4); color:var(--base2);
     font-weight:700; letter-spacing:-.02em}
   /* base00, not base0: at 44px this is large text, which needs 3:1 rather
@@ -114,7 +150,7 @@
   .pill.full{background:rgba(203,75,22,.14); color:var(--orange); border:1px solid rgba(203,75,22,.35)}
   .dot{width:7px; height:7px; border-radius:50%; background:currentColor}
   .gate p{margin:0; flex:1; min-width:220px; font-size:var(--t-sm)}
-  .btn{background:var(--link); color:var(--base03); font-weight:650;
+  .btn{background:var(--link); color:var(--button-text); font-weight:650;
     font-size:var(--t-sm); padding:var(--s-3) var(--s-5); border-radius:5px;
     border:0; white-space:nowrap}
   .btn.ghost{background:transparent; color:var(--base1); border:1px solid var(--base01)}
@@ -125,7 +161,7 @@
   /* A keyboard visitor has to be able to see where they are. The primary
      call to action is a link with no underline inside a borderless button,
      so before this there was nothing but the browser default to go on. */
-  a:focus-visible,.btn:focus-visible{outline:2px solid var(--link);
+  a:focus-visible,.btn:focus-visible,#theme-select:focus-visible{outline:2px solid var(--link);
     outline-offset:2px; border-radius:3px}
   /* Gated: on a touch device hover fires on tap and then sticks, so the
      Telegram button stayed lit after it had been pressed. */
@@ -236,7 +272,7 @@
     .board .row>:nth-child(2){grid-area:2 / 2; justify-self:end}
     .board .shop{display:block}
     .board .size{display:block; font-size:.92em}
-    .mark{gap:var(--s-3); margin-bottom:var(--s-4)}
+    .mark{gap:var(--s-3)}
     .mark .logo{width:66px; height:66px}
     .cols{grid-template-columns:1fr; gap:var(--s-4)}
     .feature-proof{grid-template-columns:1fr; gap:var(--s-4)}
@@ -252,17 +288,28 @@
 <div class="wrap">
 
 <header>
-  <div class="mark">
-    <svg class="logo" viewBox="0 0 72 72" aria-hidden="true">
-      <g fill="none" stroke="currentColor">
-        <circle cx="23.5" cy="36" r="11.5" stroke-width="3.2"/>
-        <circle cx="48.5" cy="36" r="11.5" stroke-width="3.2"/>
-        <circle cx="23.5" cy="36" r="4" stroke-width="2.6"/>
-        <circle cx="48.5" cy="36" r="4" stroke-width="2.6"/>
-      </g>
-      <rect x="34" y="33.4" width="4" height="5.2" fill="currentColor"/>
-    </svg>
-    <span class="word">Scout</span>
+  <div class="topbar">
+    <div class="mark">
+      <svg class="logo" viewBox="0 0 72 72" aria-hidden="true">
+        <g fill="none" stroke="currentColor">
+          <circle cx="23.5" cy="36" r="11.5" stroke-width="3.2"/>
+          <circle cx="48.5" cy="36" r="11.5" stroke-width="3.2"/>
+          <circle cx="23.5" cy="36" r="4" stroke-width="2.6"/>
+          <circle cx="48.5" cy="36" r="4" stroke-width="2.6"/>
+        </g>
+        <rect x="34" y="33.4" width="4" height="5.2" fill="currentColor"/>
+      </svg>
+      <span class="word">Scout</span>
+    </div>
+    <label class="theme-control" for="theme-select">
+      Theme
+      <select id="theme-select">
+        <option value="solarized-dark">Solarized dark</option>
+        <option value="solarized-light">Solarized light</option>
+        <option value="light">Light</option>
+        <option value="black">Black</option>
+      </select>
+    </label>
   </div>
   <h1>Finds the actual cheapest —<br><em>and shows you the arithmetic.</em></h1>
   <p class="lede">

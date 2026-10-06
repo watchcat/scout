@@ -188,6 +188,7 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
         // down for a reason the site does not have.
         .route("/healthz", get(healthz))
         .route("/icon.svg", get(icon))
+        .route("/theme.js", get(theme_js))
         .route("/assets/trips-desktop.webp", get(trips_desktop))
         .route("/assets/trips-mobile.webp", get(trips_mobile))
         .route("/robots.txt", get(robots))
@@ -589,6 +590,14 @@ async fn icon() -> impl IntoResponse {
     const ICON: &str = include_str!("icon.svg");
     ([(header::CONTENT_TYPE, "image/svg+xml"),
       (header::CACHE_CONTROL, "public, max-age=86400")], ICON)
+}
+
+/// Theme selection for the public landing page. Kept external so the page
+/// does not need to loosen the site's content security policy for inline JS.
+async fn theme_js() -> impl IntoResponse {
+    const SCRIPT: &str = include_str!("theme.js");
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+      (header::CACHE_CONTROL, "public, max-age=86400")], SCRIPT)
 }
 
 /// Product screenshots used by the landing page and README. They are renders
@@ -1245,6 +1254,13 @@ mod tests {
             .await.unwrap();
         assert_eq!(icon.status(), StatusCode::OK);
         assert_eq!(icon.headers()["content-type"], "image/svg+xml");
+
+        let theme = app.clone()
+            .oneshot(Request::builder().uri("/theme.js").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(theme.status(), StatusCode::OK);
+        assert_eq!(theme.headers()["content-type"], "text/javascript; charset=utf-8");
+        assert_eq!(theme.headers()["cache-control"], "public, max-age=86400");
 
         for path in ["/assets/trips-desktop.webp", "/assets/trips-mobile.webp"] {
             let shot = app.clone()

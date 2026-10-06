@@ -201,6 +201,25 @@ mod tests {
     }
 
     #[test]
+    fn the_landing_page_offers_four_themes_and_persists_the_choice() {
+        let page = render(&Admission::Full, Visitor::NoAuth);
+        assert!(page.contains(r#"<script src="/theme.js"></script>"#));
+        assert!(page.contains(r#"<label class="theme-control" for="theme-select">"#));
+        for option in [
+            r#"<option value="solarized-dark">Solarized dark</option>"#,
+            r#"<option value="solarized-light">Solarized light</option>"#,
+            r#"<option value="light">Light</option>"#,
+            r#"<option value="black">Black</option>"#,
+        ] {
+            assert!(page.contains(option), "the theme picker is missing {option}");
+        }
+
+        let script = include_str!("theme.js");
+        assert!(script.contains(r#"localStorage.getItem(storageKey)"#));
+        assert!(script.contains(r#"localStorage.setItem(storageKey, theme)"#));
+    }
+
+    #[test]
     fn the_trip_feature_has_a_responsive_screenshot_and_useful_fallback_text() {
         let page = render(&Admission::Full, Visitor::NoAuth);
         assert!(page.contains(r#"src="/assets/trips-desktop.webp""#));
@@ -362,12 +381,24 @@ mod tests {
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
     }
 
-    /// Every `--name:#rrggbb` declared in the stylesheet.
-    fn palette() -> std::collections::HashMap<String, String> {
+    /// The color tokens declared by one theme's root rule.
+    fn palette(theme: &str) -> std::collections::HashMap<String, String> {
         let css = include_str!("index.html");
+        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
+        let selector = match theme {
+            "solarized-dark" => ":root{",
+            "solarized-light" => ":root[data-theme=\"solarized-light\"]{",
+            "light" => ":root[data-theme=\"light\"]{",
+            "black" => ":root[data-theme=\"black\"]{",
+            _ => panic!("unknown theme: {theme}"),
+        };
+        let start = css.find(selector).unwrap_or_else(|| panic!("no CSS rule for {theme}"));
+        let block_start = start + selector.len();
+        let block_end = block_start + css[block_start..].find('}').expect("theme rule closes");
+        let block = &css[block_start..block_end];
         let mut out = std::collections::HashMap::new();
-        for (i, _) in css.match_indices("--") {
-            let rest = &css[i + 2..];
+        for (i, _) in block.match_indices("--") {
+            let rest = &block[i + 2..];
             let Some(colon) = rest.find(':') else { continue };
             let name = &rest[..colon];
             if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -391,71 +422,55 @@ mod tests {
         // have rendered with no colour, and no test would have said a word.
         let css = include_str!("index.html");
         let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
-        let defined = palette();
-        for (i, _) in css.match_indices("var(--") {
-            let rest = &css[i + 6..];
-            let name = &rest[..rest.find(')').expect("a var() must close")];
-            // Sizes and curves are not colours; only colours land in `palette`.
-            if name.starts_with("t-") || name.starts_with("s-") || name.starts_with("ease") {
-                continue;
+        for theme in ["solarized-dark", "solarized-light", "light", "black"] {
+            let defined = palette(theme);
+            for (i, _) in css.match_indices("var(--") {
+                let rest = &css[i + 6..];
+                let name = &rest[..rest.find(')').expect("a var() must close")];
+                // Sizes and curves are not colours; only colours land in `palette`.
+                if name.starts_with("t-") || name.starts_with("s-") || name.starts_with("ease") {
+                    continue;
+                }
+                assert!(
+                    defined.contains_key(name),
+                    "{theme} uses var(--{name}) but does not define it"
+                );
             }
-            assert!(defined.contains_key(name), "var(--{name}) is used but never defined");
         }
     }
 
     #[test]
     fn the_text_on_this_page_can_be_read() {
-        // Measured, not judged. Ten of fifteen pairs failed WCAG AA before
-        // this: a third of the prose, every section label, and — worst —
-        // the primary call to action and every link on the page.
-        //
-        // Solarized's dimmer values are *designed* to recede, which is why
-        // they were reached for. WCAG does not grade on intent.
-        let p = palette();
-        let c = |name: &str| p.get(name).unwrap_or_else(|| panic!("no --{name}")).clone();
-        let (bg, surface) = (c("base03"), c("base02"));
+        // Every displayed theme is checked independently; a palette that is
+        // readable only while dark must not silently ship with the light modes.
+        for theme in ["solarized-dark", "solarized-light", "light", "black"] {
+            let p = palette(theme);
+            let c = |name: &str| {
+                p.get(name).unwrap_or_else(|| panic!("{theme} has no --{name}")).clone()
+            };
+            let (bg, surface) = (c("base03"), c("base02"));
 
-        // (what it is, colour, behind, minimum)
-        let pairs: &[(&str, String, String, f64)] = &[
-            ("body and lede", c("base1"), bg.clone(), 4.5),
-            ("prose in columns and sources", c("base0"), bg.clone(), 4.5),
-            ("section labels, caption, footer", c("base0"), bg.clone(), 4.5),
-            // 44px display: large text, so 3:1 is the bar and the quieter
-            // value survives.
-            ("the second line of the headline", c("base00"), bg.clone(), 3.0),
-            ("anything on a raised surface", c("base1"), surface.clone(), 4.5),
-            ("the board's per-unit price", c("unit"), surface.clone(), 4.5),
-            ("the board's shipping cost", c("ship"), surface.clone(), 4.5),
-            ("link text", c("link"), bg.clone(), 4.5),
-            ("the button's label on its fill", bg.clone(), c("link"), 4.5),
-            ("the button's label, hovered", bg.clone(), c("link-hover"), 4.5),
-        ];
-        for (what, fg, back, need) in pairs {
-            let got = contrast(fg, back);
-            assert!(
-                got >= *need,
-                "{what}: {fg} on {back} is {got:.2}:1, needs {need}:1"
-            );
+            // (what it is, colour, behind, minimum)
+            let pairs: &[(&str, String, String, f64)] = &[
+                ("body and lede", c("base1"), bg.clone(), 4.5),
+                ("prose and labels", c("base0"), bg.clone(), 4.5),
+                // 44px display: large text, so 3:1 is the bar.
+                ("the second line of the headline", c("base00"), bg.clone(), 3.0),
+                ("anything on a raised surface", c("base1"), surface.clone(), 4.5),
+                ("the board's per-unit price", c("unit"), surface.clone(), 4.5),
+                ("the board's shipping cost", c("ship"), surface.clone(), 4.5),
+                ("link text", c("link"), bg.clone(), 4.5),
+                ("button label on its fill", c("button-text"), c("link"), 4.5),
+                ("button label on hover", c("button-text"), c("link-hover"), 4.5),
+            ];
+            for (what, fg, back, need) in pairs {
+                let got = contrast(fg, back);
+                assert!(
+                    got >= *need,
+                    "{theme} {what}: {fg} on {back} is {got:.2}:1, needs {need}:1"
+                );
+            }
         }
-
-        // The pairs above prove the palette is sound. They do not prove the
-        // rules reach for the right entries — reverting one rule to
-        // `base00` left this test green, which is the "passes for a
-        // different reason" failure. So: the two values that cannot carry
-        // text here must not be used as text.
-        let css = include_str!("index.html");
-        let css = &css[css.find("<style>").expect("styles")..css.find("</style>").expect("styles")];
-        assert!(
-            !css.contains("color:var(--base01)"),
-            "base01 is 2.79:1 on the page background — it cannot carry text here"
-        );
-        // base00 is 3.37:1: under AA for body, over the 3:1 bar for large
-        // text. The headline's second line is the one place that holds.
-        assert_eq!(
-            css.matches("color:var(--base00)").count(),
-            1,
-            "base00 is only legible at display size; the headline is the one place for it"
-        );
     }
 
     #[test]

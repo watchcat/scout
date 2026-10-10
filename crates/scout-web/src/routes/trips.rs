@@ -184,12 +184,15 @@ async fn delete_trip(
     }
 
     match scout_core::trips::delete(&auth.core, account_id, &body.trip).await {
-        Ok(Some(remaining)) => axum::Json(remaining).into_response(),
+        Ok(scout_core::trips::Deletion::Deleted(remaining)) => axum::Json(remaining).into_response(),
         // Somebody else's trip and a name nobody used are the same answer,
         // for the reason `keep` gives: a 403 would confirm the trip exists.
         // A second press on a tab that has not repainted lands here too,
         // and "already gone" is the state that press wanted.
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(scout_core::trips::Deletion::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        // On the trip, so knowing it exists is no news; only its owner can
+        // take it from everyone.
+        Ok(scout_core::trips::Deletion::NotOwner(_)) => StatusCode::FORBIDDEN.into_response(),
         Err(e) => {
             tracing::error!(error = %e, account_id, "could not delete a trip");
             sorry()

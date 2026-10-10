@@ -199,18 +199,30 @@ pub async fn keep(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Op
 /// reached only by `trip_id`, so a row left behind after the trip is gone
 /// is unreachable by every read path there is and stays in the database
 /// forever.
-pub async fn delete(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Option<Vec<Plan>>> {
+pub async fn delete(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Deletion> {
     let store = core.store();
     let owned = name.to_string();
     // Scoped to the account in the store, like every other lookup by name
     // here: two accounts can both have an "Atlantic loop", and this is the
     // one write where reaching the wrong one destroys it.
-    if !blocking(move || store.delete_trip(account_id, &owned)).await? {
-        return Ok(None);
+    match blocking(move || store.delete_trip(account_id, &owned)).await? {
+        // Through `list` rather than a second query shape, so a client that
+        // repaints from this answer sees exactly what reloading would show.
+        crate::store::TripDeleted::Deleted => list(core, account_id).await.map(Deletion::Deleted),
+        crate::store::TripDeleted::NotFound => Ok(Deletion::NotFound),
+        crate::store::TripDeleted::NotOwner { owner } => Ok(Deletion::NotOwner(owner)),
     }
-    // Through `list` rather than a second query shape, so a client that
-    // repaints from this answer sees exactly what reloading would show.
-    list(core, account_id).await.map(Some)
+}
+
+/// What `delete` did, for a page to answer with.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Deletion {
+    /// Gone; the trips the account still reaches, to repaint from.
+    Deleted(Vec<Plan>),
+    NotFound,
+    /// Shared with this account, owned by someone else, whose name this is
+    /// when the trip has one for them.
+    NotOwner(Option<String>),
 }
 
 /// Select one of the already parked candidate flights on a segment.
@@ -1027,10 +1039,9 @@ mod tests {
         seed_trip_for_tests(&core, account_id, "October").await.unwrap();
         seed_trip_for_tests(&core, account_id, "Atlantic loop").await.unwrap();
 
-        let left = delete(&core, account_id, "october")
-            .await
-            .unwrap()
-            .expect("a trip this account has is deleted, found by a lower-cased name");
+        let Deletion::Deleted(left) = delete(&core, account_id, "october").await.unwrap() else {
+            panic!("a trip this account has is deleted, found by a lower-cased name");
+        };
         assert_eq!(
             left.iter().map(|p| p.trip.name.as_str()).collect::<Vec<_>>(),
             vec!["Atlantic loop"],
@@ -1050,7 +1061,7 @@ mod tests {
 
         assert_eq!(
             delete(&core, account_id, "a trip nobody made").await.unwrap(),
-            None,
+            Deletion::NotFound,
             "a name nobody used is nothing to delete, not an error",
         );
         assert_eq!(list(&core, account_id).await.unwrap().len(), 1);
@@ -1069,7 +1080,9 @@ mod tests {
         // must not be what deletes the owner's.
         seed_trip_for_tests(&core, stranger, "Atlantic loop").await.unwrap();
 
-        let left = delete(&core, stranger, "Atlantic loop").await.unwrap().unwrap();
+        let Deletion::Deleted(left) = delete(&core, stranger, "Atlantic loop").await.unwrap() else {
+            panic!("the stranger's own trip is theirs to delete");
+        };
         assert!(left.is_empty(), "the stranger deleted their own and has none left");
 
         let owned = list(&core, owner).await.unwrap();
@@ -1082,7 +1095,7 @@ mod tests {
         );
 
         // Now that the stranger has none, the name is not theirs to delete.
-        assert_eq!(delete(&core, stranger, "Atlantic loop").await.unwrap(), None);
+        assert_eq!(delete(&core, stranger, "Atlantic loop").await.unwrap(), Deletion::NotFound);
         assert_eq!(list(&core, owner).await.unwrap().len(), 1);
     }
 

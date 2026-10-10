@@ -721,6 +721,17 @@ pub enum CandidateChoice {
     CandidateNotFound,
 }
 
+/// What asking to delete a trip did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TripDeleted {
+    Deleted,
+    /// No trip of that name that this account reaches — mistyped, or
+    /// already gone, which is the state the caller wanted.
+    NotFound,
+    /// A shared trip this account is on but does not own.
+    NotOwner { owner: Option<String> },
+}
+
 /// What became of a move asked from the page.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Moved {
@@ -1744,6 +1755,13 @@ impl Store {
     /// DuckDB will not start another inside. It is rolled back on recovery;
     /// when there is none the `ROLLBACK` errors, and that error is the
     /// uninteresting one.
+    /// The connection, for a test in another module to set up rows no
+    /// public method writes yet.
+    #[cfg(test)]
+    pub(crate) fn conn_for_tests(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn()
+    }
+
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         match self.conn.lock() {
             Ok(guard) => guard,
@@ -2176,6 +2194,19 @@ impl Store {
                 return Ok(false);
             }
             conn.execute("DELETE FROM messages WHERE conversation_id = ?", params![conversation_id])?;
+            // A trip other people are on is not this thread's to take with
+            // it: it is detached, as expiry detaches, and lives on.
+            conn.execute(
+                "UPDATE trips SET conversation_id = NULL
+                 WHERE conversation_id = ?
+                   AND id IN (SELECT trip_id FROM trip_people WHERE left_at IS NULL)",
+                params![conversation_id],
+            )?;
+            // An editor's own thread for a trip, likewise forgotten.
+            conn.execute(
+                "UPDATE trip_people SET conversation_id = NULL WHERE conversation_id = ?",
+                params![conversation_id],
+            )?;
             // The trips this thread owns go with it. Inside this same
             // transaction: a cascade that can half-happen would leave a trip
             // pointing at a conversation that no longer exists.
@@ -4276,19 +4307,23 @@ impl Store {
         load_trip(&conn, trip_id)
     }
 
-    /// False when there was no such trip. Deleting something already gone is
-    /// the state the caller wanted, not a failure.
-    pub fn delete_trip(&self, account_id: i64, name: &str) -> Result<bool> {
+    /// What became of the trip; see `TripDeleted`. Deleting something
+    /// already gone is the state the caller wanted, not a failure, and a
+    /// shared trip is its owner's alone to delete.
+    pub fn delete_trip(&self, account_id: i64, name: &str) -> Result<TripDeleted> {
         let key = name.trim().to_lowercase();
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT id FROM trips WHERE account_id = ? AND name_key = ?")?;
-        let mut ids = stmt.query_map(params![account_id, key], |row| row.get::<_, i64>(0))?;
-        let Some(id) = ids.next().transpose()? else {
-            return Ok(false);
+        let Some(id) = reachable_trip_id(&conn, account_id, &key)? else {
+            return Ok(TripDeleted::NotFound);
         };
-        drop(ids);
-        drop(stmt);
+        let (owner, owner_name): (i64, Option<String>) = conn.query_row(
+            "SELECT account_id, owner_name FROM trips WHERE id = ?",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if owner != account_id {
+            return Ok(TripDeleted::NotOwner { owner: owner_name });
+        }
         // Children before parents, or the subquery finds nothing.
         conn.execute(
             "DELETE FROM item_candidates WHERE item_id IN
@@ -4300,8 +4335,10 @@ impl Store {
         // still there, and goes with the item if it is not.
         release_attachments_within(&conn, &item_ids_of(&conn, id)?)?;
         conn.execute("DELETE FROM trip_items WHERE trip_id = ?", params![id])?;
+        conn.execute("DELETE FROM trip_people WHERE trip_id = ?", params![id])?;
+        conn.execute("DELETE FROM trip_links WHERE trip_id = ?", params![id])?;
         conn.execute("DELETE FROM trips WHERE id = ?", params![id])?;
-        Ok(true)
+        Ok(TripDeleted::Deleted)
     }
 }
 
@@ -4475,6 +4512,10 @@ fn detach_trips_within(conn: &Connection, conversation_ids: &[i64]) -> Result<us
         return Ok(0);
     }
     let holes = ["?"].repeat(conversation_ids.len()).join(", ");
+    conn.execute(
+        &format!("UPDATE trip_people SET conversation_id = NULL WHERE conversation_id IN ({holes})"),
+        duckdb::params_from_iter(conversation_ids.iter()),
+    )?;
     Ok(conn.execute(
         &format!("UPDATE trips SET conversation_id = NULL WHERE conversation_id IN ({holes})"),
         duckdb::params_from_iter(conversation_ids.iter()),
@@ -8014,7 +8055,7 @@ CREATE TABLE trips (
                 false,
             )
             .unwrap();
-        store.delete_trip(7, "Japan").unwrap();
+        assert_eq!(store.delete_trip(7, "Japan").unwrap(), TripDeleted::Deleted);
 
         let err = store.choose_candidate(trip.id, 1, 1).unwrap_err();
         assert_eq!(err.to_string(), "no such trip", "a deleted trip must not read as a bad option number");
@@ -8093,9 +8134,9 @@ CREATE TABLE trips (
             )
             .unwrap();
 
-        assert!(store.delete_trip(7, "setpember").unwrap());
+        assert_eq!(store.delete_trip(7, "setpember").unwrap(), TripDeleted::Deleted);
         assert!(store.find_trip(7, "Setpember").unwrap().is_none());
-        assert!(!store.delete_trip(7, "Setpember").unwrap(), "deleting twice is not an error");
+        assert_eq!(store.delete_trip(7, "Setpember").unwrap(), TripDeleted::NotFound, "deleting twice is not an error");
 
         // The name said this and only `find_trip` was checked, which cannot
         // see either child table: both are reached by `trip_id` alone, so a
@@ -8115,7 +8156,7 @@ CREATE TABLE trips (
 
         // Another user's trip of the same name is untouched.
         store.upsert_trip(8, "Setpember", None, None, None).unwrap();
-        assert!(!store.delete_trip(7, "Setpember").unwrap());
+        assert_eq!(store.delete_trip(7, "Setpember").unwrap(), TripDeleted::NotFound);
         assert!(store.find_trip(8, "Setpember").unwrap().is_some());
     }
 
@@ -9225,6 +9266,42 @@ CREATE TABLE conversations (
         put_on(&s, trip.id, editor, "Masha");
         assert!(s.keep_trip(editor, "Lisbon").unwrap());
         assert!(s.find_trip(owner, "Lisbon").unwrap().unwrap().kept);
+    }
+
+    #[test]
+    fn only_the_owner_deletes_a_shared_trip_and_its_people_and_links_go_with_it() {
+        let (s, _d) = test_store();
+        let (owner, editor) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        s.conn().execute("UPDATE trips SET owner_name = 'Sasha' WHERE id = ?", params![trip.id]).unwrap();
+        assert_eq!(s.delete_trip(editor, "Lisbon").unwrap(), TripDeleted::NotOwner { owner: Some("Sasha".into()) });
+        assert!(s.find_trip(owner, "Lisbon").unwrap().is_some());
+        assert_eq!(s.delete_trip(owner, "Lisbon").unwrap(), TripDeleted::Deleted);
+        let left: i64 = s.conn().query_row("SELECT count(*) FROM trip_people", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(s.delete_trip(owner, "Lisbon").unwrap(), TripDeleted::NotFound);
+    }
+
+    #[test]
+    fn deleting_the_owners_thread_detaches_a_shared_trip_and_deletes_an_unshared_one() {
+        let (s, _d) = test_store();
+        let (owner, editor) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
+        let thread = s.start_conversation(owner, "direct").unwrap();
+        let shared = s.upsert_trip(owner, "Lisbon", None, None, Some(thread)).unwrap();
+        s.upsert_trip(owner, "Porto", None, None, Some(thread)).unwrap();
+        put_on(&s, shared.id, editor, "Masha");
+        let theirs = s.start_conversation(editor, "direct").unwrap();
+        s.upsert_trip(editor, "Lisbon", None, None, Some(theirs)).unwrap();
+        assert!(s.delete_conversation(owner, thread).unwrap());
+        assert!(s.find_trip(owner, "Lisbon").unwrap().is_some(), "shared: detached");
+        assert!(s.find_trip(owner, "Porto").unwrap().is_none(), "not shared: gone with its chat");
+        assert!(s.delete_conversation(editor, theirs).unwrap());
+        let cleared: Option<i64> = s
+            .conn()
+            .query_row("SELECT conversation_id FROM trip_people", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cleared, None);
     }
 
     /// A database at 20 with a trip and an item in it. Built from
@@ -10382,7 +10459,7 @@ CREATE TABLE messages (
         store.attach_to_item(boarding, museum).unwrap();
         delete_mail_now(&store, a, doomed);
 
-        assert!(store.delete_trip(a, "Lisbon").unwrap());
+        assert_eq!(store.delete_trip(a, "Lisbon").unwrap(), TripDeleted::Deleted);
 
         assert_eq!(
             store.attachment(ticket).unwrap().expect("its mail is still there").1,

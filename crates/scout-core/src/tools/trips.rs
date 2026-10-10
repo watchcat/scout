@@ -2238,17 +2238,24 @@ impl Tool for DeleteTripTool {
         let account_id = self.account_id;
         let name = args.trip.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<DeleteTripResult> {
-            let deleted = store.delete_trip(account_id, &args.trip)?;
-            let notes = match deleted {
-                true => Vec::new(),
+            let (deleted, notes) = match store.delete_trip(account_id, &args.trip)? {
+                crate::store::TripDeleted::Deleted => (true, Vec::new()),
                 // A mistyped name is indistinguishable here from one
                 // already deleted, so both get the same real names to
                 // correct against rather than a silent no-op.
-                false => vec![format!(
+                crate::store::TripDeleted::NotFound => (false, vec![format!(
                     "nothing called {:?} to delete. This traveller has: {}",
                     args.trip,
                     trip_names(&store, account_id)?
-                )],
+                )]),
+                // Said in full, so the model passes on who can and what
+                // the traveller can do instead, rather than "it failed".
+                crate::store::TripDeleted::NotOwner { owner } => (false, vec![format!(
+                    "{:?} is shared with this traveller and only {} can delete it. \
+                     They can leave it from the trip page instead.",
+                    args.trip,
+                    owner.as_deref().unwrap_or("its owner")
+                )]),
             };
             Ok(DeleteTripResult { deleted, trip: name, notes })
         })
@@ -3355,6 +3362,28 @@ mod tests {
         let delete = DeleteTripTool { store: store.clone(), account_id: 7 };
         assert!(delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
         assert!(!delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
+    }
+
+    #[tokio::test]
+    async fn an_editor_asking_scout_to_delete_a_shared_trip_is_told_who_can() {
+        let (store, _d) = setup();
+        let (owner, editor) = (store.account_for_telegram(1).unwrap(), store.account_for_telegram(2).unwrap());
+        let trip = store.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        store
+            .conn_for_tests()
+            .execute(
+                "INSERT INTO trip_people (trip_id, account_id, name) VALUES (?, ?, 'Masha')",
+                duckdb::params![trip.id, editor],
+            )
+            .unwrap();
+        store.conn_for_tests().execute("UPDATE trips SET owner_name = 'Sasha'", []).unwrap();
+        let out = DeleteTripTool { store: store.clone(), account_id: editor }
+            .call(DeleteTripArgs { trip: "Lisbon".into() })
+            .await
+            .unwrap();
+        assert!(!out.deleted);
+        assert!(out.notes[0].contains("only Sasha can delete it"), "{:?}", out.notes);
+        assert!(store.find_trip(owner, "Lisbon").unwrap().is_some());
     }
 
     // The four tests below are the ones that would have caught the spec

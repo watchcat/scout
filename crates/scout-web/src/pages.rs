@@ -33,7 +33,7 @@ const SHELL: &str = r#"<!DOCTYPE html>
     padding:24px}
   label{display:block; font-size:12px; letter-spacing:.1em; text-transform:uppercase;
     color:var(--base01); margin:0 0 8px; font-weight:600}
-  input[type=email]{width:100%; padding:11px 12px; border-radius:5px;
+  input[type=email],input[type=text]{width:100%; padding:11px 12px; border-radius:5px;
     border:1px solid var(--base01); background:var(--base03); color:var(--base2);
     font:inherit; margin:0 0 18px}
   .btn{background:var(--blue); color:var(--base03); font:inherit; font-weight:650;
@@ -127,6 +127,84 @@ pub fn sign_in(csrf: &str, widget: Option<&str>) -> String {
   </div>{telegram}"#
         ),
     )
+}
+
+/// What a share link opens before the visitor is known: the trip's name,
+/// its dates and its people, then the two ways in. The trip's name and the
+/// people's names came from people, so they are escaped.
+pub fn join_signed_out(trip: &str, dates: &str, people: &[String], csrf: &str, widget: Option<&str>) -> String {
+    let telegram = widget
+        .map(|w| format!(r#"
+  <p class="muted">Or, if you use Telegram:</p>
+  <div class="card">{w}</div>"#))
+        .unwrap_or_default();
+    let dates = if dates.is_empty() { String::new() } else { format!("{} ", escape(dates)) };
+    shell(
+        "Join a trip",
+        &format!(
+            r#"  <h1>Join {trip}</h1>
+  <p>{dates}With {people}.</p>
+  <p>Sign in to see the plan and add to it. New to Scout? This signs you up.</p>
+  <div class="card">
+    <form method="post" action="/sign-in/email">
+      <input type="hidden" name="csrf" value="{csrf}">
+      <label for="email">Email address</label>
+      <input type="email" id="email" name="email" autocomplete="email" required placeholder="you@example.com">
+      <button class="btn" type="submit">Email me a link</button>
+    </form>
+  </div>{telegram}"#,
+            trip = escape(trip),
+            people = escape(&people.join(", ")),
+        ),
+    )
+}
+
+/// The signed-in visitor's form: what to be called on the trip, and, when
+/// they already have a trip of this name, a new name for theirs.
+pub fn join_form(
+    trip: &str,
+    token: &str,
+    csrf: &str,
+    name: &str,
+    clash: Option<&str>,
+    problem: Option<&str>,
+    in_telegram: bool,
+) -> String {
+    let rename = clash
+        .map(|c| {
+            format!(
+                r#"
+      <p>You already have a trip called {c}. Give yours another name to join this one.</p>
+      <label for="rename">New name for your trip</label>
+      <input type="text" id="rename" name="rename" required maxlength="80">"#,
+                c = escape(c)
+            )
+        })
+        .unwrap_or_default();
+    let problem = problem.map(|p| format!(r#"<p class="muted">{}</p>"#, escape(p))).unwrap_or_default();
+    let surface = if in_telegram { r#"<input type="hidden" name="in" value="telegram">"# } else { "" };
+    shell(
+        "Join a trip",
+        &format!(
+            r#"  <h1>Join {trip}</h1>
+  <div class="card">
+    <form method="post" action="/join/{token}">
+      <input type="hidden" name="csrf" value="{csrf}">{surface}
+      <label for="name">Your name on this trip</label>
+      <input type="text" id="name" name="name" value="{name}" required maxlength="40">{rename}{problem}
+      <button class="btn" type="submit">Join trip</button>
+    </form>
+  </div>"#,
+            trip = escape(trip),
+            token = escape(token),
+            name = escape(name),
+        ),
+    )
+}
+
+/// A link that cannot be used, and what to do about it.
+pub fn join_dead(headline: &str, sentence: &str) -> String {
+    shell("Join a trip", &format!("  <h1>{}</h1>\n  <p>{}</p>", escape(headline), escape(sentence)))
 }
 
 /// Telegram's login button, as Telegram's own script draws it.

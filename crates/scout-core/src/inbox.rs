@@ -1150,8 +1150,7 @@ pub async fn add_arrival(
             .trip_by_id(account_id, trip.id)?
             .ok_or_else(|| anyhow::anyhow!("the trip just written is gone"))?;
         collect_drafts(&store, account_id);
-        let chat = store.trip_chat(trip.id)?;
-        Ok(Outcome::Done(Box::new(Plan::from_trip(trip, chat))))
+        Ok(Outcome::Done(Box::new(Plan::for_reader(&store, account_id, trip)?)))
     })
     .await
 }
@@ -1217,7 +1216,7 @@ fn build_item(
         let (Some(origin), Some(destination)) = (arrival.origin.as_deref(), arrival.destination.as_deref()) else {
             anyhow::bail!("arrival {arrival_id} is a flight with no route");
         };
-        let with_leg = store.add_flight(trip.id, origin, destination, date)?;
+        let with_leg = store.add_flight_by(trip.id, origin, destination, date, booked_by(account_id))?;
         // The leg just added is the newest unbooked one on that route
         // and day; `add_flight` returns the trip, not the row.
         let leg = with_leg
@@ -1270,7 +1269,7 @@ fn build_item(
             currency: arrival.currency.clone(),
             arrival_id: Some(arrival_id),
         };
-        store.add_item(trip.id, item)?
+        store.add_item_by(trip.id, item, booked_by(account_id))?
     };
     let item_id = trip
         .items
@@ -1279,6 +1278,11 @@ fn build_item(
         .map(|i| i.id)
         .ok_or_else(|| anyhow::anyhow!("the item just added does not carry its arrival"))?;
     Ok((trip, item_id))
+}
+
+/// What an item made from an arrival records: the account that pressed Add.
+fn booked_by(account_id: i64) -> crate::store::Author {
+    crate::store::Author { account_id, via: crate::store::Via::Mail }
 }
 
 /// Writes the flight a confirmation named onto the leg it was just booked

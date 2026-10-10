@@ -29,6 +29,7 @@ pub mod retry;
 pub mod run;
 mod schedule;
 pub mod session;
+pub mod sharing;
 pub mod stats;
 pub mod text;
 pub mod toolcall;

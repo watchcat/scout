@@ -6,7 +6,7 @@
 
 use crate::core::{blocking, Core};
 use crate::store::{CandidateChoice, ExpectedItem, NewCandidate, NewItem, TripChat};
-pub use crate::store::{Trip, TripCandidate, TripItem};
+pub use crate::store::{Added, Trip, TripCandidate, TripItem};
 
 // One definition of readiness for every view of a trip. It lives beside
 // `ready_to_price` in `tools::trips`, because that is what computes it,
@@ -53,6 +53,42 @@ pub struct Plan {
     /// The chat this trip belongs to. `None` is orphaned — an ordinary
     /// state, reached by outliving the chat that made it.
     pub chat: Option<TripChat>,
+    /// Who is on the trip, the owner first. One entry on a trip of one.
+    pub people: Vec<Person>,
+    /// Whether the reader owns the trip: what the page shows Remove, the
+    /// link's controls and Delete to.
+    pub you_own: bool,
+    /// The share link's state, for the owner, while one works.
+    pub link: Option<LinkView>,
+}
+
+/// Someone on a trip, as one reader sees them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Person {
+    /// The account id, which the owner's Remove sends back.
+    pub id: i64,
+    pub name: String,
+    pub owner: bool,
+    pub you: bool,
+}
+
+/// A share link's state, as the owner's panel says it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct LinkView {
+    /// `YYYY-MM-DD`, the day it stops working.
+    pub expires: String,
+    pub admits: i64,
+    pub cap: i64,
+}
+
+impl LinkView {
+    pub fn of(link: &crate::store::TripLink) -> Self {
+        Self {
+            expires: link.expires_at.date().to_string(),
+            admits: link.admits,
+            cap: crate::store::LINK_ADMITS,
+        }
+    }
 }
 
 impl Plan {
@@ -80,7 +116,37 @@ impl Plan {
             to_book,
             notes,
             chat,
+            people: Vec::new(),
+            you_own: true,
+            link: None,
         }
+    }
+
+    /// The plan as this account sees it: its own thread for the trip, who
+    /// is on it, and every item's author named, "you" for the reader.
+    pub(crate) fn for_reader(store: &crate::store::Store, account_id: i64, trip: Trip) -> anyhow::Result<Self> {
+        let chat = store.trip_chat_for(account_id, trip.id)?;
+        let people = store.trip_people(trip.id)?;
+        let names = store.author_names(trip.id)?;
+        let link = if trip.owner_id == account_id {
+            store.live_link(trip.id, crate::sharing::now())?
+        } else {
+            None
+        };
+        let mut plan = Self::from_trip(trip, chat);
+        plan.you_own = plan.trip.owner_id == account_id;
+        plan.people = people
+            .into_iter()
+            .map(|p| Person { you: p.account_id == account_id, id: p.account_id, name: p.name, owner: p.owner })
+            .collect();
+        for item in &mut plan.trip.items {
+            if let Some(added) = item.added.as_mut() {
+                added.you = added.account_id == account_id;
+                added.name = names.get(&added.account_id).cloned();
+            }
+        }
+        plan.link = link.as_ref().map(LinkView::of);
+        Ok(plan)
     }
 }
 
@@ -106,17 +172,15 @@ pub enum Selection {
 pub async fn list(core: &Core, account_id: i64) -> anyhow::Result<Vec<Plan>> {
     let store = core.store();
     blocking(move || {
-        // One `trip_chat` read per trip rather than a second query shape: an
-        // account's trip list is the handful of itineraries a traveller is
-        // actively planning, not a table a client paginates, so the extra
-        // round trips are not worth the JOIN-in-list_trips complexity.
+        // A few reads per trip — its thread, its people, its link — rather
+        // than a second query shape: an account's trip list is the handful
+        // of itineraries a traveller is actively planning, not a table a
+        // client paginates, so the extra round trips are not worth the
+        // JOIN-in-list_trips complexity.
         store
             .list_trips(account_id)?
             .into_iter()
-            .map(|trip| {
-                let chat = store.trip_chat(trip.id)?;
-                Ok(Plan::from_trip(trip, chat))
-            })
+            .map(|trip| Plan::for_reader(&store, account_id, trip))
             .collect()
     })
     .await
@@ -137,8 +201,7 @@ pub async fn find(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Op
             .find_trip(account_id, &name)
             .and_then(|trip| match trip {
                 Some(trip) => {
-                    let chat = store.trip_chat(trip.id)?;
-                    Ok(Some(Plan::from_trip(trip, chat)))
+                    Ok(Some(Plan::for_reader(&store, account_id, trip)?))
                 }
                 None => Ok(None),
             })
@@ -168,8 +231,7 @@ pub async fn keep(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Op
             .find_trip(account_id, &name)
             .and_then(|trip| match trip {
                 Some(trip) => {
-                    let chat = store.trip_chat(trip.id)?;
-                    Ok(Some(Plan::from_trip(trip, chat)))
+                    Ok(Some(Plan::for_reader(&store, account_id, trip)?))
                 }
                 // Only reachable by a concurrent delete between the two
                 // statements: it really was kept, there is just no longer a
@@ -199,18 +261,30 @@ pub async fn keep(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Op
 /// reached only by `trip_id`, so a row left behind after the trip is gone
 /// is unreachable by every read path there is and stays in the database
 /// forever.
-pub async fn delete(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Option<Vec<Plan>>> {
+pub async fn delete(core: &Core, account_id: i64, name: &str) -> anyhow::Result<Deletion> {
     let store = core.store();
     let owned = name.to_string();
     // Scoped to the account in the store, like every other lookup by name
     // here: two accounts can both have an "Atlantic loop", and this is the
     // one write where reaching the wrong one destroys it.
-    if !blocking(move || store.delete_trip(account_id, &owned)).await? {
-        return Ok(None);
+    match blocking(move || store.delete_trip(account_id, &owned)).await? {
+        // Through `list` rather than a second query shape, so a client that
+        // repaints from this answer sees exactly what reloading would show.
+        crate::store::TripDeleted::Deleted => list(core, account_id).await.map(Deletion::Deleted),
+        crate::store::TripDeleted::NotFound => Ok(Deletion::NotFound),
+        crate::store::TripDeleted::NotOwner { owner } => Ok(Deletion::NotOwner(owner)),
     }
-    // Through `list` rather than a second query shape, so a client that
-    // repaints from this answer sees exactly what reloading would show.
-    list(core, account_id).await.map(Some)
+}
+
+/// What `delete` did, for a page to answer with.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Deletion {
+    /// Gone; the trips the account still reaches, to repaint from.
+    Deleted(Vec<Plan>),
+    NotFound,
+    /// Shared with this account, owned by someone else, whose name this is
+    /// when the trip has one for them.
+    NotOwner(Option<String>),
 }
 
 /// Select one of the already parked candidate flights on a segment.
@@ -228,8 +302,7 @@ pub async fn choose(
             .choose_candidate_for_account(account_id, &trip_name, position, candidate)
             .and_then(|outcome| match outcome {
                 CandidateChoice::Chosen(trip) => {
-                    let chat = store.trip_chat(trip.id)?;
-                    Ok(Selection::Chosen(Box::new(Plan::from_trip(trip, chat))))
+                    Ok(Selection::Chosen(Box::new(Plan::for_reader(&store, account_id, trip)?)))
                 }
                 CandidateChoice::TripNotFound => Ok(Selection::TripNotFound),
                 CandidateChoice::CandidateNotFound => Ok(Selection::CandidateNotFound),
@@ -293,14 +366,14 @@ pub async fn add_leg(
         // write: the same "not this account's trip" the lookup would have
         // given a moment later. `add_flight_checked` reports it as a value;
         // nothing here reads the text of an error to find out.
-        let Some(trip) = store.add_flight_checked(trip.id, &origin, &destination, &date)? else {
+        let author = crate::store::Author { account_id, via: crate::store::Via::Page };
+        let Some(trip) = store.add_flight_checked_by(trip.id, &origin, &destination, &date, author)? else {
             return Ok(LegEdit::TripNotFound);
         };
         // Through `trip_chat` rather than assumed: the composer needs the
         // same answer here that `list` gives, or the client would show a
         // trip changing chats when it only gained a leg.
-        let chat = store.trip_chat(trip.id)?;
-        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+        Ok(LegEdit::Done(Box::new(Plan::for_reader(&store, account_id, trip)?)))
     })
     .await
 }
@@ -392,8 +465,7 @@ pub async fn remove_item(
         let Some(trip) = store.find_trip(account_id, &trip_name)? else {
             return Ok(LegEdit::TripNotFound);
         };
-        let chat = store.trip_chat(trip.id)?;
-        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+        Ok(LegEdit::Done(Box::new(Plan::for_reader(&store, account_id, trip)?)))
     })
     .await
 }
@@ -444,8 +516,7 @@ pub async fn hold_item(
         let Some(trip) = store.find_trip(account_id, &trip_name)? else {
             return Ok(LegEdit::TripNotFound);
         };
-        let chat = store.trip_chat(trip.id)?;
-        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+        Ok(LegEdit::Done(Box::new(Plan::for_reader(&store, account_id, trip)?)))
     })
     .await
 }
@@ -545,8 +616,7 @@ pub async fn dismiss_warning(
         let Some(trip) = store.find_trip(account_id, &trip_name)? else {
             return Ok(LegEdit::TripNotFound);
         };
-        let chat = store.trip_chat(trip.id)?;
-        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+        Ok(LegEdit::Done(Box::new(Plan::for_reader(&store, account_id, trip)?)))
     })
     .await
 }
@@ -658,8 +728,7 @@ pub async fn note_item(
         let Some(trip) = store.find_trip(account_id, &trip_name)? else {
             return Ok(LegEdit::TripNotFound);
         };
-        let chat = store.trip_chat(trip.id)?;
-        Ok(LegEdit::Done(Box::new(Plan::from_trip(trip, chat))))
+        Ok(LegEdit::Done(Box::new(Plan::for_reader(&store, account_id, trip)?)))
     })
     .await
 }
@@ -726,7 +795,7 @@ pub async fn seed_trip_for_tests(core: &Core, account_id: i64, name: &str) -> an
         // upsert_trip above was called with conversation_id: None, so this
         // trip is orphaned by construction — no store round trip needed to
         // know that.
-        Ok(Plan::from_trip(trip, None))
+        Plan::for_reader(&store, account_id, trip)
     })
     .await
 }
@@ -785,8 +854,7 @@ pub async fn seed_item_for_tests(
             anyhow::bail!("seed_item_for_tests: no trip {trip_name:?} for account {account_id}");
         };
         let trip = store.add_item(trip.id, item)?;
-        let chat = store.trip_chat(trip.id)?;
-        Ok(Plan::from_trip(trip, chat))
+        Plan::for_reader(&store, account_id, trip)
     })
     .await
 }
@@ -815,6 +883,51 @@ mod tests {
             title: None,
             date: date.map(str::to_string),
         }
+    }
+
+    #[tokio::test]
+    async fn a_shared_trip_names_its_people_and_its_authors_for_each_reader() {
+        let (core, _dir, owner) = core().await;
+        seed_trip_for_tests(&core, owner, "October").await.unwrap();
+        let masha = core.store().account_for_telegram(12).unwrap();
+        crate::sharing::share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
+        let store = core.store();
+        let trip = store.find_trip(masha, "October").unwrap().unwrap();
+        store
+            .add_item_by(
+                trip.id,
+                crate::store::NewItem {
+                    kind: "activity".into(),
+                    title: "Fado".into(),
+                    place: None,
+                    date: "2026-10-03".into(),
+                    starts_at: None,
+                    ends_at: None,
+                    notes: None,
+                    booked: false,
+                    confirmation_code: None,
+                    price: None,
+                    currency: None,
+                    arrival_id: None,
+                },
+                crate::store::Author { account_id: masha, via: crate::store::Via::Scout },
+            )
+            .unwrap();
+
+        let theirs = find(&core, masha, "October").await.unwrap().unwrap();
+        assert!(!theirs.you_own);
+        let people: Vec<_> = theirs.people.iter().map(|p| (p.name.as_str(), p.owner, p.you)).collect();
+        assert_eq!(people, vec![("Traveller", true, false), ("Masha", false, true)]);
+        let fado = theirs.trip.items.iter().find(|i| i.title == "Fado").unwrap();
+        assert!(fado.added.as_ref().unwrap().you);
+        assert!(theirs.link.is_none(), "only the owner sees the link's state");
+
+        let mine = find(&core, owner, "October").await.unwrap().unwrap();
+        assert!(mine.you_own);
+        let fado = mine.trip.items.iter().find(|i| i.title == "Fado").unwrap();
+        let added = fado.added.as_ref().unwrap();
+        assert_eq!((added.name.as_deref(), added.you, added.via.as_str()), (Some("Masha"), false, "scout"));
+        assert!(mine.link.is_some());
     }
 
     #[tokio::test]
@@ -1027,10 +1140,9 @@ mod tests {
         seed_trip_for_tests(&core, account_id, "October").await.unwrap();
         seed_trip_for_tests(&core, account_id, "Atlantic loop").await.unwrap();
 
-        let left = delete(&core, account_id, "october")
-            .await
-            .unwrap()
-            .expect("a trip this account has is deleted, found by a lower-cased name");
+        let Deletion::Deleted(left) = delete(&core, account_id, "october").await.unwrap() else {
+            panic!("a trip this account has is deleted, found by a lower-cased name");
+        };
         assert_eq!(
             left.iter().map(|p| p.trip.name.as_str()).collect::<Vec<_>>(),
             vec!["Atlantic loop"],
@@ -1050,7 +1162,7 @@ mod tests {
 
         assert_eq!(
             delete(&core, account_id, "a trip nobody made").await.unwrap(),
-            None,
+            Deletion::NotFound,
             "a name nobody used is nothing to delete, not an error",
         );
         assert_eq!(list(&core, account_id).await.unwrap().len(), 1);
@@ -1069,7 +1181,9 @@ mod tests {
         // must not be what deletes the owner's.
         seed_trip_for_tests(&core, stranger, "Atlantic loop").await.unwrap();
 
-        let left = delete(&core, stranger, "Atlantic loop").await.unwrap().unwrap();
+        let Deletion::Deleted(left) = delete(&core, stranger, "Atlantic loop").await.unwrap() else {
+            panic!("the stranger's own trip is theirs to delete");
+        };
         assert!(left.is_empty(), "the stranger deleted their own and has none left");
 
         let owned = list(&core, owner).await.unwrap();
@@ -1082,7 +1196,7 @@ mod tests {
         );
 
         // Now that the stranger has none, the name is not theirs to delete.
-        assert_eq!(delete(&core, stranger, "Atlantic loop").await.unwrap(), None);
+        assert_eq!(delete(&core, stranger, "Atlantic loop").await.unwrap(), Deletion::NotFound);
         assert_eq!(list(&core, owner).await.unwrap().len(), 1);
     }
 

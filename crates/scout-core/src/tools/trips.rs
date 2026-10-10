@@ -5,7 +5,7 @@
 //! outlives the conversation that made it, so a trip holds the itinerary —
 //! airports, dates, flight numbers — and finalisation re-prices it.
 
-use crate::store::{ExpectedItem, NewCandidate, NewItem, Store, Trip, TripCandidate, TripItem};
+use crate::store::{Author, ExpectedItem, NewCandidate, NewItem, Store, Trip, TripCandidate, TripItem, Via};
 use crate::tools::budget::FlightBudget;
 use crate::tools::duffel::{
     dominant_currency, merged_search, DuffelClient, Flight, FlightQuery, MultiCityQuery, Slice, Source,
@@ -172,6 +172,10 @@ pub struct TripView {
     /// which is not a failure either.
     pub changed: Option<String>,
     pub notes: Vec<String>,
+    /// Who else is on this trip and whether the asker owns it. Absent on a
+    /// trip of one, so a solo trip reads exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared: Option<String>,
 }
 
 impl TripView {
@@ -195,7 +199,7 @@ impl TripView {
         }
         let readiness = Readiness::of(&trip.items);
         let notes = itinerary_notes(&trip.items);
-        Self { trip, readiness, changed: None, notes }
+        Self { trip, readiness, changed: None, notes, shared: None }
     }
 
     /// The same view, with a note of what this call did to get it.
@@ -1207,7 +1211,7 @@ impl Tool for AddTripSegmentTool {
                 args.cabin_class.as_deref(),
             )?;
             store
-                .add_flight(trip.id, &origin, &destination, &date)
+                .add_flight_by(trip.id, &origin, &destination, &date, Author { account_id, via: Via::Scout })
                 .map_err(lost_trip_race)
         })
         .await
@@ -1365,7 +1369,7 @@ impl Tool for AddTripItemTool {
                 args.cabin_class.as_deref(),
             )?;
             store
-                .add_item(
+                .add_item_by(
                     trip.id,
                     NewItem {
                         kind,
@@ -1383,6 +1387,7 @@ impl Tool for AddTripItemTool {
                         currency: None,
                         arrival_id: None,
                     },
+                    Author { account_id, via: Via::Scout },
                 )
                 .map_err(lost_trip_race)
         })
@@ -1410,6 +1415,23 @@ fn lost_trip_race(e: anyhow::Error) -> anyhow::Error {
 }
 
 /// "none yet", or the traveller's trip names joined for a human to read.
+/// "Shared: Sasha (owner), Masha. You are an editor." — so Scout knows a
+/// trip is several people's, and which of them it is talking to. `None` on
+/// a trip of one.
+fn shared_line(store: &Store, account_id: i64, trip: &Trip) -> anyhow::Result<Option<String>> {
+    let people = store.trip_people(trip.id)?;
+    if people.len() < 2 {
+        return Ok(None);
+    }
+    let names = people
+        .iter()
+        .map(|p| if p.owner { format!("{} (owner)", p.name) } else { p.name.clone() })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let role = if trip.owner_id == account_id { "You are the owner." } else { "You are an editor." };
+    Ok(Some(format!("Shared: {names}. {role}")))
+}
+
 fn trip_names(store: &Store, account_id: i64) -> anyhow::Result<String> {
     let names: Vec<String> = store.list_trips(account_id)?.into_iter().map(|t| t.name).collect();
     Ok(match names.is_empty() {
@@ -1733,15 +1755,22 @@ impl Tool for ShowTripTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
         let account_id = self.account_id;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Trip>> {
-            match &args.trip {
-                None => store.list_trips(account_id),
-                Some(name) => find_trip_or_list(&store, account_id, name).map(|trip| vec![trip]),
-            }
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<TripView>> {
+            let trips = match &args.trip {
+                None => store.list_trips(account_id)?,
+                Some(name) => vec![find_trip_or_list(&store, account_id, name)?],
+            };
+            trips
+                .into_iter()
+                .map(|trip| {
+                    let shared = shared_line(&store, account_id, &trip)?;
+                    Ok(TripView { shared, ..TripView::of(trip) })
+                })
+                .collect()
         })
         .await
         .map_err(internal)?
-        .map(|trips| TripList { trips: trips.into_iter().map(TripView::of).collect() })
+        .map(|trips| TripList { trips })
         .map_err(internal)
     }
 }
@@ -2238,17 +2267,24 @@ impl Tool for DeleteTripTool {
         let account_id = self.account_id;
         let name = args.trip.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<DeleteTripResult> {
-            let deleted = store.delete_trip(account_id, &args.trip)?;
-            let notes = match deleted {
-                true => Vec::new(),
+            let (deleted, notes) = match store.delete_trip(account_id, &args.trip)? {
+                crate::store::TripDeleted::Deleted => (true, Vec::new()),
                 // A mistyped name is indistinguishable here from one
                 // already deleted, so both get the same real names to
                 // correct against rather than a silent no-op.
-                false => vec![format!(
+                crate::store::TripDeleted::NotFound => (false, vec![format!(
                     "nothing called {:?} to delete. This traveller has: {}",
                     args.trip,
                     trip_names(&store, account_id)?
-                )],
+                )]),
+                // Said in full, so the model passes on who can and what
+                // the traveller can do instead, rather than "it failed".
+                crate::store::TripDeleted::NotOwner { owner } => (false, vec![format!(
+                    "{:?} is shared with this traveller and only {} can delete it. \
+                     They can leave it from the trip page instead.",
+                    args.trip,
+                    owner.as_deref().unwrap_or("its owner")
+                )]),
             };
             Ok(DeleteTripResult { deleted, trip: name, notes })
         })
@@ -2462,6 +2498,7 @@ mod tests {
             geocode_tried: false,
             warning: None,
             checking: false,
+            added: None,
         }
     }
 
@@ -2475,6 +2512,7 @@ mod tests {
         }];
         let trip = Trip {
             id: 3,
+            owner_id: 1,
             name: "Lisbon".into(),
             adults: 1,
             cabin_class: None,
@@ -3155,6 +3193,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_scout_adds_is_credited_to_the_chat_it_was_asked_in() {
+        let (store, _d) = setup();
+        let view = AddTripItemTool { store: store.clone(), account_id: 7, conversation_id: 99 }
+            .call(AddItemArgs {
+                trip: "Hong Kong".into(), kind: "activity".into(), title: "Lunch".into(),
+                place: None, date: "2026-09-24".into(), time: None,
+                end_date: None, notes: None, adults: None, cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let added = view.trip.items[0].added.as_ref().expect("an author");
+        assert_eq!((added.account_id, added.via.as_str()), (7, "scout"));
+    }
+
+    #[tokio::test]
     async fn an_item_already_on_a_trip_can_be_corrected_without_being_rebuilt() {
         // Asked to put a maps link on a lunch already on the trip, Scout
         // could only offer a second activity on the same day: nothing
@@ -3355,6 +3408,51 @@ mod tests {
         let delete = DeleteTripTool { store: store.clone(), account_id: 7 };
         assert!(delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
         assert!(!delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
+    }
+
+    #[tokio::test]
+    async fn show_trip_tells_scout_who_the_trip_is_shared_with_and_which_one_is_asking() {
+        let (store, _d) = setup();
+        let (owner, editor) = (store.account_for_telegram(1).unwrap(), store.account_for_telegram(2).unwrap());
+        let trip = store.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        store
+            .conn_for_tests()
+            .execute(
+                "INSERT INTO trip_people (trip_id, account_id, name) VALUES (?, ?, 'Masha')",
+                duckdb::params![trip.id, editor],
+            )
+            .unwrap();
+        store.conn_for_tests().execute("UPDATE trips SET owner_name = 'Sasha'", []).unwrap();
+        let out = ShowTripTool { store: store.clone(), account_id: editor }
+            .call(ShowTripArgs { trip: Some("Lisbon".into()) })
+            .await
+            .unwrap();
+        assert_eq!(out.trips[0].shared.as_deref(), Some("Shared: Sasha (owner), Masha. You are an editor."));
+        let solo = store.upsert_trip(owner, "Porto", None, None, None).unwrap();
+        let out = ShowTripTool { store, account_id: owner }.call(ShowTripArgs { trip: Some(solo.name) }).await.unwrap();
+        assert_eq!(out.trips[0].shared, None);
+    }
+
+    #[tokio::test]
+    async fn an_editor_asking_scout_to_delete_a_shared_trip_is_told_who_can() {
+        let (store, _d) = setup();
+        let (owner, editor) = (store.account_for_telegram(1).unwrap(), store.account_for_telegram(2).unwrap());
+        let trip = store.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        store
+            .conn_for_tests()
+            .execute(
+                "INSERT INTO trip_people (trip_id, account_id, name) VALUES (?, ?, 'Masha')",
+                duckdb::params![trip.id, editor],
+            )
+            .unwrap();
+        store.conn_for_tests().execute("UPDATE trips SET owner_name = 'Sasha'", []).unwrap();
+        let out = DeleteTripTool { store: store.clone(), account_id: editor }
+            .call(DeleteTripArgs { trip: "Lisbon".into() })
+            .await
+            .unwrap();
+        assert!(!out.deleted);
+        assert!(out.notes[0].contains("only Sasha can delete it"), "{:?}", out.notes);
+        assert!(store.find_trip(owner, "Lisbon").unwrap().is_some());
     }
 
     // The four tests below are the ones that would have caught the spec
@@ -5063,6 +5161,7 @@ mod tests {
             geocode_tried: false,
             warning: None,
             checking: false,
+            added: None,
         }
     }
 

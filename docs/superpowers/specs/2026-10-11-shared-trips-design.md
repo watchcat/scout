@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS trip_people (
     name            TEXT NOT NULL,
     joined_at       TIMESTAMP NOT NULL DEFAULT current_timestamp,
     conversation_id BIGINT,
+    left_at         TIMESTAMP,
     PRIMARY KEY (trip_id, account_id)
 );
 CREATE TABLE IF NOT EXISTS trip_links (
@@ -75,8 +76,9 @@ ALTER TABLE trip_items ADD COLUMN IF NOT EXISTS added_by   BIGINT;
 ALTER TABLE trip_items ADD COLUMN IF NOT EXISTS added_via  TEXT;
 ```
 
-- `trip_people` holds editors only. A row going away is a person leaving
-  or being removed; their items keep `added_by`.
+- `trip_people` holds editors only. Leaving or being removed sets
+  `left_at`; the row stays, so a label can still name them. Rejoining
+  clears it. Every "is on the trip" question reads `left_at IS NULL`.
 - `trip_people.name` is what labels show. Stored with the person rather
   than looked up, so a person who left is still named on what they added.
 - `trip_people.conversation_id` is the editor's own thread for this trip,
@@ -119,6 +121,9 @@ link, making one if there is none or the last has expired, been revoked
 or filled. `POST /chat/trips/link-new` — owner only: revokes the live link
 and makes another. `POST /chat/trips/link-off` — owner only: revokes it.
 
+Making a link keeps the trip. A draft is deleted with its owner's chat,
+and the people who joined it would lose it with no warning.
+
 What is shared is `https://goodscout.fyi/join/<token>`. In the Mini App the
 Share action also offers `https://t.me/<bot>?startapp=j_<token>`, which
 opens the Mini App for someone who has already chatted with the bot; a
@@ -135,9 +140,12 @@ the people on it — nothing else from the trip.
 - **Link not usable.** Expired, revoked or full: a page that says which,
   and names the owner to ask for a new link. No sign-in is offered.
 - **Not signed in.** "Continue with Telegram" and "Use email", the existing
-  sign-in flows, each returning to `/join/<token>` afterwards. The return
-  path is checked to be exactly `/join/<22 base64url characters>`; nothing
-  else is accepted as a return.
+  sign-in flows, each returning to `/join/<token>` afterwards: the join
+  page sets `__Host-scout_join` to the token for an hour, and the redirect
+  after signing in reads it. Only a 22-character base64url token is
+  accepted from it, and the path is built from the token, so the cookie
+  cannot send anyone anywhere else. An email link opened in another
+  browser lands on `/chat`, as now.
 - **Signed in, already on the trip** (owner or editor): redirect to
   `/chat?trip=<name>`.
 - **Signed in, revoked member:** "You no longer have access to Scout." No
@@ -173,10 +181,14 @@ already does.
 ### Leaving and removing
 
 `POST /chat/trips/leave` — `{trip}`, editors only. `POST
-/chat/trips/remove-person` — `{trip, account_id}`, owner only. Both delete
-the `trip_people` row. The person's threads stay theirs; the trip
+/chat/trips/remove-person` — `{trip, account_id}`, owner only. Both set `left_at`
+on the `trip_people` row. The person's threads stay theirs; the trip
 disappears from their list on the next fetch; any request about it from
 them is 404. A seat given by a link stays.
+
+Deleting the owner's thread no longer deletes a trip that has people on
+it: it detaches it, as expiry does. Deleting an editor's thread clears
+their `conversation_id`.
 
 ### Who added it
 
@@ -208,12 +220,11 @@ the person's stored name, `"you"` for the reader — and `added_via`.
   while the trip has more than one person. None on an item with no
   `added_by`.
 - **The printed plan** prints the label in small type on a shared trip.
-- **Refetch on focus.** The page refetches the trips when the tab or Mini
-  App becomes visible again, so another person's changes show without a
-  reload. Edits still carry the stale-tab rule: a changed item is 409 and a
-  reload.
-- **The Mini App** gets the same header line, panel and labels; Share is
-  also in its ⋯ menu.
+- **Refetch on focus.** Already there: the page refetches the trips when
+  it becomes visible again. Edits carry the stale-tab rule: a changed
+  item is 409 and a reload.
+- **The Mini App** gets the same header line, panel and labels. Telegram's ⋯ menu has room for one button of ours,
+  and it opens the address editor; Share is in the header.
 
 ### Scout
 

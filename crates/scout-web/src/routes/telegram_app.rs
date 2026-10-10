@@ -115,6 +115,22 @@ async fn start_session(State(auth): State<AuthState>, headers: HeaderMap, Json(b
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    // A share link's launch: the join page decides who may join, seat and
+    // all, so the cookie is handed out whatever the account's standing,
+    // and the answer says where to go. Read only after the launch data
+    // verified, so the parameter is Telegram's word, not the caller's.
+    let joining = telegram_login::start_param(&body.init_data)
+        .and_then(|p| p.strip_prefix("j_").map(str::to_string))
+        .filter(|t| crate::routes::trips::is_link_token(t));
+    if let Some(token) = joining {
+        let cookie = session::mint(&auth.cfg.session_key, account_id, session::SESSION_TTL_SECS);
+        return (
+            StatusCode::OK,
+            [(header::SET_COOKIE, session::set_embedded_cookie(&cookie, session::SESSION_TTL_SECS))],
+            Json(serde_json::json!({ "next": format!("/join/{token}?in=telegram") })),
+        )
+            .into_response();
+    }
     match is_admitted(&auth, account_id).await {
         Ok(true) => {}
         Ok(false) => return StatusCode::FORBIDDEN.into_response(),
@@ -273,6 +289,24 @@ mod tests {
         let res = start(&app, None, &launch_data(777)).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(header(&res, "set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_launch_from_a_share_link_signs_in_someone_without_a_seat_and_sends_them_to_join() {
+        // No round open, as for the stranger below: the link is the way in.
+        let (app, _core, _dir) = test_app().await;
+        let token = "k".repeat(22);
+        let user = r#"{"id":4242,"first_name":"Masha"}"#;
+        let start_param = format!("j_{token}");
+        let data = crate::telegram_login::web_app_data_like_telegram(
+            BOT,
+            &[("auth_date", &chrono::Utc::now().timestamp().to_string()), ("user", user), ("start_param", &start_param)],
+        );
+        let res = start(&app, Some(&crate::session::csrf(TEST_KEY)), &data).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(header(&res, "set-cookie").is_some());
+        let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(body["next"], format!("/join/{token}?in=telegram"));
     }
 
     #[tokio::test]

@@ -50,7 +50,9 @@ async function begin() {
   }
   if (res.ok) {
     markExchanged(store, Date.now())
-    location.replace(tripPageUrl(location.search))
+    // A share link's launch answers with where to go: its join page.
+    const next = res.status === 200 ? (await res.json().catch(() => ({}))).next : null
+    location.replace(typeof next === 'string' && next.startsWith('/join/') ? next : tripPageUrl(location.search))
     return
   }
   if (res.status === 403) {

@@ -103,6 +103,15 @@ pub fn verify_web_app(bot_token: &str, init_data: &str) -> Option<i64> {
     serde_json::from_str::<serde_json::Value>(user).ok()?.get("id")?.as_i64()
 }
 
+/// The `start_param` of launch data `verify_web_app` has already passed:
+/// what a `?startapp=` link carried. Read on its own so `verify_web_app`
+/// keeps answering one question.
+pub fn start_param(init_data: &str) -> Option<String> {
+    form_urlencoded::parse(init_data.as_bytes())
+        .find(|(k, _)| k == "start_param")
+        .map(|(_, v)| v.into_owned())
+}
+
 /// `initData` signed the way Telegram signs one, as the query string a
 /// Mini App receives. For the same reason as `signed_like_telegram`.
 #[cfg(test)]

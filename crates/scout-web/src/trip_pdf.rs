@@ -1324,6 +1324,9 @@ mod tests {
             to_book: Vec::new(),
             notes: vec!["Separate tickets need extra care.".to_string()],
             chat: None,
+            people: vec![],
+            you_own: true,
+            link: None,
         }
     }
 

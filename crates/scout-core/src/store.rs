@@ -3634,6 +3634,11 @@ impl Store {
     }
 
     /// Whether this account owns the trip or is on it.
+    ///
+    /// Test-only until a caller needs the question on its own — the
+    /// arrival buttons of the trip-address slice will; every lookup today
+    /// asks it inside `REACHES`. Drop the attribute when one appears.
+    #[cfg(test)]
     pub fn can_reach(&self, account_id: i64, trip_id: i64) -> Result<bool> {
         let conn = self.conn();
         let n: i64 = conn.query_row(

@@ -1150,8 +1150,7 @@ pub async fn add_arrival(
             .trip_by_id(account_id, trip.id)?
             .ok_or_else(|| anyhow::anyhow!("the trip just written is gone"))?;
         collect_drafts(&store, account_id);
-        let chat = store.trip_chat(trip.id)?;
-        Ok(Outcome::Done(Box::new(Plan::from_trip(trip, chat))))
+        Ok(Outcome::Done(Box::new(Plan::for_reader(&store, account_id, trip)?)))
     })
     .await
 }

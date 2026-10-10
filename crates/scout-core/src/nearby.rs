@@ -329,6 +329,9 @@ mod tests {
             to_book: vec![],
             notes: vec![],
             chat: None,
+            people: vec![],
+            you_own: true,
+            link: None,
         }
     }
 

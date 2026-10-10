@@ -5,7 +5,7 @@
 //! outlives the conversation that made it, so a trip holds the itinerary —
 //! airports, dates, flight numbers — and finalisation re-prices it.
 
-use crate::store::{ExpectedItem, NewCandidate, NewItem, Store, Trip, TripCandidate, TripItem};
+use crate::store::{Author, ExpectedItem, NewCandidate, NewItem, Store, Trip, TripCandidate, TripItem, Via};
 use crate::tools::budget::FlightBudget;
 use crate::tools::duffel::{
     dominant_currency, merged_search, DuffelClient, Flight, FlightQuery, MultiCityQuery, Slice, Source,
@@ -1207,7 +1207,7 @@ impl Tool for AddTripSegmentTool {
                 args.cabin_class.as_deref(),
             )?;
             store
-                .add_flight(trip.id, &origin, &destination, &date)
+                .add_flight_by(trip.id, &origin, &destination, &date, Author { account_id, via: Via::Scout })
                 .map_err(lost_trip_race)
         })
         .await
@@ -1365,7 +1365,7 @@ impl Tool for AddTripItemTool {
                 args.cabin_class.as_deref(),
             )?;
             store
-                .add_item(
+                .add_item_by(
                     trip.id,
                     NewItem {
                         kind,
@@ -1383,6 +1383,7 @@ impl Tool for AddTripItemTool {
                         currency: None,
                         arrival_id: None,
                     },
+                    Author { account_id, via: Via::Scout },
                 )
                 .map_err(lost_trip_race)
         })
@@ -2469,6 +2470,7 @@ mod tests {
             geocode_tried: false,
             warning: None,
             checking: false,
+            added: None,
         }
     }
 
@@ -2482,6 +2484,7 @@ mod tests {
         }];
         let trip = Trip {
             id: 3,
+            owner_id: 1,
             name: "Lisbon".into(),
             adults: 1,
             cabin_class: None,
@@ -3159,6 +3162,21 @@ mod tests {
             .unwrap();
         let said = again.changed.expect("a no-op still reports");
         assert!(said.contains("already"), "a no-op is not a failure: {said}");
+    }
+
+    #[tokio::test]
+    async fn what_scout_adds_is_credited_to_the_chat_it_was_asked_in() {
+        let (store, _d) = setup();
+        let view = AddTripItemTool { store: store.clone(), account_id: 7, conversation_id: 99 }
+            .call(AddItemArgs {
+                trip: "Hong Kong".into(), kind: "activity".into(), title: "Lunch".into(),
+                place: None, date: "2026-09-24".into(), time: None,
+                end_date: None, notes: None, adults: None, cabin_class: None,
+            })
+            .await
+            .unwrap();
+        let added = view.trip.items[0].added.as_ref().expect("an author");
+        assert_eq!((added.account_id, added.via.as_str()), (7, "scout"));
     }
 
     #[tokio::test]
@@ -5092,6 +5110,7 @@ mod tests {
             geocode_tried: false,
             warning: None,
             checking: false,
+            added: None,
         }
     }
 

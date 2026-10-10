@@ -305,7 +305,8 @@ pub async fn add_leg(
         // write: the same "not this account's trip" the lookup would have
         // given a moment later. `add_flight_checked` reports it as a value;
         // nothing here reads the text of an error to find out.
-        let Some(trip) = store.add_flight_checked(trip.id, &origin, &destination, &date)? else {
+        let author = crate::store::Author { account_id, via: crate::store::Via::Page };
+        let Some(trip) = store.add_flight_checked_by(trip.id, &origin, &destination, &date, author)? else {
             return Ok(LegEdit::TripNotFound);
         };
         // Through `trip_chat` rather than assumed: the composer needs the

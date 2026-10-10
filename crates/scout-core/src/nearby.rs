@@ -317,12 +317,13 @@ mod tests {
             geocode_tried: coords.is_some(),
             warning: None,
             checking: false,
+            added: None,
         }
     }
 
     fn plan(name: &str, kept: bool, items: Vec<TripItem>) -> Plan {
         Plan {
-            trip: crate::store::Trip { id: 1, name: name.into(), adults: 1, cabin_class: None, status: "planning".into(), items, kept },
+            trip: crate::store::Trip { id: 1, owner_id: 1, name: name.into(), adults: 1, cabin_class: None, status: "planning".into(), items, kept },
             readiness: crate::tools::trips::Readiness::NoFlights,
             not_ready: None,
             to_book: vec![],

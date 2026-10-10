@@ -1221,6 +1221,7 @@ mod tests {
             geocode_tried: false,
             warning: None,
             checking: false,
+            added: None,
         }
     }
 
@@ -1228,6 +1229,7 @@ mod tests {
         Plan {
             trip: Trip {
                 id: 7,
+                owner_id: 1,
                 name: "October <escape>".to_string(),
                 adults: 2,
                 cabin_class: Some("premium_economy".to_string()),
@@ -1287,6 +1289,7 @@ mod tests {
                         geocode_tried: false,
                         warning: None,
                         checking: false,
+                        added: None,
                     },
                     flight(
                         3,
@@ -1461,6 +1464,7 @@ mod tests {
             geocode_tried: false,
             warning: None,
             checking: false,
+            added: None,
         }
     }
 

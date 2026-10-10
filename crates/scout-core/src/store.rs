@@ -537,6 +537,9 @@ pub struct Reminder {
 pub struct Trip {
     #[serde(skip)]
     pub id: i64,
+    /// `trips.account_id`. Not serialised, like `id`.
+    #[serde(skip)]
+    pub owner_id: i64,
     pub name: String,
     pub adults: i64,
     pub cabin_class: Option<String>,
@@ -611,6 +614,8 @@ pub struct TripItem {
     /// `checking_since`, and only for five minutes: a check that died with
     /// the pod must not leave the card saying "Checking…" for good.
     pub checking: bool,
+    /// Who put it here. `None` on everything from before sharing.
+    pub added: Option<Added>,
 }
 
 impl TripItem {
@@ -625,6 +630,45 @@ impl TripItem {
             _ => self.title.clone(),
         }
     }
+}
+
+/// Who put an item on a trip, and through what.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Author {
+    pub account_id: i64,
+    pub via: Via,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Via {
+    /// Made on the trip page.
+    Page,
+    /// A desk tool, in a run of this account's chat.
+    Scout,
+    /// An arrival this account pressed Add on.
+    Mail,
+}
+
+impl Via {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::Page => "page",
+            Via::Scout => "scout",
+            Via::Mail => "mail",
+        }
+    }
+}
+
+/// Who added an item, as it is read back. `name` and `you` are the
+/// reader's to know and are filled by `Plan::for_reader`; the store leaves
+/// them empty.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Added {
+    #[serde(skip)]
+    pub account_id: i64,
+    pub via: String,
+    pub name: Option<String>,
+    pub you: bool,
 }
 
 /// An item on its way into the database. Flights do not come through this;
@@ -3638,11 +3682,17 @@ impl Store {
         date: &str,
     ) -> Result<Trip> {
         let conn = self.conn();
-        add_flight_within(&conn, trip_id, origin, destination, date)
+        add_flight_within(&conn, trip_id, origin, destination, date, None)
     }
 
-    /// `add_flight`, but a trip that is gone reads as `None` rather than an
-    /// error.
+    /// `add_flight`, recording who added the leg.
+    pub fn add_flight_by(&self, trip_id: i64, origin: &str, destination: &str, date: &str, author: Author) -> Result<Trip> {
+        let conn = self.conn();
+        add_flight_within(&conn, trip_id, origin, destination, date, Some(author))
+    }
+
+    /// `add_flight_by`, but a trip that is gone reads as `None` rather than
+    /// an error.
     ///
     /// For a caller drawing from a copy of the trip that may be older than
     /// the trip — a browser tab — a trip deleted underneath it is the same
@@ -3650,12 +3700,13 @@ impl Store {
     /// answer is to re-read, not to apologise. It needs to tell that apart
     /// from a real fault, and matching on the text of an error message
     /// would break silently the first time somebody reworded it.
-    pub fn add_flight_checked(
+    pub fn add_flight_checked_by(
         &self,
         trip_id: i64,
         origin: &str,
         destination: &str,
         date: &str,
+        author: Author,
     ) -> Result<Option<Trip>> {
         let conn = self.conn();
         // Checked here as well as inside `add_flight_within`: this one turns
@@ -3664,13 +3715,22 @@ impl Store {
         if !trip_exists(&conn, trip_id)? {
             return Ok(None);
         }
-        add_flight_within(&conn, trip_id, origin, destination, date).map(Some)
+        add_flight_within(&conn, trip_id, origin, destination, date, Some(author)).map(Some)
     }
 
     /// Adds a stay, an activity or a transport booking. Flights carry a
     /// route and candidates and come through `add_flight`, so a flight here
     /// is a caller's mistake rather than a second way in.
     pub fn add_item(&self, trip_id: i64, item: NewItem) -> Result<Trip> {
+        self.add_item_within(trip_id, item, None)
+    }
+
+    /// `add_item`, recording who added it.
+    pub fn add_item_by(&self, trip_id: i64, item: NewItem, author: Author) -> Result<Trip> {
+        self.add_item_within(trip_id, item, Some(author))
+    }
+
+    fn add_item_within(&self, trip_id: i64, item: NewItem, author: Option<Author>) -> Result<Trip> {
         if item.kind == "flight" {
             anyhow::bail!("flights go through add_flight");
         }
@@ -3686,8 +3746,9 @@ impl Store {
         conn.execute(
             "INSERT INTO trip_items (
                  trip_id, position, kind, title, place, date, starts_at, ends_at,
-                 notes, booked, confirmation_code, price, currency, arrival_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 notes, booked, confirmation_code, price, currency, arrival_id,
+                 added_by, added_via)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 trip_id,
                 next_position(&conn, trip_id)?,
@@ -3702,7 +3763,9 @@ impl Store {
                 item.confirmation_code,
                 item.price,
                 item.currency,
-                item.arrival_id
+                item.arrival_id,
+                author.map(|a| a.account_id),
+                author.map(|a| a.via.as_str())
             ],
         )?;
         reorder_items(&conn, trip_id)?;
@@ -4587,6 +4650,7 @@ fn add_flight_within(
     origin: &str,
     destination: &str,
     date: &str,
+    author: Option<Author>,
 ) -> Result<Trip> {
     // Checked before anything is written: without this, a bad trip_id
     // would reach the INSERT below and leave an item row for a trip that
@@ -4596,15 +4660,17 @@ fn add_flight_within(
         anyhow::bail!("no such trip");
     }
     conn.execute(
-        "INSERT INTO trip_items (trip_id, position, kind, title, origin, destination, date)
-         VALUES (?, ?, 'flight', ?, ?, ?, ?)",
+        "INSERT INTO trip_items (trip_id, position, kind, title, origin, destination, date, added_by, added_via)
+         VALUES (?, ?, 'flight', ?, ?, ?, ?, ?, ?)",
         params![
             trip_id,
             next_position(conn, trip_id)?,
             format!("{origin} → {destination}"),
             origin,
             destination,
-            date
+            date,
+            author.map(|a| a.account_id),
+            author.map(|a| a.via.as_str())
         ],
     )?;
     reorder_items(conn, trip_id)?;
@@ -4763,8 +4829,8 @@ fn reorder_items(conn: &Connection, trip_id: i64) -> Result<()> {
 /// be called by a method that already holds the lock — every trip-mutating
 /// method returns the trip it just changed, and re-locking would deadlock.
 fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
-    let (name, adults, cabin_class, status, kept) = conn.query_row(
-        "SELECT name, adults, cabin_class, status, kept FROM trips WHERE id = ?",
+    let (name, adults, cabin_class, status, kept, owner_id) = conn.query_row(
+        "SELECT name, adults, cabin_class, status, kept, account_id FROM trips WHERE id = ?",
         params![id],
         |row| {
             Ok((
@@ -4773,6 +4839,7 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, bool>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         },
     )?;
@@ -4782,7 +4849,8 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
                 booked, confirmation_code, price, currency, notes, arrival_id, lat, lng, geocode_tried,
                 warning,
                 (checking_since IS NOT NULL
-                 AND checking_since > CAST(current_timestamp AS TIMESTAMP) - to_seconds(300))
+                 AND checking_since > CAST(current_timestamp AS TIMESTAMP) - to_seconds(300)),
+                added_by, added_via
          FROM trip_items WHERE trip_id = ? ORDER BY position",
     )?;
     let rows: Vec<TripItem> = stmt
@@ -4811,6 +4879,10 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
                 geocode_tried: r.get::<_, Option<bool>>(18)?.unwrap_or(false),
                 warning: r.get(19)?,
                 checking: r.get(20)?,
+                added: match (r.get::<_, Option<i64>>(21)?, r.get::<_, Option<String>>(22)?) {
+                    (Some(account_id), Some(via)) => Some(Added { account_id, via, name: None, you: false }),
+                    _ => None,
+                },
             })
         })?
         .collect::<duckdb::Result<_>>()?;
@@ -4902,7 +4974,7 @@ fn load_trip(conn: &Connection, id: i64) -> Result<Trip> {
         })
         .collect();
 
-    Ok(Trip { id, name, adults, cabin_class, status, items, kept })
+    Ok(Trip { id, owner_id, name, adults, cabin_class, status, items, kept })
 }
 
 fn row_to_purchase(row: &Row) -> duckdb::Result<Purchase> {
@@ -9269,6 +9341,41 @@ CREATE TABLE conversations (
     }
 
     #[test]
+    fn an_item_remembers_who_added_it_and_how() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        let by = |via| Author { account_id: owner, via };
+        s.add_flight_by(trip.id, "AMS", "LIS", "2026-11-02", by(Via::Page)).unwrap();
+        let trip = s
+            .add_item_by(
+                trip.id,
+                NewItem {
+                    kind: "activity".into(),
+                    title: "Tram 28".into(),
+                    place: None,
+                    date: "2026-11-03".into(),
+                    starts_at: None,
+                    ends_at: None,
+                    notes: None,
+                    booked: false,
+                    confirmation_code: None,
+                    price: None,
+                    currency: None,
+                    arrival_id: None,
+                },
+                by(Via::Scout),
+            )
+            .unwrap();
+        let vias: Vec<_> =
+            trip.items.iter().map(|i| i.added.as_ref().map(|a| (a.account_id, a.via.clone()))).collect();
+        assert_eq!(vias, vec![Some((owner, "page".to_string())), Some((owner, "scout".to_string()))]);
+        assert_eq!(trip.owner_id, owner);
+        let unattributed = s.add_flight(trip.id, "LIS", "AMS", "2026-11-09").unwrap();
+        assert_eq!(unattributed.items[2].added, None);
+    }
+
+    #[test]
     fn only_the_owner_deletes_a_shared_trip_and_its_people_and_links_go_with_it() {
         let (s, _d) = test_store();
         let (owner, editor) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
@@ -9336,7 +9443,7 @@ CREATE TABLE conversations (
         let s = Store::open(&path).unwrap();
         assert_eq!(s.schema_version().unwrap(), 21);
         let trip = &s.list_trips(1).unwrap()[0];
-        assert_eq!(trip.items[0].title, "Lunch");
+        assert_eq!(trip.items[0].added, None, "an item from before sharing has no author");
         let (fresh, _d) = test_store();
         for table in ["trips", "trip_items", "trip_people", "trip_links"] {
             assert_eq!(shape(&fresh.conn(), table), shape(&s.conn(), table), "{table}");

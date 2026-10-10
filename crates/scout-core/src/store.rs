@@ -765,6 +765,75 @@ pub enum CandidateChoice {
     CandidateNotFound,
 }
 
+/// How long a share link works, and how many people without a seat it
+/// may let in.
+pub const LINK_DAYS: i64 = 14;
+pub const LINK_ADMITS: i64 = 10;
+
+/// Someone on a trip: the owner, or an editor who has not left.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TripPerson {
+    pub account_id: i64,
+    pub name: String,
+    pub owner: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TripLink {
+    pub token: String,
+    pub trip_id: i64,
+    pub expires_at: chrono::NaiveDateTime,
+    pub admits: i64,
+}
+
+/// What a token is, right now.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkState {
+    Live(TripLink),
+    Expired,
+    /// Turned off, or replaced by a newer link.
+    Off,
+    Unknown,
+}
+
+/// A request to join, with what the store cannot work out itself: whether
+/// the account is a founder (from the config) and what to call the owner
+/// if the trip has never been shared (from their identities).
+#[derive(Debug, Clone)]
+pub struct Join<'a> {
+    pub token: &'a str,
+    pub account_id: i64,
+    pub name: &'a str,
+    pub rename: Option<&'a str>,
+    pub founder: bool,
+    pub owner_name: &'a str,
+    pub now: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Joined {
+    Joined { trip: String, seated: bool },
+    Already { trip: String },
+    Link(LinkState),
+    Revoked,
+    /// The link has given its ten seats and this account has none.
+    Full,
+    /// The account already reaches a trip of this name. `yours` when it is
+    /// its own, which renaming can fix; otherwise it is another shared one.
+    Clash { name: String, yours: bool },
+    RenameTaken { name: String },
+}
+
+/// A timestamp as this file writes one: text DuckDB casts, since `duckdb`
+/// is built without `chrono` (see `enqueue_mirror`).
+fn stamp(t: chrono::NaiveDateTime) -> String {
+    t.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn unstamp(text: &str) -> Result<chrono::NaiveDateTime> {
+    Ok(chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")?)
+}
+
 /// What asking to delete a trip did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TripDeleted {
@@ -4370,6 +4439,174 @@ impl Store {
         load_trip(&conn, trip_id)
     }
 
+    /// The owner, then the editors in the order they joined. The owner's
+    /// name is `owner_name`, or their Telegram name, or "Owner" on a trip
+    /// that has never been shared.
+    pub fn trip_people(&self, trip_id: i64) -> Result<Vec<TripPerson>> {
+        let conn = self.conn();
+        let owner: TripPerson = conn.query_row(
+            "SELECT t.account_id, coalesce(t.owner_name, u.display_name, 'Owner')
+             FROM trips t LEFT JOIN users u ON u.account_id = t.account_id WHERE t.id = ?",
+            params![trip_id],
+            |r| Ok(TripPerson { account_id: r.get(0)?, name: r.get(1)?, owner: true }),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT account_id, name FROM trip_people
+             WHERE trip_id = ? AND left_at IS NULL ORDER BY joined_at, account_id",
+        )?;
+        let editors = stmt
+            .query_map(params![trip_id], |r| {
+                Ok(TripPerson { account_id: r.get(0)?, name: r.get(1)?, owner: false })
+            })?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        Ok(std::iter::once(owner).chain(editors).collect())
+    }
+
+    /// Every name a label on this trip may need: the owner, and everyone
+    /// who was ever on it, including those who left.
+    pub fn author_names(&self, trip_id: i64) -> Result<std::collections::HashMap<i64, String>> {
+        let mut names: std::collections::HashMap<i64, String> = self
+            .trip_people(trip_id)?
+            .into_iter()
+            .filter(|p| p.owner)
+            .map(|p| (p.account_id, p.name))
+            .collect();
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT account_id, name FROM trip_people WHERE trip_id = ?")?;
+        for row in stmt.query_map(params![trip_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, name) = row?;
+            names.insert(id, name);
+        }
+        Ok(names)
+    }
+
+    /// The thread this account talks about the trip in: the trip's own for
+    /// the owner, the editor's own for an editor. `None` when there is none.
+    pub fn trip_chat_for(&self, account_id: i64, trip_id: i64) -> Result<Option<TripChat>> {
+        if self.is_owner(account_id, trip_id)? {
+            return self.trip_chat(trip_id);
+        }
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT c.id, c.title, c.scope FROM trip_people p
+                 JOIN conversations c ON c.id = p.conversation_id
+                 WHERE p.trip_id = ? AND p.account_id = ? AND p.left_at IS NULL",
+                params![trip_id, account_id],
+                |r| Ok(TripChat { id: r.get(0)?, title: r.get(1)?, scope: r.get(2)? }),
+            )
+            .optional()?)
+    }
+
+    /// The link a share would hand out now: not turned off, not expired,
+    /// not out of seats.
+    pub fn live_link(&self, trip_id: i64, now: chrono::NaiveDateTime) -> Result<Option<TripLink>> {
+        let conn = self.conn();
+        let row: Option<(String, String, i64)> = conn
+            .query_row(
+                "SELECT token, CAST(expires_at AS VARCHAR), admits FROM trip_links
+                 WHERE trip_id = ? AND revoked_at IS NULL
+                   AND expires_at > CAST(? AS TIMESTAMP) AND admits < ?
+                 ORDER BY created_at DESC LIMIT 1",
+                params![trip_id, stamp(now), LINK_ADMITS],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(token, expires_at, admits)| {
+            Ok(TripLink { token, trip_id, expires_at: unstamp(&expires_at)?, admits })
+        })
+        .transpose()
+    }
+
+    /// A new link, which turns off every other. Keeps the trip: a draft is
+    /// deleted with its owner's chat, and people who joined it would lose
+    /// it. The token comes from the caller, which has the randomness.
+    pub fn make_link(&self, trip_id: i64, token: &str, now: chrono::NaiveDateTime) -> Result<TripLink> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE trip_links SET revoked_at = CAST(? AS TIMESTAMP) WHERE trip_id = ? AND revoked_at IS NULL",
+            params![stamp(now), trip_id],
+        )?;
+        let expires_at = now + chrono::Duration::days(LINK_DAYS);
+        conn.execute(
+            "INSERT INTO trip_links (token, trip_id, created_at, expires_at)
+             VALUES (?, ?, CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP))",
+            params![token, trip_id, stamp(now), stamp(expires_at)],
+        )?;
+        conn.execute("UPDATE trips SET kept = true WHERE id = ?", params![trip_id])?;
+        Ok(TripLink { token: token.to_string(), trip_id, expires_at, admits: 0 })
+    }
+
+    /// Turns the trip's links off. False when this account is not the owner.
+    pub fn links_off(&self, account_id: i64, trip_id: i64, now: chrono::NaiveDateTime) -> Result<bool> {
+        if !self.is_owner(account_id, trip_id)? {
+            return Ok(false);
+        }
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE trip_links SET revoked_at = CAST(? AS TIMESTAMP) WHERE trip_id = ? AND revoked_at IS NULL",
+            params![stamp(now), trip_id],
+        )?;
+        Ok(true)
+    }
+
+    /// What a token opens, for the join page before anyone signs in.
+    pub fn link_trip(&self, token: &str, now: chrono::NaiveDateTime) -> Result<(LinkState, Option<Trip>)> {
+        let conn = self.conn();
+        let trip_id: Option<i64> = conn
+            .query_row("SELECT trip_id FROM trip_links WHERE token = ?", params![token], |r| r.get(0))
+            .optional()?;
+        let state = link_state(&conn, token, now)?;
+        let trip = match trip_id {
+            Some(id) if trip_exists(&conn, id)? => Some(load_trip(&conn, id)?),
+            _ => None,
+        };
+        Ok((state, trip))
+    }
+
+    /// Joining, in one transaction; see `join_within` for the order.
+    pub fn join_trip(&self, j: Join<'_>) -> Result<Joined> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        match join_within(&conn, &j) {
+            Ok(joined) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(joined)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// An editor leaving. False when they were not on it — or are its
+    /// owner, who deletes rather than leaves.
+    pub fn leave_trip(&self, account_id: i64, trip_id: i64, now: chrono::NaiveDateTime) -> Result<bool> {
+        let conn = self.conn();
+        Ok(conn.execute(
+            "UPDATE trip_people SET left_at = CAST(? AS TIMESTAMP), conversation_id = NULL
+             WHERE trip_id = ? AND account_id = ? AND left_at IS NULL",
+            params![stamp(now), trip_id, account_id],
+        )? > 0)
+    }
+
+    /// The owner taking someone off. False for anyone but the owner.
+    pub fn remove_from_trip(&self, owner: i64, trip_id: i64, person: i64, now: chrono::NaiveDateTime) -> Result<bool> {
+        if !self.is_owner(owner, trip_id)? {
+            return Ok(false);
+        }
+        self.leave_trip(person, trip_id, now)
+    }
+
+    /// The latest name Telegram gave this account, if it ever wrote to the bot.
+    pub fn display_name_of(&self, account_id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row("SELECT display_name FROM users WHERE account_id = ?", params![account_id], |r| r.get(0))
+            .optional()?)
+    }
+
     /// What became of the trip; see `TripDeleted`. Deleting something
     /// already gone is the state the caller wanted, not a failure, and a
     /// shared trip is its owner's alone to delete.
@@ -4426,6 +4663,113 @@ fn reachable_trip_id(conn: &Connection, account_id: i64, key: &str) -> Result<Op
             |r| r.get(0),
         )
         .optional()?)
+}
+
+fn link_state(conn: &Connection, token: &str, now: chrono::NaiveDateTime) -> Result<LinkState> {
+    let row: Option<(i64, String, i64, bool)> = conn
+        .query_row(
+            "SELECT l.trip_id, CAST(l.expires_at AS VARCHAR), l.admits, l.revoked_at IS NOT NULL
+             FROM trip_links l JOIN trips t ON t.id = l.trip_id WHERE l.token = ?",
+            params![token],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((trip_id, expires_at, admits, off)) = row else {
+        return Ok(LinkState::Unknown);
+    };
+    let expires_at = unstamp(&expires_at)?;
+    Ok(if off {
+        LinkState::Off
+    } else if expires_at <= now {
+        LinkState::Expired
+    } else {
+        LinkState::Live(TripLink { token: token.to_string(), trip_id, expires_at, admits })
+    })
+}
+
+/// Joining, inside the transaction `join_trip` opened. In the spec's
+/// order: the link, whether they are on it already, their standing, the
+/// rename, the clash, the seat, and then the row.
+fn join_within(conn: &Connection, j: &Join<'_>) -> Result<Joined> {
+    let link = match link_state(conn, j.token, j.now)? {
+        LinkState::Live(link) => link,
+        other => return Ok(Joined::Link(other)),
+    };
+    let (owner, name, key): (i64, String, String) = conn.query_row(
+        "SELECT account_id, name, name_key FROM trips WHERE id = ?",
+        params![link.trip_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let on_it: i64 = conn.query_row(
+        "SELECT count(*) FROM trip_people WHERE trip_id = ? AND account_id = ? AND left_at IS NULL",
+        params![link.trip_id, j.account_id],
+        |r| r.get(0),
+    )?;
+    if owner == j.account_id || on_it > 0 {
+        return Ok(Joined::Already { trip: name });
+    }
+    let standing: Option<bool> = conn
+        .query_row(
+            "SELECT revoked_at IS NULL FROM members WHERE account_id = ?",
+            params![j.account_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    // Revoking is not undone by a link, as it is not by a round.
+    if standing == Some(false) {
+        return Ok(Joined::Revoked);
+    }
+    if let Some(new) = j.rename.map(str::trim).filter(|n| !n.is_empty()) {
+        let new_key = new.to_lowercase();
+        if reachable_trip_id(conn, j.account_id, &new_key)?.is_some() {
+            return Ok(Joined::RenameTaken { name: new.to_string() });
+        }
+        // Their own trip only: the shared one is never renamed, and a
+        // clash with another shared trip is not theirs to rename away.
+        conn.execute(
+            "UPDATE trips SET name = ?, name_key = ?, updated_at = current_timestamp
+             WHERE account_id = ? AND name_key = ?",
+            params![new, new_key, j.account_id, key],
+        )?;
+    }
+    if let Some(clash) = reachable_trip_id(conn, j.account_id, &key)? {
+        let (clash_name, clash_owner): (String, i64) = conn.query_row(
+            "SELECT name, account_id FROM trips WHERE id = ?",
+            params![clash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        return Ok(Joined::Clash { name: clash_name, yours: clash_owner == j.account_id });
+    }
+    let seated_already = standing == Some(true) || j.founder;
+    if !seated_already {
+        if link.admits >= LINK_ADMITS {
+            return Ok(Joined::Full);
+        }
+        conn.execute(
+            "INSERT INTO members (account_id, code) VALUES (?, ?)",
+            params![j.account_id, format!("trip-{}", link.trip_id)],
+        )?;
+        // Nobody who is inside should be chased by a later announce.
+        conn.execute("DELETE FROM waitlist WHERE account_id = ?", params![j.account_id])?;
+        conn.execute("UPDATE trip_links SET admits = admits + 1 WHERE token = ?", params![j.token])?;
+    }
+    let returning = conn.execute(
+        "UPDATE trip_people SET left_at = NULL, name = ?, joined_at = CAST(? AS TIMESTAMP)
+         WHERE trip_id = ? AND account_id = ?",
+        params![j.name, stamp(j.now), link.trip_id, j.account_id],
+    )?;
+    if returning == 0 {
+        conn.execute(
+            "INSERT INTO trip_people (trip_id, account_id, name, joined_at)
+             VALUES (?, ?, ?, CAST(? AS TIMESTAMP))",
+            params![link.trip_id, j.account_id, j.name, stamp(j.now)],
+        )?;
+    }
+    conn.execute(
+        "UPDATE trips SET owner_name = ? WHERE id = ? AND owner_name IS NULL",
+        params![j.owner_name, link.trip_id],
+    )?;
+    Ok(Joined::Joined { trip: name, seated: !seated_already })
 }
 
 fn trip_exists(conn: &Connection, trip_id: i64) -> Result<bool> {
@@ -9373,6 +9717,142 @@ CREATE TABLE conversations (
         assert_eq!(trip.owner_id, owner);
         let unattributed = s.add_flight(trip.id, "LIS", "AMS", "2026-11-09").unwrap();
         assert_eq!(unattributed.items[2].added, None);
+    }
+
+    fn at(s: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap()
+    }
+
+    fn joining<'a>(token: &'a str, account_id: i64, now: &str) -> Join<'a> {
+        Join { token, account_id, name: "Masha", rename: None, founder: false, owner_name: "Sasha", now: at(now) }
+    }
+
+    fn shared_trip(s: &Store) -> (i64, i64) {
+        let owner = s.account_for_telegram(1).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        s.make_link(trip.id, "t".repeat(22).as_str(), at("2026-10-11 10:00")).unwrap();
+        (owner, trip.id)
+    }
+
+    #[test]
+    fn joining_through_a_link_puts_you_on_the_trip_and_gives_a_seat_once() {
+        let (s, _d) = test_store();
+        let (_owner, trip_id) = shared_trip(&s);
+        let masha = s.account_for_telegram(2).unwrap();
+        let token = "t".repeat(22);
+        assert_eq!(
+            s.join_trip(joining(&token, masha, "2026-10-12 10:00")).unwrap(),
+            Joined::Joined { trip: "Lisbon".into(), seated: true }
+        );
+        assert!(s.is_member(masha).unwrap());
+        assert!(s.can_reach(masha, trip_id).unwrap());
+        assert_eq!(
+            s.join_trip(joining(&token, masha, "2026-10-12 10:05")).unwrap(),
+            Joined::Already { trip: "Lisbon".into() }
+        );
+        assert_eq!(s.live_link(trip_id, at("2026-10-12 11:00")).unwrap().unwrap().admits, 1);
+        let people: Vec<_> = s.trip_people(trip_id).unwrap().into_iter().map(|p| (p.name, p.owner)).collect();
+        assert_eq!(people, vec![("Sasha".to_string(), true), ("Masha".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_member_joining_takes_no_seat_from_the_link_and_a_revoked_one_is_refused() {
+        let (s, _d) = test_store();
+        let (_owner, trip_id) = shared_trip(&s);
+        let token = "t".repeat(22);
+        let member = s.account_for_telegram(2).unwrap();
+        s.conn().execute("INSERT INTO members (account_id, code) VALUES (?, 'autumn')", params![member]).unwrap();
+        assert_eq!(
+            s.join_trip(joining(&token, member, "2026-10-12 10:00")).unwrap(),
+            Joined::Joined { trip: "Lisbon".into(), seated: false }
+        );
+        assert_eq!(s.live_link(trip_id, at("2026-10-12 11:00")).unwrap().unwrap().admits, 0);
+        let revoked = s.account_for_telegram(3).unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO members (account_id, code, revoked_at) VALUES (?, 'autumn', current_timestamp)",
+                params![revoked],
+            )
+            .unwrap();
+        assert_eq!(s.join_trip(joining(&token, revoked, "2026-10-12 10:00")).unwrap(), Joined::Revoked);
+        assert!(!s.can_reach(revoked, trip_id).unwrap());
+    }
+
+    #[test]
+    fn a_link_that_expired_was_turned_off_or_let_in_ten_says_so() {
+        let (s, _d) = test_store();
+        let (owner, trip_id) = shared_trip(&s);
+        let token = "t".repeat(22);
+        let late = s.account_for_telegram(2).unwrap();
+        assert_eq!(s.join_trip(joining(&token, late, "2026-10-25 10:01")).unwrap(), Joined::Link(LinkState::Expired));
+        for n in 0..LINK_ADMITS {
+            let a = s.account_for_telegram(100 + n).unwrap();
+            assert!(matches!(
+                s.join_trip(joining(&token, a, "2026-10-12 10:00")).unwrap(),
+                Joined::Joined { seated: true, .. }
+            ));
+        }
+        let eleventh = s.account_for_telegram(200).unwrap();
+        assert_eq!(s.join_trip(joining(&token, eleventh, "2026-10-12 10:00")).unwrap(), Joined::Full);
+        assert!(!s.is_member(eleventh).unwrap(), "no seat for the eleventh");
+        assert!(s.live_link(trip_id, at("2026-10-12 10:00")).unwrap().is_none(), "a full link is not handed out");
+        assert!(s.links_off(owner, trip_id, at("2026-10-12 10:00")).unwrap());
+        assert_eq!(s.join_trip(joining(&token, late, "2026-10-12 10:00")).unwrap(), Joined::Link(LinkState::Off));
+        assert_eq!(
+            s.join_trip(joining("u".repeat(22).as_str(), late, "2026-10-12 10:00")).unwrap(),
+            Joined::Link(LinkState::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_name_clash_is_refused_until_the_joiner_renames_their_own_trip() {
+        let (s, _d) = test_store();
+        let (_owner, trip_id) = shared_trip(&s);
+        let token = "t".repeat(22);
+        let masha = s.account_for_telegram(2).unwrap();
+        s.upsert_trip(masha, "lisbon", None, None, None).unwrap();
+        s.upsert_trip(masha, "Lisbon 2025", None, None, None).unwrap();
+        assert_eq!(
+            s.join_trip(joining(&token, masha, "2026-10-12 10:00")).unwrap(),
+            Joined::Clash { name: "lisbon".into(), yours: true }
+        );
+        let again = Join { rename: Some("Lisbon 2025"), ..joining(&token, masha, "2026-10-12 10:00") };
+        assert_eq!(s.join_trip(again).unwrap(), Joined::RenameTaken { name: "Lisbon 2025".into() });
+        let renamed = Join { rename: Some("Lisbon solo"), ..joining(&token, masha, "2026-10-12 10:00") };
+        assert!(matches!(s.join_trip(renamed).unwrap(), Joined::Joined { .. }));
+        assert!(s.find_trip(masha, "Lisbon solo").unwrap().is_some());
+        assert_eq!(s.find_trip(masha, "Lisbon").unwrap().unwrap().id, trip_id);
+    }
+
+    #[test]
+    fn leaving_and_being_removed_take_the_trip_away_and_keep_the_name() {
+        let (s, _d) = test_store();
+        let (owner, trip_id) = shared_trip(&s);
+        let token = "t".repeat(22);
+        let masha = s.account_for_telegram(2).unwrap();
+        s.join_trip(joining(&token, masha, "2026-10-12 10:00")).unwrap();
+        assert!(!s.remove_from_trip(masha, trip_id, owner, at("2026-10-12 11:00")).unwrap(), "an editor cannot remove");
+        assert!(s.leave_trip(masha, trip_id, at("2026-10-12 11:00")).unwrap());
+        assert!(!s.can_reach(masha, trip_id).unwrap());
+        assert_eq!(s.author_names(trip_id).unwrap().get(&masha).map(String::as_str), Some("Masha"));
+        s.join_trip(joining(&token, masha, "2026-10-12 12:00")).unwrap();
+        assert!(s.remove_from_trip(owner, trip_id, masha, at("2026-10-12 13:00")).unwrap());
+        assert!(!s.can_reach(masha, trip_id).unwrap());
+        assert!(!s.leave_trip(owner, trip_id, at("2026-10-12 13:00")).unwrap(), "the owner does not leave");
+    }
+
+    #[test]
+    fn making_a_link_keeps_the_trip_and_replaces_the_last_one() {
+        let (s, _d) = test_store();
+        let (owner, trip_id) = shared_trip(&s);
+        assert!(s.find_trip(owner, "Lisbon").unwrap().unwrap().kept);
+        s.make_link(trip_id, "v".repeat(22).as_str(), at("2026-10-13 10:00")).unwrap();
+        let masha = s.account_for_telegram(2).unwrap();
+        assert_eq!(
+            s.join_trip(joining(&"t".repeat(22), masha, "2026-10-13 11:00")).unwrap(),
+            Joined::Link(LinkState::Off)
+        );
+        assert_eq!(s.live_link(trip_id, at("2026-10-13 11:00")).unwrap().unwrap().token, "v".repeat(22));
     }
 
     #[test]

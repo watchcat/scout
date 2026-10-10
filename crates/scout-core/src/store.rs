@@ -3365,55 +3365,68 @@ impl Store {
         }
         let key = name.to_lowercase();
         let conn = self.conn();
-        let inserted = conn.execute(
-            "INSERT INTO trips (account_id, name, name_key) VALUES (?, ?, ?)
-             ON CONFLICT (account_id, name_key) DO NOTHING",
-            params![account_id, name, key],
-        )?;
+        // A trip the account already reaches, its own or a shared one, is
+        // the trip it means: an editor saying "Lisbon" is talking about the
+        // Lisbon they are on, not asking for a second.
+        let found = reachable_trip_id(&conn, account_id, &key)?;
+        let id: i64 = match found {
+            Some(id) => id,
+            None => {
+                conn.execute(
+                    "INSERT INTO trips (account_id, name, name_key) VALUES (?, ?, ?)
+                     ON CONFLICT (account_id, name_key) DO NOTHING",
+                    params![account_id, name, key],
+                )?;
+                conn.query_row(
+                    "SELECT id FROM trips WHERE account_id = ? AND name_key = ?",
+                    params![account_id, key],
+                    |row| row.get(0),
+                )?
+            }
+        };
         // Only ever fills a hole. `IS NULL` is what makes the creator keep
         // the trip while an orphan gets adopted, in one statement and with
-        // no second code path. No `updated_at` bump here, unlike the
-        // updates below: adoption is bookkeeping, not an edit, and bumping
-        // it would reorder the traveller's trip list just because a
-        // different chat mentioned the trip.
+        // no second code path — on whichever side of the trip this account
+        // is: the owner's thread on `trips`, an editor's on their own row.
+        // No `updated_at` bump here, unlike the updates below: adoption is
+        // bookkeeping, not an edit, and bumping it would reorder the
+        // traveller's trip list just because a different chat mentioned
+        // the trip.
         if let Some(conversation_id) = conversation_id {
             conn.execute(
                 "UPDATE trips SET conversation_id = ?
-                 WHERE account_id = ? AND name_key = ? AND conversation_id IS NULL",
-                params![conversation_id, account_id, key],
+                 WHERE id = ? AND account_id = ? AND conversation_id IS NULL",
+                params![conversation_id, id, account_id],
+            )?;
+            conn.execute(
+                "UPDATE trip_people SET conversation_id = ?
+                 WHERE trip_id = ? AND account_id = ? AND left_at IS NULL AND conversation_id IS NULL",
+                params![conversation_id, id, account_id],
             )?;
         }
         // A freshly created trip already starts in `planning`, and a call
         // that supplies neither field is how find-or-create works — it must
         // stay inert. Only an edit to an *existing* trip's price-relevant
         // fields can invalidate prices it was finalised at.
-        let invalidates_prices = inserted == 0 && (adults.is_some() || cabin_class.is_some());
+        let invalidates_prices = found.is_some() && (adults.is_some() || cabin_class.is_some());
         if let Some(adults) = adults {
             conn.execute(
-                "UPDATE trips SET adults = ?, updated_at = current_timestamp
-                 WHERE account_id = ? AND name_key = ?",
-                params![adults, account_id, key],
+                "UPDATE trips SET adults = ?, updated_at = current_timestamp WHERE id = ?",
+                params![adults, id],
             )?;
         }
         if let Some(cabin) = cabin_class {
             conn.execute(
-                "UPDATE trips SET cabin_class = ?, updated_at = current_timestamp
-                 WHERE account_id = ? AND name_key = ?",
-                params![cabin, account_id, key],
+                "UPDATE trips SET cabin_class = ?, updated_at = current_timestamp WHERE id = ?",
+                params![cabin, id],
             )?;
         }
         if invalidates_prices {
             conn.execute(
-                "UPDATE trips SET status = 'planning', updated_at = current_timestamp
-                 WHERE account_id = ? AND name_key = ?",
-                params![account_id, key],
+                "UPDATE trips SET status = 'planning', updated_at = current_timestamp WHERE id = ?",
+                params![id],
             )?;
         }
-        let id: i64 = conn.query_row(
-            "SELECT id FROM trips WHERE account_id = ? AND name_key = ?",
-            params![account_id, key],
-            |row| row.get(0),
-        )?;
         load_trip(&conn, id)
     }
 
@@ -3462,36 +3475,51 @@ impl Store {
         Ok(())
     }
 
-    /// One trip by id, if it is this account's. The owner is part of the
-    /// key, as in `arrival_of`: an id from the page proves nothing.
+    /// One trip by id, if this account reaches it. The account is part of
+    /// the key, as in `arrival_of`: an id from the page proves nothing.
     pub fn trip_by_id(&self, account_id: i64, trip_id: i64) -> Result<Option<Trip>> {
         let conn = self.conn();
         let found: Option<i64> = conn
             .query_row(
-                "SELECT id FROM trips WHERE id = ? AND account_id = ?",
-                params![trip_id, account_id],
+                &format!("SELECT t.id FROM trips t WHERE t.id = ? AND {REACHES}"),
+                params![trip_id, account_id, account_id],
                 |row| row.get(0),
             )
             .optional()?;
         found.map(|id| load_trip(&conn, id)).transpose()
     }
 
+    /// Whether this account owns the trip or is on it.
+    pub fn can_reach(&self, account_id: i64, trip_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM trips t WHERE t.id = ? AND {REACHES}"),
+            params![trip_id, account_id, account_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether this account owns the trip: what deleting it, removing
+    /// people from it and turning its link off ask.
+    pub fn is_owner(&self, account_id: i64, trip_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM trips WHERE id = ? AND account_id = ?",
+            params![trip_id, account_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The trip of this name that the account reaches, its own or one it
+    /// is on.
     pub fn find_trip(&self, account_id: i64, name: &str) -> Result<Option<Trip>> {
         let key = name.trim().to_lowercase();
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT id FROM trips WHERE account_id = ? AND name_key = ?")?;
-        let id: Option<i64> = stmt
-            .query_map(params![account_id, key], |row| row.get(0))?
-            .next()
-            .transpose()?;
-        match id {
-            Some(id) => Ok(Some(load_trip(&conn, id)?)),
-            None => Ok(None),
-        }
+        reachable_trip_id(&conn, account_id, &key)?.map(|id| load_trip(&conn, id)).transpose()
     }
 
-    /// Every trip this user has, newest activity first.
     /// What a geocoder said about an item's place: where it is, or that it
     /// could not be found. Either way the item is not asked about again
     /// until its place changes. No owner check: the caller holds an item
@@ -3505,12 +3533,15 @@ impl Store {
         Ok(())
     }
 
+    /// Every trip this account reaches, its own and the ones it is on,
+    /// newest activity first.
     pub fn list_trips(&self, account_id: i64) -> Result<Vec<Trip>> {
         let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT id FROM trips WHERE account_id = ? ORDER BY updated_at DESC, id DESC")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT t.id FROM trips t WHERE {REACHES} ORDER BY t.updated_at DESC, t.id DESC"
+        ))?;
         let ids: Vec<i64> = stmt
-            .query_map(params![account_id], |row| row.get(0))?
+            .query_map(params![account_id, account_id], |row| row.get(0))?
             .collect::<duckdb::Result<_>>()?;
         ids.into_iter().map(|id| load_trip(&conn, id)).collect()
     }
@@ -3533,12 +3564,12 @@ impl Store {
     #[cfg(test)]
     pub fn list_kept_trips(&self, account_id: i64) -> Result<Vec<Trip>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id FROM trips WHERE account_id = ? AND kept
-             ORDER BY updated_at DESC, id DESC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT t.id FROM trips t WHERE {REACHES} AND t.kept
+             ORDER BY t.updated_at DESC, t.id DESC"
+        ))?;
         let ids: Vec<i64> = stmt
-            .query_map(params![account_id], |row| row.get(0))?
+            .query_map(params![account_id, account_id], |row| row.get(0))?
             .collect::<duckdb::Result<_>>()?;
         ids.into_iter().map(|id| load_trip(&conn, id)).collect()
     }
@@ -3554,18 +3585,12 @@ impl Store {
     pub fn keep_trip(&self, account_id: i64, name: &str) -> Result<bool> {
         let key = name.trim().to_lowercase();
         let conn = self.conn();
-        let found: i64 = conn.query_row(
-            "SELECT count(*) FROM trips WHERE account_id = ? AND name_key = ?",
-            params![account_id, key],
-            |row| row.get(0),
-        )?;
-        if found == 0 {
+        let Some(id) = reachable_trip_id(&conn, account_id, &key)? else {
             return Ok(false);
-        }
+        };
         conn.execute(
-            "UPDATE trips SET kept = true, updated_at = current_timestamp
-             WHERE account_id = ? AND name_key = ?",
-            params![account_id, key],
+            "UPDATE trips SET kept = true, updated_at = current_timestamp WHERE id = ?",
+            params![id],
         )?;
         Ok(true)
     }
@@ -4278,6 +4303,29 @@ impl Store {
         conn.execute("DELETE FROM trips WHERE id = ?", params![id])?;
         Ok(true)
     }
+}
+
+/// True when the account bound to the two `?` reaches the trip `t`: it owns
+/// it, or it is on it and has not left. Every lookup of a trip by an
+/// account goes through this, so an editor can do whatever the owner can
+/// except what checks `trips.account_id` itself.
+const REACHES: &str = "(t.account_id = ? OR EXISTS (SELECT 1 FROM trip_people p \
+     WHERE p.trip_id = t.id AND p.account_id = ? AND p.left_at IS NULL))";
+
+/// The trip of this name that the account reaches. Its own first, should
+/// it ever reach two of one name — joining refuses that, so only a bug
+/// could make the tie, and the account's own trip is the safer side of it.
+fn reachable_trip_id(conn: &Connection, account_id: i64, key: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT t.id FROM trips t WHERE t.name_key = ? AND {REACHES}
+                 ORDER BY (t.account_id = ?) DESC LIMIT 1"
+            ),
+            params![key, account_id, account_id, account_id],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 fn trip_exists(conn: &Connection, trip_id: i64) -> Result<bool> {
@@ -9107,6 +9155,76 @@ CREATE TABLE conversations (
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
         assert_eq!(shape(&fresh.conn(), "trip_items"), shape(&s.conn(), "trip_items"));
+    }
+
+    /// Puts `account` on `trip` as an editor, as joining will.
+    fn put_on(s: &Store, trip_id: i64, account: i64, name: &str) {
+        s.conn()
+            .execute(
+                "INSERT INTO trip_people (trip_id, account_id, name) VALUES (?, ?, ?)",
+                params![trip_id, account, name],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn an_editor_finds_lists_and_reads_a_shared_trip_and_a_stranger_does_not() {
+        let (s, _d) = test_store();
+        let (owner, editor, stranger) = (
+            s.account_for_telegram(1).unwrap(),
+            s.account_for_telegram(2).unwrap(),
+            s.account_for_telegram(3).unwrap(),
+        );
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        assert_eq!(s.find_trip(editor, "lisbon").unwrap().map(|t| t.id), Some(trip.id));
+        assert_eq!(s.list_trips(editor).unwrap().len(), 1);
+        assert!(s.trip_by_id(editor, trip.id).unwrap().is_some());
+        assert!(s.find_trip(stranger, "Lisbon").unwrap().is_none());
+        assert!(s.list_trips(stranger).unwrap().is_empty());
+        assert!(s.trip_by_id(stranger, trip.id).unwrap().is_none());
+        assert!(s.can_reach(editor, trip.id).unwrap() && !s.is_owner(editor, trip.id).unwrap());
+        assert!(s.is_owner(owner, trip.id).unwrap());
+    }
+
+    #[test]
+    fn someone_who_left_no_longer_reaches_the_trip() {
+        let (s, _d) = test_store();
+        let (owner, editor) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        s.conn().execute("UPDATE trip_people SET left_at = current_timestamp", []).unwrap();
+        assert!(s.find_trip(editor, "Lisbon").unwrap().is_none());
+        assert!(!s.can_reach(editor, trip.id).unwrap());
+    }
+
+    #[test]
+    fn an_editor_naming_a_shared_trip_edits_it_rather_than_making_another() {
+        let (s, _d) = test_store();
+        let (owner, editor) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, Some(10)).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        let same = s.upsert_trip(editor, "LISBON", Some(3), None, Some(20)).unwrap();
+        assert_eq!(same.id, trip.id);
+        assert_eq!(same.adults, 3);
+        assert_eq!(s.list_trips(editor).unwrap().len(), 1, "no second trip");
+        // The owner's thread stays the owner's; the editor's run is theirs.
+        assert_eq!(s.trip_owner(trip.id).unwrap(), Some(10));
+        let theirs: Option<i64> = s
+            .conn()
+            .query_row("SELECT conversation_id FROM trip_people WHERE account_id = ?", params![editor], |r| r.get(0))
+            .unwrap();
+        assert_eq!(theirs, Some(20));
+    }
+
+    #[test]
+    fn an_editor_can_keep_a_shared_draft() {
+        let (s, _d) = test_store();
+        let (owner, editor) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        assert!(s.keep_trip(editor, "Lisbon").unwrap());
+        assert!(s.find_trip(owner, "Lisbon").unwrap().unwrap().kept);
     }
 
     /// A database at 20 with a trip and an item in it. Built from

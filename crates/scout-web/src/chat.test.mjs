@@ -13,6 +13,7 @@ import {
   moveBody, warningBody, tripDays, dayChipDraggable, shouldPollChecks,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
+  peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody,
   ITINERARY_NOTE,
   CONFIRM_ARM_MS,
 } from './chat.js'
@@ -1173,4 +1174,35 @@ test('the page has looks for a card being checked, a warning and the day picker'
   const script = readFileSync(new URL('./chat.js', import.meta.url), 'utf8')
   assert.match(script, /Moving the card won't move the booking\./)
   assert.match(script, /'\/chat\/trips\/item-move'/)
+})
+
+test('the people line names the reader first and says when a trip is theirs alone', () => {
+  assert.equal(peopleLine({ people: [{ name: 'Sasha', owner: true, you: true }] }), 'Only you')
+  assert.equal(peopleLine({ people: [] }), 'Only you')
+  assert.equal(peopleLine({}), 'Only you', 'a tab loaded before sharing shipped')
+  const shared = { people: [{ name: 'Sasha', owner: true, you: false }, { name: 'Masha', owner: false, you: true }, { name: 'Dan', owner: false, you: false }] }
+  assert.equal(peopleLine(shared), 'You, Sasha, Dan')
+})
+
+test('an item says who added it only on a shared trip', () => {
+  const solo = { people: [{ name: 'Sasha', owner: true, you: true }] }
+  const shared = { people: [{ name: 'Sasha', owner: true, you: true }, { name: 'Masha', owner: false, you: false }] }
+  const by = (via, name, you = false) => ({ added: { via, name, you } })
+  assert.equal(addedLabel(by('page', 'Masha'), solo), null)
+  assert.equal(addedLabel({ added: null }, shared), null)
+  assert.equal(addedLabel({}, shared), null)
+  assert.equal(addedLabel(by('page', 'Masha'), shared), 'Added by Masha')
+  assert.equal(addedLabel(by('scout', 'Masha'), shared), 'Added by Masha, via Scout')
+  assert.equal(addedLabel(by('mail', 'Sasha', true), shared), 'Added by you, from mail')
+  assert.equal(addedLabel(by('page', null), shared), 'Added by someone who left')
+})
+
+test('the link line says until when and how many of its places are used', () => {
+  assert.equal(linkStateLine({ expires: '2026-10-25', admits: 2, cap: 10 }, 'en-GB'), 'Link works until 25 Oct · 2 of 10 new people used')
+  assert.equal(linkStateLine(null), 'No link yet. Copy link makes one.')
+})
+
+test('a person is removed by id, a trip shared and left by name', () => {
+  assert.deepEqual(JSON.parse(removePersonBody('Lisbon', 7)), { trip: 'Lisbon', person: 7 })
+  assert.deepEqual(JSON.parse(tripBody('Lisbon')), { trip: 'Lisbon' })
 })

@@ -1038,6 +1038,41 @@ export function deleteTripBody(tripName) {
 // it — see `Store::delete_trip` — and "Delete this trip?" on its own gives
 // the reader no way to tell a stray press on an empty draft from one that
 // throws away an afternoon of price research.
+// "You, Sasha, Dan": the reader first, as "You", then everyone else in the
+// order the trip lists them, owner first. "Only you" for a trip of one,
+// which is every trip until it is shared.
+export function peopleLine(trip) {
+  const people = trip?.people ?? []
+  if (people.length < 2) return 'Only you'
+  return ['You', ...people.filter((p) => !p.you).map((p) => p.name)].join(', ')
+}
+
+const ADDED_VIA = { scout: ', via Scout', mail: ', from mail' }
+
+// Only while more than one person is on the trip: on a trip of one every
+// card would say "Added by you", which says nothing.
+export function addedLabel(item, trip) {
+  if (!item?.added || (trip?.people?.length ?? 0) < 2) return null
+  const who = item.added.you ? 'you' : (item.added.name ?? 'someone who left')
+  return `Added by ${who}${ADDED_VIA[item.added.via] ?? ''}`
+}
+
+// The owner's view of the link: until when, and how many of the people
+// without a seat it may let in have used it.
+export function linkStateLine(link, locale = undefined) {
+  if (!link) return 'No link yet. Copy link makes one.'
+  const until = new Date(`${link.expires}T12:00:00Z`).toLocaleDateString(locale, { day: 'numeric', month: 'short', timeZone: 'UTC' })
+  return `Link works until ${until} · ${link.admits} of ${link.cap} new people used`
+}
+
+export function tripBody(tripName) {
+  return JSON.stringify({ trip: tripName })
+}
+
+export function removePersonBody(tripName, person) {
+  return JSON.stringify({ trip: tripName, person })
+}
+
 export function tripDeleteConsequence(trip) {
   const items = trip?.items ?? []
   const options = items.reduce((total, item) => total + (item.candidates?.length ?? 0), 0)

@@ -9,6 +9,7 @@ pub mod account;
 pub mod auth;
 pub mod chat;
 pub mod inbox;
+pub mod join;
 pub mod telegram_app;
 pub mod trips;
 

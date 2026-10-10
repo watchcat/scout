@@ -220,7 +220,7 @@ struct Confirmed {
 }
 
 /// Spends the token behind the button.
-async fn confirm(State(auth): State<AuthState>, Form(form): Form<Confirmed>) -> Response {
+async fn confirm(State(auth): State<AuthState>, headers: HeaderMap, Form(form): Form<Confirmed>) -> Response {
     if !session::csrf_ok(&auth.cfg.session_key, &form.csrf) {
         return stale_form();
     }
@@ -241,7 +241,7 @@ async fn confirm(State(auth): State<AuthState>, Form(form): Form<Confirmed>) -> 
                 // turning them away with no session would be the dead end
                 // this work exists to close.
                 Ok(SignIn::In { account_id } | SignIn::Queued { account_id }) => {
-                    signed_in(&auth, account_id)
+                    signed_in(&auth, &headers, account_id)
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "could not sign in an address");
@@ -339,7 +339,7 @@ async fn telegram_callback(
         return match identity::sign_in(&auth.core, "telegram", &telegram_id).await {
             // Queued is signed in too, for the reason `confirm` gives.
             Ok(SignIn::In { account_id } | SignIn::Queued { account_id }) => {
-                signed_in(&auth, account_id)
+                signed_in(&auth, &headers, account_id)
             }
             Err(e) => {
                 tracing::error!(error = %e, "could not sign in a Telegram id");
@@ -368,11 +368,13 @@ async fn telegram_callback(
 }
 
 /// Sets the session cookie and sends them on.
-fn signed_in(auth: &AuthState, account_id: i64) -> Response {
-    // The chat is what people came for. A queued account is sent on to
-    // `/account` by `/chat`'s own gate, which is where its explanation
-    // lives — so this needs to know nothing about membership.
-    signed_in_at(auth, account_id, "/chat")
+fn signed_in(auth: &AuthState, headers: &HeaderMap, account_id: i64) -> Response {
+    // The chat is what people came for, unless they were on their way into
+    // a shared trip: `after_sign_in` reads the join page's cookie. A queued
+    // account is sent on to `/account` by `/chat`'s own gate, which is
+    // where its explanation lives — so this needs to know nothing about
+    // membership.
+    signed_in_at(auth, account_id, &super::join::after_sign_in(headers))
 }
 
 /// The same, landing somewhere that says what just happened.

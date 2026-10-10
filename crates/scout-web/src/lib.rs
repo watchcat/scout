@@ -218,6 +218,7 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
                 .merge(routes::account::routes(auth.clone()))
                 .merge(routes::chat::routes(auth.clone()))
                 .merge(routes::trips::routes(auth.clone()))
+                .merge(routes::join::routes(auth.clone()))
                 .merge(routes::telegram_app::routes(auth.clone()));
             // The inbox's signed-in side goes with its webhook: without
             // one, nothing ever fills the inbox, and the page reads the

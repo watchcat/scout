@@ -352,6 +352,31 @@ fn meta_line(parts: &[String]) -> String {
     format!("<div class=\"meta-line\">{}</div>", said.join("<span class=\"sep\">·</span>"))
 }
 
+/// "Added by Masha, via Scout" on a shared trip, as a piece of the meta
+/// line; nothing on a trip of one. The reader's own items carry their name
+/// rather than "you": paper is handed on. `chat.js::addedLabel` is the
+/// page's half.
+fn added_line(plan: &Plan, item: &TripItem) -> String {
+    if plan.people.len() < 2 {
+        return String::new();
+    }
+    let Some(added) = item.added.as_ref() else {
+        return String::new();
+    };
+    let name = if added.you {
+        plan.people.iter().find(|p| p.you).map(|p| p.name.clone())
+    } else {
+        added.name.clone()
+    };
+    let name = name.unwrap_or_else(|| "someone who left".to_string());
+    let via = match added.via.as_str() {
+        "scout" => ", via Scout",
+        "mail" => ", from mail",
+        _ => "",
+    };
+    format!("<span>Added by {}{via}</span>", escape(&name))
+}
+
 /// One day of the trip and what falls on it — the paper half of
 /// `chat.js::tripDayRows`, held to it by `day_rows.json`, which both test
 /// suites read.
@@ -1074,7 +1099,7 @@ pub fn html(plan: &Plan) -> String {
                 "<section class=\"segment\"><div class=\"segment-head\"><div><div class=\"number\">{}</div><h2>{}</h2>{}</div><time>{}</time></div>{}{}</section>",
                 escape(&kind_label(&segment.kind)),
                 escape(&segment.title),
-                meta_line(&[place.clone(), booked.clone(), tickets(segment)]),
+                meta_line(&[place.clone(), booked.clone(), tickets(segment), added_line(plan, segment)]),
                 escape(&item_when(segment)),
                 warning(segment),
                 note(segment)
@@ -1091,7 +1116,7 @@ pub fn html(plan: &Plan) -> String {
             // The mark a stay carries, on a leg: a leg bought by forwarding
             // a confirmation has a code, and the code is the one thing a
             // traveller reads off a printed itinerary at a desk.
-            meta_line(&[booked_mark(segment), tickets(segment)]),
+            meta_line(&[booked_mark(segment), tickets(segment), added_line(plan, segment)]),
             escape(&date(&segment.date)),
             note(segment)
         )
@@ -1223,6 +1248,26 @@ mod tests {
             checking: false,
             added: None,
         }
+    }
+
+    #[test]
+    fn a_shared_trips_items_say_who_added_them_on_paper() {
+        let mut shared = plan();
+        shared.people = vec![
+            scout_core::trips::Person { id: 1, name: "Sasha".into(), owner: true, you: true },
+            scout_core::trips::Person { id: 2, name: "Masha <b>".into(), owner: false, you: false },
+        ];
+        shared.trip.items[0].added = Some(scout_core::trips::Added {
+            account_id: 2,
+            via: "scout".into(),
+            name: Some("Masha <b>".into()),
+            you: false,
+        });
+        assert!(html(&shared).contains("Added by Masha &lt;b&gt;, via Scout"));
+        shared.trip.items[0].added.as_mut().unwrap().you = true;
+        assert!(html(&shared).contains("Added by Sasha, via Scout"), "the reader's own name, not \"you\"");
+        shared.people.truncate(1);
+        assert!(!html(&shared).contains("Added by"), "a trip of one says nothing");
     }
 
     fn plan() -> Plan {

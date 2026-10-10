@@ -172,6 +172,10 @@ pub struct TripView {
     /// which is not a failure either.
     pub changed: Option<String>,
     pub notes: Vec<String>,
+    /// Who else is on this trip and whether the asker owns it. Absent on a
+    /// trip of one, so a solo trip reads exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared: Option<String>,
 }
 
 impl TripView {
@@ -195,7 +199,7 @@ impl TripView {
         }
         let readiness = Readiness::of(&trip.items);
         let notes = itinerary_notes(&trip.items);
-        Self { trip, readiness, changed: None, notes }
+        Self { trip, readiness, changed: None, notes, shared: None }
     }
 
     /// The same view, with a note of what this call did to get it.
@@ -1411,6 +1415,23 @@ fn lost_trip_race(e: anyhow::Error) -> anyhow::Error {
 }
 
 /// "none yet", or the traveller's trip names joined for a human to read.
+/// "Shared: Sasha (owner), Masha. You are an editor." — so Scout knows a
+/// trip is several people's, and which of them it is talking to. `None` on
+/// a trip of one.
+fn shared_line(store: &Store, account_id: i64, trip: &Trip) -> anyhow::Result<Option<String>> {
+    let people = store.trip_people(trip.id)?;
+    if people.len() < 2 {
+        return Ok(None);
+    }
+    let names = people
+        .iter()
+        .map(|p| if p.owner { format!("{} (owner)", p.name) } else { p.name.clone() })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let role = if trip.owner_id == account_id { "You are the owner." } else { "You are an editor." };
+    Ok(Some(format!("Shared: {names}. {role}")))
+}
+
 fn trip_names(store: &Store, account_id: i64) -> anyhow::Result<String> {
     let names: Vec<String> = store.list_trips(account_id)?.into_iter().map(|t| t.name).collect();
     Ok(match names.is_empty() {
@@ -1734,15 +1755,22 @@ impl Tool for ShowTripTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let store = self.store.clone();
         let account_id = self.account_id;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Trip>> {
-            match &args.trip {
-                None => store.list_trips(account_id),
-                Some(name) => find_trip_or_list(&store, account_id, name).map(|trip| vec![trip]),
-            }
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<TripView>> {
+            let trips = match &args.trip {
+                None => store.list_trips(account_id)?,
+                Some(name) => vec![find_trip_or_list(&store, account_id, name)?],
+            };
+            trips
+                .into_iter()
+                .map(|trip| {
+                    let shared = shared_line(&store, account_id, &trip)?;
+                    Ok(TripView { shared, ..TripView::of(trip) })
+                })
+                .collect()
         })
         .await
         .map_err(internal)?
-        .map(|trips| TripList { trips: trips.into_iter().map(TripView::of).collect() })
+        .map(|trips| TripList { trips })
         .map_err(internal)
     }
 }
@@ -3380,6 +3408,29 @@ mod tests {
         let delete = DeleteTripTool { store: store.clone(), account_id: 7 };
         assert!(delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
         assert!(!delete.call(DeleteTripArgs { trip: "Setpember".into() }).await.unwrap().deleted);
+    }
+
+    #[tokio::test]
+    async fn show_trip_tells_scout_who_the_trip_is_shared_with_and_which_one_is_asking() {
+        let (store, _d) = setup();
+        let (owner, editor) = (store.account_for_telegram(1).unwrap(), store.account_for_telegram(2).unwrap());
+        let trip = store.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        store
+            .conn_for_tests()
+            .execute(
+                "INSERT INTO trip_people (trip_id, account_id, name) VALUES (?, ?, 'Masha')",
+                duckdb::params![trip.id, editor],
+            )
+            .unwrap();
+        store.conn_for_tests().execute("UPDATE trips SET owner_name = 'Sasha'", []).unwrap();
+        let out = ShowTripTool { store: store.clone(), account_id: editor }
+            .call(ShowTripArgs { trip: Some("Lisbon".into()) })
+            .await
+            .unwrap();
+        assert_eq!(out.trips[0].shared.as_deref(), Some("Shared: Sasha (owner), Masha. You are an editor."));
+        let solo = store.upsert_trip(owner, "Porto", None, None, None).unwrap();
+        let out = ShowTripTool { store, account_id: owner }.call(ShowTripArgs { trip: Some(solo.name) }).await.unwrap();
+        assert_eq!(out.trips[0].shared, None);
     }
 
     #[tokio::test]

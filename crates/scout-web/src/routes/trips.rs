@@ -30,11 +30,176 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/trips/item-held", post(hold_item))
         .route("/chat/trips/item-move", post(move_item))
         .route("/chat/trips/item-warning", post(dismiss_warning))
+        .route("/chat/trips/link", post(share_link))
+        .route("/chat/trips/link-new", post(new_link))
+        .route("/chat/trips/link-off", post(link_off))
+        .route("/chat/trips/leave", post(leave))
+        .route("/chat/trips/remove-person", post(remove_person))
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             super::only_from_our_own_pages,
         ))
         .with_state(auth)
+}
+
+/// 16 random bytes, base64url: a share link's token. 22 characters, the
+/// shape `/join` and the sign-in redirect check for.
+pub(crate) fn fresh_link_token() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>())
+}
+
+/// Whether a string has a link token's shape and nothing else, so it can
+/// be put in a path.
+pub(crate) fn is_link_token(s: &str) -> bool {
+    s.len() == 22 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// What the page needs to share a link: the web address, the Telegram one
+/// that opens the Mini App, and the link's state.
+fn link_json(auth: &AuthState, link: &scout_core::sharing::TripLink) -> serde_json::Value {
+    let base = auth.cfg.base_url.trim_end_matches('/');
+    let bot = auth
+        .core
+        .return_url()
+        .and_then(|u| u.rsplit('/').next().map(str::to_string))
+        .filter(|u| !u.is_empty());
+    let view = scout_core::trips::LinkView::of(link);
+    serde_json::json!({
+        "token": link.token,
+        "url": format!("{base}/join/{}", link.token),
+        "telegram_url": bot.map(|bot| format!("https://t.me/{bot}?startapp=j_{}", link.token)),
+        "expires": view.expires,
+        "admits": view.admits,
+        "cap": view.cap,
+    })
+}
+
+/// A sharing action that was not this person's to take, as a response:
+/// 404 for a trip the account does not reach, 403 for one it is on.
+fn refused<T>(out: anyhow::Result<scout_core::sharing::Owned<T>>, account_id: i64, what: &str) -> Response {
+    use scout_core::sharing::Owned;
+    match out {
+        Ok(Owned::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Owned::NotOwner) => StatusCode::FORBIDDEN.into_response(),
+        // Callers take `Done` themselves; reaching here is a bug in them.
+        Ok(Owned::Done(_)) => sorry(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, what, "a sharing action failed");
+            sorry()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TripIn {
+    trip: String,
+}
+
+/// The trip's link, made if it has none. Anyone on the trip may share it.
+async fn share_link(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<TripIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match scout_core::sharing::link(&auth.core, account_id, &body.trip, fresh_link_token()).await {
+        Ok(Some(link)) => axum::Json(link_json(&auth, &link)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not make a share link");
+            sorry()
+        }
+    }
+}
+
+/// A new link in place of the old one, for the owner.
+async fn new_link(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<TripIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match scout_core::sharing::new_link(&auth.core, account_id, &body.trip, fresh_link_token()).await {
+        Ok(scout_core::sharing::Owned::Done(link)) => axum::Json(link_json(&auth, &link)).into_response(),
+        other => refused(other, account_id, "new link"),
+    }
+}
+
+/// The link turned off, for the owner.
+async fn link_off(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<TripIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match scout_core::sharing::link_off(&auth.core, account_id, &body.trip).await {
+        Ok(scout_core::sharing::Owned::Done(())) => StatusCode::OK.into_response(),
+        other => refused(other, account_id, "link off"),
+    }
+}
+
+/// An editor leaving. Answers with the trips they still have, as delete
+/// does, so the page repaints from the answer.
+async fn leave(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<TripIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match scout_core::sharing::leave(&auth.core, account_id, &body.trip).await {
+        Ok(scout_core::sharing::Owned::Done(())) => list(axum::extract::State(auth), headers).await,
+        other => refused(other, account_id, "leave"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RemovePersonIn {
+    trip: String,
+    person: i64,
+}
+
+/// The owner taking someone off the trip.
+async fn remove_person(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<RemovePersonIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match scout_core::sharing::remove(&auth.core, account_id, &body.trip, body.person).await {
+        Ok(scout_core::sharing::Owned::Done(())) => list(axum::extract::State(auth), headers).await,
+        other => refused(other, account_id, "remove person"),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -700,6 +865,74 @@ mod tests {
             .oneshot(request.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap()
+    }
+
+    /// A second admitted account on the same app, with its cookie and token.
+    async fn second(core: &scout_core::core::Core) -> (i64, String, String) {
+        let scout_core::identity::SignIn::In { account_id } =
+            scout_core::identity::sign_in(core, "telegram", "778").await.unwrap()
+        else {
+            panic!("the open round should admit the account");
+        };
+        (account_id, crate::session::mint(TEST_KEY, account_id, DAY), crate::session::csrf_for(TEST_KEY, account_id))
+    }
+
+    #[tokio::test]
+    async fn anyone_on_a_trip_gets_its_link_and_only_the_owner_turns_it_off() {
+        let (app, core, _dir, owner, cookie, csrf) = setup().await;
+        let (masha, m_cookie, m_csrf) = second(&core).await;
+        let res = post_json(&app, "/chat/trips/link", &cookie, Some(&csrf), r#"{"trip":"October"}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        let token = body["token"].as_str().unwrap();
+        assert!(is_link_token(token), "{token}");
+        assert!(body["url"].as_str().unwrap().ends_with(&format!("/join/{token}")));
+        scout_core::sharing::share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
+        let res = post_json(&app, "/chat/trips/link", &m_cookie, Some(&m_csrf), r#"{"trip":"October"}"#).await;
+        assert_eq!(res.status(), StatusCode::OK, "an editor can copy the link");
+        for path in ["/chat/trips/link-off", "/chat/trips/link-new"] {
+            let res = post_json(&app, path, &m_cookie, Some(&m_csrf), r#"{"trip":"October"}"#).await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        let res = post_json(&app, "/chat/trips/link-off", &cookie, Some(&csrf), r#"{"trip":"October"}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_editor_leaves_the_owner_removes_and_an_editor_cannot_delete() {
+        let (app, core, _dir, owner, cookie, csrf) = setup().await;
+        let (masha, m_cookie, m_csrf) = second(&core).await;
+        scout_core::sharing::share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
+        let res = delete_json(&app, "/chat/trips", &m_cookie, Some(&m_csrf), r#"{"trip":"October"}"#).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let res = post_json(&app, "/chat/trips/leave", &cookie, Some(&csrf), r#"{"trip":"October"}"#).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "the owner deletes, not leaves");
+        let res = post_json(&app, "/chat/trips/leave", &m_cookie, Some(&m_csrf), r#"{"trip":"October"}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert!(listed.as_array().unwrap().is_empty(), "answers with what the leaver still has");
+        scout_core::sharing::share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
+        let body = format!(r#"{{"trip":"October","person":{masha}}}"#);
+        let res = post_json(&app, "/chat/trips/remove-person", &m_cookie, Some(&m_csrf), &body).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let res = post_json(&app, "/chat/trips/remove-person", &cookie, Some(&csrf), &body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = get_with_cookie(&app, "/chat/trips", &m_cookie).await;
+        let listed: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert!(listed.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_trip_list_carries_people_ownership_and_the_link() {
+        let (app, core, _dir, owner, cookie, _csrf) = setup().await;
+        let (masha, _, _) = second(&core).await;
+        scout_core::sharing::share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
+        let res = get_with_cookie(&app, "/chat/trips", &cookie).await;
+        let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(body[0]["you_own"], true);
+        assert_eq!(body[0]["people"][1]["name"], "Masha");
+        assert!(body[0]["link"]["expires"].is_string());
+        assert!(body[0]["items"][0].get("added").is_some(), "the field is on the wire, null or not");
     }
 
     #[tokio::test]

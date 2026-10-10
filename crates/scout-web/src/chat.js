@@ -2261,7 +2261,14 @@ function start() {
       card.append(warning)
     }
     card.append(noteSlot(trip, item))
+    appendAdded(card, trip, item)
     return card
+  }
+
+  // Who put the card here, at its foot, on a trip more than one person is on.
+  function appendAdded(card, trip, item) {
+    const added = addedLabel(item, trip)
+    if (added) card.append(node('p', 'item-added', added))
   }
 
   function renderItem(trip, segment) {
@@ -2295,11 +2302,13 @@ function start() {
 
     if (!segment.candidates.length) {
       card.append(node('p', 'no-options', noFlightLine(segment)))
+      appendAdded(card, trip, segment)
       return card
     }
     const options = node('div', 'option-list')
     for (const candidate of segment.candidates) options.append(renderOption(trip, segment, candidate))
     card.append(options)
+    appendAdded(card, trip, segment)
     return card
   }
 
@@ -2335,6 +2344,12 @@ function start() {
       node('h2', 'trip-title', trip.name),
       node('p', 'trip-subtitle', `${trip.adults} ${trip.adults === 1 ? 'traveller' : 'travellers'} · ${trip.cabin_class ?? 'Cabin not set'}`),
     )
+    // Who is on the trip, and the way to share it: one control, because
+    // "Only you" is the line that most wants the Share beside it.
+    const peopleButton = node('button', 'trip-people', `${peopleLine(trip)} · Share`)
+    peopleButton.type = 'button'
+    peopleButton.setAttribute('aria-expanded', 'false')
+    title.append(peopleButton)
     const actions = node('div', 'trip-head-actions')
     // Same warning as the list row, plus the one control that resolves it.
     // Omitted entirely once `trip.kept` — a kept trip has nothing left for
@@ -2358,16 +2373,28 @@ function start() {
     // `deleteSlot` below rather than swapping itself out in place, the way
     // an Other-mail row's × does — the confirm needs room for a full
     // sentence, and a header pill's worth of space is not that.
+    //
+    // The owner's alone: an editor leaves a shared trip from its People
+    // panel instead, and the server refuses them the delete anyway.
+    // `you_own` is absent on a tab loaded before sharing shipped, which
+    // only ever showed its reader their own trips.
     const deleteButton = node('button', 'trip-delete-button', '×')
     deleteButton.type = 'button'
     deleteButton.setAttribute('aria-label', `Delete ${trip.name}`)
-    actions.append(deleteButton)
+    if (trip.you_own !== false) actions.append(deleteButton)
     head.append(title, actions)
     tripDetail.append(head)
     const deleteSlot = node('div', 'trip-delete-slot')
     tripDetail.append(deleteSlot)
     deleteButton.addEventListener('click', () => {
       deleteSlot.replaceChildren(tripDeleteConfirm(trip, deleteSlot))
+    })
+    const peopleSlot = node('div', 'people-slot')
+    tripDetail.append(peopleSlot)
+    peopleButton.addEventListener('click', () => {
+      const open = peopleButton.getAttribute('aria-expanded') === 'true'
+      peopleButton.setAttribute('aria-expanded', String(!open))
+      peopleSlot.replaceChildren(...(open ? [] : [peoplePanel(trip)]))
     })
     if (trip.items.length) tripDetail.append(renderOverview(trip))
 
@@ -3357,6 +3384,147 @@ function start() {
   // needs a paragraph, not the width of one header pill. Styled like
   // `.trip-alert` with the border `.join-card.danger` uses, so it reads as a
   // warning rather than routine trip info sitting under the title.
+  // Who is on the trip and what can be done about it: copy the link, for
+  // anyone; leave, for an editor; remove people and manage the link, for
+  // the owner. A removal or a leave answers with the trips, so the page
+  // repaints from the answer as every other trip write here does.
+  function peoplePanel(trip) {
+    const panel = node('section', 'people-panel')
+    panel.setAttribute('aria-label', `People on ${trip.name}`)
+    const list = node('ul', 'people-list')
+    const ask = node('div', 'people-ask')
+    for (const person of trip.people ?? []) {
+      const row = node('li', 'people-row')
+      row.append(node('span', 'people-name', person.you ? `${person.name} (you)` : person.name))
+      if (person.owner) row.append(node('span', 'people-owner', 'owner'))
+      if (trip.you_own && !person.owner) {
+        const remove = node('button', 'people-remove', 'Remove')
+        remove.type = 'button'
+        remove.addEventListener('click', () => askInPanel(ask,
+          `Remove ${person.name}? They lose the trip; what they added stays.`, 'Remove',
+          () => tripAction('/chat/trips/remove-person', removePersonBody(trip.name, person.id), `${person.name} removed.`)))
+        row.append(remove)
+      }
+      list.append(row)
+    }
+    const actions = node('div', 'people-actions')
+    const copy = node('button', 'people-copy', 'Copy link')
+    copy.type = 'button'
+    copy.addEventListener('click', () => copyShareLink(trip, copy))
+    actions.append(copy)
+    if (trip.you_own) {
+      for (const [label, path, said] of [
+        ['New link', '/chat/trips/link-new', 'New link made. The old one no longer works.'],
+        ['Turn link off', '/chat/trips/link-off', 'Link turned off.'],
+      ]) {
+        const button = node('button', 'people-link-action', label)
+        button.type = 'button'
+        button.addEventListener('click', () => linkAction(path, trip, said))
+        actions.append(button)
+      }
+    } else {
+      const leave = node('button', 'people-leave', 'Leave trip')
+      leave.type = 'button'
+      leave.addEventListener('click', () => askInPanel(ask,
+        `Leave ${trip.name}? It disappears from your trips; what you added stays.`, 'Leave trip',
+        () => tripAction('/chat/trips/leave', tripBody(trip.name), `You left ${trip.name}.`)))
+      actions.append(leave)
+    }
+    panel.append(list, actions)
+    if (trip.you_own) panel.append(node('p', 'people-link-state', linkStateLine(trip.link)))
+    panel.append(ask)
+    return panel
+  }
+
+  // The question under the panel, with Cancel and the action itself, armed
+  // against the click that opened it as every confirm-in-place here is.
+  function askInPanel(slot, question, label, act) {
+    const row = node('div', 'trip-delete-confirm-row')
+    const cancel = node('button', '', 'Cancel')
+    cancel.type = 'button'
+    cancel.addEventListener('click', () => slot.replaceChildren())
+    const go = node('button', 'danger', label)
+    go.type = 'button'
+    go.addEventListener('click', () => {
+      go.disabled = true
+      cancel.disabled = true
+      act().finally(() => slot.replaceChildren())
+    })
+    armConfirm(go)
+    row.append(cancel, go)
+    slot.replaceChildren(node('p', '', question), row)
+  }
+
+  // Leave and Remove: the answer is the reader's trips as they now stand.
+  async function tripAction(path, body, said) {
+    try {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body,
+      })
+      if (!res.ok) {
+        showTripToast(res.status === 403 ? 'Only the trip’s owner can do that.' : 'That did not work. Reload and try again.')
+        return
+      }
+      trips = await res.json()
+      tripCount.textContent = String(trips.length)
+      tripCount.hidden = trips.length === 0
+      if (!trips.some((t) => t.name === currentTrip)) currentTrip = trips[0]?.name ?? null
+      renderTripList()
+      renderTripDetail()
+      showTripToast(said)
+    } catch {
+      showTripToast('That did not work. Check your connection and try again.')
+    }
+  }
+
+  // New link and Turn link off change only the link's line, which comes
+  // with the trips: read them again.
+  async function linkAction(path, trip, said) {
+    try {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body: tripBody(trip.name),
+      })
+      if (!res.ok) throw new Error('refused')
+      tripsLoaded = false
+      await loadTrips()
+      showTripToast(said)
+    } catch {
+      showTripToast('Could not change the link. Try again.')
+    }
+  }
+
+  // Inside Telegram the link to share is the one that opens the Mini App;
+  // elsewhere the web address, which opens anywhere.
+  async function copyShareLink(trip, button) {
+    button.disabled = true
+    try {
+      const res = await fetch('/chat/trips/link', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+        body: tripBody(trip.name),
+      })
+      if (!res.ok) throw new Error('refused')
+      const link = await res.json()
+      const url = inTelegram && link.telegram_url ? link.telegram_url : link.url
+      try {
+        await navigator.clipboard.writeText(url)
+        showTripToast('Link copied. It works for 14 days.')
+      } catch {
+        // No clipboard (an old browser, a denied permission): the link
+        // itself, where it can be selected by hand.
+        showTripToast(url)
+      }
+    } catch {
+      showTripToast('Could not make a link. Try again.')
+    } finally {
+      button.disabled = false
+    }
+  }
+
   function tripDeleteConfirm(trip, slot) {
     const box = node('div', 'trip-delete-confirm')
     box.append(node('p', '', `Delete this trip? ${tripDeleteConsequence(trip)}`))
@@ -4484,7 +4652,16 @@ function start() {
   // Loaded in the background so the Trips tab can show a count before it is
   // opened. A failure is rendered inside that workspace and does not disturb
   // the chat, which remains the default view.
-  loadTrips().catch(() => {})
+  //
+  // A join lands here as /chat?trip=<name>: open that trip, which loads
+  // the trips on the way.
+  const asked = new URLSearchParams(location.search).get('trip')
+  if (asked) {
+    currentTrip = asked
+    switchView('trips')
+  } else {
+    loadTrips().catch(() => {})
+  }
 }
 
 // Guarded so `node --test` can import the pure functions above without a

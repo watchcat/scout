@@ -377,6 +377,28 @@
   .trip-title{margin:0; color:var(--base2); font-size:clamp(25px,3vw,34px); line-height:1.12;
     letter-spacing:-.025em}
   .trip-subtitle{margin:7px 0 0; color:var(--base0); font-size:14px}
+  /* Who is on the trip, and the way to share it. A link-coloured line
+     rather than a pill: it reads as part of the trip's description. */
+  .trip-people{display:block; margin:6px 0 0; padding:4px 0; border:0; background:none;
+    color:var(--blue); font:inherit; font-size:14px; text-align:left; cursor:pointer}
+  .trip-people:hover{text-decoration:underline}
+  .trip-people:focus-visible{outline:2px solid var(--blue); outline-offset:2px; border-radius:3px}
+  .people-panel{margin:0 0 18px; padding:14px 16px; border:1px solid var(--line); border-radius:12px;
+    background:var(--card)}
+  .people-list{list-style:none; margin:0 0 12px; padding:0; display:grid; gap:8px}
+  .people-row{display:flex; align-items:center; gap:10px; min-height:32px}
+  .people-name{color:var(--base1); overflow-wrap:anywhere}
+  .people-owner{font-size:11.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--base0)}
+  .people-remove{margin-left:auto}
+  .people-actions{display:flex; flex-wrap:wrap; gap:8px}
+  .people-actions button,.people-remove{padding:7px 12px; border:1px solid var(--line); border-radius:8px;
+    background:transparent; color:var(--base1); font:inherit; font-size:13.5px; cursor:pointer}
+  .people-actions button:hover,.people-remove:hover{background:var(--row-hover); color:var(--base2)}
+  .people-actions button:focus-visible,.people-remove:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  .people-actions button:disabled{opacity:.6; cursor:default}
+  .people-link-state{margin:10px 0 0; color:var(--base0); font-size:13px}
+  .people-ask:not(:empty){margin:12px 0 0; padding-top:12px; border-top:1px solid var(--line)}
+  .people-ask p{margin:0 0 10px; color:var(--base1); font-size:13.5px; line-height:1.5}
   .trip-head-actions{display:flex; align-items:center; gap:8px; flex:none}
   .status-chip{display:inline-flex; align-items:center; gap:7px; flex:none; margin-top:5px;
     padding:6px 10px; border:1px solid var(--line); border-radius:999px; color:var(--base1);
@@ -603,6 +625,8 @@
   .item-checking{color:var(--base01); font-size:12px; font-style:italic; white-space:nowrap}
   /* The verdict when it is a warning: the yellow the readiness banner
      uses for "needs a decision", under the head where the eye already is. */
+  /* Who put the card here, on a shared trip: the card's last line. */
+  .item-added{margin:0; padding:8px 16px 10px; color:var(--base0); font-size:12.5px}
   .item-warning{margin:0; padding:9px 16px; border-top:1px solid var(--warn-edge); background:var(--warn-wash);
     color:var(--warn-text); font-size:13px; line-height:1.45; overflow-wrap:anywhere}
   .day-chip.warn{border-color:var(--yellow)}

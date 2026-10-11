@@ -249,7 +249,6 @@ Schema step 22, on the same terms as step 21.
 ```sql
 ALTER TABLE trips        ADD COLUMN IF NOT EXISTS address    TEXT;
 ALTER TABLE inbound_mail ADD COLUMN IF NOT EXISTS trip_id    BIGINT;
-ALTER TABLE arrivals     ADD COLUMN IF NOT EXISTS trip_id    BIGINT;
 ALTER TABLE arrivals     ADD COLUMN IF NOT EXISTS settled_by BIGINT;
 CREATE TABLE IF NOT EXISTS mail_forwards (
     mail_id      BIGINT NOT NULL,
@@ -259,10 +258,12 @@ CREATE TABLE IF NOT EXISTS mail_forwards (
 );
 ```
 
-- `trips.address` is the local part, lowercase. Unique across trip
-  addresses and personal handles together, checked in Rust under the store
-  lock as `set_handle` already is. Setting a personal handle checks trip
-  addresses too.
+- `trips.address` is the local part, lowercase. It always contains a
+  dash, which a personal handle (`a-z0-9.`) never can, so the two kinds
+  never collide; trip addresses are unique among themselves, checked in
+  Rust under the store lock.
+- `arrivals.trip_id` already exists — placement writes it — and a trip's
+  mail sets it to that trip.
 - `inbound_mail.account_id` for a trip's mail is the owner, so every
   existing per-account query keeps working; `trip_id` says it came to the
   trip.
@@ -272,11 +273,11 @@ CREATE TABLE IF NOT EXISTS mail_forwards (
 
 ### The address
 
-- Made when a trip is kept: the name lowercased, anything outside `a-z0-9`
+- Given to a kept trip the first time it is served, which covers trips
+  kept before this release too: the name lowercased, anything outside `a-z0-9`
   turned into `-`, runs of `-` collapsed, trimmed, cut to 20 characters,
-  then `-` and 4 random characters from `a-z0-9`. Drawn again on a clash.
+  then `-` and 5 random characters from `a-z0-9`. Drawn again on a clash.
   A name with nothing left after slugging gets `trip`.
-- Trips kept before step 22 get one when first served.
 - Drafts have none.
 - `POST /chat/trips/address-new` — owner only: draws a new one. The old one
   becomes unknown, as any unheld handle is.
@@ -284,6 +285,9 @@ CREATE TABLE IF NOT EXISTS mail_forwards (
   names the trip's address instead of the person's own.
 
 ### Mail in
+
+Anyone on the trip may delete one of its mails under Other mail, as
+anyone may Add or Ignore its bookings.
 
 `our_handle` is unchanged. The lookup after it tries personal handles,
 then trip addresses. Mail for a trip address is recorded with the owner as

@@ -251,7 +251,10 @@ where
                             }
                             Ok(None) => return Some("the specialist ended without answering"),
                             Err(_) if last_item.elapsed() < NESTED_STALL => continue,
-                            Err(_) => return Some("it stopped responding"),
+                            Err(_) => {
+                                self.observer.metrics.provider_error("model", "stalled");
+                                return Some("it stopped responding");
+                            }
                         }
                     };
                     match next {

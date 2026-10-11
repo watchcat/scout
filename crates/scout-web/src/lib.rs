@@ -278,9 +278,10 @@ async fn metrics() -> Response {
 ///
 /// A listener of its own rather than a route on the front door, because
 /// the front door is the internet's: the ingress sends everything on it
-/// here. This port is in neither the Service nor the Ingress, so it is
-/// reached from the node, or from inside the cluster by whatever scrapes
-/// it later, and from nowhere else — no token to leak or rotate.
+/// here. This port is in neither the Service nor the Ingress, so the
+/// internet cannot reach it; the node, the cluster and the pod itself can.
+/// The pod includes `fetch_page`, which opens any address the model names,
+/// loopback too — nothing here is secret, but this is not a wall.
 pub async fn serve_metrics(bind: &str) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, metrics_router()).await?;
@@ -1317,7 +1318,9 @@ mod tests {
         assert!(page.contains("# TYPE scout_store_lock_wait_seconds histogram"), "{page}");
 
         // The public port is the internet's. What Scout is doing, and how
-        // often its providers fail, is not.
+        // often its providers fail, is not. The site without keys has the
+        // fewest routes; with them it adds its own, and the handler is
+        // private to this file, so only `metrics_router` can name it.
         let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
         let site = router(cache, None, None, None);
         let res = site.oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();

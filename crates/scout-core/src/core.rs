@@ -202,6 +202,7 @@ impl Core {
             marktplaats,
             store,
             secondhand_sites: cfg.secondhand_sites.clone(),
+            metrics: crate::metrics::global(),
             return_url,
             links_enabled: cfg.duffel_links_enabled,
             shown: std::sync::Arc::new(crate::tools::shown::ShownFlights::default()),

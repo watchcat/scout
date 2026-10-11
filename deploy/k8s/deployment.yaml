@@ -44,8 +44,9 @@ spec:
             # place to keep in step; a local run leaves it unset and polls.
             - { name: TELEGRAM_WEBHOOK_URL, value: "https://${SCOUT_DOMAIN}/telegram/webhook" }
             # /metrics, on a port of its own. Named below and deliberately in
-            # neither service.yaml nor ingress.yaml: it is read from the node
-            # (scripts/metrics.sh) and never from the internet.
+            # neither service.yaml nor ingress.yaml, so the internet cannot
+            # reach it: it is read from the node (scripts/metrics.sh). The
+            # cluster and the pod itself can, fetch_page included.
             - { name: SCOUT_METRICS_BIND, value: "0.0.0.0:9090" }
           ports:
             - { name: http, containerPort: 8080 }

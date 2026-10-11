@@ -1966,7 +1966,9 @@ impl Store {
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         let asked = std::time::Instant::now();
-        let guard = match self.conn.lock() {
+        let taken = self.conn.lock();
+        self.metrics.lock_waited(asked.elapsed());
+        match taken {
             Ok(guard) => guard,
             Err(poisoned) => {
                 let guard = poisoned.into_inner();
@@ -1975,9 +1977,7 @@ impl Store {
                 let _ = guard.execute_batch("ROLLBACK");
                 guard
             }
-        };
-        self.metrics.lock_waited(asked.elapsed());
-        guard
+        }
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -9858,7 +9858,9 @@ CREATE TABLE trips (
         let holder = std::thread::spawn(move || {
             let _held = conn.lock().unwrap();
             taken.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            // Well past the 0.1 bound, so a slow wake on a loaded machine
+            // cannot land the wait under it.
+            std::thread::sleep(std::time::Duration::from_millis(300));
         });
         take.recv().unwrap();
         s.log_request(1, "text").unwrap();

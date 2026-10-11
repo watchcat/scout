@@ -18,9 +18,15 @@ use std::time::Duration;
 
 /// The most label sets one counter keeps. A tool name comes from the
 /// model's call, and a model can name a tool that does not exist; past
-/// this many, new names are counted under `other` instead of each growing
-/// the page by a line.
+/// this many, a new set is counted with its first label — the tool, the
+/// provider — as `other`, keeping the rest, which are a handful of words
+/// this code chose. Those `other` sets may take the page a few lines past
+/// the cap, and no further.
 pub const MAX_SERIES: usize = 256;
+
+/// The longest a label value is kept. A name the model invented can be any
+/// length; a real one is a few words.
+const MAX_VALUE: usize = 64;
 
 /// Upper bounds, in seconds, for a run's length. The budget is 300 s; a
 /// wrap-up after a cut-short run can add a minute on top.
@@ -81,9 +87,9 @@ impl Counter {
 
     fn add(&self, values: &[&str]) {
         let mut map = self.values.lock().unwrap_or_else(|e| e.into_inner());
-        let mut key: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+        let mut key: Vec<String> = values.iter().map(|v| v.chars().take(MAX_VALUE).collect()).collect();
         if !map.contains_key(&key) && map.len() >= MAX_SERIES {
-            key = vec!["other".to_string(); values.len()];
+            key[0] = "other".to_string();
         }
         *map.entry(key).or_insert(0) += 1;
     }
@@ -170,10 +176,10 @@ impl Metrics {
     /// The whole set in the Prometheus text format.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        self.runs.render(&mut out, "scout_runs_total", "Runs, by how they ended.");
-        self.run_duration.render(&mut out, "scout_run_duration_seconds", "How long a run took, from its row to its last word.");
+        self.runs.render(&mut out, "scout_runs_total", "Runs, by how they ended: answered, cut_short or failed once a run has a row; busy or overloaded when it never got one.");
+        self.run_duration.render(&mut out, "scout_run_duration_seconds", "How long a run took, from its row to its last word; the wait for a slot is not in it.");
         self.tool_calls.render(&mut out, "scout_tool_calls_total", "Tool calls the agents made, by tool and whether the tool answered.");
-        self.provider_errors.render(&mut out, "scout_provider_errors_total", "Requests to a provider that failed after their retries, by provider and kind.");
+        self.provider_errors.render(&mut out, "scout_provider_errors_total", "Requests that failed after their retries: paid APIs as they answered (client includes a not-found), and the model during runs.");
         self.provider_retries.render(&mut out, "scout_provider_retries_total", "Requests to a provider sent again after a 429, a 5xx or a refused connection.");
         self.lock_wait.render(&mut out, "scout_store_lock_wait_seconds", "Time a store call waited for the database's lock.");
         out
@@ -264,6 +270,14 @@ mod tests {
     }
 
     #[test]
+    fn a_long_label_value_is_cut_to_a_length_a_name_could_have() {
+        let m = Metrics::default();
+        m.tool_call(&"x".repeat(1000), "failed");
+        assert!(m.render().contains(&format!("tool=\"{}\"", "x".repeat(MAX_VALUE))));
+        assert!(!m.render().contains(&"x".repeat(MAX_VALUE + 1)));
+    }
+
+    #[test]
     fn a_label_value_is_escaped() {
         let m = Metrics::default();
         m.tool_call("say \"hi\"\\\nnow", "failed");
@@ -282,7 +296,7 @@ mod tests {
         m.tool_call("tool_0", "ok");
         let page = m.render();
         assert_eq!(page.matches("scout_tool_calls_total{").count(), MAX_SERIES + 1);
-        assert!(page.contains("scout_tool_calls_total{tool=\"other\",status=\"other\"} 2\n"));
+        assert!(page.contains("scout_tool_calls_total{tool=\"other\",status=\"failed\"} 2\n"), "the outcome is kept");
         assert!(page.contains("scout_tool_calls_total{tool=\"tool_0\",status=\"ok\"} 2\n"));
         assert!(!page.contains("invented_by_the_model"));
     }

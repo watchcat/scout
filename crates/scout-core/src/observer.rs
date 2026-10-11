@@ -121,16 +121,16 @@ impl Observer {
         let duration_ms = started.elapsed().as_millis() as i64;
         let status = if failed { "failed" } else { "ok" }.to_string();
         let detail = failed.then(|| text.to_string());
-        let seq = {
+        let (seq, tool) = {
             let mut rows = self.rows();
             let row = &mut rows[index];
-            self.metrics.tool_call(row.tool.as_deref().unwrap_or_default(), &status);
             row.duration_ms = Some(duration_ms);
             row.status = Some(status.clone());
             row.detail = detail.clone();
             row.result = Some(text.to_string());
-            row.seq
+            (row.seq, row.tool.clone().unwrap_or_default())
         };
+        self.metrics.tool_call(&tool, &status);
         self.emit(TraceFrame::Finished { seq, duration_ms, status, detail });
     }
 

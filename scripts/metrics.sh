@@ -10,11 +10,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Read from .env the way deploy-k3s.sh does: .env cannot be `source`d.
-SCOUT_SSH="${SCOUT_SSH:-$( [ -f .env ] && sed -n 's/^SCOUT_SSH=//p' .env | head -1 )}"
+env_file_value() {
+    [ -f .env ] || return 0
+    sed -n "s/^$1=//p" .env | head -1
+}
+SCOUT_SSH="${SCOUT_SSH:-$(env_file_value SCOUT_SSH)}"
 [ -n "$SCOUT_SSH" ] || { echo "SCOUT_SSH is not set and not in .env" >&2; exit 1; }
 
 # Single-quoted: expanded on the node, not here.
-page=$(ssh "$SCOUT_SSH" 'ip=$(kubectl -n scout get pod -l app=scout -o jsonpath="{.items[0].status.podIP}") && curl -fsS "http://$ip:9090/metrics"')
+page=$(ssh -o BatchMode=yes "$SCOUT_SSH" 'ip=$(kubectl -n scout get pod -l app=scout -o jsonpath="{.items[0].status.podIP}") && curl -fsS "http://$ip:9090/metrics"')
 if [ -n "${1:-}" ]; then
     grep -F -- "$1" <<<"$page"
 else

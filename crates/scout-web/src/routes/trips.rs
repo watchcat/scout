@@ -33,6 +33,7 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/trips/link", post(share_link))
         .route("/chat/trips/link-new", post(new_link))
         .route("/chat/trips/link-off", post(link_off))
+        .route("/chat/trips/address-new", post(new_address))
         .route("/chat/trips/leave", post(leave))
         .route("/chat/trips/remove-person", post(remove_person))
         .layer(axum::middleware::from_fn_with_state(
@@ -154,6 +155,26 @@ async fn link_off(
     match scout_core::sharing::link_off(&auth.core, account_id, &body.trip).await {
         Ok(scout_core::sharing::Owned::Done(())) => StatusCode::OK.into_response(),
         other => refused(other, account_id, "link off"),
+    }
+}
+
+/// A new address in place of the old one, for the owner, so an address
+/// that has leaked can be retired without deleting the trip.
+async fn new_address(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<TripIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match scout_core::sharing::new_address(&auth.core, account_id, &body.trip).await {
+        Ok(scout_core::sharing::Owned::Done(address)) => axum::Json(serde_json::json!({ "address": address })).into_response(),
+        other => refused(other, account_id, "new address"),
     }
 }
 
@@ -1894,5 +1915,22 @@ mod tests {
         let mine = r#"{"trip":"October","position":2,"title":"Lunch with Stanley","date":"2026-10-12"}"#;
         let plan = json_of(post_json(&app, "/chat/trips/item-warning", &cookie, Some(&csrf), mine).await).await;
         assert_eq!(plan["items"][1]["warning"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_replaces_a_trips_address_and_everyone_sees_it() {
+        let (app, core, _dir, owner, cookie, csrf) = setup().await;
+        let (masha, m_cookie, m_csrf) = second(&core).await;
+        scout_core::sharing::share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
+        let listed: serde_json::Value =
+            serde_json::from_str(&body_of(get_with_cookie(&app, "/chat/trips", &m_cookie).await).await).unwrap();
+        let first = listed[0]["address"].as_str().unwrap().to_string();
+        assert!(first.starts_with("october-"), "{first}");
+        let res = post_json(&app, "/chat/trips/address-new", &m_cookie, Some(&m_csrf), r#"{"trip":"October"}"#).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let res = post_json(&app, "/chat/trips/address-new", &cookie, Some(&csrf), r#"{"trip":"October"}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_ne!(body["address"].as_str().unwrap(), first);
     }
 }

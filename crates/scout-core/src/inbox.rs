@@ -42,6 +42,38 @@ pub fn normalise_handle(raw: &str) -> Result<String, String> {
     Ok(h)
 }
 
+/// The readable half of a trip's address: the name lowercased, anything
+/// outside `a-z0-9` turned into one dash, trimmed, cut to 20 characters.
+/// "trip" when nothing is left — a name in another script has no letters
+/// an address can carry.
+pub fn trip_address_slug(name: &str) -> String {
+    let mut slug = String::new();
+    for c in name.trim().to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    // The cut can land just after a dash, so the end is trimmed again.
+    let slug: String = slug.trim_matches('-').chars().take(20).collect();
+    let slug = slug.trim_end_matches('-').to_string();
+    if slug.is_empty() { "trip".to_string() } else { slug }
+}
+
+/// A local part read as a trip address: `a-z0-9` and dashes, at least one
+/// dash, none at either end. A handle never has a dash, so the two kinds
+/// of address can be told apart by shape alone.
+pub fn normalise_trip_address(raw: &str) -> Option<String> {
+    let a = raw.trim().to_ascii_lowercase();
+    let ok = a.contains('-')
+        && !a.starts_with('-')
+        && !a.ends_with('-')
+        && a.len() <= 40
+        && a.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    ok.then_some(a)
+}
+
 /// What the extractor is told before it sees the mail. The mail is data:
 /// it is the one piece of text in the system written by a stranger, and
 /// this is where that is said to the model.
@@ -1580,6 +1612,19 @@ mod tests {
         for bad in ["ab", "a".repeat(31).as_str(), ".sasha", "sasha.", "sa sha", "sa@sha", "postmaster", "Admin", "no-reply", "sásha"] {
             assert!(normalise_handle(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_trip_address_is_the_name_as_a_slug_with_a_tail() {
+        assert_eq!(trip_address_slug("Hong Kong, September!"), "hong-kong-september");
+        assert_eq!(trip_address_slug("  Lisbon  "), "lisbon");
+        assert_eq!(trip_address_slug("A very long trip name that goes on"), "a-very-long-trip-nam");
+        assert_eq!(trip_address_slug("Москва"), "trip");
+        assert_eq!(trip_address_slug("---"), "trip");
+        assert_eq!(normalise_trip_address(" Hong-Kong-SEP-4f9qa "), Some("hong-kong-sep-4f9qa".into()));
+        assert_eq!(normalise_trip_address("sasha"), None, "no dash: a handle's shape, not a trip's");
+        assert_eq!(normalise_trip_address("a-b.c"), None);
+        assert_eq!(normalise_trip_address("-lisbon-"), None);
     }
 
     #[test]

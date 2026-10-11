@@ -3685,6 +3685,54 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// The trip's address, given now if it is kept and has none. `None` for
+    /// a draft: an address on a trip that may be gone tomorrow would send a
+    /// hotel's confirmation nowhere.
+    ///
+    /// Test-only until the mail routing of the trip-address slice calls it
+    /// (Task 4). Drop the attribute, here and on `new_trip_address`,
+    /// `trip_for_address`, `draw_address` and `address_tail`, when it does.
+    #[cfg(test)]
+    pub fn trip_address(&self, trip_id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        let (address, kept, name): (Option<String>, bool, String) = conn.query_row(
+            "SELECT address, kept, name FROM trips WHERE id = ?",
+            params![trip_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        match (address, kept) {
+            (Some(address), _) => Ok(Some(address)),
+            (None, false) => Ok(None),
+            (None, true) => draw_address(&conn, trip_id, &name).map(Some),
+        }
+    }
+
+    /// A new address in place of the old, for the owner; the old one then
+    /// belongs to nobody. `None` for anyone else. Test-only, as `trip_address`.
+    #[cfg(test)]
+    pub fn new_trip_address(&self, account_id: i64, trip_id: i64) -> Result<Option<String>> {
+        if !self.is_owner(account_id, trip_id)? {
+            return Ok(None);
+        }
+        let conn = self.conn();
+        let name: String = conn.query_row("SELECT name FROM trips WHERE id = ?", params![trip_id], |r| r.get(0))?;
+        draw_address(&conn, trip_id, &name).map(Some)
+    }
+
+    /// Whose trip an address is: the trip and its owner. Test-only, as
+    /// `trip_address`.
+    #[cfg(test)]
+    pub fn trip_for_address(&self, address: &str) -> Result<Option<(i64, i64)>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT id, account_id FROM trips WHERE address = ?",
+                params![address],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Whether this account owns the trip: what deleting it, removing
     /// people from it and turning its link off ask.
     pub fn is_owner(&self, account_id: i64, trip_id: i64) -> Result<bool> {
@@ -4689,6 +4737,35 @@ impl Store {
 /// except what checks `trips.account_id` itself.
 const REACHES: &str = "(t.account_id = ? OR EXISTS (SELECT 1 FROM trip_people p \
      WHERE p.trip_id = t.id AND p.account_id = ? AND p.left_at IS NULL))";
+
+/// Five characters of `a-z0-9`: the part of a trip's address nobody can
+/// guess from the trip's name. Test-only, as `Store::trip_address`.
+#[cfg(test)]
+fn address_tail() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..5).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
+}
+
+/// Draws a fresh address for the trip and writes it, under the lock the
+/// caller holds. Ten tries at a tail no other trip has; the eleventh
+/// collision in a space of sixty million is a bug, said as one. Test-only,
+/// as `Store::trip_address`.
+#[cfg(test)]
+fn draw_address(conn: &Connection, trip_id: i64, name: &str) -> Result<String> {
+    let slug = crate::inbox::trip_address_slug(name);
+    for _ in 0..10 {
+        let candidate = format!("{slug}-{}", address_tail());
+        let taken: i64 =
+            conn.query_row("SELECT count(*) FROM trips WHERE address = ?", params![candidate], |r| r.get(0))?;
+        if taken == 0 {
+            conn.execute("UPDATE trips SET address = ? WHERE id = ?", params![candidate, trip_id])?;
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("no free address for trip {trip_id} after ten draws")
+}
 
 /// The trip of this name that the account reaches. Its own first, should
 /// it ever reach two of one name — joining refuses that, so only a bug
@@ -9663,6 +9740,26 @@ CREATE TABLE conversations (
                 params![trip_id, account, name],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_kept_trip_gets_one_address_and_the_owner_can_replace_it() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        assert_eq!(s.trip_address(trip.id).unwrap(), None, "a draft has none");
+        s.keep_trip(owner, "Lisbon").unwrap();
+        let first = s.trip_address(trip.id).unwrap().unwrap();
+        assert!(first.starts_with("lisbon-") && first.len() == "lisbon-".len() + 5, "{first}");
+        assert_eq!(s.trip_address(trip.id).unwrap().as_deref(), Some(first.as_str()), "the same one next time");
+        assert_eq!(s.trip_for_address(&first).unwrap(), Some((trip.id, owner)));
+        let editor = s.account_for_telegram(2).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        assert_eq!(s.new_trip_address(editor, trip.id).unwrap(), None, "the owner's to replace");
+        let second = s.new_trip_address(owner, trip.id).unwrap().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(s.trip_for_address(&first).unwrap(), None, "the old one stops working");
+        assert_eq!(s.trip_for_address(&second).unwrap(), Some((trip.id, owner)));
     }
 
     #[test]

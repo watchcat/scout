@@ -6860,6 +6860,7 @@ dependencies = [
  "dashmap",
  "duckdb",
  "futures",
+ "rand 0.8.7",
  "reqwest 0.12.28",
  "rig",
  "scout-api",

@@ -290,9 +290,18 @@ CREATE TABLE IF NOT EXISTS mail_forwards (
   (200 either way, `{ok, address}` or `{ok: false, reason}`, on the
   handle check's rate limit); `POST /chat/trips/address` sets it, checked
   again under the lock that writes (422 for a rule, 409 when taken, 403
-  for an editor, 404 for a draft). The old address becomes unknown, as any
-  unheld handle is. The form says so the whole time: mail from anyone
-  holding the old one stops arriving.
+  for an editor, 404 for a draft). The old address becomes unknown, and the
+  form says so the whole time: mail from anyone holding the old one stops
+  arriving.
+- **A released address is held for 90 days.** When a trip's address is
+  changed, a trip with one is deleted, a handle is changed, or an account
+  holding one is merged away, the address goes into `released_addresses`
+  (step 23) with whoever let it go. For 90 days only that account may
+  take it again, as a trip's address or a handle; to everyone else it is
+  "taken". A hotel holding the old address keeps writing to it, and its
+  next confirmation — names, booking references — must not reach a
+  stranger who claimed the name in the meantime. Mail to a held address
+  is dropped, as mail to any unknown one is.
 - Signing in with an address on the inbound domain is refused, quietly:
   such an identity would have Scout forward a trip's mail to itself.
 - Shown in the People panel with Copy. On a trip page, the to-book banner

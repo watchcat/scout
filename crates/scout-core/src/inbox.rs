@@ -693,14 +693,10 @@ pub async fn check_handle(core: &Core, account_id: i64, raw: &str) -> anyhow::Re
     };
     let store = core.store();
     let wanted = handle.clone();
-    // A trip's address is the same kind of mailbox, so one a trip holds
-    // is taken too — `Store::set_handle` refuses it on the same grounds.
-    let (held, a_trips) = blocking(move || Ok((store.account_for_handle(&wanted)?, store.trip_address_held(&wanted)?))).await?;
-    Ok(match held {
-        Some(holder) if holder != account_id => Claim::Taken,
-        _ if a_trips => Claim::Taken,
-        _ => Claim::Claimed(handle),
-    })
+    // Everything `Store::set_handle` refuses: somebody's handle, a trip's
+    // address, or one somebody else released within the hold.
+    let free = blocking(move || store.handle_free(account_id, &wanted)).await?;
+    Ok(if free { Claim::Claimed(handle) } else { Claim::Taken })
 }
 
 /// Whose address `<raw>@domain` is. A local part that breaks the rules

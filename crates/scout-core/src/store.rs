@@ -258,6 +258,16 @@ CREATE TABLE IF NOT EXISTS mail_forwards (
     refused      BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (mail_id, account_id)
 );
+-- An address — a handle or a trip's — that stopped being anybody's, and
+-- who let it go. For `HOLD_DAYS` only that account may take it again: a
+-- hotel that has it keeps writing to it, and its next confirmation must
+-- not reach a stranger who claimed the name in the meantime. No key: one
+-- address can be released more than once, and any recent row holds it.
+CREATE TABLE IF NOT EXISTS released_addresses (
+    address     TEXT NOT NULL,
+    account_id  BIGINT NOT NULL,
+    released_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
 CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
 -- A person, independent of how they reach Scout. Deliberately almost empty:
 -- everything knowable about someone belongs to one of their identities or to
@@ -1568,6 +1578,16 @@ CREATE TABLE IF NOT EXISTS mail_forwards (
 );
 "#;
 
+/// Released addresses, held for whoever let them go. A new table and
+/// nothing else, so the step is the version bump and its backup; see
+/// `STEP_21_SHARING` for why it still has to build the table right.
+const STEP_23_RELEASED_ADDRESSES: &str = r#"
+CREATE TABLE IF NOT EXISTS released_addresses (
+    address TEXT NOT NULL, account_id BIGINT NOT NULL,
+    released_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -1592,6 +1612,7 @@ fn steps() -> Vec<(i64, Step)> {
         (20, Step::Sql(STEP_20_ITEM_CHECK)),
         (21, Step::Sql(STEP_21_SHARING)),
         (22, Step::Sql(STEP_22_TRIP_ADDRESS)),
+        (23, Step::Sql(STEP_23_RELEASED_ADDRESSES)),
     ]
 }
 
@@ -1906,6 +1927,13 @@ fn move_rows(conn: &Connection, absorbed: i64, survivor: i64) -> Result<()> {
         params![survivor, survivor],
     )?;
 
+    // A handle on the absorbed account goes with it, held for the survivor
+    // rather than freed for anyone.
+    conn.execute(
+        "INSERT INTO released_addresses (address, account_id)
+         SELECT handle, ? FROM accounts WHERE id = ? AND handle IS NOT NULL",
+        params![survivor, absorbed],
+    )?;
     conn.execute("DELETE FROM accounts WHERE id = ?", params![absorbed])?;
     Ok(())
 }
@@ -3754,7 +3782,13 @@ impl Store {
         if !address_free_within(&conn, trip_id, address)? {
             return Ok(AddressClaim::Taken);
         }
+        let old: Option<String> =
+            conn.query_row("SELECT address FROM trips WHERE id = ?", params![trip_id], |r| r.get(0))?;
         conn.execute("UPDATE trips SET address = ? WHERE id = ?", params![address, trip_id])?;
+        // The old one is held for the owner: hotels keep writing to it.
+        if let Some(old) = old.filter(|old| old != address) {
+            release_within(&conn, &old, owner)?;
+        }
         Ok(AddressClaim::Set)
     }
 
@@ -3766,11 +3800,18 @@ impl Store {
         address_free_within(&conn, trip_id, address)
     }
 
-    /// Whether any trip holds this address — what choosing a handle asks.
-    pub fn trip_address_held(&self, address: &str) -> Result<bool> {
+    /// Whether `account_id` could take `handle` now — `set_handle`'s three
+    /// questions as one read, for a form that asks as the person types:
+    /// nobody else's handle, no trip's address, not held for another.
+    pub fn handle_free(&self, account_id: i64, handle: &str) -> Result<bool> {
         let conn = self.conn();
-        let n: i64 = conn.query_row("SELECT count(*) FROM trips WHERE address = ?", params![address], |r| r.get(0))?;
-        Ok(n > 0)
+        let taken: i64 = conn.query_row(
+            "SELECT (SELECT count(*) FROM accounts WHERE handle = ? AND id <> ?)
+                  + (SELECT count(*) FROM trips WHERE address = ?)",
+            params![handle, account_id, handle],
+            |r| r.get(0),
+        )?;
+        Ok(taken == 0 && !held_for_another(&conn, handle, account_id)?)
     }
 
     /// Whose trip an address is: the trip and its owner.
@@ -4788,6 +4829,12 @@ impl Store {
         conn.execute("DELETE FROM trip_items WHERE trip_id = ?", params![id])?;
         conn.execute("DELETE FROM trip_people WHERE trip_id = ?", params![id])?;
         conn.execute("DELETE FROM trip_links WHERE trip_id = ?", params![id])?;
+        // Its address goes with it, held for the owner, as a changed one is.
+        let address: Option<String> =
+            conn.query_row("SELECT address FROM trips WHERE id = ?", params![id], |r| r.get(0))?;
+        if let Some(address) = address {
+            release_within(&conn, &address, account_id)?;
+        }
         conn.execute("DELETE FROM trips WHERE id = ?", params![id])?;
         Ok(TripDeleted::Deleted)
     }
@@ -4809,7 +4856,36 @@ fn address_tail() -> String {
     (0..5).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
 }
 
-/// `trip_address_free`, under a lock the caller holds.
+/// How long a released address stays its last holder's to take back.
+pub const HOLD_DAYS: i64 = 90;
+
+/// Whether `address` was released within `HOLD_DAYS` by an account other
+/// than this one. Its own release does not bind it: an owner who changes
+/// a trip's address and changes it back has lost nothing.
+fn held_for_another(conn: &Connection, address: &str, account_id: i64) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM released_addresses
+         WHERE address = ? AND account_id <> ?
+           AND released_at > CAST(current_timestamp AS TIMESTAMP) - to_days(CAST(? AS INTEGER))",
+        params![address, account_id, HOLD_DAYS],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Records that `account_id` let `address` go, so `held_for_another`
+/// keeps it from anybody else for `HOLD_DAYS`.
+fn release_within(conn: &Connection, address: &str, account_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO released_addresses (address, account_id) VALUES (?, ?)",
+        params![address, account_id],
+    )?;
+    Ok(())
+}
+
+/// `trip_address_free`, under a lock the caller holds: no other trip has
+/// the address, no account has it as a handle, and nobody but the trip's
+/// owner released it within `HOLD_DAYS`.
 fn address_free_within(conn: &Connection, trip_id: i64, address: &str) -> Result<bool> {
     let held: i64 = conn.query_row(
         "SELECT (SELECT count(*) FROM trips WHERE address = ? AND id <> ?)
@@ -4817,7 +4893,12 @@ fn address_free_within(conn: &Connection, trip_id: i64, address: &str) -> Result
         params![address, trip_id, address],
         |r| r.get(0),
     )?;
-    Ok(held == 0)
+    if held > 0 {
+        return Ok(false);
+    }
+    let owner: Option<i64> =
+        conn.query_row("SELECT account_id FROM trips WHERE id = ?", params![trip_id], |r| r.get(0)).optional()?;
+    Ok(!held_for_another(conn, address, owner.unwrap_or(0))?)
 }
 
 /// Draws a fresh address for the trip and writes it, under the lock the
@@ -5655,12 +5736,20 @@ impl Store {
             )
             .optional()?;
         // A trip's address is the same kind of mailbox: a chosen one can
-        // look exactly like a handle.
+        // look exactly like a handle. And one somebody else let go lately
+        // is still theirs — see `HOLD_DAYS`.
         let trip: i64 = conn.query_row("SELECT count(*) FROM trips WHERE address = ?", params![handle], |r| r.get(0))?;
-        if taken.is_some() || trip > 0 {
+        if taken.is_some() || trip > 0 || held_for_another(&conn, handle, account_id)? {
             return Ok(false);
         }
+        let old: Option<String> = conn
+            .query_row("SELECT handle FROM accounts WHERE id = ?", params![account_id], |r| r.get(0))
+            .optional()?
+            .flatten();
         conn.execute("UPDATE accounts SET handle = ? WHERE id = ?", params![handle, account_id])?;
+        if let Some(old) = old.filter(|old| old != handle) {
+            release_within(&conn, &old, account_id)?;
+        }
         Ok(true)
     }
 
@@ -7007,7 +7096,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 22);
+        assert_eq!(s.schema_version().unwrap(), 23);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -7071,7 +7160,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 22);
+        assert_eq!(store.schema_version().unwrap(), 23);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -8979,7 +9068,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 22);
+        assert_eq!(store.schema_version().unwrap(), 23);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -9805,7 +9894,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 22, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 23, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -9846,7 +9935,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 22);
+        assert_eq!(s.schema_version().unwrap(), 23);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -9946,7 +10035,7 @@ CREATE TABLE conversations (
         // updated the table: the pod crash-looped on this step.
         let (_dir, path) = version_eighteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 22);
+        assert_eq!(s.schema_version().unwrap(), 23);
         let trip = s.list_trips(1).unwrap().remove(0);
         assert_eq!((trip.items[0].lat, trip.items[0].geocode_tried), (None, false));
         s.set_item_coords(trip.items[0].id, None).unwrap();
@@ -9983,7 +10072,7 @@ CREATE TABLE conversations (
     fn step_20_runs_on_a_database_that_has_items_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_nineteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 22);
+        assert_eq!(s.schema_version().unwrap(), 23);
         let item = &s.list_trips(1).unwrap()[0].items[0];
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
@@ -10025,6 +10114,54 @@ CREATE TABLE conversations (
     }
 
     #[test]
+    fn a_released_address_is_held_for_ninety_days_for_whoever_let_it_go() {
+        let (s, _d) = test_store();
+        let (sasha, masha) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
+        let lisbon = s.upsert_trip(sasha, "Lisbon", None, None, None).unwrap();
+        let porto = s.upsert_trip(sasha, "Porto", None, None, None).unwrap();
+        let theirs = s.upsert_trip(masha, "Rome", None, None, None).unwrap();
+        for (who, name) in [(sasha, "Lisbon"), (sasha, "Porto"), (masha, "Rome")] {
+            s.keep_trip(who, name).unwrap();
+        }
+
+        // A trip's address, changed: held from everyone but its owner.
+        assert_eq!(s.set_trip_address(sasha, lisbon.id, "lisbon2026").unwrap(), AddressClaim::Set);
+        assert_eq!(s.set_trip_address(sasha, lisbon.id, "lisbon2027").unwrap(), AddressClaim::Set);
+        assert_eq!(s.trip_for_address("lisbon2026").unwrap(), None, "nobody's now");
+        assert_eq!(s.set_trip_address(masha, theirs.id, "lisbon2026").unwrap(), AddressClaim::Taken);
+        assert!(!s.set_handle(masha, "lisbon2026").unwrap(), "nor as a handle");
+        assert!(!s.handle_free(masha, "lisbon2026").unwrap());
+        assert_eq!(s.set_trip_address(sasha, porto.id, "lisbon2026").unwrap(), AddressClaim::Set, "the owner may take it back");
+
+        // A handle, changed: the same.
+        assert!(s.set_handle(masha, "masha").unwrap());
+        assert!(s.set_handle(masha, "masha2").unwrap());
+        assert_eq!(s.set_trip_address(sasha, lisbon.id, "masha").unwrap(), AddressClaim::Taken);
+        assert!(s.set_handle(masha, "masha").unwrap(), "and back again");
+
+        // A deleted trip's address: held for its owner.
+        let gone = s.trip_address(theirs.id).unwrap().unwrap();
+        assert_eq!(s.delete_trip(masha, "Rome").unwrap(), TripDeleted::Deleted);
+        assert_eq!(s.set_trip_address(sasha, lisbon.id, &gone).unwrap(), AddressClaim::Taken);
+
+        // Ninety days on, anybody may.
+        s.conn().execute("UPDATE released_addresses SET released_at = released_at - INTERVAL 91 DAY", []).unwrap();
+        assert_eq!(s.set_trip_address(sasha, lisbon.id, &gone).unwrap(), AddressClaim::Set);
+        assert!(s.set_handle(masha, "masha2").unwrap(), "her own old handle, aged out of its hold too");
+        assert!(!s.set_handle(masha, "lisbon2027").unwrap(), "released by that last change, so held from today");
+    }
+
+    #[test]
+    fn step_23_by_itself_builds_what_a_fresh_database_has() {
+        let (_dir, path) = version_twenty_one_db();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE IF EXISTS released_addresses").unwrap();
+        conn.execute_batch(STEP_23_RELEASED_ADDRESSES).unwrap();
+        let (fresh, _d) = test_store();
+        assert_eq!(shape(&fresh.conn(), "released_addresses"), shape(&conn, "released_addresses"));
+    }
+
+    #[test]
     fn a_trip_address_and_a_handle_are_one_namespace() {
         let (s, _d) = test_store();
         let (sasha, masha) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
@@ -10040,7 +10177,8 @@ CREATE TABLE conversations (
         assert!(!s.trip_address_free(porto.id, "lisbon2026").unwrap());
         assert!(s.trip_address_free(lisbon.id, "lisbon2026").unwrap(), "a trip's own is free to it");
         assert!(!s.set_handle(masha, "lisbon2026").unwrap(), "a handle cannot take a trip's address");
-        assert!(s.trip_address_held("lisbon2026").unwrap());
+        assert!(!s.handle_free(masha, "lisbon2026").unwrap());
+        assert!(s.handle_free(masha, "masha").unwrap(), "their own is free to them");
     }
 
     #[test]
@@ -10477,7 +10615,7 @@ CREATE TABLE conversations (
     fn step_21_runs_on_a_database_with_trips_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 22);
+        assert_eq!(s.schema_version().unwrap(), 23);
         let trip = &s.list_trips(1).unwrap()[0];
         assert_eq!(trip.items[0].added, None, "an item from before sharing has no author");
         let (fresh, _d) = test_store();
@@ -10515,7 +10653,7 @@ CREATE TABLE conversations (
     fn step_22_runs_on_a_database_with_mail_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_one_db();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 22);
+        assert_eq!(s.schema_version().unwrap(), 23);
         let (fresh, _d) = test_store();
         // Not `mail_forwards`: `Store::open` runs `MIGRATIONS` before the
         // steps, so the table is there whatever step 22 says, and comparing
@@ -11109,7 +11247,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 22);
+        assert_eq!(store.schema_version().unwrap(), 23);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -11213,7 +11351,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 22);
+        assert_eq!(store.schema_version().unwrap(), 23);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -11258,7 +11396,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 22);
+        assert_eq!(store.schema_version().unwrap(), 23);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -11334,7 +11472,7 @@ CREATE TABLE messages (
         // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 22);
+        assert_eq!(store.schema_version().unwrap(), 23);
         let part = mail_part("att_1", Some("inline"), None);
         let m = store
             .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))
@@ -11353,7 +11491,12 @@ CREATE TABLE messages (
         assert_eq!(store.account_for_handle("sasha").unwrap(), Some(a));
         assert!(store.set_handle(a, "sasha.k").unwrap(), "changed");
         assert_eq!(store.account_for_handle("sasha").unwrap(), None, "retired, not redirected");
-        assert!(store.set_handle(b, "sasha").unwrap(), "free again");
+        assert!(!store.set_handle(b, "sasha").unwrap(), "held for whoever let it go, for HOLD_DAYS");
+        store
+            .conn()
+            .execute("UPDATE released_addresses SET released_at = released_at - INTERVAL 91 DAY", [])
+            .unwrap();
+        assert!(store.set_handle(b, "sasha").unwrap(), "free again once the hold is over");
         assert!(store.set_handle(a, "SASHA").unwrap(), "case is normalise_handle's job, not the store's");
     }
 

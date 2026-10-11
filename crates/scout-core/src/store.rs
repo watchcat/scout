@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS trips (
     -- Last, so a fresh database and one migrated by step 21 agree.
     owner_name  TEXT,
     -- The trip's own address, the local part. Step 22; NULL until the
-    -- trip is kept and served. Always holds a dash, which a handle cannot.
+    -- trip is kept and served, or chosen by its owner. Unique against
+    -- other trips' addresses and accounts' handles alike, in Rust.
     address     TEXT,
     UNIQUE (account_id, name_key)
 );
@@ -851,6 +852,18 @@ fn stamp(t: chrono::NaiveDateTime) -> String {
 
 fn unstamp(text: &str) -> Result<chrono::NaiveDateTime> {
     Ok(chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")?)
+}
+
+/// What choosing a trip's address came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressClaim {
+    Set,
+    /// Another trip's address, or somebody's handle.
+    Taken,
+    /// On the trip, but not its owner.
+    NotOwner,
+    /// No such trip, or a draft, which has no address.
+    NotFound,
 }
 
 /// What asking to delete a trip did.
@@ -3716,26 +3729,48 @@ impl Store {
         }
     }
 
-    /// A new address in place of the old, for the owner; the old one then
-    /// belongs to nobody. `None` for anyone else, and for a draft.
-    pub fn new_trip_address(&self, account_id: i64, trip_id: i64) -> Result<Option<String>> {
-        if !self.is_owner(account_id, trip_id)? {
-            return Ok(None);
-        }
+    /// The address the owner chose, in place of the old one, which then
+    /// belongs to nobody. `address` has passed `inbox::check_trip_address`.
+    /// Unique against every other trip's address and every account's
+    /// handle, checked under the lock that writes it: the two kinds look
+    /// alike now that a chosen address needs no dash, and one inbound
+    /// mailbox cannot belong to two of them.
+    pub fn set_trip_address(&self, account_id: i64, trip_id: i64, address: &str) -> Result<AddressClaim> {
         let conn = self.conn();
-        // Gone since the owner check, or a draft: either way there is
-        // nothing to replace, and a draft is not given an address here
-        // any more than `trip_address` gives it one.
-        let Some((kept, name)): Option<(bool, String)> = conn
-            .query_row("SELECT kept, name FROM trips WHERE id = ?", params![trip_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        let Some((owner, kept)): Option<(i64, bool)> = conn
+            .query_row("SELECT account_id, kept FROM trips WHERE id = ?", params![trip_id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?
         else {
-            return Ok(None);
+            return Ok(AddressClaim::NotFound);
         };
-        if !kept {
-            return Ok(None);
+        if owner != account_id {
+            return Ok(AddressClaim::NotOwner);
         }
-        draw_address(&conn, trip_id, &name).map(Some)
+        // A draft has no address to change, any more than `trip_address`
+        // gives it one.
+        if !kept {
+            return Ok(AddressClaim::NotFound);
+        }
+        if !address_free_within(&conn, trip_id, address)? {
+            return Ok(AddressClaim::Taken);
+        }
+        conn.execute("UPDATE trips SET address = ? WHERE id = ?", params![address, trip_id])?;
+        Ok(AddressClaim::Set)
+    }
+
+    /// Whether `address` is free for this trip: no other trip holds it and
+    /// no account has it as a handle. The trip's own current address counts
+    /// as free, so re-typing it is not a clash.
+    pub fn trip_address_free(&self, trip_id: i64, address: &str) -> Result<bool> {
+        let conn = self.conn();
+        address_free_within(&conn, trip_id, address)
+    }
+
+    /// Whether any trip holds this address — what choosing a handle asks.
+    pub fn trip_address_held(&self, address: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row("SELECT count(*) FROM trips WHERE address = ?", params![address], |r| r.get(0))?;
+        Ok(n > 0)
     }
 
     /// Whose trip an address is: the trip and its owner.
@@ -4774,16 +4809,27 @@ fn address_tail() -> String {
     (0..5).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
 }
 
+/// `trip_address_free`, under a lock the caller holds.
+fn address_free_within(conn: &Connection, trip_id: i64, address: &str) -> Result<bool> {
+    let held: i64 = conn.query_row(
+        "SELECT (SELECT count(*) FROM trips WHERE address = ? AND id <> ?)
+              + (SELECT count(*) FROM accounts WHERE handle = ?)",
+        params![address, trip_id, address],
+        |r| r.get(0),
+    )?;
+    Ok(held == 0)
+}
+
 /// Draws a fresh address for the trip and writes it, under the lock the
-/// caller holds. Ten tries at a tail no other trip has; ten collisions in
+/// caller holds. Ten tries at a tail nothing else holds; ten collisions in
 /// a row in a space of sixty million is a bug, said as one.
 fn draw_address(conn: &Connection, trip_id: i64, name: &str) -> Result<String> {
     let slug = crate::inbox::trip_address_slug(name);
     for _ in 0..10 {
         let candidate = format!("{slug}-{}", address_tail());
-        let taken: i64 =
-            conn.query_row("SELECT count(*) FROM trips WHERE address = ?", params![candidate], |r| r.get(0))?;
-        if taken == 0 {
+        // The rules an owner's choice must pass, so a draw can never land
+        // on a reserved name (`no` + `reply`) that lookups then refuse.
+        if crate::inbox::check_trip_address(&candidate).is_ok() && address_free_within(conn, trip_id, &candidate)? {
             conn.execute("UPDATE trips SET address = ? WHERE id = ?", params![candidate, trip_id])?;
             return Ok(candidate);
         }
@@ -5608,7 +5654,10 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        if taken.is_some() {
+        // A trip's address is the same kind of mailbox: a chosen one can
+        // look exactly like a handle.
+        let trip: i64 = conn.query_row("SELECT count(*) FROM trips WHERE address = ?", params![handle], |r| r.get(0))?;
+        if taken.is_some() || trip > 0 {
             return Ok(false);
         }
         conn.execute("UPDATE accounts SET handle = ? WHERE id = ?", params![handle, account_id])?;
@@ -9952,12 +10001,12 @@ CREATE TABLE conversations (
     }
 
     #[test]
-    fn a_kept_trip_gets_one_address_and_the_owner_can_replace_it() {
+    fn a_kept_trip_gets_one_address_and_the_owner_can_choose_another() {
         let (s, _d) = test_store();
         let owner = s.account_for_telegram(1).unwrap();
         let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
         assert_eq!(s.trip_address(trip.id).unwrap(), None, "a draft has none");
-        assert_eq!(s.new_trip_address(owner, trip.id).unwrap(), None, "and is not given one by a replace");
+        assert_eq!(s.set_trip_address(owner, trip.id, "lisbon2026").unwrap(), AddressClaim::NotFound, "and cannot be given one");
         assert_eq!(s.trip_address(trip.id).unwrap(), None, "still none");
         assert_eq!(s.trip_address(trip.id + 1000).unwrap(), None, "a trip that is not there has none");
         s.keep_trip(owner, "Lisbon").unwrap();
@@ -9968,11 +10017,30 @@ CREATE TABLE conversations (
         assert_eq!(s.trip_for_address(&first).unwrap(), Some((trip.id, owner)));
         let editor = s.account_for_telegram(2).unwrap();
         put_on(&s, trip.id, editor, "Masha");
-        assert_eq!(s.new_trip_address(editor, trip.id).unwrap(), None, "the owner's to replace");
-        let second = s.new_trip_address(owner, trip.id).unwrap().unwrap();
-        assert_ne!(first, second);
+        assert_eq!(s.set_trip_address(editor, trip.id, "lisbon2026").unwrap(), AddressClaim::NotOwner);
+        assert_eq!(s.set_trip_address(owner, trip.id, "lisbon2026").unwrap(), AddressClaim::Set);
         assert_eq!(s.trip_for_address(&first).unwrap(), None, "the old one stops working");
-        assert_eq!(s.trip_for_address(&second).unwrap(), Some((trip.id, owner)));
+        assert_eq!(s.trip_for_address("lisbon2026").unwrap(), Some((trip.id, owner)));
+        assert_eq!(s.set_trip_address(owner, trip.id, "lisbon2026").unwrap(), AddressClaim::Set, "its own again is no clash");
+    }
+
+    #[test]
+    fn a_trip_address_and_a_handle_are_one_namespace() {
+        let (s, _d) = test_store();
+        let (sasha, masha) = (s.account_for_telegram(1).unwrap(), s.account_for_telegram(2).unwrap());
+        assert!(s.set_handle(masha, "masha").unwrap());
+        let lisbon = s.upsert_trip(sasha, "Lisbon", None, None, None).unwrap();
+        let porto = s.upsert_trip(sasha, "Porto", None, None, None).unwrap();
+        s.keep_trip(sasha, "Lisbon").unwrap();
+        s.keep_trip(sasha, "Porto").unwrap();
+        assert_eq!(s.set_trip_address(sasha, lisbon.id, "masha").unwrap(), AddressClaim::Taken, "somebody's handle");
+        assert!(!s.trip_address_free(lisbon.id, "masha").unwrap());
+        assert_eq!(s.set_trip_address(sasha, lisbon.id, "lisbon2026").unwrap(), AddressClaim::Set);
+        assert_eq!(s.set_trip_address(sasha, porto.id, "lisbon2026").unwrap(), AddressClaim::Taken, "another trip's");
+        assert!(!s.trip_address_free(porto.id, "lisbon2026").unwrap());
+        assert!(s.trip_address_free(lisbon.id, "lisbon2026").unwrap(), "a trip's own is free to it");
+        assert!(!s.set_handle(masha, "lisbon2026").unwrap(), "a handle cannot take a trip's address");
+        assert!(s.trip_address_held("lisbon2026").unwrap());
     }
 
     #[test]

@@ -84,21 +84,37 @@ pub fn trip_address_slug(name: &str) -> String {
     if slug.is_empty() { "trip".to_string() } else { slug }
 }
 
-/// A local part read as a trip address: `a-z0-9` and dashes, at least one
-/// dash, none at either end. A handle never has a dash, so the two kinds
-/// of address can be told apart by shape alone.
+/// What a trip's address may be: `a-z0-9`, dots and dashes, 3 to 40
+/// characters, not starting or ending with a dot or a dash, and none of
+/// the names a handle may not take either. The owner may choose one, so
+/// the reasons are sentences for the form; a generated address always
+/// passes.
 ///
-/// The cap is 40 rather than the 26 a generated address reaches (20 of
-/// slug, a dash, 5 of tail): it only keeps absurd input out, and room above
-/// 26 means an address issued under a longer slug rule still reads.
-pub fn normalise_trip_address(raw: &str) -> Option<String> {
+/// No dash is required. A chosen address may look exactly like a handle
+/// (`lisbon2026`), which is why the two kinds are kept unique against
+/// each other in the store rather than told apart by shape.
+pub fn check_trip_address(raw: &str) -> Result<String, String> {
     let a = raw.trim().to_ascii_lowercase();
-    let ok = a.contains('-')
-        && !a.starts_with('-')
-        && !a.ends_with('-')
-        && a.len() <= 40
-        && a.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    ok.then_some(a)
+    // Charset before length, as `normalise_handle` does: the length is in
+    // bytes, which is only the number of characters once all is ASCII.
+    if !a.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-') {
+        return Err("letters, digits, dots and dashes only".into());
+    }
+    if a.len() < 3 || a.len() > 40 {
+        return Err("an address is 3 to 40 characters".into());
+    }
+    if a.starts_with(['.', '-']) || a.ends_with(['.', '-']) {
+        return Err("an address cannot start or end with a dot or a dash".into());
+    }
+    if RESERVED_HANDLES.contains(&a.as_str()) {
+        return Err("that one is reserved".into());
+    }
+    Ok(a)
+}
+
+/// `check_trip_address` as a lookup wants it: the address, or nothing.
+pub fn normalise_trip_address(raw: &str) -> Option<String> {
+    check_trip_address(raw).ok()
 }
 
 /// What the extractor is told before it sees the mail. The mail is data:
@@ -677,9 +693,12 @@ pub async fn check_handle(core: &Core, account_id: i64, raw: &str) -> anyhow::Re
     };
     let store = core.store();
     let wanted = handle.clone();
-    let held = blocking(move || store.account_for_handle(&wanted)).await?;
+    // A trip's address is the same kind of mailbox, so one a trip holds
+    // is taken too — `Store::set_handle` refuses it on the same grounds.
+    let (held, a_trips) = blocking(move || Ok((store.account_for_handle(&wanted)?, store.trip_address_held(&wanted)?))).await?;
     Ok(match held {
         Some(holder) if holder != account_id => Claim::Taken,
+        _ if a_trips => Claim::Taken,
         _ => Claim::Claimed(handle),
     })
 }
@@ -1780,9 +1799,14 @@ mod tests {
         assert_eq!(trip_address_slug("abcdefghijklmnopqrs tuv"), "abcdefghijklmnopqrs", "a cut that lands on a dash");
         assert_eq!(trip_address_slug("2026"), "2026");
         assert_eq!(normalise_trip_address(" Hong-Kong-SEP-4f9qa "), Some("hong-kong-sep-4f9qa".into()));
-        assert_eq!(normalise_trip_address("sasha"), None, "no dash: a handle's shape, not a trip's");
-        assert_eq!(normalise_trip_address("a-b.c"), None);
+        assert_eq!(normalise_trip_address("lisbon2026"), Some("lisbon2026".into()), "a chosen one needs no dash");
+        assert_eq!(normalise_trip_address("a-b.c"), Some("a-b.c".into()));
         assert_eq!(normalise_trip_address("-lisbon-"), None);
+        assert_eq!(check_trip_address("lisbon_2026"), Err("letters, digits, dots and dashes only".into()));
+        assert_eq!(check_trip_address("ab"), Err("an address is 3 to 40 characters".into()));
+        assert_eq!(check_trip_address(&"a".repeat(41)), Err("an address is 3 to 40 characters".into()));
+        assert_eq!(check_trip_address(".lisbon"), Err("an address cannot start or end with a dot or a dash".into()));
+        assert_eq!(check_trip_address("Admin"), Err("that one is reserved".into()));
     }
 
     #[test]

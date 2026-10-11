@@ -1226,6 +1226,21 @@ export function handleProblem(raw) {
   return null
 }
 
+// The server's rule for a trip's address (`check_trip_address`), mirrored
+// so the form can speak on every keystroke; the server still decides.
+const RESERVED_ADDRESSES = ['postmaster', 'abuse', 'admin', 'hello', 'noreply', 'no-reply', 'support', 'info', 'scout', 'security', 'webmaster']
+
+export function tripAddressProblem(raw) {
+  const trimmed = String(raw ?? '').trim()
+  // Before lowercasing, as `handleProblem` does, for the same reason.
+  if (!/^[A-Za-z0-9.-]*$/.test(trimmed)) return 'letters, digits, dots and dashes only'
+  const a = trimmed.toLowerCase()
+  if (a.length < 3 || a.length > 40) return 'an address is 3 to 40 characters'
+  if (/^[.-]|[.-]$/.test(a)) return 'an address cannot start or end with a dot or a dash'
+  if (RESERVED_ADDRESSES.includes(a)) return 'that one is reserved'
+  return null
+}
+
 // The trace panel's model. Pure so it can be tested without a DOM, and
 // shared by the saved trace (rows from the server) and the live one (rows
 // built from frames), which must read identically.
@@ -2855,7 +2870,7 @@ function start() {
     if (!shouldPollChecks(trip, document.hidden)) return
     checkTimer = setTimeout(async () => {
       checkTimer = null
-      const busy = tripChoicePending || tripDetail.querySelector(':popover-open, .item-note-editor')
+      const busy = tripChoicePending || tripDetail.querySelector(':popover-open, .item-note-editor, .people-address-form')
       if (!busy) await loadTrips().catch(() => {})
       watchChecks()
     }, CHECK_POLL_MS)
@@ -3431,18 +3446,12 @@ function start() {
         button.addEventListener('click', () => linkAction(path, trip, said))
         actions.append(button)
       }
-      // Asked first, unlike the link: a link lost costs one re-share, but
-      // a hotel holding the old address cannot be told the new one, and
-      // its next mail — a changed time, a cancellation — goes nowhere.
-      // Only where there is an address to replace.
-      if (trip.address) {
-        const replace = node('button', 'people-link-action', 'New address')
-        replace.type = 'button'
-        replace.addEventListener('click', () => askInPanel(ask,
-          'Replace the trip email? Mail sent to the old address, including from places you already booked with, will stop arriving.',
-          'New address',
-          () => linkAction('/chat/trips/address-new', trip, 'New address made. The old one no longer works.')))
-        actions.append(replace)
+      // Only where there is an address to change: a draft has none.
+      if (trip.address && inbox?.domain) {
+        const change = node('button', 'people-link-action', 'Change address')
+        change.type = 'button'
+        change.addEventListener('click', () => ask.replaceChildren(...addressForm(trip, ask)))
+        actions.append(change)
       }
     } else {
       const leave = node('button', 'people-leave', 'Leave trip')
@@ -3468,6 +3477,99 @@ function start() {
     if (trip.you_own) panel.append(node('p', 'people-link-state', linkStateLine(trip.link)))
     panel.append(ask)
     return panel
+  }
+
+  // The owner's own choice of the trip's address, in the panel's question
+  // slot. Checked as they type — the rules here, whether it is free at the
+  // server, 400 ms after the last key — and checked again when saved,
+  // under the lock that writes it. The warning stays on screen the whole
+  // time: a hotel holding the old address cannot be told the new one, and
+  // its next mail — a changed time, a cancellation — goes nowhere.
+  function addressForm(trip, slot) {
+    const form = node('form', 'people-address-form')
+    form.append(node('p', '', 'Mail sent to the old address, including from places you already booked with, will stop arriving.'))
+    const row = node('div', 'handle-form-row')
+    const input = document.createElement('input')
+    input.type = 'text'
+    input.autocomplete = 'off'
+    input.spellcheck = false
+    input.value = trip.address
+    input.setAttribute('aria-label', 'Trip email')
+    input.setAttribute('aria-describedby', 'trip-address-hint')
+    row.append(input, node('span', 'handle-suffix', `@${inbox.domain}`))
+    const hint = node('p', 'handle-hint')
+    hint.id = 'trip-address-hint'
+    const buttons = node('div', 'trip-delete-confirm-row')
+    const cancel = node('button', '', 'Cancel')
+    cancel.type = 'button'
+    const save = node('button', 'danger', 'Change address')
+    save.type = 'submit'
+    buttons.append(cancel, save)
+    form.append(row, hint, buttons)
+    const say = (text, problem) => {
+      hint.className = problem ? 'handle-hint problem' : 'handle-hint'
+      hint.textContent = text
+    }
+    let checkSeq = 0
+    let checkTimer = null
+    async function check(raw, seq) {
+      try {
+        const res = await fetch(`/chat/trips/address-check?trip=${encodeURIComponent(trip.name)}&address=${encodeURIComponent(raw)}`)
+        if (seq !== checkSeq || !res.ok) return
+        const answer = await res.json()
+        if (seq !== checkSeq) return
+        if (answer.ok) say(answer.address === trip.address ? 'This is the current address' : `${answer.address}@${inbox.domain} is free`, false)
+        else if (typeof answer.reason === 'string') say(answer.reason, true)
+      } catch {
+        // Silence: the save will say what the check could not.
+      }
+    }
+    input.addEventListener('input', () => {
+      clearTimeout(checkTimer)
+      checkSeq++
+      const raw = input.value
+      if (!raw.trim()) return say('', false)
+      const problem = tripAddressProblem(raw)
+      say(problem ?? '', Boolean(problem))
+      if (problem) return
+      const seq = checkSeq
+      checkTimer = setTimeout(() => check(raw, seq).catch(() => {}), 400)
+    })
+    cancel.addEventListener('click', () => {
+      clearTimeout(checkTimer)
+      checkSeq++
+      slot.replaceChildren()
+    })
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault()
+      clearTimeout(checkTimer)
+      checkSeq++
+      const raw = input.value
+      const problem = tripAddressProblem(raw)
+      if (problem) return say(problem, true)
+      save.disabled = true
+      try {
+        const res = await fetch('/chat/trips/address', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-scout-csrf': csrfToken },
+          body: JSON.stringify({ trip: trip.name, address: raw }),
+        })
+        const answer = await res.json().catch(() => ({}))
+        if (res.ok) {
+          tripsLoaded = false
+          await loadTrips()
+          showTripToast(`The trip email is now ${answer.address ?? raw.trim().toLowerCase()}@${inbox.domain}.`)
+          return
+        }
+        say(typeof answer.reason === 'string' ? answer.reason : 'That did not work. Try again.', true)
+      } catch {
+        say('That did not work. Check your connection and try again.', true)
+      } finally {
+        save.disabled = false
+      }
+    })
+    queueMicrotask(() => input.focus())
+    return [form]
   }
 
   // The question under the panel, with Cancel and the action itself, armed
@@ -3513,8 +3615,8 @@ function start() {
     }
   }
 
-  // New link, Turn link off and New address change only what the trips
-  // carry — the link's line, the trip's address: read them again.
+  // New link and Turn link off change only the link's line, which comes
+  // with the trips: read them again.
   async function linkAction(path, trip, said) {
     try {
       const res = await fetch(path, {

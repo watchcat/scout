@@ -66,25 +66,73 @@ pub async fn new_link(core: &Core, account_id: i64, trip: &str, fresh: String) -
     .await
 }
 
-/// A new address for the trip, for the owner.
-///
-/// Ownership is asked here, as `new_link` asks it, although the store asks
-/// again: the store's `None` means both "not the owner" and "a draft", and
-/// only the first is `NotOwner`. A draft has no address to replace — the
-/// page shows none on it, so offers no Replace — and is `NotFound`, the
-/// answer for a trip the request cannot act on. No variant of its own:
-/// nothing on the page could ask.
-pub async fn new_address(core: &Core, account_id: i64, trip: &str) -> anyhow::Result<Owned<String>> {
+/// What choosing a trip's address came to, for the owner's form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressChoice {
+    /// Free (from a check) or now the trip's (from a set), as normalised.
+    Free(String),
+    /// A rule broken, with the sentence for the form.
+    Invalid(String),
+    /// Another trip's address, or somebody's personal one.
+    Taken,
+    NotFound,
+    NotOwner,
+}
+
+/// The owner's trip by name, for the two address calls: `Err` carries the
+/// answer when it is not one the owner can change.
+fn owned_trip(store: &crate::store::Store, account_id: i64, trip: &str) -> anyhow::Result<Result<i64, AddressChoice>> {
+    let Some(id) = trip_id(store, account_id, trip)? else { return Ok(Err(AddressChoice::NotFound)) };
+    if !store.is_owner(account_id, id)? {
+        return Ok(Err(AddressChoice::NotOwner));
+    }
+    // A draft has no address to change, so the check answers as the set
+    // will; the page never offers the form on one anyway.
+    if store.trip_address(id)?.is_none() {
+        return Ok(Err(AddressChoice::NotFound));
+    }
+    Ok(Ok(id))
+}
+
+/// Whether the owner could give the trip this address right now, for a
+/// form that asks as they type. Nothing is written.
+pub async fn check_address(core: &Core, account_id: i64, trip: &str, raw: &str) -> anyhow::Result<AddressChoice> {
+    let address = match crate::inbox::check_trip_address(raw) {
+        Ok(a) => a,
+        Err(why) => return Ok(AddressChoice::Invalid(why)),
+    };
     let store = core.store();
     let trip = trip.to_string();
     blocking(move || {
-        let Some(id) = trip_id(&store, account_id, &trip)? else { return Ok(Owned::NotFound) };
-        if !store.is_owner(account_id, id)? {
-            return Ok(Owned::NotOwner);
-        }
-        Ok(match store.new_trip_address(account_id, id)? {
-            Some(address) => Owned::Done(address),
-            None => Owned::NotFound,
+        let id = match owned_trip(&store, account_id, &trip)? {
+            Ok(id) => id,
+            Err(answer) => return Ok(answer),
+        };
+        Ok(if store.trip_address_free(id, &address)? { AddressChoice::Free(address) } else { AddressChoice::Taken })
+    })
+    .await
+}
+
+/// Gives the trip the address its owner chose. The old one then belongs
+/// to nobody, and mail sent to it stops arriving — the page asks first.
+pub async fn set_address(core: &Core, account_id: i64, trip: &str, raw: &str) -> anyhow::Result<AddressChoice> {
+    let address = match crate::inbox::check_trip_address(raw) {
+        Ok(a) => a,
+        Err(why) => return Ok(AddressChoice::Invalid(why)),
+    };
+    let store = core.store();
+    let trip = trip.to_string();
+    blocking(move || {
+        let id = match owned_trip(&store, account_id, &trip)? {
+            Ok(id) => id,
+            Err(answer) => return Ok(answer),
+        };
+        // The store asks ownership again, under the lock that writes.
+        Ok(match store.set_trip_address(account_id, id, &address)? {
+            crate::store::AddressClaim::Set => AddressChoice::Free(address),
+            crate::store::AddressClaim::Taken => AddressChoice::Taken,
+            crate::store::AddressClaim::NotOwner => AddressChoice::NotOwner,
+            crate::store::AddressClaim::NotFound => AddressChoice::NotFound,
         })
     })
     .await
@@ -259,25 +307,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_owner_replaces_a_kept_trips_address() {
+    async fn only_the_owner_chooses_a_kept_trips_address_and_it_must_be_free() {
         let (core, _dir, owner) = core().await;
-        assert_eq!(new_address(&core, owner, "October").await.unwrap(), Owned::NotFound, "a draft has none to replace");
+        assert_eq!(set_address(&core, owner, "October", "october2026").await.unwrap(), AddressChoice::NotFound, "a draft has none");
 
         // Sharing keeps the trip, so it has an address from here on.
         let masha = core.store().account_for_telegram(12).unwrap();
         share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
-        let old = crate::trips::find(&core, owner, "October").await.unwrap().unwrap().address.expect("a kept trip has one");
-        assert_eq!(new_address(&core, masha, "October").await.unwrap(), Owned::NotOwner);
-        let new = match new_address(&core, owner, "October").await.unwrap() {
-            Owned::Done(address) => address,
-            other => panic!("{other:?}"),
-        };
-        assert_ne!(new, old);
+        assert_eq!(set_address(&core, masha, "October", "october2026").await.unwrap(), AddressChoice::NotOwner);
+        assert_eq!(check_address(&core, masha, "October", "october2026").await.unwrap(), AddressChoice::NotOwner);
+        assert_eq!(
+            check_address(&core, owner, "October", "Oct_2026").await.unwrap(),
+            AddressChoice::Invalid("letters, digits, dots and dashes only".into())
+        );
+        assert_eq!(check_address(&core, owner, "October", " October2026 ").await.unwrap(), AddressChoice::Free("october2026".into()));
+        assert_eq!(set_address(&core, owner, "October", "October2026").await.unwrap(), AddressChoice::Free("october2026".into()));
         let seen = crate::trips::find(&core, masha, "October").await.unwrap().unwrap().address;
-        assert_eq!(seen.as_deref(), Some(new.as_str()), "everyone on the trip sees the new one");
+        assert_eq!(seen.as_deref(), Some("october2026"), "everyone on the trip sees the new one");
+        assert_eq!(
+            crate::inbox::check_handle(&core, masha, "october2026").await.unwrap(),
+            crate::inbox::Claim::Taken,
+            "a trip's address is not free as a personal one"
+        );
+
+        // Somebody's personal address is taken, and so is another trip's.
+        crate::inbox::set_handle(&core, masha, "masha").await.unwrap();
+        assert_eq!(check_address(&core, owner, "October", "masha").await.unwrap(), AddressChoice::Taken);
+        crate::trips::seed_trip_for_tests(&core, owner, "Porto").await.unwrap();
+        crate::trips::keep(&core, owner, "Porto").await.unwrap();
+        assert_eq!(set_address(&core, owner, "Porto", "october2026").await.unwrap(), AddressChoice::Taken);
 
         let stranger = core.store().account_for_telegram(13).unwrap();
-        assert_eq!(new_address(&core, stranger, "October").await.unwrap(), Owned::NotFound);
+        assert_eq!(set_address(&core, stranger, "October", "x2026x").await.unwrap(), AddressChoice::NotFound);
     }
 
     #[tokio::test]

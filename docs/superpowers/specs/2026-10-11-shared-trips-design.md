@@ -259,10 +259,11 @@ CREATE TABLE IF NOT EXISTS mail_forwards (
 );
 ```
 
-- `trips.address` is the local part, lowercase. It always contains a
-  dash, which a personal handle (`a-z0-9.`) never can, so the two kinds
-  never collide; trip addresses are unique among themselves, checked in
-  Rust under the store lock.
+- `trips.address` is the local part, lowercase. Unique against every
+  other trip's address and every account's handle together, checked in
+  Rust under the store lock; choosing a handle checks trip addresses too.
+  A chosen address can look just like a handle, so shape cannot keep the
+  two kinds apart.
 - `arrivals.trip_id` already exists — placement writes it — and a trip's
   mail sets it to that trip.
 - `inbound_mail.account_id` for a trip's mail is the owner, so every
@@ -282,10 +283,16 @@ CREATE TABLE IF NOT EXISTS mail_forwards (
   then `-` and 5 random characters from `a-z0-9`. Drawn again on a clash.
   A name with nothing left after slugging gets `trip`.
 - Drafts have none.
-- `POST /chat/trips/address-new` — owner only: draws a new one. The old one
-  becomes unknown, as any unheld handle is. The page asks first and shows
-  the button only where there is an address: mail from anyone holding the
-  old one stops arriving.
+- The owner may choose another: `a-z0-9`, dots and dashes, 3 to 40
+  characters, not starting or ending with a dot or a dash, none of the
+  reserved names — no dash required (`lisbon2026`).
+  `GET /chat/trips/address-check?trip=&address=` answers as they type
+  (200 either way, `{ok, address}` or `{ok: false, reason}`, on the
+  handle check's rate limit); `POST /chat/trips/address` sets it, checked
+  again under the lock that writes (422 for a rule, 409 when taken, 403
+  for an editor, 404 for a draft). The old address becomes unknown, as any
+  unheld handle is. The form says so the whole time: mail from anyone
+  holding the old one stops arriving.
 - Signing in with an address on the inbound domain is refused, quietly:
   such an identity would have Scout forward a trip's mail to itself.
 - Shown in the People panel with Copy. On a trip page, the to-book banner
@@ -297,8 +304,9 @@ Anyone on the trip may delete one of its mails under Other mail, as
 anyone may Add or Ignore its bookings.
 
 Every address on our domain in `to`, then `received_for`, is tried — at
-most 16, since the header is a stranger's to fill — and the first trip
-address that resolves wins over any handle: a trip address is the more
+most 16, since the header is a stranger's to fill — each as a trip's
+address first and then as a handle, and the first trip address that
+resolves wins over any handle: a trip address is the more
 specific intent, and its mail reaches everyone on the trip. Only when no
 trip address resolves does the first handle that does. A mail naming two
 of ours is stored once. Mail for a trip address is recorded with the owner

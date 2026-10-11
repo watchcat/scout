@@ -6165,11 +6165,6 @@ impl Store {
     }
 
     /// The people a trip's mail has been forwarded to.
-    ///
-    /// Test-only until the worker forwards a trip's mail to everyone on it
-    /// (Task 6); drop the attribute, here and on `note_forwarded_to`, when
-    /// it does.
-    #[cfg(test)]
     pub fn forwarded_to(&self, mail_id: i64) -> Result<Vec<i64>> {
         let conn = self.conn();
         let mut stmt = conn.prepare("SELECT account_id FROM mail_forwards WHERE mail_id = ? ORDER BY account_id")?;
@@ -6178,9 +6173,7 @@ impl Store {
     }
 
     /// One more person has their copy. Idempotent, so a retry that races a
-    /// slow first pass does not fail on the key. Test-only, as
-    /// `forwarded_to`.
-    #[cfg(test)]
+    /// slow first pass does not fail on the key.
     pub fn note_forwarded_to(&self, mail_id: i64, account_id: i64) -> Result<()> {
         let conn = self.conn();
         conn.execute(
@@ -6247,9 +6240,18 @@ impl Store {
         // mail done), and a non-booking is that before it is anything else.
         // The ranking survives the collapse: `failed` is the mail's own
         // status, so it is every reading of that mail's reason at once.
+        //
+        // Whether a row was forwarded is the viewer's answer. A trip's mail
+        // goes to each person on the trip separately, so its `forwarded_at`
+        // only says that nobody is owed a copy any more; the viewer's own
+        // copy is in `mail_forwards`. Were it read off the row, an editor
+        // with no address would see the owner's copy as their own.
         let failed = unreadable("m");
         let mut stmt = conn.prepare(&format!(
-            "SELECT m.id, m.from_address, m.subject, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ'), m.forwarded_at IS NOT NULL, a.id,
+            "SELECT m.id, m.from_address, m.subject, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ'),
+                    CASE WHEN m.trip_id IS NULL THEN m.forwarded_at IS NOT NULL
+                         ELSE EXISTS (SELECT 1 FROM mail_forwards f WHERE f.mail_id = m.id AND f.account_id = ?) END,
+                    a.id,
                     CASE WHEN {failed} THEN 'failed'
                          WHEN NOT a.booking THEN 'not_booking'
                          ELSE 'ignored' END
@@ -6265,7 +6267,7 @@ impl Store {
              ORDER BY m.received_at DESC, m.id DESC"
         ))?;
         let mut other: Vec<scout_api::MailRow> = stmt
-            .query_map(params![account_id, account_id, account_id, days_ago(30)], |r| {
+            .query_map(params![account_id, account_id, account_id, account_id, days_ago(30)], |r| {
                 Ok(scout_api::MailRow {
                     mail_id: r.get(0)?, from: r.get(1)?, subject: r.get(2)?, received_at: r.get(3)?,
                     forwarded: r.get(4)?, arrival_id: r.get(5)?, reason: r.get(6)?, attachments: Vec::new(),
@@ -9992,6 +9994,38 @@ CREATE TABLE conversations (
         s.mail_done(mail).unwrap();
         assert_eq!(s.delete_mail(editor, mail).unwrap(), MailGone::Gone);
         assert!(s.forwarded_to(mail).unwrap().is_empty());
+    }
+
+    #[test]
+    fn whether_a_trips_mail_was_forwarded_is_each_viewers_own_answer() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let editor = s.account_for_telegram(2).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        let newsletter = || NewArrival { booking: false, summary: "Newsletter".into(), ..NewArrival::default() };
+        let forwarded = |viewer: i64, mail: i64| {
+            s.inbox_view(viewer).unwrap().other.iter().find(|r| r.mail_id == mail).map(|r| r.forwarded)
+        };
+
+        // The owner had a copy and the editor did not, and the mail is
+        // marked forwarded because nobody is owed one any more.
+        let trips = s.insert_trip_mail(trip.id, "p-1", "hotel@example.com", None, None, None, false, &[]).unwrap().unwrap();
+        s.insert_arrivals(owner, trips, &[newsletter()]).unwrap();
+        s.note_forwarded_to(trips, owner).unwrap();
+        s.mail_forwarded(trips).unwrap();
+        assert_eq!(forwarded(owner, trips), Some(true));
+        assert_eq!(forwarded(editor, trips), Some(false), "the owner's copy is not the editor's");
+        s.note_forwarded_to(trips, editor).unwrap();
+        assert_eq!(forwarded(editor, trips), Some(true));
+
+        // An account's own mail reads the row, as it always has.
+        let own = s.insert_mail(owner, "p-2", "hotel@example.com", None, None, None, false, &[]).unwrap().unwrap();
+        s.insert_arrivals(owner, own, &[newsletter()]).unwrap();
+        assert_eq!(forwarded(owner, own), Some(false));
+        s.mail_forwarded(own).unwrap();
+        assert_eq!(forwarded(owner, own), Some(true));
+        assert_eq!(forwarded(editor, own), None, "and it is nobody else's to see");
     }
 
     #[test]

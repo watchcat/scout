@@ -8,10 +8,13 @@
 //! account is who sent it, in which case the person has their own copy
 //! already and only the reading is owed — asks the
 //! tool-less extractor what it is, records the arrival where it belongs,
-//! and says one line on Telegram. Every step is idempotent per row, so a
+//! and says one line on Telegram. Mail that came to a trip's address is
+//! forwarded to, and announced to, each person on the trip rather than
+//! its owner alone. Every step is idempotent per row, so a
 //! retry after a crash mid-way does the remaining work and repeats none
-//! of the visible parts: the forward is recorded on the row, and the
-//! attachments are fetched only while the row has none.
+//! of the visible parts: the forward is recorded on the row (and, for a
+//! trip's mail, per person in `mail_forwards`), and the attachments are
+//! fetched only while the row has none.
 
 use crate::resend::{AttachmentMeta, Meta, Outgoing, ResendClient};
 use scout_core::core::Core;
@@ -162,9 +165,14 @@ async fn work_one(core: &Core, client: &ResendClient, from: &str, m: &MailToWork
         return Ok(());
     }
     scout_core::inbox::mail_failed(core, m.id, &format!("{e:#}")).await?;
+    // Everyone on a trip is told about its unreadable mail, not only the
+    // owner: each of them sees it under Other mail, and any of them may
+    // be the one who was waiting on it.
     let text = "An email arrived that Scout could not read. It is under Other mail on goodscout.fyi/chat.";
-    if let Err(e) = scout_core::inbox::nudge(core, m.account_id, m.id, text).await {
-        tracing::warn!(error = %e, id = m.id, "could not nudge about a failed email");
+    for person in to_be_told(core, m).await {
+        if let Err(e) = scout_core::inbox::nudge(core, person, m.id, text).await {
+            tracing::warn!(error = %e, id = m.id, person, "could not nudge about a failed email");
+        }
     }
     Ok(())
 }
@@ -322,8 +330,9 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
 
     // 5. The nudge. From here nothing fails the mail: it is filed, and a
     // line that could not be queued is not a reason to pay the model to
-    // read it again.
-    let text = match placement {
+    // read it again. `None` is the Other-mail line, which is written per
+    // person below because it says whether the mail reached the reader.
+    let same_for_all = match placement {
         Some(p) => {
             let name = match scout_core::inbox::trip_name(core, m.account_id, p.id()).await {
                 Ok(name) => name,
@@ -332,23 +341,75 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
                     None
                 }
             };
-            arrival_nudge(p, name.as_deref().unwrap_or("a trip"), &named)
+            Some(arrival_nudge(p, name.as_deref().unwrap_or("a trip"), &named))
         }
         // A file handed to the bot in the chat is a question asked there,
         // and "nothing" is an answer it is owed.
         None if sender == scout_core::inbox::TELEGRAM_SENDER => {
-            no_booking_in_document(subject.as_deref().unwrap_or("that file"))
+            Some(no_booking_in_document(subject.as_deref().unwrap_or("that file")))
         }
         // Not a booking, but from a place bookings come from: worth a line,
         // since the person may be waiting on it. Anything else is just
         // mail, and mail arrives quietly.
-        None if looks_like_a_booking_site(&sender) => other_mail_nudge(&sender, subject.as_deref().unwrap_or_default(), forwarded),
+        None if looks_like_a_booking_site(&sender) => None,
         None => return Ok(()),
     };
-    if let Err(e) = scout_core::inbox::nudge(core, m.account_id, m.id, &text).await {
-        tracing::warn!(error = %e, id = m.id, "could not nudge about an arrival");
+    // Who holds a copy of a trip's mail is per person, and only the
+    // Other-mail line asks. A store that cannot say leaves the line
+    // silent about the forward rather than claiming one.
+    let copies = match (m.trip_id, &same_for_all) {
+        (Some(_), None) => scout_core::inbox::forwarded_to(core, m.id).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, id = m.id, "could not read who has a copy for the nudge");
+            Vec::new()
+        }),
+        _ => Vec::new(),
+    };
+    // Each person under their own account: the outbox key is per account,
+    // so a retry tells nobody twice, and the buttons the chat hangs under
+    // the line read that person's own reach to the bookings.
+    for person in to_be_told(core, m).await {
+        let text = match &same_for_all {
+            Some(text) => text.clone(),
+            None => {
+                let theirs = forwarded_for(core, m, person, &sender, forwarded, &copies).await;
+                other_mail_nudge(&sender, subject.as_deref().unwrap_or_default(), theirs)
+            }
+        };
+        if let Err(e) = scout_core::inbox::nudge(core, person, m.id, &text).await {
+            tracing::warn!(error = %e, id = m.id, person, "could not nudge about an arrival");
+        }
     }
     Ok(())
+}
+
+/// What the Other-mail line may tell `person` about the forward. For an
+/// account's own mail that is the mail's answer. For a trip's mail the
+/// mail's answer is about everyone, and "Forwarded to you" must not reach
+/// the editor with no address, or the one who sent it: each is told about
+/// their own copy, which `copies` (the `mail_forwards` rows) records.
+async fn forwarded_for(
+    core: &Core,
+    m: &MailToWork,
+    person: i64,
+    sender: &str,
+    forwarded: Forwarded,
+    copies: &[i64],
+) -> Forwarded {
+    if m.trip_id.is_none() {
+        return forwarded;
+    }
+    if copies.contains(&person) {
+        return Forwarded::Yes;
+    }
+    match scout_core::inbox::emails_of(core, person).await {
+        Ok(theirs) if scout_core::inbox::sender_is_the_account(sender, &theirs) => Forwarded::TheirOwn,
+        Ok(theirs) if theirs.is_empty() => Forwarded::NoAddress,
+        // Owed and not sent yet, refused, or unknown because the store
+        // did not answer: in each case nothing is known to have reached
+        // them, and the line says nothing of it rather than guess.
+        _ if forwarded == Forwarded::Later => Forwarded::Later,
+        _ => Forwarded::Refused,
+    }
 }
 
 /// The forward, unless the row says it went, or the account is who sent
@@ -372,6 +433,9 @@ async fn forward(
 ) -> Result<Forwarded, Failure> {
     if m.forwarded {
         return Ok(Forwarded::Yes);
+    }
+    if let Some(trip_id) = m.trip_id {
+        return forward_to_trip(core, client, from, m, trip_id, sender, subject, text, html).await;
     }
     // Every address the account holds, of which the first is where a
     // forward goes — as it went when this read one address and no more.
@@ -411,6 +475,102 @@ async fn forward(
         Err(e) => {
             tracing::warn!(error = %e, id = m.id, "the forward was refused; reading the mail anyway");
             Ok(Forwarded::Refused)
+        }
+    }
+}
+
+/// A trip's mail, to each person on the trip with an address, one send
+/// each so nobody sees another's address, never back to whoever sent it.
+/// `mail_forwards` remembers who has theirs, so a retry after an outage
+/// sends only what is still owed. `Yes` once nobody is owed one; `Later`
+/// while somebody is and Resend was not there.
+///
+/// A refusal is not owed again, as in `forward`: Resend would give the
+/// same answer tomorrow, so that person is passed over and the mail can
+/// still be done.
+#[allow(clippy::too_many_arguments)]
+async fn forward_to_trip(
+    core: &Core,
+    client: &ResendClient,
+    from: &str,
+    m: &MailToWork,
+    trip_id: i64,
+    sender: &str,
+    subject: Option<String>,
+    text: Option<String>,
+    html: Option<String>,
+) -> Result<Forwarded, Failure> {
+    let people = people_or_owner(core, m, trip_id).await.map_err(Failure::Reading)?;
+    let done = scout_core::inbox::forwarded_to(core, m.id).await.map_err(Failure::Reading)?;
+    // Read once for everyone: the bytes are the same for each send, and a
+    // trip of four should not ask the store for them four times.
+    let all = scout_core::inbox::attachment_bytes(core, m.id).await.map_err(Failure::Reading)?;
+    let attachments = within_cap(all, FORWARD_CAP);
+    let mut later = false;
+    for person in people.into_iter().filter(|p| !done.contains(p)) {
+        let theirs = scout_core::inbox::emails_of(core, person).await.map_err(Failure::Reading)?;
+        if scout_core::inbox::sender_is_the_account(sender, &theirs) {
+            // Whoever booked it and sent it on already holds it. The id
+            // and the person, not the address, as in `forward`.
+            tracing::info!(id = m.id, person, "a trip's mail sent by one of its people; not sending it back to them");
+            continue;
+        }
+        let Some(to) = theirs.first().cloned() else {
+            continue;
+        };
+        let mail = Outgoing {
+            from: from.into(),
+            to,
+            reply_to: Some(sender.to_string()),
+            subject: subject.clone().unwrap_or_default(),
+            text: text.clone(),
+            html: html.clone(),
+            attachments: attachments.clone(),
+        };
+        match client.send(&mail).await {
+            Ok(()) => scout_core::inbox::note_forwarded_to(core, m.id, person).await.map_err(Failure::Reading)?,
+            Err(e) if crate::resend::is_transient(&e) => {
+                tracing::warn!(error = %e, id = m.id, person, "a trip forward did not go; sending it later");
+                later = true;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, id = m.id, person, "a trip forward was refused");
+            }
+        }
+    }
+    if later {
+        return Ok(Forwarded::Later);
+    }
+    // The row's own mark means "nobody is owed one", which is what lets a
+    // later pass skip all of the above at the `m.forwarded` check. Who
+    // actually has a copy is `mail_forwards`' to say, and the Other mail
+    // row reads it from there.
+    scout_core::inbox::mail_forwarded(core, m.id).await.map_err(Failure::Reading)?;
+    Ok(Forwarded::Yes)
+}
+
+/// Everyone on the trip a mail came to, owner first. A trip deleted since
+/// its mail arrived has nobody on it, but the mail is still the owner's —
+/// it was stored under their account — so they are who is left to hear
+/// about it.
+async fn people_or_owner(core: &Core, m: &MailToWork, trip_id: i64) -> anyhow::Result<Vec<i64>> {
+    let people = scout_core::sharing::people_of(core, trip_id).await?;
+    Ok(if people.is_empty() { vec![m.account_id] } else { people })
+}
+
+/// Who a line on the phone about this mail goes to: everyone on its trip
+/// for a trip's mail, each under their own account, else the account it
+/// came to. A store that cannot say who is on the trip still leaves the
+/// owner, who would have been told before trips had people.
+async fn to_be_told(core: &Core, m: &MailToWork) -> Vec<i64> {
+    let Some(trip_id) = m.trip_id else {
+        return vec![m.account_id];
+    };
+    match people_or_owner(core, m, trip_id).await {
+        Ok(people) => people,
+        Err(e) => {
+            tracing::warn!(error = %e, id = m.id, "could not read who is on the trip; telling the owner only");
+            vec![m.account_id]
         }
     }
 }
@@ -842,7 +1002,7 @@ mod tests {
     use crate::tests::{admitted, open_round, test_app, test_app_with_model};
     use scout_core::inbox::{MailIn, MailPart};
     use serde_json::json;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A part as `winnow` sees it, whichever source described it.
@@ -1798,5 +1958,168 @@ mod tests {
         work_once(&core, &client, FROM, 1).await;
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.iter().filter(|r| r.url.path().starts_with("/emails/receiving/re_") && !r.url.path().ends_with("/attachments")).count(), 2);
+    }
+
+    /// Who each send to Resend was addressed to, in the order they were
+    /// made, failed attempts included.
+    fn recipients(reqs: &[wiremock::Request]) -> Vec<String> {
+        reqs.iter()
+            .filter(|r| r.url.path() == "/emails")
+            .map(|r| {
+                let sent: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                let to = sent["to"].as_array().expect("a list of recipients");
+                assert_eq!(to.len(), 1, "one person a send, so nobody sees another's address");
+                to[0].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    /// A kept trip called Lisbon, owned by `owner`, with each of `editors`
+    /// on it under the name given. Its id.
+    async fn shared_lisbon(core: &scout_core::core::Core, owner: i64, editors: &[(i64, &str)]) -> i64 {
+        scout_core::trips::seed_trip_for_tests(core, owner, "Lisbon").await.unwrap();
+        scout_core::trips::keep(core, owner, "Lisbon").await.unwrap();
+        for (editor, name) in editors {
+            scout_core::sharing::share_for_tests(core, owner, "Lisbon", *editor, name).await.unwrap();
+        }
+        scout_core::trips::find(core, owner, "Lisbon").await.unwrap().unwrap().trip.id
+    }
+
+    #[tokio::test]
+    async fn a_trips_mail_goes_to_everyone_on_it_once_and_never_back_to_its_sender() {
+        let server = MockServer::start().await;
+        // Masha booked it, so the confirmation comes from her address: she
+        // forwarded it to the trip's, or gave that address to the hotel and
+        // the hotel copied her in.
+        resend_like_from(&server, "Masha <masha@example.com>").await;
+        model_saying(&server, r#"{"booking":true,"kind":"stay","title":"Hotel Alfama","place":"Lisbon","date":"2026-10-12","summary":"Hotel in Lisbon, 12 Oct"}"#).await;
+        let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
+        open_round(&core, "autumn", 5).await;
+        // Sasha owns the trip and has an address but no phone; Masha has
+        // both; Dan has a phone only.
+        let sasha = admitted(&core, "111").await;
+        let masha = admitted(&core, "222").await;
+        let dan = admitted(&core, "333").await;
+        scout_core::inbox::seed_email_identity_for_tests(&core, sasha, "sasha@example.com").await.unwrap();
+        scout_core::inbox::seed_email_identity_for_tests(&core, masha, "masha@example.com").await.unwrap();
+        core.note_address(222, "telegram", "2222".into()).await.unwrap();
+        core.note_address(333, "telegram", "3333".into()).await.unwrap();
+        let trip_id = shared_lisbon(&core, sasha, &[(masha, "Masha"), (dan, "Dan")]).await;
+        let theirs = MailIn { from: "Masha <masha@example.com>".into(), ..a_mail("re_1") };
+        let mail_id = scout_core::inbox::record_trip_mail(&core, trip_id, theirs).await.unwrap().expect("a new mail");
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+
+        // Sasha's copy and nobody else's: Masha sent it, and Dan has no
+        // address to send it to.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(recipients(&reqs), ["sasha@example.com"]);
+        let forward: serde_json::Value = serde_json::from_slice(&reqs.iter().find(|r| r.url.path() == "/emails").unwrap().body).unwrap();
+        assert_eq!(forward["reply_to"], json!(["Masha <masha@example.com>"]), "a reply goes to whoever booked it");
+        assert_eq!(forward["attachments"][0]["filename"], "ticket.pdf");
+        assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "nobody is owed one, so it is done");
+
+        // And done means done: a pass after this sends nothing more.
+        scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        work_once(&core, &client, FROM, 10).await;
+        assert_eq!(forwards(&server.received_requests().await.unwrap()), 1);
+
+        // Everyone with a phone hears of it, each under their own account,
+        // so the Add button under each line reaches that person's bookings.
+        // Sasha has no phone, so there is no line for her to get.
+        let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
+        let mut told: Vec<(i64, &str, &str)> =
+            queued.iter().map(|q| (q.account_id, q.address.as_str(), q.turn_key.as_str())).collect();
+        told.sort();
+        let key = format!("inbox:{mail_id}");
+        assert_eq!(told, vec![(masha, "2222", key.as_str()), (dan, "3333", key.as_str())]);
+        assert!(queued.iter().all(|q| q.body == "A booking arrived for Lisbon: Hotel Alfama. Add it here, or review on goodscout.fyi/chat."), "{queued:?}");
+    }
+
+    #[tokio::test]
+    async fn a_trips_forward_owed_after_an_outage_goes_only_to_those_still_owed() {
+        let server = MockServer::start().await;
+        // Resend falls over on Sasha's copy, once, and takes everyone
+        // else's. Mounted first, so it wins the tie with `resend_like`'s
+        // POST for the one request the two of them both match.
+        Mock::given(method("POST"))
+            .and(path("/emails"))
+            .and(body_partial_json(json!({"to": ["sasha@example.com"]})))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        resend_like(&server).await;
+        model_saying(&server, r#"{"booking":false,"summary":"A newsletter"}"#).await;
+        let (_app, core, _dir) = test_app_with_model(&server.uri()).await;
+        open_round(&core, "autumn", 5).await;
+        let sasha = admitted(&core, "111").await;
+        let masha = admitted(&core, "222").await;
+        let dan = admitted(&core, "333").await;
+        for (who, address) in [(sasha, "sasha@example.com"), (masha, "masha@example.com"), (dan, "dan@example.com")] {
+            scout_core::inbox::seed_email_identity_for_tests(&core, who, address).await.unwrap();
+        }
+        let trip_id = shared_lisbon(&core, sasha, &[(masha, "Masha"), (dan, "Dan")]).await;
+        let mail_id = scout_core::inbox::record_trip_mail(&core, trip_id, a_mail("re_1")).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        work_once(&core, &client, FROM, 10).await;
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(recipients(&reqs), ["sasha@example.com", "masha@example.com", "dan@example.com"], "one send each, owner first");
+        assert_eq!(scout_core::inbox::forwarded_to(&core, mail_id).await.unwrap(), {
+            let mut got = vec![masha, dan];
+            got.sort();
+            got
+        });
+        // Sasha is still owed hers, so the mail waits for a later pass
+        // rather than being done without it.
+        scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        let due = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert_eq!(due.iter().map(|m| (m.id, m.forwarded)).collect::<Vec<_>>(), vec![(mail_id, false)]);
+
+        work_once(&core, &client, FROM, 10).await;
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            recipients(&reqs),
+            ["sasha@example.com", "masha@example.com", "dan@example.com", "sasha@example.com"],
+            "the retry sent Sasha's copy and nobody a second one"
+        );
+        assert_eq!(extractions(&reqs), 1, "read once");
+        let mut everyone = vec![sasha, masha, dan];
+        everyone.sort();
+        assert_eq!(scout_core::inbox::forwarded_to(&core, mail_id).await.unwrap(), everyone);
+        scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "nobody is owed one now");
+        // Each of them sees their own copy as forwarded under Other mail.
+        for who in [sasha, masha, dan] {
+            let view = scout_core::inbox::view(&core, who, "goodscout.fyi").await.unwrap();
+            assert!(view.other[0].forwarded, "account {who}");
+        }
+    }
+
+    #[tokio::test]
+    async fn everyone_on_a_trip_hears_that_its_mail_could_not_be_read() {
+        let server = MockServer::start().await;
+        resend_like(&server).await;
+        // `test_app` points the model at a closed port, so every reading
+        // fails and the mail is given up on after its attempts.
+        let (_app, core, _dir) = test_app().await;
+        open_round(&core, "autumn", 5).await;
+        let sasha = admitted(&core, "111").await;
+        let masha = admitted(&core, "222").await;
+        core.note_address(111, "telegram", "1111".into()).await.unwrap();
+        core.note_address(222, "telegram", "2222".into()).await.unwrap();
+        let trip_id = shared_lisbon(&core, sasha, &[(masha, "Masha")]).await;
+        let mail_id = scout_core::inbox::record_trip_mail(&core, trip_id, a_mail("re_1")).await.unwrap().unwrap();
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+        for _ in 0..ATTEMPTS {
+            work_once(&core, &client, FROM, 10).await;
+            scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+        }
+        let queued = scout_core::mirror::pending(&core, 10).await.unwrap();
+        let mut told: Vec<i64> = queued.iter().map(|q| q.account_id).collect();
+        told.sort();
+        assert_eq!(told, vec![sasha, masha], "{queued:?}");
+        assert!(queued.iter().all(|q| q.body.starts_with("An email arrived that Scout could not read.")));
     }
 }

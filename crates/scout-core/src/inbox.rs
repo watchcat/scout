@@ -870,6 +870,19 @@ pub async fn mail_forwarded(core: &Core, id: i64) -> anyhow::Result<()> {
     blocking(move || store.mail_forwarded(id)).await
 }
 
+/// Who already has their copy of a trip's mail, so a retry after an
+/// outage sends only what is still owed.
+pub async fn forwarded_to(core: &Core, mail_id: i64) -> anyhow::Result<Vec<i64>> {
+    let store = core.store();
+    blocking(move || store.forwarded_to(mail_id)).await
+}
+
+/// One person on a trip has their copy of its mail. Idempotent.
+pub async fn note_forwarded_to(core: &Core, mail_id: i64, account_id: i64) -> anyhow::Result<()> {
+    let store = core.store();
+    blocking(move || store.note_forwarded_to(mail_id, account_id)).await
+}
+
 /// The body fetched from the provider, cut at `cap_chars` characters,
 /// and the sender that came with it — see `Store::mail_fetched` for why the
 /// two are written together and why a blank sender changes nothing.

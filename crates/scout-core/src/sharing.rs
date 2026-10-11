@@ -202,6 +202,15 @@ pub async fn join(core: &Core, account_id: i64, token: &str, name: &str, rename:
     Ok(joined)
 }
 
+/// The accounts on a trip, the owner first and the editors after, as
+/// `Store::trip_people` orders them. Empty for a trip that is gone. The
+/// inbox worker reads this to forward and announce a trip's mail to
+/// everyone on it rather than to the owner alone.
+pub async fn people_of(core: &Core, trip_id: i64) -> anyhow::Result<Vec<i64>> {
+    let store = core.store();
+    blocking(move || Ok(store.trip_people(trip_id)?.into_iter().map(|p| p.account_id).collect())).await
+}
+
 /// Puts `account` on the owner's trip as joining would. Test scaffolding
 /// for the other crates.
 #[doc(hidden)]

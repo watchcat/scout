@@ -3515,7 +3515,7 @@ function start() {
       await loadTrips()
       showTripToast(said)
     } catch {
-      showTripToast('Could not change the link. Try again.')
+      showTripToast('That did not work. Try again.')
     }
   }
 

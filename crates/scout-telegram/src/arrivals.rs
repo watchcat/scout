@@ -92,7 +92,8 @@ pub fn decided_line(decision: Decision, title: Option<&str>, trip: Option<&str>)
     }
 }
 
-/// What a press says when somebody else on the trip pressed first.
+/// What a press says when the booking was already decided — by someone
+/// else on the trip, or by the presser themselves, earlier.
 pub fn already_line(added: bool, by: &str) -> String {
     format!("Already {} by {by}.", if added { "added" } else { "ignored" })
 }

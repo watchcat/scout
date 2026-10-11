@@ -1932,5 +1932,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
         assert_ne!(body["address"].as_str().unwrap(), first);
+        let listed: serde_json::Value =
+            serde_json::from_str(&body_of(get_with_cookie(&app, "/chat/trips", &m_cookie).await).await).unwrap();
+        assert_eq!(listed[0]["address"], body["address"], "the editor sees the new one");
     }
 }

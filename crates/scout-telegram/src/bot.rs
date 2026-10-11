@@ -1362,7 +1362,13 @@ async fn handle_callback(bot: Bot, q: teloxide::types::CallbackQuery, app: Arc<A
         // everyone on it, so the second press is usually a person.
         Ok(Outcome::NotPending) => match scout_core::inbox::settler(&app.core, account_id, arrival_id).await {
             Ok(Some(s)) => crate::arrivals::already_line(s.added, &s.by),
-            _ => "Already decided — on the Trips tab, or from another press.".to_string(),
+            Ok(None) => "Already decided — on the Trips tab, or from another press.".to_string(),
+            // The press itself went through; only the name is missing, so
+            // the reader gets the plain line and the log gets the reason.
+            Err(e) => {
+                tracing::warn!(error = %e, account_id, arrival_id, "could not say who decided an arrival");
+                "Already decided — on the Trips tab, or from another press.".to_string()
+            }
         },
         Err(e) => {
             tracing::error!(error = %e, account_id, arrival_id, "a button could not decide an arrival");

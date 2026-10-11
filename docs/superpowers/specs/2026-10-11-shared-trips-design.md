@@ -249,45 +249,60 @@ Schema step 22, on the same terms as step 21.
 ```sql
 ALTER TABLE trips        ADD COLUMN IF NOT EXISTS address    TEXT;
 ALTER TABLE inbound_mail ADD COLUMN IF NOT EXISTS trip_id    BIGINT;
-ALTER TABLE arrivals     ADD COLUMN IF NOT EXISTS trip_id    BIGINT;
 ALTER TABLE arrivals     ADD COLUMN IF NOT EXISTS settled_by BIGINT;
 CREATE TABLE IF NOT EXISTS mail_forwards (
     mail_id      BIGINT NOT NULL,
     account_id   BIGINT NOT NULL,
     forwarded_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    refused      BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (mail_id, account_id)
 );
 ```
 
-- `trips.address` is the local part, lowercase. Unique across trip
-  addresses and personal handles together, checked in Rust under the store
-  lock as `set_handle` already is. Setting a personal handle checks trip
-  addresses too.
+- `trips.address` is the local part, lowercase. It always contains a
+  dash, which a personal handle (`a-z0-9.`) never can, so the two kinds
+  never collide; trip addresses are unique among themselves, checked in
+  Rust under the store lock.
+- `arrivals.trip_id` already exists — placement writes it — and a trip's
+  mail sets it to that trip.
 - `inbound_mail.account_id` for a trip's mail is the owner, so every
   existing per-account query keeps working; `trip_id` says it came to the
   trip.
-- `mail_forwards` records each person a mail has been forwarded to, so a
-  retry after a partial failure does not send anyone a second copy.
+- `mail_forwards` records each person a mail has been forwarded to, or
+  whose copy Resend refused, so a retry after a partial failure sends
+  nobody a second copy and asks for no refused one again.
   `inbound_mail.forwarded_at` keeps its meaning for personal mail.
 
 ### The address
 
-- Made when a trip is kept: the name lowercased, anything outside `a-z0-9`
-  turned into `-`, runs of `-` collapsed, trimmed, cut to 20 characters,
-  then `-` and 4 random characters from `a-z0-9`. Drawn again on a clash.
+- Given to a kept trip the first time it is served, which covers trips
+  kept before this release too: the name lowercased, accents dropped
+  (NFD, plus ø æ œ ß ł đ þ ð ı spelled out — the address is typed by
+  people and handed to hotels), anything outside `a-z0-9` turned into `-`, runs of `-` collapsed, trimmed, cut to 20 characters,
+  then `-` and 5 random characters from `a-z0-9`. Drawn again on a clash.
   A name with nothing left after slugging gets `trip`.
-- Trips kept before step 22 get one when first served.
 - Drafts have none.
 - `POST /chat/trips/address-new` — owner only: draws a new one. The old one
-  becomes unknown, as any unheld handle is.
+  becomes unknown, as any unheld handle is. The page asks first and shows
+  the button only where there is an address: mail from anyone holding the
+  old one stops arriving.
+- Signing in with an address on the inbound domain is refused, quietly:
+  such an identity would have Scout forward a trip's mail to itself.
 - Shown in the People panel with Copy. On a trip page, the to-book banner
   names the trip's address instead of the person's own.
 
 ### Mail in
 
-`our_handle` is unchanged. The lookup after it tries personal handles,
-then trip addresses. Mail for a trip address is recorded with the owner as
-`account_id` and the trip as `trip_id`.
+Anyone on the trip may delete one of its mails under Other mail, as
+anyone may Add or Ignore its bookings.
+
+Every address on our domain in `to`, then `received_for`, is tried — at
+most 16, since the header is a stranger's to fill — and the first trip
+address that resolves wins over any handle: a trip address is the more
+specific intent, and its mail reaches everyone on the trip. Only when no
+trip address resolves does the first handle that does. A mail naming two
+of ours is stored once. Mail for a trip address is recorded with the owner
+as `account_id` and the trip as `trip_id`.
 
 The worker, for a trip's mail:
 
@@ -295,8 +310,9 @@ The worker, for a trip's mail:
   skipped: every arrival from it gets that `trip_id` and sits on that trip,
   pending, for everyone on it. Non-bookings appear under Other mail for
   everyone on the trip.
-- **Forwarding.** One forward per participant with an email identity, each
-  to that person alone, so nobody sees another's address. Skipped for the
+- **Forwarding.** One forward per participant with an email identity, a
+  short pause between sends for Resend's rate limit, each to that person
+  alone, so nobody sees another's address. Skipped for the
   participant who sent the mail, as a person's own mail is skipped now.
   Each success writes a `mail_forwards` row; a retry skips those rows.
 - **Telegram.** Each participant with a Telegram delivery gets the

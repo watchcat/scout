@@ -121,6 +121,9 @@ CREATE TABLE IF NOT EXISTS trips (
     -- What labels call the owner once the trip is shared; NULL until then.
     -- Last, so a fresh database and one migrated by step 21 agree.
     owner_name  TEXT,
+    -- The trip's own address, the local part. Step 22; NULL until the
+    -- trip is kept and served. Always holds a dash, which a handle cannot.
+    address     TEXT,
     UNIQUE (account_id, name_key)
 );
 -- Where and when. This is all that gets re-searched.
@@ -242,6 +245,17 @@ CREATE TABLE IF NOT EXISTS trip_links (
     expires_at TIMESTAMP NOT NULL,
     admits     BIGINT NOT NULL DEFAULT 0,
     revoked_at TIMESTAMP
+);
+-- Who a trip's mail has been forwarded to, one row each, so a retry after
+-- a partial failure sends nobody a second copy. A row with `refused` set is
+-- a person Resend would not send it to: settled, so nobody asks again, but
+-- not a copy they hold.
+CREATE TABLE IF NOT EXISTS mail_forwards (
+    mail_id      BIGINT NOT NULL,
+    account_id   BIGINT NOT NULL,
+    forwarded_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    refused      BOOLEAN NOT NULL DEFAULT false,
+    PRIMARY KEY (mail_id, account_id)
 );
 CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
 -- A person, independent of how they reach Scout. Deliberately almost empty:
@@ -417,7 +431,10 @@ CREATE TABLE IF NOT EXISTS inbound_mail (
     -- that refused a minute ago is the model that refuses now.
     attempted_at TIMESTAMP,
     forwarded_at TIMESTAMP,
-    error        TEXT
+    error        TEXT,
+    -- Set when the mail came to a trip's address rather than a person's;
+    -- `account_id` is then the trip's owner. Step 22.
+    trip_id      BIGINT
 );
 CREATE SEQUENCE IF NOT EXISTS attachments_id_seq;
 -- A file that came with a mail. `item_id` is set once the booking is added
@@ -486,7 +503,9 @@ CREATE TABLE IF NOT EXISTS arrivals (
     -- The airports changed at, comma-separated, the way `travellers` keeps
     -- its list: a connection is one booking, and the leg's itinerary strip
     -- has to show the stop or the card calls a one-stop ticket direct.
-    stops             TEXT
+    stops             TEXT,
+    -- Who pressed Add or Ignore, on a trip several people share. Step 22.
+    settled_by        BIGINT
 );
 "#;
 
@@ -915,7 +934,7 @@ pub enum MailGone {
     /// Nobody's, or not this account's — one answer for both, so an id
     /// tried against a stranger's mail learns nothing from the reply.
     NotFound,
-    /// A booking off this mail is still waiting on its owner. Deleting the
+    /// A booking off this mail is still waiting for a decision. Deleting the
     /// mail would take that row off the trip's timeline with nothing said,
     /// so the decision comes first.
     Waiting,
@@ -1516,6 +1535,26 @@ CREATE TABLE IF NOT EXISTS trip_links (
 );
 "#;
 
+/// A trip's own address, and its mail: where it came to, who settled its
+/// bookings, who it was forwarded to. Every new column is nullable and
+/// added last — see `STEP_19_ITEM_COORDS` for the step that tried to
+/// constrain a column on a table with rows. The table is already there on
+/// any database `MIGRATIONS` has run on, which is every one, for the reason
+/// `STEP_21_SHARING` and `STEP_18_MAIL_PARTS` give; what the step earns is
+/// the version bump and the backup that comes with it, and it still has to
+/// build the table right.
+const STEP_22_TRIP_ADDRESS: &str = r#"
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS address TEXT;
+ALTER TABLE inbound_mail ADD COLUMN IF NOT EXISTS trip_id BIGINT;
+ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS settled_by BIGINT;
+CREATE TABLE IF NOT EXISTS mail_forwards (
+    mail_id BIGINT NOT NULL, account_id BIGINT NOT NULL,
+    forwarded_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    refused BOOLEAN NOT NULL DEFAULT false,
+    PRIMARY KEY (mail_id, account_id)
+);
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -1539,6 +1578,7 @@ fn steps() -> Vec<(i64, Step)> {
         (19, Step::Sql(STEP_19_ITEM_COORDS)),
         (20, Step::Sql(STEP_20_ITEM_CHECK)),
         (21, Step::Sql(STEP_21_SHARING)),
+        (22, Step::Sql(STEP_22_TRIP_ADDRESS)),
     ]
 }
 
@@ -1663,6 +1703,9 @@ pub struct MailToWork {
     pub html: Option<String>,
     pub attempts: i64,
     pub forwarded: bool,
+    /// The trip whose address the mail came to; `None` for mail to the
+    /// account's own address. `account_id` is then the trip's owner.
+    pub trip_id: Option<i64>,
 }
 
 /// What a mail said one of its parts is, as the inbound webhook described
@@ -3649,6 +3692,64 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// The trip's address, given now if it is kept and has none. `None` for
+    /// a draft: an address on a trip that may be gone tomorrow would send a
+    /// hotel's confirmation nowhere.
+    pub fn trip_address(&self, trip_id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        // A trip that is not there has no address, rather than being a
+        // failure: it may have been deleted since the caller last looked.
+        let Some((address, kept, name)): Option<(Option<String>, bool, String)> = conn
+            .query_row(
+                "SELECT address, kept, name FROM trips WHERE id = ?",
+                params![trip_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        match (address, kept) {
+            (Some(address), _) => Ok(Some(address)),
+            (None, false) => Ok(None),
+            (None, true) => draw_address(&conn, trip_id, &name).map(Some),
+        }
+    }
+
+    /// A new address in place of the old, for the owner; the old one then
+    /// belongs to nobody. `None` for anyone else, and for a draft.
+    pub fn new_trip_address(&self, account_id: i64, trip_id: i64) -> Result<Option<String>> {
+        if !self.is_owner(account_id, trip_id)? {
+            return Ok(None);
+        }
+        let conn = self.conn();
+        // Gone since the owner check, or a draft: either way there is
+        // nothing to replace, and a draft is not given an address here
+        // any more than `trip_address` gives it one.
+        let Some((kept, name)): Option<(bool, String)> = conn
+            .query_row("SELECT kept, name FROM trips WHERE id = ?", params![trip_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if !kept {
+            return Ok(None);
+        }
+        draw_address(&conn, trip_id, &name).map(Some)
+    }
+
+    /// Whose trip an address is: the trip and its owner.
+    pub fn trip_for_address(&self, address: &str) -> Result<Option<(i64, i64)>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT id, account_id FROM trips WHERE address = ?",
+                params![address],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Whether this account owns the trip: what deleting it, removing
     /// people from it and turning its link off ask.
     pub fn is_owner(&self, account_id: i64, trip_id: i64) -> Result<bool> {
@@ -4447,14 +4548,23 @@ impl Store {
     /// The owner, then the editors in the order they joined. The owner's
     /// name is `owner_name`, or their Telegram name, or "Owner" on a trip
     /// that has never been shared.
+    ///
+    /// Empty for a trip that is gone. An arrival keeps the id of a trip
+    /// deleted under it, and a late press on that arrival asks who is on
+    /// the trip: nobody is, and that is an answer rather than a failure.
     pub fn trip_people(&self, trip_id: i64) -> Result<Vec<TripPerson>> {
         let conn = self.conn();
-        let owner: TripPerson = conn.query_row(
-            "SELECT t.account_id, coalesce(t.owner_name, u.display_name, 'Owner')
-             FROM trips t LEFT JOIN users u ON u.account_id = t.account_id WHERE t.id = ?",
-            params![trip_id],
-            |r| Ok(TripPerson { account_id: r.get(0)?, name: r.get(1)?, owner: true }),
-        )?;
+        let Some(owner): Option<TripPerson> = conn
+            .query_row(
+                "SELECT t.account_id, coalesce(t.owner_name, u.display_name, 'Owner')
+                 FROM trips t LEFT JOIN users u ON u.account_id = t.account_id WHERE t.id = ?",
+                params![trip_id],
+                |r| Ok(TripPerson { account_id: r.get(0)?, name: r.get(1)?, owner: true }),
+            )
+            .optional()?
+        else {
+            return Ok(Vec::new());
+        };
         let mut stmt = conn.prepare(
             "SELECT account_id, name FROM trip_people
              WHERE trip_id = ? AND left_at IS NULL ORDER BY joined_at, account_id",
@@ -4468,7 +4578,8 @@ impl Store {
     }
 
     /// Every name a label on this trip may need: the owner, and everyone
-    /// who was ever on it, including those who left.
+    /// who was ever on it, including those who left. Empty for a trip that
+    /// is gone, as `trip_people` is.
     pub fn author_names(&self, trip_id: i64) -> Result<std::collections::HashMap<i64, String>> {
         let mut names: std::collections::HashMap<i64, String> = self
             .trip_people(trip_id)?
@@ -4653,6 +4764,32 @@ impl Store {
 /// except what checks `trips.account_id` itself.
 const REACHES: &str = "(t.account_id = ? OR EXISTS (SELECT 1 FROM trip_people p \
      WHERE p.trip_id = t.id AND p.account_id = ? AND p.left_at IS NULL))";
+
+/// Five characters of `a-z0-9`: the part of a trip's address nobody can
+/// guess from the trip's name.
+fn address_tail() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..5).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
+}
+
+/// Draws a fresh address for the trip and writes it, under the lock the
+/// caller holds. Ten tries at a tail no other trip has; ten collisions in
+/// a row in a space of sixty million is a bug, said as one.
+fn draw_address(conn: &Connection, trip_id: i64, name: &str) -> Result<String> {
+    let slug = crate::inbox::trip_address_slug(name);
+    for _ in 0..10 {
+        let candidate = format!("{slug}-{}", address_tail());
+        let taken: i64 =
+            conn.query_row("SELECT count(*) FROM trips WHERE address = ?", params![candidate], |r| r.get(0))?;
+        if taken == 0 {
+            conn.execute("UPDATE trips SET address = ? WHERE id = ?", params![candidate, trip_id])?;
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("no free address for trip {trip_id} after ten draws")
+}
 
 /// The trip of this name that the account reaches. Its own first, should
 /// it ever reach two of one name — joining refuses that, so only a bug
@@ -5088,9 +5225,9 @@ fn note_item_within(
 }
 
 /// What becomes of the files these items are carrying, called just before
-/// the items go. An attachment has no owner of its own — `attachment_owner`
-/// finds one through the mail it came with, or through the trip behind its
-/// item — so deleting an item without deciding this leaves rows that answer
+/// the items go. An attachment has no owner of its own —
+/// `can_open_attachment` reaches it through the mail it came with, or
+/// through the trip behind its item — so deleting an item without deciding this leaves rows that answer
 /// with nobody: undownloadable, and unreachable by both mail sweeps, whose
 /// deletes are keyed on mail ids that by then no longer exist.
 ///
@@ -5352,8 +5489,15 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
 }
 
 /// The select `arrival_row` reads — columns, FROM and joins — so the two
-/// readers cannot drift. The trip join is owner-scoped: a `trip_id` that
-/// names someone else's trip yields no name rather than theirs.
+/// readers cannot drift. The trip join is not scoped to the arrival's
+/// account: a booking placed on a trip shared with that account must still
+/// show the trip's name. What makes that safe is where `trip_id` comes
+/// from. An arrival of mail sent to a trip's address always carries that
+/// mail's own trip — `inbox::record_arrivals` enforces it, reading the
+/// trip off the stored mail and placing every booking of it there without
+/// asking — and any other arrival's `trip_id` came from placement, which
+/// chooses only among the trips the arrival's own account reached. Either way, whoever can reach
+/// the arrival may see the name of the trip it is on.
 const ARRIVAL_SELECT: &str =
     "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
      a.airline, a.flight_number, a.stops, a.date,
@@ -5361,7 +5505,30 @@ const ARRIVAL_SELECT: &str =
      a.trip_id, t.name, a.status, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ')
      FROM arrivals a
      JOIN inbound_mail m ON m.id = a.mail_id
-     LEFT JOIN trips t ON t.id = a.trip_id AND t.account_id = a.account_id";
+     LEFT JOIN trips t ON t.id = a.trip_id";
+
+/// Where a delivered mail is filed: under an account, for its own address,
+/// or under a trip, for the trip's address — and so under the trip's owner,
+/// whom `insert_mail_within` reads itself.
+#[derive(Clone, Copy)]
+enum MailTo {
+    Account(i64),
+    Trip(i64),
+}
+
+/// True when the account bound to the three `?` may see and decide the
+/// arrival `a` of mail `m`: it is the account's own, or it came to the
+/// address of a trip the account reaches. `REACHES` with `t` renamed,
+/// since `ARRIVAL_SELECT` already uses `t` for the arrival's trip.
+const ARRIVAL_REACH: &str = "(a.account_id = ? OR (m.trip_id IS NOT NULL AND EXISTS (
+     SELECT 1 FROM trips mt WHERE mt.id = m.trip_id AND (mt.account_id = ? OR EXISTS (
+         SELECT 1 FROM trip_people p WHERE p.trip_id = mt.id AND p.account_id = ? AND p.left_at IS NULL)))))";
+
+/// The same for a mail with no arrival in the query: the mail is the
+/// account's own, or it came to the address of a trip the account reaches.
+const MAIL_REACH: &str = "(m.account_id = ? OR (m.trip_id IS NOT NULL AND EXISTS (
+     SELECT 1 FROM trips mt WHERE mt.id = m.trip_id AND (mt.account_id = ? OR EXISTS (
+         SELECT 1 FROM trip_people p WHERE p.trip_id = mt.id AND p.account_id = ? AND p.left_at IS NULL)))))";
 
 /// Everything but the attachments, which need a second query per row.
 fn arrival_row(r: &Row) -> duckdb::Result<scout_api::Arrival> {
@@ -5413,7 +5580,7 @@ fn minutes_ago(minutes: i64) -> String {
 /// spent in the same second are one attempt.
 pub const MAIL_RETRY_MINUTES: i64 = 5;
 
-/// A booking that is still waiting on its owner. Only a booking waits: a
+/// A booking that is still waiting for a decision. Only a booking waits: a
 /// non-booking is born decided, so this is the one condition both the
 /// inbox and the sweep read as "undecided".
 const UNDECIDED: &str = "a.booking AND a.status = 'pending'";
@@ -5505,6 +5672,46 @@ impl Store {
         truncated: bool,
         parts: &[MailPart],
     ) -> Result<Option<i64>> {
+        self.insert_mail_within(MailTo::Account(account_id), provider_id, from, subject, text, html, truncated, parts)
+    }
+
+    /// `insert_mail` for a mail that came to a trip's address: stored under
+    /// the trip's owner, with the trip on it. The owner is read here, under
+    /// the same lock as the insert, so the mail cannot be filed under an
+    /// account that does not own the trip.
+    ///
+    /// `None` also when the trip no longer exists — deleted between the
+    /// address lookup and this write. To the caller that is the same as a
+    /// redelivery: nothing was stored and there is nothing to read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_trip_mail(
+        &self,
+        trip_id: i64,
+        provider_id: &str,
+        from: &str,
+        subject: Option<&str>,
+        text: Option<&str>,
+        html: Option<&str>,
+        truncated: bool,
+        parts: &[MailPart],
+    ) -> Result<Option<i64>> {
+        self.insert_mail_within(MailTo::Trip(trip_id), provider_id, from, subject, text, html, truncated, parts)
+    }
+
+    /// The one writer behind `insert_mail` and `insert_trip_mail`, so the
+    /// redelivery check and the transaction are written once.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_mail_within(
+        &self,
+        to: MailTo,
+        provider_id: &str,
+        from: &str,
+        subject: Option<&str>,
+        text: Option<&str>,
+        html: Option<&str>,
+        truncated: bool,
+        parts: &[MailPart],
+    ) -> Result<Option<i64>> {
         let conn = self.conn();
         let seen: Option<i64> = conn
             .query_row("SELECT id FROM inbound_mail WHERE provider_id = ?", params![provider_id], |r| r.get(0))
@@ -5512,12 +5719,22 @@ impl Store {
         if seen.is_some() {
             return Ok(None);
         }
+        let (account_id, trip_id): (i64, Option<i64>) = match to {
+            MailTo::Account(account_id) => (account_id, None),
+            MailTo::Trip(trip_id) => {
+                let owner: Option<i64> = conn
+                    .query_row("SELECT account_id FROM trips WHERE id = ?", params![trip_id], |r| r.get(0))
+                    .optional()?;
+                let Some(owner) = owner else { return Ok(None) };
+                (owner, Some(trip_id))
+            }
+        };
         conn.execute_batch("BEGIN")?;
         let written = (|| -> Result<i64> {
             let id: i64 = conn.query_row(
-                "INSERT INTO inbound_mail (account_id, provider_id, from_address, subject, text, html, truncated)
-                 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                params![account_id, provider_id, from, subject, text, html, truncated],
+                "INSERT INTO inbound_mail (account_id, provider_id, from_address, subject, text, html, truncated, trip_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                params![account_id, provider_id, from, subject, text, html, truncated, trip_id],
                 |r| r.get(0),
             )?;
             for part in parts {
@@ -5580,7 +5797,7 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, account_id, provider_id, from_address, subject, text, html, attempts,
-                    forwarded_at IS NOT NULL
+                    forwarded_at IS NOT NULL, trip_id
              FROM inbound_mail
              WHERE status IN ('new', 'extracting') AND attempts < ?
                AND (attempted_at IS NULL OR attempted_at < ?)
@@ -5590,7 +5807,7 @@ impl Store {
             Ok(MailToWork {
                 id: r.get(0)?, account_id: r.get(1)?, provider_id: r.get(2)?, from: r.get(3)?,
                 subject: r.get(4)?, text: r.get(5)?, html: r.get(6)?, attempts: r.get(7)?,
-                forwarded: r.get(8)?,
+                forwarded: r.get(8)?, trip_id: r.get(9)?,
             })
         })?;
         rows.map(|r| r.map_err(Into::into)).collect()
@@ -5625,6 +5842,16 @@ impl Store {
         let conn = self.conn();
         let n: i64 = conn.query_row("SELECT count(*) FROM arrivals WHERE mail_id = ?", params![mail_id], |r| r.get(0))?;
         Ok(n > 0)
+    }
+
+    /// The trip whose address the mail came to, if it came to one. `None`
+    /// too for a mail that is not there: it has no trip to be filed on.
+    pub fn mail_trip(&self, mail_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn();
+        let trip: Option<Option<i64>> = conn
+            .query_row("SELECT trip_id FROM inbound_mail WHERE id = ?", params![mail_id], |r| r.get(0))
+            .optional()?;
+        Ok(trip.flatten())
     }
 
     /// Backdates the last attempt by an hour, so a test can walk a mail
@@ -5748,29 +5975,35 @@ impl Store {
             .optional()?)
     }
 
-    /// Whose file this is: an attachment has no owner of its own, so a
-    /// download has to ask here. By the mail it came with while that
-    /// exists, and by the trip item it joined once the sweep has taken the
-    /// mail — a kept ticket must not become nobody's.
-    pub fn attachment_owner(&self, id: i64) -> Result<Option<i64>> {
+    /// Whether this account may open the file. An attachment has no owner
+    /// of its own, so it is reached through one of two routes: the mail it
+    /// came with, while that exists, if the account reaches the mail (its
+    /// own, or one sent to the address of a trip it is on); or the trip
+    /// item it joined, if the account reaches that item's trip — so a kept
+    /// ticket does not become nobody's once the sweep takes its mail, and
+    /// an editor can open a ticket that came in the owner's mail and now
+    /// sits on the shared trip.
+    ///
+    /// One query, so the answer is read under the one lock; the `IS NOT
+    /// NULL` guards keep a missing mail or item from reaching anything.
+    pub fn can_open_attachment(&self, id: i64, account_id: i64) -> Result<bool> {
         let conn = self.conn();
-        Ok(conn
-            .query_row(
-                "SELECT coalesce(m.account_id, t.account_id)
-                 FROM attachments a
+        let n: i64 = conn.query_row(
+            &format!(
+                "SELECT count(*) FROM attachments a
                  LEFT JOIN inbound_mail m ON m.id = a.mail_id
                  LEFT JOIN trip_items i ON i.id = a.item_id
                  LEFT JOIN trips t ON t.id = i.trip_id
-                 WHERE a.id = ?",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten())
+                 WHERE a.id = ? AND ((m.id IS NOT NULL AND {MAIL_REACH}) OR (t.id IS NOT NULL AND {REACHES}))"
+            ),
+            params![id, account_id, account_id, account_id, account_id, account_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
-    /// The caller has already proven both ids are theirs (`attachment_owner`
-    /// for the file, the trip for the item); nothing is checked here but
+    /// The caller has already proven both ids are its to use (the mail's
+    /// arrival for the file, the trip for the item); nothing is checked here but
     /// that the file is still loose. A ticket belongs to the booking it
     /// came with, so the first item to claim it keeps it.
     pub fn attach_to_item(&self, attachment_id: i64, item_id: i64) -> Result<()> {
@@ -5858,17 +6091,16 @@ impl Store {
         Ok(ids.remove(0))
     }
 
-    /// The arrival, if it is this account's. The owner is part of the key
-    /// on purpose: an id from the page is not proof of anything.
     /// The bookings of one mail still waiting for a decision, oldest
-    /// first: what a nudge about that mail can offer to add.
+    /// first: what a nudge about that mail can offer to add. Everyone on
+    /// the trip a mail came to sees its bookings, as `ARRIVAL_REACH` says.
     pub fn pending_arrivals_of_mail(&self, mail_id: i64, account_id: i64) -> Result<Vec<scout_api::Arrival>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {ARRIVAL_SELECT} WHERE a.mail_id = ? AND a.account_id = ? AND a.status = 'pending' AND a.booking
+            "SELECT {ARRIVAL_SELECT} WHERE a.mail_id = ? AND {ARRIVAL_REACH} AND a.status = 'pending' AND a.booking
              ORDER BY a.id"
         ))?;
-        let rows = stmt.query_map(params![mail_id, account_id], arrival_row)?;
+        let rows = stmt.query_map(params![mail_id, account_id, account_id, account_id], arrival_row)?;
         let mut arrivals = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         for arrival in &mut arrivals {
             arrival.attachments = attachments_of(&conn, arrival.mail_id)?;
@@ -5876,12 +6108,15 @@ impl Store {
         Ok(arrivals)
     }
 
+    /// The arrival, if this account may see it: its own, or one that came
+    /// to the address of a trip it is on. The account is part of the key
+    /// on purpose: an id from the page is not proof of anything.
     pub fn arrival_of(&self, id: i64, account_id: i64) -> Result<Option<scout_api::Arrival>> {
         let conn = self.conn();
         let found = conn
             .query_row(
-                &format!("SELECT {ARRIVAL_SELECT} WHERE a.id = ? AND a.account_id = ?"),
-                params![id, account_id],
+                &format!("SELECT {ARRIVAL_SELECT} WHERE a.id = ? AND {ARRIVAL_REACH}"),
+                params![id, account_id, account_id, account_id],
                 arrival_row,
             )
             .optional()?;
@@ -5894,30 +6129,96 @@ impl Store {
         }
     }
 
-    /// Records the owner's decision, and is the claim on it: `false` when
-    /// the arrival is not this account's (an id from the page proves
-    /// nothing), was decided already, or was never a booking. The check is
-    /// in the `WHERE`, under the one lock, so two clicks that both read
-    /// "pending" cannot both win — the second finds nothing to update.
+    /// Records a decision and who made it, and is the claim on it: `false`
+    /// when the arrival is not this account's to decide (its own, or its
+    /// trip's — an id from the page proves nothing), was decided already,
+    /// or was never a booking. The check is in the `WHERE`, under the one
+    /// lock, so two clicks that both read "pending" cannot both win — the
+    /// second finds nothing to update, whoever on the trip pressed it.
     /// `item_id` is the trip item an added booking became, when the caller
     /// already knows it; `note_arrival_item` fills it in later otherwise.
+    ///
+    /// The reach check is a subquery so that `ARRIVAL_REACH` is reused as
+    /// it is, with its `a` and `m` aliases unchanged; a join in the UPDATE
+    /// itself would need the predicate restated over other names.
     pub fn decide_arrival(&self, id: i64, account_id: i64, status: &str, item_id: Option<i64>) -> Result<bool> {
         let conn = self.conn();
         let changed = conn.execute(
-            "UPDATE arrivals SET status = ?, item_id = ?, decided_at = now()
-             WHERE id = ? AND account_id = ? AND status = 'pending' AND booking",
-            params![status, item_id, id, account_id],
+            &format!(
+                "UPDATE arrivals SET status = ?, item_id = ?, decided_at = now(), settled_by = ?
+                 WHERE id = ? AND status = 'pending' AND booking
+                   AND id IN (SELECT a.id FROM arrivals a JOIN inbound_mail m ON m.id = a.mail_id
+                              WHERE a.id = ? AND {ARRIVAL_REACH})"
+            ),
+            params![status, item_id, account_id, id, id, account_id, account_id, account_id],
         )?;
         Ok(changed > 0)
     }
 
+    /// Who settled an arrival, and how: `(status, account)`. `None` while
+    /// it waits, or for one decided before step 22 recorded the presser.
+    pub fn arrival_settler(&self, id: i64) -> Result<Option<(String, i64)>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT status, settled_by FROM arrivals WHERE id = ? AND status <> 'pending' AND settled_by IS NOT NULL",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The people a trip's mail has been forwarded to.
+    pub fn forwarded_to(&self, mail_id: i64) -> Result<Vec<i64>> {
+        self.forwards_where(mail_id, false)
+    }
+
+    /// The people Resend refused to send a trip's mail to. Nobody holds a
+    /// copy for them, and nobody asks Resend again.
+    pub fn forward_refused_to(&self, mail_id: i64) -> Result<Vec<i64>> {
+        self.forwards_where(mail_id, true)
+    }
+
+    fn forwards_where(&self, mail_id: i64, refused: bool) -> Result<Vec<i64>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT account_id FROM mail_forwards WHERE mail_id = ? AND refused = ? ORDER BY account_id",
+        )?;
+        let rows = stmt.query_map(params![mail_id, refused], |r| r.get(0))?;
+        Ok(rows.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// One more person has their copy. Idempotent, so a retry that races a
+    /// slow first pass does not fail on the key.
+    pub fn note_forwarded_to(&self, mail_id: i64, account_id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO mail_forwards (mail_id, account_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            params![mail_id, account_id],
+        )?;
+        Ok(())
+    }
+
+    /// Resend refused this person's copy. Recorded so that a pass coming
+    /// back for somebody else's owed copy does not ask for this one again.
+    /// Idempotent, as `note_forwarded_to`.
+    pub fn note_forward_refused(&self, mail_id: i64, account_id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO mail_forwards (mail_id, account_id, refused) VALUES (?, ?, true) ON CONFLICT DO NOTHING",
+            params![mail_id, account_id],
+        )?;
+        Ok(())
+    }
+
     /// Undoes a claim whose item could not be built, so the booking waits
     /// on the page again instead of reading as added with nothing to show.
-    /// No owner check: the caller reverts only what it just claimed.
+    /// No owner check: the caller reverts only what it just claimed. Who
+    /// claimed it goes too, since nobody has settled it now.
     pub fn reopen_arrival(&self, id: i64) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "UPDATE arrivals SET status = 'pending', item_id = NULL, decided_at = NULL WHERE id = ?",
+            "UPDATE arrivals SET status = 'pending', item_id = NULL, decided_at = NULL, settled_by = NULL WHERE id = ?",
             params![id],
         )?;
         Ok(())
@@ -5937,17 +6238,22 @@ impl Store {
     /// and each row's `sent_by_you` are the caller's — the store knows
     /// neither the address's domain, nor how the handle should read, nor
     /// which senders are the account's own.
+    ///
+    /// Mail that came to the address of a trip the account is on is listed
+    /// as well as its own, as `ARRIVAL_REACH` and `MAIL_REACH` say: everyone
+    /// on the trip may Add or Ignore its bookings.
     pub fn inbox_view(&self, account_id: i64) -> Result<scout_api::InboxView> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
             // Newest mail first, but the readings of one mail in the order
             // they were read: the legs of a ticket belong in the ticket's
             // order, out before back.
-            "SELECT {ARRIVAL_SELECT} WHERE a.account_id = ? AND {UNDECIDED}
+            "SELECT {ARRIVAL_SELECT} WHERE {ARRIVAL_REACH} AND {UNDECIDED}
              ORDER BY m.received_at DESC, a.id ASC"
         ))?;
-        let mut pending: Vec<scout_api::Arrival> =
-            stmt.query_map(params![account_id], arrival_row)?.collect::<duckdb::Result<_>>()?;
+        let mut pending: Vec<scout_api::Arrival> = stmt
+            .query_map(params![account_id, account_id, account_id], arrival_row)?
+            .collect::<duckdb::Result<_>>()?;
         for arrival in &mut pending {
             arrival.attachments = attachments_of(&conn, arrival.mail_id)?;
         }
@@ -5962,14 +6268,23 @@ impl Store {
         // mail done), and a non-booking is that before it is anything else.
         // The ranking survives the collapse: `failed` is the mail's own
         // status, so it is every reading of that mail's reason at once.
+        //
+        // Whether a row was forwarded is the viewer's answer. A trip's mail
+        // goes to each person on the trip separately, so its `forwarded_at`
+        // only says that nobody is owed a copy any more; the viewer's own
+        // copy is in `mail_forwards`. Were it read off the row, an editor
+        // with no address would see the owner's copy as their own.
         let failed = unreadable("m");
         let mut stmt = conn.prepare(&format!(
-            "SELECT m.id, m.from_address, m.subject, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ'), m.forwarded_at IS NOT NULL, a.id,
+            "SELECT m.id, m.from_address, m.subject, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ'),
+                    CASE WHEN m.trip_id IS NULL THEN m.forwarded_at IS NOT NULL
+                         ELSE EXISTS (SELECT 1 FROM mail_forwards f WHERE f.mail_id = m.id AND f.account_id = ? AND NOT f.refused) END,
+                    a.id,
                     CASE WHEN {failed} THEN 'failed'
                          WHEN NOT a.booking THEN 'not_booking'
                          ELSE 'ignored' END
              FROM inbound_mail m LEFT JOIN arrivals a ON a.mail_id = m.id
-             WHERE m.account_id = ? AND m.received_at >= ?
+             WHERE {MAIL_REACH} AND m.received_at >= ?
                AND ({failed} OR (a.id IS NOT NULL AND (NOT a.booking OR a.status = 'ignored')))
              -- One row per mail. The partition is ordered by the same rank the
              -- CASE above uses, so the reason the collapse keeps is the reason
@@ -5980,7 +6295,7 @@ impl Store {
              ORDER BY m.received_at DESC, m.id DESC"
         ))?;
         let mut other: Vec<scout_api::MailRow> = stmt
-            .query_map(params![account_id, days_ago(30)], |r| {
+            .query_map(params![account_id, account_id, account_id, account_id, days_ago(30)], |r| {
                 Ok(scout_api::MailRow {
                     mail_id: r.get(0)?, from: r.get(1)?, subject: r.get(2)?, received_at: r.get(3)?,
                     forwarded: r.get(4)?, arrival_id: r.get(5)?, reason: r.get(6)?, attachments: Vec::new(),
@@ -5998,14 +6313,15 @@ impl Store {
         Ok(scout_api::InboxView { handle: None, domain: String::new(), pending, other })
     }
 
-    /// Forgets mail older than `days`, with its reading, its parts and its
-    /// loose files. Kept regardless of age: a mail whose booking nobody has
+    /// Forgets mail older than `days`, with its reading, its parts, its
+    /// loose files and the record of who it was forwarded to. Kept
+    /// regardless of age: a mail whose booking nobody has
     /// decided on yet, and any file that has become part of a trip item.
     /// Returns the mail rows deleted.
     pub fn sweep_inbox(&self, days: i64) -> Result<usize> {
         let cutoff = days_ago(days);
         let conn = self.conn();
-        // The one definition of "sweepable" the four deletes share; the
+        // The one definition of "sweepable" the five deletes share; the
         // mail goes last so a crash between them leaves nothing orphaned
         // that the next sweep will not find again.
         let sweepable = format!(
@@ -6019,26 +6335,30 @@ impl Store {
             &format!("DELETE FROM attachments WHERE item_id IS NULL AND mail_id IN ({sweepable})"),
             params![cutoff],
         )?;
+        conn.execute(&format!("DELETE FROM mail_forwards WHERE mail_id IN ({sweepable})"), params![cutoff])?;
         conn.execute(&format!("DELETE FROM arrivals WHERE mail_id IN ({sweepable})"), params![cutoff])?;
         Ok(conn.execute(&format!("DELETE FROM inbound_mail WHERE id IN ({sweepable})"), params![cutoff])?)
     }
 
-    /// Forgets one mail now, on its owner's say-so, instead of in thirty
-    /// days.
+    /// Forgets one mail now, on the say-so of someone who reaches it,
+    /// instead of in thirty days. A mail that came to a trip's address is the whole trip's:
+    /// anyone on it may delete it, as anyone on it may Add or Ignore its
+    /// bookings — `MAIL_REACH` is the check.
     ///
-    /// The four deletes are `sweep_inbox`'s — the parts, the loose files,
-    /// the readings, then the mail — but unlike the sweep they are in one
-    /// transaction, which is what keeps them whole: a crash takes all four
-    /// back, so nothing is orphaned and the order between them decides
+    /// The five deletes are `sweep_inbox`'s — the parts, the loose files,
+    /// who it was forwarded to, the readings, then the mail — but unlike
+    /// the sweep they are in one transaction, which is what keeps them
+    /// whole: a crash takes all five back, so nothing is orphaned and the order between them decides
     /// nothing. It is kept anyway, so the two paths that delete a mail read
     /// the same. A file that has joined a trip item is the trip's now and
-    /// stays — `attachment_owner` answers for it through the item. A part
+    /// stays — `can_open_attachment` reaches it through the item. A part
     /// has no such escape: it says what one mail's part was and is worth
     /// nothing once that mail is gone.
     ///
     /// Two refusals, both about rows this delete would strand:
     ///
-    /// - a booking still waiting on its owner, which is `UNDECIDED`, the
+    /// - a booking still waiting for someone to decide it, which is
+    ///   `UNDECIDED`, the
     ///   same predicate that keeps such a mail out of the sweep;
     /// - a mail the worker has not finished with, which would have its
     ///   reading written against it moments later.
@@ -6048,7 +6368,8 @@ impl Store {
     pub fn delete_mail(&self, account_id: i64, mail_id: i64) -> Result<MailGone> {
         let conn = self.conn();
         // The account is half the key, as in `arrival_of`: an id in a URL
-        // is not proof of anything. Whether the worker is done with the
+        // is not proof of anything, and `MAIL_REACH` widens it only to the
+        // people on the trip the mail came to. Whether the worker is done with the
         // mail is read in the same row — read, refused, or out of attempts,
         // which is `unreadable` and so the same set `inbox_view` can list.
         // A `new` or `extracting` mail with attempts left is still on its
@@ -6056,10 +6377,10 @@ impl Store {
         let mine: Option<bool> = conn
             .query_row(
                 &format!(
-                    "SELECT m.status = 'done' OR {} FROM inbound_mail m WHERE m.id = ? AND m.account_id = ?",
+                    "SELECT m.status = 'done' OR {} FROM inbound_mail m WHERE m.id = ? AND {MAIL_REACH}",
                     unreadable("m")
                 ),
-                params![mail_id, account_id],
+                params![mail_id, account_id, account_id, account_id],
                 |r| r.get(0),
             )
             .optional()?;
@@ -6086,6 +6407,7 @@ impl Store {
                 "DELETE FROM attachments WHERE item_id IS NULL AND mail_id = ?",
                 params![mail_id],
             )?;
+            conn.execute("DELETE FROM mail_forwards WHERE mail_id = ?", params![mail_id])?;
             conn.execute("DELETE FROM arrivals WHERE mail_id = ?", params![mail_id])?;
             conn.execute("DELETE FROM inbound_mail WHERE id = ?", params![mail_id])?;
             Ok(())
@@ -6153,7 +6475,7 @@ impl Store {
     /// delete paths no longer make such rows. It is what clears the ones
     /// already stranded in a live database.
     ///
-    /// The condition is `attachment_owner`'s two routes, negated: neither
+    /// The condition is `can_open_attachment`'s two routes, negated: neither
     /// the mail nor a trip behind the item is still there. Run from the
     /// hourly maintenance; a pass that finds nothing is two index-less
     /// scans of a small table, which is what the sweeps beside it cost too.
@@ -6636,7 +6958,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -6700,7 +7022,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -8608,7 +8930,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -9434,7 +9756,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 22, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -9475,7 +9797,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -9575,7 +9897,7 @@ CREATE TABLE conversations (
         // updated the table: the pod crash-looped on this step.
         let (_dir, path) = version_eighteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         let trip = s.list_trips(1).unwrap().remove(0);
         assert_eq!((trip.items[0].lat, trip.items[0].geocode_tried), (None, false));
         s.set_item_coords(trip.items[0].id, None).unwrap();
@@ -9612,7 +9934,7 @@ CREATE TABLE conversations (
     fn step_20_runs_on_a_database_that_has_items_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_nineteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         let item = &s.list_trips(1).unwrap()[0].items[0];
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
@@ -9627,6 +9949,163 @@ CREATE TABLE conversations (
                 params![trip_id, account, name],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_kept_trip_gets_one_address_and_the_owner_can_replace_it() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        assert_eq!(s.trip_address(trip.id).unwrap(), None, "a draft has none");
+        assert_eq!(s.new_trip_address(owner, trip.id).unwrap(), None, "and is not given one by a replace");
+        assert_eq!(s.trip_address(trip.id).unwrap(), None, "still none");
+        assert_eq!(s.trip_address(trip.id + 1000).unwrap(), None, "a trip that is not there has none");
+        s.keep_trip(owner, "Lisbon").unwrap();
+        let first = s.trip_address(trip.id).unwrap().unwrap();
+        assert!(first["lisbon-".len()..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()), "{first}");
+        assert!(first.starts_with("lisbon-") && first.len() == "lisbon-".len() + 5, "{first}");
+        assert_eq!(s.trip_address(trip.id).unwrap().as_deref(), Some(first.as_str()), "the same one next time");
+        assert_eq!(s.trip_for_address(&first).unwrap(), Some((trip.id, owner)));
+        let editor = s.account_for_telegram(2).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        assert_eq!(s.new_trip_address(editor, trip.id).unwrap(), None, "the owner's to replace");
+        let second = s.new_trip_address(owner, trip.id).unwrap().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(s.trip_for_address(&first).unwrap(), None, "the old one stops working");
+        assert_eq!(s.trip_for_address(&second).unwrap(), Some((trip.id, owner)));
+    }
+
+    #[test]
+    fn a_trips_mail_and_its_bookings_reach_everyone_on_the_trip_and_record_who_settled_them() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let (editor, stranger) = (s.account_for_telegram(2).unwrap(), s.account_for_telegram(3).unwrap());
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        let mail = s
+            .insert_trip_mail(trip.id, "p-1", "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.mail_to_work(10).unwrap()[0].trip_id, Some(trip.id));
+        let hotel = NewArrival { booking: true, summary: "Hotel".into(), trip_id: Some(trip.id), ..NewArrival::default() };
+        let not_one = NewArrival { booking: false, summary: "Newsletter".into(), ..NewArrival::default() };
+        let ids = s.insert_arrivals(owner, mail, &[hotel, not_one]).unwrap();
+
+        assert_eq!(s.pending_arrivals_of_mail(mail, editor).unwrap().len(), 1);
+        assert!(s.arrival_of(ids[0], editor).unwrap().is_some());
+        assert_eq!(s.arrival_of(ids[0], editor).unwrap().unwrap().trip_name.as_deref(), Some("Lisbon"));
+        assert!(s.arrival_of(ids[0], stranger).unwrap().is_none());
+        assert_eq!(s.inbox_view(editor).unwrap().pending.len(), 1);
+        assert_eq!(s.inbox_view(editor).unwrap().other.len(), 1, "the newsletter, under Other mail");
+        assert!(s.inbox_view(stranger).unwrap().pending.is_empty());
+
+        // A stranger reaches none of it, and a press of theirs on a booking
+        // that is still waiting changes nothing.
+        assert!(!s.decide_arrival(ids[0], stranger, "ignored", None).unwrap());
+        assert_eq!(s.arrival_of(ids[0], owner).unwrap().unwrap().status, "pending", "still waiting");
+        assert_eq!(s.arrival_settler(ids[0]).unwrap(), None);
+        assert!(s.pending_arrivals_of_mail(mail, stranger).unwrap().is_empty());
+        assert!(s.inbox_view(stranger).unwrap().other.is_empty());
+        assert_eq!(s.delete_mail(stranger, mail).unwrap(), MailGone::NotFound);
+
+        assert!(s.decide_arrival(ids[0], editor, "added", None).unwrap());
+        assert!(!s.decide_arrival(ids[0], owner, "ignored", None).unwrap(), "the first press decided");
+        assert_eq!(s.arrival_settler(ids[0]).unwrap(), Some(("added".to_string(), editor)));
+
+        assert!(s.forwarded_to(mail).unwrap().is_empty());
+        s.note_forwarded_to(mail, editor).unwrap();
+        s.note_forwarded_to(mail, editor).unwrap();
+        assert_eq!(s.forwarded_to(mail).unwrap(), vec![editor]);
+
+        // Anyone on the trip may delete its mail, and the record of who it
+        // was forwarded to goes with it.
+        s.mail_done(mail).unwrap();
+        assert_eq!(s.delete_mail(editor, mail).unwrap(), MailGone::Gone);
+        assert!(s.forwarded_to(mail).unwrap().is_empty());
+    }
+
+    #[test]
+    fn whether_a_trips_mail_was_forwarded_is_each_viewers_own_answer() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let editor = s.account_for_telegram(2).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        let newsletter = || NewArrival { booking: false, summary: "Newsletter".into(), ..NewArrival::default() };
+        let forwarded = |viewer: i64, mail: i64| {
+            s.inbox_view(viewer).unwrap().other.iter().find(|r| r.mail_id == mail).map(|r| r.forwarded)
+        };
+
+        // The owner had a copy and the editor did not, and the mail is
+        // marked forwarded because nobody is owed one any more.
+        let trips = s.insert_trip_mail(trip.id, "p-1", "hotel@example.com", None, None, None, false, &[]).unwrap().unwrap();
+        s.insert_arrivals(owner, trips, &[newsletter()]).unwrap();
+        s.note_forwarded_to(trips, owner).unwrap();
+        s.mail_forwarded(trips).unwrap();
+        assert_eq!(forwarded(owner, trips), Some(true));
+        assert_eq!(forwarded(editor, trips), Some(false), "the owner's copy is not the editor's");
+        // A refusal settles the editor's copy without giving them one.
+        s.note_forward_refused(trips, editor).unwrap();
+        assert_eq!(forwarded(editor, trips), Some(false), "refused is not forwarded");
+        assert_eq!(s.forwarded_to(trips).unwrap(), vec![owner]);
+        assert_eq!(s.forward_refused_to(trips).unwrap(), vec![editor]);
+
+        // An account's own mail reads the row, as it always has.
+        let own = s.insert_mail(owner, "p-2", "hotel@example.com", None, None, None, false, &[]).unwrap().unwrap();
+        s.insert_arrivals(owner, own, &[newsletter()]).unwrap();
+        assert_eq!(forwarded(owner, own), Some(false));
+        s.mail_forwarded(own).unwrap();
+        assert_eq!(forwarded(owner, own), Some(true));
+        assert_eq!(forwarded(editor, own), None, "and it is nobody else's to see");
+    }
+
+    #[test]
+    fn an_editor_who_left_the_trip_no_longer_reaches_its_mail() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let editor = s.account_for_telegram(2).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        let mail = s
+            .insert_trip_mail(trip.id, "p-1", "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .unwrap()
+            .unwrap();
+        let hotel = NewArrival { booking: true, summary: "Hotel".into(), trip_id: Some(trip.id), ..NewArrival::default() };
+        let not_one = NewArrival { booking: false, summary: "Newsletter".into(), ..NewArrival::default() };
+        let ids = s.insert_arrivals(owner, mail, &[hotel, not_one]).unwrap();
+        assert!(s.arrival_of(ids[0], editor).unwrap().is_some(), "reached while on the trip");
+
+        assert!(s.leave_trip(editor, trip.id, chrono::Utc::now().naive_utc()).unwrap());
+        assert!(s.arrival_of(ids[0], editor).unwrap().is_none());
+        assert!(s.pending_arrivals_of_mail(mail, editor).unwrap().is_empty());
+        let view = s.inbox_view(editor).unwrap();
+        assert!(view.pending.is_empty() && view.other.is_empty(), "neither the booking nor the mail");
+        assert!(!s.decide_arrival(ids[0], editor, "added", None).unwrap());
+        assert_eq!(s.delete_mail(editor, mail).unwrap(), MailGone::NotFound);
+        assert_eq!(s.arrival_of(ids[0], owner).unwrap().unwrap().status, "pending", "the owner still has it");
+    }
+
+    /// The editor's own mail, placed on the owner's trip that is shared with
+    /// the editor: the arrival's account is not the trip's, which is the
+    /// case the old owner-scoped trip join named no trip for.
+    #[test]
+    fn a_booking_from_an_editors_own_mail_shows_the_shared_trips_name() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let editor = s.account_for_telegram(2).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        let mail = s
+            .insert_mail(editor, "p-1", "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .unwrap()
+            .unwrap();
+        let hotel = NewArrival { booking: true, summary: "Hotel".into(), trip_id: Some(trip.id), ..NewArrival::default() };
+        let id = s.insert_arrival(editor, mail, &hotel).unwrap();
+
+        assert_eq!(s.arrival_of(id, editor).unwrap().unwrap().trip_name.as_deref(), Some("Lisbon"));
+        let pending = s.inbox_view(editor).unwrap().pending;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].trip_name.as_deref(), Some("Lisbon"));
     }
 
     #[test]
@@ -9898,7 +10377,10 @@ CREATE TABLE conversations (
 
     /// A database at 20 with a trip and an item in it. Built from
     /// `MIGRATIONS` and stripped of everything step 21 adds, for the reason
-    /// `version_eighteen_db_with_an_item` gives.
+    /// `version_eighteen_db_with_an_item` gives. It drops step 22's
+    /// `trips.address` too: left in, it would sit before `owner_name`, which
+    /// step 21 appends, and the shape comparison would see the two columns
+    /// in the wrong order.
     fn version_twenty_db_with_an_item() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v20.duckdb");
@@ -9910,6 +10392,7 @@ CREATE TABLE conversations (
              ALTER TABLE trip_items DROP COLUMN added_via;
              DROP TABLE trip_people;
              DROP TABLE trip_links;
+             ALTER TABLE trips DROP COLUMN address;
              CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
              DELETE FROM schema_version;
              INSERT INTO schema_version VALUES (20);
@@ -9926,12 +10409,87 @@ CREATE TABLE conversations (
     fn step_21_runs_on_a_database_with_trips_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         let trip = &s.list_trips(1).unwrap()[0];
         assert_eq!(trip.items[0].added, None, "an item from before sharing has no author");
         let (fresh, _d) = test_store();
         for table in ["trips", "trip_items", "trip_people", "trip_links"] {
             assert_eq!(shape(&fresh.conn(), table), shape(&s.conn(), table), "{table}");
+        }
+    }
+
+    /// A database at 21 with a trip, a mail and an arrival in it, stripped
+    /// of what step 22 adds.
+    fn version_twenty_one_db() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v21.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE trips DROP COLUMN address;
+             ALTER TABLE inbound_mail DROP COLUMN trip_id;
+             ALTER TABLE arrivals DROP COLUMN settled_by;
+             DROP TABLE mail_forwards;
+             CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
+             DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES (21);
+             INSERT INTO accounts (id) VALUES (1);
+             INSERT INTO trips (id, account_id, name, name_key, kept) VALUES (1, 1, 'Lisbon', 'lisbon', true);
+             INSERT INTO inbound_mail (id, account_id, provider_id, from_address) VALUES (1, 1, 'p1', 'hotel@example.com');
+             INSERT INTO arrivals (id, account_id, mail_id, booking, summary, trip_id) VALUES (1, 1, 1, true, 'Hotel', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    #[test]
+    fn step_22_runs_on_a_database_with_mail_in_it_and_matches_a_fresh_one() {
+        let (_dir, path) = version_twenty_one_db();
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 22);
+        let (fresh, _d) = test_store();
+        // Not `mail_forwards`: `Store::open` runs `MIGRATIONS` before the
+        // steps, so the table is there whatever step 22 says, and comparing
+        // it would set the DDL against itself. The test below runs the step
+        // on its own.
+        for table in ["trips", "inbound_mail", "arrivals"] {
+            assert_eq!(shape(&fresh.conn(), table), shape(&s.conn(), table), "{table}");
+        }
+        let conn = s.conn();
+        let address: Option<String> = conn.query_row("SELECT address FROM trips WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let trip_id: Option<i64> = conn.query_row("SELECT trip_id FROM inbound_mail WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let settled_by: Option<i64> = conn.query_row("SELECT settled_by FROM arrivals WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!((address, trip_id, settled_by), (None, None, None), "rows from before the step carry NULLs");
+    }
+
+    #[test]
+    fn step_22_by_itself_builds_what_a_fresh_database_has() {
+        // `Store::open` runs `MIGRATIONS` before any step, so opening the
+        // fixture would hide a step whose DDL had drifted — see
+        // `the_step_that_adds_mail_parts_builds_the_table_a_fresh_database_has`.
+        // Run the step alone, on a raw connection to the stripped fixture.
+        let (_dir, path) = version_twenty_one_db();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(STEP_22_TRIP_ADDRESS).unwrap();
+        let (fresh, _d) = test_store();
+        for table in ["trips", "inbound_mail", "arrivals", "mail_forwards"] {
+            assert_eq!(shape(&fresh.conn(), table), shape(&conn, table), "{table}");
+        }
+    }
+
+    #[test]
+    fn steps_21_and_22_by_themselves_build_the_sharing_tables_a_fresh_database_has() {
+        // The same gap as above, for step 21's two tables: run the steps on
+        // a raw connection, since opening the store would create the tables
+        // from `MIGRATIONS` first.
+        let (_dir, path) = version_twenty_db_with_an_item();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(STEP_21_SHARING).unwrap();
+        conn.execute_batch(STEP_22_TRIP_ADDRESS).unwrap();
+        let (fresh, _d) = test_store();
+        for table in ["trip_people", "trip_links"] {
+            assert_eq!(shape(&fresh.conn(), table), shape(&conn, table), "{table}");
         }
     }
 
@@ -10483,7 +11041,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -10587,7 +11145,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -10600,14 +11158,18 @@ CREATE TABLE messages (
     /// A database in the shape step 16 left it: `arrivals` without the
     /// three columns step 17 adds. Built by dropping them from the finished
     /// shape rather than by restating the old DDL, so it cannot drift from
-    /// what `MIGRATIONS` says the rest of the table is.
+    /// what `MIGRATIONS` says the rest of the table is. It drops step 22's
+    /// `arrivals.settled_by` as well: left in, it would sit before the
+    /// columns step 17 appends and the shape comparison would see them in
+    /// the wrong order.
     fn version_sixteen_db() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v16.duckdb");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(MIGRATIONS).unwrap();
         conn.execute_batch(
-            "ALTER TABLE arrivals DROP COLUMN airline;
+            "ALTER TABLE arrivals DROP COLUMN settled_by;
+             ALTER TABLE arrivals DROP COLUMN airline;
              ALTER TABLE arrivals DROP COLUMN flight_number;
              ALTER TABLE arrivals DROP COLUMN stops;
              CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
@@ -10628,7 +11190,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -10704,7 +11266,7 @@ CREATE TABLE messages (
         // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         let part = mail_part("att_1", Some("inline"), None);
         let m = store
             .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))
@@ -10968,7 +11530,7 @@ CREATE TABLE messages (
         assert_eq!(gone, 1, "one mail row");
         assert!(store.attachment(kept).unwrap().is_some());
         assert!(store.attachment(loose).unwrap().is_none());
-        assert_eq!(store.attachment_owner(kept).unwrap(), Some(a), "owned through the item once the mail is gone");
+        assert!(store.can_open_attachment(kept, a).unwrap(), "owned through the item once the mail is gone");
     }
 
     /// A stay on `trip`, booked, with a ticket already on it: the shape
@@ -11002,9 +11564,10 @@ CREATE TABLE messages (
         // mail, and destroying a traveller's ticket because they took one
         // leg off a trip would be indefensible. If the mail has already
         // gone, the item was the only thing that could reach those bytes:
-        // left behind, the row answers `attachment_owner` with nothing,
-        // which no reader may download and no sweep can find — the sweeps
-        // are keyed on mail ids that no longer exist.
+        // left behind, the row is reached by neither of
+        // `can_open_attachment`'s routes, so no reader may download it and
+        // no sweep can find it — the sweeps are keyed on mail ids that no
+        // longer exist.
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
         let live = mail(&store, a, "re_1");
@@ -11016,7 +11579,7 @@ CREATE TABLE messages (
         store.attach_to_item(ticket, hotel).unwrap();
         store.attach_to_item(boarding, hotel).unwrap();
         delete_mail_now(&store, a, doomed);
-        assert_eq!(store.attachment_owner(boarding).unwrap(), Some(a), "kept by the item, which is the state this is about");
+        assert!(store.can_open_attachment(boarding, a).unwrap(), "kept by the item, which is the state this is about");
 
         store.drop_item(trip.id, 1).unwrap();
 
@@ -11025,7 +11588,7 @@ CREATE TABLE messages (
             None,
             "the ticket was not handed back to its mail, so nothing will ever sweep it",
         );
-        assert_eq!(store.attachment_owner(ticket).unwrap(), Some(a), "handed back but unreachable");
+        assert!(store.can_open_attachment(ticket, a).unwrap(), "handed back but unreachable");
         assert!(
             store.attachment(boarding).unwrap().is_none(),
             "a file whose mail is gone outlived the only item that could reach it",
@@ -11138,8 +11701,8 @@ CREATE TABLE messages (
         // mail is alive, a file on an item of a live trip, and a file whose
         // mail is gone but whose item still holds it — the exact state the
         // inbox sweep is careful to leave behind. Only the fourth, which
-        // answers `attachment_owner` with nothing and which no other path
-        // can ever delete, is the sweep's.
+        // `can_open_attachment` reaches by neither route and which no
+        // other path can ever delete, is the sweep's.
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
         let live = mail(&store, a, "re_1");
@@ -11160,7 +11723,7 @@ CREATE TABLE messages (
         // here to clear.
         let orphan = store.insert_attachment(doomed, "old.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
         store.conn().execute("UPDATE attachments SET item_id = ? WHERE id = ?", params![hotel + 500, orphan]).unwrap();
-        assert_eq!(store.attachment_owner(orphan).unwrap(), None, "the row must be unreachable for this test to mean anything");
+        assert!(!store.can_open_attachment(orphan, a).unwrap(), "the row must be unreachable for this test to mean anything");
 
         assert_eq!(store.sweep_orphaned_attachments().unwrap(), 1);
 
@@ -11255,7 +11818,7 @@ CREATE TABLE messages (
         // The ticket belongs to the trip now, and is still answered for
         // through the item — the same survival the sweep was built for.
         assert!(store.attachment(kept).unwrap().is_some());
-        assert_eq!(store.attachment_owner(kept).unwrap(), Some(a));
+        assert!(store.can_open_attachment(kept, a).unwrap());
         // A second press from a tab that has not repainted: already gone.
         assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::NotFound);
     }
@@ -11339,7 +11902,7 @@ CREATE TABLE messages (
         assert_eq!(trip.items[0].confirmation_code.as_deref(), Some("ABC"));
         // The ticket is still downloadable: the item answers for it now.
         assert!(store.attachment(ticket).unwrap().is_some());
-        assert_eq!(store.attachment_owner(ticket).unwrap(), Some(a));
+        assert!(store.can_open_attachment(ticket, a).unwrap());
     }
 
     #[test]
@@ -11395,7 +11958,7 @@ CREATE TABLE messages (
         // parses without a date library.
         assert!(got.received_at.contains('T') && got.received_at.ends_with('Z'), "{}", got.received_at);
         assert_eq!(got.attachments, vec![scout_api::AttachmentRef { id: att, filename: "ticket.pdf".into(), mime: "application/pdf".into() }]);
-        assert_eq!(store.attachment_owner(att).unwrap(), Some(a));
+        assert!(store.can_open_attachment(att, a).unwrap());
         assert_eq!(store.attachments_of_mail(m).unwrap().len(), 1);
         assert_eq!(store.attachment(att).unwrap().map(|(mail_id, item_id, _, _, bytes)| (mail_id, item_id, bytes)), Some((m, None, None)));
     }

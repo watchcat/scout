@@ -983,7 +983,7 @@ mod tests {
         let res = delete_with_cookie(&app, &format!("/chat/mail/{mail}"), &session, Some(&csrf)).await;
         assert_eq!(res.status(), StatusCode::OK);
         // The mail it arrived with is gone and the ticket is still served:
-        // `attachment_owner` answers for it through the item now.
+        // `can_open_attachment` answers for it through the item now.
         let res = get_with_cookie(&app, &format!("/chat/attachments/{ticket}"), &session).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert!(res.headers()["content-disposition"].to_str().unwrap().contains("ticket.pdf"));

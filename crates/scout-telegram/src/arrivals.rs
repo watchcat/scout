@@ -92,6 +92,12 @@ pub fn decided_line(decision: Decision, title: Option<&str>, trip: Option<&str>)
     }
 }
 
+/// What a press says when the booking was already decided — by someone
+/// else on the trip, or by the presser themselves, earlier.
+pub fn already_line(added: bool, by: &str) -> String {
+    format!("Already {} by {by}.", if added { "added" } else { "ignored" })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +198,12 @@ mod tests {
         assert_eq!(decided_line(Decision::Add(1), Some("Harbour View Rooms"), Some("HK")), "✓ Harbour View Rooms added to HK.");
         assert_eq!(decided_line(Decision::Add(1), None, None), "✓ The booking added.");
         assert!(decided_line(Decision::Ignore(1), Some("Lunch"), None).starts_with("✗ Lunch ignored."));
+    }
+
+    #[test]
+    fn a_press_that_came_second_says_who_came_first() {
+        assert_eq!(already_line(true, "Masha"), "Already added by Masha.");
+        assert_eq!(already_line(false, "Masha"), "Already ignored by Masha.");
+        assert_eq!(already_line(true, "you"), "Already added by you.");
     }
 }

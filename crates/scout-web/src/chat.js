@@ -1047,6 +1047,15 @@ export function peopleLine(trip) {
   return ['You', ...people.filter((p) => !p.you).map((p) => p.name)].join(', ')
 }
 
+// Where a confirmation for this trip should go: the trip's own address
+// when it has one, so it lands here for everyone on it; the reader's own
+// otherwise. Needs the domain, which the inbox carries.
+export function bookingAddress(trip, inbox) {
+  if (!inbox?.domain) return null
+  if (trip?.address) return `${trip.address}@${inbox.domain}`
+  return inbox.handle ? `${inbox.handle}@${inbox.domain}` : null
+}
+
 const ADDED_VIA = { scout: ', via Scout', mail: ', from mail' }
 
 // Only while more than one person is on the trip: on a trip of one every
@@ -2398,7 +2407,7 @@ function start() {
     })
     if (trip.items.length) tripDetail.append(renderOverview(trip))
 
-    const alert = readinessAlert(trip, inboxAddress())
+    const alert = readinessAlert(trip, bookingAddress(trip, inbox))
     if (alert) {
       const readiness = node('div', alert.tone === 'ready' ? 'trip-alert ready' : 'trip-alert')
       readiness.append(node('strong', '', alert.headline))
@@ -3422,6 +3431,19 @@ function start() {
         button.addEventListener('click', () => linkAction(path, trip, said))
         actions.append(button)
       }
+      // Asked first, unlike the link: a link lost costs one re-share, but
+      // a hotel holding the old address cannot be told the new one, and
+      // its next mail — a changed time, a cancellation — goes nowhere.
+      // Only where there is an address to replace.
+      if (trip.address) {
+        const replace = node('button', 'people-link-action', 'New address')
+        replace.type = 'button'
+        replace.addEventListener('click', () => askInPanel(ask,
+          'Replace the trip email? Mail sent to the old address, including from places you already booked with, will stop arriving.',
+          'New address',
+          () => linkAction('/chat/trips/address-new', trip, 'New address made. The old one no longer works.')))
+        actions.append(replace)
+      }
     } else {
       const leave = node('button', 'people-leave', 'Leave trip')
       leave.type = 'button'
@@ -3430,7 +3452,19 @@ function start() {
         () => tripAction('/chat/trips/leave', tripBody(trip.name), `You left ${trip.name}.`)))
       actions.append(leave)
     }
-    panel.append(list, actions)
+    panel.append(list)
+    const address = trip.address && inbox?.domain ? `${trip.address}@${inbox.domain}` : null
+    if (address) {
+      const line = node('p', 'people-address')
+      line.append(document.createTextNode('Trip email: '), node('code', '', address))
+      const copyAddressButton = node('button', 'alert-copy', 'Copy')
+      copyAddressButton.type = 'button'
+      copyAddressButton.setAttribute('aria-label', `Copy ${address}`)
+      copyAddressButton.addEventListener('click', () => copyAddress(address))
+      line.append(copyAddressButton)
+      panel.append(line)
+    }
+    panel.append(actions)
     if (trip.you_own) panel.append(node('p', 'people-link-state', linkStateLine(trip.link)))
     panel.append(ask)
     return panel
@@ -3479,8 +3513,8 @@ function start() {
     }
   }
 
-  // New link and Turn link off change only the link's line, which comes
-  // with the trips: read them again.
+  // New link, Turn link off and New address change only what the trips
+  // carry — the link's line, the trip's address: read them again.
   async function linkAction(path, trip, said) {
     try {
       const res = await fetch(path, {
@@ -3493,7 +3527,7 @@ function start() {
       await loadTrips()
       showTripToast(said)
     } catch {
-      showTripToast('Could not change the link. Try again.')
+      showTripToast('That did not work. Try again.')
     }
   }
 

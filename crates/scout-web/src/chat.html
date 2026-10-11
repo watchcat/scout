@@ -397,6 +397,8 @@
   .people-actions button:focus-visible,.people-remove:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   .people-actions button:disabled{opacity:.6; cursor:default}
   .people-link-state{margin:10px 0 0; color:var(--base0); font-size:13px}
+  .people-address{margin:0 0 12px; color:var(--base1); font-size:13.5px; overflow-wrap:anywhere}
+  .people-address code{font-size:13px}
   .people-ask:not(:empty){margin:12px 0 0; padding-top:12px; border-top:1px solid var(--line)}
   .people-ask p{margin:0 0 10px; color:var(--base1); font-size:13.5px; line-height:1.5}
   .trip-head-actions{display:flex; align-items:center; gap:8px; flex:none}
@@ -522,9 +524,9 @@
   /* The address in the banner is a thing to copy, so it looks like one. */
   .trip-alert code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; color:var(--base2);
     overflow-wrap:anywhere}
-  .trip-alert .alert-copy{margin-left:6px; background:transparent; border:1px solid currentColor; border-radius:7px;
+  .trip-alert .alert-copy,.people-address .alert-copy{margin-left:6px; background:transparent; border:1px solid currentColor; border-radius:7px;
     color:inherit; font:inherit; font-size:11.5px; font-weight:650; padding:2px 8px; cursor:pointer; vertical-align:1px}
-  .trip-alert .alert-copy:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  .trip-alert .alert-copy:focus-visible,.people-address .alert-copy:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   .segment-stack{display:flex; flex-direction:column; gap:12px}
   /* Dashed, like `.trip-empty`: this card is an invitation to add to the
      itinerary, not part of it yet. Sits after the stack rather than inside

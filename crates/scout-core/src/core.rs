@@ -1015,8 +1015,8 @@ mod tests {
     #[test]
     fn maintenance_sweeps_the_attachments_nothing_owns() {
         // The only thing that can ever delete them: an attachment whose
-        // mail and whose item are both gone answers `attachment_owner`
-        // with nobody, so no reader can reach it and neither mail sweep
+        // mail and whose item are both gone is reached by neither of
+        // `can_open_attachment`'s routes, so no reader can reach it and neither mail sweep
         // can find it — its deletes are keyed on a mail id that no longer
         // exists. Without this call those bytes sit in the database
         // forever.

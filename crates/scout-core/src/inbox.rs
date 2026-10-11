@@ -42,6 +42,65 @@ pub fn normalise_handle(raw: &str) -> Result<String, String> {
     Ok(h)
 }
 
+/// The readable half of a trip's address: the name lowercased, accents
+/// dropped, anything outside `a-z0-9` turned into one dash, trimmed, cut
+/// to 20 characters. "trip" when nothing is left — a name in another
+/// script has no letters an address can carry.
+///
+/// Accents are dropped rather than treated as separators because the
+/// address is read out to hotels and typed by people: "zurich" is what
+/// they will write, and "z-rich" would be a puzzle.
+pub fn trip_address_slug(name: &str) -> String {
+    use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+    let mut slug = String::new();
+    // Lowercased first so the table below needs no capitals, then taken
+    // apart so "ü" arrives as "u" and a mark, and the mark is skipped.
+    for c in name.trim().to_lowercase().nfd().filter(|c| !is_combining_mark(*c)) {
+        // Letters that are not an accent on another letter, so they do not
+        // come apart; the usual transliterations stand in for them.
+        let spelled = match c {
+            'ø' => "o",
+            'æ' => "ae",
+            'œ' => "oe",
+            'ß' => "ss",
+            'ł' => "l",
+            'đ' => "d",
+            'þ' => "th",
+            'ð' => "d",
+            'ı' => "i",
+            _ => "",
+        };
+        if !spelled.is_empty() {
+            slug.push_str(spelled);
+        } else if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    // The cut can land just after a dash, so the end is trimmed again.
+    let slug: String = slug.trim_matches('-').chars().take(20).collect();
+    let slug = slug.trim_end_matches('-').to_string();
+    if slug.is_empty() { "trip".to_string() } else { slug }
+}
+
+/// A local part read as a trip address: `a-z0-9` and dashes, at least one
+/// dash, none at either end. A handle never has a dash, so the two kinds
+/// of address can be told apart by shape alone.
+///
+/// The cap is 40 rather than the 26 a generated address reaches (20 of
+/// slug, a dash, 5 of tail): it only keeps absurd input out, and room above
+/// 26 means an address issued under a longer slug rule still reads.
+pub fn normalise_trip_address(raw: &str) -> Option<String> {
+    let a = raw.trim().to_ascii_lowercase();
+    let ok = a.contains('-')
+        && !a.starts_with('-')
+        && !a.ends_with('-')
+        && a.len() <= 40
+        && a.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    ok.then_some(a)
+}
+
 /// What the extractor is told before it sees the mail. The mail is data:
 /// it is the one piece of text in the system written by a stranger, and
 /// this is where that is said to the model.
@@ -635,6 +694,16 @@ pub async fn account_for_handle(core: &Core, raw: &str) -> anyhow::Result<Option
     blocking(move || store.account_for_handle(&handle)).await
 }
 
+/// Whose trip `<raw>@domain` is: the trip and its owner. A local part not
+/// shaped like a trip address cannot be one and never reaches the store.
+pub async fn trip_for_address(core: &Core, raw: &str) -> anyhow::Result<Option<(i64, i64)>> {
+    let Some(address) = normalise_trip_address(raw) else {
+        return Ok(None);
+    };
+    let store = core.store();
+    blocking(move || store.trip_for_address(&address)).await
+}
+
 /// A delivered mail, as the webhook hands it over.
 /// No `Debug`: it carries the body, and a `{:?}` in an error path would
 /// put a mail in the log.
@@ -659,6 +728,31 @@ pub async fn record_mail(core: &Core, account_id: i64, mail: MailIn) -> anyhow::
     let id = blocking(move || {
         store.insert_mail(
             account_id,
+            &mail.provider_id,
+            &mail.from,
+            mail.subject.as_deref(),
+            mail.text.as_deref(),
+            mail.html.as_deref(),
+            mail.truncated,
+            &mail.parts,
+        )
+    })
+    .await?;
+    if id.is_some() {
+        core.wake_inbox();
+    }
+    Ok(id)
+}
+
+/// `record_mail`, for a mail that came to a trip's address: stored under
+/// the trip's owner, with the trip on it. `None` for a redelivery, or for
+/// a trip deleted since the address was looked up — to the webhook both
+/// are "nothing more to do".
+pub async fn record_trip_mail(core: &Core, trip_id: i64, mail: MailIn) -> anyhow::Result<Option<i64>> {
+    let store = core.store();
+    let id = blocking(move || {
+        store.insert_trip_mail(
+            trip_id,
             &mail.provider_id,
             &mail.from,
             mail.subject.as_deref(),
@@ -776,6 +870,34 @@ pub async fn mail_forwarded(core: &Core, id: i64) -> anyhow::Result<()> {
     blocking(move || store.mail_forwarded(id)).await
 }
 
+/// Who is settled for a trip's mail: who has their copy, and who Resend
+/// refused one. Neither is asked for again.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MailForwards {
+    pub sent: Vec<i64>,
+    pub refused: Vec<i64>,
+}
+
+/// Who is settled for a trip's mail, so a retry after an outage sends only
+/// what is still owed.
+pub async fn forwards_of(core: &Core, mail_id: i64) -> anyhow::Result<MailForwards> {
+    let store = core.store();
+    blocking(move || Ok(MailForwards { sent: store.forwarded_to(mail_id)?, refused: store.forward_refused_to(mail_id)? })).await
+}
+
+/// One person on a trip has their copy of its mail. Idempotent.
+pub async fn note_forwarded_to(core: &Core, mail_id: i64, account_id: i64) -> anyhow::Result<()> {
+    let store = core.store();
+    blocking(move || store.note_forwarded_to(mail_id, account_id)).await
+}
+
+/// Resend refused one person's copy of a trip's mail; it is not asked for
+/// again. Idempotent.
+pub async fn note_forward_refused(core: &Core, mail_id: i64, account_id: i64) -> anyhow::Result<()> {
+    let store = core.store();
+    blocking(move || store.note_forward_refused(mail_id, account_id)).await
+}
+
 /// The body fetched from the provider, cut at `cap_chars` characters,
 /// and the sender that came with it — see `Store::mail_fetched` for why the
 /// two are written together and why a blank sender changes nothing.
@@ -816,12 +938,15 @@ pub async fn attachment_bytes(core: &Core, mail_id: i64) -> anyhow::Result<Vec<(
     blocking(move || store.attachment_bytes_of(mail_id)).await
 }
 
-/// A file to download: `(filename, mime, bytes)`, or `None` when it is not
-/// this account's or has no bytes to serve.
+/// A file to download: `(filename, mime, bytes)`, or `None` when this
+/// account may not open it or it has no bytes to serve. Anyone on a trip
+/// may open a file that came to the trip's address or sits on one of its
+/// items, as `Store::can_open_attachment` says, not only the account whose
+/// mail it came in.
 pub async fn attachment_for(core: &Core, id: i64, account_id: i64) -> anyhow::Result<Option<(String, String, Vec<u8>)>> {
     let store = core.store();
     blocking(move || {
-        if store.attachment_owner(id)? != Some(account_id) {
+        if !store.can_open_attachment(id, account_id)? {
             return Ok(None);
         }
         Ok(store
@@ -879,7 +1004,7 @@ pub fn sender_is_the_account(sender: &str, theirs: &[String]) -> bool {
 /// people. ASCII rather than Unicode on purpose: `to_lowercase` folds
 /// U+212A, the Kelvin sign, to a plain `k`, which would make two
 /// different mailboxes one and silently withhold a confirmation from
-/// whoever owns the plain one. It also matches how `our_handle` compares
+/// whoever owns the plain one. It also matches how `our_local_parts` compares
 /// our own domain. (Turkish costs nothing either way here: Rust
 /// lowercases `İ` to two code points and leaves `ı` alone, so neither
 /// spelling of an `i` was ever going to fold onto the other.)
@@ -922,6 +1047,12 @@ fn mailbox(raw: &str) -> Option<String> {
 /// Stores the extractor's reading. A booking is placed on a trip (or a
 /// draft made for it) here, so the row can name where Add would put it;
 /// nothing is added to that trip until the person says so.
+///
+/// A mail that came to a trip's address puts every booking it holds on
+/// that trip and nowhere else. The trip is read off the stored mail, not
+/// taken from the caller, so no caller can file it anywhere else: the
+/// store's `ARRIVAL_SELECT` shows the trip's name to anyone who reaches
+/// the arrival on the strength of exactly that.
 pub async fn record_arrivals(
     core: &Core,
     account_id: i64,
@@ -940,19 +1071,24 @@ pub async fn record_arrivals(
                 e
             })
             .collect();
-        // One confirmation is one journey: the mail is placed once and all
-        // of its bookings go there. Placing each on its own would put the
-        // legs of a round trip on two drafts — a draft holds no items until
-        // Add, and placement matches on the dates of a trip's items, so a
-        // return three weeks out cannot see the draft just made for the
-        // outbound.
-        //
-        // Every dated booking is asked, not only the first: an outbound
-        // that names no place matches nothing on its own, and the ticket
-        // would start a bare draft beside the trip its return plainly
-        // belongs to. The first leg that fits a trip takes the mail there;
-        // when none fit, the first dated booking names the draft.
-        let placement = {
+        let placement = if let Some(trip) = store.mail_trip(mail_id)? {
+            // Sent to the trip's own address: the sender said where it
+            // goes, so there is nothing to work out.
+            readings.iter().any(|e| e.booking).then_some(Placement::Trip(trip))
+        } else {
+            // One confirmation is one journey: the mail is placed once and
+            // all of its bookings go there. Placing each on its own would
+            // put the legs of a round trip on two drafts — a draft holds no
+            // items until Add, and placement matches on the dates of a
+            // trip's items, so a return three weeks out cannot see the
+            // draft just made for the outbound.
+            //
+            // Every dated booking is asked, not only the first: an outbound
+            // that names no place matches nothing on its own, and the
+            // ticket would start a bare draft beside the trip its return
+            // plainly belongs to. The first leg that fits a trip takes the
+            // mail there; when none fit, the first dated booking names the
+            // draft.
             let dated: Vec<&Extraction> = readings.iter().filter(|e| e.booking && e.date.is_some()).collect();
             // Read once for the whole mail, not once per booking: every
             // dated leg is asked, and each ask would otherwise load every
@@ -1374,6 +1510,50 @@ pub async fn ignore_arrival(core: &Core, account_id: i64, arrival_id: i64) -> an
     .await
 }
 
+/// Who decided an arrival, for a press that came second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    pub added: bool,
+    /// Their name on the arrival's trip, "you" when it was the asker.
+    pub by: String,
+}
+
+/// Who settled an arrival this account reaches, and how. `None` when the
+/// account does not reach it, while it still waits, and for one decided
+/// before the presser was recorded: there is no one to name. `None` too for
+/// a status this does not know, rather than a guess at which way it went.
+pub async fn settler(core: &Core, account_id: i64, arrival_id: i64) -> anyhow::Result<Option<Settled>> {
+    let store = core.store();
+    blocking(move || {
+        // Reach first, so an id from the page cannot learn who decided an
+        // arrival on a trip the asker is not on.
+        let Some(arrival) = store.arrival_of(arrival_id, account_id)? else { return Ok(None) };
+        let Some((status, by)) = store.arrival_settler(arrival_id)? else { return Ok(None) };
+        let added = match status.as_str() {
+            "added" => true,
+            "ignored" => false,
+            other => {
+                tracing::warn!(arrival_id, status = other, "an arrival was settled with a status settler does not know");
+                return Ok(None);
+            }
+        };
+        let by = if by == account_id {
+            "you".to_string()
+        } else {
+            let names = match arrival.trip_id {
+                Some(trip) => store.author_names(trip)?,
+                None => Default::default(),
+            };
+            // A presser the trip cannot name, its arrival unplaced or the
+            // trip gone since, was still not the asker, and saying "you"
+            // or nothing would tell them something untrue.
+            names.get(&by).cloned().unwrap_or_else(|| "someone on the trip".to_string())
+        };
+        Ok(Some(Settled { added, by }))
+    })
+    .await
+}
+
 /// The × on a row under Other mail: the mail goes now rather than waiting
 /// out the thirty days the retention sweep gives it. One store call, whose
 /// doc says what goes with it and what survives.
@@ -1580,6 +1760,29 @@ mod tests {
         for bad in ["ab", "a".repeat(31).as_str(), ".sasha", "sasha.", "sa sha", "sa@sha", "postmaster", "Admin", "no-reply", "sásha"] {
             assert!(normalise_handle(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_trip_address_is_the_name_as_a_slug_with_a_tail() {
+        assert_eq!(trip_address_slug("Hong Kong, September!"), "hong-kong-september");
+        assert_eq!(trip_address_slug("  Lisbon  "), "lisbon");
+        assert_eq!(trip_address_slug("A very long trip name that goes on"), "a-very-long-trip-nam");
+        assert_eq!(trip_address_slug("Москва"), "trip");
+        assert_eq!(trip_address_slug("---"), "trip");
+        assert_eq!(trip_address_slug("Zürich"), "zurich");
+        assert_eq!(trip_address_slug("São Paulo"), "sao-paulo");
+        assert_eq!(trip_address_slug("İstanbul"), "istanbul");
+        assert_eq!(trip_address_slug("Diyarbakır"), "diyarbakir");
+        assert_eq!(trip_address_slug("Ðakovo"), "dakovo");
+        assert_eq!(trip_address_slug("København"), "kobenhavn");
+        assert_eq!(trip_address_slug("Ålesund"), "alesund");
+        assert_eq!(trip_address_slug("Café Crawl"), "cafe-crawl");
+        assert_eq!(trip_address_slug("abcdefghijklmnopqrs tuv"), "abcdefghijklmnopqrs", "a cut that lands on a dash");
+        assert_eq!(trip_address_slug("2026"), "2026");
+        assert_eq!(normalise_trip_address(" Hong-Kong-SEP-4f9qa "), Some("hong-kong-sep-4f9qa".into()));
+        assert_eq!(normalise_trip_address("sasha"), None, "no dash: a handle's shape, not a trip's");
+        assert_eq!(normalise_trip_address("a-b.c"), None);
+        assert_eq!(normalise_trip_address("-lisbon-"), None);
     }
 
     #[test]
@@ -2003,6 +2206,46 @@ mod tests {
         assert_eq!(attachment_for(&core, ticket, a).await.unwrap(), Some(("ticket.pdf".to_string(), "application/pdf".to_string(), b"%PDF".to_vec())));
         let b = store.account_for_telegram(2).unwrap();
         assert_eq!(attachment_for(&core, ticket, b).await.unwrap(), None, "not theirs");
+    }
+
+    #[tokio::test]
+    async fn everyone_on_a_trip_opens_its_files_and_a_stranger_does_not() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let owner = store.account_for_telegram(1).unwrap();
+        let (editor, stranger) = (store.account_for_telegram(2).unwrap(), store.account_for_telegram(3).unwrap());
+        let trip = store.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        let item = store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap().items[0].id;
+        crate::sharing::share_for_tests(&core, owner, "Lisbon", editor, "Masha").await.unwrap();
+
+        // A ticket from the owner's own mail is the owner's until it joins
+        // the shared trip's item, and then it is the trip's.
+        let own_mail = seed_mail(&core, owner, "re_1").await;
+        let ticket = store.insert_attachment(own_mail, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        assert_eq!(attachment_for(&core, ticket, editor).await.unwrap(), None, "loose in the owner's own mail");
+        store.attach_to_item(ticket, item).unwrap();
+        assert_eq!(
+            attachment_for(&core, ticket, editor).await.unwrap().map(|(f, _, b)| (f, b)),
+            Some(("ticket.pdf".to_string(), b"%PDF".to_vec())),
+            "on an item of a trip shared with the editor"
+        );
+
+        // A file of mail sent to the trip's address is the trip's while it
+        // is still loose.
+        let trip_mail = store
+            .insert_trip_mail(trip.id, "re_2", "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .unwrap()
+            .unwrap();
+        let voucher = store.insert_attachment(trip_mail, "voucher.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        assert_eq!(
+            attachment_for(&core, voucher, editor).await.unwrap().map(|(f, _, b)| (f, b)),
+            Some(("voucher.pdf".to_string(), b"%PDF".to_vec())),
+            "loose in mail to the trip's address"
+        );
+
+        for file in [ticket, voucher] {
+            assert_eq!(attachment_for(&core, file, stranger).await.unwrap(), None, "a stranger opens neither");
+        }
     }
 
     #[tokio::test]
@@ -2468,6 +2711,127 @@ mod tests {
         assert_eq!((v.other[0].arrival_id, v.other[0].reason.as_str()), (Some(id), "ignored"));
         assert_eq!(ignore_arrival(&core, a, id).await.unwrap(), Outcome::NotPending);
         assert_eq!(add_arrival(&core, a, id, AddTarget::New).await.unwrap(), Outcome::NotPending);
+    }
+
+    /// One pending booking on a mail that came to the trip's address, filed
+    /// as the worker would file it: under the owner, on the trip.
+    fn seed_trip_booking(store: &Store, owner: i64, trip_id: i64, provider_id: &str) -> i64 {
+        let mail_id = store
+            .insert_trip_mail(trip_id, provider_id, "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .unwrap()
+            .expect("a new mail");
+        let row = NewArrival {
+            booking: true,
+            kind: Some("stay".into()),
+            title: Some("Hotel Alfama".into()),
+            date: Some("2026-10-13".into()),
+            summary: "Hotel Alfama".into(),
+            trip_id: Some(trip_id),
+            ..NewArrival::default()
+        };
+        store.insert_arrivals(owner, mail_id, &[row]).unwrap()[0]
+    }
+
+    #[tokio::test]
+    async fn a_trips_mail_is_filed_on_that_trip_without_asking_placement() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let owner = store.account_for_telegram(1).unwrap();
+        crate::trips::seed_trip_for_tests(&core, owner, "Lisbon").await.unwrap();
+        crate::trips::keep(&core, owner, "Lisbon").await.unwrap().expect("kept");
+        let plan = crate::trips::find(&core, owner, "Lisbon").await.unwrap().unwrap();
+        let address = plan.address.expect("a kept trip has an address");
+
+        let trip_id = plan.trip.id;
+        assert_eq!(trip_for_address(&core, &address).await.unwrap(), Some((trip_id, owner)));
+        assert_eq!(
+            trip_for_address(&core, &address.to_uppercase()).await.unwrap(),
+            Some((trip_id, owner)),
+            "read the way a sender may have typed it"
+        );
+        assert_eq!(trip_for_address(&core, "sasha").await.unwrap(), None, "a handle is not a trip address");
+
+        let mail_id = record_trip_mail(&core, trip_id, mail_in("re_1")).await.unwrap().expect("a new mail");
+        assert_eq!(record_trip_mail(&core, trip_id, mail_in("re_1")).await.unwrap(), None, "a redelivery is a no-op");
+
+        // Porto in December fits nothing about Lisbon in October, and on
+        // its own would start a draft; it came to Lisbon's address, so it
+        // goes on Lisbon.
+        let porto = arrival("stay", "Hotel Ribeira", Some("Porto"), "2026-12-01");
+        let newsletter = Extraction { booking: false, summary: "Newsletter".into(), ..Extraction::default() };
+        let (ids, placement) =
+            record_arrivals(&core, owner, mail_id, vec![porto, newsletter]).await.unwrap();
+        assert_eq!(placement, Some(Placement::Trip(trip_id)));
+        assert_eq!(store.arrival_of(ids[0], owner).unwrap().unwrap().trip_id, Some(trip_id));
+        assert_eq!(store.arrival_of(ids[1], owner).unwrap().unwrap().trip_id, None, "a non-booking names no trip");
+        assert_eq!(store.list_trips(owner).unwrap().len(), 1, "no draft was made for Porto");
+
+        // A trip's mail that booked nothing is placed nowhere, as any other.
+        let other = record_trip_mail(&core, trip_id, mail_in("re_2")).await.unwrap().unwrap();
+        let newsletter = Extraction { booking: false, summary: "Newsletter".into(), ..Extraction::default() };
+        let (_, placement) = record_arrivals(&core, owner, other, vec![newsletter]).await.unwrap();
+        assert_eq!(placement, None);
+    }
+
+    #[tokio::test]
+    async fn the_settler_is_named_for_whoever_asks() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let owner = store.account_for_telegram(1).unwrap();
+        let (masha, stranger) = (store.account_for_telegram(2).unwrap(), store.account_for_telegram(3).unwrap());
+        let trip_id = crate::trips::seed_trip_for_tests(&core, owner, "Lisbon").await.unwrap().trip.id;
+        crate::sharing::share_for_tests(&core, owner, "Lisbon", masha, "Masha").await.unwrap();
+        let id = seed_trip_booking(&store, owner, trip_id, "re_1");
+
+        assert_eq!(settler(&core, owner, id).await.unwrap(), None, "nobody has decided it yet");
+        assert_eq!(ignore_arrival(&core, masha, id).await.unwrap(), Outcome::Done(()));
+        assert_eq!(settler(&core, owner, id).await.unwrap(), Some(Settled { added: false, by: "Masha".into() }));
+        assert_eq!(settler(&core, masha, id).await.unwrap(), Some(Settled { added: false, by: "you".into() }));
+        assert_eq!(settler(&core, stranger, id).await.unwrap(), None, "not on the trip, not told");
+    }
+
+    #[tokio::test]
+    async fn an_added_booking_says_so_and_one_settled_before_pressers_were_kept_names_nobody() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let owner = store.account_for_telegram(1).unwrap();
+        let masha = store.account_for_telegram(2).unwrap();
+        let trip_id = crate::trips::seed_trip_for_tests(&core, owner, "Lisbon").await.unwrap().trip.id;
+        crate::sharing::share_for_tests(&core, owner, "Lisbon", masha, "Masha").await.unwrap();
+
+        let added = seed_trip_booking(&store, owner, trip_id, "re_1");
+        assert!(matches!(add_arrival(&core, masha, added, AddTarget::Matched).await.unwrap(), Outcome::Done(_)));
+        assert_eq!(settler(&core, owner, added).await.unwrap(), Some(Settled { added: true, by: "Masha".into() }));
+
+        // Decided before step 22 recorded who pressed: there is nobody to
+        // name, and a guess would name the wrong person.
+        let old = seed_trip_booking(&store, owner, trip_id, "re_2");
+        store
+            .conn_for_tests()
+            .execute("UPDATE arrivals SET status = 'ignored', decided_at = now() WHERE id = ?", duckdb::params![old])
+            .unwrap();
+        assert_eq!(settler(&core, owner, old).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_late_press_on_a_deleted_trips_booking_names_someone_and_does_not_fail() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let owner = store.account_for_telegram(1).unwrap();
+        let masha = store.account_for_telegram(2).unwrap();
+        let trip_id = crate::trips::seed_trip_for_tests(&core, owner, "Lisbon").await.unwrap().trip.id;
+        crate::sharing::share_for_tests(&core, owner, "Lisbon", masha, "Masha").await.unwrap();
+        let id = seed_trip_booking(&store, owner, trip_id, "re_1");
+        assert_eq!(ignore_arrival(&core, masha, id).await.unwrap(), Outcome::Done(()));
+
+        // The arrival keeps the deleted trip's id, so the trip it names
+        // has nobody on it to read Masha's name from.
+        assert_eq!(store.delete_trip(owner, "Lisbon").unwrap(), crate::store::TripDeleted::Deleted);
+        assert!(store.author_names(trip_id).unwrap().is_empty(), "a trip that is gone has nobody on it");
+        assert_eq!(
+            settler(&core, owner, id).await.unwrap(),
+            Some(Settled { added: false, by: "someone on the trip".into() })
+        );
     }
 
     #[tokio::test]

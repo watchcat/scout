@@ -60,6 +60,9 @@ pub struct Plan {
     pub you_own: bool,
     /// The share link's state, for the owner, while one works.
     pub link: Option<LinkView>,
+    /// The trip's own address, the local part; the page adds the domain.
+    /// `None` on a draft.
+    pub address: Option<String>,
 }
 
 /// Someone on a trip, as one reader sees them.
@@ -119,6 +122,7 @@ impl Plan {
             people: Vec::new(),
             you_own: true,
             link: None,
+            address: None,
         }
     }
 
@@ -146,6 +150,17 @@ impl Plan {
             }
         }
         plan.link = link.as_ref().map(LinkView::of);
+        // Read last and on its own: this is the one read here that may
+        // write, drawing a kept trip's first address, and a draw that
+        // fails costs the trip its address on the page rather than costing
+        // the reader their whole list of trips.
+        plan.address = match store.trip_address(plan.trip.id) {
+            Ok(address) => address,
+            Err(e) => {
+                tracing::warn!(error = %e, trip_id = plan.trip.id, "a trip is served without its address");
+                None
+            }
+        };
         Ok(plan)
     }
 }
@@ -928,6 +943,30 @@ mod tests {
         let added = fado.added.as_ref().unwrap();
         assert_eq!((added.name.as_deref(), added.you, added.via.as_str()), (Some("Masha"), false, "scout"));
         assert!(mine.link.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_kept_trip_carries_its_address_and_a_draft_none() {
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+        assert_eq!(find(&core, account_id, "October").await.unwrap().unwrap().address, None, "a draft");
+        let kept = keep(&core, account_id, "October").await.unwrap().unwrap().address.expect("a kept trip has one");
+        assert!(kept.starts_with("october-"), "{kept}");
+        let listed = list(&core, account_id).await.unwrap();
+        assert_eq!(listed[0].address.as_deref(), Some(kept.as_str()), "the same one, not drawn again");
+    }
+
+    #[tokio::test]
+    async fn a_trip_whose_address_cannot_be_read_is_still_listed() {
+        let (core, _dir, account_id) = core().await;
+        seed_trip_for_tests(&core, account_id, "October").await.unwrap();
+        keep(&core, account_id, "October").await.unwrap().unwrap();
+        // The one way to make the address read fail without touching
+        // anything else the list reads.
+        core.store().conn_for_tests().execute_batch("ALTER TABLE trips DROP COLUMN address").unwrap();
+        let listed = list(&core, account_id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].trip.name.as_str(), listed[0].address.as_deref()), ("October", None));
     }
 
     #[tokio::test]

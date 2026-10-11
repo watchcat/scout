@@ -5940,10 +5940,16 @@ impl Store {
             .optional()?)
     }
 
-    /// Whose file this is: an attachment has no owner of its own, so a
-    /// download has to ask here. By the mail it came with while that
-    /// exists, and by the trip item it joined once the sweep has taken the
-    /// mail — a kept ticket must not become nobody's.
+    /// Whose file this is: an attachment has no owner of its own. By the
+    /// mail it came with while that exists, and by the trip item it joined
+    /// once the sweep has taken the mail — a kept ticket must not become
+    /// nobody's.
+    ///
+    /// A download no longer asks here: one account is too narrow an answer
+    /// once trips are shared, and `can_open_attachment` is what decides.
+    /// Test-only now, because the cleanup tests read ownership through it;
+    /// drop the attribute if a caller outside them appears.
+    #[cfg(test)]
     pub fn attachment_owner(&self, id: i64) -> Result<Option<i64>> {
         let conn = self.conn();
         Ok(conn
@@ -5961,8 +5967,33 @@ impl Store {
             .flatten())
     }
 
-    /// The caller has already proven both ids are theirs (`attachment_owner`
-    /// for the file, the trip for the item); nothing is checked here but
+    /// Whether this account may open the file: its mail is one the account
+    /// reaches (its own, or one sent to the address of a trip it is on), or
+    /// the item it joined is on a trip the account reaches. Unlike
+    /// `attachment_owner`, which names one account and so prefers the
+    /// mail's, this lets an editor open a ticket that came in the owner's
+    /// mail and now sits on the shared trip.
+    ///
+    /// One query, so the answer is read under the one lock; the `IS NOT
+    /// NULL` guards keep a missing mail or item from reaching anything.
+    pub fn can_open_attachment(&self, id: i64, account_id: i64) -> Result<bool> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row(
+            &format!(
+                "SELECT count(*) FROM attachments a
+                 LEFT JOIN inbound_mail m ON m.id = a.mail_id
+                 LEFT JOIN trip_items i ON i.id = a.item_id
+                 LEFT JOIN trips t ON t.id = i.trip_id
+                 WHERE a.id = ? AND ((m.id IS NOT NULL AND {MAIL_REACH}) OR (t.id IS NOT NULL AND {REACHES}))"
+            ),
+            params![id, account_id, account_id, account_id, account_id, account_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The caller has already proven both ids are its to use (the mail's
+    /// arrival for the file, the trip for the item); nothing is checked here but
     /// that the file is still loose. A ticket belongs to the booking it
     /// came with, so the first item to claim it keeps it.
     pub fn attach_to_item(&self, attachment_id: i64, item_id: i64) -> Result<()> {

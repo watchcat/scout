@@ -875,12 +875,15 @@ pub async fn attachment_bytes(core: &Core, mail_id: i64) -> anyhow::Result<Vec<(
     blocking(move || store.attachment_bytes_of(mail_id)).await
 }
 
-/// A file to download: `(filename, mime, bytes)`, or `None` when it is not
-/// this account's or has no bytes to serve.
+/// A file to download: `(filename, mime, bytes)`, or `None` when this
+/// account may not open it or it has no bytes to serve. Anyone on a trip
+/// may open a file that came to the trip's address or sits on one of its
+/// items, as `Store::can_open_attachment` says, not only the account whose
+/// mail it came in.
 pub async fn attachment_for(core: &Core, id: i64, account_id: i64) -> anyhow::Result<Option<(String, String, Vec<u8>)>> {
     let store = core.store();
     blocking(move || {
-        if store.attachment_owner(id)? != Some(account_id) {
+        if !store.can_open_attachment(id, account_id)? {
             return Ok(None);
         }
         Ok(store
@@ -2085,6 +2088,46 @@ mod tests {
         assert_eq!(attachment_for(&core, ticket, a).await.unwrap(), Some(("ticket.pdf".to_string(), "application/pdf".to_string(), b"%PDF".to_vec())));
         let b = store.account_for_telegram(2).unwrap();
         assert_eq!(attachment_for(&core, ticket, b).await.unwrap(), None, "not theirs");
+    }
+
+    #[tokio::test]
+    async fn everyone_on_a_trip_opens_its_files_and_a_stranger_does_not() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let owner = store.account_for_telegram(1).unwrap();
+        let (editor, stranger) = (store.account_for_telegram(2).unwrap(), store.account_for_telegram(3).unwrap());
+        let trip = store.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        let item = store.add_flight(trip.id, "AMS", "LIS", "2026-10-12").unwrap().items[0].id;
+        crate::sharing::share_for_tests(&core, owner, "Lisbon", editor, "Masha").await.unwrap();
+
+        // A ticket from the owner's own mail is the owner's until it joins
+        // the shared trip's item, and then it is the trip's.
+        let own_mail = seed_mail(&core, owner, "re_1").await;
+        let ticket = store.insert_attachment(own_mail, "ticket.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        assert_eq!(attachment_for(&core, ticket, editor).await.unwrap(), None, "loose in the owner's own mail");
+        store.attach_to_item(ticket, item).unwrap();
+        assert_eq!(
+            attachment_for(&core, ticket, editor).await.unwrap().map(|(f, _, b)| (f, b)),
+            Some(("ticket.pdf".to_string(), b"%PDF".to_vec())),
+            "on an item of a trip shared with the editor"
+        );
+
+        // A file of mail sent to the trip's address is the trip's while it
+        // is still loose.
+        let trip_mail = store
+            .insert_trip_mail(trip.id, owner, "re_2", "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .unwrap()
+            .unwrap();
+        let voucher = store.insert_attachment(trip_mail, "voucher.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
+        assert_eq!(
+            attachment_for(&core, voucher, editor).await.unwrap().map(|(f, _, b)| (f, b)),
+            Some(("voucher.pdf".to_string(), b"%PDF".to_vec())),
+            "loose in mail to the trip's address"
+        );
+
+        for file in [ticket, voucher] {
+            assert_eq!(attachment_for(&core, file, stranger).await.unwrap(), None, "a stranger opens neither");
+        }
     }
 
     #[tokio::test]

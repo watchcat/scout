@@ -208,11 +208,19 @@ impl Attachment {
     }
 }
 
+/// How many of a mail's addresses are looked up. The `To:` header is a
+/// stranger's to fill, and every request arrives from Resend's addresses,
+/// so the per-address limiter cannot stop one mail from listing thousands
+/// of made-up addresses at a database query each. A booking mail names a
+/// handful of recipients at most, so the ones past this are not looked at.
+const MAX_ADDRESSES_TRIED: usize = 16;
+
 /// The local part of every address whose domain is ours, as written and
 /// in order, each once: `account_for_handle` and `trip_for_address` do the
 /// normalising, so a capital here is their business, not a reason to
-/// refuse. Every one is kept, not only the first, because the first may
-/// be a mistyped handle on a mail whose other recipient is a trip.
+/// refuse. Every one is kept, up to `MAX_ADDRESSES_TRIED`, not only the
+/// first, because the first may be a mistyped handle on a mail whose other
+/// recipient is a trip.
 fn our_local_parts(addresses: impl IntoIterator<Item = String>, domain: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     // `sasha+hotel@…` is handed on whole; `normalise_handle` refuses the
@@ -226,6 +234,7 @@ fn our_local_parts(addresses: impl IntoIterator<Item = String>, domain: &str) ->
         // `to` and `received_for` usually repeat each other, and the same
         // mailbox in another case is still the same mailbox.
         .filter(|local| seen.insert(local.to_ascii_lowercase()))
+        .take(MAX_ADDRESSES_TRIED)
         .collect()
 }
 
@@ -550,6 +559,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unknown_address_listed_before_a_known_one_of_its_kind_does_not_hide_it() {
+        let (app, core, _dir, owner) = app_with_sasha().await;
+        let (trip_id, address) = kept_lisbon(&core, owner).await;
+
+        let handles = received_payload_to("re_1", &["sasa@goodscout.fyi".into(), "sasha@goodscout.fyi".into()]);
+        assert_eq!(post_signed(&app, SECRET, &handles).await.status(), 200);
+        let work = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!((work[0].account_id, work[0].trip_id), (owner, None));
+
+        let trips = received_payload_to("re_2", &["nobody-xxxxx@goodscout.fyi".into(), format!("{address}@goodscout.fyi")]);
+        assert_eq!(post_signed(&app, SECRET, &trips).await.status(), 200);
+        let work = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert_eq!(work.len(), 2);
+        assert!(work.iter().any(|w| w.trip_id == Some(trip_id)));
+    }
+
+    #[tokio::test]
+    async fn an_address_past_the_cap_is_never_tried() {
+        let (app, core, _dir) = inbound_app(SECRET).await;
+        let owner = admitted(&core, "111").await;
+        let (_, address) = kept_lisbon(&core, owner).await;
+        let mut to: Vec<String> = (0..MAX_ADDRESSES_TRIED).map(|i| format!("nobody{i}@goodscout.fyi")).collect();
+        to.push(format!("{address}@goodscout.fyi"));
+        let body = received_payload_to("re_1", &to);
+        assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200);
+        assert!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().is_empty(), "the 17th address was not read");
+    }
+
+    #[tokio::test]
     async fn a_handle_alone_is_stored_for_the_account_without_a_trip() {
         let (app, core, _dir, owner) = app_with_sasha().await;
         kept_lisbon(&core, owner).await;
@@ -862,6 +901,10 @@ mod tests {
         assert_eq!(ours(&["x@elsewhere.example", "sasha@goodscout.fyi"]), ["sasha"]);
         assert_eq!(ours(&["sasha@goodscout.fyi", "lisbon-k3x9q@goodscout.fyi"]), ["sasha", "lisbon-k3x9q"]);
         assert_eq!(ours(&["a@goodscout.fyi", "A@goodscout.fyi", "a@goodscout.fyi"]), ["a"], "each once");
+        let many: Vec<String> = (0..MAX_ADDRESSES_TRIED + 5).map(|i| format!("u{i}@goodscout.fyi")).collect();
+        let kept = our_local_parts(many, "goodscout.fyi");
+        assert_eq!(kept.len(), MAX_ADDRESSES_TRIED, "the rest are not looked at");
+        assert_eq!(kept[0], "u0");
         assert!(ours(&["x@elsewhere.example"]).is_empty());
         assert!(ours(&["sasha@goodscout.fyi.evil.example"]).is_empty(), "a suffix is not our domain");
         assert!(ours(&["nobody"]).is_empty());

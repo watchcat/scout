@@ -270,22 +270,43 @@ async fn receive(State(state): State<InboundState>, headers: HeaderMap, body: By
     let Some(handle) = our_handle(data.to.iter().chain(data.received_for.iter()).cloned(), &state.domain) else {
         return StatusCode::OK.into_response();
     };
-    let account = match inbox::account_for_handle(&state.core, &handle).await {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            // The handle and nothing else: who wrote to it and what about
-            // is the mail's business, and this line is for spotting a
-            // guessed address, not reading one. Bounded, because the
-            // local part is whatever the sender typed.
-            let shown: String = handle.chars().take(64).collect();
-            tracing::info!(handle = shown, "mail for an address nobody holds");
-            return StatusCode::OK.into_response();
-        }
+    let to = match inbox::account_for_handle(&state.core, &handle).await {
+        Ok(Some(a)) => Recipient::Account(a),
+        // A handle is only `a-z0-9.` and a trip's address always has a
+        // dash, so the two never name the same mailbox and the order of
+        // the lookups does not matter.
+        Ok(None) => match inbox::trip_for_address(&state.core, &handle).await {
+            Ok(Some((trip_id, _owner))) => Recipient::Trip(trip_id),
+            Ok(None) => {
+                // The handle and nothing else: who wrote to it and what about
+                // is the mail's business, and this line is for spotting a
+                // guessed address, not reading one. Bounded, because the
+                // local part is whatever the sender typed.
+                let shown: String = handle.chars().take(64).collect();
+                tracing::info!(handle = shown, "mail for an address nobody holds");
+                return StatusCode::OK.into_response();
+            }
+            Err(err) => {
+                tracing::error!(%err, "looking up a trip address");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
         Err(err) => {
             tracing::error!(%err, "looking up a handle");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    store(&state, to, data).await
+}
+
+/// Whose address a mail came to: a person's own, or a trip's.
+enum Recipient {
+    Account(i64),
+    Trip(i64),
+}
+
+/// Puts the mail on file for whoever it was addressed to.
+async fn store(state: &InboundState, to: Recipient, data: Data) -> Response {
     // No body yet: the webhook does not carry one, and the worker fetches
     // it through the API when it picks the row up.
     //
@@ -305,9 +326,13 @@ async fn receive(State(state): State<InboundState>, headers: HeaderMap, body: By
         truncated: false,
         parts: data.attachments.into_iter().filter_map(Attachment::stored).collect(),
     };
-    match inbox::record_mail(&state.core, account, mail).await {
-        // `None` is a redelivery already on file; 200 either way, or
-        // Resend keeps sending it.
+    let recorded = match to {
+        Recipient::Account(account) => inbox::record_mail(&state.core, account, mail).await,
+        Recipient::Trip(trip) => inbox::record_trip_mail(&state.core, trip, mail).await,
+    };
+    match recorded {
+        // `None` is a redelivery already on file, or a trip deleted since
+        // the lookup; 200 either way, or Resend keeps sending it.
         Ok(_) => StatusCode::OK.into_response(),
         Err(err) => {
             tracing::error!(%err, "recording an inbound mail");
@@ -439,6 +464,29 @@ mod tests {
         let other = received_payload("re_3", "sasha@elsewhere.example");
         assert_eq!(post_signed(&app, SECRET, &other).await.status(), 200);
         assert_eq!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().len(), 1, "another domain is not ours");
+    }
+
+    #[tokio::test]
+    async fn mail_to_a_trips_address_is_stored_for_that_trip() {
+        let (app, core, _dir) = inbound_app(SECRET).await;
+        let owner = admitted(&core, "111").await;
+        scout_core::trips::seed_trip_for_tests(&core, owner, "Lisbon").await.unwrap();
+        scout_core::trips::keep(&core, owner, "Lisbon").await.unwrap();
+        let address = scout_core::trips::find(&core, owner, "Lisbon").await.unwrap().unwrap().address.unwrap();
+        let (trip_id, _) = scout_core::inbox::trip_for_address(&core, &address).await.unwrap().unwrap();
+
+        let body = received_payload("re_1", &format!("{address}@goodscout.fyi"));
+        assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200);
+        let work = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].account_id, owner);
+        assert_eq!(work[0].trip_id, Some(trip_id));
+
+        // The same shape with a suffix nobody was given is an unknown
+        // address like any other: 200, so Resend does not retry, and nothing stored.
+        let stranger = received_payload("re_2", "nobody-xxxxx@goodscout.fyi");
+        assert_eq!(post_signed(&app, SECRET, &stranger).await.status(), 200);
+        assert_eq!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().len(), 1, "unknown trip address dropped");
     }
 
     #[tokio::test]

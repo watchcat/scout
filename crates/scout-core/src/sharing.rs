@@ -86,6 +86,11 @@ fn owned_trip(store: &crate::store::Store, account_id: i64, trip: &str) -> anyho
     if !store.is_owner(account_id, id)? {
         return Ok(Err(AddressChoice::NotOwner));
     }
+    // A draft has no address to change, so the check answers as the set
+    // will; the page never offers the form on one anyway.
+    if store.trip_address(id)?.is_none() {
+        return Ok(Err(AddressChoice::NotFound));
+    }
     Ok(Ok(id))
 }
 

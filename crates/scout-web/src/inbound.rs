@@ -501,7 +501,6 @@ mod tests {
         assert_eq!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().len(), 1, "another domain is not ours");
     }
 
-    /// A kept Lisbon trip for this account: its id and its address.
     #[tokio::test]
     async fn a_chosen_trip_address_without_a_dash_reaches_the_trip() {
         let (app, core, _dir, owner) = app_with_sasha().await;
@@ -521,6 +520,7 @@ mod tests {
         assert!(work.iter().all(|w| w.trip_id == Some(trip_id)));
     }
 
+    /// A kept Lisbon trip for this account: its id and its address.
     async fn kept_lisbon(core: &scout_core::core::Core, owner: i64) -> (i64, String) {
         scout_core::trips::seed_trip_for_tests(core, owner, "Lisbon").await.unwrap();
         scout_core::trips::keep(core, owner, "Lisbon").await.unwrap();

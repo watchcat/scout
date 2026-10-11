@@ -4827,7 +4827,9 @@ fn draw_address(conn: &Connection, trip_id: i64, name: &str) -> Result<String> {
     let slug = crate::inbox::trip_address_slug(name);
     for _ in 0..10 {
         let candidate = format!("{slug}-{}", address_tail());
-        if address_free_within(conn, trip_id, &candidate)? {
+        // The rules an owner's choice must pass, so a draw can never land
+        // on a reserved name (`no` + `reply`) that lookups then refuse.
+        if crate::inbox::check_trip_address(&candidate).is_ok() && address_free_within(conn, trip_id, &candidate)? {
             conn.execute("UPDATE trips SET address = ? WHERE id = ?", params![candidate, trip_id])?;
             return Ok(candidate);
         }

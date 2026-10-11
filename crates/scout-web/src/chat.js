@@ -2870,7 +2870,7 @@ function start() {
     if (!shouldPollChecks(trip, document.hidden)) return
     checkTimer = setTimeout(async () => {
       checkTimer = null
-      const busy = tripChoicePending || tripDetail.querySelector(':popover-open, .item-note-editor')
+      const busy = tripChoicePending || tripDetail.querySelector(':popover-open, .item-note-editor, .people-address-form')
       if (!busy) await loadTrips().catch(() => {})
       watchChecks()
     }, CHECK_POLL_MS)
@@ -3558,7 +3558,7 @@ function start() {
         if (res.ok) {
           tripsLoaded = false
           await loadTrips()
-          showTripToast(`The trip email is now ${answer.address}@${inbox.domain}.`)
+          showTripToast(`The trip email is now ${answer.address ?? raw.trim().toLowerCase()}@${inbox.domain}.`)
           return
         }
         say(typeof answer.reason === 'string' ? answer.reason : 'That did not work. Try again.', true)

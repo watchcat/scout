@@ -6871,6 +6871,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "wiremock",
 ]
 

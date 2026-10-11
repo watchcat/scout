@@ -3695,11 +3695,18 @@ impl Store {
     #[cfg(test)]
     pub fn trip_address(&self, trip_id: i64) -> Result<Option<String>> {
         let conn = self.conn();
-        let (address, kept, name): (Option<String>, bool, String) = conn.query_row(
-            "SELECT address, kept, name FROM trips WHERE id = ?",
-            params![trip_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
+        // A trip that is not there has no address, rather than being a
+        // failure: it may have been deleted since the caller last looked.
+        let Some((address, kept, name)): Option<(Option<String>, bool, String)> = conn
+            .query_row(
+                "SELECT address, kept, name FROM trips WHERE id = ?",
+                params![trip_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
         match (address, kept) {
             (Some(address), _) => Ok(Some(address)),
             (None, false) => Ok(None),
@@ -3708,14 +3715,26 @@ impl Store {
     }
 
     /// A new address in place of the old, for the owner; the old one then
-    /// belongs to nobody. `None` for anyone else. Test-only, as `trip_address`.
+    /// belongs to nobody. `None` for anyone else, and for a draft. Test-only, as
+    /// `trip_address`.
     #[cfg(test)]
     pub fn new_trip_address(&self, account_id: i64, trip_id: i64) -> Result<Option<String>> {
         if !self.is_owner(account_id, trip_id)? {
             return Ok(None);
         }
         let conn = self.conn();
-        let name: String = conn.query_row("SELECT name FROM trips WHERE id = ?", params![trip_id], |r| r.get(0))?;
+        // Gone since the owner check, or a draft: either way there is
+        // nothing to replace, and a draft is not given an address here
+        // any more than `trip_address` gives it one.
+        let Some((kept, name)): Option<(bool, String)> = conn
+            .query_row("SELECT kept, name FROM trips WHERE id = ?", params![trip_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if !kept {
+            return Ok(None);
+        }
         draw_address(&conn, trip_id, &name).map(Some)
     }
 
@@ -4749,9 +4768,9 @@ fn address_tail() -> String {
 }
 
 /// Draws a fresh address for the trip and writes it, under the lock the
-/// caller holds. Ten tries at a tail no other trip has; the eleventh
-/// collision in a space of sixty million is a bug, said as one. Test-only,
-/// as `Store::trip_address`.
+/// caller holds. Ten tries at a tail no other trip has; ten collisions in
+/// a row in a space of sixty million is a bug, said as one. Test-only, as
+/// `Store::trip_address`.
 #[cfg(test)]
 fn draw_address(conn: &Connection, trip_id: i64, name: &str) -> Result<String> {
     let slug = crate::inbox::trip_address_slug(name);
@@ -9748,8 +9767,12 @@ CREATE TABLE conversations (
         let owner = s.account_for_telegram(1).unwrap();
         let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
         assert_eq!(s.trip_address(trip.id).unwrap(), None, "a draft has none");
+        assert_eq!(s.new_trip_address(owner, trip.id).unwrap(), None, "and is not given one by a replace");
+        assert_eq!(s.trip_address(trip.id).unwrap(), None, "still none");
+        assert_eq!(s.trip_address(trip.id + 1000).unwrap(), None, "a trip that is not there has none");
         s.keep_trip(owner, "Lisbon").unwrap();
         let first = s.trip_address(trip.id).unwrap().unwrap();
+        assert!(first["lisbon-".len()..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()), "{first}");
         assert!(first.starts_with("lisbon-") && first.len() == "lisbon-".len() + 5, "{first}");
         assert_eq!(s.trip_address(trip.id).unwrap().as_deref(), Some(first.as_str()), "the same one next time");
         assert_eq!(s.trip_for_address(&first).unwrap(), Some((trip.id, owner)));

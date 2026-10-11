@@ -42,14 +42,35 @@ pub fn normalise_handle(raw: &str) -> Result<String, String> {
     Ok(h)
 }
 
-/// The readable half of a trip's address: the name lowercased, anything
-/// outside `a-z0-9` turned into one dash, trimmed, cut to 20 characters.
-/// "trip" when nothing is left — a name in another script has no letters
-/// an address can carry.
+/// The readable half of a trip's address: the name lowercased, accents
+/// dropped, anything outside `a-z0-9` turned into one dash, trimmed, cut
+/// to 20 characters. "trip" when nothing is left — a name in another
+/// script has no letters an address can carry.
+///
+/// Accents are dropped rather than treated as separators because the
+/// address is read out to hotels and typed by people: "zurich" is what
+/// they will write, and "z-rich" would be a puzzle.
 pub fn trip_address_slug(name: &str) -> String {
+    use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
     let mut slug = String::new();
-    for c in name.trim().to_lowercase().chars() {
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+    // Lowercased first so the table below needs no capitals, then taken
+    // apart so "ü" arrives as "u" and a mark, and the mark is skipped.
+    for c in name.trim().to_lowercase().nfd().filter(|c| !is_combining_mark(*c)) {
+        // Letters that are not an accent on another letter, so they do not
+        // come apart; the usual transliterations stand in for them.
+        let spelled = match c {
+            'ø' => "o",
+            'æ' => "ae",
+            'œ' => "oe",
+            'ß' => "ss",
+            'ł' => "l",
+            'đ' => "d",
+            'þ' => "th",
+            _ => "",
+        };
+        if !spelled.is_empty() {
+            slug.push_str(spelled);
+        } else if c.is_ascii_lowercase() || c.is_ascii_digit() {
             slug.push(c);
         } else if !slug.ends_with('-') && !slug.is_empty() {
             slug.push('-');
@@ -64,6 +85,10 @@ pub fn trip_address_slug(name: &str) -> String {
 /// A local part read as a trip address: `a-z0-9` and dashes, at least one
 /// dash, none at either end. A handle never has a dash, so the two kinds
 /// of address can be told apart by shape alone.
+///
+/// The cap is 40 rather than the 26 a generated address reaches (20 of
+/// slug, a dash, 5 of tail): it only keeps absurd input out, and room above
+/// 26 means an address issued under a longer slug rule still reads.
 pub fn normalise_trip_address(raw: &str) -> Option<String> {
     let a = raw.trim().to_ascii_lowercase();
     let ok = a.contains('-')
@@ -1621,6 +1646,14 @@ mod tests {
         assert_eq!(trip_address_slug("A very long trip name that goes on"), "a-very-long-trip-nam");
         assert_eq!(trip_address_slug("Москва"), "trip");
         assert_eq!(trip_address_slug("---"), "trip");
+        assert_eq!(trip_address_slug("Zürich"), "zurich");
+        assert_eq!(trip_address_slug("São Paulo"), "sao-paulo");
+        assert_eq!(trip_address_slug("İstanbul"), "istanbul");
+        assert_eq!(trip_address_slug("København"), "kobenhavn");
+        assert_eq!(trip_address_slug("Ålesund"), "alesund");
+        assert_eq!(trip_address_slug("Café Crawl"), "cafe-crawl");
+        assert_eq!(trip_address_slug("abcdefghijklmnopqrs tuv"), "abcdefghijklmnopqrs", "a cut that lands on a dash");
+        assert_eq!(trip_address_slug("2026"), "2026");
         assert_eq!(normalise_trip_address(" Hong-Kong-SEP-4f9qa "), Some("hong-kong-sep-4f9qa".into()));
         assert_eq!(normalise_trip_address("sasha"), None, "no dash: a handle's shape, not a trip's");
         assert_eq!(normalise_trip_address("a-b.c"), None);

@@ -5,11 +5,15 @@
 //! MIME part — never the body; the worker fetches that later through the
 //! API. So the only thing this route decides is whether the mail is
 //! somebody's: the signature says Resend sent it, the `to` address says
-//! whose it is, and one mail row and its parts go into the store. The
-//! parts are kept because this is the only place they are known to
-//! arrive; see `Attachment`. Everything else is 200 and nothing,
-//! because a 4xx makes Resend retry, and a retry cannot make an unknown
-//! address known.
+//! whose it is, and one mail row and its parts go into the store. That
+//! address is either a person's own handle, and the row is theirs, or a
+//! kept trip's address, and the row is the trip owner's and carries the
+//! trip. A mail that names both goes to the trip: its address is the
+//! more specific intent, and the trip's mail reaches the person too when
+//! they are on it. The parts are kept because this is the only place
+//! they are known to arrive; see `Attachment`. Everything else is 200
+//! and nothing, because a 4xx makes Resend retry, and a retry cannot
+//! make an unknown address known.
 
 use crate::ratelimit::Limiter;
 use crate::routes::auth::client_bucket;
@@ -204,16 +208,44 @@ impl Attachment {
     }
 }
 
-/// The local part of the first address whose domain is ours, as written:
-/// `account_for_handle` does the normalising, so a capital here is its
-/// business, not a reason to refuse.
-fn our_handle(addresses: impl IntoIterator<Item = String>, domain: &str) -> Option<String> {
+/// The local part of every address whose domain is ours, as written and
+/// in order, each once: `account_for_handle` and `trip_for_address` do the
+/// normalising, so a capital here is their business, not a reason to
+/// refuse. Every one is kept, not only the first, because the first may
+/// be a mistyped handle on a mail whose other recipient is a trip.
+fn our_local_parts(addresses: impl IntoIterator<Item = String>, domain: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     // `sasha+hotel@…` is handed on whole; `normalise_handle` refuses the
     // `+`, so plus-addressing is an unknown handle rather than a feature.
-    addresses.into_iter().find_map(|raw| {
-        let (local, host) = bare_address(&raw).rsplit_once('@')?;
-        (host.eq_ignore_ascii_case(domain) && !local.is_empty()).then(|| local.to_string())
-    })
+    addresses
+        .into_iter()
+        .filter_map(|raw| {
+            let (local, host) = bare_address(&raw).rsplit_once('@')?;
+            (host.eq_ignore_ascii_case(domain) && !local.is_empty()).then(|| local.to_string())
+        })
+        // `to` and `received_for` usually repeat each other, and the same
+        // mailbox in another case is still the same mailbox.
+        .filter(|local| seen.insert(local.to_ascii_lowercase()))
+        .collect()
+}
+
+/// Who, if anyone, one of these local parts belongs to. A trip's address
+/// beats a handle, and the order within each kind is the order given.
+/// Which lookup a part gets is decided by its shape, since a handle never
+/// has a dash and a trip address always does, so the database is not asked
+/// about a shape that cannot match.
+async fn recipient_of(core: &Core, locals: &[String]) -> anyhow::Result<Option<Recipient>> {
+    for local in locals.iter().filter(|l| l.contains('-')) {
+        if let Some((trip_id, _owner)) = inbox::trip_for_address(core, local).await? {
+            return Ok(Some(Recipient::Trip(trip_id)));
+        }
+    }
+    for local in locals.iter().filter(|l| !l.contains('-')) {
+        if let Some(account) = inbox::account_for_handle(core, local).await? {
+            return Ok(Some(Recipient::Account(account)));
+        }
+    }
+    Ok(None)
 }
 
 async fn receive(State(state): State<InboundState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -267,32 +299,23 @@ async fn receive(State(state): State<InboundState>, headers: HeaderMap, body: By
     };
     // `to` first, then `received_for`: a mail forwarded to us by someone
     // else's rule has our address only in the latter.
-    let Some(handle) = our_handle(data.to.iter().chain(data.received_for.iter()).cloned(), &state.domain) else {
+    let locals = our_local_parts(data.to.iter().chain(data.received_for.iter()).cloned(), &state.domain);
+    if locals.is_empty() {
         return StatusCode::OK.into_response();
-    };
-    let to = match inbox::account_for_handle(&state.core, &handle).await {
-        Ok(Some(a)) => Recipient::Account(a),
-        // A handle is only `a-z0-9.` and a trip's address always has a
-        // dash, so the two never name the same mailbox and the order of
-        // the lookups does not matter.
-        Ok(None) => match inbox::trip_for_address(&state.core, &handle).await {
-            Ok(Some((trip_id, _owner))) => Recipient::Trip(trip_id),
-            Ok(None) => {
-                // The handle and nothing else: who wrote to it and what about
-                // is the mail's business, and this line is for spotting a
-                // guessed address, not reading one. Bounded, because the
-                // local part is whatever the sender typed.
-                let shown: String = handle.chars().take(64).collect();
-                tracing::info!(handle = shown, "mail for an address nobody holds");
-                return StatusCode::OK.into_response();
-            }
-            Err(err) => {
-                tracing::error!(%err, "looking up a trip address");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        },
+    }
+    let to = match recipient_of(&state.core, &locals).await {
+        Ok(Some(to)) => to,
+        Ok(None) => {
+            // The addresses and nothing else: who wrote to them and what
+            // about is the mail's business, and this line is for spotting
+            // a guessed address, not reading one. Bounded, because the
+            // local part is whatever the sender typed.
+            let shown: String = locals[0].chars().take(64).collect();
+            tracing::info!(address = shown, "mail for an address nobody holds");
+            return StatusCode::OK.into_response();
+        }
         Err(err) => {
-            tracing::error!(%err, "looking up a handle");
+            tracing::error!(%err, "looking up a recipient");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -466,14 +489,27 @@ mod tests {
         assert_eq!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().len(), 1, "another domain is not ours");
     }
 
+    /// A kept Lisbon trip for this account: its id and its address.
+    async fn kept_lisbon(core: &scout_core::core::Core, owner: i64) -> (i64, String) {
+        scout_core::trips::seed_trip_for_tests(core, owner, "Lisbon").await.unwrap();
+        scout_core::trips::keep(core, owner, "Lisbon").await.unwrap();
+        let plan = scout_core::trips::find(core, owner, "Lisbon").await.unwrap().unwrap();
+        (plan.trip.id, plan.address.unwrap())
+    }
+
+    /// A payload addressed to all of these at once.
+    fn received_payload_to(email_id: &str, to: &[String]) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&received_payload(email_id, "x@goodscout.fyi")).unwrap();
+        v["data"]["to"] = serde_json::json!(to);
+        v["data"]["received_for"] = serde_json::json!(to);
+        v.to_string()
+    }
+
     #[tokio::test]
     async fn mail_to_a_trips_address_is_stored_for_that_trip() {
         let (app, core, _dir) = inbound_app(SECRET).await;
         let owner = admitted(&core, "111").await;
-        scout_core::trips::seed_trip_for_tests(&core, owner, "Lisbon").await.unwrap();
-        scout_core::trips::keep(&core, owner, "Lisbon").await.unwrap();
-        let address = scout_core::trips::find(&core, owner, "Lisbon").await.unwrap().unwrap().address.unwrap();
-        let (trip_id, _) = scout_core::inbox::trip_for_address(&core, &address).await.unwrap().unwrap();
+        let (trip_id, address) = kept_lisbon(&core, owner).await;
 
         let body = received_payload("re_1", &format!("{address}@goodscout.fyi"));
         assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200);
@@ -482,11 +518,47 @@ mod tests {
         assert_eq!(work[0].account_id, owner);
         assert_eq!(work[0].trip_id, Some(trip_id));
 
+        assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200, "a redelivery");
+        assert_eq!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().len(), 1, "stored once");
+
         // The same shape with a suffix nobody was given is an unknown
         // address like any other: 200, so Resend does not retry, and nothing stored.
         let stranger = received_payload("re_2", "nobody-xxxxx@goodscout.fyi");
         assert_eq!(post_signed(&app, SECRET, &stranger).await.status(), 200);
         assert_eq!(scout_core::inbox::mail_to_work(&core, 10).await.unwrap().len(), 1, "unknown trip address dropped");
+    }
+
+    #[tokio::test]
+    async fn a_trip_address_wins_over_a_handle_and_over_an_unknown_one_listed_first() {
+        let (app, core, _dir, owner) = app_with_sasha().await;
+        let (trip_id, address) = kept_lisbon(&core, owner).await;
+        let trip = format!("{address}@goodscout.fyi");
+
+        // Both named, the handle first: the trip still gets it.
+        let both = received_payload_to("re_1", &["sasha@goodscout.fyi".into(), trip.clone()]);
+        assert_eq!(post_signed(&app, SECRET, &both).await.status(), 200);
+        let work = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!((work[0].account_id, work[0].trip_id), (owner, Some(trip_id)));
+
+        // A mistyped handle ahead of the trip does not lose the mail.
+        let typo = received_payload_to("re_2", &["sasa@goodscout.fyi".into(), trip]);
+        assert_eq!(post_signed(&app, SECRET, &typo).await.status(), 200);
+        let work = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert_eq!(work.len(), 2);
+        assert!(work.iter().all(|w| w.trip_id == Some(trip_id)));
+    }
+
+    #[tokio::test]
+    async fn a_handle_alone_is_stored_for_the_account_without_a_trip() {
+        let (app, core, _dir, owner) = app_with_sasha().await;
+        kept_lisbon(&core, owner).await;
+        // An unknown trip-shaped address beside the handle changes nothing.
+        let body = received_payload_to("re_1", &["nobody-xxxxx@goodscout.fyi".into(), "sasha@goodscout.fyi".into()]);
+        assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200);
+        let work = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!((work[0].account_id, work[0].trip_id), (owner, None));
     }
 
     #[tokio::test]
@@ -781,16 +853,18 @@ mod tests {
     }
 
     #[test]
-    fn the_handle_is_the_local_part_of_the_first_address_on_our_domain() {
+    fn the_local_parts_are_those_of_every_address_on_our_domain_in_order_once_each() {
         let ours = |addrs: &[&str]| {
-            our_handle(addrs.iter().map(|s| s.to_string()), "goodscout.fyi")
+            our_local_parts(addrs.iter().map(|s| s.to_string()), "goodscout.fyi")
         };
-        assert_eq!(ours(&["sasha@goodscout.fyi"]).as_deref(), Some("sasha"));
-        assert_eq!(ours(&["Sasha <SASHA@GoodScout.FYI>"]).as_deref(), Some("SASHA"));
-        assert_eq!(ours(&["x@elsewhere.example", "sasha@goodscout.fyi"]).as_deref(), Some("sasha"));
-        assert_eq!(ours(&["x@elsewhere.example"]), None);
-        assert_eq!(ours(&["sasha@goodscout.fyi.evil.example"]), None, "a suffix is not our domain");
-        assert_eq!(ours(&["nobody"]), None);
-        assert_eq!(ours(&[]), None);
+        assert_eq!(ours(&["sasha@goodscout.fyi"]), ["sasha"]);
+        assert_eq!(ours(&["Sasha <SASHA@GoodScout.FYI>"]), ["SASHA"]);
+        assert_eq!(ours(&["x@elsewhere.example", "sasha@goodscout.fyi"]), ["sasha"]);
+        assert_eq!(ours(&["sasha@goodscout.fyi", "lisbon-k3x9q@goodscout.fyi"]), ["sasha", "lisbon-k3x9q"]);
+        assert_eq!(ours(&["a@goodscout.fyi", "A@goodscout.fyi", "a@goodscout.fyi"]), ["a"], "each once");
+        assert!(ours(&["x@elsewhere.example"]).is_empty());
+        assert!(ours(&["sasha@goodscout.fyi.evil.example"]).is_empty(), "a suffix is not our domain");
+        assert!(ours(&["nobody"]).is_empty());
+        assert!(ours(&[]).is_empty());
     }
 }

@@ -1533,8 +1533,13 @@ CREATE TABLE IF NOT EXISTS trip_links (
 "#;
 
 /// A trip's own address, and its mail: where it came to, who settled its
-/// bookings, who it was forwarded to. Nullable columns and a new table,
-/// as step 21.
+/// bookings, who it was forwarded to. Every new column is nullable and
+/// added last — see `STEP_19_ITEM_COORDS` for the step that tried to
+/// constrain a column on a table with rows. The table is already there on
+/// any database `MIGRATIONS` has run on, which is every one, for the reason
+/// `STEP_21_SHARING` and `STEP_18_MAIL_PARTS` give; what the step earns is
+/// the version bump and the backup that comes with it, and it still has to
+/// build the table right.
 const STEP_22_TRIP_ADDRESS: &str = r#"
 ALTER TABLE trips ADD COLUMN IF NOT EXISTS address TEXT;
 ALTER TABLE inbound_mail ADD COLUMN IF NOT EXISTS trip_id BIGINT;
@@ -9929,7 +9934,10 @@ CREATE TABLE conversations (
 
     /// A database at 20 with a trip and an item in it. Built from
     /// `MIGRATIONS` and stripped of everything step 21 adds, for the reason
-    /// `version_eighteen_db_with_an_item` gives.
+    /// `version_eighteen_db_with_an_item` gives. It drops step 22's
+    /// `trips.address` too: left in, it would sit before `owner_name`, which
+    /// step 21 appends, and the shape comparison would see the two columns
+    /// in the wrong order.
     fn version_twenty_db_with_an_item() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v20.duckdb");
@@ -9998,8 +10006,47 @@ CREATE TABLE conversations (
         let s = Store::open(&path).unwrap();
         assert_eq!(s.schema_version().unwrap(), 22);
         let (fresh, _d) = test_store();
-        for table in ["trips", "inbound_mail", "arrivals", "mail_forwards"] {
+        // Not `mail_forwards`: `Store::open` runs `MIGRATIONS` before the
+        // steps, so the table is there whatever step 22 says, and comparing
+        // it would set the DDL against itself. The test below runs the step
+        // on its own.
+        for table in ["trips", "inbound_mail", "arrivals"] {
             assert_eq!(shape(&fresh.conn(), table), shape(&s.conn(), table), "{table}");
+        }
+        let conn = s.conn();
+        let address: Option<String> = conn.query_row("SELECT address FROM trips WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let trip_id: Option<i64> = conn.query_row("SELECT trip_id FROM inbound_mail WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let settled_by: Option<i64> = conn.query_row("SELECT settled_by FROM arrivals WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!((address, trip_id, settled_by), (None, None, None), "rows from before the step carry NULLs");
+    }
+
+    #[test]
+    fn step_22_by_itself_builds_what_a_fresh_database_has() {
+        // `Store::open` runs `MIGRATIONS` before any step, so opening the
+        // fixture would hide a step whose DDL had drifted — see
+        // `the_step_that_adds_mail_parts_builds_the_table_a_fresh_database_has`.
+        // Run the step alone, on a raw connection to the stripped fixture.
+        let (_dir, path) = version_twenty_one_db();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(STEP_22_TRIP_ADDRESS).unwrap();
+        let (fresh, _d) = test_store();
+        for table in ["trips", "inbound_mail", "arrivals", "mail_forwards"] {
+            assert_eq!(shape(&fresh.conn(), table), shape(&conn, table), "{table}");
+        }
+    }
+
+    #[test]
+    fn steps_21_and_22_by_themselves_build_the_sharing_tables_a_fresh_database_has() {
+        // The same gap as above, for step 21's two tables: run the steps on
+        // a raw connection, since opening the store would create the tables
+        // from `MIGRATIONS` first.
+        let (_dir, path) = version_twenty_db_with_an_item();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(STEP_21_SHARING).unwrap();
+        conn.execute_batch(STEP_22_TRIP_ADDRESS).unwrap();
+        let (fresh, _d) = test_store();
+        for table in ["trip_people", "trip_links"] {
+            assert_eq!(shape(&fresh.conn(), table), shape(&conn, table), "{table}");
         }
     }
 
@@ -10668,7 +10715,10 @@ CREATE TABLE messages (
     /// A database in the shape step 16 left it: `arrivals` without the
     /// three columns step 17 adds. Built by dropping them from the finished
     /// shape rather than by restating the old DDL, so it cannot drift from
-    /// what `MIGRATIONS` says the rest of the table is.
+    /// what `MIGRATIONS` says the rest of the table is. It drops step 22's
+    /// `arrivals.settled_by` as well: left in, it would sit before the
+    /// columns step 17 appends and the shape comparison would see them in
+    /// the wrong order.
     fn version_sixteen_db() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v16.duckdb");

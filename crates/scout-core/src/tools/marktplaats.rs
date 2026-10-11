@@ -98,7 +98,7 @@ impl MarktplaatsClient {
                 ("limit", &limit.to_string()),
                 ("offset", "0"),
             ])
-            .send_with_retry()
+            .send_with_retry("marktplaats")
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

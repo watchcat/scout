@@ -50,14 +50,31 @@ fn is_transient(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+/// What kind of failure a provider's final answer was, for `/metrics`, or
+/// `None` when it was not one.
+fn failure_kind(outcome: &reqwest::Result<reqwest::Response>) -> Option<&'static str> {
+    match outcome {
+        Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => Some("rate_limited"),
+        Ok(resp) if resp.status().is_server_error() => Some("server"),
+        Ok(resp) if !resp.status().is_success() => Some("client"),
+        Ok(_) => None,
+        Err(e) if e.is_timeout() => Some("timeout"),
+        Err(_) => Some("network"),
+    }
+}
+
 pub(crate) trait SendWithRetry {
     /// `send`, with up to two more tries on a 429, a 5xx or a refused
     /// connection. Hands back whatever the last attempt produced.
-    async fn send_with_retry(self) -> reqwest::Result<reqwest::Response>;
+    ///
+    /// `provider` is the name `/metrics` counts its retries and failures
+    /// under: one per paid API, never anything a caller typed.
+    async fn send_with_retry(self, provider: &'static str) -> reqwest::Result<reqwest::Response>;
 }
 
 impl SendWithRetry for reqwest::RequestBuilder {
-    async fn send_with_retry(self) -> reqwest::Result<reqwest::Response> {
+    async fn send_with_retry(self, provider: &'static str) -> reqwest::Result<reqwest::Response> {
+        let metrics = crate::metrics::global();
         let mut attempt = 0;
         let mut request = self;
         loop {
@@ -74,8 +91,14 @@ impl SendWithRetry for reqwest::RequestBuilder {
                     (wait_before(attempt, retry_after), resp.status().to_string())
                 }
                 Err(e) if e.is_connect() && !last => (wait_before(attempt, None), e.to_string()),
-                _ => return outcome,
+                _ => {
+                    if let Some(kind) = failure_kind(&outcome) {
+                        metrics.provider_error(provider, kind);
+                    }
+                    return outcome;
+                }
             };
+            metrics.provider_retry(provider);
             tracing::warn!(attempt = attempt + 1, wait_ms = wait.as_millis() as u64, why, "retrying a provider request");
             tokio::time::sleep(wait).await;
             request = again.expect("checked above");
@@ -92,6 +115,15 @@ mod tests {
 
     async fn hits(server: &MockServer) -> Vec<wiremock::Request> {
         server.received_requests().await.unwrap()
+    }
+
+    /// The value of one series on the process's page, or 0 before it has
+    /// been counted. Each test names a provider of its own, so no other
+    /// test writes to the series it reads.
+    fn counted(series: &str) -> u64 {
+        let page = crate::metrics::global().render();
+        let start = format!("{series} ");
+        page.lines().find_map(|l| l.strip_prefix(start.as_str())).map_or(0, |n| n.parse().unwrap())
     }
 
     fn post(server: &MockServer) -> reqwest::RequestBuilder {
@@ -115,12 +147,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let resp = post(&server).send_with_retry().await.unwrap();
+        let resp = post(&server).send_with_retry("test-rescued").await.unwrap();
 
         assert_eq!(resp.status(), 200);
         let seen = hits(&server).await;
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].body, seen[1].body, "the retry must carry the whole request");
+        // The 429 the provider sent is counted though the call was saved.
+        assert_eq!(counted("scout_provider_retries_total{provider=\"test-rescued\"}"), 1);
+        assert!(!crate::metrics::global().render().contains("provider=\"test-rescued\",kind="), "a call that worked is no error");
     }
 
     #[tokio::test]
@@ -132,10 +167,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let resp = post(&server).send_with_retry().await.unwrap();
+        let resp = post(&server).send_with_retry("test-refused").await.unwrap();
 
         assert_eq!(resp.status(), 400);
         assert_eq!(hits(&server).await.len(), 1);
+        assert_eq!(counted("scout_provider_errors_total{provider=\"test-refused\",kind=\"client\"}"), 1);
+        assert_eq!(counted("scout_provider_retries_total{provider=\"test-refused\"}"), 0);
     }
 
     #[tokio::test]
@@ -147,11 +184,38 @@ mod tests {
             .mount(&server)
             .await;
 
-        let resp = post(&server).send_with_retry().await.unwrap();
+        let resp = post(&server).send_with_retry("test-down").await.unwrap();
 
         // The caller's own status check still runs and words the error.
         assert_eq!(resp.status(), 503);
         assert_eq!(hits(&server).await.len(), ATTEMPTS);
+        // One failed call, however many times it was sent.
+        assert_eq!(counted("scout_provider_errors_total{provider=\"test-down\",kind=\"server\"}"), 1);
+        assert_eq!(counted("scout_provider_retries_total{provider=\"test-down\"}"), (ATTEMPTS - 1) as u64);
+    }
+
+    #[tokio::test]
+    async fn a_429_that_never_clears_is_a_rate_limit_and_a_timeout_is_its_own_kind() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/q"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/slow"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
+            .mount(&server)
+            .await;
+
+        let resp = post(&server).send_with_retry("test-throttled").await.unwrap();
+        let slow = reqwest::Client::builder().timeout(Duration::from_millis(50)).build().unwrap();
+        let err = slow.post(format!("{}/slow", server.uri())).send_with_retry("test-slow").await.unwrap_err();
+
+        assert_eq!(resp.status(), 429);
+        assert_eq!(counted("scout_provider_errors_total{provider=\"test-throttled\",kind=\"rate_limited\"}"), 1);
+        assert!(err.is_timeout(), "got: {err}");
+        assert_eq!(counted("scout_provider_errors_total{provider=\"test-slow\",kind=\"timeout\"}"), 1);
     }
 
     #[tokio::test]
@@ -161,11 +225,12 @@ mod tests {
 
         let err = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/q"))
-            .send_with_retry()
+            .send_with_retry("test-unreachable")
             .await
             .unwrap_err();
 
         assert!(err.is_connect(), "got: {err}");
+        assert_eq!(counted("scout_provider_errors_total{provider=\"test-unreachable\",kind=\"network\"}"), 1);
     }
 
     #[test]
@@ -195,7 +260,13 @@ mod tests {
         for (name, src) in providers {
             let src = src.split("#[cfg(test)]").next().unwrap();
             assert_eq!(src.matches(".send()").count(), 0, "{name} sends a request without the retry");
-            assert!(src.contains("send_with_retry()"), "{name} never sends through the retry");
+            let named = format!("send_with_retry(\"{name}\")");
+            assert!(src.contains(&named), "{name} never sends through the retry");
+            assert_eq!(
+                src.matches("send_with_retry(").count(),
+                src.matches(named.as_str()).count(),
+                "{name} counts a request under another provider's name"
+            );
         }
     }
 }

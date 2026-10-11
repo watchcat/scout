@@ -1796,6 +1796,9 @@ pub struct NewArrival {
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    /// Where the wait for `conn` is reported: the process's set, or under
+    /// test one of the test's own, so a wait measured is that test's.
+    metrics: &'static crate::metrics::Metrics,
 }
 
 /// Writes a consistent copy of `conn`'s database to `path`.
@@ -1962,7 +1965,8 @@ impl Store {
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        match self.conn.lock() {
+        let asked = std::time::Instant::now();
+        let guard = match self.conn.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 let guard = poisoned.into_inner();
@@ -1971,7 +1975,9 @@ impl Store {
                 let _ = guard.execute_batch("ROLLBACK");
                 guard
             }
-        }
+        };
+        self.metrics.lock_waited(asked.elapsed());
+        guard
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -1980,6 +1986,7 @@ impl Store {
         apply_steps(&conn, path.as_ref())?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            metrics: crate::metrics::global(),
         })
     }
 
@@ -9834,6 +9841,37 @@ CREATE TABLE trips (
 
         s.log_request(1, "text").expect("the store must recover from a poisoned lock");
         assert_eq!(s.requests_today(1).unwrap(), 1);
+    }
+
+    /// Every store call goes through `conn()`, so that is where the wait
+    /// for the lock is measured: one held for a while elsewhere shows up
+    /// as a wait at least that long, and an uncontended take as almost none.
+    #[test]
+    fn a_store_call_reports_how_long_it_waited_for_the_lock() {
+        let (mut s, _dir) = test_store();
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        s.metrics = metrics;
+        s.log_request(1, "text").unwrap();
+
+        let conn = s.conn.clone();
+        let (taken, take) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held = conn.lock().unwrap();
+            taken.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        });
+        take.recv().unwrap();
+        s.log_request(1, "text").unwrap();
+        holder.join().unwrap();
+
+        let page = metrics.render();
+        let count = |le: &str| -> u64 {
+            let start = format!("scout_store_lock_wait_seconds_bucket{{le=\"{le}\"}} ");
+            page.lines().find_map(|l| l.strip_prefix(start.as_str())).unwrap().parse().unwrap()
+        };
+        assert_eq!(count("+Inf"), 2, "{page}");
+        assert_eq!(count("0.1"), 1, "the held lock must show as a wait over 100 ms:\n{page}");
+        assert_eq!(count("0.05"), 1, "{page}");
     }
 
     /// A panic mid-transaction leaves that transaction open on the

@@ -302,6 +302,7 @@ where
                         }
                         Err(e) => {
                             tracing::warn!(specialist = self.name, error = %e, "the nested run failed");
+                            self.observer.metrics.provider_error("model", "error");
                             return Some("the model call failed");
                         }
                     }

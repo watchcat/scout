@@ -20,6 +20,11 @@ pub struct Observer {
     /// Calls started and not yet finished, by rig's internal call id, to
     /// the row they opened and the instant they started.
     open: Mutex<HashMap<String, (usize, std::time::Instant)>>,
+    /// When the run began, for the length `/metrics` reports.
+    started: std::time::Instant,
+    /// Where tool calls and the run's end are counted: the process's set,
+    /// or under test one of the test's own.
+    pub(crate) metrics: &'static crate::metrics::Metrics,
 }
 
 fn now_iso() -> String {
@@ -42,7 +47,14 @@ impl Observer {
             rows: Mutex::new(Vec::new()),
             called: Mutex::new(HashMap::new()),
             open: Mutex::new(HashMap::new()),
+            started: std::time::Instant::now(),
+            metrics: crate::metrics::global(),
         }
+    }
+
+    /// How long since the run began.
+    pub(crate) fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
     }
 
     fn rows(&self) -> std::sync::MutexGuard<'_, Vec<TraceRow>> {
@@ -112,6 +124,7 @@ impl Observer {
         let seq = {
             let mut rows = self.rows();
             let row = &mut rows[index];
+            self.metrics.tool_call(row.tool.as_deref().unwrap_or_default(), &status);
             row.duration_ms = Some(duration_ms);
             row.status = Some(status.clone());
             row.detail = detail.clone();
@@ -192,6 +205,25 @@ mod tests {
         assert_eq!(rows[0].detail.as_deref(), Some("duffel api error (status 429): slow down"));
         assert!(rows[0].nested);
         assert!(matches!(frames(&mut seen)[1], TraceFrame::Finished { ref detail, .. } if detail.is_some()));
+    }
+
+    #[test]
+    fn a_finished_tool_is_counted_by_name_and_outcome_nested_or_not() {
+        let (mut o, _seen) = observer();
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        o.metrics = metrics;
+        o.tool_started("c1", "search_web", json!({}), false);
+        o.tool_finished("c1", "{}");
+        o.tool_started("c2", "search_flights", json!({}), true);
+        o.tool_finished("c2", "duffel api error (status 429): slow down");
+        // Started and never finished: the run was cut short under it, and
+        // there is no outcome to count it under.
+        o.tool_started("c3", "search_web", json!({}), false);
+        o.tool_finished("ghost", "{}");
+        let page = metrics.render();
+        assert!(page.contains("scout_tool_calls_total{tool=\"search_web\",status=\"ok\"} 1\n"), "{page}");
+        assert!(page.contains("scout_tool_calls_total{tool=\"search_flights\",status=\"failed\"} 1\n"), "{page}");
+        assert_eq!(page.matches("scout_tool_calls_total{").count(), 2, "{page}");
     }
 
     #[test]

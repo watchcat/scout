@@ -995,7 +995,7 @@ impl DuffelClient {
             .header("Duffel-Version", DUFFEL_VERSION)
             .header("Accept", "application/json")
             .json(&serde_json::json!({"data": data}))
-            .send_with_retry()
+            .send_with_retry("duffel")
             .await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -1043,7 +1043,7 @@ impl DuffelClient {
             // second round trip to be worth anything.
             .query(&[("return_offers", "true")])
             .json(&body)
-            .send_with_retry()
+            .send_with_retry("duffel")
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

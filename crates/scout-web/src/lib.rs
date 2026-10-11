@@ -261,6 +261,33 @@ async fn healthz(State(public): State<Public>) -> Response {
     }
 }
 
+/// `/metrics` and nothing else, for the listener `serve_metrics` opens.
+fn metrics_router() -> Router {
+    Router::new().route("/metrics", get(metrics))
+}
+
+async fn metrics() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        scout_core::metrics::global().render(),
+    )
+        .into_response()
+}
+
+/// Serves `/metrics` at `bind`, apart from the site.
+///
+/// A listener of its own rather than a route on the front door, because
+/// the front door is the internet's: the ingress sends everything on it
+/// here. This port is in neither the Service nor the Ingress, so the
+/// internet cannot reach it; the node, the cluster and the pod itself can.
+/// The pod includes `fetch_page`, which opens any address the model names,
+/// loopback too — nothing here is secret, but this is not a wall.
+pub async fn serve_metrics(bind: &str) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    axum::serve(listener, metrics_router()).await?;
+    Ok(())
+}
+
 /// Sends a request that arrived at the wrong address to the right one:
 /// plain HTTP to HTTPS, and `www.` to the apex.
 ///
@@ -1277,6 +1304,27 @@ mod tests {
         let app = router(cache, None, None, Some(fine));
         let res = app.oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_served_on_their_own_listener_and_never_on_the_site() {
+        let res = metrics_router()
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "text/plain; version=0.0.4; charset=utf-8");
+        let page = body_of(res).await;
+        assert!(page.contains("# TYPE scout_store_lock_wait_seconds histogram"), "{page}");
+
+        // The public port is the internet's. What Scout is doing, and how
+        // often its providers fail, is not. The site without keys has the
+        // fewest routes; with them it adds its own, and the handler is
+        // private to this file, so only `metrics_router` can name it.
+        let cache = crate::cache::AdmissionCache::new(scout_core::core::Admission::Full);
+        let site = router(cache, None, None, None);
+        let res = site.oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

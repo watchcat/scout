@@ -227,6 +227,20 @@ async fn main() -> Result<()> {
         }
     });
 
+    // `/metrics`, on a port the ingress does not route to. Unset in a
+    // local run, where there is nobody to scrape it; failing to bind is
+    // logged and nothing else, since the bot and the site do not need it.
+    match std::env::var("SCOUT_METRICS_BIND").ok().filter(|b| !b.trim().is_empty()) {
+        Some(bind) => {
+            tokio::spawn(async move {
+                if let Err(e) = scout_web::serve_metrics(&bind).await {
+                    tracing::error!(error = %e, bind, "the metrics listener did not open");
+                }
+            });
+        }
+        None => tracing::info!("no SCOUT_METRICS_BIND; /metrics is not served"),
+    }
+
     match &mini_app {
         Some(launch) => {
             tokio::spawn(install_menu_button(telegram.clone(), launch.clone()));

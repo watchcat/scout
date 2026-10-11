@@ -67,7 +67,7 @@ impl PerplexityClient {
             .post(format!("{}/search", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&serde_json::json!({ "query": queries, "max_results": max_results }))
-            .send_with_retry()
+            .send_with_retry("perplexity")
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

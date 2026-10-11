@@ -268,6 +268,9 @@ pub struct AgentDeps {
     pub marktplaats: MarktplaatsClient,
     pub store: Store,
     pub secondhand_sites: Vec<String>,
+    /// Where runs, tool calls and model errors are counted for `/metrics`:
+    /// the process's set, or under test one of the test's own.
+    pub metrics: &'static crate::metrics::Metrics,
 }
 
 /// One-shot classifier used when a chat resumes after the session TTL: does

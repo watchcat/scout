@@ -104,7 +104,7 @@ impl IgnavClient {
             .header("X-Api-Key", &self.api_key)
             .header("Accept", "application/json")
             .json(&body)
-            .send_with_retry()
+            .send_with_retry("ignav")
             .await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -136,7 +136,7 @@ impl IgnavClient {
             // passenger or market fields" — because the id already carries
             // the market and passengers of the search that produced it.
             .json(&serde_json::json!({"ignav_id": ignav_id}))
-            .send_with_retry()
+            .send_with_retry("ignav")
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

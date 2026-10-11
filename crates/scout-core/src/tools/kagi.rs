@@ -85,7 +85,7 @@ impl KagiClient {
             .post(format!("{}/v1/search", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&serde_json::json!({ "query": query, "limit": limit }))
-            .send_with_retry()
+            .send_with_retry("kagi")
             .await?;
         let body: SearchResponse = decode(check(resp).await?).await?;
         Ok(body

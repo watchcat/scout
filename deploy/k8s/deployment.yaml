@@ -43,8 +43,14 @@ spec:
             # From the domain the ingress already serves, so there is no second
             # place to keep in step; a local run leaves it unset and polls.
             - { name: TELEGRAM_WEBHOOK_URL, value: "https://${SCOUT_DOMAIN}/telegram/webhook" }
+            # /metrics, on a port of its own. Named below and deliberately in
+            # neither service.yaml nor ingress.yaml, so the internet cannot
+            # reach it: it is read from the node (scripts/metrics.sh). The
+            # cluster and the pod itself can, fetch_page included.
+            - { name: SCOUT_METRICS_BIND, value: "0.0.0.0:9090" }
           ports:
             - { name: http, containerPort: 8080 }
+            - { name: metrics, containerPort: 9090 }
           # /healthz reports process liveness and deliberately says nothing
           # about the database: a check that failed while DuckDB was busy would
           # restart a pod that was still serving the page correctly from cache.

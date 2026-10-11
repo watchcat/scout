@@ -123,7 +123,7 @@ impl EbayClient {
                 ("grant_type", "client_credentials"),
                 ("scope", "https://api.ebay.com/oauth/api_scope"),
             ])
-            .send_with_retry()
+            .send_with_retry("ebay")
             .await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -147,7 +147,7 @@ impl EbayClient {
             .bearer_auth(token)
             .header("X-EBAY-C-MARKETPLACE-ID", &self.marketplace)
             .query(&[("q", query), ("limit", &limit.to_string())])
-            .send_with_retry()
+            .send_with_retry("ebay")
             .await?;
         let status = resp.status();
         let text = resp.text().await?;

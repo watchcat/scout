@@ -55,6 +55,7 @@ pub async fn run_agent(
     prompt: &str,
 ) -> anyhow::Result<RunOutcome> {
     let Some(_guard) = begin_run(&core.deps.running, run.conversation_id) else {
+        core.deps.metrics.run_refused("busy");
         return Ok(RunOutcome::Busy);
     };
     let (account_id, conversation_id) = (run.account_id, run.conversation_id);
@@ -62,13 +63,16 @@ pub async fn run_agent(
     // is told "still working" rather than queued behind strangers; before
     // anything is built, because nothing below this line is free.
     let Some(_slot) = take_slot(&core.deps.runs, &events).await else {
+        core.deps.metrics.run_refused("overloaded");
         return Ok(RunOutcome::Overloaded);
     };
     let run_id = {
         let store = core.deps.store.clone();
         crate::core::blocking(move || store.open_run(account_id, conversation_id)).await?
     };
-    let observer = std::sync::Arc::new(crate::observer::Observer::new(events.clone(), run_id));
+    let mut observer = crate::observer::Observer::new(events.clone(), run_id);
+    observer.metrics = core.deps.metrics;
+    let observer = std::sync::Arc::new(observer);
     observer.announce();
     // From here on the run has a row, and every way out must close it. The
     // body is a separate function so that closing happens in one place
@@ -143,7 +147,10 @@ async fn run_with(
                         }
                         Ok(None) => return Ok(None),
                         Err(_) if observer.pulse.since() < STREAM_STALL => continue,
-                        Err(_) => return Ok(Some("the model stopped responding")),
+                        Err(_) => {
+                            observer.metrics.provider_error("model", "stalled");
+                            return Ok(Some("the model stopped responding"));
+                        }
                     }
                 };
                 let item = match next {
@@ -153,7 +160,10 @@ async fn run_with(
                     Err(e) if is_max_turns(&e) => {
                         return Ok(Some("I ran out of research steps"))
                     }
-                    Err(e) => return Err(anyhow::Error::from(e)),
+                    Err(e) => {
+                        observer.metrics.provider_error("model", "error");
+                        return Err(anyhow::Error::from(e));
+                    }
                 };
                 match item {
                 // The model's call, streamed before the tool runs: where its
@@ -291,10 +301,14 @@ async fn run_with(
         reply = match tokio::time::timeout(WRAP_UP_BUDGET, agent.chat(REASONING_ONLY_NOTE, &mut history)).await {
             Ok(Ok(text)) => strip_thinking(&text),
             Ok(Err(e)) => {
+                observer.metrics.provider_error("model", "error");
                 observer.event("the model call failed", true);
                 return Err(e.into());
             }
-            Err(_) => String::new(),
+            Err(_) => {
+                observer.metrics.provider_error("model", "timeout");
+                String::new()
+            }
         };
     }
     // A reply that was reasoning from its first character to its last.
@@ -357,10 +371,12 @@ async fn run_with(
         {
             Ok(Ok(text)) => strip_thinking(&text),
             Ok(Err(e)) => {
+                observer.metrics.provider_error("model", "error");
                 observer.event("the model call failed", true);
                 return Err(e.into());
             }
             Err(_) => {
+                observer.metrics.provider_error("model", "timeout");
                 let why = "wrap-up timed out after the run was interrupted";
                 observer.event(why, true);
                 anyhow::bail!(why);
@@ -399,7 +415,7 @@ async fn run_with(
     if crate::toolcall::looks_like_tool_call(&reply) {
         tracing::warn!(conversation_id, "the model wrote a tool call as text; asking it to answer");
         observer.event("the model wrote a tool call as text; asking it to answer", false);
-        reply = strip_thinking(&agent.chat(crate::toolcall::REPAIR_NOTE, &mut history).await?);
+        reply = strip_thinking(&model_call(observer, agent.chat(crate::toolcall::REPAIR_NOTE, &mut history).await)?);
         if crate::toolcall::looks_like_tool_call(&reply) {
             // Twice is not a slip. The run has not answered, and an apology
             // the reader understands beats markup they cannot.
@@ -417,7 +433,7 @@ async fn run_with(
         tracing::warn!(?dead, conversation_id, "dead links in reply; asking the agent to correct it");
         observer.event("dead links in reply; asking the agent to correct it", false);
         let note = crate::links::repair_prompt(&dead);
-        reply = strip_thinking(&agent.chat(note, &mut history).await?);
+        reply = strip_thinking(&model_call(observer, agent.chat(note, &mut history).await)?);
         let still_dead = crate::links::dead_links_in(&core.deps.http, &reply).await;
         if !still_dead.is_empty() {
             tracing::warn!(?still_dead, conversation_id, "dead links survived the correction; stripping");
@@ -451,9 +467,20 @@ async fn run_with(
     Ok(RunOutcome::Answered(reply))
 }
 
+/// A repair turn's answer, with a refusal counted as the model's error on
+/// the way out — the turns that end in a bare `?` otherwise leave a failed
+/// run with no provider error under it.
+fn model_call<T>(observer: &crate::observer::Observer, result: Result<T, rig::completion::PromptError>) -> anyhow::Result<T> {
+    result.map_err(|e| {
+        observer.metrics.provider_error("model", "error");
+        e.into()
+    })
+}
+
 /// Writes the trace and closes the run, on every exit that has one. Never
 /// fails the reply over it: the answer is already on its way.
 async fn finish_run(store: &crate::store::Store, observer: &crate::observer::Observer, outcome: &str, detail: Option<&str>) {
+    observer.metrics.run_finished(outcome, observer.elapsed());
     let rows = observer.take_rows();
     let (store, run_id, outcome, detail) = (store.clone(), observer.run_id, outcome.to_string(), detail.map(str::to_string));
     if let Err(e) = crate::core::blocking(move || {
@@ -972,6 +999,8 @@ mod tests {
         core: Core,
         account_id: i64,
         conversation_id: i64,
+        /// The run's own counts, apart from every other test's.
+        metrics: &'static crate::metrics::Metrics,
         /// Held so the database outlives the run it is read back from.
         _dir: tempfile::TempDir,
     }
@@ -991,7 +1020,9 @@ mod tests {
             dir.path().join("run.duckdb").to_str().unwrap(),
         );
         cfg.minimax_base_url = llm.uri();
-        let core = Core::start(cfg, None).unwrap();
+        let mut core = Core::start(cfg, None).unwrap();
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        core.deps.metrics = metrics;
         let store = core.store();
         let account_id = store.account_for_telegram(4242).unwrap();
         let conversation_id = store.start_conversation(account_id, "direct").unwrap();
@@ -1009,7 +1040,7 @@ mod tests {
         while let Ok(event) = seen.try_recv() {
             shown.push(event);
         }
-        Ran { outcome, shown, core, account_id, conversation_id, _dir: dir }
+        Ran { outcome, shown, core, account_id, conversation_id, metrics, _dir: dir }
     }
 
     /// `minimax`, with the corrective turn an all-reasoning reply gets
@@ -1174,6 +1205,85 @@ mod tests {
         assert!(err.to_string().contains("no answer and no notes"), "got: {err}");
         // That no wrap-up was bought is checked by the mount above when the
         // server drops at the end of this test.
+    }
+
+    /// The value of one series on a page, or 0 before it has been counted.
+    fn counted(metrics: &crate::metrics::Metrics, series: &str) -> u64 {
+        let page = metrics.render();
+        let start = format!("{series} ");
+        page.lines().find_map(|l| l.strip_prefix(start.as_str())).map_or(0, |n| n.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_model_that_refuses_the_call_is_one_provider_error_and_one_failed_run() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream is down"))
+            .mount(&llm)
+            .await;
+
+        let ran = a_run_against(&llm).await;
+
+        assert!(ran.outcome.is_err());
+        assert_eq!(counted(ran.metrics, "scout_provider_errors_total{provider=\"model\",kind=\"error\"}"), 1);
+        assert_eq!(counted(ran.metrics, "scout_runs_total{outcome=\"failed\"}"), 1);
+        assert_eq!(counted(ran.metrics, "scout_run_duration_seconds_count"), 1);
+    }
+
+    #[tokio::test]
+    async fn an_answered_run_is_counted_with_its_tools_and_no_provider_error() {
+        let llm = minimax(streamed_text(&["Lisbon in May is warm."]), None).await;
+
+        let ran = a_run_against(&llm).await;
+
+        assert!(ran.outcome.is_ok());
+        assert_eq!(counted(ran.metrics, "scout_runs_total{outcome=\"answered\"}"), 1);
+        assert!(!ran.metrics.render().contains("scout_provider_errors_total{"), "{}", ran.metrics.render());
+    }
+
+    /// A core whose runs are counted on a set of the test's own, for the
+    /// refusals: neither gets as far as the model, so none is mounted.
+    fn a_core_counting(dir: &tempfile::TempDir) -> (Core, &'static crate::metrics::Metrics, scout_api::RunContext) {
+        let cfg = crate::config::Config::for_test(dir.path().join("run.duckdb").to_str().unwrap());
+        let mut core = Core::start(cfg, None).unwrap();
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        core.deps.metrics = metrics;
+        let store = core.store();
+        let account_id = store.account_for_telegram(4242).unwrap();
+        let conversation_id = store.start_conversation(account_id, "direct").unwrap();
+        let run = scout_api::RunContext { account_id, conversation_id, reply_to: None, title_source: None };
+        (core, metrics, run)
+    }
+
+    #[tokio::test]
+    async fn a_second_run_in_a_busy_thread_is_counted_as_busy_with_no_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, metrics, run) = a_core_counting(&dir);
+        let _first = begin_run(&core.deps.running, run.conversation_id).unwrap();
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = run_agent(&core, events, &run, "and the hotels?").await.unwrap();
+
+        assert!(matches!(outcome, RunOutcome::Busy));
+        assert_eq!(counted(metrics, "scout_runs_total{outcome=\"busy\"}"), 1);
+        assert_eq!(counted(metrics, "scout_run_duration_seconds_count"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_never_gets_a_slot_is_counted_as_overloaded_with_no_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, metrics, run) = a_core_counting(&dir);
+        core.deps.runs = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = run_agent(&core, events, &run, "flights to Lisbon").await.unwrap();
+
+        assert!(matches!(outcome, RunOutcome::Overloaded));
+        assert_eq!(counted(metrics, "scout_runs_total{outcome=\"overloaded\"}"), 1);
+        assert_eq!(counted(metrics, "scout_run_duration_seconds_count"), 0);
     }
 
     #[test]
@@ -1430,6 +1540,25 @@ mod tests {
         let called = body.find("observer.tool_called(&internal_call_id)").expect("the clock starts at the model's call");
         let started = body.find("observer.tool_started(").expect("the start is recorded");
         assert!(called < started, "the call arm comes before the start arm, as the items do");
+    }
+
+    #[test]
+    fn a_closed_run_is_counted_with_how_it_ended_and_how_long_it_took() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (store, _dir) = crate::store::tests::test_store();
+        let me = store.account_for_telegram(1).unwrap();
+        let conv = store.start_conversation(me, "direct").unwrap();
+        let run_id = store.open_run(me, conv).unwrap();
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let mut observer = crate::observer::Observer::new(events, run_id);
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        observer.metrics = metrics;
+
+        rt.block_on(finish_run(&store, &observer, "cut_short", Some("this took too long")));
+
+        let page = metrics.render();
+        assert!(page.contains("scout_runs_total{outcome=\"cut_short\"} 1\n"), "{page}");
+        assert!(page.contains("scout_run_duration_seconds_count 1\n"), "{page}");
     }
 
     #[test]

@@ -13,7 +13,7 @@ import {
   moveBody, warningBody, tripDays, dayChipDraggable, shouldPollChecks,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
-  peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody,
+  peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody, bookingAddress,
   ITINERARY_NOTE,
   CONFIRM_ARM_MS,
 } from './chat.js'
@@ -1205,4 +1205,12 @@ test('the link line says until when and how many of its places are used', () => 
 test('a person is removed by id, a trip shared and left by name', () => {
   assert.deepEqual(JSON.parse(removePersonBody('Lisbon', 7)), { trip: 'Lisbon', person: 7 })
   assert.deepEqual(JSON.parse(tripBody('Lisbon')), { trip: 'Lisbon' })
+})
+
+test('a trip with its own address is booked to that, else to the reader\'s', () => {
+  const inbox = { handle: 'sasha', domain: 'goodscout.fyi' }
+  assert.equal(bookingAddress({ address: 'lisbon-4f9qa' }, inbox), 'lisbon-4f9qa@goodscout.fyi')
+  assert.equal(bookingAddress({ address: null }, inbox), 'sasha@goodscout.fyi')
+  assert.equal(bookingAddress({}, { handle: null, domain: 'goodscout.fyi' }), null)
+  assert.equal(bookingAddress({ address: 'lisbon-4f9qa' }, null), null, 'no domain known yet')
 })

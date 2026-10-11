@@ -1047,6 +1047,15 @@ export function peopleLine(trip) {
   return ['You', ...people.filter((p) => !p.you).map((p) => p.name)].join(', ')
 }
 
+// Where a confirmation for this trip should go: the trip's own address
+// when it has one, so it lands here for everyone on it; the reader's own
+// otherwise. Needs the domain, which the inbox carries.
+export function bookingAddress(trip, inbox) {
+  if (!inbox?.domain) return null
+  if (trip?.address) return `${trip.address}@${inbox.domain}`
+  return inbox.handle ? `${inbox.handle}@${inbox.domain}` : null
+}
+
 const ADDED_VIA = { scout: ', via Scout', mail: ', from mail' }
 
 // Only while more than one person is on the trip: on a trip of one every
@@ -2398,7 +2407,7 @@ function start() {
     })
     if (trip.items.length) tripDetail.append(renderOverview(trip))
 
-    const alert = readinessAlert(trip, inboxAddress())
+    const alert = readinessAlert(trip, bookingAddress(trip, inbox))
     if (alert) {
       const readiness = node('div', alert.tone === 'ready' ? 'trip-alert ready' : 'trip-alert')
       readiness.append(node('strong', '', alert.headline))
@@ -3416,6 +3425,7 @@ function start() {
       for (const [label, path, said] of [
         ['New link', '/chat/trips/link-new', 'New link made. The old one no longer works.'],
         ['Turn link off', '/chat/trips/link-off', 'Link turned off.'],
+        ['New address', '/chat/trips/address-new', 'New address made. The old one no longer works.'],
       ]) {
         const button = node('button', 'people-link-action', label)
         button.type = 'button'
@@ -3430,7 +3440,19 @@ function start() {
         () => tripAction('/chat/trips/leave', tripBody(trip.name), `You left ${trip.name}.`)))
       actions.append(leave)
     }
-    panel.append(list, actions)
+    panel.append(list)
+    const address = trip.address && inbox?.domain ? `${trip.address}@${inbox.domain}` : null
+    if (address) {
+      const line = node('p', 'people-address')
+      line.append(document.createTextNode('Trip email: '), node('code', '', address))
+      const copyAddressButton = node('button', 'alert-copy', 'Copy')
+      copyAddressButton.type = 'button'
+      copyAddressButton.setAttribute('aria-label', `Copy ${address}`)
+      copyAddressButton.addEventListener('click', () => copyAddress(address))
+      line.append(copyAddressButton)
+      panel.append(line)
+    }
+    panel.append(actions)
     if (trip.you_own) panel.append(node('p', 'people-link-state', linkStateLine(trip.link)))
     panel.append(ask)
     return panel

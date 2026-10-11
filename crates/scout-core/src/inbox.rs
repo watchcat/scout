@@ -66,6 +66,8 @@ pub fn trip_address_slug(name: &str) -> String {
             'ł' => "l",
             'đ' => "d",
             'þ' => "th",
+            'ð' => "d",
+            'ı' => "i",
             _ => "",
         };
         if !spelled.is_empty() {
@@ -1649,6 +1651,8 @@ mod tests {
         assert_eq!(trip_address_slug("Zürich"), "zurich");
         assert_eq!(trip_address_slug("São Paulo"), "sao-paulo");
         assert_eq!(trip_address_slug("İstanbul"), "istanbul");
+        assert_eq!(trip_address_slug("Diyarbakır"), "diyarbakir");
+        assert_eq!(trip_address_slug("Ðakovo"), "dakovo");
         assert_eq!(trip_address_slug("København"), "kobenhavn");
         assert_eq!(trip_address_slug("Ålesund"), "alesund");
         assert_eq!(trip_address_slug("Café Crawl"), "cafe-crawl");

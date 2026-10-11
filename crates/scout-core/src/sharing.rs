@@ -113,8 +113,9 @@ pub async fn check_address(core: &Core, account_id: i64, trip: &str, raw: &str) 
     .await
 }
 
-/// Gives the trip the address its owner chose. The old one then belongs
-/// to nobody, and mail sent to it stops arriving — the page asks first.
+/// Gives the trip the address its owner chose. The old one is then held
+/// for the owner alone for `store::HOLD_DAYS`, and mail sent to it stops arriving —
+/// the page says so first.
 pub async fn set_address(core: &Core, account_id: i64, trip: &str, raw: &str) -> anyhow::Result<AddressChoice> {
     let address = match crate::inbox::check_trip_address(raw) {
         Ok(a) => a,

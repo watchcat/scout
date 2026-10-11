@@ -1912,7 +1912,9 @@ fn move_rows(conn: &Connection, absorbed: i64, survivor: i64) -> Result<()> {
         )?;
     }
 
-    for table in ["deliveries", "users", "members", "waitlist", "login_tokens", "identities"] {
+    // `released_addresses` too: what the absorbed account let go is the
+    // survivor's to take back, not held against it by an id that is gone.
+    for table in ["deliveries", "users", "members", "waitlist", "login_tokens", "identities", "released_addresses"] {
         conn.execute(
             &format!("UPDATE {table} SET account_id = ? WHERE account_id = ?"),
             params![survivor, absorbed],
@@ -2431,6 +2433,14 @@ impl Store {
             conn.execute(
                 "DELETE FROM trip_items WHERE trip_id IN
                      (SELECT id FROM trips WHERE conversation_id = ?)",
+                params![conversation_id],
+            )?;
+            // Their addresses are held for their owner, as a deleted
+            // trip's always is: a kept trip still belongs to the thread
+            // that made it, and hotels keep writing to its address.
+            conn.execute(
+                "INSERT INTO released_addresses (address, account_id)
+                 SELECT address, account_id FROM trips WHERE conversation_id = ? AND address IS NOT NULL",
                 params![conversation_id],
             )?;
             conn.execute(
@@ -3757,8 +3767,8 @@ impl Store {
         }
     }
 
-    /// The address the owner chose, in place of the old one, which then
-    /// belongs to nobody. `address` has passed `inbox::check_trip_address`.
+    /// The address the owner chose, in place of the old one, which is then
+    /// nobody's — held for the owner alone for `HOLD_DAYS`. `address` has passed `inbox::check_trip_address`.
     /// Unique against every other trip's address and every account's
     /// handle, checked under the lock that writes it: the two kinds look
     /// alike now that a chosen address needs no dash, and one inbound
@@ -3784,16 +3794,20 @@ impl Store {
         }
         let old: Option<String> =
             conn.query_row("SELECT address FROM trips WHERE id = ?", params![trip_id], |r| r.get(0))?;
-        conn.execute("UPDATE trips SET address = ? WHERE id = ?", params![address, trip_id])?;
         // The old one is held for the owner: hotels keep writing to it.
+        // Held before the change, so a write that fails between the two
+        // leaves a hold on an address still in use — harmless, it binds
+        // only others — rather than a changed address with no hold.
         if let Some(old) = old.filter(|old| old != address) {
             release_within(&conn, &old, owner)?;
         }
+        conn.execute("UPDATE trips SET address = ? WHERE id = ?", params![address, trip_id])?;
         Ok(AddressClaim::Set)
     }
 
-    /// Whether `address` is free for this trip: no other trip holds it and
-    /// no account has it as a handle. The trip's own current address counts
+    /// Whether `address` is free for this trip: no other trip holds it, no
+    /// account has it as a handle, and nobody but the trip's owner released
+    /// it within `HOLD_DAYS`. The trip's own current address counts
     /// as free, so re-typing it is not a clash.
     pub fn trip_address_free(&self, trip_id: i64, address: &str) -> Result<bool> {
         let conn = self.conn();
@@ -5723,7 +5737,9 @@ fn unreadable(m: &str) -> String {
 
 impl Store {
     /// Claims `handle` for the account; `false` when another account holds
-    /// it. The check and the write share the lock, and that is the whole
+    /// it, a trip has it as its address, or somebody else released it
+    /// within `HOLD_DAYS`. The account's old handle, if any, is then held
+    /// for it. The check and the write share the lock, and that is the whole
     /// uniqueness guarantee — see the column's comment for why there is no
     /// index. Case is the caller's job.
     pub fn set_handle(&self, account_id: i64, handle: &str) -> Result<bool> {
@@ -5746,10 +5762,11 @@ impl Store {
             .query_row("SELECT handle FROM accounts WHERE id = ?", params![account_id], |r| r.get(0))
             .optional()?
             .flatten();
-        conn.execute("UPDATE accounts SET handle = ? WHERE id = ?", params![handle, account_id])?;
+        // Held before the change, for the reason `set_trip_address` gives.
         if let Some(old) = old.filter(|old| old != handle) {
             release_within(&conn, &old, account_id)?;
         }
+        conn.execute("UPDATE accounts SET handle = ? WHERE id = ?", params![handle, account_id])?;
         Ok(true)
     }
 
@@ -6459,6 +6476,13 @@ impl Store {
     pub fn sweep_inbox(&self, days: i64) -> Result<usize> {
         let cutoff = days_ago(days);
         let conn = self.conn();
+        // Holds that have run out, on the same daily sweep: a row past
+        // `HOLD_DAYS` binds nobody, and every free check reads the table.
+        conn.execute(
+            "DELETE FROM released_addresses
+             WHERE released_at <= CAST(current_timestamp AS TIMESTAMP) - to_days(CAST(? AS INTEGER))",
+            params![HOLD_DAYS],
+        )?;
         // The one definition of "sweepable" the five deletes share; the
         // mail goes last so a crash between them leaves nothing orphaned
         // that the next sweep will not find again.
@@ -10144,11 +10168,34 @@ CREATE TABLE conversations (
         assert_eq!(s.delete_trip(masha, "Rome").unwrap(), TripDeleted::Deleted);
         assert_eq!(s.set_trip_address(sasha, lisbon.id, &gone).unwrap(), AddressClaim::Taken);
 
-        // Ninety days on, anybody may.
-        s.conn().execute("UPDATE released_addresses SET released_at = released_at - INTERVAL 91 DAY", []).unwrap();
+        // Still held at eighty-nine days; free after ninety.
+        s.conn().execute("UPDATE released_addresses SET released_at = released_at - INTERVAL 89 DAY", []).unwrap();
+        assert_eq!(s.set_trip_address(sasha, lisbon.id, &gone).unwrap(), AddressClaim::Taken, "a day short");
+        s.conn().execute("UPDATE released_addresses SET released_at = released_at - INTERVAL 2 DAY", []).unwrap();
         assert_eq!(s.set_trip_address(sasha, lisbon.id, &gone).unwrap(), AddressClaim::Set);
         assert!(s.set_handle(masha, "masha2").unwrap(), "her own old handle, aged out of its hold too");
         assert!(!s.set_handle(masha, "lisbon2027").unwrap(), "released by that last change, so held from today");
+    }
+
+    #[test]
+    fn a_merged_account_hands_its_holds_to_the_survivor() {
+        let (s, _d) = test_store();
+        let telegram = s.account_for_identity("telegram", "11").unwrap();
+        s.log_request(telegram, "text").unwrap();
+        let web = s.account_for_identity("email", "a@example.com").unwrap();
+        assert!(s.set_handle(web, "oldname").unwrap());
+        assert!(s.set_handle(web, "newname").unwrap());
+        assert_eq!(s.link_identity(web, "telegram", "11").unwrap(), LinkOutcome::Merged { account_id: telegram });
+        let stranger = s.account_for_telegram(3).unwrap();
+        for name in ["oldname", "newname"] {
+            assert!(!s.handle_free(stranger, name).unwrap(), "{name} is held from a stranger");
+            assert!(s.handle_free(telegram, name).unwrap(), "{name} is the survivor's to take");
+        }
+        // Expired holds go on the daily sweep.
+        s.conn().execute("UPDATE released_addresses SET released_at = released_at - INTERVAL 91 DAY", []).unwrap();
+        s.sweep_inbox(30).unwrap();
+        let left: i64 = s.conn().query_row("SELECT count(*) FROM released_addresses", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
@@ -10574,6 +10621,17 @@ CREATE TABLE conversations (
         assert!(s.find_trip(owner, "Lisbon").unwrap().is_some(), "shared: detached");
         assert!(s.find_trip(owner, "Porto").unwrap().is_none(), "not shared: gone with its chat");
         assert!(s.delete_conversation(editor, theirs).unwrap());
+
+        // A kept trip deleted with its thread has its address held for its
+        // owner, as any deleted trip's is.
+        let thread = s.start_conversation(owner, "direct").unwrap();
+        s.upsert_trip(owner, "Rome", None, None, Some(thread)).unwrap();
+        s.keep_trip(owner, "Rome").unwrap();
+        let rome = s.find_trip(owner, "Rome").unwrap().unwrap();
+        let address = s.trip_address(rome.id).unwrap().unwrap();
+        assert!(s.delete_conversation(owner, thread).unwrap());
+        assert!(!s.handle_free(editor, &address).unwrap(), "held from a stranger");
+        assert!(s.handle_free(owner, &address).unwrap(), "but not from its owner");
         let cleared: Option<i64> = s
             .conn()
             .query_row("SELECT conversation_id FROM trip_people", [], |r| r.get(0))

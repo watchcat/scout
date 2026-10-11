@@ -294,14 +294,15 @@ CREATE TABLE IF NOT EXISTS mail_forwards (
   form says so the whole time: mail from anyone holding the old one stops
   arriving.
 - **A released address is held for 90 days.** When a trip's address is
-  changed, a trip with one is deleted, a handle is changed, or an account
-  holding one is merged away, the address goes into `released_addresses`
+  changed, a trip with one is deleted — by hand, or with the chat that
+  made it — a handle is changed, or an account holding one is merged away, the address goes into `released_addresses`
   (step 23) with whoever let it go. For 90 days only that account may
   take it again, as a trip's address or a handle; to everyone else it is
   "taken". A hotel holding the old address keeps writing to it, and its
   next confirmation — names, booking references — must not reach a
   stranger who claimed the name in the meantime. Mail to a held address
-  is dropped, as mail to any unknown one is.
+  is dropped, as mail to any unknown one is. Holds past 90 days are
+  swept daily, and a merged-away account's holds pass to the survivor.
 - Signing in with an address on the inbound domain is refused, quietly:
   such an identity would have Scout forward a trip's mail to itself.
 - Shown in the People panel with Copy. On a trip page, the to-book banner

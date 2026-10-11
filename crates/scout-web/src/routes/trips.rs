@@ -33,7 +33,8 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/trips/link", post(share_link))
         .route("/chat/trips/link-new", post(new_link))
         .route("/chat/trips/link-off", post(link_off))
-        .route("/chat/trips/address-new", post(new_address))
+        .route("/chat/trips/address", post(set_address))
+        .route("/chat/trips/address-check", get(check_address))
         .route("/chat/trips/leave", post(leave))
         .route("/chat/trips/remove-person", post(remove_person))
         .layer(axum::middleware::from_fn_with_state(
@@ -158,12 +159,44 @@ async fn link_off(
     }
 }
 
-/// A new address in place of the old one, for the owner, so an address
-/// that has leaked can be retired without deleting the trip.
-async fn new_address(
+/// The owner's answer about an address, as the form wants it: what it
+/// would be, or why not. `ok: false` with a sentence for a rule broken or
+/// an address taken; the status says which, for the save.
+fn address_answer(out: anyhow::Result<scout_core::sharing::AddressChoice>, account_id: i64, saving: bool) -> Response {
+    use scout_core::sharing::AddressChoice;
+    let no = |status: StatusCode, reason: &str| {
+        (status, axum::Json(serde_json::json!({ "ok": false, "reason": reason }))).into_response()
+    };
+    match out {
+        Ok(AddressChoice::Free(address)) => axum::Json(serde_json::json!({ "ok": true, "address": address })).into_response(),
+        // A live check answers 200 either way, as the handle check does:
+        // "taken" is an answer, not a failure.
+        Ok(AddressChoice::Invalid(reason)) => {
+            no(if saving { StatusCode::UNPROCESSABLE_ENTITY } else { StatusCode::OK }, &reason)
+        }
+        Ok(AddressChoice::Taken) => no(if saving { StatusCode::CONFLICT } else { StatusCode::OK }, "that address is taken"),
+        Ok(AddressChoice::NotOwner) => StatusCode::FORBIDDEN.into_response(),
+        Ok(AddressChoice::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, account_id, "could not choose a trip's address");
+            sorry()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AddressIn {
+    trip: String,
+    address: String,
+}
+
+/// The owner gives the trip an address of their choosing. Unique against
+/// every trip's address and every personal one, checked again here under
+/// the lock that writes it, whatever the live check said a moment ago.
+async fn set_address(
     axum::extract::State(auth): axum::extract::State<AuthState>,
     headers: HeaderMap,
-    axum::extract::Json(body): axum::extract::Json<TripIn>,
+    axum::extract::Json(body): axum::extract::Json<AddressIn>,
 ) -> Response {
     let account_id = match admitted_account(&auth, &headers).await {
         Ok(id) => id,
@@ -172,10 +205,31 @@ async fn new_address(
     if !csrf_header_ok(&auth, &headers, account_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    match scout_core::sharing::new_address(&auth.core, account_id, &body.trip).await {
-        Ok(scout_core::sharing::Owned::Done(address)) => axum::Json(serde_json::json!({ "address": address })).into_response(),
-        other => refused(other, account_id, "new address"),
+    address_answer(scout_core::sharing::set_address(&auth.core, account_id, &body.trip, &body.address).await, account_id, true)
+}
+
+#[derive(serde::Deserialize)]
+struct AddressCheckIn {
+    trip: String,
+    address: String,
+}
+
+/// Whether the owner could take this address, for the form as they type.
+/// On the handle check's budget: each is a database read, and both answer
+/// whether a name is somebody's.
+async fn check_address(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<AddressCheckIn>,
+) -> Response {
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !auth.handle_by_account.allow(&account_id.to_string()) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
+    address_answer(scout_core::sharing::check_address(&auth.core, account_id, &q.trip, &q.address).await, account_id, false)
 }
 
 /// An editor leaving. Answers with the trips they still have, as delete
@@ -1917,23 +1971,49 @@ mod tests {
         assert_eq!(plan["items"][1]["warning"], serde_json::Value::Null);
     }
 
+    #[test]
+    fn the_page_reserves_the_names_the_server_does() {
+        // The form mirrors `check_trip_address` to speak as the owner
+        // types; a name only the server refuses would read as free until
+        // Save. Held together here, as the theme tests hold `theme.js`.
+        let page = include_str!("../chat.js");
+        let line = page.lines().find(|l| l.starts_with("const RESERVED_ADDRESSES")).expect("the page's list");
+        for name in scout_core::inbox::RESERVED_HANDLES {
+            assert!(line.contains(&format!("'{name}'")), "{name} is reserved on the server and not on the page");
+        }
+        assert_eq!(line.matches('\'').count() / 2, scout_core::inbox::RESERVED_HANDLES.len(), "and nothing more");
+    }
+
     #[tokio::test]
-    async fn only_the_owner_replaces_a_trips_address_and_everyone_sees_it() {
+    async fn only_the_owner_chooses_a_trips_address_and_a_taken_one_is_refused() {
         let (app, core, _dir, owner, cookie, csrf) = setup().await;
         let (masha, m_cookie, m_csrf) = second(&core).await;
         scout_core::sharing::share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
         let listed: serde_json::Value =
             serde_json::from_str(&body_of(get_with_cookie(&app, "/chat/trips", &m_cookie).await).await).unwrap();
-        let first = listed[0]["address"].as_str().unwrap().to_string();
-        assert!(first.starts_with("october-"), "{first}");
-        let res = post_json(&app, "/chat/trips/address-new", &m_cookie, Some(&m_csrf), r#"{"trip":"October"}"#).await;
+        assert!(listed[0]["address"].as_str().unwrap().starts_with("october-"));
+
+        let res = post_json(&app, "/chat/trips/address", &m_cookie, Some(&m_csrf), r#"{"trip":"October","address":"oct2026"}"#).await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
-        let res = post_json(&app, "/chat/trips/address-new", &cookie, Some(&csrf), r#"{"trip":"October"}"#).await;
+        let res = get_with_cookie(&app, "/chat/trips/address-check?trip=October&address=oct_2026", &cookie).await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
-        assert_ne!(body["address"].as_str().unwrap(), first);
+        let said: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!((said["ok"].as_bool(), said["reason"].as_str()), (Some(false), Some("letters, digits, dots and dashes only")));
+        let res = get_with_cookie(&app, "/chat/trips/address-check?trip=October&address=Oct2026", &cookie).await;
+        let said: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!((said["ok"].as_bool(), said["address"].as_str()), (Some(true), Some("oct2026")));
+
+        let res = post_json(&app, "/chat/trips/address", &cookie, Some(&csrf), r#"{"trip":"October","address":"Oct2026"}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
         let listed: serde_json::Value =
             serde_json::from_str(&body_of(get_with_cookie(&app, "/chat/trips", &m_cookie).await).await).unwrap();
-        assert_eq!(listed[0]["address"], body["address"], "the editor sees the new one");
+        assert_eq!(listed[0]["address"], "oct2026", "the editor sees the chosen one");
+
+        // Somebody's personal address cannot be a trip's.
+        scout_core::inbox::set_handle(&core, masha, "masha").await.unwrap();
+        let res = post_json(&app, "/chat/trips/address", &cookie, Some(&csrf), r#"{"trip":"October","address":"masha"}"#).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let res = post_json(&app, "/chat/trips/address", &cookie, Some(&csrf), r#"{"trip":"October","address":"ab"}"#).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

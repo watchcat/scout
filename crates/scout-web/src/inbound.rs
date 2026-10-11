@@ -240,16 +240,19 @@ fn our_local_parts(addresses: impl IntoIterator<Item = String>, domain: &str) ->
 
 /// Who, if anyone, one of these local parts belongs to. A trip's address
 /// beats a handle, and the order within each kind is the order given.
-/// Which lookup a part gets is decided by its shape, since a handle never
-/// has a dash and a trip address always does, so the database is not asked
-/// about a shape that cannot match.
+/// Every part is asked as a trip's address first: an owner may choose one
+/// that looks just like a handle (`lisbon2026`), so shape no longer says
+/// which kind a part is. The store keeps the two unique against each
+/// other, so at most one of the lookups can answer for any one part. Each
+/// lookup still refuses a shape its kind cannot take before it reaches the
+/// database — a dash is never a handle.
 async fn recipient_of(core: &Core, locals: &[String]) -> anyhow::Result<Option<Recipient>> {
-    for local in locals.iter().filter(|l| l.contains('-')) {
+    for local in locals {
         if let Some((trip_id, _owner)) = inbox::trip_for_address(core, local).await? {
             return Ok(Some(Recipient::Trip(trip_id)));
         }
     }
-    for local in locals.iter().filter(|l| !l.contains('-')) {
+    for local in locals {
         if let Some(account) = inbox::account_for_handle(core, local).await? {
             return Ok(Some(Recipient::Account(account)));
         }
@@ -499,6 +502,25 @@ mod tests {
     }
 
     /// A kept Lisbon trip for this account: its id and its address.
+    #[tokio::test]
+    async fn a_chosen_trip_address_without_a_dash_reaches_the_trip() {
+        let (app, core, _dir, owner) = app_with_sasha().await;
+        let (trip_id, _) = kept_lisbon(&core, owner).await;
+        assert_eq!(
+            scout_core::sharing::set_address(&core, owner, "Lisbon", "lisbon2026").await.unwrap(),
+            scout_core::sharing::AddressChoice::Free("lisbon2026".into())
+        );
+        let body = received_payload_to("re_1", &["lisbon2026@goodscout.fyi".into()]);
+        assert_eq!(post_signed(&app, SECRET, &body).await.status(), 200);
+        let work = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert_eq!((work.len(), work[0].trip_id), (1, Some(trip_id)));
+        // The handle beside it is still sasha's, and still loses to the trip.
+        let both = received_payload_to("re_2", &["sasha@goodscout.fyi".into(), "lisbon2026@goodscout.fyi".into()]);
+        assert_eq!(post_signed(&app, SECRET, &both).await.status(), 200);
+        let work = scout_core::inbox::mail_to_work(&core, 10).await.unwrap();
+        assert!(work.iter().all(|w| w.trip_id == Some(trip_id)));
+    }
+
     async fn kept_lisbon(core: &scout_core::core::Core, owner: i64) -> (i64, String) {
         scout_core::trips::seed_trip_for_tests(core, owner, "Lisbon").await.unwrap();
         scout_core::trips::keep(core, owner, "Lisbon").await.unwrap();

@@ -13,7 +13,7 @@ import {
   moveBody, warningBody, tripDays, dayChipDraggable, shouldPollChecks,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
-  peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody, bookingAddress,
+  peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody, tripAddressProblem, bookingAddress,
   ITINERARY_NOTE,
   CONFIRM_ARM_MS,
 } from './chat.js'
@@ -1213,4 +1213,15 @@ test('a trip with its own address is booked to that, else to the reader\'s', () 
   assert.equal(bookingAddress({ address: null }, inbox), 'sasha@goodscout.fyi')
   assert.equal(bookingAddress({}, { handle: null, domain: 'goodscout.fyi' }), null)
   assert.equal(bookingAddress({ address: 'lisbon-4f9qa' }, null), null, 'no domain known yet')
+})
+
+test('a trip address is checked by the server\'s rules as it is typed', () => {
+  assert.equal(tripAddressProblem('lisbon2026'), null, 'no dash needed')
+  assert.equal(tripAddressProblem(' Hong-Kong.Sep '), null)
+  assert.equal(tripAddressProblem('lisbon_2026'), 'letters, digits, dots and dashes only')
+  assert.equal(tripAddressProblem('ab'), 'an address is 3 to 40 characters')
+  assert.equal(tripAddressProblem('a'.repeat(41)), 'an address is 3 to 40 characters')
+  assert.equal(tripAddressProblem('-lisbon'), 'an address cannot start or end with a dot or a dash')
+  assert.equal(tripAddressProblem('lisbon.'), 'an address cannot start or end with a dot or a dash')
+  assert.equal(tripAddressProblem('Admin'), 'that one is reserved')
 })

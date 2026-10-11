@@ -2115,7 +2115,7 @@ mod tests {
         // A file of mail sent to the trip's address is the trip's while it
         // is still loose.
         let trip_mail = store
-            .insert_trip_mail(trip.id, owner, "re_2", "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .insert_trip_mail(trip.id, "re_2", "hotel@example.com", Some("Your stay"), None, None, false, &[])
             .unwrap()
             .unwrap();
         let voucher = store.insert_attachment(trip_mail, "voucher.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();

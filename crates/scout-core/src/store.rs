@@ -931,7 +931,7 @@ pub enum MailGone {
     /// Nobody's, or not this account's — one answer for both, so an id
     /// tried against a stranger's mail learns nothing from the reply.
     NotFound,
-    /// A booking off this mail is still waiting on its owner. Deleting the
+    /// A booking off this mail is still waiting for a decision. Deleting the
     /// mail would take that row off the trip's timeline with nothing said,
     /// so the decision comes first.
     Waiting,
@@ -5223,9 +5223,9 @@ fn note_item_within(
 }
 
 /// What becomes of the files these items are carrying, called just before
-/// the items go. An attachment has no owner of its own — `attachment_owner`
-/// finds one through the mail it came with, or through the trip behind its
-/// item — so deleting an item without deciding this leaves rows that answer
+/// the items go. An attachment has no owner of its own —
+/// `can_open_attachment` reaches it through the mail it came with, or
+/// through the trip behind its item — so deleting an item without deciding this leaves rows that answer
 /// with nobody: undownloadable, and unreachable by both mail sweeps, whose
 /// deletes are keyed on mail ids that by then no longer exist.
 ///
@@ -5488,10 +5488,13 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
 
 /// The select `arrival_row` reads — columns, FROM and joins — so the two
 /// readers cannot drift. The trip join is not scoped to the arrival's
-/// account: a booking placed on a trip shared with the account must still
-/// show that trip's name. It is safe because the trip id comes only from
-/// placement or from the mail's own address, and both name a trip the
-/// arrival's account reached.
+/// account: a booking placed on a trip shared with that account must still
+/// show the trip's name. What makes that safe is where `trip_id` comes
+/// from. An arrival of mail sent to a trip's address always carries that
+/// mail's own trip — filing a trip's mail enforces it — and any other
+/// arrival's `trip_id` came from placement, which chooses only among the
+/// trips the arrival's own account reached. Either way, whoever can reach
+/// the arrival may see the name of the trip it is on.
 const ARRIVAL_SELECT: &str =
     "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
      a.airline, a.flight_number, a.stops, a.date,
@@ -5500,6 +5503,19 @@ const ARRIVAL_SELECT: &str =
      FROM arrivals a
      JOIN inbound_mail m ON m.id = a.mail_id
      LEFT JOIN trips t ON t.id = a.trip_id";
+
+/// Where a delivered mail is filed: under an account, for its own address,
+/// or under a trip, for the trip's address — and so under the trip's owner,
+/// whom `insert_mail_within` reads itself.
+///
+/// `Trip` is test-only with `insert_trip_mail`, its one maker (Task 4);
+/// drop the attribute here and on its match arm when that one goes.
+#[derive(Clone, Copy)]
+enum MailTo {
+    Account(i64),
+    #[cfg(test)]
+    Trip(i64),
+}
 
 /// True when the account bound to the three `?` may see and decide the
 /// arrival `a` of mail `m`: it is the account's own, or it came to the
@@ -5565,7 +5581,7 @@ fn minutes_ago(minutes: i64) -> String {
 /// spent in the same second are one attempt.
 pub const MAIL_RETRY_MINUTES: i64 = 5;
 
-/// A booking that is still waiting on its owner. Only a booking waits: a
+/// A booking that is still waiting for a decision. Only a booking waits: a
 /// non-booking is born decided, so this is the one condition both the
 /// inbox and the sweep read as "undecided".
 const UNDECIDED: &str = "a.booking AND a.status = 'pending'";
@@ -5657,11 +5673,17 @@ impl Store {
         truncated: bool,
         parts: &[MailPart],
     ) -> Result<Option<i64>> {
-        self.insert_mail_within(account_id, None, provider_id, from, subject, text, html, truncated, parts)
+        self.insert_mail_within(MailTo::Account(account_id), provider_id, from, subject, text, html, truncated, parts)
     }
 
     /// `insert_mail` for a mail that came to a trip's address: stored under
-    /// the trip's owner, with the trip on it.
+    /// the trip's owner, with the trip on it. The owner is read here, under
+    /// the same lock as the insert, so the mail cannot be filed under an
+    /// account that does not own the trip.
+    ///
+    /// `None` also when the trip no longer exists — deleted between the
+    /// address lookup and this write. To the caller that is the same as a
+    /// redelivery: nothing was stored and there is nothing to read.
     ///
     /// Test-only until core files a trip's mail through it (Task 4); drop
     /// the attribute when it does.
@@ -5670,7 +5692,6 @@ impl Store {
     pub fn insert_trip_mail(
         &self,
         trip_id: i64,
-        owner: i64,
         provider_id: &str,
         from: &str,
         subject: Option<&str>,
@@ -5679,7 +5700,7 @@ impl Store {
         truncated: bool,
         parts: &[MailPart],
     ) -> Result<Option<i64>> {
-        self.insert_mail_within(owner, Some(trip_id), provider_id, from, subject, text, html, truncated, parts)
+        self.insert_mail_within(MailTo::Trip(trip_id), provider_id, from, subject, text, html, truncated, parts)
     }
 
     /// The one writer behind `insert_mail` and `insert_trip_mail`, so the
@@ -5687,8 +5708,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     fn insert_mail_within(
         &self,
-        account_id: i64,
-        trip_id: Option<i64>,
+        to: MailTo,
         provider_id: &str,
         from: &str,
         subject: Option<&str>,
@@ -5704,6 +5724,17 @@ impl Store {
         if seen.is_some() {
             return Ok(None);
         }
+        let (account_id, trip_id): (i64, Option<i64>) = match to {
+            MailTo::Account(account_id) => (account_id, None),
+            #[cfg(test)]
+            MailTo::Trip(trip_id) => {
+                let owner: Option<i64> = conn
+                    .query_row("SELECT account_id FROM trips WHERE id = ?", params![trip_id], |r| r.get(0))
+                    .optional()?;
+                let Some(owner) = owner else { return Ok(None) };
+                (owner, Some(trip_id))
+            }
+        };
         conn.execute_batch("BEGIN")?;
         let written = (|| -> Result<i64> {
             let id: i64 = conn.query_row(
@@ -5940,39 +5971,14 @@ impl Store {
             .optional()?)
     }
 
-    /// Whose file this is: an attachment has no owner of its own. By the
-    /// mail it came with while that exists, and by the trip item it joined
-    /// once the sweep has taken the mail — a kept ticket must not become
-    /// nobody's.
-    ///
-    /// A download no longer asks here: one account is too narrow an answer
-    /// once trips are shared, and `can_open_attachment` is what decides.
-    /// Test-only now, because the cleanup tests read ownership through it;
-    /// drop the attribute if a caller outside them appears.
-    #[cfg(test)]
-    pub fn attachment_owner(&self, id: i64) -> Result<Option<i64>> {
-        let conn = self.conn();
-        Ok(conn
-            .query_row(
-                "SELECT coalesce(m.account_id, t.account_id)
-                 FROM attachments a
-                 LEFT JOIN inbound_mail m ON m.id = a.mail_id
-                 LEFT JOIN trip_items i ON i.id = a.item_id
-                 LEFT JOIN trips t ON t.id = i.trip_id
-                 WHERE a.id = ?",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    /// Whether this account may open the file: its mail is one the account
-    /// reaches (its own, or one sent to the address of a trip it is on), or
-    /// the item it joined is on a trip the account reaches. Unlike
-    /// `attachment_owner`, which names one account and so prefers the
-    /// mail's, this lets an editor open a ticket that came in the owner's
-    /// mail and now sits on the shared trip.
+    /// Whether this account may open the file. An attachment has no owner
+    /// of its own, so it is reached through one of two routes: the mail it
+    /// came with, while that exists, if the account reaches the mail (its
+    /// own, or one sent to the address of a trip it is on); or the trip
+    /// item it joined, if the account reaches that item's trip — so a kept
+    /// ticket does not become nobody's once the sweep takes its mail, and
+    /// an editor can open a ticket that came in the owner's mail and now
+    /// sits on the shared trip.
     ///
     /// One query, so the answer is read under the one lock; the `IS NOT
     /// NULL` guards keep a missing mail or item from reaching anything.
@@ -6128,8 +6134,9 @@ impl Store {
     /// `item_id` is the trip item an added booking became, when the caller
     /// already knows it; `note_arrival_item` fills it in later otherwise.
     ///
-    /// The reach check is a subquery because an UPDATE cannot join the
-    /// mail that `ARRIVAL_REACH` reads.
+    /// The reach check is a subquery so that `ARRIVAL_REACH` is reused as
+    /// it is, with its `a` and `m` aliases unchanged; a join in the UPDATE
+    /// itself would need the predicate restated over other names.
     pub fn decide_arrival(&self, id: i64, account_id: i64, status: &str, item_id: Option<i64>) -> Result<bool> {
         let conn = self.conn();
         let changed = conn.execute(
@@ -6307,8 +6314,8 @@ impl Store {
         Ok(conn.execute(&format!("DELETE FROM inbound_mail WHERE id IN ({sweepable})"), params![cutoff])?)
     }
 
-    /// Forgets one mail now, on its owner's say-so, instead of in thirty
-    /// days. A mail that came to a trip's address is the whole trip's:
+    /// Forgets one mail now, on the say-so of someone who reaches it,
+    /// instead of in thirty days. A mail that came to a trip's address is the whole trip's:
     /// anyone on it may delete it, as anyone on it may Add or Ignore its
     /// bookings — `MAIL_REACH` is the check.
     ///
@@ -6318,13 +6325,14 @@ impl Store {
     /// whole: a crash takes all five back, so nothing is orphaned and the order between them decides
     /// nothing. It is kept anyway, so the two paths that delete a mail read
     /// the same. A file that has joined a trip item is the trip's now and
-    /// stays — `attachment_owner` answers for it through the item. A part
+    /// stays — `can_open_attachment` reaches it through the item. A part
     /// has no such escape: it says what one mail's part was and is worth
     /// nothing once that mail is gone.
     ///
     /// Two refusals, both about rows this delete would strand:
     ///
-    /// - a booking still waiting on its owner, which is `UNDECIDED`, the
+    /// - a booking still waiting for someone to decide it, which is
+    ///   `UNDECIDED`, the
     ///   same predicate that keeps such a mail out of the sweep;
     /// - a mail the worker has not finished with, which would have its
     ///   reading written against it moments later.
@@ -6441,7 +6449,7 @@ impl Store {
     /// delete paths no longer make such rows. It is what clears the ones
     /// already stranded in a live database.
     ///
-    /// The condition is `attachment_owner`'s two routes, negated: neither
+    /// The condition is `can_open_attachment`'s two routes, negated: neither
     /// the mail nor a trip behind the item is still there. Run from the
     /// hourly maintenance; a pass that finds nothing is two index-less
     /// scans of a small table, which is what the sweeps beside it cost too.
@@ -9949,7 +9957,7 @@ CREATE TABLE conversations (
         let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
         put_on(&s, trip.id, editor, "Masha");
         let mail = s
-            .insert_trip_mail(trip.id, owner, "p-1", "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .insert_trip_mail(trip.id, "p-1", "hotel@example.com", Some("Your stay"), None, None, false, &[])
             .unwrap()
             .unwrap();
         assert_eq!(s.mail_to_work(10).unwrap()[0].trip_id, Some(trip.id));
@@ -9965,6 +9973,15 @@ CREATE TABLE conversations (
         assert_eq!(s.inbox_view(editor).unwrap().other.len(), 1, "the newsletter, under Other mail");
         assert!(s.inbox_view(stranger).unwrap().pending.is_empty());
 
+        // A stranger reaches none of it, and a press of theirs on a booking
+        // that is still waiting changes nothing.
+        assert!(!s.decide_arrival(ids[0], stranger, "ignored", None).unwrap());
+        assert_eq!(s.arrival_of(ids[0], owner).unwrap().unwrap().status, "pending", "still waiting");
+        assert_eq!(s.arrival_settler(ids[0]).unwrap(), None);
+        assert!(s.pending_arrivals_of_mail(mail, stranger).unwrap().is_empty());
+        assert!(s.inbox_view(stranger).unwrap().other.is_empty());
+        assert_eq!(s.delete_mail(stranger, mail).unwrap(), MailGone::NotFound);
+
         assert!(s.decide_arrival(ids[0], editor, "added", None).unwrap());
         assert!(!s.decide_arrival(ids[0], owner, "ignored", None).unwrap(), "the first press decided");
         assert_eq!(s.arrival_settler(ids[0]).unwrap(), Some(("added".to_string(), editor)));
@@ -9973,6 +9990,61 @@ CREATE TABLE conversations (
         s.note_forwarded_to(mail, editor).unwrap();
         s.note_forwarded_to(mail, editor).unwrap();
         assert_eq!(s.forwarded_to(mail).unwrap(), vec![editor]);
+
+        // Anyone on the trip may delete its mail, and the record of who it
+        // was forwarded to goes with it.
+        s.mail_done(mail).unwrap();
+        assert_eq!(s.delete_mail(editor, mail).unwrap(), MailGone::Gone);
+        assert!(s.forwarded_to(mail).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_editor_who_left_the_trip_no_longer_reaches_its_mail() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let editor = s.account_for_telegram(2).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        let mail = s
+            .insert_trip_mail(trip.id, "p-1", "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .unwrap()
+            .unwrap();
+        let hotel = NewArrival { booking: true, summary: "Hotel".into(), trip_id: Some(trip.id), ..NewArrival::default() };
+        let not_one = NewArrival { booking: false, summary: "Newsletter".into(), ..NewArrival::default() };
+        let ids = s.insert_arrivals(owner, mail, &[hotel, not_one]).unwrap();
+        assert!(s.arrival_of(ids[0], editor).unwrap().is_some(), "reached while on the trip");
+
+        assert!(s.leave_trip(editor, trip.id, chrono::Utc::now().naive_utc()).unwrap());
+        assert!(s.arrival_of(ids[0], editor).unwrap().is_none());
+        assert!(s.pending_arrivals_of_mail(mail, editor).unwrap().is_empty());
+        let view = s.inbox_view(editor).unwrap();
+        assert!(view.pending.is_empty() && view.other.is_empty(), "neither the booking nor the mail");
+        assert!(!s.decide_arrival(ids[0], editor, "added", None).unwrap());
+        assert_eq!(s.delete_mail(editor, mail).unwrap(), MailGone::NotFound);
+        assert_eq!(s.arrival_of(ids[0], owner).unwrap().unwrap().status, "pending", "the owner still has it");
+    }
+
+    /// The editor's own mail, placed on the owner's trip that is shared with
+    /// the editor: the arrival's account is not the trip's, which is the
+    /// case the old owner-scoped trip join named no trip for.
+    #[test]
+    fn a_booking_from_an_editors_own_mail_shows_the_shared_trips_name() {
+        let (s, _d) = test_store();
+        let owner = s.account_for_telegram(1).unwrap();
+        let editor = s.account_for_telegram(2).unwrap();
+        let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
+        put_on(&s, trip.id, editor, "Masha");
+        let mail = s
+            .insert_mail(editor, "p-1", "hotel@example.com", Some("Your stay"), None, None, false, &[])
+            .unwrap()
+            .unwrap();
+        let hotel = NewArrival { booking: true, summary: "Hotel".into(), trip_id: Some(trip.id), ..NewArrival::default() };
+        let id = s.insert_arrival(editor, mail, &hotel).unwrap();
+
+        assert_eq!(s.arrival_of(id, editor).unwrap().unwrap().trip_name.as_deref(), Some("Lisbon"));
+        let pending = s.inbox_view(editor).unwrap().pending;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].trip_name.as_deref(), Some("Lisbon"));
     }
 
     #[test]
@@ -11397,7 +11469,7 @@ CREATE TABLE messages (
         assert_eq!(gone, 1, "one mail row");
         assert!(store.attachment(kept).unwrap().is_some());
         assert!(store.attachment(loose).unwrap().is_none());
-        assert_eq!(store.attachment_owner(kept).unwrap(), Some(a), "owned through the item once the mail is gone");
+        assert!(store.can_open_attachment(kept, a).unwrap(), "owned through the item once the mail is gone");
     }
 
     /// A stay on `trip`, booked, with a ticket already on it: the shape
@@ -11431,9 +11503,10 @@ CREATE TABLE messages (
         // mail, and destroying a traveller's ticket because they took one
         // leg off a trip would be indefensible. If the mail has already
         // gone, the item was the only thing that could reach those bytes:
-        // left behind, the row answers `attachment_owner` with nothing,
-        // which no reader may download and no sweep can find — the sweeps
-        // are keyed on mail ids that no longer exist.
+        // left behind, the row is reached by neither of
+        // `can_open_attachment`'s routes, so no reader may download it and
+        // no sweep can find it — the sweeps are keyed on mail ids that no
+        // longer exist.
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
         let live = mail(&store, a, "re_1");
@@ -11445,7 +11518,7 @@ CREATE TABLE messages (
         store.attach_to_item(ticket, hotel).unwrap();
         store.attach_to_item(boarding, hotel).unwrap();
         delete_mail_now(&store, a, doomed);
-        assert_eq!(store.attachment_owner(boarding).unwrap(), Some(a), "kept by the item, which is the state this is about");
+        assert!(store.can_open_attachment(boarding, a).unwrap(), "kept by the item, which is the state this is about");
 
         store.drop_item(trip.id, 1).unwrap();
 
@@ -11454,7 +11527,7 @@ CREATE TABLE messages (
             None,
             "the ticket was not handed back to its mail, so nothing will ever sweep it",
         );
-        assert_eq!(store.attachment_owner(ticket).unwrap(), Some(a), "handed back but unreachable");
+        assert!(store.can_open_attachment(ticket, a).unwrap(), "handed back but unreachable");
         assert!(
             store.attachment(boarding).unwrap().is_none(),
             "a file whose mail is gone outlived the only item that could reach it",
@@ -11567,8 +11640,8 @@ CREATE TABLE messages (
         // mail is alive, a file on an item of a live trip, and a file whose
         // mail is gone but whose item still holds it — the exact state the
         // inbox sweep is careful to leave behind. Only the fourth, which
-        // answers `attachment_owner` with nothing and which no other path
-        // can ever delete, is the sweep's.
+        // `can_open_attachment` reaches by neither route and which no
+        // other path can ever delete, is the sweep's.
         let (store, _dir) = test_store();
         let a = store.account_for_telegram(1).unwrap();
         let live = mail(&store, a, "re_1");
@@ -11589,7 +11662,7 @@ CREATE TABLE messages (
         // here to clear.
         let orphan = store.insert_attachment(doomed, "old.pdf", "application/pdf", Some(b"%PDF"), None).unwrap();
         store.conn().execute("UPDATE attachments SET item_id = ? WHERE id = ?", params![hotel + 500, orphan]).unwrap();
-        assert_eq!(store.attachment_owner(orphan).unwrap(), None, "the row must be unreachable for this test to mean anything");
+        assert!(!store.can_open_attachment(orphan, a).unwrap(), "the row must be unreachable for this test to mean anything");
 
         assert_eq!(store.sweep_orphaned_attachments().unwrap(), 1);
 
@@ -11684,7 +11757,7 @@ CREATE TABLE messages (
         // The ticket belongs to the trip now, and is still answered for
         // through the item — the same survival the sweep was built for.
         assert!(store.attachment(kept).unwrap().is_some());
-        assert_eq!(store.attachment_owner(kept).unwrap(), Some(a));
+        assert!(store.can_open_attachment(kept, a).unwrap());
         // A second press from a tab that has not repainted: already gone.
         assert_eq!(store.delete_mail(a, m).unwrap(), MailGone::NotFound);
     }
@@ -11768,7 +11841,7 @@ CREATE TABLE messages (
         assert_eq!(trip.items[0].confirmation_code.as_deref(), Some("ABC"));
         // The ticket is still downloadable: the item answers for it now.
         assert!(store.attachment(ticket).unwrap().is_some());
-        assert_eq!(store.attachment_owner(ticket).unwrap(), Some(a));
+        assert!(store.can_open_attachment(ticket, a).unwrap());
     }
 
     #[test]
@@ -11824,7 +11897,7 @@ CREATE TABLE messages (
         // parses without a date library.
         assert!(got.received_at.contains('T') && got.received_at.ends_with('Z'), "{}", got.received_at);
         assert_eq!(got.attachments, vec![scout_api::AttachmentRef { id: att, filename: "ticket.pdf".into(), mime: "application/pdf".into() }]);
-        assert_eq!(store.attachment_owner(att).unwrap(), Some(a));
+        assert!(store.can_open_attachment(att, a).unwrap());
         assert_eq!(store.attachments_of_mail(m).unwrap().len(), 1);
         assert_eq!(store.attachment(att).unwrap().map(|(mail_id, item_id, _, _, bytes)| (mail_id, item_id, bytes)), Some((m, None, None)));
     }

@@ -1358,7 +1358,12 @@ async fn handle_callback(bot: Bot, q: teloxide::types::CallbackQuery, app: Arc<A
         Ok(Outcome::Done(trip)) => decided_line(decision, title.as_deref(), trip.as_deref()),
         // Somebody else's, or gone: one answer for both, as on the page.
         Ok(Outcome::NotFound) => "That booking isn't here any more.".to_string(),
-        Ok(Outcome::NotPending) => "Already decided — on the Trips tab, or from another press.".to_string(),
+        // Say who decided when the store knows; a trip's booking goes to
+        // everyone on it, so the second press is usually a person.
+        Ok(Outcome::NotPending) => match scout_core::inbox::settler(&app.core, account_id, arrival_id).await {
+            Ok(Some(s)) => crate::arrivals::already_line(s.added, &s.by),
+            _ => "Already decided — on the Trips tab, or from another press.".to_string(),
+        },
         Err(e) => {
             tracing::error!(error = %e, account_id, arrival_id, "a button could not decide an arrival");
             answer("Sorry, something went wrong. Try again in a minute.").await?;

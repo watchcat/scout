@@ -870,17 +870,32 @@ pub async fn mail_forwarded(core: &Core, id: i64) -> anyhow::Result<()> {
     blocking(move || store.mail_forwarded(id)).await
 }
 
-/// Who already has their copy of a trip's mail, so a retry after an
-/// outage sends only what is still owed.
-pub async fn forwarded_to(core: &Core, mail_id: i64) -> anyhow::Result<Vec<i64>> {
+/// Who is settled for a trip's mail: who has their copy, and who Resend
+/// refused one. Neither is asked for again.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MailForwards {
+    pub sent: Vec<i64>,
+    pub refused: Vec<i64>,
+}
+
+/// Who is settled for a trip's mail, so a retry after an outage sends only
+/// what is still owed.
+pub async fn forwards_of(core: &Core, mail_id: i64) -> anyhow::Result<MailForwards> {
     let store = core.store();
-    blocking(move || store.forwarded_to(mail_id)).await
+    blocking(move || Ok(MailForwards { sent: store.forwarded_to(mail_id)?, refused: store.forward_refused_to(mail_id)? })).await
 }
 
 /// One person on a trip has their copy of its mail. Idempotent.
 pub async fn note_forwarded_to(core: &Core, mail_id: i64, account_id: i64) -> anyhow::Result<()> {
     let store = core.store();
     blocking(move || store.note_forwarded_to(mail_id, account_id)).await
+}
+
+/// Resend refused one person's copy of a trip's mail; it is not asked for
+/// again. Idempotent.
+pub async fn note_forward_refused(core: &Core, mail_id: i64, account_id: i64) -> anyhow::Result<()> {
+    let store = core.store();
+    blocking(move || store.note_forward_refused(mail_id, account_id)).await
 }
 
 /// The body fetched from the provider, cut at `cap_chars` characters,

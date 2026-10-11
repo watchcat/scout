@@ -247,11 +247,14 @@ CREATE TABLE IF NOT EXISTS trip_links (
     revoked_at TIMESTAMP
 );
 -- Who a trip's mail has been forwarded to, one row each, so a retry after
--- a partial failure sends nobody a second copy.
+-- a partial failure sends nobody a second copy. A row with `refused` set is
+-- a person Resend would not send it to: settled, so nobody asks again, but
+-- not a copy they hold.
 CREATE TABLE IF NOT EXISTS mail_forwards (
     mail_id      BIGINT NOT NULL,
     account_id   BIGINT NOT NULL,
     forwarded_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    refused      BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (mail_id, account_id)
 );
 CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
@@ -1547,6 +1550,7 @@ ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS settled_by BIGINT;
 CREATE TABLE IF NOT EXISTS mail_forwards (
     mail_id BIGINT NOT NULL, account_id BIGINT NOT NULL,
     forwarded_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    refused BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (mail_id, account_id)
 );
 "#;
@@ -6166,9 +6170,21 @@ impl Store {
 
     /// The people a trip's mail has been forwarded to.
     pub fn forwarded_to(&self, mail_id: i64) -> Result<Vec<i64>> {
+        self.forwards_where(mail_id, false)
+    }
+
+    /// The people Resend refused to send a trip's mail to. Nobody holds a
+    /// copy for them, and nobody asks Resend again.
+    pub fn forward_refused_to(&self, mail_id: i64) -> Result<Vec<i64>> {
+        self.forwards_where(mail_id, true)
+    }
+
+    fn forwards_where(&self, mail_id: i64, refused: bool) -> Result<Vec<i64>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT account_id FROM mail_forwards WHERE mail_id = ? ORDER BY account_id")?;
-        let rows = stmt.query_map(params![mail_id], |r| r.get(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT account_id FROM mail_forwards WHERE mail_id = ? AND refused = ? ORDER BY account_id",
+        )?;
+        let rows = stmt.query_map(params![mail_id, refused], |r| r.get(0))?;
         Ok(rows.collect::<duckdb::Result<_>>()?)
     }
 
@@ -6178,6 +6194,18 @@ impl Store {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO mail_forwards (mail_id, account_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            params![mail_id, account_id],
+        )?;
+        Ok(())
+    }
+
+    /// Resend refused this person's copy. Recorded so that a pass coming
+    /// back for somebody else's owed copy does not ask for this one again.
+    /// Idempotent, as `note_forwarded_to`.
+    pub fn note_forward_refused(&self, mail_id: i64, account_id: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO mail_forwards (mail_id, account_id, refused) VALUES (?, ?, true) ON CONFLICT DO NOTHING",
             params![mail_id, account_id],
         )?;
         Ok(())
@@ -6250,7 +6278,7 @@ impl Store {
         let mut stmt = conn.prepare(&format!(
             "SELECT m.id, m.from_address, m.subject, strftime(m.received_at, '%Y-%m-%dT%H:%M:%SZ'),
                     CASE WHEN m.trip_id IS NULL THEN m.forwarded_at IS NOT NULL
-                         ELSE EXISTS (SELECT 1 FROM mail_forwards f WHERE f.mail_id = m.id AND f.account_id = ?) END,
+                         ELSE EXISTS (SELECT 1 FROM mail_forwards f WHERE f.mail_id = m.id AND f.account_id = ? AND NOT f.refused) END,
                     a.id,
                     CASE WHEN {failed} THEN 'failed'
                          WHEN NOT a.booking THEN 'not_booking'
@@ -10016,8 +10044,11 @@ CREATE TABLE conversations (
         s.mail_forwarded(trips).unwrap();
         assert_eq!(forwarded(owner, trips), Some(true));
         assert_eq!(forwarded(editor, trips), Some(false), "the owner's copy is not the editor's");
-        s.note_forwarded_to(trips, editor).unwrap();
-        assert_eq!(forwarded(editor, trips), Some(true));
+        // A refusal settles the editor's copy without giving them one.
+        s.note_forward_refused(trips, editor).unwrap();
+        assert_eq!(forwarded(editor, trips), Some(false), "refused is not forwarded");
+        assert_eq!(s.forwarded_to(trips).unwrap(), vec![owner]);
+        assert_eq!(s.forward_refused_to(trips).unwrap(), vec![editor]);
 
         // An account's own mail reads the row, as it always has.
         let own = s.insert_mail(owner, "p-2", "hotel@example.com", None, None, None, false, &[]).unwrap().unwrap();

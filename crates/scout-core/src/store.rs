@@ -4544,14 +4544,23 @@ impl Store {
     /// The owner, then the editors in the order they joined. The owner's
     /// name is `owner_name`, or their Telegram name, or "Owner" on a trip
     /// that has never been shared.
+    ///
+    /// Empty for a trip that is gone. An arrival keeps the id of a trip
+    /// deleted under it, and a late press on that arrival asks who is on
+    /// the trip: nobody is, and that is an answer rather than a failure.
     pub fn trip_people(&self, trip_id: i64) -> Result<Vec<TripPerson>> {
         let conn = self.conn();
-        let owner: TripPerson = conn.query_row(
-            "SELECT t.account_id, coalesce(t.owner_name, u.display_name, 'Owner')
-             FROM trips t LEFT JOIN users u ON u.account_id = t.account_id WHERE t.id = ?",
-            params![trip_id],
-            |r| Ok(TripPerson { account_id: r.get(0)?, name: r.get(1)?, owner: true }),
-        )?;
+        let Some(owner): Option<TripPerson> = conn
+            .query_row(
+                "SELECT t.account_id, coalesce(t.owner_name, u.display_name, 'Owner')
+                 FROM trips t LEFT JOIN users u ON u.account_id = t.account_id WHERE t.id = ?",
+                params![trip_id],
+                |r| Ok(TripPerson { account_id: r.get(0)?, name: r.get(1)?, owner: true }),
+            )
+            .optional()?
+        else {
+            return Ok(Vec::new());
+        };
         let mut stmt = conn.prepare(
             "SELECT account_id, name FROM trip_people
              WHERE trip_id = ? AND left_at IS NULL ORDER BY joined_at, account_id",
@@ -4565,7 +4574,8 @@ impl Store {
     }
 
     /// Every name a label on this trip may need: the owner, and everyone
-    /// who was ever on it, including those who left.
+    /// who was ever on it, including those who left. Empty for a trip that
+    /// is gone, as `trip_people` is.
     pub fn author_names(&self, trip_id: i64) -> Result<std::collections::HashMap<i64, String>> {
         let mut names: std::collections::HashMap<i64, String> = self
             .trip_people(trip_id)?
@@ -5479,10 +5489,10 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
 /// account: a booking placed on a trip shared with that account must still
 /// show the trip's name. What makes that safe is where `trip_id` comes
 /// from. An arrival of mail sent to a trip's address always carries that
-/// mail's own trip — `inbox::record_arrivals` enforces it, placing every
-/// booking of such a mail on the mail's trip without asking — and any
-/// other arrival's `trip_id` came from placement, which chooses only among
-/// the trips the arrival's own account reached. Either way, whoever can reach
+/// mail's own trip — `inbox::record_arrivals` enforces it, reading the
+/// trip off the stored mail and placing every booking of it there without
+/// asking — and any other arrival's `trip_id` came from placement, which
+/// chooses only among the trips the arrival's own account reached. Either way, whoever can reach
 /// the arrival may see the name of the trip it is on.
 const ARRIVAL_SELECT: &str =
     "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
@@ -5828,6 +5838,16 @@ impl Store {
         let conn = self.conn();
         let n: i64 = conn.query_row("SELECT count(*) FROM arrivals WHERE mail_id = ?", params![mail_id], |r| r.get(0))?;
         Ok(n > 0)
+    }
+
+    /// The trip whose address the mail came to, if it came to one. `None`
+    /// too for a mail that is not there: it has no trip to be filed on.
+    pub fn mail_trip(&self, mail_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn();
+        let trip: Option<Option<i64>> = conn
+            .query_row("SELECT trip_id FROM inbound_mail WHERE id = ?", params![mail_id], |r| r.get(0))
+            .optional()?;
+        Ok(trip.flatten())
     }
 
     /// Backdates the last attempt by an hour, so a test can walk a mail

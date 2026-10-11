@@ -72,8 +72,8 @@ pub async fn new_link(core: &Core, account_id: i64, trip: &str, fresh: String) -
 /// again: the store's `None` means both "not the owner" and "a draft", and
 /// only the first is `NotOwner`. A draft has no address to replace — the
 /// page shows none on it, so offers no Replace — and is `NotFound`, the
-/// answer for a trip the request cannot act on, as is one deleted between
-/// the two reads. No variant of its own: nothing on the page could ask.
+/// answer for a trip the request cannot act on. No variant of its own:
+/// nothing on the page could ask.
 pub async fn new_address(core: &Core, account_id: i64, trip: &str) -> anyhow::Result<Owned<String>> {
     let store = core.store();
     let trip = trip.to_string();

@@ -317,7 +317,7 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
     // something the reader can see. Taken before the readings move.
     let named: Vec<String> = readings.iter().filter(|e| e.booking).filter_map(|e| e.title.clone()).collect();
     let (_, placement) =
-        scout_core::inbox::record_arrivals(core, m.account_id, m.id, readings, None).await.map_err(Failure::Reading)?;
+        scout_core::inbox::record_arrivals(core, m.account_id, m.id, readings).await.map_err(Failure::Reading)?;
     settle(core, m, forwarded).await?;
 
     // 5. The nudge. From here nothing fails the mail: it is filed, and a

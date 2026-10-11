@@ -1020,17 +1020,16 @@ fn mailbox(raw: &str) -> Option<String> {
 /// draft made for it) here, so the row can name where Add would put it;
 /// nothing is added to that trip until the person says so.
 ///
-/// `trip` is the trip whose address the mail came to, if it came to one.
-/// Every booking of such a mail goes on that trip and nowhere else: the
-/// sender said where it belongs, and `ARRIVAL_SELECT` in the store shows
-/// the trip's name to anyone who reaches the arrival on the strength of
-/// exactly that.
+/// A mail that came to a trip's address puts every booking it holds on
+/// that trip and nowhere else. The trip is read off the stored mail, not
+/// taken from the caller, so no caller can file it anywhere else: the
+/// store's `ARRIVAL_SELECT` shows the trip's name to anyone who reaches
+/// the arrival on the strength of exactly that.
 pub async fn record_arrivals(
     core: &Core,
     account_id: i64,
     mail_id: i64,
     readings: Vec<Extraction>,
-    trip: Option<i64>,
 ) -> anyhow::Result<(Vec<i64>, Option<Placement>)> {
     let store = core.store();
     let today = chrono::Utc::now().date_naive();
@@ -1044,22 +1043,24 @@ pub async fn record_arrivals(
                 e
             })
             .collect();
-        // One confirmation is one journey: the mail is placed once and all
-        // of its bookings go there. Placing each on its own would put the
-        // legs of a round trip on two drafts — a draft holds no items until
-        // Add, and placement matches on the dates of a trip's items, so a
-        // return three weeks out cannot see the draft just made for the
-        // outbound.
-        //
-        // Every dated booking is asked, not only the first: an outbound
-        // that names no place matches nothing on its own, and the ticket
-        // would start a bare draft beside the trip its return plainly
-        // belongs to. The first leg that fits a trip takes the mail there;
-        // when none fit, the first dated booking names the draft.
-        let placement = if let Some(trip) = trip {
-            // Sent to the trip's own address: there is nothing to work out.
+        let placement = if let Some(trip) = store.mail_trip(mail_id)? {
+            // Sent to the trip's own address: the sender said where it
+            // goes, so there is nothing to work out.
             readings.iter().any(|e| e.booking).then_some(Placement::Trip(trip))
         } else {
+            // One confirmation is one journey: the mail is placed once and
+            // all of its bookings go there. Placing each on its own would
+            // put the legs of a round trip on two drafts — a draft holds no
+            // items until Add, and placement matches on the dates of a
+            // trip's items, so a return three weeks out cannot see the
+            // draft just made for the outbound.
+            //
+            // Every dated booking is asked, not only the first: an outbound
+            // that names no place matches nothing on its own, and the
+            // ticket would start a bare draft beside the trip its return
+            // plainly belongs to. The first leg that fits a trip takes the
+            // mail there; when none fit, the first dated booking names the
+            // draft.
             let dated: Vec<&Extraction> = readings.iter().filter(|e| e.booking && e.date.is_some()).collect();
             // Read once for the whole mail, not once per booking: every
             // dated leg is asked, and each ask would otherwise load every
@@ -1491,7 +1492,8 @@ pub struct Settled {
 
 /// Who settled an arrival this account reaches, and how. `None` when the
 /// account does not reach it, while it still waits, and for one decided
-/// before the presser was recorded: there is no one to name.
+/// before the presser was recorded: there is no one to name. `None` too for
+/// a status this does not know, rather than a guess at which way it went.
 pub async fn settler(core: &Core, account_id: i64, arrival_id: i64) -> anyhow::Result<Option<Settled>> {
     let store = core.store();
     blocking(move || {
@@ -1499,6 +1501,14 @@ pub async fn settler(core: &Core, account_id: i64, arrival_id: i64) -> anyhow::R
         // arrival on a trip the asker is not on.
         let Some(arrival) = store.arrival_of(arrival_id, account_id)? else { return Ok(None) };
         let Some((status, by)) = store.arrival_settler(arrival_id)? else { return Ok(None) };
+        let added = match status.as_str() {
+            "added" => true,
+            "ignored" => false,
+            other => {
+                tracing::warn!(arrival_id, status = other, "an arrival was settled with a status settler does not know");
+                return Ok(None);
+            }
+        };
         let by = if by == account_id {
             "you".to_string()
         } else {
@@ -1511,7 +1521,7 @@ pub async fn settler(core: &Core, account_id: i64, arrival_id: i64) -> anyhow::R
             // or nothing would tell them something untrue.
             names.get(&by).cloned().unwrap_or_else(|| "someone on the trip".to_string())
         };
-        Ok(Some(Settled { added: status == "added", by }))
+        Ok(Some(Settled { added, by }))
     })
     .await
 }
@@ -2141,7 +2151,7 @@ mod tests {
             travellers: Some(vec!["Sasha".into(), "Kim".into()]),
             ..arrival("stay", "Hotel Alfama", Some("Lisbon"), "2026-10-13")
         };
-        let (ids, placement) = record_arrivals(&core, a, mail_id, vec![e], None).await.unwrap();
+        let (ids, placement) = record_arrivals(&core, a, mail_id, vec![e]).await.unwrap();
         let id = ids[0];
         assert_eq!(placement, Some(Placement::Trip(lisbon.id)));
         assert_eq!(trip_name(&core, a, lisbon.id).await.unwrap().as_deref(), Some("Lisbon, October"));
@@ -2224,7 +2234,7 @@ mod tests {
             currency: Some("EUR".into()),
             ..arrival("flight", "AMS → LIS", Some("Lisbon"), "2026-10-12")
         };
-        let (ids, placement) = record_arrivals(&core, a, mail_id, vec![e], None).await.unwrap();
+        let (ids, placement) = record_arrivals(&core, a, mail_id, vec![e]).await.unwrap();
         let id = ids[0];
         assert!(matches!(placement, Some(Placement::Draft(_))));
         let plan = match add_arrival(&core, a, id, AddTarget::Matched).await.unwrap() {
@@ -2366,7 +2376,7 @@ mod tests {
                 "summary":"HKG → CDG → AMS"}]}"#,
         )
         .unwrap();
-        let (ids, _) = record_arrivals(&core, a, mail_id, readings, None).await.unwrap();
+        let (ids, _) = record_arrivals(&core, a, mail_id, readings).await.unwrap();
         let plan = match add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap() {
             Outcome::Done(plan) => plan,
             other => panic!("{other:?}"),
@@ -2389,7 +2399,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let mail_id = record_mail(&core, a, mail_in("re_hotel")).await.unwrap().unwrap();
         let stay = arrival("stay", "Hotel Panorama", Some("Hong Kong"), "2026-11-04");
-        let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay], None).await.unwrap();
+        let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay]).await.unwrap();
         let draft = placed.expect("the stay was placed").id();
         store.age_trip(draft).unwrap();
         assert_eq!(store.sweep_all_empty_drafts().unwrap(), 0, "a booking is waiting on it");
@@ -2410,7 +2420,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let mail_id = record_mail(&core, a, mail_in("re_hotel")).await.unwrap().unwrap();
         let stay = arrival("stay", "Hotel Panorama", Some("Hong Kong"), "2026-11-04");
-        let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay], None).await.unwrap();
+        let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay]).await.unwrap();
         let draft = placed.expect("the stay was placed").id();
         assert_eq!(ignore_arrival(&core, a, ids[0]).await.unwrap(), Outcome::Done(()));
         assert!(
@@ -2484,7 +2494,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let flights = record_mail(&core, a, mail_in("re_flights")).await.unwrap().unwrap();
         let legs = Extraction::parse_many(ROUND_TRIP).unwrap();
-        let (_, placement) = record_arrivals(&core, a, flights, legs, None).await.unwrap();
+        let (_, placement) = record_arrivals(&core, a, flights, legs).await.unwrap();
         let draft = match placement.expect("the ticket was placed") {
             Placement::Draft(id) => id,
             other => panic!("expected a draft, got {other:?}"),
@@ -2492,7 +2502,7 @@ mod tests {
 
         let hotel = record_mail(&core, a, mail_in("re_hotel")).await.unwrap().unwrap();
         let stay = arrival("stay", "Hotel Panorama", Some("Tsim Sha Tsui, Hong Kong"), "2026-11-04");
-        let (ids, placed) = record_arrivals(&core, a, hotel, vec![stay], None).await.unwrap();
+        let (ids, placed) = record_arrivals(&core, a, hotel, vec![stay]).await.unwrap();
         assert_eq!(placed, Some(Placement::Trip(draft)), "the hotel joins the flights it is for");
         assert_eq!(store.arrival_of(ids[0], a).unwrap().unwrap().trip_id, Some(draft));
         assert_eq!(store.list_trips(a).unwrap().len(), 1, "one trip, not one per email");
@@ -2508,7 +2518,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let hotel = record_mail(&core, a, mail_in("re_hotel")).await.unwrap().unwrap();
         let stay = arrival("stay", "Hotel Panorama", Some("Hong Kong"), "2026-11-04");
-        let (ids, placed) = record_arrivals(&core, a, hotel, vec![stay], None).await.unwrap();
+        let (ids, placed) = record_arrivals(&core, a, hotel, vec![stay]).await.unwrap();
         let draft = placed.expect("the stay was placed").id();
         // A trip of their own, under a name of its own: the draft was
         // named for the same place and month, and an upsert on that name
@@ -2535,7 +2545,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let mail_id = record_mail(&core, a, mail_in("re_hotel")).await.unwrap().unwrap();
         let stay = arrival("stay", "Hotel Panorama", Some("Hong Kong"), "2026-11-04");
-        let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay], None).await.unwrap();
+        let (ids, placed) = record_arrivals(&core, a, mail_id, vec![stay]).await.unwrap();
         let draft = placed.expect("the stay was placed").id();
         store.age_trip(draft).unwrap();
         assert_eq!(ignore_arrival(&core, a, ids[0]).await.unwrap(), Outcome::Done(()));
@@ -2563,7 +2573,7 @@ mod tests {
             destination: Some("HKG".into()),
             ..arrival("flight", "AMS → HKG", None, "2026-09-14")
         };
-        let (_, placement) = record_arrivals(&core, a, mail_id, vec![e], None).await.unwrap();
+        let (_, placement) = record_arrivals(&core, a, mail_id, vec![e]).await.unwrap();
         let draft = placement.expect("the leg was placed").id();
         assert_eq!(store.trip_by_id(a, draft).unwrap().unwrap().name, "HKG, September");
     }
@@ -2722,7 +2732,7 @@ mod tests {
         let porto = arrival("stay", "Hotel Ribeira", Some("Porto"), "2026-12-01");
         let newsletter = Extraction { booking: false, summary: "Newsletter".into(), ..Extraction::default() };
         let (ids, placement) =
-            record_arrivals(&core, owner, mail_id, vec![porto, newsletter], Some(trip_id)).await.unwrap();
+            record_arrivals(&core, owner, mail_id, vec![porto, newsletter]).await.unwrap();
         assert_eq!(placement, Some(Placement::Trip(trip_id)));
         assert_eq!(store.arrival_of(ids[0], owner).unwrap().unwrap().trip_id, Some(trip_id));
         assert_eq!(store.arrival_of(ids[1], owner).unwrap().unwrap().trip_id, None, "a non-booking names no trip");
@@ -2731,7 +2741,7 @@ mod tests {
         // A trip's mail that booked nothing is placed nowhere, as any other.
         let other = record_trip_mail(&core, trip_id, mail_in("re_2")).await.unwrap().unwrap();
         let newsletter = Extraction { booking: false, summary: "Newsletter".into(), ..Extraction::default() };
-        let (_, placement) = record_arrivals(&core, owner, other, vec![newsletter], Some(trip_id)).await.unwrap();
+        let (_, placement) = record_arrivals(&core, owner, other, vec![newsletter]).await.unwrap();
         assert_eq!(placement, None);
     }
 
@@ -2753,13 +2763,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_added_booking_says_so_and_one_settled_before_pressers_were_kept_names_nobody() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let owner = store.account_for_telegram(1).unwrap();
+        let masha = store.account_for_telegram(2).unwrap();
+        let trip_id = crate::trips::seed_trip_for_tests(&core, owner, "Lisbon").await.unwrap().trip.id;
+        crate::sharing::share_for_tests(&core, owner, "Lisbon", masha, "Masha").await.unwrap();
+
+        let added = seed_trip_booking(&store, owner, trip_id, "re_1");
+        assert!(matches!(add_arrival(&core, masha, added, AddTarget::Matched).await.unwrap(), Outcome::Done(_)));
+        assert_eq!(settler(&core, owner, added).await.unwrap(), Some(Settled { added: true, by: "Masha".into() }));
+
+        // Decided before step 22 recorded who pressed: there is nobody to
+        // name, and a guess would name the wrong person.
+        let old = seed_trip_booking(&store, owner, trip_id, "re_2");
+        store
+            .conn_for_tests()
+            .execute("UPDATE arrivals SET status = 'ignored', decided_at = now() WHERE id = ?", duckdb::params![old])
+            .unwrap();
+        assert_eq!(settler(&core, owner, old).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_late_press_on_a_deleted_trips_booking_names_someone_and_does_not_fail() {
+        let (core, _dir) = core();
+        let store = core.store();
+        let owner = store.account_for_telegram(1).unwrap();
+        let masha = store.account_for_telegram(2).unwrap();
+        let trip_id = crate::trips::seed_trip_for_tests(&core, owner, "Lisbon").await.unwrap().trip.id;
+        crate::sharing::share_for_tests(&core, owner, "Lisbon", masha, "Masha").await.unwrap();
+        let id = seed_trip_booking(&store, owner, trip_id, "re_1");
+        assert_eq!(ignore_arrival(&core, masha, id).await.unwrap(), Outcome::Done(()));
+
+        // The arrival keeps the deleted trip's id, so the trip it names
+        // has nobody on it to read Masha's name from.
+        assert_eq!(store.delete_trip(owner, "Lisbon").unwrap(), crate::store::TripDeleted::Deleted);
+        assert!(store.author_names(trip_id).unwrap().is_empty(), "a trip that is gone has nobody on it");
+        assert_eq!(
+            settler(&core, owner, id).await.unwrap(),
+            Some(Settled { added: false, by: "someone on the trip".into() })
+        );
+    }
+
+    #[tokio::test]
     async fn a_non_booking_is_recorded_without_a_placement() {
         let (core, _dir) = core();
         let store = core.store();
         let a = store.account_for_telegram(1).unwrap();
         let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().unwrap();
         let e = Extraction { booking: false, summary: "Newsletter from TAP".into(), ..Extraction::default() };
-        let (ids, placement) = record_arrivals(&core, a, mail_id, vec![e], None).await.unwrap();
+        let (ids, placement) = record_arrivals(&core, a, mail_id, vec![e]).await.unwrap();
         let id = ids[0];
         assert_eq!(placement, None);
         assert!(store.list_trips(a).unwrap().is_empty(), "no draft for a newsletter");
@@ -2780,7 +2834,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().unwrap();
         let legs = Extraction::parse_many(ROUND_TRIP).unwrap();
-        let (ids, placement) = record_arrivals(&core, a, mail_id, legs.clone(), None).await.unwrap();
+        let (ids, placement) = record_arrivals(&core, a, mail_id, legs.clone()).await.unwrap();
         assert_eq!(ids.len(), 2, "both legs are kept");
         let placed = placement.expect("a booking was placed");
         let rows: Vec<scout_api::Arrival> =
@@ -2806,7 +2860,7 @@ mod tests {
 
         // A retry reads the same mail again: the pending rows are replaced,
         // not doubled.
-        let (again, _) = record_arrivals(&core, a, mail_id, legs, None).await.unwrap();
+        let (again, _) = record_arrivals(&core, a, mail_id, legs).await.unwrap();
         assert_eq!(again.len(), 2);
         assert_eq!(view(&core, a, "d").await.unwrap().pending.len(), 2, "two, not four");
         for old in ids {
@@ -2827,7 +2881,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let (ids, placement) = record_arrivals(&core, a, mail_id, legs, None).await.unwrap();
+        let (ids, placement) = record_arrivals(&core, a, mail_id, legs).await.unwrap();
         let placed = placement.expect("a booking was placed");
         assert_eq!(ids.len(), 2);
         for id in ids {
@@ -2862,7 +2916,7 @@ mod tests {
                 ..arrival("flight", "HKG → AMS", None, "2026-11-23")
             },
         ];
-        let (ids, placement) = record_arrivals(&core, a, mail_id, legs, None).await.unwrap();
+        let (ids, placement) = record_arrivals(&core, a, mail_id, legs).await.unwrap();
         assert_eq!(placement, Some(Placement::Trip(home.id)), "the return's trip took the ticket");
         assert_eq!(store.list_trips(a).unwrap().len(), 1, "no draft beside the trip it belongs to");
         for id in ids {
@@ -2877,7 +2931,7 @@ mod tests {
         let a = store.account_for_telegram(1).unwrap();
         let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().unwrap();
         let readings = Extraction::parse_many(r#"{"bookings":[],"summary":"Newsletter from TAP"}"#).unwrap();
-        let (ids, placement) = record_arrivals(&core, a, mail_id, readings, None).await.unwrap();
+        let (ids, placement) = record_arrivals(&core, a, mail_id, readings).await.unwrap();
         assert_eq!((ids.len(), placement), (1, None));
         assert!(store.list_trips(a).unwrap().is_empty(), "no draft for a newsletter");
         mail_done(&core, mail_id).await.unwrap();
@@ -3113,7 +3167,7 @@ mod tests {
             currency: Some("EUR".into()),
             ..arrival("flight", "AMS → HKG", Some("Hong Kong"), "2026-09-21")
         };
-        let (ids, _) = record_arrivals(&core, a, ticket_mail, vec![ticket], None).await.unwrap();
+        let (ids, _) = record_arrivals(&core, a, ticket_mail, vec![ticket]).await.unwrap();
         let plan = match add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap() {
             Outcome::Done(plan) => plan,
             other => panic!("{other:?}"),
@@ -3131,7 +3185,7 @@ mod tests {
             confirmation_code: Some("ZKVNPX".into()),
             ..arrival("flight", "AMS → HKG", Some("Hong Kong"), "2026-09-21")
         };
-        let (ids, placement) = record_arrivals(&core, a, pass_mail, vec![pass], None).await.unwrap();
+        let (ids, placement) = record_arrivals(&core, a, pass_mail, vec![pass]).await.unwrap();
         assert!(matches!(placement, Some(Placement::Trip(_))), "placed on the trip the ticket made");
         let plan = match add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap() {
             Outcome::Done(plan) => plan,
@@ -3148,10 +3202,10 @@ mod tests {
         // Something that is not a flight, sent twice with its code, joins itself too.
         let sim_mail = record_mail(&core, a, mail_in("re_sim")).await.unwrap().unwrap();
         let sim = Extraction { confirmation_code: Some("QUK437123".into()), ..arrival("activity", "5G eSIM", Some("Hong Kong"), "2026-09-21") };
-        let (ids, _) = record_arrivals(&core, a, sim_mail, vec![sim.clone()], None).await.unwrap();
+        let (ids, _) = record_arrivals(&core, a, sim_mail, vec![sim.clone()]).await.unwrap();
         add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap();
         let sim_again = record_mail(&core, a, mail_in("re_sim2")).await.unwrap().unwrap();
-        let (ids, _) = record_arrivals(&core, a, sim_again, vec![sim], None).await.unwrap();
+        let (ids, _) = record_arrivals(&core, a, sim_again, vec![sim]).await.unwrap();
         let plan = match add_arrival(&core, a, ids[0], AddTarget::Matched).await.unwrap() {
             Outcome::Done(plan) => plan,
             other => panic!("{other:?}"),

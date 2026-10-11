@@ -49,6 +49,12 @@ const TICK: Duration = Duration::from_secs(60);
 /// Other mail. The store enforces the same number in its view; this one
 /// decides when to say so.
 const ATTEMPTS: i64 = scout_core::inbox::MAIL_ATTEMPTS;
+
+/// The pause between one person's copy of a trip's mail and the next.
+/// Resend allows a couple of calls a second by default, and the pass has
+/// just spent some on the mail's body and files; a trip of four sent back
+/// to back would see its later copies turned away and owed to a retry.
+const SEND_GAP: Duration = Duration::from_millis(600);
 /// A bound on one request to Resend or its storage. Long enough for a
 /// ten-megabyte attachment on a slow link, short enough that a hung
 /// download does not stall the whole inbox.
@@ -522,7 +528,12 @@ async fn forward_to_trip(
         let all = scout_core::inbox::attachment_bytes(core, m.id).await.map_err(Failure::Reading)?;
         let (mut subject, mut text, mut html, mut attachments) = (subject, text, html, within_cap(all, FORWARD_CAP));
         let mut owed = owed.into_iter().peekable();
+        let mut first = true;
         while let Some((person, to)) = owed.next() {
+            if !first {
+                tokio::time::sleep(SEND_GAP).await;
+            }
+            first = false;
             // The last send takes the body itself; the others take a copy.
             let mail = if owed.peek().is_none() {
                 copy_for(from, to, sender, subject.take(), text.take(), html.take(), std::mem::take(&mut attachments))

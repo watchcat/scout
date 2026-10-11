@@ -1004,7 +1004,7 @@ pub fn sender_is_the_account(sender: &str, theirs: &[String]) -> bool {
 /// people. ASCII rather than Unicode on purpose: `to_lowercase` folds
 /// U+212A, the Kelvin sign, to a plain `k`, which would make two
 /// different mailboxes one and silently withhold a confirmation from
-/// whoever owns the plain one. It also matches how `our_handle` compares
+/// whoever owns the plain one. It also matches how `our_local_parts` compares
 /// our own domain. (Turkish costs nothing either way here: Rust
 /// lowercases `İ` to two code points and leaves `ı` alone, so neither
 /// spelling of an `i` was ever going to fold onto the other.)

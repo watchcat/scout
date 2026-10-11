@@ -152,7 +152,13 @@ pub(crate) async fn offer_a_link(
     // Counted on `ratelimit`'s keys rather than on what was typed and what
     // the header said: `victim+1@` and `victim+2@` are one inbox, and a
     // /128 out of an IPv6 client's own /64 is one client.
+    // Never an address on our own inbound domain: a sign-in there is an
+    // identity whose mail Scout forwards to itself — a person's handle or
+    // a trip's address — and a trip's mail forwarded to a trip address
+    // arrives as a new mail for that trip, without end. Refused as
+    // quietly as an undeliverable address, for the same reason.
     let send = deliverable(&address)
+        && !on_our_domain(&address, &auth.cfg.inbox_domain)
         && auth.by_address.allow(&ratelimit::address_key(&address))
         && auth.by_ip.allow(&client_bucket(headers));
     if send {
@@ -160,6 +166,12 @@ pub(crate) async fn offer_a_link(
     }
 
     Html(pages::check_your_inbox()).into_response()
+}
+
+/// Whether an address is one of ours: its domain, compared whole, is the
+/// inbound domain.
+fn on_our_domain(address: &str, domain: &str) -> bool {
+    address.rsplit_once('@').is_some_and(|(_, d)| d.trim().eq_ignore_ascii_case(domain.trim()))
 }
 
 /// Files a token and hands the mail off to a task of its own.
@@ -475,6 +487,15 @@ fn client_ip(headers: &HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_address_on_our_own_domain_is_never_an_identity() {
+        assert!(super::on_our_domain("lisbon-4f9qa@goodscout.fyi", "goodscout.fyi"));
+        assert!(super::on_our_domain("Sasha@GoodScout.FYI", "goodscout.fyi"));
+        assert!(!super::on_our_domain("sasha@example.com", "goodscout.fyi"));
+        assert!(!super::on_our_domain("sasha@goodscout.fyi.evil.example", "goodscout.fyi"));
+        assert!(!super::on_our_domain("no-at-sign", "goodscout.fyi"));
+    }
     use crate::tests::*;
     use axum::http::StatusCode;
 

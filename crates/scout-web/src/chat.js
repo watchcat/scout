@@ -3425,12 +3425,24 @@ function start() {
       for (const [label, path, said] of [
         ['New link', '/chat/trips/link-new', 'New link made. The old one no longer works.'],
         ['Turn link off', '/chat/trips/link-off', 'Link turned off.'],
-        ['New address', '/chat/trips/address-new', 'New address made. The old one no longer works.'],
       ]) {
         const button = node('button', 'people-link-action', label)
         button.type = 'button'
         button.addEventListener('click', () => linkAction(path, trip, said))
         actions.append(button)
+      }
+      // Asked first, unlike the link: a link lost costs one re-share, but
+      // a hotel holding the old address cannot be told the new one, and
+      // its next mail — a changed time, a cancellation — goes nowhere.
+      // Only where there is an address to replace.
+      if (trip.address) {
+        const replace = node('button', 'people-link-action', 'New address')
+        replace.type = 'button'
+        replace.addEventListener('click', () => askInPanel(ask,
+          'Replace the trip email? Mail sent to the old address, including from places you already booked with, will stop arriving.',
+          'New address',
+          () => linkAction('/chat/trips/address-new', trip, 'New address made. The old one no longer works.')))
+        actions.append(replace)
       }
     } else {
       const leave = node('button', 'people-leave', 'Leave trip')
@@ -3501,8 +3513,8 @@ function start() {
     }
   }
 
-  // New link and Turn link off change only the link's line, which comes
-  // with the trips: read them again.
+  // New link, Turn link off and New address change only what the trips
+  // carry — the link's line, the trip's address: read them again.
   async function linkAction(path, trip, said) {
     try {
       const res = await fetch(path, {

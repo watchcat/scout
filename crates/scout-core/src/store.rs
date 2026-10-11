@@ -121,6 +121,9 @@ CREATE TABLE IF NOT EXISTS trips (
     -- What labels call the owner once the trip is shared; NULL until then.
     -- Last, so a fresh database and one migrated by step 21 agree.
     owner_name  TEXT,
+    -- The trip's own address, the local part. Step 22; NULL until the
+    -- trip is kept and served. Always holds a dash, which a handle cannot.
+    address     TEXT,
     UNIQUE (account_id, name_key)
 );
 -- Where and when. This is all that gets re-searched.
@@ -242,6 +245,14 @@ CREATE TABLE IF NOT EXISTS trip_links (
     expires_at TIMESTAMP NOT NULL,
     admits     BIGINT NOT NULL DEFAULT 0,
     revoked_at TIMESTAMP
+);
+-- Who a trip's mail has been forwarded to, one row each, so a retry after
+-- a partial failure sends nobody a second copy.
+CREATE TABLE IF NOT EXISTS mail_forwards (
+    mail_id      BIGINT NOT NULL,
+    account_id   BIGINT NOT NULL,
+    forwarded_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (mail_id, account_id)
 );
 CREATE SEQUENCE IF NOT EXISTS accounts_id_seq;
 -- A person, independent of how they reach Scout. Deliberately almost empty:
@@ -417,7 +428,10 @@ CREATE TABLE IF NOT EXISTS inbound_mail (
     -- that refused a minute ago is the model that refuses now.
     attempted_at TIMESTAMP,
     forwarded_at TIMESTAMP,
-    error        TEXT
+    error        TEXT,
+    -- Set when the mail came to a trip's address rather than a person's;
+    -- `account_id` is then the trip's owner. Step 22.
+    trip_id      BIGINT
 );
 CREATE SEQUENCE IF NOT EXISTS attachments_id_seq;
 -- A file that came with a mail. `item_id` is set once the booking is added
@@ -486,7 +500,9 @@ CREATE TABLE IF NOT EXISTS arrivals (
     -- The airports changed at, comma-separated, the way `travellers` keeps
     -- its list: a connection is one booking, and the leg's itinerary strip
     -- has to show the stop or the card calls a one-stop ticket direct.
-    stops             TEXT
+    stops             TEXT,
+    -- Who pressed Add or Ignore, on a trip several people share. Step 22.
+    settled_by        BIGINT
 );
 "#;
 
@@ -1516,6 +1532,20 @@ CREATE TABLE IF NOT EXISTS trip_links (
 );
 "#;
 
+/// A trip's own address, and its mail: where it came to, who settled its
+/// bookings, who it was forwarded to. Nullable columns and a new table,
+/// as step 21.
+const STEP_22_TRIP_ADDRESS: &str = r#"
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS address TEXT;
+ALTER TABLE inbound_mail ADD COLUMN IF NOT EXISTS trip_id BIGINT;
+ALTER TABLE arrivals ADD COLUMN IF NOT EXISTS settled_by BIGINT;
+CREATE TABLE IF NOT EXISTS mail_forwards (
+    mail_id BIGINT NOT NULL, account_id BIGINT NOT NULL,
+    forwarded_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (mail_id, account_id)
+);
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -1539,6 +1569,7 @@ fn steps() -> Vec<(i64, Step)> {
         (19, Step::Sql(STEP_19_ITEM_COORDS)),
         (20, Step::Sql(STEP_20_ITEM_CHECK)),
         (21, Step::Sql(STEP_21_SHARING)),
+        (22, Step::Sql(STEP_22_TRIP_ADDRESS)),
     ]
 }
 
@@ -6636,7 +6667,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -6700,7 +6731,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -8608,7 +8639,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -9434,7 +9465,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 22, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -9475,7 +9506,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -9575,7 +9606,7 @@ CREATE TABLE conversations (
         // updated the table: the pod crash-looped on this step.
         let (_dir, path) = version_eighteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         let trip = s.list_trips(1).unwrap().remove(0);
         assert_eq!((trip.items[0].lat, trip.items[0].geocode_tried), (None, false));
         s.set_item_coords(trip.items[0].id, None).unwrap();
@@ -9612,7 +9643,7 @@ CREATE TABLE conversations (
     fn step_20_runs_on_a_database_that_has_items_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_nineteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         let item = &s.list_trips(1).unwrap()[0].items[0];
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
@@ -9910,6 +9941,7 @@ CREATE TABLE conversations (
              ALTER TABLE trip_items DROP COLUMN added_via;
              DROP TABLE trip_people;
              DROP TABLE trip_links;
+             ALTER TABLE trips DROP COLUMN address;
              CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
              DELETE FROM schema_version;
              INSERT INTO schema_version VALUES (20);
@@ -9926,11 +9958,47 @@ CREATE TABLE conversations (
     fn step_21_runs_on_a_database_with_trips_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 21);
+        assert_eq!(s.schema_version().unwrap(), 22);
         let trip = &s.list_trips(1).unwrap()[0];
         assert_eq!(trip.items[0].added, None, "an item from before sharing has no author");
         let (fresh, _d) = test_store();
         for table in ["trips", "trip_items", "trip_people", "trip_links"] {
+            assert_eq!(shape(&fresh.conn(), table), shape(&s.conn(), table), "{table}");
+        }
+    }
+
+    /// A database at 21 with a trip, a mail and an arrival in it, stripped
+    /// of what step 22 adds.
+    fn version_twenty_one_db() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v21.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE trips DROP COLUMN address;
+             ALTER TABLE inbound_mail DROP COLUMN trip_id;
+             ALTER TABLE arrivals DROP COLUMN settled_by;
+             DROP TABLE mail_forwards;
+             CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
+             DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES (21);
+             INSERT INTO accounts (id) VALUES (1);
+             INSERT INTO trips (id, account_id, name, name_key, kept) VALUES (1, 1, 'Lisbon', 'lisbon', true);
+             INSERT INTO inbound_mail (id, account_id, provider_id, from_address) VALUES (1, 1, 'p1', 'hotel@example.com');
+             INSERT INTO arrivals (id, account_id, mail_id, booking, summary, trip_id) VALUES (1, 1, 1, true, 'Hotel', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    #[test]
+    fn step_22_runs_on_a_database_with_mail_in_it_and_matches_a_fresh_one() {
+        let (_dir, path) = version_twenty_one_db();
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 22);
+        let (fresh, _d) = test_store();
+        for table in ["trips", "inbound_mail", "arrivals", "mail_forwards"] {
             assert_eq!(shape(&fresh.conn(), table), shape(&s.conn(), table), "{table}");
         }
     }
@@ -10483,7 +10551,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -10587,7 +10655,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -10607,7 +10675,8 @@ CREATE TABLE messages (
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(MIGRATIONS).unwrap();
         conn.execute_batch(
-            "ALTER TABLE arrivals DROP COLUMN airline;
+            "ALTER TABLE arrivals DROP COLUMN settled_by;
+             ALTER TABLE arrivals DROP COLUMN airline;
              ALTER TABLE arrivals DROP COLUMN flight_number;
              ALTER TABLE arrivals DROP COLUMN stops;
              CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
@@ -10628,7 +10697,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -10704,7 +10773,7 @@ CREATE TABLE messages (
         // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        assert_eq!(store.schema_version().unwrap(), 22);
         let part = mail_part("att_1", Some("inline"), None);
         let m = store
             .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))

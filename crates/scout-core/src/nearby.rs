@@ -332,6 +332,7 @@ mod tests {
             people: vec![],
             you_own: true,
             link: None,
+            address: None,
         }
     }
 

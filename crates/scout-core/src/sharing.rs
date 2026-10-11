@@ -66,6 +66,30 @@ pub async fn new_link(core: &Core, account_id: i64, trip: &str, fresh: String) -
     .await
 }
 
+/// A new address for the trip, for the owner.
+///
+/// Ownership is asked here, as `new_link` asks it, although the store asks
+/// again: the store's `None` means both "not the owner" and "a draft", and
+/// only the first is `NotOwner`. A draft has no address to replace — the
+/// page shows none on it, so offers no Replace — and is `NotFound`, the
+/// answer for a trip the request cannot act on, as is one deleted between
+/// the two reads. No variant of its own: nothing on the page could ask.
+pub async fn new_address(core: &Core, account_id: i64, trip: &str) -> anyhow::Result<Owned<String>> {
+    let store = core.store();
+    let trip = trip.to_string();
+    blocking(move || {
+        let Some(id) = trip_id(&store, account_id, &trip)? else { return Ok(Owned::NotFound) };
+        if !store.is_owner(account_id, id)? {
+            return Ok(Owned::NotOwner);
+        }
+        Ok(match store.new_trip_address(account_id, id)? {
+            Some(address) => Owned::Done(address),
+            None => Owned::NotFound,
+        })
+    })
+    .await
+}
+
 /// Turns the link off, for the owner.
 pub async fn link_off(core: &Core, account_id: i64, trip: &str) -> anyhow::Result<Owned<()>> {
     let store = core.store();
@@ -223,6 +247,28 @@ mod tests {
         assert_eq!(remove(&core, owner, "October", masha).await.unwrap(), Owned::Done(()));
         assert!(crate::trips::find(&core, masha, "October").await.unwrap().is_none());
         assert_eq!(new_link(&core, masha, "October", "c".repeat(22)).await.unwrap(), Owned::NotFound);
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_replaces_a_kept_trips_address() {
+        let (core, _dir, owner) = core().await;
+        assert_eq!(new_address(&core, owner, "October").await.unwrap(), Owned::NotFound, "a draft has none to replace");
+
+        // Sharing keeps the trip, so it has an address from here on.
+        let masha = core.store().account_for_telegram(12).unwrap();
+        share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
+        let old = crate::trips::find(&core, owner, "October").await.unwrap().unwrap().address.expect("a kept trip has one");
+        assert_eq!(new_address(&core, masha, "October").await.unwrap(), Owned::NotOwner);
+        let new = match new_address(&core, owner, "October").await.unwrap() {
+            Owned::Done(address) => address,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(new, old);
+        let seen = crate::trips::find(&core, masha, "October").await.unwrap().unwrap().address;
+        assert_eq!(seen.as_deref(), Some(new.as_str()), "everyone on the trip sees the new one");
+
+        let stranger = core.store().account_for_telegram(13).unwrap();
+        assert_eq!(new_address(&core, stranger, "October").await.unwrap(), Owned::NotFound);
     }
 
     #[tokio::test]

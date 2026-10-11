@@ -3691,11 +3691,6 @@ impl Store {
     /// The trip's address, given now if it is kept and has none. `None` for
     /// a draft: an address on a trip that may be gone tomorrow would send a
     /// hotel's confirmation nowhere.
-    ///
-    /// Test-only until the mail routing of the trip-address slice calls it
-    /// (Task 4). Drop the attribute, here and on `new_trip_address`,
-    /// `trip_for_address`, `draw_address` and `address_tail`, when it does.
-    #[cfg(test)]
     pub fn trip_address(&self, trip_id: i64) -> Result<Option<String>> {
         let conn = self.conn();
         // A trip that is not there has no address, rather than being a
@@ -3718,9 +3713,7 @@ impl Store {
     }
 
     /// A new address in place of the old, for the owner; the old one then
-    /// belongs to nobody. `None` for anyone else, and for a draft. Test-only, as
-    /// `trip_address`.
-    #[cfg(test)]
+    /// belongs to nobody. `None` for anyone else, and for a draft.
     pub fn new_trip_address(&self, account_id: i64, trip_id: i64) -> Result<Option<String>> {
         if !self.is_owner(account_id, trip_id)? {
             return Ok(None);
@@ -3741,9 +3734,7 @@ impl Store {
         draw_address(&conn, trip_id, &name).map(Some)
     }
 
-    /// Whose trip an address is: the trip and its owner. Test-only, as
-    /// `trip_address`.
-    #[cfg(test)]
+    /// Whose trip an address is: the trip and its owner.
     pub fn trip_for_address(&self, address: &str) -> Result<Option<(i64, i64)>> {
         let conn = self.conn();
         Ok(conn
@@ -4761,8 +4752,7 @@ const REACHES: &str = "(t.account_id = ? OR EXISTS (SELECT 1 FROM trip_people p 
      WHERE p.trip_id = t.id AND p.account_id = ? AND p.left_at IS NULL))";
 
 /// Five characters of `a-z0-9`: the part of a trip's address nobody can
-/// guess from the trip's name. Test-only, as `Store::trip_address`.
-#[cfg(test)]
+/// guess from the trip's name.
 fn address_tail() -> String {
     use rand::Rng;
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -4772,9 +4762,7 @@ fn address_tail() -> String {
 
 /// Draws a fresh address for the trip and writes it, under the lock the
 /// caller holds. Ten tries at a tail no other trip has; ten collisions in
-/// a row in a space of sixty million is a bug, said as one. Test-only, as
-/// `Store::trip_address`.
-#[cfg(test)]
+/// a row in a space of sixty million is a bug, said as one.
 fn draw_address(conn: &Connection, trip_id: i64, name: &str) -> Result<String> {
     let slug = crate::inbox::trip_address_slug(name);
     for _ in 0..10 {
@@ -5491,9 +5479,10 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
 /// account: a booking placed on a trip shared with that account must still
 /// show the trip's name. What makes that safe is where `trip_id` comes
 /// from. An arrival of mail sent to a trip's address always carries that
-/// mail's own trip — filing a trip's mail enforces it — and any other
-/// arrival's `trip_id` came from placement, which chooses only among the
-/// trips the arrival's own account reached. Either way, whoever can reach
+/// mail's own trip — `inbox::record_arrivals` enforces it, placing every
+/// booking of such a mail on the mail's trip without asking — and any
+/// other arrival's `trip_id` came from placement, which chooses only among
+/// the trips the arrival's own account reached. Either way, whoever can reach
 /// the arrival may see the name of the trip it is on.
 const ARRIVAL_SELECT: &str =
     "a.id, a.mail_id, a.booking, a.kind, a.title, a.place, a.origin, a.destination,
@@ -5507,13 +5496,9 @@ const ARRIVAL_SELECT: &str =
 /// Where a delivered mail is filed: under an account, for its own address,
 /// or under a trip, for the trip's address — and so under the trip's owner,
 /// whom `insert_mail_within` reads itself.
-///
-/// `Trip` is test-only with `insert_trip_mail`, its one maker (Task 4);
-/// drop the attribute here and on its match arm when that one goes.
 #[derive(Clone, Copy)]
 enum MailTo {
     Account(i64),
-    #[cfg(test)]
     Trip(i64),
 }
 
@@ -5684,10 +5669,6 @@ impl Store {
     /// `None` also when the trip no longer exists — deleted between the
     /// address lookup and this write. To the caller that is the same as a
     /// redelivery: nothing was stored and there is nothing to read.
-    ///
-    /// Test-only until core files a trip's mail through it (Task 4); drop
-    /// the attribute when it does.
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn insert_trip_mail(
         &self,
@@ -5726,7 +5707,6 @@ impl Store {
         }
         let (account_id, trip_id): (i64, Option<i64>) = match to {
             MailTo::Account(account_id) => (account_id, None),
-            #[cfg(test)]
             MailTo::Trip(trip_id) => {
                 let owner: Option<i64> = conn
                     .query_row("SELECT account_id FROM trips WHERE id = ?", params![trip_id], |r| r.get(0))
@@ -6153,10 +6133,6 @@ impl Store {
 
     /// Who settled an arrival, and how: `(status, account)`. `None` while
     /// it waits, or for one decided before step 22 recorded the presser.
-    ///
-    /// Test-only until core reads who settled a trip's booking (Task 4);
-    /// drop the attribute when it does.
-    #[cfg(test)]
     pub fn arrival_settler(&self, id: i64) -> Result<Option<(String, i64)>> {
         let conn = self.conn();
         Ok(conn

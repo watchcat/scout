@@ -152,6 +152,8 @@ enum Command {
     Unkick(String),
     #[command(description = "admin only: take a database backup now")]
     Backup,
+    #[command(description = "admin only: what Scout has done since the last restart")]
+    Metrics,
 }
 
 const HELP: &str = "\
@@ -183,7 +185,11 @@ const ADMIN_HELP: &str = "\n\
 /invite announce <name> - tell the waitlist a round is open (admin)\n\
 /kick <user_id> - remove a member (admin)\n\
 /unkick <user_id> - undo a kick (admin)\n\
-/backup - copy the database now, before doing something risky (admin)";
+/backup - copy the database now, before doing something risky (admin)\n\
+/metrics - runs, tools, provider errors and the store's lock since the last restart (admin)";
+
+/// What `/metrics` says outside a private chat.
+const METRICS_IN_PRIVATE: &str = "Ask me for /metrics in our private chat.";
 
 /// What a stranger who sends a bare `/start` is told. The one message a
 /// non-member gets unprompted: silence here reads as broken rather than as
@@ -509,6 +515,23 @@ async fn handle_command(
                 Err(e) => format!("Backup failed: {e}"),
             };
             bot.send_message(msg.chat.id, reply).await?;
+        }
+        // The same counts `/metrics` serves on the pod's own port, read
+        // from memory: this is the process that keeps them. Admin only,
+        // because they are everyone's runs, not the caller's.
+        Command::Metrics => {
+            let Some(user_id) = sender_id(&msg) else { return Ok(()) };
+            if !app.core.is_admin(scout_core::ids::TelegramId(user_id)) {
+                bot.send_message(msg.chat.id, scout_core::invites::NOT_ADMIN).await?;
+                return Ok(());
+            }
+            // The admin is who asked, not who reads: in a group the
+            // answer would go to everyone in it.
+            if !msg.chat.is_private() {
+                bot.send_message(msg.chat.id, METRICS_IN_PRIVATE).await?;
+                return Ok(());
+            }
+            bot.send_message(msg.chat.id, scout_core::metrics::global().summary()).await?;
         }
         Command::Advert(body) => {
             let Some(user_id) = sender_id(&msg) else { return Ok(()) };
@@ -1792,6 +1815,29 @@ mod tests {
             "a note this channel writes to itself must carry the marker, or the reader \
              will see it in their transcript as their own words"
         );
+    }
+
+    #[test]
+    fn metrics_are_for_the_admin_alone() {
+        // Everyone's runs and every provider's failures: the admin's to
+        // read, and listed only in the help an admin is shown. A source
+        // assertion for the reason the tests above give.
+        let src = include_str!("bot.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let arm = &src[src.find("Command::Metrics =>").expect("the command is handled")..];
+        let arm = &arm[..arm[1..].find("Command::").expect("another arm follows") + 1];
+        let gate = arm.find("if !app.core.is_admin(").expect("the arm turns away anyone but the admin");
+        let private = arm.find("if !msg.chat.is_private()").expect("the arm turns away a group");
+        let reply = arm.find("summary()").expect("the arm sends the summary");
+        assert!(gate < private && private < reply, "both checks come before the summary");
+        assert_eq!(
+            arm[..gate].matches("send_message").count(),
+            0,
+            "nothing is sent before the admin check"
+        );
+        assert!(arm[gate..private].contains("NOT_ADMIN"), "anyone else is told it is the admin's");
+        assert!(super::ADMIN_HELP.contains("/metrics"));
+        assert!(!super::HELP.contains("/metrics"));
     }
 
     #[test]

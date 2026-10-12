@@ -188,6 +188,9 @@ const ADMIN_HELP: &str = "\n\
 /backup - copy the database now, before doing something risky (admin)\n\
 /metrics - runs, tools, provider errors and the store's lock since the last restart (admin)";
 
+/// What `/metrics` says outside a private chat.
+const METRICS_IN_PRIVATE: &str = "Ask me for /metrics in our private chat.";
+
 /// What a stranger who sends a bare `/start` is told. The one message a
 /// non-member gets unprompted: silence here reads as broken rather than as
 /// closed, and pressing START is the single most likely thing a person does
@@ -520,6 +523,12 @@ async fn handle_command(
             let Some(user_id) = sender_id(&msg) else { return Ok(()) };
             if !app.core.is_admin(scout_core::ids::TelegramId(user_id)) {
                 bot.send_message(msg.chat.id, scout_core::invites::NOT_ADMIN).await?;
+                return Ok(());
+            }
+            // The admin is who asked, not who reads: in a group the
+            // answer would go to everyone in it.
+            if !msg.chat.is_private() {
+                bot.send_message(msg.chat.id, METRICS_IN_PRIVATE).await?;
                 return Ok(());
             }
             bot.send_message(msg.chat.id, scout_core::metrics::global().summary()).await?;
@@ -1816,11 +1825,17 @@ mod tests {
         let src = include_str!("bot.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         let arm = &src[src.find("Command::Metrics =>").expect("the command is handled")..];
-        let arm = &arm[..arm.find("Command::Advert").expect("the next arm follows")];
-        let gate = arm.find("is_admin(").expect("the arm checks for the admin");
+        let arm = &arm[..arm[1..].find("Command::").expect("another arm follows") + 1];
+        let gate = arm.find("if !app.core.is_admin(").expect("the arm turns away anyone but the admin");
+        let private = arm.find("if !msg.chat.is_private()").expect("the arm turns away a group");
         let reply = arm.find("summary()").expect("the arm sends the summary");
-        assert!(gate < reply, "the admin check must come before anything is sent");
-        assert!(arm.contains("NOT_ADMIN"), "anyone else is told it is the admin's");
+        assert!(gate < private && private < reply, "both checks come before the summary");
+        assert_eq!(
+            arm[..gate].matches("send_message").count(),
+            0,
+            "nothing is sent before the admin check"
+        );
+        assert!(arm[gate..private].contains("NOT_ADMIN"), "anyone else is told it is the admin's");
         assert!(super::ADMIN_HELP.contains("/metrics"));
         assert!(!super::HELP.contains("/metrics"));
     }

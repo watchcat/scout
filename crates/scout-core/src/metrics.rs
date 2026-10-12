@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The most label sets one counter keeps. A tool name comes from the
 /// model's call, and a model can name a tool that does not exist; past
@@ -35,7 +35,11 @@ const RUN_BUCKETS: &[f64] = &[1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0, 120.0
 /// Upper bounds, in seconds, for a wait on the store's lock: from an
 /// uncontended take, well under a tenth of a millisecond, up to a backup
 /// holding it for seconds.
-const LOCK_BUCKETS: &[f64] = &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0];
+const LOCK_BUCKETS: &[f64] = &[0.0001, 0.0005, 0.001, 0.005, SLOW_WAIT, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0];
+
+/// A wait on the store's lock the summary calls slow. One of the bounds
+/// above, by name, so the count and its label cannot drift apart.
+const SLOW_WAIT: f64 = 0.01;
 
 /// A distribution, kept as a count per bucket plus one past the last.
 /// Cumulative only when written out, so an observation is one add.
@@ -119,10 +123,10 @@ fn escape(value: &str) -> String {
 }
 
 pub struct Metrics {
-    /// When this set began counting. The process's set is made by the
-    /// first store call, which is `Core::start` opening the database — so
-    /// this is the restart the summary counts from.
-    started: std::time::Instant,
+    /// When this set began counting. The process's set is made when
+    /// `Store::open` first asks for it, inside `Core::start` — so this is
+    /// the restart the summary counts from.
+    started: Instant,
     runs: Counter,
     run_duration: Histogram,
     tool_calls: Counter,
@@ -134,7 +138,7 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
-            started: std::time::Instant::now(),
+            started: Instant::now(),
             runs: Counter::new(&["outcome"]),
             run_duration: Histogram::new(RUN_BUCKETS),
             tool_calls: Counter::new(&["tool", "status"]),
@@ -209,6 +213,8 @@ fn quantile_bound(bounds: &[f64], counts: &[u64], q: f64) -> Option<f64> {
 
 /// A length as a number and its unit: milliseconds under a second,
 /// minutes from one, seconds between. One decimal at most, none when whole.
+/// Meant for bucket bounds, which sit well inside a unit: the unit is
+/// chosen before rounding, so 0.99996 s would read `1000 ms`.
 fn span_parts(secs: f64) -> (String, &'static str) {
     let (value, unit) = match secs {
         s if s < 1.0 => (s * 1000.0, "ms"),
@@ -288,6 +294,8 @@ impl Metrics {
         self.summary_after(self.started.elapsed())
     }
 
+    /// The summary for a set that has been counting for `uptime`, apart
+    /// from the clock so a test can say how long that was.
     fn summary_after(&self, uptime: Duration) -> String {
         [
             format!("Since restart {} ago\n", ago(uptime)),
@@ -325,7 +333,11 @@ impl Metrics {
     fn tools_line(&self) -> String {
         let mut tools: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         for (k, n) in self.tool_calls.snapshot() {
-            let entry = tools.entry(k[0].clone()).or_default();
+            // A name the model invented is shown, not obeyed: a newline in
+            // it would forge a line of this summary.
+            let tool: String = k[0].chars().map(|c| if c.is_control() { '?' } else { c }).collect();
+            let tool = if tool.trim().is_empty() { "(unnamed)".to_string() } else { tool };
+            let entry = tools.entry(tool).or_default();
             entry.0 += n;
             if k[1] == "failed" {
                 entry.1 += n;
@@ -335,7 +347,8 @@ impl Metrics {
             return "Tools: none yet".to_string();
         }
         let mut busiest: Vec<(String, (u64, u64))> = tools.into_iter().collect();
-        busiest.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
+        // Stable, over a map already in name order: a tie reads alphabetically.
+        busiest.sort_by_key(|(_, (all, _))| std::cmp::Reverse(*all));
         let mut said: Vec<String> = busiest
             .iter()
             .take(TOOLS_NAMED)
@@ -379,11 +392,13 @@ impl Metrics {
         if total == 0 {
             return "Store lock: no takes yet".to_string();
         }
-        let within = LOCK_BUCKETS.iter().position(|&b| b == 0.01).expect("10 ms is a bound");
+        // Past the bucket that ends at the threshold: a wait of exactly
+        // 10 ms is within it, since buckets are `le`.
+        let within = LOCK_BUCKETS.iter().position(|&b| b == SLOW_WAIT).expect("SLOW_WAIT is one of the bounds");
         let slow: u64 = counts[within + 1..].iter().sum();
         let slow = match slow {
-            0 => "none waited over 10 ms".to_string(),
-            n => format!("{} waited over 10 ms", grouped(n)),
+            0 => format!("none waited over {}", span(SLOW_WAIT)),
+            n => format!("{} waited over {}", grouped(n), span(SLOW_WAIT)),
         };
         let last = counts.iter().rposition(|&n| n > 0).expect("total is not zero");
         let longest = match last {
@@ -563,6 +578,52 @@ mod tests {
         m.lock_waited(Duration::from_micros(20));
         let text = m.summary_after(FOURTEEN_HOURS);
         assert!(text.ends_with("Store lock: 1 take, none waited over 10 ms, longest under 0.1 ms"), "{text}");
+    }
+
+    #[test]
+    fn a_wait_of_exactly_ten_ms_is_not_slow_and_one_just_past_it_is() {
+        let m = Metrics::default();
+        m.lock_waited(Duration::from_millis(7));
+        m.lock_waited(Duration::from_millis(10));
+        let text = m.summary_after(FOURTEEN_HOURS);
+        assert!(text.ends_with("Store lock: 2 takes, none waited over 10 ms, longest 5–10 ms"), "{text}");
+        m.lock_waited(Duration::from_micros(10_001));
+        let text = m.summary_after(FOURTEEN_HOURS);
+        assert!(text.ends_with("Store lock: 3 takes, 1 waited over 10 ms, longest 10–50 ms"), "{text}");
+    }
+
+    #[test]
+    fn runs_that_were_only_turned_away_have_no_lengths_to_report() {
+        let m = Metrics::default();
+        m.run_refused("overloaded");
+        m.run_refused("busy");
+        let text = m.summary_after(FOURTEEN_HOURS);
+        let runs = text.lines().find(|l| l.starts_with("Runs:")).unwrap();
+        assert_eq!(runs, "Runs: 1 busy, 1 overloaded");
+    }
+
+    #[test]
+    fn eight_tools_are_all_named_and_a_ninth_is_counted() {
+        let m = Metrics::default();
+        for i in 0..8 {
+            m.tool_call(&format!("t{i}"), "ok");
+        }
+        let line = |m: &Metrics| m.summary_after(FOURTEEN_HOURS).lines().find(|l| l.starts_with("Tools:")).unwrap().to_string();
+        assert_eq!(line(&m), "Tools: t0 1, t1 1, t2 1, t3 1, t4 1, t5 1, t6 1, t7 1");
+        m.tool_call("t8", "ok");
+        assert_eq!(line(&m), "Tools: t0 1, t1 1, t2 1, t3 1, t4 1, t5 1, t6 1, t7 1, and 1 more");
+    }
+
+    #[test]
+    fn a_tool_name_cannot_forge_a_line_of_the_summary() {
+        let m = Metrics::default();
+        m.tool_call("x\nStore lock: 0 takes", "failed");
+        m.tool_call("", "ok");
+        let text = m.summary_after(Duration::from_secs(45));
+        assert!(text.starts_with("Since restart 45s ago"), "{text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("Store lock:")).count(), 1, "{text}");
+        assert!(text.contains("x?Store lock: 0 takes 1 (1 failed)"), "{text}");
+        assert!(text.contains("(unnamed) 1"), "{text}");
     }
 
     #[test]

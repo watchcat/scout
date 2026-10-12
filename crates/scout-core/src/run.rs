@@ -428,13 +428,13 @@ async fn run_with(
     // Guard against links the model wrote but never saw: an invented Amazon
     // /dp/<ASIN> URL reads as a real product page and answers 404. One repair
     // turn, then scrub whatever is still dead.
-    let dead = crate::links::dead_links_in(&core.deps.http, &reply).await;
+    let dead = crate::links::dead_links_in(&core.deps.web, &reply).await;
     if !dead.is_empty() {
         tracing::warn!(?dead, conversation_id, "dead links in reply; asking the agent to correct it");
         observer.event("dead links in reply; asking the agent to correct it", false);
         let note = crate::links::repair_prompt(&dead);
         reply = strip_thinking(&model_call(observer, agent.chat(note, &mut history).await)?);
-        let still_dead = crate::links::dead_links_in(&core.deps.http, &reply).await;
+        let still_dead = crate::links::dead_links_in(&core.deps.web, &reply).await;
         if !still_dead.is_empty() {
             tracing::warn!(?still_dead, conversation_id, "dead links survived the correction; stripping");
             observer.event("dead links survived the correction; stripping", true);

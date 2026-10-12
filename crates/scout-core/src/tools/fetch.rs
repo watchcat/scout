@@ -668,7 +668,9 @@ fn availability(html: &str) -> Option<&'static str> {
 /// retailer listing page and pull out direct product URLs and prices.
 /// Built per request, so `opens` counts this request's page opens.
 pub struct FetchPageTool {
-    pub http: reqwest::Client,
+    /// Public internet only — see `net_guard`. Never the integrations'
+    /// shared client: every URL this tool opens was chosen by the model.
+    pub web: crate::net_guard::OpenWeb,
     /// Headless-Chrome fallback, when a browser is installed. Only reached
     /// after plain HTTP has failed.
     pub renderer: Option<super::browser::Renderer>,
@@ -681,9 +683,9 @@ pub struct FetchPageTool {
 }
 
 impl FetchPageTool {
-    pub fn new(http: reqwest::Client, renderer: Option<super::browser::Renderer>) -> Self {
+    pub fn new(web: crate::net_guard::OpenWeb, renderer: Option<super::browser::Renderer>) -> Self {
         Self {
-            http,
+            web,
             renderer,
             opens: std::sync::atomic::AtomicUsize::new(0),
             seen: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -771,6 +773,14 @@ impl Tool for FetchPageTool {
             tracing::info!(url = %url, "already read this request; serving the page again");
             return Ok(cached.clone());
         }
+        // Before the budget and before the renderer: an address inside the
+        // pod or the cluster is not a page that failed, it is a page that
+        // does not exist for us, and the model should hear that in words
+        // rather than as a connector error it might retry.
+        if self.web.guard.check(&url).await.is_err() {
+            tracing::warn!(url = %url, "refused a non-public address");
+            return Err(FetchError::Invalid(crate::net_guard::NOT_PUBLIC.to_string()));
+        }
         // Counted only once the url is worth opening, so a malformed one
         // costs the model a turn but not part of its page budget.
         if self.opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_OPENS {
@@ -784,7 +794,16 @@ impl Tool for FetchPageTool {
         if fetched != url {
             tracing::info!(url = %url, via = %fetched, "using the readable host");
         }
-        let resp = browser_get(&self.http, fetched.clone()).send().await?;
+        // A redirect hop or a rebinding name is refused inside the client;
+        // this only translates that refusal into the same sentence.
+        let resp = browser_get(&self.web.http, fetched.clone()).send().await.map_err(|e| {
+            if crate::net_guard::refused(&e) {
+                tracing::warn!(url = %url, "refused a redirect to a non-public address");
+                FetchError::Invalid(crate::net_guard::NOT_PUBLIC.to_string())
+            } else {
+                FetchError::Http(e)
+            }
+        })?;
         let status = resp.status();
         let body = if status.is_success() { resp.text().await? } else { String::new() };
 
@@ -961,6 +980,8 @@ fn find_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_guard::OpenWeb;
+    use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1035,7 +1056,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = FetchPageTool::new(reqwest::Client::new(), None);
+        let tool = FetchPageTool::new(OpenWeb::exempting(*server.address()), None);
         let page = tool
             .call(FetchArgs { url: format!("{}/p/1", server.uri()) })
             .await
@@ -1062,7 +1083,7 @@ mod tests {
             .await;
 
         // No renderer configured, so the wall cannot be cleared.
-        let tool = FetchPageTool::new(reqwest::Client::new(), None);
+        let tool = FetchPageTool::new(OpenWeb::exempting(*server.address()), None);
         let err = tool
             .call(FetchArgs { url: format!("{}/thread", server.uri()) })
             .await
@@ -1438,7 +1459,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = FetchPageTool::new(reqwest::Client::new(), None);
+        let tool = FetchPageTool::new(OpenWeb::exempting(*server.address()), None);
         let first = format!("{}/p/1", server.uri());
         for _ in 0..3 {
             let page = tool.call(FetchArgs { url: first.clone() }).await.unwrap();
@@ -1459,7 +1480,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = FetchPageTool::new(reqwest::Client::new(), None);
+        let tool = FetchPageTool::new(OpenWeb::exempting(*server.address()), None);
         for i in 0..MAX_OPENS {
             let page = tool.call(FetchArgs { url: format!("{}/p/{i}", server.uri()) }).await;
             assert!(page.is_ok(), "open {i} should be allowed");
@@ -1471,7 +1492,7 @@ mod tests {
         assert!(err.to_string().contains("page budget spent"), "got: {err}");
 
         // A fresh tool (i.e. the next request) starts with a full budget.
-        let next = FetchPageTool::new(reqwest::Client::new(), None);
+        let next = FetchPageTool::new(OpenWeb::exempting(*server.address()), None);
         assert!(next.call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.is_ok());
     }
 
@@ -1484,7 +1505,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tool = FetchPageTool::new(reqwest::Client::new(), None);
+        let tool = FetchPageTool::new(OpenWeb::exempting(*server.address()), None);
         let err = tool
             .call(FetchArgs { url: format!("{}/gone", server.uri()) })
             .await
@@ -1496,5 +1517,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("scheme"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_address_inside_the_pod_is_refused_before_anything_is_sent() {
+        // What a prompt injection on a page Scout reads would ask for: the
+        // pod's own metrics listener, echoed back into the chat.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("secret_total 1"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tool = FetchPageTool::new(OpenWeb::new(Duration::from_secs(5)).unwrap(), None);
+        for url in [
+            format!("{}/metrics", server.uri()),
+            "http://169.254.169.254/latest/meta-data/".to_string(),
+            "http://10.43.0.1/".to_string(),
+            "http://localhost:9090/metrics".to_string(),
+        ] {
+            let err = tool.call(FetchArgs { url: url.clone() }).await.unwrap_err();
+            assert!(matches!(err, FetchError::Invalid(_)), "{url}: {err:?}");
+            assert!(err.to_string().contains("not on the public internet"), "{url}: {err}");
+        }
+        // Refusals are not opens: the budget is untouched.
+        assert_eq!(tool.opens.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_public_page_that_redirects_into_the_pod_is_refused() {
+        let public = MockServer::start().await;
+        let private = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("secret_total 1"))
+            .expect(0)
+            .mount(&private)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/innocent"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/metrics", private.uri())),
+            )
+            .mount(&public)
+            .await;
+
+        let tool = FetchPageTool::new(OpenWeb::exempting(*public.address()), None);
+        let err = tool
+            .call(FetchArgs { url: format!("{}/innocent", public.uri()) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Invalid(_)), "got: {err:?}");
+        assert!(err.to_string().contains("not on the public internet"), "got: {err}");
     }
 }

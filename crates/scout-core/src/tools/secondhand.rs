@@ -62,7 +62,9 @@ pub fn parse_sites(value: &str) -> Vec<String> {
 
 pub struct SecondhandSearchTool {
     pub client: KagiClient,
-    pub http: reqwest::Client,
+    /// Probes the hits; public internet only, as every hit is a URL a
+    /// search engine handed back rather than one we chose.
+    pub web: crate::net_guard::OpenWeb,
     /// When configured, eBay sites are queried through the official Browse
     /// API (live price/condition/availability) instead of Kagi + probing.
     pub ebay: Option<EbayClient>,
@@ -103,7 +105,7 @@ impl Tool for SecondhandSearchTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let searches = self.sites.iter().map(|site| {
             let client = self.client.clone();
-            let http = self.http.clone();
+            let web = self.web.clone();
             let ebay = self.ebay.clone();
             let marktplaats = self.marktplaats.clone();
             let budget = self.budget.clone();
@@ -202,9 +204,9 @@ impl Tool for SecondhandSearchTool {
                     Ok(results) => {
                         // Verify every hit concurrently; drop deleted listings.
                         let alive = futures::future::join_all(results.iter().map(|r| {
-                            let http = http.clone();
+                            let web = web.clone();
                             let url = r.url.clone();
-                            async move { !is_dead_link(&http, &url).await }
+                            async move { !is_dead_link(&web, &url).await }
                         }))
                         .await;
                         let total = results.len();
@@ -306,7 +308,7 @@ mod tests {
                 "k".to_string(),
                 server.uri(),
             ),
-            http: reqwest::Client::new(),
+            web: crate::net_guard::OpenWeb::exempting(*server.address()),
             ebay: None,
             marktplaats: MarktplaatsClient::new(reqwest::Client::new(), server.uri()),
             budget: Default::default(),

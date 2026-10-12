@@ -282,6 +282,11 @@ impl Core {
         Ok(ids.iter().any(|id| self.cfg.allowed_user_ids.contains(id)))
     }
 
+    /// The program that draws a PDF's pages; see `Config::pdftoppm`.
+    pub fn pdftoppm(&self) -> &str {
+        &self.cfg.pdftoppm
+    }
+
     pub fn is_admin(&self, id: crate::ids::TelegramId) -> bool {
         is_admin_id(&self.cfg.admin_user_ids, id.0)
     }

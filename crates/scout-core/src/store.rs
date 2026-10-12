@@ -1793,6 +1793,16 @@ pub struct NewArrival {
     pub trip_id: Option<i64>,
 }
 
+/// What `Store::document_state` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentState {
+    pub mail_id: i64,
+    /// Read or refused, so nothing is still writing to it.
+    pub settled: bool,
+    /// The reading found at least one booking.
+    pub booking: bool,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -6212,18 +6222,27 @@ impl Store {
         Ok(())
     }
 
-    /// This account's mail under `provider_id`, if reading it found no
-    /// booking: the one a file sent to the bot again may replace. `None`
-    /// for another account's, and for one that held a booking.
-    pub fn found_nothing_in(&self, account_id: i64, provider_id: &str) -> Result<Option<i64>> {
+    /// Where this account's earlier copy of a file sent to the bot stands:
+    /// `None` when there is none. Telegram documents only — the one kind of
+    /// mail a sender can hand in twice on purpose — and only this
+    /// account's, since the delete this feeds must never reach anyone
+    /// else's.
+    ///
+    /// Settled means read, or refused: `done` or `failed`. A mail still
+    /// `extracting` is not settled even on its last attempt, though
+    /// `unreadable` counts it so: `mail_attempted` spends that attempt
+    /// when the pass begins, and a pass that reads pages from pictures can
+    /// run for minutes after it.
+    pub fn document_state(&self, account_id: i64, provider_id: &str) -> Result<Option<DocumentState>> {
         let conn = self.conn();
         Ok(conn
             .query_row(
-                "SELECT m.id FROM inbound_mail m
-                 WHERE m.provider_id = ? AND m.account_id = ?
-                   AND NOT EXISTS (SELECT 1 FROM arrivals a WHERE a.mail_id = m.id AND a.booking)",
+                "SELECT m.id, m.status IN ('done', 'failed'),
+                        EXISTS (SELECT 1 FROM arrivals a WHERE a.mail_id = m.id AND a.booking)
+                 FROM inbound_mail m
+                 WHERE m.provider_id = ? AND m.account_id = ? AND m.from_address = 'telegram' AND m.trip_id IS NULL",
                 params![provider_id, account_id],
-                |r| r.get(0),
+                |r| Ok(DocumentState { mail_id: r.get(0)?, settled: r.get(1)?, booking: r.get(2)? }),
             )
             .optional()?)
     }
@@ -11431,27 +11450,34 @@ CREATE TABLE messages (
     }
 
     #[test]
-    fn a_mail_that_held_no_booking_is_found_only_for_its_own_account() {
+    fn a_documents_state_is_this_accounts_and_settled_only_once_it_is_read() {
         let (s, _dir) = test_store();
         let me = s.account_for_telegram(1).unwrap();
         let other = s.account_for_telegram(2).unwrap();
-        let mail = s.insert_mail(me, "telegram:same-file", "telegram", Some("hotel.pdf"), Some(""), None, false, &[]).unwrap().unwrap();
-        assert_eq!(s.found_nothing_in(me, "telegram:same-file").unwrap(), Some(mail));
-        assert_eq!(s.found_nothing_in(other, "telegram:same-file").unwrap(), None, "not another account's");
-        assert_eq!(s.found_nothing_in(me, "telegram:never-sent").unwrap(), None);
+        let mail = s.insert_mail(me, "telegram:1:same-file", "telegram", Some("hotel.pdf"), Some(""), None, false, &[]).unwrap().unwrap();
+        let state = |_: i64, booking, settled| Some(DocumentState { mail_id: mail, settled, booking });
+        assert_eq!(s.document_state(me, "telegram:1:same-file").unwrap(), state(me, false, false), "new: not settled");
+        assert_eq!(s.document_state(other, "telegram:1:same-file").unwrap(), None, "not another account's");
+        assert_eq!(s.document_state(me, "telegram:1:never-sent").unwrap(), None);
 
-        // A reading that was not a booking leaves it replaceable; one that
-        // was, does not.
-        s.conn().execute(
-            "INSERT INTO arrivals (account_id, mail_id, booking, summary) VALUES (?, ?, false, 'a newsletter')",
-            params![me, mail],
-        ).unwrap();
-        assert_eq!(s.found_nothing_in(me, "telegram:same-file").unwrap(), Some(mail));
-        s.conn().execute(
-            "INSERT INTO arrivals (account_id, mail_id, booking, summary) VALUES (?, ?, true, 'Hotel Mashuk')",
-            params![me, mail],
-        ).unwrap();
-        assert_eq!(s.found_nothing_in(me, "telegram:same-file").unwrap(), None);
+        // On its last attempt and still being read: not settled, though
+        // the Other-mail list already counts it unreadable.
+        for _ in 0..MAIL_ATTEMPTS {
+            s.mail_attempted(mail).unwrap();
+        }
+        assert_eq!(s.document_state(me, "telegram:1:same-file").unwrap(), state(me, false, false));
+        s.mail_failed(mail, "the model was down").unwrap();
+        assert_eq!(s.document_state(me, "telegram:1:same-file").unwrap(), state(me, false, true), "refused is settled");
+        s.mail_done(mail).unwrap();
+        s.conn().execute("INSERT INTO arrivals (account_id, mail_id, booking, summary) VALUES (?, ?, false, 'a newsletter')", params![me, mail]).unwrap();
+        assert_eq!(s.document_state(me, "telegram:1:same-file").unwrap(), state(me, false, true), "a reading that was not a booking");
+        s.conn().execute("INSERT INTO arrivals (account_id, mail_id, booking, summary) VALUES (?, ?, true, 'Hotel')", params![me, mail]).unwrap();
+        assert_eq!(s.document_state(me, "telegram:1:same-file").unwrap(), state(me, true, true));
+
+        // Mail from anywhere else is not a document, whatever its id.
+        let emailed = s.insert_mail(me, "re_123", "hotel@example.com", Some("Booking"), Some("body"), None, false, &[]).unwrap().unwrap();
+        s.mail_done(emailed).unwrap();
+        assert_eq!(s.document_state(me, "re_123").unwrap(), None);
     }
 
     #[test]

@@ -57,6 +57,10 @@ pub struct Config {
     /// the bot. Bounds volume per person; rounds bound how many people
     /// there are.
     pub invite_daily_requests: i64,
+    /// The program that draws a PDF's pages for reading from pictures:
+    /// `SCOUT_PDFTOPPM`, or poppler's `pdftoppm` on the path. A setting so
+    /// a test can stand a script in for it.
+    pub pdftoppm: String,
     /// Ignav fare-search key. A second flights provider whose prices are
     /// approximate rather than bookable (their docs say to show them as
     /// "from $299"), so its rows arrive labelled. 1,000 free requests,
@@ -226,6 +230,7 @@ impl Config {
             duffel_links_enabled,
             ignav_api_key: non_empty("IGNAV_API_KEY"),
             invite_daily_requests,
+            pdftoppm: non_empty("SCOUT_PDFTOPPM").unwrap_or_else(|| "pdftoppm".to_string()),
         })
     }
 }

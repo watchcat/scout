@@ -16,11 +16,22 @@ const MAX_PROBES: usize = 12;
 /// (404/410 — e.g. a deleted Marktplaats listing answers 410, an invented
 /// Amazon ASIN answers 404). Bot walls (403/503) and network errors are NOT
 /// dead: we just can't verify those.
-pub async fn is_dead_link(http: &reqwest::Client, url: &str) -> bool {
+///
+/// The URLs come from the model's reply, so they get the same fence as
+/// `fetch_page`: an address inside the pod or the cluster is never
+/// requested. It counts as not dead — unverifiable, like a bot wall —
+/// because striking it would tell the model which internal addresses
+/// answer 404, and probing is the thing being refused.
+pub async fn is_dead_link(web: &crate::net_guard::OpenWeb, url: &str) -> bool {
     if is_single_use(url) {
         return false;
     }
-    match crate::tools::fetch::browser_get(http, url)
+    let Ok(parsed) = reqwest::Url::parse(url) else { return false };
+    if web.guard.check(&parsed).await.is_err() {
+        tracing::warn!(url, "not probing a non-public address");
+        return false;
+    }
+    match crate::tools::fetch::browser_get(&web.http, parsed)
         .timeout(PROBE_TIMEOUT)
         .send()
         .await
@@ -77,12 +88,12 @@ pub fn extract_urls(text: &str) -> Vec<String> {
 
 /// Probes every link in `text` concurrently and returns those that are
 /// definitively gone.
-pub async fn dead_links_in(http: &reqwest::Client, text: &str) -> Vec<String> {
+pub async fn dead_links_in(web: &crate::net_guard::OpenWeb, text: &str) -> Vec<String> {
     let urls = extract_urls(text);
     let verdicts = futures::future::join_all(urls.iter().map(|url| {
-        let http = http.clone();
+        let web = web.clone();
         let url = url.clone();
-        async move { is_dead_link(&http, &url).await }
+        async move { is_dead_link(&web, &url).await }
     }))
     .await;
     urls.into_iter()
@@ -121,6 +132,7 @@ pub fn strike_dead(text: &str, dead: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_guard::OpenWeb;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -150,7 +162,7 @@ mod tests {
                 .mount(&server)
                 .await;
         }
-        let http = reqwest::Client::new();
+        let http = OpenWeb::exempting(*server.address());
         let text = format!(
             "{0}/ok {0}/blocked {0}/missing {0}/gone",
             server.uri()
@@ -182,7 +194,7 @@ mod tests {
         // that only recognised "links.duffel.com/<something>" would probe
         // — and spend — every real booking link.
         let real = "https://links.duffel.com?token=U0ZNeU5UWS5nMmdEYlFBQUFCWXdNREF3UWpr";
-        let http = reqwest::Client::new();
+        let http = OpenWeb::exempting(*server.address());
         assert!(!is_dead_link(&http, real).await);
         assert!(dead_links_in(&http, &format!("book here: {real}")).await.is_empty());
         // Path form too, in case they ever change it.
@@ -190,6 +202,26 @@ mod tests {
 
         // The exemption is by host: a lookalike elsewhere is still probed.
         assert!(is_dead_link(&http, &format!("{}/links.duffel.com", server.uri())).await);
+    }
+
+    #[tokio::test]
+    async fn links_inside_the_pod_are_never_probed() {
+        // The reply is model output, and the model can be steered by a page
+        // it read. A link check is a GET like any other: without the fence
+        // it would request the metrics listener on every reply that named it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let web = OpenWeb::new(std::time::Duration::from_secs(5)).unwrap();
+        let text = format!(
+            "{}/metrics http://169.254.169.254/latest/meta-data/ http://localhost:{}/x",
+            server.uri(),
+            server.address().port()
+        );
+        assert!(dead_links_in(&web, &text).await.is_empty());
     }
 
     #[test]

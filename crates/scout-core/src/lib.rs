@@ -24,6 +24,7 @@ pub mod invites;
 pub mod links;
 pub mod metrics;
 pub mod mirror;
+pub mod net_guard;
 pub mod move_check;
 pub mod nearby;
 pub mod retry;

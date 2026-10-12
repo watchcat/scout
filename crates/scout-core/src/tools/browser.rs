@@ -153,24 +153,15 @@ impl Renderer {
                 .unwrap_or_default()
         ));
 
+        // `fetch_page` checked the URL, but Chrome follows redirects, runs
+        // the page's scripts and resolves names on its own — any of which
+        // can land on the pod's own listeners. Every connection it makes
+        // goes through this proxy instead, which applies the same fence.
+        let (proxy, _proxy) = crate::net_guard::serve_socks(crate::net_guard::Guard::PUBLIC_ONLY)
+            .await
+            .map_err(|e| BrowserError::Launch(e.to_string()))?;
         let mut child = tokio::process::Command::new(&self.chrome)
-            .arg("--headless=new")
-            .arg("--dump-dom")
-            .arg(format!("--virtual-time-budget={VIRTUAL_TIME_BUDGET_MS}"))
-            .arg(format!("--user-data-dir={}", profile.display()))
-            .arg(format!("--user-agent={}", super::fetch::BROWSER_USER_AGENT))
-            // --no-sandbox is required to run as a non-root user in a
-            // container; --disable-dev-shm-usage keeps Chrome from dying on
-            // the small /dev/shm a container gets.
-            .arg("--no-sandbox")
-            .arg("--disable-dev-shm-usage")
-            .arg("--disable-gpu")
-            .arg("--disable-extensions")
-            .arg("--no-first-run")
-            .arg("--window-size=1280,1024")
-            .arg("--lang=nl-NL")
-            .arg("--mute-audio")
-            .arg(url)
+            .args(chrome_args(url, &profile, proxy))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -206,9 +197,48 @@ impl Renderer {
     }
 }
 
+/// Chrome's command line for one render through the proxy on `proxy`.
+fn chrome_args(url: &str, profile: &std::path::Path, proxy: u16) -> Vec<String> {
+    vec![
+        "--headless=new".into(),
+        "--dump-dom".into(),
+        format!("--virtual-time-budget={VIRTUAL_TIME_BUDGET_MS}"),
+        format!("--user-data-dir={}", profile.display()),
+        format!("--user-agent={}", super::fetch::BROWSER_USER_AGENT),
+        // socks5, not socks4 or http: Chrome then sends the hostname and
+        // leaves resolving it to the proxy, so the name is checked and
+        // dialled in one place and cannot be rebound in between.
+        format!("--proxy-server=socks5://127.0.0.1:{proxy}"),
+        // Chrome sends localhost and loopback around any proxy unless told
+        // not to — which would walk straight past the fence to :9090.
+        "--proxy-bypass-list=<-loopback>".into(),
+        // --no-sandbox is required to run as a non-root user in a
+        // container; --disable-dev-shm-usage keeps Chrome from dying on
+        // the small /dev/shm a container gets.
+        "--no-sandbox".into(),
+        "--disable-dev-shm-usage".into(),
+        "--disable-gpu".into(),
+        "--disable-extensions".into(),
+        "--no-first-run".into(),
+        "--window-size=1280,1024".into(),
+        "--lang=nl-NL".into(),
+        "--mute-audio".into(),
+        url.into(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chrome_goes_through_the_guard_proxy_loopback_included() {
+        let args = chrome_args("https://shop.example/p", std::path::Path::new("/tmp/p"), 4321);
+        assert!(args.contains(&"--proxy-server=socks5://127.0.0.1:4321".to_string()));
+        // Without this Chrome reaches 127.0.0.1 directly, proxy or not.
+        assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("https://shop.example/p"));
+    }
 
     #[test]
     fn challenge_pages_are_recognised_by_title_not_by_leftover_scripts() {
@@ -310,5 +340,30 @@ mod live {
         let html = Renderer::new(chrome).render(&url).await.unwrap();
         let page = crate::tools::fetch::extract_page_for_test(&html, &url);
         println!("LIVE bytes={} product={:?}", html.len(), page);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn cannot_reach_loopback() {
+        // A local page that renders fine, asked for by literal and by name.
+        // Measured: drop `<-loopback>` and Chrome renders it in full.
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("<html><body>{}</body></html>", "secret ".repeat(500))),
+            )
+            .mount(&server)
+            .await;
+        let chrome = find_chrome().expect("chrome");
+        let renderer = Renderer::new(chrome);
+        for url in [format!("{}/metrics", server.uri()), format!("http://localhost:{}/", server.address().port())] {
+            let html = renderer.render(&url).await.unwrap_or_default();
+            assert!(!html.contains("secret"), "{url} rendered: {html}");
+        }
+        // And the public web still renders through the proxy.
+        let html = renderer.render("https://example.com/").await.unwrap();
+        assert!(html.contains("Example Domain"), "got: {html}");
     }
 }

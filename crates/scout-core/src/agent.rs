@@ -244,7 +244,9 @@ pub struct AgentDeps {
     pub bol: Option<crate::tools::bol::BolClient>,
     /// Second search engine when a key is configured; see WebSearchTool.
     pub perplexity: Option<crate::tools::perplexity::PerplexityClient>,
-    pub http: reqwest::Client,
+    /// For URLs the model chose — `fetch_page` and the link check. Public
+    /// internet only; the vendor clients above keep their own.
+    pub web: crate::net_guard::OpenWeb,
     pub ebay: Option<EbayClient>,
     /// Live flight search when a Duffel key is configured. Search only —
     /// Scout never creates an order, so no passenger details or payment
@@ -636,10 +638,10 @@ pub fn build_agent(
             perplexity: d.perplexity.clone(),
             budget: budget.clone(),
         })
-        .tool(FetchPageTool::new(d.http.clone(), d.renderer.clone()))
+        .tool(FetchPageTool::new(d.web.clone(), d.renderer.clone()))
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
-            http: d.http.clone(),
+            web: d.web.clone(),
             ebay: d.ebay.clone(),
             marktplaats: d.marktplaats.clone(),
             sites: effective_sites(facts, &d.secondhand_sites),

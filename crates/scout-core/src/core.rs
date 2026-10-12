@@ -188,6 +188,7 @@ impl Core {
             "flight search"
         );
 
+        let web = crate::net_guard::OpenWeb::new(Duration::from_secs(30))?;
         let http_for_ignav = http.clone();
         let deps = AgentDeps {
             llm,
@@ -196,7 +197,7 @@ impl Core {
             renderer,
             bol,
             perplexity,
-            http,
+            web,
             ebay,
             duffel,
             marktplaats,

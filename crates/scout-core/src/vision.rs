@@ -38,3 +38,34 @@ pub async fn describe_photo(
     }
     Ok(draft)
 }
+
+const TRANSCRIBE_PREAMBLE: &str = "\
+This is one page of a document: a booking confirmation, a ticket, an invoice \
+or similar, saved as a picture. Write out all the text on it, exactly as \
+written, in its own language and in reading order. Keep names, dates, times, \
+numbers, prices and codes exactly as they appear. Do not translate, explain \
+or summarise. Reply with the page's text only.";
+
+/// How long one page may take to read. A page of a confirmation is a few
+/// hundred words; a model that has not written them in a minute is not
+/// going to.
+pub const PAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The text on one page of a document, read from its picture.
+///
+/// For a PDF whose text cannot be read as text — printed to PDF as drawn
+/// shapes, or scanned — so what comes back is handed to the same extractor
+/// a text PDF's words are. `page_jpeg` is a JPEG of the page.
+pub async fn transcribe_page(llm: &LlmClient, page_jpeg: &[u8]) -> Result<String> {
+    let agent = llm.agent(MODEL).preamble(TRANSCRIBE_PREAMBLE).build();
+    let image = Image {
+        data: DocumentSourceKind::base64(&BASE64_STANDARD.encode(page_jpeg)),
+        media_type: Some(ImageMediaType::JPEG),
+        // As for a photo: MiniMax refuses rig's default "auto", and small
+        // print is the whole point here.
+        detail: Some(ImageDetail::High),
+        ..Default::default()
+    };
+    let text = strip_thinking(&tokio::time::timeout(PAGE_BUDGET, agent.prompt(image)).await??);
+    Ok(text.trim().to_string())
+}

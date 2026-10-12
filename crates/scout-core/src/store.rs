@@ -6188,6 +6188,46 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// `(id, filename, bytes)` for each PDF of a mail that kept its bytes
+    /// and has no text: a file printed to PDF as drawn shapes, or scanned,
+    /// that the text reader found nothing in. What the worker reads from
+    /// its pages' pictures instead.
+    #[allow(clippy::type_complexity)]
+    pub fn unread_pdfs_of(&self, mail_id: i64) -> Result<Vec<(i64, String, Vec<u8>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, filename, bytes FROM attachments
+             WHERE mail_id = ? AND mime = 'application/pdf' AND bytes IS NOT NULL AND (text IS NULL OR trim(text) = '')
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![mail_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// The text read off a file's pages, kept on it so a retry of the mail
+    /// does not pay to read them again.
+    pub fn set_attachment_text(&self, id: i64, text: &str) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE attachments SET text = ? WHERE id = ?", params![text, id])?;
+        Ok(())
+    }
+
+    /// This account's mail under `provider_id`, if reading it found no
+    /// booking: the one a file sent to the bot again may replace. `None`
+    /// for another account's, and for one that held a booking.
+    pub fn found_nothing_in(&self, account_id: i64, provider_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT m.id FROM inbound_mail m
+                 WHERE m.provider_id = ? AND m.account_id = ?
+                   AND NOT EXISTS (SELECT 1 FROM arrivals a WHERE a.mail_id = m.id AND a.booking)",
+                params![provider_id, account_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// `(filename, bytes)` for the attachments that kept their bytes: what
     /// a forward carries along. A text-only row has nothing to send.
     pub fn attachment_bytes_of(&self, mail_id: i64) -> Result<Vec<(String, Vec<u8>)>> {
@@ -11365,6 +11405,53 @@ CREATE TABLE messages (
             nested: false, started_at: "2026-09-13T10:00:00Z".into(), duration_ms: Some(120),
             status: Some("ok".into()), detail: None, result: result.map(str::to_string), truncated: false,
         }
+    }
+
+    #[test]
+    fn a_pdf_with_no_text_is_listed_for_reading_until_its_text_is_kept() {
+        let (s, _dir) = test_store();
+        let me = s.account_for_telegram(1).unwrap();
+        let mail = s.insert_mail(me, "telegram:printed", "telegram", Some("hotel.pdf"), Some(""), None, false, &[]).unwrap().unwrap();
+        let drawn = s.insert_attachment(mail, "hotel.pdf", "application/pdf", Some(b"%PDF-drawn"), None).unwrap();
+        let blank = s.insert_attachment(mail, "blank.pdf", "application/pdf", Some(b"%PDF-blank"), Some("  ")).unwrap();
+        s.insert_attachment(mail, "ticket.pdf", "application/pdf", Some(b"%PDF-text"), Some("KL887")).unwrap();
+        s.insert_attachment(mail, "photo.jpg", "image/jpeg", Some(b"jpeg"), None).unwrap();
+        s.insert_attachment(mail, "lost.pdf", "application/pdf", None, None).unwrap();
+
+        let unread = s.unread_pdfs_of(mail).unwrap();
+        assert_eq!(
+            unread,
+            vec![(drawn, "hotel.pdf".to_string(), b"%PDF-drawn".to_vec()), (blank, "blank.pdf".to_string(), b"%PDF-blank".to_vec())],
+            "only a PDF with bytes and no text: not one with text, not an image, not one whose bytes were never kept"
+        );
+
+        s.set_attachment_text(drawn, "Hotel Mashuk, 21-26 Oct").unwrap();
+        assert_eq!(s.unread_pdfs_of(mail).unwrap().iter().map(|u| u.0).collect::<Vec<_>>(), vec![blank]);
+        assert!(s.attachment_texts_of(mail).unwrap().contains(&("hotel.pdf".to_string(), Some("Hotel Mashuk, 21-26 Oct".to_string()))));
+    }
+
+    #[test]
+    fn a_mail_that_held_no_booking_is_found_only_for_its_own_account() {
+        let (s, _dir) = test_store();
+        let me = s.account_for_telegram(1).unwrap();
+        let other = s.account_for_telegram(2).unwrap();
+        let mail = s.insert_mail(me, "telegram:same-file", "telegram", Some("hotel.pdf"), Some(""), None, false, &[]).unwrap().unwrap();
+        assert_eq!(s.found_nothing_in(me, "telegram:same-file").unwrap(), Some(mail));
+        assert_eq!(s.found_nothing_in(other, "telegram:same-file").unwrap(), None, "not another account's");
+        assert_eq!(s.found_nothing_in(me, "telegram:never-sent").unwrap(), None);
+
+        // A reading that was not a booking leaves it replaceable; one that
+        // was, does not.
+        s.conn().execute(
+            "INSERT INTO arrivals (account_id, mail_id, booking, summary) VALUES (?, ?, false, 'a newsletter')",
+            params![me, mail],
+        ).unwrap();
+        assert_eq!(s.found_nothing_in(me, "telegram:same-file").unwrap(), Some(mail));
+        s.conn().execute(
+            "INSERT INTO arrivals (account_id, mail_id, booking, summary) VALUES (?, ?, true, 'Hotel Mashuk')",
+            params![me, mail],
+        ).unwrap();
+        assert_eq!(s.found_nothing_in(me, "telegram:same-file").unwrap(), None);
     }
 
     #[test]

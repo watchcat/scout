@@ -345,6 +345,18 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
     } else {
         stored
     };
+    // A PDF with no text — printed as drawn shapes, or scanned — read from
+    // its pages' pictures, and the texts read again with what that found.
+    // A model that fails here fails the mail, which is tried again, rather
+    // than filing it as holding nothing.
+    let texts = if texts.iter().any(|(_, t)| t.is_none()) {
+        match scout_core::inbox::read_unread_pdfs(core, m.id, page_images).await.map_err(Failure::Reading)? {
+            0 => texts,
+            _ => scout_core::inbox::attachment_texts(core, m.id).await.map_err(Failure::Reading)?,
+        }
+    } else {
+        texts
+    };
 
     // 3. Forward, once.
     let forwarded = forward(core, client, from, m, &sender, subject.clone(), text.clone(), html.clone()).await?;
@@ -938,6 +950,75 @@ pub async fn pdf_text(mail_id: i64, bytes: Vec<u8>) -> (Vec<u8>, Option<String>)
     (bytes, text)
 }
 
+/// The program that draws a PDF's pages: poppler's, from `poppler-utils`
+/// in the image. A local run without it reads text PDFs as before and
+/// leaves a drawn one unread.
+const PDFTOPPM: &str = "pdftoppm";
+
+/// How long drawing one file's pages may take.
+const DRAW_BUDGET: Duration = Duration::from_secs(30);
+
+/// The longer side of a drawn page, in pixels: an A4 page at about 140
+/// dpi, where a confirmation's small print is still plain to read and the
+/// picture is a few hundred kilobytes.
+const PAGE_PIXELS: u32 = 1600;
+
+/// A PDF's first pages as JPEGs, for `inbox::read_unread_pdfs`. Empty when
+/// the file could not be drawn — a broken PDF, no `pdftoppm` — which leaves
+/// it unread, as it was before there was a way to read it.
+pub async fn page_images(bytes: Vec<u8>) -> Vec<Vec<u8>> {
+    page_images_with(PDFTOPPM, bytes).await
+}
+
+async fn page_images_with(program: &str, bytes: Vec<u8>) -> Vec<Vec<u8>> {
+    let drawn = async {
+        let dir = tempfile::tempdir()?;
+        let input = dir.path().join("in.pdf");
+        tokio::fs::write(&input, &bytes).await?;
+        let prefix = dir.path().join("page");
+        let output = tokio::process::Command::new(program)
+            .args(["-jpeg", "-jpegopt", "quality=85", "-scale-to"])
+            .arg(PAGE_PIXELS.to_string())
+            .args(["-f", "1", "-l"])
+            .arg(scout_core::inbox::PAGES_READ.to_string())
+            .arg(&input)
+            .arg(&prefix)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await?;
+        if !output.success() {
+            anyhow::bail!("{program} exited with {output}");
+        }
+        // `page-1.jpg`, or `page-01.jpg` for a longer file: one width per
+        // run, so the names sort in page order.
+        let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("page") && n.ends_with(".jpg")))
+            .collect();
+        names.sort();
+        let mut pages = Vec::new();
+        for name in names {
+            pages.push(tokio::fs::read(name).await?);
+        }
+        anyhow::Ok(pages)
+    };
+    // The errors name the program and its exit, never the file's content.
+    match tokio::time::timeout(DRAW_BUDGET, drawn).await {
+        Ok(Ok(pages)) => pages,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "a PDF's pages could not be drawn");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("drawing a PDF's pages took longer than the budget");
+            Vec::new()
+        }
+    }
+}
+
 /// Body first, then each attachment's text under a header; HTML stripped to
 /// text when there is no plain part; cut at `cap` characters.
 pub fn assemble(text: Option<&str>, html: Option<&str>, attachments: &[(&str, Option<&str>)], cap: usize) -> String {
@@ -1400,6 +1481,44 @@ mod tests {
         // A reading with no title still gets a line, without a stray colon.
         assert_eq!(arrival_nudge(Placement::Trip(1), "Lisbon", &[]), "A booking arrived for Lisbon. Add it here, or review on goodscout.fyi/chat.");
         assert!(no_booking_in_document("eticket.pdf").starts_with("I read eticket.pdf and found no booking"));
+    }
+
+    /// A stand-in for `pdftoppm` that runs `body` as a shell script.
+    fn a_program(dir: &tempfile::TempDir, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("fake-pdftoppm");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_pdfs_pages_are_drawn_in_page_order_and_a_failure_is_no_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        // Writes its pages out of order, and what it was asked, beside them;
+        // the last argument is the prefix, the one before it the file.
+        let draws = a_program(&dir, &format!(
+            "for last; do :; done\nprintf two > \"$last-2.jpg\"\nprintf one > \"$last-1.jpg\"\necho \"$@\" > {}/args",
+            dir.path().display()
+        ));
+        assert_eq!(page_images_with(&draws, b"%PDF".to_vec()).await, vec![b"one".to_vec(), b"two".to_vec()]);
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        assert!(args.starts_with("-jpeg -jpegopt quality=85 -scale-to 1600 -f 1 -l 3 "), "{args}");
+
+        let fails = a_program(&dir, "exit 1");
+        assert!(page_images_with(&fails, b"%PDF".to_vec()).await.is_empty());
+        assert!(page_images_with("/nonexistent/pdftoppm", b"%PDF".to_vec()).await.is_empty(), "no program, no pages, no panic");
+    }
+
+    /// The real program on a real one-page PDF. Ignored where poppler is
+    /// not installed; in the image it is.
+    #[tokio::test]
+    #[ignore = "needs pdftoppm (poppler-utils)"]
+    async fn pdftoppm_draws_a_real_page() {
+        let pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R>>endobj\n4 0 obj<</Length 35>>stream\n0 0 1 rg 100 600 200 100 re f\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n";
+        let pages = page_images(pdf.to_vec()).await;
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].starts_with(&[0xFF, 0xD8]), "a JPEG");
     }
 
     /// A model that answers every completion with `answer`, on the same

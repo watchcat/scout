@@ -792,7 +792,12 @@ pub const TELEGRAM_SENDER: &str = "telegram";
 
 /// A PDF handed to the bot in a chat, filed as a mail so the same worker
 /// reads it, places it and nudges about it. `provider_id` is Telegram's
-/// own id for the file, so the same file sent twice is read once.
+/// own id for the file, so the same file sent twice is read once — unless
+/// reading it found no booking. Then sending it again is asking again, and
+/// the earlier mail is deleted and the file filed afresh: a new mail, so a
+/// new reading and a new answer, where reopening the old one would meet
+/// its own nudge already sent under the same key. A mail still being read,
+/// or with a booking waiting on it, is left alone.
 ///
 /// Recorded as already forwarded: the person has the file on their phone,
 /// and mailing it back to them would be the one thing they did not ask
@@ -813,6 +818,11 @@ pub async fn record_document(
         // An empty body rather than none: the worker takes "the row has a
         // body" as "nothing to fetch from the mail provider", which is the
         // truth here — the text is in the attachment.
+        if let Some(earlier) = store.found_nothing_in(account_id, &provider_id)? {
+            if !matches!(store.delete_mail(account_id, earlier)?, crate::store::MailGone::Gone) {
+                return Ok(None);
+            }
+        }
         let Some(id) = store.insert_mail(account_id, &provider_id, TELEGRAM_SENDER, Some(&filename), Some(""), None, false, &[])? else {
             return Ok(None);
         };
@@ -825,6 +835,53 @@ pub async fn record_document(
         core.wake_inbox();
     }
     Ok(id)
+}
+
+/// The most pages of one file read from their pictures. A confirmation is
+/// a page or two; a fifty-page brochure is not one, and each page is a
+/// model call.
+pub const PAGES_READ: usize = 3;
+
+/// Reads every PDF of this mail that has no text from its pages' pictures,
+/// keeping what it reads on the file. `render` turns a PDF's bytes into at
+/// most `PAGES_READ` page images (JPEG) — the caller's, since drawing a
+/// page takes a program this crate does not run; an empty list is a file
+/// that could not be drawn, and is left as it was.
+///
+/// A model that fails is this function's error, so the mail is tried
+/// again later rather than filed as holding nothing; a page read as empty
+/// is not an error. Returns how many files gained text.
+pub async fn read_unread_pdfs<F, Fut>(core: &Core, mail_id: i64, render: F) -> anyhow::Result<usize>
+where
+    F: Fn(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Vec<Vec<u8>>>,
+{
+    let store = core.store();
+    let unread = blocking(move || store.unread_pdfs_of(mail_id)).await?;
+    let mut read = 0;
+    for (id, _filename, bytes) in unread {
+        let pages = render(bytes).await;
+        if pages.is_empty() {
+            continue;
+        }
+        let mut text = Vec::new();
+        for page in pages.iter().take(PAGES_READ) {
+            let words = crate::vision::transcribe_page(&core.deps.llm, page).await?;
+            if !words.is_empty() {
+                text.push(words);
+            }
+        }
+        // Counts only: the file is the sender's.
+        tracing::info!(id = mail_id, pages = pages.len().min(PAGES_READ), chars = text.iter().map(|t| t.len()).sum::<usize>(), "read a PDF with no text from its pages");
+        if text.is_empty() {
+            continue;
+        }
+        let store = core.store();
+        let text = text.join("\n\n");
+        blocking(move || store.set_attachment_text(id, &text)).await?;
+        read += 1;
+    }
+    Ok(read)
 }
 
 /// One arrival of this account's, decided or not.
@@ -3155,6 +3212,109 @@ mod tests {
         assert!(mine.text.is_some(), "a body on the row, so nothing is fetched from the mail provider");
         let texts = attachment_texts(&core, id).await.unwrap();
         assert_eq!(texts, vec![("eticket.pdf".to_string(), Some("KLM KL887 21 Sep".to_string()))]);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_held_no_booking_is_read_afresh_when_it_is_sent_again() {
+        let (core, _dir) = core();
+        let me = core.store().account_for_telegram(1).unwrap();
+        let send = |text: Option<&str>| {
+            record_document(&core, me, "telegram:AQADprinted", "hotel.pdf", "application/pdf", b"%PDF".to_vec(), text.map(Into::into))
+        };
+        let first = send(None).await.unwrap().expect("a first sending is recorded");
+        // Still being read: the same file again is not a second reading.
+        assert_eq!(send(None).await.unwrap(), None);
+
+        // Read, and nothing found in it: sending it again is asking again.
+        mail_done(&core, first).await.unwrap();
+        let second = send(None).await.unwrap().expect("filed afresh");
+        assert_ne!(second, first, "a new mail, so the answer is a new nudge rather than one already sent");
+        assert!(attachment_texts(&core, first).await.unwrap().is_empty(), "the earlier mail and its file are gone");
+        assert!(mail_to_work(&core, 10).await.unwrap().iter().any(|m| m.id == second));
+
+        // Read, and a booking found: the same file again is the same mail.
+        mail_done(&core, second).await.unwrap();
+        core.store().conn_for_tests().execute(
+            "INSERT INTO arrivals (account_id, mail_id, booking, summary, status) VALUES (?, ?, true, 'Hotel', 'added')",
+            duckdb::params![me, second],
+        ).unwrap();
+        assert_eq!(send(None).await.unwrap(), None);
+    }
+
+    /// A core whose model is `llm`, for the readings below.
+    fn core_reading_with(llm: &wiremock::MockServer) -> (Core, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::for_test(dir.path().join("inbox.duckdb").to_str().unwrap());
+        cfg.minimax_base_url = llm.uri();
+        (Core::start(cfg, None).unwrap(), dir)
+    }
+
+    fn page_says(text: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "p1", "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_pdf_with_no_text_is_read_from_its_pages_and_the_reading_kept() {
+        use wiremock::matchers::{method, path};
+        let llm = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(page_says("<think>a hotel voucher</think>Hotel Mashuk\nCheck-in 21.10.2026"))
+            .mount(&llm).await;
+        let (core, _dir) = core_reading_with(&llm);
+        let me = core.store().account_for_telegram(1).unwrap();
+        let mail = record_document(&core, me, "telegram:drawn", "hotel.pdf", "application/pdf", b"%PDF-drawn".to_vec(), None)
+            .await.unwrap().unwrap();
+
+        let drawn = std::sync::Mutex::new(Vec::new());
+        let read = read_unread_pdfs(&core, mail, |bytes| {
+            drawn.lock().unwrap().push(bytes);
+            async { vec![b"page-one-jpeg".to_vec(), b"page-two-jpeg".to_vec()] }
+        }).await.unwrap();
+
+        assert_eq!(read, 1);
+        assert_eq!(*drawn.lock().unwrap(), vec![b"%PDF-drawn".to_vec()], "the file's own bytes are drawn");
+        assert_eq!(
+            attachment_texts(&core, mail).await.unwrap(),
+            vec![("hotel.pdf".to_string(), Some("Hotel Mashuk\nCheck-in 21.10.2026\n\nHotel Mashuk\nCheck-in 21.10.2026".to_string()))],
+            "both pages, reasoning stripped, kept on the file"
+        );
+        let asked = llm.received_requests().await.unwrap();
+        assert_eq!(asked.len(), 2, "one call per page");
+        let body = String::from_utf8_lossy(&asked[0].body).to_string();
+        assert!(body.contains(BASE64_PAGE_ONE), "the page goes as a picture: {body}");
+
+        // Kept: a retry of the mail reads nothing again.
+        let again = read_unread_pdfs(&core, mail, |_| async { vec![b"page-one-jpeg".to_vec()] }).await.unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(llm.received_requests().await.unwrap().len(), 2);
+    }
+
+    const BASE64_PAGE_ONE: &str = "cGFnZS1vbmUtanBlZw==";
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_drawn_is_left_and_a_model_that_fails_is_an_error() {
+        use wiremock::matchers::{method, path};
+        let llm = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&llm).await;
+        let (core, _dir) = core_reading_with(&llm);
+        let me = core.store().account_for_telegram(1).unwrap();
+        let mail = record_document(&core, me, "telegram:broken", "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None)
+            .await.unwrap().unwrap();
+
+        // Nothing drawn: no model call, nothing kept, no error.
+        assert_eq!(read_unread_pdfs(&core, mail, |_| async { Vec::new() }).await.unwrap(), 0);
+        assert!(llm.received_requests().await.unwrap().is_empty());
+
+        // Drawn, and the model fails: the mail is to be tried again, so
+        // this is an error rather than a file that held nothing.
+        assert!(read_unread_pdfs(&core, mail, |_| async { vec![b"page".to_vec()] }).await.is_err());
+        assert_eq!(attachment_texts(&core, mail).await.unwrap(), vec![("hotel.pdf".to_string(), None)]);
     }
 
     #[tokio::test]

@@ -814,10 +814,14 @@ pub enum Recorded {
 /// and mailing it back to them would be the one thing they did not ask
 /// for. Everything else — the extraction, the placement, the pending row
 /// on the Trips tab — is exactly what a mailed ticket gets.
+// Eight because the file arrives as its parts, each from a different
+// place in the handler; a struct for one caller would only rename them.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_document(
     core: &Core,
     account_id: i64,
     provider_id: &str,
+    older_id: Option<&str>,
     filename: &str,
     mime: &str,
     bytes: Vec<u8>,
@@ -825,18 +829,19 @@ pub async fn record_document(
 ) -> anyhow::Result<Recorded> {
     let store = core.store();
     let (provider_id, filename, mime) = (provider_id.to_string(), filename.to_string(), mime.to_string());
+    let older_id = older_id.map(str::to_string);
     let recorded = blocking(move || {
-        match store.document_state(account_id, &provider_id)? {
+        match store.document_state(account_id, &provider_id, older_id.as_deref())? {
             None => {}
             Some(earlier) if !earlier.settled => return Ok(Recorded::Reading),
             Some(earlier) if earlier.booking => return Ok(Recorded::Held),
             // Settled with nothing found: replaced. `delete_mail` checks
             // again under its own lock, and anything but gone is a reading
             // that started in between.
-            Some(earlier) if !matches!(store.delete_mail(account_id, earlier.mail_id)?, MailGone::Gone) => {
-                return Ok(Recorded::Reading);
-            }
-            Some(_) => {}
+            Some(earlier) => match store.delete_mail(account_id, earlier.mail_id)? {
+                MailGone::Gone => {}
+                _ => return Ok(Recorded::Reading),
+            },
         }
         // An empty body rather than none: the worker takes "the row has a
         // body" as "nothing to fetch from the mail provider", which is the
@@ -873,7 +878,9 @@ const PAGE_TEXT_CAP: usize = 8_000;
 /// bytes into page images (JPEG) — the caller's, since drawing a page takes
 /// a program this crate does not run; an empty list is a file that could
 /// not be drawn, and is left as it was. At most `PAGES_READ` pages are
-/// read for the whole mail, in file order.
+/// read for the whole mail, in file order — so three pages of a brochure
+/// attached first leave a voucher attached second unread. Accepted: a
+/// booking mail's first file is almost always the booking.
 ///
 /// A model that fails is this function's error, so the mail is tried
 /// again later rather than filed as holding nothing; a page read as empty
@@ -3229,7 +3236,7 @@ mod tests {
     async fn a_pdf_sent_to_the_bot_is_a_mail_the_worker_will_read_and_never_a_forward() {
         let (core, _dir) = core();
         let account_id = core.store().account_for_telegram(1).unwrap();
-        let Recorded::Filed(id) = record_document(&core, account_id, "telegram:AQADfile", "eticket.pdf", "application/pdf", b"%PDF".to_vec(), Some("KLM KL887 21 Sep".into()))
+        let Recorded::Filed(id) = record_document(&core, account_id, "telegram:AQADfile", None, "eticket.pdf", "application/pdf", b"%PDF".to_vec(), Some("KLM KL887 21 Sep".into()))
             .await
             .unwrap()
         else {
@@ -3237,7 +3244,7 @@ mod tests {
         };
         // The same file again, while it is read, is the same mail.
         assert_eq!(
-            record_document(&core, account_id, "telegram:AQADfile", "eticket.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap(),
+            record_document(&core, account_id, "telegram:AQADfile", None, "eticket.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap(),
             Recorded::Reading
         );
         let due = mail_to_work(&core, 10).await.unwrap();
@@ -3254,7 +3261,7 @@ mod tests {
         let (core, _dir) = core();
         let me = core.store().account_for_telegram(1).unwrap();
         let send = |text: Option<&str>| {
-            record_document(&core, me, "telegram:AQADprinted", "hotel.pdf", "application/pdf", b"%PDF".to_vec(), text.map(Into::into))
+            record_document(&core, me, "telegram:AQADprinted", None, "hotel.pdf", "application/pdf", b"%PDF".to_vec(), text.map(Into::into))
         };
         let Recorded::Filed(first) = send(None).await.unwrap() else { panic!("a first sending is recorded") };
         // Still being read: the same file again is not a second reading.
@@ -3287,11 +3294,11 @@ mod tests {
     async fn a_file_that_could_not_be_read_is_read_afresh_when_it_is_sent_again() {
         let (core, _dir) = core();
         let me = core.store().account_for_telegram(1).unwrap();
-        let Recorded::Filed(first) = record_document(&core, me, "telegram:1:x", "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap() else {
+        let Recorded::Filed(first) = record_document(&core, me, "telegram:1:x", None, "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap() else {
             panic!("filed");
         };
         core.store().mail_failed(first, "the model was down").unwrap();
-        let again = record_document(&core, me, "telegram:1:x", "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap();
+        let again = record_document(&core, me, "telegram:1:x", None, "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap();
         assert!(matches!(again, Recorded::Filed(id) if id != first), "{again:?}");
     }
 
@@ -3320,7 +3327,7 @@ mod tests {
             .mount(&llm).await;
         let (core, _dir) = core_reading_with(&llm);
         let me = core.store().account_for_telegram(1).unwrap();
-        let Recorded::Filed(mail) = record_document(&core, me, "telegram:drawn", "hotel.pdf", "application/pdf", b"%PDF-drawn".to_vec(), None)
+        let Recorded::Filed(mail) = record_document(&core, me, "telegram:drawn", None, "hotel.pdf", "application/pdf", b"%PDF-drawn".to_vec(), None)
             .await.unwrap() else { panic!("filed") };
 
         let drawn = std::sync::Mutex::new(Vec::new());
@@ -3358,7 +3365,7 @@ mod tests {
             .mount(&llm).await;
         let (core, _dir) = core_reading_with(&llm);
         let me = core.store().account_for_telegram(1).unwrap();
-        let Recorded::Filed(mail) = record_document(&core, me, "telegram:1:a", "a.pdf", "application/pdf", b"%PDF-a".to_vec(), None)
+        let Recorded::Filed(mail) = record_document(&core, me, "telegram:1:a", None, "a.pdf", "application/pdf", b"%PDF-a".to_vec(), None)
             .await.unwrap() else { panic!("filed") };
         for name in ["b.pdf", "c.pdf"] {
             core.store().insert_attachment(mail, name, "application/pdf", Some(b"%PDF-more"), None).unwrap();
@@ -3383,7 +3390,7 @@ mod tests {
             .mount(&llm).await;
         let (core, _dir) = core_reading_with(&llm);
         let me = core.store().account_for_telegram(1).unwrap();
-        let Recorded::Filed(mail) = record_document(&core, me, "telegram:broken", "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None)
+        let Recorded::Filed(mail) = record_document(&core, me, "telegram:broken", None, "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None)
             .await.unwrap() else { panic!("filed") };
 
         // Nothing drawn: no model call, nothing kept, no error.

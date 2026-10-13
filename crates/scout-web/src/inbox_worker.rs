@@ -234,8 +234,9 @@ impl From<Forwarded> for Forward {
 /// Everything one mail needs, in the order that makes a retry safe: body,
 /// attachments, forward, then the model — reading pages from pictures
 /// first, then the extractor. The forward comes before the model on
-/// purpose — the person gets their mail even when the model is down. A forward Resend refuses is a warning, not a reason to leave the
-/// mail unread; a forward Resend was not there for is owed, and `settle`
+/// purpose — the person gets their mail even when the model is down. A
+/// forward Resend refuses is a warning, not a reason to leave the mail
+/// unread; a forward Resend was not there for is owed, and `settle`
 /// leaves the mail due so a later pass sends it — that pass finds the
 /// reading on record and does nothing else.
 async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork) -> Result<(), Failure> {
@@ -1007,7 +1008,7 @@ async fn page_images(program: &str, bytes: Vec<u8>) -> Vec<Vec<u8>> {
         let input = dir.path().join("in.pdf");
         tokio::fs::write(&input, &bytes).await?;
         let prefix = dir.path().join("page");
-        let output = tokio::process::Command::new("sh")
+        let mut child = tokio::process::Command::new("sh")
             .args(["-c", LIMITED, program])
             .args(["-jpeg", "-jpegopt", "quality=85", "-scale-to"])
             .arg(PAGE_PIXELS.to_string())
@@ -1019,14 +1020,24 @@ async fn page_images(program: &str, bytes: Vec<u8>) -> Vec<Vec<u8>> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .output()
-            .await?;
-        if !output.status.success() {
-            // Poppler's first complaint, which names the file's structure
-            // ("Incorrect password", "Couldn't find trailer") and not what
-            // it says; cut short all the same.
-            let said: String = String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or_default().chars().take(200).collect();
-            anyhow::bail!("{program} exited with {}: {said}", output.status);
+            .spawn()?;
+        // What poppler says, kept to 4 KB: a hostile file can make it
+        // complain for its whole 25 seconds, and the rest is drained so it
+        // never blocks on a full pipe.
+        let mut said = Vec::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use tokio::io::AsyncReadExt;
+            (&mut stderr).take(4096).read_to_end(&mut said).await?;
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            // The line that says why ("Incorrect password", "Couldn't find
+            // trailer") rather than the warnings before it. Poppler can
+            // quote a token of the file in an error, so it is cut short.
+            let said = String::from_utf8_lossy(&said);
+            let why: String = said.lines().rev().find(|l| l.contains("Error")).or_else(|| said.lines().next()).unwrap_or_default().chars().take(200).collect();
+            anyhow::bail!("{program} exited with {status}: {why}");
         }
         // `page-1.jpg`, or `page-01.jpg` for a longer file: one width per
         // run, so the names sort in page order.
@@ -1617,7 +1628,7 @@ mod tests {
         open_round(&core, "autumn", 5).await;
         let a = admitted(&core, "111").await;
         let scout_core::inbox::Recorded::Filed(_) =
-            scout_core::inbox::record_document(&core, a, "telegram:1:drawn", "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap()
+            scout_core::inbox::record_document(&core, a, "telegram:1:drawn", None, "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap()
         else {
             panic!("filed");
         };

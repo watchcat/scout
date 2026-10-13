@@ -1323,7 +1323,10 @@ async fn handle_document(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResul
     // account is in the key because Telegram's id is the file's, the same
     // for everyone who has it — someone else's copy is theirs to read.
     let provider_id = format!("telegram:{account_id}:{}", doc.file.unique_id);
-    let recorded = scout_core::inbox::record_document(&app.core, account_id, &provider_id, &filename, "application/pdf", bytes, text).await;
+    // The key a file sent before this had: without it, the first resend of
+    // a file whose booking is already on the trip would be read again.
+    let older_id = format!("telegram:{}", doc.file.unique_id);
+    let recorded = scout_core::inbox::record_document(&app.core, account_id, &provider_id, Some(&older_id), &filename, "application/pdf", bytes, text).await;
     let reply = match recorded {
         Ok(scout_core::inbox::Recorded::Filed(_)) => "Reading it now. I'll say what I found in a moment.".to_string(),
         Ok(scout_core::inbox::Recorded::Held) => "I've read that file already; it's on your Trips tab.".to_string(),

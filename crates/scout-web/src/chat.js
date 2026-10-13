@@ -3424,9 +3424,10 @@ function start() {
   // `.trip-alert` with the border `.join-card.danger` uses, so it reads as a
   // warning rather than routine trip info sitting under the title.
   // Who is on the trip and what can be done about it: copy the link, for
-  // anyone; leave, for an editor; remove people and manage the link, for
-  // the owner. A removal or a leave answers with the trips, so the page
-  // repaints from the answer as every other trip write here does.
+  // anyone; leave, for an editor; hand the trip over, remove people and
+  // manage the link, for the owner. A handover, a removal or a leave
+  // answers with the trips, so the page repaints from the answer as every
+  // other trip write here does.
   function peoplePanel(trip) {
     const panel = node('section', 'people-panel')
     panel.setAttribute('aria-label', `People on ${trip.name}`)
@@ -3612,7 +3613,9 @@ function start() {
     slot.replaceChildren(node('p', '', question), row)
   }
 
-  // Leave and Remove: the answer is the reader's trips as they now stand.
+  // Leave, Remove and Make owner: the answer is the reader's trips as they
+  // now stand. `refusal`, where given, words a refused answer from its
+  // status and the server's reason.
   async function tripAction(path, body, said, refusal) {
     try {
       const res = await fetch(path, {
@@ -3624,6 +3627,10 @@ function start() {
         if (refusal) {
           const answer = await res.json().catch(() => ({}))
           showTripToast(refusal(res.status, answer?.refused))
+          // A refusal the panel could not have foreseen — the person left
+          // meanwhile — means it is out of date: read the trips again.
+          tripsLoaded = false
+          await loadTrips()
           return
         }
         showTripToast(res.status === 403 ? 'Only the trip’s owner can do that.' : 'That did not work. Reload and try again.')

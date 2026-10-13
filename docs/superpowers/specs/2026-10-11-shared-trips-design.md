@@ -204,12 +204,22 @@ tool — a misread chat message should not be able to do it.
 is taken up again, as on joining). Each keeps their own thread: the new
 owner's becomes `trips.conversation_id`, the one that takes the trip with
 it when deleted; the old owner's moves to their `trip_people` row, which
-does not. Items, address, link and mail stay with the trip. Refused,
+does not. Items, address, link and mail stay with the trip — the mail
+that came to its address, and its readings, are filed under the owner, so
+they are re-filed under the new one; otherwise the old owner, once removed,
+could still decide its bookings. A reading in flight across the handover is
+filed with its mail, not with whoever the worker read it for. Refused,
 changing nothing, when the asker is not the owner (403), when the person is
-not an editor now — never the owner, never someone who left (409
-`not_on_trip`), and when they already own a trip by that name, since an
-account's trips are told apart by name (409 `name_taken`). The new owner is
-told on Telegram, where the bot can reach them, what they can now do.
+not an editor now — never the owner, never someone who left, never someone
+removed from Scout (409 `not_on_trip`) — and when they already own a trip by
+that name, since an account's trips are told apart by name (409
+`name_taken`). The new owner is told on Telegram, where the bot can reach
+them, what they can now do; a notice that fails is logged and does not undo
+the handover.
+
+Not moved: holds on addresses the trip had before. `released_addresses`
+does not record the trip, so they stay with whoever let them go for their
+90 days.
 
 ### Who added it
 

@@ -185,6 +185,22 @@ pub fn handed_over_line(from: &str, trip: &str) -> String {
     )
 }
 
+/// Queues the line for the new owner where the bot can reach them; an
+/// account that has never written to it learns from the page. After the
+/// handover is committed, so a failure here is logged, never the answer:
+/// the trip has changed hands either way.
+fn tell_new_owner(store: &crate::store::Store, person: i64, trip_id: i64, line: &str) -> bool {
+    let queued = (|| -> anyhow::Result<bool> {
+        let Some(address) = store.delivery_address(person, crate::mirror::TELEGRAM)? else { return Ok(false) };
+        let key = format!("handover:{trip_id}:{}", now().and_utc().timestamp_millis());
+        store.enqueue_mirror(person, crate::mirror::TELEGRAM, &address, line, &key, false)
+    })();
+    queued.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, person, trip_id, "could not tell the new owner");
+        false
+    })
+}
+
 /// The owner handing the trip to an editor, staying on it as one, and the
 /// new owner told so. `NotOwner` for anyone but the owner; the store's
 /// own refusals — not on the trip, a trip of theirs by that name — come
@@ -196,18 +212,13 @@ pub async fn hand_over(core: &Core, account_id: i64, trip: &str, person: i64) ->
         let Some(found) = store.find_trip(account_id, &trip)? else { return Ok(Owned::NotFound) };
         Ok(match store.hand_over_trip(account_id, found.id, person, now())? {
             HandOver::NotOwner => Owned::NotOwner,
+            HandOver::NotFound => Owned::NotFound,
             handed => {
-                if let HandOver::Done { from, .. } = &handed {
-                    // Told where the bot can reach them; an account that
-                    // has never written to it learns from the page.
-                    if let Some(address) = store.delivery_address(person, crate::mirror::TELEGRAM)? {
-                        let key = format!("handover:{}:{}", found.id, now().and_utc().timestamp_millis());
-                        if store.enqueue_mirror(person, crate::mirror::TELEGRAM, &address, &handed_over_line(from, &found.name), &key, false)? {
-                            return Ok(Owned::Done((handed, true)));
-                        }
-                    }
-                }
-                Owned::Done((handed, false))
+                let told = match &handed {
+                    HandOver::Done { from, .. } => tell_new_owner(&store, person, found.id, &handed_over_line(from, &found.name)),
+                    _ => false,
+                };
+                Owned::Done((handed, told))
             }
         })
     })

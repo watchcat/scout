@@ -254,7 +254,7 @@ async fn leave(
 }
 
 #[derive(serde::Deserialize)]
-struct RemovePersonIn {
+struct PersonIn {
     trip: String,
     person: i64,
 }
@@ -263,7 +263,7 @@ struct RemovePersonIn {
 async fn remove_person(
     axum::extract::State(auth): axum::extract::State<AuthState>,
     headers: HeaderMap,
-    axum::extract::Json(body): axum::extract::Json<RemovePersonIn>,
+    axum::extract::Json(body): axum::extract::Json<PersonIn>,
 ) -> Response {
     let account_id = match admitted_account(&auth, &headers).await {
         Ok(id) => id,
@@ -285,7 +285,7 @@ async fn remove_person(
 async fn hand_over(
     axum::extract::State(auth): axum::extract::State<AuthState>,
     headers: HeaderMap,
-    axum::extract::Json(body): axum::extract::Json<RemovePersonIn>,
+    axum::extract::Json(body): axum::extract::Json<PersonIn>,
 ) -> Response {
     use scout_core::sharing::{HandOver, Owned};
     let account_id = match admitted_account(&auth, &headers).await {
@@ -300,9 +300,10 @@ async fn hand_over(
         Ok(Owned::Done(HandOver::Done { .. })) => list(axum::extract::State(auth), headers).await,
         Ok(Owned::Done(HandOver::NotOnTrip)) => refusal("not_on_trip"),
         Ok(Owned::Done(HandOver::NameTaken)) => refusal("name_taken"),
-        // The store's own word for an owner who stopped being one between
-        // the lookup and the write.
+        // `sharing::hand_over` answers these two itself; here only so the
+        // match is whole.
         Ok(Owned::Done(HandOver::NotOwner)) => StatusCode::FORBIDDEN.into_response(),
+        Ok(Owned::Done(HandOver::NotFound)) => StatusCode::NOT_FOUND.into_response(),
         other => refused(other, account_id, "hand over"),
     }
 }

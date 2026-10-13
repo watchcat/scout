@@ -3,7 +3,7 @@
 //! store, under its lock.
 
 use crate::core::{blocking, Core};
-pub use crate::store::{Joined, LinkState, TripLink, LINK_ADMITS, LINK_DAYS};
+pub use crate::store::{HandOver, Joined, LinkState, TripLink, LINK_ADMITS, LINK_DAYS};
 
 /// UTC, naive: the clock every timestamp in `trip_links` is written and
 /// compared in.
@@ -176,6 +176,54 @@ pub async fn remove(core: &Core, account_id: i64, trip: &str, person: i64) -> an
     .await
 }
 
+/// What the new owner is told on Telegram: what they can now do, which
+/// nobody else on the trip can, and that the one who gave it is still on it.
+pub fn handed_over_line(from: &str, trip: &str) -> String {
+    format!(
+        "{from} made you the owner of {trip}. You can now delete it, change its email address, \
+         manage its share link and take people off it. {from} is still on it."
+    )
+}
+
+/// The owner handing the trip to an editor, staying on it as one, and the
+/// new owner told so. `NotOwner` for anyone but the owner; the store's
+/// own refusals — not on the trip, a trip of theirs by that name — come
+/// back inside `Done`, since the asker was entitled to ask.
+pub async fn hand_over(core: &Core, account_id: i64, trip: &str, person: i64) -> anyhow::Result<Owned<HandOver>> {
+    let store = core.store();
+    let trip = trip.to_string();
+    let answer = blocking(move || {
+        let Some(found) = store.find_trip(account_id, &trip)? else { return Ok(Owned::NotFound) };
+        Ok(match store.hand_over_trip(account_id, found.id, person, now())? {
+            HandOver::NotOwner => Owned::NotOwner,
+            handed => {
+                if let HandOver::Done { from, .. } = &handed {
+                    // Told where the bot can reach them; an account that
+                    // has never written to it learns from the page.
+                    if let Some(address) = store.delivery_address(person, crate::mirror::TELEGRAM)? {
+                        let key = format!("handover:{}:{}", found.id, now().and_utc().timestamp_millis());
+                        if store.enqueue_mirror(person, crate::mirror::TELEGRAM, &address, &handed_over_line(from, &found.name), &key, false)? {
+                            return Ok(Owned::Done((handed, true)));
+                        }
+                    }
+                }
+                Owned::Done((handed, false))
+            }
+        })
+    })
+    .await?;
+    Ok(match answer {
+        Owned::Done((handed, told)) => {
+            if told {
+                core.wake_mirror();
+            }
+            Owned::Done(handed)
+        }
+        Owned::NotFound => Owned::NotFound,
+        Owned::NotOwner => Owned::NotOwner,
+    })
+}
+
 /// What a link opens. `None` for a token that was never made, or whose
 /// trip is gone.
 pub async fn preview(core: &Core, token: &str) -> anyhow::Result<Option<Preview>> {
@@ -283,6 +331,43 @@ mod tests {
         let owner = core.store().account_for_telegram(11).unwrap();
         crate::trips::seed_trip_for_tests(&core, owner, "October").await.unwrap();
         (core, dir, owner)
+    }
+
+    #[tokio::test]
+    async fn the_owner_hands_the_trip_over_and_the_new_owner_is_told() {
+        let (core, _dir, owner) = core().await;
+        let masha = core.store().account_for_telegram(12).unwrap();
+        // Where the bot reaches her: her chat, as the bot notes on her
+        // first message.
+        core.store().note_delivery(masha, "telegram", "12").unwrap();
+        share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
+        let stranger = core.store().account_for_telegram(13).unwrap();
+
+        assert_eq!(hand_over(&core, masha, "October", masha).await.unwrap(), Owned::NotOwner);
+        assert_eq!(hand_over(&core, stranger, "October", masha).await.unwrap(), Owned::NotFound);
+        assert_eq!(hand_over(&core, owner, "October", stranger).await.unwrap(), Owned::Done(HandOver::NotOnTrip));
+        assert!(core.store().pending_mirror("telegram", 10).unwrap().is_empty(), "a refusal tells nobody");
+
+        let Owned::Done(HandOver::Done { from, to }) = hand_over(&core, owner, "October", masha).await.unwrap() else {
+            panic!("handed over");
+        };
+        assert_eq!(to, "Masha");
+        let told = core.store().pending_mirror("telegram", 10).unwrap();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].address, "12", "the new owner, on their own chat");
+        assert_eq!(told[0].body, handed_over_line(&from, "October"));
+        // Now Masha's to give, and the one who gave it is an editor on it.
+        assert_eq!(remove(&core, owner, "October", masha).await.unwrap(), Owned::NotOwner);
+        assert_eq!(leave(&core, owner, "October").await.unwrap(), Owned::Done(()));
+    }
+
+    #[test]
+    fn the_new_owner_is_told_what_they_can_do_now() {
+        assert_eq!(
+            handed_over_line("Sasha", "Минводы"),
+            "Sasha made you the owner of Минводы. You can now delete it, change its email address, \
+             manage its share link and take people off it. Sasha is still on it."
+        );
     }
 
     #[tokio::test]

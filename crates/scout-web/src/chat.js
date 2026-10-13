@@ -1082,6 +1082,21 @@ export function removePersonBody(tripName, person) {
   return JSON.stringify({ trip: tripName, person })
 }
 
+// What the owner is asked before the trip changes hands: what moves, and
+// that they stay. Immediate once confirmed — the new owner can give it
+// back the same way.
+export function handOverQuestion(name, tripName) {
+  return `Make ${name} the owner of ${tripName}? You stay on it as an editor. Only ${name} will be able to delete it, change its email address, manage its link and take people off it.`
+}
+
+// What a refused handover says, by the status and the server's reason.
+export function handOverRefusal(status, reason, name, tripName) {
+  if (status === 409 && reason === 'name_taken') return `${name} already has a trip called ${tripName}. One of you renames theirs first.`
+  if (status === 409 && reason === 'not_on_trip') return `${name} is no longer on ${tripName}.`
+  if (status === 403) return 'Only the trip’s owner can do that.'
+  return 'That did not work. Reload and try again.'
+}
+
 export function tripDeleteConsequence(trip) {
   const items = trip?.items ?? []
   const options = items.reduce((total, item) => total + (item.candidates?.length ?? 0), 0)
@@ -3422,6 +3437,12 @@ function start() {
       row.append(node('span', 'people-name', person.you ? `${person.name} (you)` : person.name))
       if (person.owner) row.append(node('span', 'people-owner', 'owner'))
       if (trip.you_own && !person.owner) {
+        const handOver = node('button', 'people-hand-over', 'Make owner')
+        handOver.type = 'button'
+        handOver.addEventListener('click', () => askInPanel(ask, handOverQuestion(person.name, trip.name), 'Make owner',
+          () => tripAction('/chat/trips/hand-over', removePersonBody(trip.name, person.id), `${person.name} is now the owner.`,
+            (status, reason) => handOverRefusal(status, reason, person.name, trip.name))))
+        row.append(handOver)
         const remove = node('button', 'people-remove', 'Remove')
         remove.type = 'button'
         remove.addEventListener('click', () => askInPanel(ask,
@@ -3592,7 +3613,7 @@ function start() {
   }
 
   // Leave and Remove: the answer is the reader's trips as they now stand.
-  async function tripAction(path, body, said) {
+  async function tripAction(path, body, said, refusal) {
     try {
       const res = await fetch(path, {
         method: 'POST',
@@ -3600,6 +3621,11 @@ function start() {
         body,
       })
       if (!res.ok) {
+        if (refusal) {
+          const answer = await res.json().catch(() => ({}))
+          showTripToast(refusal(res.status, answer?.refused))
+          return
+        }
         showTripToast(res.status === 403 ? 'Only the trip’s owner can do that.' : 'That did not work. Reload and try again.')
         return
       }

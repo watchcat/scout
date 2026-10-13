@@ -37,6 +37,7 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/chat/trips/address-check", get(check_address))
         .route("/chat/trips/leave", post(leave))
         .route("/chat/trips/remove-person", post(remove_person))
+        .route("/chat/trips/hand-over", post(hand_over))
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             super::only_from_our_own_pages,
@@ -274,6 +275,35 @@ async fn remove_person(
     match scout_core::sharing::remove(&auth.core, account_id, &body.trip, body.person).await {
         Ok(scout_core::sharing::Owned::Done(())) => list(axum::extract::State(auth), headers).await,
         other => refused(other, account_id, "remove person"),
+    }
+}
+
+/// The owner handing the trip to an editor. Answers with the reader's
+/// trips, as Remove does; a refusal the owner could not have seen coming —
+/// the person left meanwhile, or owns a trip by that name — is a 409 that
+/// says which, for the page to word.
+async fn hand_over(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<RemovePersonIn>,
+) -> Response {
+    use scout_core::sharing::{HandOver, Owned};
+    let account_id = match admitted_account(&auth, &headers).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if !csrf_header_ok(&auth, &headers, account_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let refusal = |why: &str| (StatusCode::CONFLICT, axum::Json(serde_json::json!({ "refused": why }))).into_response();
+    match scout_core::sharing::hand_over(&auth.core, account_id, &body.trip, body.person).await {
+        Ok(Owned::Done(HandOver::Done { .. })) => list(axum::extract::State(auth), headers).await,
+        Ok(Owned::Done(HandOver::NotOnTrip)) => refusal("not_on_trip"),
+        Ok(Owned::Done(HandOver::NameTaken)) => refusal("name_taken"),
+        // The store's own word for an owner who stopped being one between
+        // the lookup and the write.
+        Ok(Owned::Done(HandOver::NotOwner)) => StatusCode::FORBIDDEN.into_response(),
+        other => refused(other, account_id, "hand over"),
     }
 }
 
@@ -995,6 +1025,36 @@ mod tests {
         let res = get_with_cookie(&app, "/chat/trips", &m_cookie).await;
         let listed: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
         assert!(listed.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_owner_hands_the_trip_over_and_an_editor_cannot() {
+        let (app, core, _dir, owner, cookie, csrf) = setup().await;
+        let (masha, m_cookie, m_csrf) = second(&core).await;
+        scout_core::sharing::share_for_tests(&core, owner, "October", masha, "Masha").await.unwrap();
+        let to_masha = format!(r#"{{"trip":"October","person":{masha}}}"#);
+        let res = post_json(&app, "/chat/trips/hand-over", &m_cookie, Some(&m_csrf), &to_masha).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "an editor cannot");
+        let res = post_json(&app, "/chat/trips/hand-over", &cookie, None, &to_masha).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "nor anything without the page's token");
+
+        let res = post_json(&app, "/chat/trips/hand-over", &cookie, Some(&csrf), &to_masha).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(listed[0]["you_own"], false, "answers with the giver's trips as they now stand");
+        assert_eq!(listed[0]["people"][0]["name"], "Masha");
+        let res = get_with_cookie(&app, "/chat/trips", &m_cookie).await;
+        let hers: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(hers[0]["you_own"], true);
+
+        // Given back is fine; to someone not on it is a refusal that says so.
+        let res = post_json(&app, "/chat/trips/hand-over", &cookie, Some(&csrf), &to_masha).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "no longer the giver's to give");
+        let to_nobody = r#"{"trip":"October","person":999999}"#;
+        let res = post_json(&app, "/chat/trips/hand-over", &m_cookie, Some(&m_csrf), to_nobody).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let said: serde_json::Value = serde_json::from_str(&body_of(res).await).unwrap();
+        assert_eq!(said["refused"], "not_on_trip");
     }
 
     #[tokio::test]

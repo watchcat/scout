@@ -190,6 +190,27 @@ Deleting the owner's thread no longer deletes a trip that has people on
 it: it detaches it, as expiry does. Deleting an editor's thread clears
 their `conversation_id`.
 
+### Handing the trip over
+
+Added 2026-10-13. `POST /chat/trips/hand-over` — `{trip, person}`, owner
+only, from a Make owner button beside each editor in the People panel,
+after a question that says what moves. Immediate: there is no offer to
+accept, and the new owner can hand it back the same way. Not a Scout
+tool — a misread chat message should not be able to do it.
+
+`Store::hand_over_trip` swaps the two in one transaction:
+`trips.account_id` and `owner_name` become the editor's, their
+`trip_people` row is deleted, and the old owner gets one (a returning row
+is taken up again, as on joining). Each keeps their own thread: the new
+owner's becomes `trips.conversation_id`, the one that takes the trip with
+it when deleted; the old owner's moves to their `trip_people` row, which
+does not. Items, address, link and mail stay with the trip. Refused,
+changing nothing, when the asker is not the owner (403), when the person is
+not an editor now — never the owner, never someone who left (409
+`not_on_trip`), and when they already own a trip by that name, since an
+account's trips are told apart by name (409 `name_taken`). The new owner is
+told on Telegram, where the bot can reach them, what they can now do.
+
 ### Who added it
 
 Every write that makes an item records who and how:
@@ -391,7 +412,7 @@ trip rather than the arrival's account.
 ## Out of scope
 
 - View-only guests.
-- Handing a trip to another owner; the owner leaving.
+- The owner leaving without handing the trip over first.
 - A shared thread with Scout.
 - Telegram messages about other people's edits, or telling editors the
   owner deleted the trip.

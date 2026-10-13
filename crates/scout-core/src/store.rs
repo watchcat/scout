@@ -840,6 +840,20 @@ pub struct Join<'a> {
     pub now: chrono::NaiveDateTime,
 }
 
+/// What handing a trip over did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HandOver {
+    /// It changed hands; the names are as the trip shows them.
+    Done { from: String, to: String },
+    /// The account asking is not the trip's owner.
+    NotOwner,
+    /// The one it was to go to is not an editor on it now.
+    NotOnTrip,
+    /// They own a trip by the same name already, and an account's trips
+    /// are told apart by name.
+    NameTaken,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Joined {
     Joined { trip: String, seated: bool },
@@ -4827,6 +4841,33 @@ impl Store {
         )? > 0)
     }
 
+    /// The owner handing the trip to an editor, and staying on it as one.
+    ///
+    /// The two swap places and each keeps their own thread: the new
+    /// owner's becomes the trip's own — the one that takes the trip with it
+    /// when it is deleted — and the old owner's becomes an editor's, which
+    /// does not. Everything that belongs to the trip stays with it: items,
+    /// address, link, mail. One transaction, so no reader sees a trip with
+    /// two owners or none.
+    pub fn hand_over_trip(&self, owner: i64, trip_id: i64, to: i64, now: chrono::NaiveDateTime) -> Result<HandOver> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        match hand_over_within(&conn, owner, trip_id, to, now) {
+            Ok(done @ HandOver::Done { .. }) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(done)
+            }
+            Ok(refused) => {
+                conn.execute_batch("ROLLBACK")?;
+                Ok(refused)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// The owner taking someone off. False for anyone but the owner.
     pub fn remove_from_trip(&self, owner: i64, trip_id: i64, person: i64, now: chrono::NaiveDateTime) -> Result<bool> {
         if !self.is_owner(owner, trip_id)? {
@@ -5083,6 +5124,58 @@ fn join_within(conn: &Connection, j: &Join<'_>) -> Result<Joined> {
         params![j.owner_name, link.trip_id],
     )?;
     Ok(Joined::Joined { trip: name, seated: !seated_already })
+}
+
+/// The body of `Store::hand_over_trip`, inside its transaction.
+fn hand_over_within(conn: &Connection, owner: i64, trip_id: i64, to: i64, now: chrono::NaiveDateTime) -> Result<HandOver> {
+    let trip: Option<(i64, String, String, Option<i64>)> = conn
+        .query_row(
+            "SELECT t.account_id, t.name_key, coalesce(t.owner_name, u.display_name, 'Owner'), t.conversation_id
+             FROM trips t LEFT JOIN users u ON u.account_id = t.account_id WHERE t.id = ?",
+            params![trip_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((current, key, from_name, owners_thread)) = trip else { return Ok(HandOver::NotOwner) };
+    if current != owner {
+        return Ok(HandOver::NotOwner);
+    }
+    let editor: Option<(String, Option<i64>)> = conn
+        .query_row(
+            "SELECT name, conversation_id FROM trip_people WHERE trip_id = ? AND account_id = ? AND left_at IS NULL",
+            params![trip_id, to],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((to_name, editors_thread)) = editor else { return Ok(HandOver::NotOnTrip) };
+    let clash: i64 = conn.query_row(
+        "SELECT count(*) FROM trips WHERE account_id = ? AND name_key = ? AND id <> ?",
+        params![to, key, trip_id],
+        |r| r.get(0),
+    )?;
+    if clash > 0 {
+        return Ok(HandOver::NameTaken);
+    }
+    conn.execute("DELETE FROM trip_people WHERE trip_id = ? AND account_id = ?", params![trip_id, to])?;
+    conn.execute(
+        "UPDATE trips SET account_id = ?, owner_name = ?, conversation_id = ? WHERE id = ?",
+        params![to, to_name, editors_thread, trip_id],
+    )?;
+    // A row from an earlier time on the trip is taken up again, as a
+    // returning joiner's is.
+    let returning = conn.execute(
+        "UPDATE trip_people SET left_at = NULL, name = ?, joined_at = CAST(? AS TIMESTAMP), conversation_id = ?
+         WHERE trip_id = ? AND account_id = ?",
+        params![from_name, stamp(now), owners_thread, trip_id, owner],
+    )?;
+    if returning == 0 {
+        conn.execute(
+            "INSERT INTO trip_people (trip_id, account_id, name, joined_at, conversation_id)
+             VALUES (?, ?, ?, CAST(? AS TIMESTAMP), ?)",
+            params![trip_id, owner, from_name, stamp(now), owners_thread],
+        )?;
+    }
+    Ok(HandOver::Done { from: from_name, to: to_name })
 }
 
 fn trip_exists(conn: &Connection, trip_id: i64) -> Result<bool> {
@@ -10707,6 +10800,84 @@ CREATE TABLE conversations (
         let trip = s.upsert_trip(owner, "Lisbon", None, None, None).unwrap();
         s.make_link(trip.id, "t".repeat(22).as_str(), at("2026-10-11 10:00")).unwrap();
         (owner, trip.id)
+    }
+
+    /// Sasha's trip with its own thread, and Masha on it with hers.
+    fn a_trip_to_hand_over(s: &Store) -> (i64, i64, i64, i64, i64) {
+        let sasha = s.account_for_telegram(1).unwrap();
+        let masha = s.account_for_telegram(2).unwrap();
+        let sashas_thread = s.start_conversation(sasha, "direct").unwrap();
+        let mashas_thread = s.start_conversation(masha, "direct").unwrap();
+        let trip = s.upsert_trip(sasha, "Lisbon", None, None, Some(sashas_thread)).unwrap();
+        s.conn().execute("UPDATE trips SET owner_name = 'Sasha', kept = true WHERE id = ?", params![trip.id]).unwrap();
+        put_on(s, trip.id, masha, "Masha");
+        s.conn().execute("UPDATE trip_people SET conversation_id = ? WHERE account_id = ?", params![mashas_thread, masha]).unwrap();
+        (sasha, masha, trip.id, sashas_thread, mashas_thread)
+    }
+
+    #[test]
+    fn the_owner_hands_a_trip_over_and_stays_on_it_as_an_editor() {
+        let (s, _d) = test_store();
+        let (sasha, masha, trip_id, sashas_thread, mashas_thread) = a_trip_to_hand_over(&s);
+        let now = at("2026-10-13 10:00");
+
+        assert_eq!(s.hand_over_trip(sasha, trip_id, masha, now).unwrap(), HandOver::Done { from: "Sasha".into(), to: "Masha".into() });
+
+        assert!(s.is_owner(masha, trip_id).unwrap());
+        assert!(!s.is_owner(sasha, trip_id).unwrap());
+        assert!(s.can_reach(sasha, trip_id).unwrap(), "Sasha is still on it");
+        let people: Vec<_> = s.trip_people(trip_id).unwrap().into_iter().map(|p| (p.account_id, p.name, p.owner)).collect();
+        assert_eq!(people, vec![(masha, "Masha".to_string(), true), (sasha, "Sasha".to_string(), false)]);
+        // Each keeps their own thread: Masha's is the trip's now, and
+        // Sasha's is an editor's.
+        assert_eq!(s.trip_chat(trip_id).unwrap().map(|c| c.id), Some(mashas_thread));
+        assert_eq!(s.trip_chat_for(sasha, trip_id).unwrap().map(|c| c.id), Some(sashas_thread));
+        // So Sasha deleting that thread leaves Masha's trip alone.
+        assert!(s.delete_conversation(sasha, sashas_thread).unwrap());
+        assert!(s.can_reach(masha, trip_id).unwrap());
+        // And the owner's powers moved with it.
+        assert!(!s.remove_from_trip(sasha, trip_id, masha, now).unwrap());
+        assert!(s.remove_from_trip(masha, trip_id, sasha, now).unwrap());
+    }
+
+    #[test]
+    fn a_trip_goes_only_from_its_owner_to_someone_on_it() {
+        let (s, _d) = test_store();
+        let (sasha, masha, trip_id, _, _) = a_trip_to_hand_over(&s);
+        let stranger = s.account_for_telegram(3).unwrap();
+        let now = at("2026-10-13 10:00");
+        assert_eq!(s.hand_over_trip(masha, trip_id, masha, now).unwrap(), HandOver::NotOwner, "an editor cannot take it");
+        assert_eq!(s.hand_over_trip(sasha, trip_id, stranger, now).unwrap(), HandOver::NotOnTrip);
+        assert_eq!(s.hand_over_trip(sasha, trip_id, sasha, now).unwrap(), HandOver::NotOnTrip, "not to the owner");
+        s.leave_trip(masha, trip_id, now).unwrap();
+        assert_eq!(s.hand_over_trip(sasha, trip_id, masha, now).unwrap(), HandOver::NotOnTrip, "not to someone who left");
+        assert!(s.is_owner(sasha, trip_id).unwrap(), "nothing moved");
+    }
+
+    #[test]
+    fn a_trip_does_not_go_to_someone_who_owns_one_by_that_name() {
+        let (s, _d) = test_store();
+        let (sasha, masha, trip_id, _, _) = a_trip_to_hand_over(&s);
+        // Her own, from before she joined: `upsert_trip` would find the
+        // shared one by that name now.
+        s.conn().execute("INSERT INTO trips (account_id, name, name_key) VALUES (?, 'Lisbon', 'lisbon')", params![masha]).unwrap();
+        assert_eq!(s.hand_over_trip(sasha, trip_id, masha, at("2026-10-13 10:00")).unwrap(), HandOver::NameTaken);
+        assert!(s.is_owner(sasha, trip_id).unwrap());
+        assert_eq!(s.trip_people(trip_id).unwrap().len(), 2, "Masha is still on it");
+    }
+
+    #[test]
+    fn a_trip_handed_over_can_be_handed_back() {
+        let (s, _d) = test_store();
+        let (sasha, masha, trip_id, sashas_thread, mashas_thread) = a_trip_to_hand_over(&s);
+        s.hand_over_trip(sasha, trip_id, masha, at("2026-10-13 10:00")).unwrap();
+        assert_eq!(s.hand_over_trip(masha, trip_id, sasha, at("2026-10-13 11:00")).unwrap(), HandOver::Done { from: "Masha".into(), to: "Sasha".into() });
+        let people: Vec<_> = s.trip_people(trip_id).unwrap().into_iter().map(|p| (p.account_id, p.owner)).collect();
+        assert_eq!(people, vec![(sasha, true), (masha, false)]);
+        assert_eq!(s.trip_chat(trip_id).unwrap().map(|c| c.id), Some(sashas_thread));
+        assert_eq!(s.trip_chat_for(masha, trip_id).unwrap().map(|c| c.id), Some(mashas_thread));
+        let rows: i64 = s.conn().query_row("SELECT count(*) FROM trip_people WHERE trip_id = ?", params![trip_id], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "one row for the one editor, never the owner");
     }
 
     #[test]

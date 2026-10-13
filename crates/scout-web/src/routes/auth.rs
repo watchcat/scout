@@ -162,7 +162,13 @@ pub(crate) async fn offer_a_link(
         && auth.by_address.allow(&ratelimit::address_key(&address))
         && auth.by_ip.allow(&client_bucket(headers));
     if send {
-        mail_a_link(auth, address, account_id).await;
+        // From a trip's join page, the link carries that trip: it may well
+        // be opened in another browser — the phone's mail app, a laptop —
+        // where the join page's cookie is not, and a newcomer who lands on
+        // an empty chat has lost the trip they came for. A sign-in only;
+        // an address being attached is not on its way into anything.
+        let join = account_id.is_none().then(|| super::join::pending_join(headers)).flatten();
+        mail_a_link(auth, address, account_id, join).await;
     }
 
     Html(pages::check_your_inbox()).into_response()
@@ -175,7 +181,7 @@ fn on_our_domain(address: &str, domain: &str) -> bool {
 }
 
 /// Files a token and hands the mail off to a task of its own.
-async fn mail_a_link(auth: &AuthState, address: String, account_id: Option<i64>) {
+async fn mail_a_link(auth: &AuthState, address: String, account_id: Option<i64>, join: Option<String>) {
     // 32 random bytes, hex. Stored as its SHA-256 and never otherwise:
     // a leaked `login_tokens` table then holds nothing anyone can spend,
     // for the same reason a password file holds hashes.
@@ -183,8 +189,8 @@ async fn mail_a_link(auth: &AuthState, address: String, account_id: Option<i64>)
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
     let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-    if let Err(e) = identity::issue_token(
-        &auth.core, &hashed(&token), &address, account_id, LINK_TTL_SECS,
+    if let Err(e) = identity::issue_token_joining(
+        &auth.core, &hashed(&token), &address, account_id, LINK_TTL_SECS, join.as_deref(),
     ).await {
         tracing::error!(error = %e, "could not file a login token");
         return;
@@ -246,15 +252,19 @@ async fn confirm(State(auth): State<AuthState>, headers: HeaderMap, Form(form): 
     };
 
     match outcome {
-        TokenOutcome::Valid { email, account_id: None } => {
+        TokenOutcome::Valid { email, account_id: None, join } => {
             match identity::sign_in(&auth.core, "email", &email).await {
                 // Queued is signed in too. They have an account, and the
                 // page they land on is the one that says where they stand;
                 // turning them away with no session would be the dead end
                 // this work exists to close.
-                Ok(SignIn::In { account_id } | SignIn::Queued { account_id }) => {
-                    signed_in(&auth, &headers, account_id)
-                }
+                //
+                // Back to the trip the link was asked for from, whichever
+                // browser this is; else wherever this browser was going.
+                Ok(SignIn::In { account_id } | SignIn::Queued { account_id }) => match join {
+                    Some(token) => signed_in_at(&auth, account_id, &super::join::landing(Some(token))),
+                    None => signed_in(&auth, &headers, account_id),
+                },
                 Err(e) => {
                     tracing::error!(error = %e, "could not sign in an address");
                     sorry()
@@ -265,7 +275,7 @@ async fn confirm(State(auth): State<AuthState>, headers: HeaderMap, Form(form): 
         // address being attached rather than a way in — no new session.
         // Task 13's `/account` shows how it went; a refusal here must not
         // move the identity, which `link_identity` is what guarantees.
-        TokenOutcome::Valid { email, account_id: Some(id) } => {
+        TokenOutcome::Valid { email, account_id: Some(id), .. } => {
             // Every outcome says which it was. The token is spent either
             // way, so an unannounced refusal is a link that looks like it
             // worked and cannot be tried again — and the page it lands on

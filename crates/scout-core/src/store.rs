@@ -357,7 +357,10 @@ CREATE TABLE IF NOT EXISTS login_tokens (
     expires_at  TIMESTAMP NOT NULL,
     -- Kept rather than deleted, so "already used" and "expired" stay
     -- distinguishable — they call for different advice.
-    consumed_at TIMESTAMP
+    consumed_at TIMESTAMP,
+    -- The share link a sign-in was asked for from, so the emailed link
+    -- returns to that trip in any browser. Last: step 25 adds it.
+    join_token  TEXT
 );
 CREATE SEQUENCE IF NOT EXISTS conversations_id_seq;
 -- A rolling thread. `scope` keeps a group chat's history out of the
@@ -989,7 +992,10 @@ pub enum MailGone {
 /// What a magic link turned out to be worth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenOutcome {
-    Valid { email: String, account_id: Option<i64> },
+    /// `join` is the share link the sign-in was asked for from, so the
+    /// link brings its reader back to that trip in whatever browser opens
+    /// it.
+    Valid { email: String, account_id: Option<i64>, join: Option<String> },
     Expired,
     AlreadyUsed,
     Unknown,
@@ -1450,6 +1456,13 @@ fn step_15_reorder_items(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The share link a sign-in was asked for from, carried by the login
+/// token so the emailed link returns to the trip in any browser. Nullable
+/// and last, as every added column here is.
+const STEP_25_LOGIN_JOIN: &str = r#"
+ALTER TABLE login_tokens ADD COLUMN IF NOT EXISTS join_token TEXT;
+"#;
+
 /// A stay now waits for the arrival on its check-in day; every trip is
 /// put in that order once, since positions otherwise change only when the
 /// trip does.
@@ -1638,6 +1651,7 @@ fn steps() -> Vec<(i64, Step)> {
         (22, Step::Sql(STEP_22_TRIP_ADDRESS)),
         (23, Step::Sql(STEP_23_RELEASED_ADDRESSES)),
         (24, Step::Code(step_24_stays_after_arrivals)),
+        (25, Step::Sql(STEP_25_LOGIN_JOIN)),
     ]
 }
 
@@ -3142,6 +3156,18 @@ impl Store {
         Ok(standing.unwrap_or(false))
     }
 
+    /// Without a join link: what the tests that are not about joining use.
+    #[cfg(test)]
+    pub fn issue_login_token(
+        &self,
+        token_hash: &str,
+        email: &str,
+        account_id: Option<i64>,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        self.issue_login_token_joining(token_hash, email, account_id, ttl_secs, None)
+    }
+
     /// Records a token that has been mailed out.
     ///
     /// `token_hash` is a hash of the value in the link, never the value:
@@ -3174,19 +3200,23 @@ impl Store {
     /// Computing the value here sidesteps it entirely, and the `<`
     /// comparison in `consume_login_token` is between two TIMESTAMPs with
     /// no arithmetic, so it never meets the same wall.
-    pub fn issue_login_token(
+    ///
+    /// `join` is the share link a sign-in was asked for from, given back
+    /// when this token is spent.
+    pub fn issue_login_token_joining(
         &self,
         token_hash: &str,
         email: &str,
         account_id: Option<i64>,
         ttl_secs: i64,
+        join: Option<&str>,
     ) -> Result<()> {
         let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs);
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO login_tokens (token_hash, email, account_id, expires_at)
-             VALUES (?, ?, ?, ?)",
-            params![token_hash, email, account_id, expires_at.to_string()],
+            "INSERT INTO login_tokens (token_hash, email, account_id, expires_at, join_token)
+             VALUES (?, ?, ?, ?, ?)",
+            params![token_hash, email, account_id, expires_at.to_string(), join],
         )?;
         Ok(())
     }
@@ -3209,21 +3239,23 @@ impl Store {
     /// Rust rather than `current_timestamp AT TIME ZONE 'UTC'`, which would
     /// also be correct, because then all three writers of a timestamp in
     /// this table are the same line and there is nothing to compare.
+    #[allow(clippy::type_complexity)]
     pub fn consume_login_token(&self, token_hash: &str) -> Result<TokenOutcome> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT email, account_id, consumed_at IS NOT NULL,
-                    expires_at < (current_timestamp AT TIME ZONE 'UTC')::TIMESTAMP
+                    expires_at < (current_timestamp AT TIME ZONE 'UTC')::TIMESTAMP,
+                    join_token
              FROM login_tokens WHERE token_hash = ?",
         )?;
-        let row: Option<(String, Option<i64>, bool, bool)> = stmt
+        let row: Option<(String, Option<i64>, bool, bool, Option<String>)> = stmt
             .query_map(params![token_hash], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .next()
             .transpose()?;
         drop(stmt);
-        let Some((email, account_id, consumed, expired)) = row else {
+        let Some((email, account_id, consumed, expired, join)) = row else {
             return Ok(TokenOutcome::Unknown);
         };
         if consumed {
@@ -3237,7 +3269,7 @@ impl Store {
             "UPDATE login_tokens SET consumed_at = ? WHERE token_hash = ?",
             params![consumed_at.to_string(), token_hash],
         )?;
-        Ok(TokenOutcome::Valid { email, account_id })
+        Ok(TokenOutcome::Valid { email, account_id, join })
     }
 
     /// Drops login tokens that stopped being worth keeping, returning how
@@ -7365,7 +7397,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 24);
+        assert_eq!(s.schema_version().unwrap(), 25);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -7395,7 +7427,7 @@ CREATE TABLE segment_candidates (
         assert_eq!(s.consume_login_token("hash-recent").unwrap(), TokenOutcome::Expired);
         assert_eq!(
             s.consume_login_token("hash-live").unwrap(),
-            TokenOutcome::Valid { email: "c@example.com".to_string(), account_id: None }
+            TokenOutcome::Valid { email: "c@example.com".to_string(), account_id: None, join: None }
         );
 
         // And the thing the window exists to protect: a row that has been
@@ -7429,11 +7461,11 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 24);
+        assert_eq!(store.schema_version().unwrap(), 25);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
-            TokenOutcome::Valid { email: "m@example.com".to_string(), account_id: None }
+            TokenOutcome::Valid { email: "m@example.com".to_string(), account_id: None, join: None }
         );
     }
 
@@ -7444,7 +7476,7 @@ CREATE TABLE segment_candidates (
 
         assert_eq!(
             s.consume_login_token("hash-a").unwrap(),
-            TokenOutcome::Valid { email: "a@example.com".to_string(), account_id: None }
+            TokenOutcome::Valid { email: "a@example.com".to_string(), account_id: None, join: None }
         );
         // The whole reason the row survives consumption: the second visit
         // gets advice ("you may already be signed in"), not "expired".
@@ -7515,7 +7547,7 @@ CREATE TABLE segment_candidates (
         s.issue_login_token("hash-c", "c@example.com", Some(account), 900).unwrap();
         assert_eq!(
             s.consume_login_token("hash-c").unwrap(),
-            TokenOutcome::Valid { email: "c@example.com".to_string(), account_id: Some(account) }
+            TokenOutcome::Valid { email: "c@example.com".to_string(), account_id: Some(account), join: None }
         );
     }
 
@@ -8703,6 +8735,32 @@ CREATE TABLE trips (
     }
 
     #[test]
+    fn step_25_gives_an_old_login_table_the_join_column_in_the_fresh_shape() {
+        let (fresh, _d) = test_store();
+        let dir = TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("old.duckdb")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE login_tokens (token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, account_id BIGINT,
+                                        expires_at TIMESTAMP NOT NULL, consumed_at TIMESTAMP);",
+        )
+        .unwrap();
+        conn.execute_batch(STEP_25_LOGIN_JOIN).unwrap();
+        assert_eq!(shape(&fresh.conn(), "login_tokens"), shape(&conn, "login_tokens"));
+    }
+
+    #[test]
+    fn a_sign_in_asked_for_from_a_join_page_gives_its_link_back_when_spent() {
+        let (s, _d) = test_store();
+        s.issue_login_token_joining("hash-join", "new@example.com", None, 900, Some("j".repeat(22).as_str())).unwrap();
+        assert_eq!(
+            s.consume_login_token("hash-join").unwrap(),
+            TokenOutcome::Valid { email: "new@example.com".to_string(), account_id: None, join: Some("j".repeat(22)) }
+        );
+        s.issue_login_token("hash-plain", "old@example.com", None, 900).unwrap();
+        assert!(matches!(s.consume_login_token("hash-plain").unwrap(), TokenOutcome::Valid { join: None, .. }));
+    }
+
+    #[test]
     fn a_stay_comes_after_the_flight_that_lands_on_its_check_in_day() {
         // Reported from a real trip: a hotel whose check-in opens at 14:00
         // sat above the 16:20 flight that brought the traveller there at
@@ -9427,7 +9485,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 24);
+        assert_eq!(store.schema_version().unwrap(), 25);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -10286,7 +10344,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 24, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 25, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -10327,7 +10385,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 24);
+        assert_eq!(s.schema_version().unwrap(), 25);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -10427,7 +10485,7 @@ CREATE TABLE conversations (
         // updated the table: the pod crash-looped on this step.
         let (_dir, path) = version_eighteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 24);
+        assert_eq!(s.schema_version().unwrap(), 25);
         let trip = s.list_trips(1).unwrap().remove(0);
         assert_eq!((trip.items[0].lat, trip.items[0].geocode_tried), (None, false));
         s.set_item_coords(trip.items[0].id, None).unwrap();
@@ -10464,7 +10522,7 @@ CREATE TABLE conversations (
     fn step_20_runs_on_a_database_that_has_items_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_nineteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 24);
+        assert_eq!(s.schema_version().unwrap(), 25);
         let item = &s.list_trips(1).unwrap()[0].items[0];
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
@@ -11167,7 +11225,7 @@ CREATE TABLE conversations (
     fn step_21_runs_on_a_database_with_trips_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 24);
+        assert_eq!(s.schema_version().unwrap(), 25);
         let trip = &s.list_trips(1).unwrap()[0];
         assert_eq!(trip.items[0].added, None, "an item from before sharing has no author");
         let (fresh, _d) = test_store();
@@ -11205,7 +11263,7 @@ CREATE TABLE conversations (
     fn step_22_runs_on_a_database_with_mail_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_one_db();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 24);
+        assert_eq!(s.schema_version().unwrap(), 25);
         let (fresh, _d) = test_store();
         // Not `mail_forwards`: `Store::open` runs `MIGRATIONS` before the
         // steps, so the table is there whatever step 22 says, and comparing
@@ -11799,7 +11857,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 24);
+        assert_eq!(store.schema_version().unwrap(), 25);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -11963,7 +12021,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 24);
+        assert_eq!(store.schema_version().unwrap(), 25);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -12008,7 +12066,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 24);
+        assert_eq!(store.schema_version().unwrap(), 25);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -12084,7 +12142,7 @@ CREATE TABLE messages (
         // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 24);
+        assert_eq!(store.schema_version().unwrap(), 25);
         let part = mail_part("att_1", Some("inline"), None);
         let m = store
             .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))

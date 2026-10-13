@@ -151,10 +151,22 @@ pub async fn issue_token(
     account_id: Option<i64>,
     ttl_secs: i64,
 ) -> anyhow::Result<()> {
+    issue_token_joining(core, token_hash, email, account_id, ttl_secs, None).await
+}
+
+/// `issue_token`, carrying the share link the sign-in was asked for from;
+/// see `TokenOutcome::Valid`.
+pub async fn issue_token_joining(
+    core: &Core,
+    token_hash: &str,
+    email: &str,
+    account_id: Option<i64>,
+    ttl_secs: i64,
+    join: Option<&str>,
+) -> anyhow::Result<()> {
     let store = core.store();
-    let token_hash = token_hash.to_string();
-    let email = email.to_string();
-    blocking(move || store.issue_login_token(&token_hash, &email, account_id, ttl_secs)).await
+    let (token_hash, email, join) = (token_hash.to_string(), email.to_string(), join.map(str::to_string));
+    blocking(move || store.issue_login_token_joining(&token_hash, &email, account_id, ttl_secs, join.as_deref())).await
 }
 
 /// Spends a login token, if it has anything left to spend.
@@ -363,7 +375,7 @@ mod tests {
         let first = consume_token(&core, "hash-1").await.unwrap();
         assert_eq!(
             first,
-            TokenOutcome::Valid { email: "reader@example.com".to_string(), account_id: None }
+            TokenOutcome::Valid { email: "reader@example.com".to_string(), account_id: None, join: None }
         );
 
         let second = consume_token(&core, "hash-1").await.unwrap();

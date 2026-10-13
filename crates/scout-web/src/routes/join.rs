@@ -24,13 +24,23 @@ pub fn routes(auth: AuthState) -> Router {
 /// when its cookie holds a token's shape, else the chat. The path is built
 /// from the token, so the cookie cannot point anywhere else.
 pub(crate) fn after_sign_in(headers: &HeaderMap) -> String {
+    landing(pending_join(headers))
+}
+
+/// The share link this browser was on its way into, from the join page's
+/// cookie: only a token's shape, so it can name nothing else.
+pub(crate) fn pending_join(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|jar| session::read_cookie(jar, JOIN_COOKIE))
         .filter(|t| is_link_token(t))
-        .map(|t| format!("/join/{t}"))
-        .unwrap_or_else(|| "/chat".to_string())
+}
+
+/// The join page for `token`, or the chat without one. The path is built
+/// from a token's shape only.
+pub(crate) fn landing(token: Option<String>) -> String {
+    token.filter(|t| is_link_token(t)).map(|t| format!("/join/{t}")).unwrap_or_else(|| "/chat".to_string())
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -241,6 +251,78 @@ mod tests {
         assert_eq!(super::after_sign_in(&with(&"j".repeat(22))), format!("/join/{}", "j".repeat(22)));
         assert_eq!(super::after_sign_in(&with("..%2F..%2Fevil")), "/chat");
         assert_eq!(super::after_sign_in(&axum::http::HeaderMap::new()), "/chat");
+    }
+
+    /// The value of the first `name="csrf"` field on a page.
+    fn csrf_on(page: &str) -> String {
+        let (_, rest) = page.split_once(r#"name="csrf" value=""#).expect("the page has a form token");
+        rest.split_once('"').unwrap().0.to_string()
+    }
+
+    #[tokio::test]
+    async fn an_emailed_sign_in_asked_for_from_the_join_page_returns_to_it_in_any_browser() {
+        // The report: a newcomer asked for the link on their laptop and
+        // opened it on their phone, where the join page's cookie is not,
+        // and landed in an empty chat instead of on the trip.
+        let (app, core, _dir, sent) = test_app_keeping_mail().await;
+        open_round(&core, "autumn", 1).await;
+        let scout_core::identity::SignIn::In { account_id: owner } =
+            scout_core::identity::sign_in(&core, "telegram", "777").await.unwrap()
+        else {
+            panic!("the open round should admit the owner");
+        };
+        scout_core::trips::seed_trip_for_tests(&core, owner, "October").await.unwrap();
+        let token = scout_core::sharing::link(&core, owner, "October", "k".repeat(22)).await.unwrap().unwrap().token;
+
+        // The laptop: the join page, and the address typed into its form.
+        let page = app.clone().oneshot(Request::get(format!("/join/{token}")).body(Body::empty()).unwrap()).await.unwrap();
+        let join_cookie = page.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+        let csrf = csrf_on(&body_of(page).await);
+        let asked = post_with_headers(
+            &app,
+            "/sign-in/email",
+            &format!("csrf={csrf}&email=new%40example.com"),
+            &[("origin", "https://example.com"), ("cookie", &join_cookie)],
+        )
+        .await;
+        assert_eq!(asked.status(), StatusCode::OK);
+
+        // The phone: the link, and nothing else — no cookie of any kind.
+        let link = mailed_link(&sent).await;
+        let login = link.split_once("?t=").expect("the mail carries a token").1.to_string();
+        let confirm_csrf = csrf_on(&body_of(get(&app, &format!("/auth/email?t={login}")).await).await);
+        let spent = post_form(&app, "/auth/email", &format!("csrf={confirm_csrf}&t={login}")).await;
+        assert_eq!(spent.status(), StatusCode::SEE_OTHER);
+        assert_eq!(spent.headers()["location"], format!("/join/{token}"), "back to the trip, not the chat");
+
+        // And from there, one press to the trip itself.
+        let session = spent.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+        let form = app
+            .clone()
+            .oneshot(Request::get(format!("/join/{token}")).header("cookie", &session).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let join_csrf = csrf_on(&body_of(form).await);
+        let joined = post_with_headers(
+            &app,
+            &format!("/join/{token}"),
+            &format!("csrf={join_csrf}&name=Newcomer"),
+            &[("origin", "https://example.com"), ("cookie", &session)],
+        )
+        .await;
+        assert_eq!(joined.status(), StatusCode::SEE_OTHER);
+        assert_eq!(joined.headers()["location"], "/chat?trip=October");
+    }
+
+    #[tokio::test]
+    async fn an_emailed_sign_in_from_anywhere_else_still_lands_in_the_chat() {
+        let (app, _core, _dir, sent) = test_app_keeping_mail().await;
+        let csrf = csrf_on(&body_of(get(&app, "/sign-in").await).await);
+        post_with_headers(&app, "/sign-in/email", &format!("csrf={csrf}&email=plain%40example.com"), &[("origin", "https://example.com")]).await;
+        let login = mailed_link(&sent).await.split_once("?t=").unwrap().1.to_string();
+        let confirm_csrf = csrf_on(&body_of(get(&app, &format!("/auth/email?t={login}")).await).await);
+        let spent = post_form(&app, "/auth/email", &format!("csrf={confirm_csrf}&t={login}")).await;
+        assert_eq!(spent.headers()["location"], "/chat");
     }
 
     #[tokio::test]

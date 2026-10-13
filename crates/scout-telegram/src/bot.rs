@@ -1318,12 +1318,19 @@ async fn handle_document(bot: Bot, msg: Message, app: Arc<App>) -> ResponseResul
         }
     };
     let (bytes, text) = scout_web::pdf_text(0, bytes).await;
-    // Telegram's own id for the file: the same PDF sent twice is read once.
-    let provider_id = format!("telegram:{}", doc.file.unique_id);
-    let recorded = scout_core::inbox::record_document(&app.core, account_id, &provider_id, &filename, "application/pdf", bytes, text).await;
+    // Telegram's own id for the file, under this account: the same PDF
+    // sent twice is read once, unless that reading found no booking. The
+    // account is in the key because Telegram's id is the file's, the same
+    // for everyone who has it — someone else's copy is theirs to read.
+    let provider_id = format!("telegram:{account_id}:{}", doc.file.unique_id);
+    // The key a file sent before this had: without it, the first resend of
+    // a file whose booking is already on the trip would be read again.
+    let older_id = format!("telegram:{}", doc.file.unique_id);
+    let recorded = scout_core::inbox::record_document(&app.core, account_id, &provider_id, Some(&older_id), &filename, "application/pdf", bytes, text).await;
     let reply = match recorded {
-        Ok(Some(_)) => "Reading it now. I'll say what I found in a moment.".to_string(),
-        Ok(None) => "I've read that file already; it's on your Trips tab.".to_string(),
+        Ok(scout_core::inbox::Recorded::Filed(_)) => "Reading it now. I'll say what I found in a moment.".to_string(),
+        Ok(scout_core::inbox::Recorded::Held) => "I've read that file already; it's on your Trips tab.".to_string(),
+        Ok(scout_core::inbox::Recorded::Reading) => "I'm still reading that one. I'll say what I found in a moment.".to_string(),
         Err(e) => {
             tracing::error!(error = %e, chat_id = chat_id.0, "could not file a document");
             "Sorry, something went wrong on my side. Please try again in a minute.".to_string()

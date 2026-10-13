@@ -32,9 +32,12 @@ FROM debian:bookworm-slim
 # namespaces instead, which this container has. Measured in the running
 # pod as uid 1000: `chromium --headless=new --print-to-pdf` writes a real
 # PDF with no sandbox binary and no --no-sandbox flag.
+# poppler-utils for `pdftoppm`: a PDF printed as drawn shapes ("Microsoft:
+# Print To PDF" does this) has no text to read, so the inbox worker draws
+# its pages and has the model read the pictures.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 chromium fonts-liberation tini \
+        ca-certificates libssl3 chromium fonts-liberation tini poppler-utils \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m scout \
     && mkdir -p /data \

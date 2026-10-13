@@ -1793,6 +1793,21 @@ pub struct NewArrival {
     pub trip_id: Option<i64>,
 }
 
+/// How long after its last attempt began a mail still marked `extracting`
+/// is taken for a worker that died mid-read: well past the slowest pass,
+/// three minutes of pages and the extractor's own budget after them.
+const STALE_PASS_MINUTES: i64 = 15;
+
+/// What `Store::document_state` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentState {
+    pub mail_id: i64,
+    /// Read or refused, so nothing is still writing to it.
+    pub settled: bool,
+    /// The reading found at least one booking.
+    pub booking: bool,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -6186,6 +6201,69 @@ impl Store {
         let mut stmt = conn.prepare("SELECT filename, text FROM attachments WHERE mail_id = ? ORDER BY id")?;
         let rows = stmt.query_map(params![mail_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// `(id, filename, bytes)` for each PDF of a mail that kept its bytes
+    /// and has no text: a file printed to PDF as drawn shapes, or scanned,
+    /// that the text reader found nothing in. What the worker reads from
+    /// its pages' pictures instead.
+    #[allow(clippy::type_complexity)]
+    pub fn unread_pdfs_of(&self, mail_id: i64) -> Result<Vec<(i64, String, Vec<u8>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, filename, bytes FROM attachments
+             WHERE mail_id = ? AND mime = 'application/pdf' AND bytes IS NOT NULL AND (text IS NULL OR trim(text) = '')
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![mail_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// The text read off a file's pages, kept on it so a retry of the mail
+    /// does not pay to read them again.
+    pub fn set_attachment_text(&self, id: i64, text: &str) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("UPDATE attachments SET text = ? WHERE id = ?", params![text, id])?;
+        Ok(())
+    }
+
+    /// Where this account's earlier copy of a file sent to the bot stands:
+    /// `None` when there is none. Telegram documents only — the one kind of
+    /// mail a sender can hand in twice on purpose — and only this
+    /// account's, since the delete this feeds must never reach anyone
+    /// else's.
+    ///
+    /// Settled means read, or refused: `done` or `failed`. A mail still
+    /// `extracting` is not settled on its last attempt, though `unreadable`
+    /// counts it so: `mail_attempted` spends that attempt when the pass
+    /// begins, and a pass that reads pages from pictures can run for
+    /// minutes after it. Past `STALE_PASS_MINUTES` that pass is a worker
+    /// that died mid-read, and the mail is as settled as it will get.
+    ///
+    /// `older` is the key the same file had before keys carried the
+    /// account; the newest of the two rows answers.
+    pub fn document_state(&self, account_id: i64, provider_id: &str, older: Option<&str>) -> Result<Option<DocumentState>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT m.id,
+                        m.status IN ('done', 'failed')
+                          OR (m.status = 'extracting' AND m.attempts >= ? AND m.attempted_at < CAST(? AS TIMESTAMP)),
+                        EXISTS (SELECT 1 FROM arrivals a WHERE a.mail_id = m.id AND a.booking)
+                 FROM inbound_mail m
+                 WHERE (m.provider_id = ? OR m.provider_id = ?) AND m.account_id = ?
+                   AND m.from_address = 'telegram' AND m.trip_id IS NULL
+                 ORDER BY m.id DESC LIMIT 1",
+                params![
+                    MAIL_ATTEMPTS,
+                    minutes_ago(STALE_PASS_MINUTES),
+                    provider_id,
+                    older.unwrap_or(provider_id),
+                    account_id
+                ],
+                |r| Ok(DocumentState { mail_id: r.get(0)?, settled: r.get(1)?, booking: r.get(2)? }),
+            )
+            .optional()?)
     }
 
     /// `(filename, bytes)` for the attachments that kept their bytes: what
@@ -11365,6 +11443,66 @@ CREATE TABLE messages (
             nested: false, started_at: "2026-09-13T10:00:00Z".into(), duration_ms: Some(120),
             status: Some("ok".into()), detail: None, result: result.map(str::to_string), truncated: false,
         }
+    }
+
+    #[test]
+    fn a_pdf_with_no_text_is_listed_for_reading_until_its_text_is_kept() {
+        let (s, _dir) = test_store();
+        let me = s.account_for_telegram(1).unwrap();
+        let mail = s.insert_mail(me, "telegram:printed", "telegram", Some("hotel.pdf"), Some(""), None, false, &[]).unwrap().unwrap();
+        let drawn = s.insert_attachment(mail, "hotel.pdf", "application/pdf", Some(b"%PDF-drawn"), None).unwrap();
+        let blank = s.insert_attachment(mail, "blank.pdf", "application/pdf", Some(b"%PDF-blank"), Some("  ")).unwrap();
+        s.insert_attachment(mail, "ticket.pdf", "application/pdf", Some(b"%PDF-text"), Some("KL887")).unwrap();
+        s.insert_attachment(mail, "photo.jpg", "image/jpeg", Some(b"jpeg"), None).unwrap();
+        s.insert_attachment(mail, "lost.pdf", "application/pdf", None, None).unwrap();
+
+        let unread = s.unread_pdfs_of(mail).unwrap();
+        assert_eq!(
+            unread,
+            vec![(drawn, "hotel.pdf".to_string(), b"%PDF-drawn".to_vec()), (blank, "blank.pdf".to_string(), b"%PDF-blank".to_vec())],
+            "only a PDF with bytes and no text: not one with text, not an image, not one whose bytes were never kept"
+        );
+
+        s.set_attachment_text(drawn, "Hotel Mashuk, 21-26 Oct").unwrap();
+        assert_eq!(s.unread_pdfs_of(mail).unwrap().iter().map(|u| u.0).collect::<Vec<_>>(), vec![blank]);
+        assert!(s.attachment_texts_of(mail).unwrap().contains(&("hotel.pdf".to_string(), Some("Hotel Mashuk, 21-26 Oct".to_string()))));
+    }
+
+    #[test]
+    fn a_documents_state_is_this_accounts_and_settled_only_once_it_is_read() {
+        let (s, _dir) = test_store();
+        let me = s.account_for_telegram(1).unwrap();
+        let other = s.account_for_telegram(2).unwrap();
+        let mail = s.insert_mail(me, "telegram:1:same-file", "telegram", Some("hotel.pdf"), Some(""), None, false, &[]).unwrap().unwrap();
+        let state = |_: i64, booking, settled| Some(DocumentState { mail_id: mail, settled, booking });
+        assert_eq!(s.document_state(me, "telegram:1:same-file", None).unwrap(), state(me, false, false), "new: not settled");
+        assert_eq!(s.document_state(other, "telegram:1:same-file", None).unwrap(), None, "not another account's");
+        assert_eq!(s.document_state(me, "telegram:1:never-sent", None).unwrap(), None);
+
+        // On its last attempt and still being read: not settled, though
+        // the Other-mail list already counts it unreadable.
+        for _ in 0..MAIL_ATTEMPTS {
+            s.mail_attempted(mail).unwrap();
+        }
+        assert_eq!(s.document_state(me, "telegram:1:same-file", None).unwrap(), state(me, false, false));
+        // Unless that pass began long ago: a worker that died mid-read.
+        s.conn().execute("UPDATE inbound_mail SET attempted_at = CAST(? AS TIMESTAMP) WHERE id = ?", params![minutes_ago(STALE_PASS_MINUTES + 5), mail]).unwrap();
+        assert_eq!(s.document_state(me, "telegram:1:same-file", None).unwrap(), state(me, false, true));
+        s.mail_failed(mail, "the model was down").unwrap();
+        assert_eq!(s.document_state(me, "telegram:1:same-file", None).unwrap(), state(me, false, true), "refused is settled");
+        s.mail_done(mail).unwrap();
+        s.conn().execute("INSERT INTO arrivals (account_id, mail_id, booking, summary) VALUES (?, ?, false, 'a newsletter')", params![me, mail]).unwrap();
+        assert_eq!(s.document_state(me, "telegram:1:same-file", None).unwrap(), state(me, false, true), "a reading that was not a booking");
+        s.conn().execute("INSERT INTO arrivals (account_id, mail_id, booking, summary) VALUES (?, ?, true, 'Hotel')", params![me, mail]).unwrap();
+        assert_eq!(s.document_state(me, "telegram:1:same-file", None).unwrap(), state(me, true, true));
+
+        // Found under the key it had before keys carried the account.
+        assert_eq!(s.document_state(me, "telegram:1:renamed", Some("telegram:1:same-file")).unwrap(), state(me, true, true));
+
+        // Mail from anywhere else is not a document, whatever its id.
+        let emailed = s.insert_mail(me, "re_123", "hotel@example.com", Some("Booking"), Some("body"), None, false, &[]).unwrap().unwrap();
+        s.mail_done(emailed).unwrap();
+        assert_eq!(s.document_state(me, "re_123", None).unwrap(), None);
     }
 
     #[test]

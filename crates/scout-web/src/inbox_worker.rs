@@ -6,7 +6,8 @@
 //! attachments (a PDF's text pulled out for the model), forwards the whole
 //! thing once to the address the account signed in with — unless the
 //! account is who sent it, in which case the person has their own copy
-//! already and only the reading is owed — asks the
+//! already and only the reading is owed — reads a PDF that has no text
+//! from its pages' pictures, asks the
 //! tool-less extractor what it is, records the arrival where it belongs,
 //! and says one line on Telegram. Mail that came to a trip's address is
 //! forwarded to, and announced to, each person on the trip rather than
@@ -231,10 +232,11 @@ impl From<Forwarded> for Forward {
 }
 
 /// Everything one mail needs, in the order that makes a retry safe: body,
-/// attachments, forward, then the model. The forward comes before the
-/// model on purpose — the person gets their mail even when the model is
-/// down. A forward Resend refuses is a warning, not a reason to leave the
-/// mail unread; a forward Resend was not there for is owed, and `settle`
+/// attachments, forward, then the model — reading pages from pictures
+/// first, then the extractor. The forward comes before the model on
+/// purpose — the person gets their mail even when the model is down. A
+/// forward Resend refuses is a warning, not a reason to leave the mail
+/// unread; a forward Resend was not there for is owed, and `settle`
 /// leaves the mail due so a later pass sends it — that pass finds the
 /// reading on record and does nothing else.
 async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork) -> Result<(), Failure> {
@@ -345,9 +347,13 @@ async fn process(core: &Core, client: &ResendClient, from: &str, m: &MailToWork)
     } else {
         stored
     };
-
     // 3. Forward, once.
     let forwarded = forward(core, client, from, m, &sender, subject.clone(), text.clone(), html.clone()).await?;
+
+    // 3½. A PDF with no text, read from its pages' pictures. After the
+    // forward, which carries the file's bytes and never its text, so a
+    // model that is down holds back the reading and not the mail.
+    let texts = read_drawn_pdfs(core, m, texts).await?;
 
     // 4. Extract, place, record, and only then settle.
     let parts: Vec<(&str, Option<&str>)> = texts.iter().map(|(f, t)| (f.as_str(), t.as_deref())).collect();
@@ -938,6 +944,132 @@ pub async fn pdf_text(mail_id: i64, bytes: Vec<u8>) -> (Vec<u8>, Option<String>)
     (bytes, text)
 }
 
+/// How long drawing one file's pages may take.
+const DRAW_BUDGET: Duration = Duration::from_secs(30);
+
+/// How long reading one mail's pages from pictures may take altogether:
+/// three pages at a few seconds each, with room for a slow model. The
+/// worker reads one mail at a time, so this is also how long the mail
+/// behind it can be kept waiting. What was read before the deadline is
+/// kept on its file.
+const PAGES_BUDGET: Duration = Duration::from_secs(180);
+
+/// The limits `pdftoppm` runs under, as a shell prefix: a gigabyte of
+/// address space and 25 seconds of CPU. `-scale-to` bounds the picture,
+/// but not what a hostile file's images and patterns make the decoder
+/// allocate on the way, in the same memory as the database. Each limit
+/// is best effort — a shell without it carries on — and `exec` hands the
+/// limits to the program.
+const LIMITED: &str = r#"ulimit -v 1048576 2>/dev/null; ulimit -t 25 2>/dev/null; exec "$0" "$@""#;
+
+/// The texts of this mail's files, with any PDF that had none read from
+/// its pages' pictures first. A model that fails here fails the mail, so
+/// it is tried again rather than filed as holding nothing — except on its
+/// last attempt, where the mail is read without the pictures: its body
+/// may hold the booking, and a mail refused for the sake of its file
+/// would hide that too.
+async fn read_drawn_pdfs(core: &Core, m: &MailToWork, texts: Vec<(String, Option<String>)>) -> Result<Vec<(String, Option<String>)>, Failure> {
+    if !texts.iter().any(|(_, t)| t.is_none()) {
+        return Ok(texts);
+    }
+    let program = core.pdftoppm().to_string();
+    let reading = scout_core::inbox::read_unread_pdfs(core, m.id, |bytes| {
+        let program = program.clone();
+        async move { page_images(&program, bytes).await }
+    });
+    let read = match tokio::time::timeout(PAGES_BUDGET, reading).await {
+        Ok(read) => read,
+        Err(_) => Err(anyhow::anyhow!("reading the pages took longer than {}s", PAGES_BUDGET.as_secs())),
+    };
+    match read {
+        Ok(0) => Ok(texts),
+        Ok(_) => scout_core::inbox::attachment_texts(core, m.id).await.map_err(Failure::Reading),
+        Err(e) if m.attempts + 1 >= ATTEMPTS => {
+            tracing::warn!(error = %e, id = m.id, "the pages could not be read on the last attempt; reading the mail without them");
+            // Whatever was read before the failure is on its file.
+            scout_core::inbox::attachment_texts(core, m.id).await.map_err(Failure::Reading)
+        }
+        Err(e) => Err(Failure::Reading(e)),
+    }
+}
+
+/// The longer side of a drawn page, in pixels: an A4 page at about 140
+/// dpi, where a confirmation's small print is still plain to read and the
+/// picture is a few hundred kilobytes.
+const PAGE_PIXELS: u32 = 1600;
+
+/// A PDF's first pages as JPEGs, drawn by `program` (`pdftoppm`), for
+/// `inbox::read_unread_pdfs`. Empty when the file could not be drawn — a
+/// broken or locked PDF, no `pdftoppm` — which leaves it unread, as it was
+/// before there was a way to read it.
+async fn page_images(program: &str, bytes: Vec<u8>) -> Vec<Vec<u8>> {
+    let drawn = async {
+        let dir = tempfile::tempdir()?;
+        let input = dir.path().join("in.pdf");
+        tokio::fs::write(&input, &bytes).await?;
+        let prefix = dir.path().join("page");
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", LIMITED, program])
+            .args(["-jpeg", "-jpegopt", "quality=85", "-scale-to"])
+            .arg(PAGE_PIXELS.to_string())
+            .args(["-f", "1", "-l"])
+            .arg(scout_core::inbox::PAGES_READ.to_string())
+            .arg(&input)
+            .arg(&prefix)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        // What poppler says, kept to 4 KB: a hostile file can make it
+        // complain for its whole 25 seconds, and the rest is drained so it
+        // never blocks on a full pipe.
+        let mut said = Vec::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use tokio::io::AsyncReadExt;
+            (&mut stderr).take(4096).read_to_end(&mut said).await?;
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            // The line that says why ("Incorrect password", "Couldn't find
+            // trailer") rather than the warnings before it. Poppler can
+            // quote a token of the file in an error, so it is cut short.
+            let said = String::from_utf8_lossy(&said);
+            let why: String = said.lines().rev().find(|l| l.contains("Error")).or_else(|| said.lines().next()).unwrap_or_default().chars().take(200).collect();
+            anyhow::bail!("{program} exited with {status}: {why}");
+        }
+        // `page-1.jpg`, or `page-01.jpg` for a longer file: one width per
+        // run, so the names sort in page order.
+        let mut names = Vec::new();
+        let mut entries = tokio::fs::read_dir(dir.path()).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("page") && n.ends_with(".jpg")) {
+                names.push(path);
+            }
+        }
+        names.sort();
+        let mut pages = Vec::new();
+        for name in names {
+            pages.push(tokio::fs::read(name).await?);
+        }
+        anyhow::Ok(pages)
+    };
+    // The errors name the program and its exit, never the file's content.
+    match tokio::time::timeout(DRAW_BUDGET, drawn).await {
+        Ok(Ok(pages)) => pages,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "a PDF's pages could not be drawn");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("drawing a PDF's pages took longer than the budget");
+            Vec::new()
+        }
+    }
+}
+
 /// Body first, then each attachment's text under a header; HTML stripped to
 /// text when there is no plain part; cut at `cap` characters.
 pub fn assemble(text: Option<&str>, html: Option<&str>, attachments: &[(&str, Option<&str>)], cap: usize) -> String {
@@ -1053,7 +1185,7 @@ mod tests {
     use crate::tests::{admitted, open_round, test_app, test_app_with_model};
     use scout_core::inbox::{MailIn, MailPart};
     use serde_json::json;
-    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A part as `winnow` sees it, whichever source described it.
@@ -1400,6 +1532,149 @@ mod tests {
         // A reading with no title still gets a line, without a stray colon.
         assert_eq!(arrival_nudge(Placement::Trip(1), "Lisbon", &[]), "A booking arrived for Lisbon. Add it here, or review on goodscout.fyi/chat.");
         assert!(no_booking_in_document("eticket.pdf").starts_with("I read eticket.pdf and found no booking"));
+    }
+
+    /// A stand-in for `pdftoppm` that runs `body` as a shell script.
+    fn a_program(dir: &tempfile::TempDir, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("fake-pdftoppm");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_pdfs_pages_are_drawn_in_page_order_and_a_failure_is_no_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        // Writes its pages out of order, and what it was asked, beside them;
+        // the last argument is the prefix, the one before it the file.
+        let draws = a_program(&dir, &format!(
+            "for last; do :; done\nprintf two > \"$last-2.jpg\"\nprintf one > \"$last-1.jpg\"\necho \"$@\" > {}/args",
+            dir.path().display()
+        ));
+        assert_eq!(page_images(&draws, b"%PDF".to_vec()).await, vec![b"one".to_vec(), b"two".to_vec()]);
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        assert!(args.starts_with("-jpeg -jpegopt quality=85 -scale-to 1600 -f 1 -l 3 "), "{args}");
+
+        let fails = a_program(&dir, "exit 1");
+        assert!(page_images(&fails, b"%PDF".to_vec()).await.is_empty());
+        assert!(page_images("/nonexistent/pdftoppm", b"%PDF".to_vec()).await.is_empty(), "no program, no pages, no panic");
+    }
+
+    /// The real program on a real one-page PDF. Ignored where poppler is
+    /// not installed; in the image it is.
+    #[tokio::test]
+    #[ignore = "needs pdftoppm (poppler-utils)"]
+    async fn pdftoppm_draws_a_real_page() {
+        // No xref table, which poppler rebuilds; the stream's length and
+        // the trailer's size are right, so nothing else needs recovering.
+        let pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R>>endobj\n4 0 obj<</Length 30>>stream\n0 0 1 rg 100 600 200 100 re f\nendstream endobj\ntrailer<</Root 1 0 R/Size 5>>\n%%EOF\n";
+        let pages = page_images("pdftoppm", pdf.to_vec()).await;
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].starts_with(&[0xFF, 0xD8]), "a JPEG");
+    }
+
+    /// A core whose model is `model_url` and whose `pdftoppm` is `program`.
+    /// Not `test_app_with_model`: that has no way to name the program.
+    fn core_drawing_with(model_url: &str, program: &str) -> (std::sync::Arc<Core>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("worker.duckdb");
+        let cfg = scout_core::config::Config::from_lookup(|k| match k {
+            "TELEGRAM_BOT_TOKEN" => Some("123456:test-bot-token".to_string()),
+            "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
+            "MINIMAX_API_KEY" => Some("mk".to_string()),
+            "MINIMAX_BASE_URL" => Some(model_url.to_string()),
+            "KAGI_API_KEY" => Some("kk".to_string()),
+            "SCOUT_DB_PATH" => Some(db.to_str().unwrap().to_string()),
+            "SCOUT_PDFTOPPM" => Some(program.to_string()),
+            _ => None,
+        })
+        .unwrap();
+        (std::sync::Arc::new(Core::start(cfg, None).unwrap()), dir)
+    }
+
+    /// The page reader's half of the model: told apart from the extractor
+    /// by its own preamble, and mounted first so it wins that match.
+    async fn pages_read_as(server: &MockServer, answer: ResponseTemplate) {
+        Mock::given(method("POST")).and(path("/chat/completions")).and(body_string_contains("Write out all the text"))
+            .respond_with(answer).mount(server).await;
+    }
+
+    fn says(text: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": "t1", "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }))
+    }
+
+    /// The extractor's requests, by what they carry.
+    fn extractor_bodies(reqs: &[wiremock::Request]) -> Vec<String> {
+        reqs.iter()
+            .filter(|r| r.url.path() == "/chat/completions")
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .filter(|b| b.contains("Forwarded email follows"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_drawn_pdf_sent_to_the_bot_is_read_from_its_pages_into_a_booking() {
+        let server = MockServer::start().await;
+        pages_read_as(&server, says("Отель АВИС\nЗаезд 21 окт. 2026")).await;
+        model_saying(&server, r#"{"booking":true,"kind":"stay","title":"Отель АВИС","place":"Минеральные Воды","date":"2026-10-21","summary":"Hotel, 21 Oct"}"#).await;
+        let draws = tempfile::tempdir().unwrap();
+        let program = a_program(&draws, "for last; do :; done\nprintf jpeg > \"$last-1.jpg\"");
+        let (core, _dir) = core_drawing_with(&server.uri(), &program);
+        open_round(&core, "autumn", 5).await;
+        let a = admitted(&core, "111").await;
+        let scout_core::inbox::Recorded::Filed(_) =
+            scout_core::inbox::record_document(&core, a, "telegram:1:drawn", None, "hotel.pdf", "application/pdf", b"%PDF".to_vec(), None).await.unwrap()
+        else {
+            panic!("filed");
+        };
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+
+        work_once(&core, &client, FROM, 10).await;
+
+        let reqs = server.received_requests().await.unwrap();
+        let read = extractor_bodies(&reqs);
+        assert_eq!(read.len(), 1);
+        assert!(read[0].contains("Заезд 21 окт. 2026"), "the extractor read the page's words: {}", read[0]);
+        let view = scout_core::inbox::view(&core, a, "goodscout.fyi").await.unwrap();
+        assert_eq!(view.pending.len(), 1, "a booking waiting for Add, not Other mail");
+        assert!(view.other.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_model_that_cannot_read_the_pages_holds_back_the_reading_and_never_the_forward() {
+        let server = MockServer::start().await;
+        resend_like(&server).await;
+        pages_read_as(&server, ResponseTemplate::new(500)).await;
+        model_saying(&server, r#"{"booking":true,"kind":"stay","title":"Hotel Lisboa","place":"Lisbon","date":"2026-10-12","summary":"Hotel in Lisbon, 12 Oct"}"#).await;
+        let draws = tempfile::tempdir().unwrap();
+        let program = a_program(&draws, "for last; do :; done\nprintf jpeg > \"$last-1.jpg\"");
+        let (core, _dir) = core_drawing_with(&server.uri(), &program);
+        let mail_id = with_mail(&core, a_mail("re_1")).await;
+        let client = ResendClient::new(reqwest::Client::new(), "k".into(), server.uri());
+
+        // Pass one: forwarded, and not read — the page reader failed.
+        work_once(&core, &client, FROM, 10).await;
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(forwards(&reqs), 1, "the person has their mail though the model is down");
+        assert!(extractor_bodies(&reqs).is_empty(), "the reading waits for the pages");
+
+        // Pass two fails the same way; pass three is the last, and reads
+        // the mail without its pictures rather than refusing it.
+        for _ in 0..2 {
+            scout_core::inbox::age_attempts_for_tests(&core, mail_id).await.unwrap();
+            work_once(&core, &client, FROM, 10).await;
+        }
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(forwards(&reqs), 1, "forwarded once");
+        let read = extractor_bodies(&reqs);
+        assert_eq!(read.len(), 1, "read once, on the last attempt");
+        assert!(read[0].contains("Check-in 12 Oct"), "from the body: {}", read[0]);
+        assert!(scout_core::inbox::mail_has_arrival(&core, mail_id).await.unwrap(), "and filed");
     }
 
     /// A model that answers every completion with `answer`, on the same

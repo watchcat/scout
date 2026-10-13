@@ -1433,6 +1433,13 @@ fn step_15_reorder_items(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// A stay now waits for the arrival on its check-in day; every trip is
+/// put in that order once, since positions otherwise change only when the
+/// trip does.
+fn step_24_stays_after_arrivals(conn: &Connection) -> Result<()> {
+    step_15_reorder_items(conn)
+}
+
 /// The booking address: a handle on the account, and the mail, files and
 /// readings it brings in. `IF NOT EXISTS` throughout, for the fixture
 /// pattern step 10 documents.
@@ -1613,6 +1620,7 @@ fn steps() -> Vec<(i64, Step)> {
         (21, Step::Sql(STEP_21_SHARING)),
         (22, Step::Sql(STEP_22_TRIP_ADDRESS)),
         (23, Step::Sql(STEP_23_RELEASED_ADDRESSES)),
+        (24, Step::Code(step_24_stays_after_arrivals)),
     ]
 }
 
@@ -5450,23 +5458,45 @@ fn item_ids_of(conn: &Connection, trip_id: i64) -> Result<Vec<i64>> {
 /// separates keep their order. Called inside every write, under the lock
 /// the caller already holds.
 ///
+/// A stay's start time is the later of its check-in and the last arrival
+/// that day — a flight's chosen option landing, a transfer's end. Check-in
+/// "from 14:00" is a window, not an appointment: a hotel above the 16:20
+/// flight that brings the traveller there at 18:50 reads backwards. A
+/// flight that lands after midnight counts for the day it lands.
+///
 /// The chosen option is joined through a GROUP BY, not the raw table: "at
 /// most one chosen" is enforced in Rust, and a duplicate slipping past it
 /// would otherwise number the item twice and leave a position vacant.
 fn reorder_items(conn: &Connection, trip_id: i64) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT i.id FROM trip_items i
-         LEFT JOIN (SELECT item_id, min(departing_at_local) AS departing_at_local
-                    FROM item_candidates WHERE chosen GROUP BY item_id) c ON c.item_id = i.id
-         WHERE i.trip_id = ?
-         ORDER BY i.date,
-                  COALESCE(i.starts_at, c.departing_at_local) IS NULL,
-                  COALESCE(i.starts_at, c.departing_at_local),
-                  CASE i.kind WHEN 'flight' THEN 0 WHEN 'transport' THEN 1 WHEN 'stay' THEN 2 ELSE 3 END,
-                  i.position, i.id",
+        "WITH chosen AS (
+             SELECT item_id, min(departing_at_local) AS departing_at_local, min(arriving_at_local) AS arriving_at_local
+             FROM item_candidates WHERE chosen GROUP BY item_id
+         ),
+         landed AS (
+             SELECT substr(arrives, 1, 10) AS day, max(arrives) AS arrives
+             FROM (SELECT CASE t.kind WHEN 'flight' THEN c.arriving_at_local ELSE t.ends_at END AS arrives
+                   FROM trip_items t LEFT JOIN chosen c ON c.item_id = t.id
+                   WHERE t.trip_id = ? AND t.kind IN ('flight', 'transport'))
+             WHERE arrives IS NOT NULL AND length(arrives) > 10
+             GROUP BY 1
+         ),
+         keyed AS (
+             SELECT i.id, i.date, i.kind, i.position,
+                    CASE WHEN i.kind = 'stay' THEN greatest(i.starts_at, l.arrives)
+                         ELSE COALESCE(i.starts_at, c.departing_at_local) END AS sort_at
+             FROM trip_items i
+             LEFT JOIN chosen c ON c.item_id = i.id
+             LEFT JOIN landed l ON l.day = i.date
+             WHERE i.trip_id = ?
+         )
+         SELECT id FROM keyed
+         ORDER BY date, sort_at IS NULL, sort_at,
+                  CASE kind WHEN 'flight' THEN 0 WHEN 'transport' THEN 1 WHEN 'stay' THEN 2 ELSE 3 END,
+                  position, id",
     )?;
     let ids: Vec<i64> =
-        stmt.query_map(params![trip_id], |r| r.get(0))?.collect::<duckdb::Result<_>>()?;
+        stmt.query_map(params![trip_id, trip_id], |r| r.get(0))?.collect::<duckdb::Result<_>>()?;
     drop(stmt);
     for (n, id) in ids.iter().enumerate() {
         conn.execute("UPDATE trip_items SET position = ? WHERE id = ?", params![n as i64 + 1, id])?;
@@ -7205,7 +7235,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 23);
+        assert_eq!(s.schema_version().unwrap(), 24);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -7269,7 +7299,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 23);
+        assert_eq!(store.schema_version().unwrap(), 24);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -8524,6 +8554,96 @@ CREATE TABLE trips (
         );
     }
 
+    fn on_day(kind: &str, title: &str, date: &str, starts_at: Option<&str>, ends_at: Option<&str>) -> NewItem {
+        NewItem {
+            kind: kind.to_string(), title: title.to_string(), place: None, date: date.to_string(),
+            starts_at: starts_at.map(str::to_string), ends_at: ends_at.map(str::to_string), notes: None,
+            booked: true, confirmation_code: None, price: None, currency: None, arrival_id: None,
+        }
+    }
+
+    fn titles(trip: &Trip) -> Vec<String> {
+        trip.items
+            .iter()
+            .map(|i| match i.kind.as_str() {
+                "flight" => format!("{}→{}", i.origin.as_deref().unwrap_or(""), i.destination.as_deref().unwrap_or("")),
+                _ => i.title.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stay_comes_after_the_flight_that_lands_on_its_check_in_day() {
+        // Reported from a real trip: a hotel whose check-in opens at 14:00
+        // sat above the 16:20 flight that brought the traveller there at
+        // 18:50. Check-in is a window, not an appointment; the stay begins
+        // when the traveller arrives.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Caucasus", None, None, None).unwrap();
+        store.add_item(trip.id, on_day("stay", "Hotel Avis", "2026-10-21", Some("2026-10-21T14:00:00"), Some("2026-10-22T12:00:00"))).unwrap();
+        store.add_item(trip.id, on_day("activity", "Dinner", "2026-10-21", Some("2026-10-21T20:30:00"), None)).unwrap();
+        store.add_item(trip.id, on_day("activity", "Lunch in Istanbul", "2026-10-21", Some("2026-10-21T12:00:00"), None)).unwrap();
+        store.add_flight(trip.id, "IST", "MRV", "2026-10-21").unwrap();
+        let flight = store.find_trip(7, "Caucasus").unwrap().unwrap().items.iter().find(|i| i.kind == "flight").unwrap().position;
+        let mut leg = candidate("Azimuth", "A46076", "2026-10-21T16:20:00");
+        leg.arriving_at_local = Some("2026-10-21T18:50:00".to_string());
+        store.add_candidate(trip.id, flight, expected("IST", "MRV", Some("2026-10-21")), leg, true).unwrap();
+
+        let trip = store.find_trip(7, "Caucasus").unwrap().unwrap();
+        assert_eq!(titles(&trip), ["Lunch in Istanbul", "IST→MRV", "Hotel Avis", "Dinner"]);
+    }
+
+    #[test]
+    fn step_24_puts_a_stay_stored_above_its_flight_after_it() {
+        // Positions written under the old rule: the hotel first.
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Caucasus", None, None, None).unwrap();
+        store.add_flight(trip.id, "IST", "MRV", "2026-10-21").unwrap();
+        let mut leg = candidate("Azimuth", "A46076", "2026-10-21T16:20:00");
+        leg.arriving_at_local = Some("2026-10-21T18:50:00".to_string());
+        store.add_candidate(trip.id, 1, expected("IST", "MRV", Some("2026-10-21")), leg, true).unwrap();
+        store.add_item(trip.id, on_day("stay", "Hotel Avis", "2026-10-21", Some("2026-10-21T14:00:00"), None)).unwrap();
+        {
+            let conn = store.conn();
+            conn.execute("UPDATE trip_items SET position = 3 - position WHERE trip_id = ?", params![trip.id]).unwrap();
+        }
+        assert_eq!(titles(&store.find_trip(7, "Caucasus").unwrap().unwrap()), ["Hotel Avis", "IST→MRV"]);
+
+        step_24_stays_after_arrivals(&store.conn()).unwrap();
+
+        assert_eq!(titles(&store.find_trip(7, "Caucasus").unwrap().unwrap()), ["IST→MRV", "Hotel Avis"]);
+    }
+
+    #[test]
+    fn a_stay_with_no_arrival_that_day_keeps_its_check_in_time_and_a_night_flight_counts_the_day_it_lands() {
+        let (store, _d) = test_store();
+        let trip = store.upsert_trip(7, "Coast", None, None, None).unwrap();
+        // No arrival on the 3rd: the check-in time places it.
+        store.add_item(trip.id, on_day("activity", "Museum", "2026-11-03", Some("2026-11-03T10:00:00"), None)).unwrap();
+        store.add_item(trip.id, on_day("stay", "Guesthouse", "2026-11-03", Some("2026-11-03T15:00:00"), Some("2026-11-05T11:00:00"))).unwrap();
+        store.add_item(trip.id, on_day("activity", "Walk", "2026-11-03", Some("2026-11-03T17:00:00"), None)).unwrap();
+        // A train that leaves on the 5th and arrives at 13:10; a stay from
+        // that day with no check-in time goes after it, not to the end.
+        store.add_item(trip.id, on_day("transport", "Train to Porto", "2026-11-05", Some("2026-11-05T10:00:00"), Some("2026-11-05T13:10:00"))).unwrap();
+        store.add_item(trip.id, on_day("stay", "Porto flat", "2026-11-05", None, Some("2026-11-07T10:00:00"))).unwrap();
+        store.add_item(trip.id, on_day("activity", "Port tasting", "2026-11-05", Some("2026-11-05T18:00:00"), None)).unwrap();
+        // A flight on the 6th that lands after midnight, on the 7th: the
+        // stay that begins on the 7th waits for it.
+        store.add_item(trip.id, on_day("stay", "Airport hotel", "2026-11-07", Some("2026-11-07T00:00:00"), None)).unwrap();
+        store.add_item(trip.id, on_day("activity", "Late snack", "2026-11-07", Some("2026-11-07T00:30:00"), None)).unwrap();
+        store.add_flight(trip.id, "OPO", "FNC", "2026-11-06").unwrap();
+        let flight = store.find_trip(7, "Coast").unwrap().unwrap().items.iter().find(|i| i.kind == "flight").unwrap().position;
+        let mut leg = candidate("TAP", "TP1690", "2026-11-06T23:10:00");
+        leg.arriving_at_local = Some("2026-11-07T01:05:00".to_string());
+        store.add_candidate(trip.id, flight, expected("OPO", "FNC", Some("2026-11-06")), leg, true).unwrap();
+
+        let trip = store.find_trip(7, "Coast").unwrap().unwrap();
+        assert_eq!(
+            titles(&trip),
+            ["Museum", "Guesthouse", "Walk", "Train to Porto", "Porto flat", "Port tasting", "OPO→FNC", "Late snack", "Airport hotel"]
+        );
+    }
+
     #[test]
     fn a_leg_inserted_by_its_date_carries_every_parked_option_with_its_segment() {
         // Every write renumbers, so a renumber that moved items and not
@@ -9177,7 +9297,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 23);
+        assert_eq!(store.schema_version().unwrap(), 24);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -10036,7 +10156,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 23, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 24, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -10077,7 +10197,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 23);
+        assert_eq!(s.schema_version().unwrap(), 24);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -10177,7 +10297,7 @@ CREATE TABLE conversations (
         // updated the table: the pod crash-looped on this step.
         let (_dir, path) = version_eighteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 23);
+        assert_eq!(s.schema_version().unwrap(), 24);
         let trip = s.list_trips(1).unwrap().remove(0);
         assert_eq!((trip.items[0].lat, trip.items[0].geocode_tried), (None, false));
         s.set_item_coords(trip.items[0].id, None).unwrap();
@@ -10214,7 +10334,7 @@ CREATE TABLE conversations (
     fn step_20_runs_on_a_database_that_has_items_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_nineteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 23);
+        assert_eq!(s.schema_version().unwrap(), 24);
         let item = &s.list_trips(1).unwrap()[0].items[0];
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
@@ -10791,7 +10911,7 @@ CREATE TABLE conversations (
     fn step_21_runs_on_a_database_with_trips_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 23);
+        assert_eq!(s.schema_version().unwrap(), 24);
         let trip = &s.list_trips(1).unwrap()[0];
         assert_eq!(trip.items[0].added, None, "an item from before sharing has no author");
         let (fresh, _d) = test_store();
@@ -10829,7 +10949,7 @@ CREATE TABLE conversations (
     fn step_22_runs_on_a_database_with_mail_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_one_db();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 23);
+        assert_eq!(s.schema_version().unwrap(), 24);
         let (fresh, _d) = test_store();
         // Not `mail_forwards`: `Store::open` runs `MIGRATIONS` before the
         // steps, so the table is there whatever step 22 says, and comparing
@@ -11423,7 +11543,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 23);
+        assert_eq!(store.schema_version().unwrap(), 24);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -11587,7 +11707,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 23);
+        assert_eq!(store.schema_version().unwrap(), 24);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -11632,7 +11752,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 23);
+        assert_eq!(store.schema_version().unwrap(), 24);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -11708,7 +11828,7 @@ CREATE TABLE messages (
         // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 23);
+        assert_eq!(store.schema_version().unwrap(), 24);
         let part = mail_part("att_1", Some("inline"), None);
         let m = store
             .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))

@@ -13,7 +13,7 @@ import {
   moveBody, warningBody, tripDays, dayChipDraggable, shouldPollChecks,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
   pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
-  peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody, tripAddressProblem, bookingAddress,
+  peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody, handOverQuestion, handOverRefusal, tripAddressProblem, bookingAddress,
   ITINERARY_NOTE,
   CONFIRM_ARM_MS,
 } from './chat.js'
@@ -1205,6 +1205,17 @@ test('the link line says until when and how many of its places are used', () => 
 test('a person is removed by id, a trip shared and left by name', () => {
   assert.deepEqual(JSON.parse(removePersonBody('Lisbon', 7)), { trip: 'Lisbon', person: 7 })
   assert.deepEqual(JSON.parse(tripBody('Lisbon')), { trip: 'Lisbon' })
+})
+
+test('handing a trip over says what moves, and a refusal says why', () => {
+  assert.equal(
+    handOverQuestion('Masha', 'Минводы'),
+    'Make Masha the owner of Минводы? You stay on it as an editor. Only Masha will be able to delete it, change its email address, manage its link and take people off it.',
+  )
+  assert.equal(handOverRefusal(409, 'name_taken', 'Masha', 'Lisbon'), 'Masha already has a trip called Lisbon. One of you renames theirs first.')
+  assert.equal(handOverRefusal(409, 'not_on_trip', 'Masha', 'Lisbon'), 'Masha is no longer on Lisbon.')
+  assert.equal(handOverRefusal(403, undefined, 'Masha', 'Lisbon'), 'Only the trip’s owner can do that.')
+  assert.equal(handOverRefusal(500, undefined, 'Masha', 'Lisbon'), 'That did not work. Reload and try again.')
 })
 
 test('a trip with its own address is booked to that, else to the reader\'s', () => {

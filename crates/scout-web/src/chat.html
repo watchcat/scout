@@ -386,15 +386,15 @@
   .people-panel{margin:0 0 18px; padding:14px 16px; border:1px solid var(--line); border-radius:12px;
     background:var(--card)}
   .people-list{list-style:none; margin:0 0 12px; padding:0; display:grid; gap:8px}
-  .people-row{display:flex; align-items:center; gap:10px; min-height:32px}
+  .people-row{display:flex; flex-wrap:wrap; align-items:center; gap:10px; min-height:32px}
   .people-name{color:var(--base1); overflow-wrap:anywhere}
   .people-owner{font-size:11.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--base0)}
-  .people-remove{margin-left:auto}
+  .people-hand-over{margin-left:auto}
   .people-actions{display:flex; flex-wrap:wrap; gap:8px}
-  .people-actions button,.people-remove{padding:7px 12px; border:1px solid var(--line); border-radius:8px;
+  .people-actions button,.people-remove,.people-hand-over{padding:7px 12px; border:1px solid var(--line); border-radius:8px;
     background:transparent; color:var(--base1); font:inherit; font-size:13.5px; cursor:pointer}
-  .people-actions button:hover,.people-remove:hover{background:var(--row-hover); color:var(--base2)}
-  .people-actions button:focus-visible,.people-remove:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
+  .people-actions button:hover,.people-remove:hover,.people-hand-over:hover{background:var(--row-hover); color:var(--base2)}
+  .people-actions button:focus-visible,.people-remove:focus-visible,.people-hand-over:focus-visible{outline:2px solid var(--blue); outline-offset:1px}
   .people-actions button:disabled{opacity:.6; cursor:default}
   .people-link-state{margin:10px 0 0; color:var(--base0); font-size:13px}
   .people-address{margin:0 0 12px; color:var(--base1); font-size:13.5px; overflow-wrap:anywhere}

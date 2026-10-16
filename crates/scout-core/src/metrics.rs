@@ -1,7 +1,7 @@
 //! What `/metrics` reports: runs, tool calls, provider errors and the
 //! store's lock.
 //!
-//! Written by hand rather than with a metrics crate. Six series in the
+//! Written by hand rather than with a metrics crate. A few series in the
 //! Prometheus text format is a page of code, and the one path that is hot —
 //! the store's lock, taken on every call — is two clock reads and three
 //! atomic adds here, with nothing behind them that could allocate or lock.
@@ -90,12 +90,18 @@ impl Counter {
     }
 
     fn add(&self, values: &[&str]) {
+        self.add_n(values, 1);
+    }
+
+    /// `n` at once; a zero still names the series, so a page says "none"
+    /// rather than nothing.
+    fn add_n(&self, values: &[&str], n: u64) {
         let mut map = self.values.lock().unwrap_or_else(|e| e.into_inner());
         let mut key: Vec<String> = values.iter().map(|v| v.chars().take(MAX_VALUE).collect()).collect();
         if !map.contains_key(&key) && map.len() >= MAX_SERIES {
             key[0] = "other".to_string();
         }
-        *map.entry(key).or_insert(0) += 1;
+        *map.entry(key).or_insert(0) += n;
     }
 
     fn render(&self, out: &mut String, name: &str, help: &str) {
@@ -133,6 +139,8 @@ pub struct Metrics {
     provider_errors: Counter,
     provider_retries: Counter,
     lock_wait: Histogram,
+    search_calls: Counter,
+    search_results: Counter,
 }
 
 impl Default for Metrics {
@@ -145,6 +153,8 @@ impl Default for Metrics {
             provider_errors: Counter::new(&["provider", "kind"]),
             provider_retries: Counter::new(&["provider"]),
             lock_wait: Histogram::new(LOCK_BUCKETS),
+            search_calls: Counter::new(&["queries"]),
+            search_results: Counter::new(&["source", "outcome"]),
         }
     }
 }
@@ -182,6 +192,18 @@ impl Metrics {
         self.lock_wait.observe(took);
     }
 
+    /// A `search_web` call, by how many Kagi queries it spent.
+    pub fn search_call(&self, queries: usize) {
+        self.search_calls.add(&[&queries.to_string()]);
+    }
+
+    /// What became of one source's hits in a `search_web` call: `kept`,
+    /// `duplicate` or `cut`, `n` of them. The source is the Kagi query's
+    /// position — `kagi_1` is the user's own phrasing — or `perplexity`.
+    pub fn search_results(&self, source: &str, outcome: &str, n: usize) {
+        self.search_results.add_n(&[source, outcome], n as u64);
+    }
+
     /// The whole set in the Prometheus text format.
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -191,6 +213,8 @@ impl Metrics {
         self.provider_errors.render(&mut out, "scout_provider_errors_total", "Requests that failed after their retries: paid APIs as they answered (client includes a not-found), and the model during runs.");
         self.provider_retries.render(&mut out, "scout_provider_retries_total", "Requests to a provider sent again after a 429, a 5xx or a refused connection.");
         self.lock_wait.render(&mut out, "scout_store_lock_wait_seconds", "Time a store call waited for the database's lock.");
+        self.search_calls.render(&mut out, "scout_search_calls_total", "search_web calls, by how many Kagi queries each spent.");
+        self.search_results.render(&mut out, "scout_search_results_total", "Hits from search_web calls, by source (kagi_N is the Nth query, kagi_1 the user's own) and what became of them: kept for the model, a duplicate of an earlier entry, or cut for want of room.");
         out
     }
 }
@@ -434,10 +458,25 @@ mod tests {
             "scout_provider_errors_total",
             "scout_provider_retries_total",
             "scout_store_lock_wait_seconds",
+            "scout_search_calls_total",
+            "scout_search_results_total",
         ] {
             assert!(page.contains(&format!("# TYPE {name} ")), "{name} is missing:\n{page}");
         }
         assert_eq!(line(&page, "scout_store_lock_wait_seconds_count"), Some("scout_store_lock_wait_seconds_count 0"));
+    }
+
+    #[test]
+    fn search_tallies_are_counted_by_source_and_outcome() {
+        let m = Metrics::default();
+        m.search_call(3);
+        m.search_results("kagi_3", "cut", 4);
+        m.search_results("kagi_3", "cut", 2);
+        m.search_results("perplexity", "kept", 0);
+        let page = m.render();
+        assert!(page.contains("scout_search_calls_total{queries=\"3\"} 1\n"), "{page}");
+        assert!(page.contains("scout_search_results_total{source=\"kagi_3\",outcome=\"cut\"} 6\n"), "{page}");
+        assert!(page.contains("scout_search_results_total{source=\"perplexity\",outcome=\"kept\"} 0\n"), "a source with nothing kept is still named:\n{page}");
     }
 
     #[test]

@@ -142,6 +142,100 @@ const MAX_QUERIES: usize = 3;
 /// Merged result cap: enough to compare on, small enough to keep the model's
 /// context readable.
 const MERGED_LIMIT: usize = 12;
+/// Hits asked of every Kagi query. Kagi bills the query, not the hits, so
+/// each is asked for a full list and the merge decides how much of it the
+/// model reads; a query's share of the list is never more than this, so
+/// alone it leaves Perplexity the last two slots, as it always has.
+const PER_QUERY: usize = 10;
+const _: () = assert!(MAX_QUERIES <= MERGED_LIMIT, "every query must get at least one slot");
+
+/// Where a hit came from: Kagi, by the query's position in the call — `0`
+/// is the user's own phrasing — or Perplexity. The label `/metrics` counts
+/// under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Kagi(usize),
+    Perplexity,
+}
+
+impl Source {
+    fn label(self) -> String {
+        match self {
+            Source::Kagi(i) => format!("kagi_{}", i + 1),
+            Source::Perplexity => "perplexity".to_string(),
+        }
+    }
+}
+
+/// What became of one source's hits in a call: `kept` reached the model,
+/// `duplicate` repeated a URL an earlier entry had listed, `cut` was depth
+/// the list had no room for. Counted so `/metrics` can say whether a
+/// billed query's hits are ever read — the traces could not, since the
+/// merged list does not say where a hit came from
+/// (docs/2026-10-16-search-fanout.md).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Tally {
+    kept: usize,
+    duplicate: usize,
+    cut: usize,
+}
+
+/// Each Kagi query's share of the list: `PER_QUERY` alone, else an equal
+/// split of the cap. Three queries used to be asked for six hits each and
+/// pushed in order, so the third language's were cut whole unless the
+/// first two overlapped — billed, never read.
+fn share(kagi_lists: usize) -> usize {
+    (MERGED_LIMIT / kagi_lists.max(1)).min(PER_QUERY)
+}
+
+/// Merges the engines' lists, each given in full, into the `MERGED_LIMIT`
+/// the model reads. In the order given — Kagi first and in query order,
+/// since the user's own phrasing carries the small-shop long tail — a
+/// duplicate URL keeps the first snippet seen. Each Kagi query gets its
+/// `share`; the slots a short list leaves free go to the other queries'
+/// deeper hits in order, then to Perplexity, which otherwise has only the
+/// slots the Kagi lists leave. Returns the list, grouped by source, and
+/// what became of each source's hits.
+fn merge(lists: Vec<(Source, Vec<SearchResult>)>) -> (Vec<SearchResult>, Vec<(Source, Tally)>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique: Vec<(Source, Vec<SearchResult>)> = Vec::new();
+    let mut tallies: Vec<(Source, Tally)> = Vec::new();
+    for (source, results) in lists {
+        debug_assert!(tallies.iter().all(|(s, _)| *s != source), "one list per source");
+        let mut tally = Tally::default();
+        let mut kept = Vec::new();
+        for r in results {
+            if seen.insert(r.url.clone()) {
+                kept.push(r);
+            } else {
+                tally.duplicate += 1;
+            }
+        }
+        unique.push((source, kept));
+        tallies.push((source, tally));
+    }
+    let share = share(unique.iter().filter(|(s, _)| matches!(s, Source::Kagi(_))).count());
+    let mut take: Vec<usize> = unique
+        .iter()
+        .map(|(source, hits)| match source {
+            Source::Kagi(_) => hits.len().min(share),
+            Source::Perplexity => 0,
+        })
+        .collect();
+    let mut spare = MERGED_LIMIT.saturating_sub(take.iter().sum());
+    for (i, (_, hits)) in unique.iter().enumerate() {
+        let more = (hits.len() - take[i]).min(spare);
+        take[i] += more;
+        spare -= more;
+    }
+    let mut merged = Vec::new();
+    for (i, (_, hits)) in unique.into_iter().enumerate() {
+        tallies[i].1.kept = take[i];
+        tallies[i].1.cut = hits.len() - take[i];
+        merged.extend(hits.into_iter().take(take[i]));
+    }
+    (merged, tallies)
+}
 
 /// Web search over both engines we have. They are complementary, not
 /// redundant: on the same Dutch shopping query their results overlapped by
@@ -202,13 +296,10 @@ impl Tool for WebSearchTool {
         // queries[0]. A spent budget is not fatal any more: Perplexity keeps
         // searching, all languages included, for a fraction of the price.
         let granted = self.budget.claim(queries.len());
-        tracing::debug!(
-            kagi_queries = granted,
-            budget_left = self.budget.remaining(),
-            perplexity = self.perplexity.is_some(),
-            "web search"
-        );
         if granted == 0 && self.perplexity.is_none() {
+            // Counted as a call that spent nothing, so the refusal rate is
+            // on the page beside the calls that searched.
+            crate::metrics::global().search_call(0);
             return Err(KagiError::Budget(format!(
                 "search budget spent ({} queries per request) — answer from the results you \
                  already have instead of searching again",
@@ -216,12 +307,12 @@ impl Tool for WebSearchTool {
             )));
         }
 
-        // One Kagi query: keep the old depth. Several: less from each, since
-        // the merged list is what the model reads. Counted on what the budget
-        // granted, not on what was asked for.
-        let per_query = if granted <= 1 { 10 } else { 6 };
+        // Every query asked in full; `merge` shares the list out. Only the
+        // queries the budget granted are sent — translations are the first
+        // to go when it runs low — and the user's own phrasing is always
+        // among them.
         let kagi = futures::future::join_all(
-            queries.iter().take(granted).map(|q| self.kagi.search(q, per_query)),
+            queries.iter().take(granted).map(|q| self.kagi.search(q, PER_QUERY)),
         );
         let (kagi, perplexity) = match &self.perplexity {
             Some(p) => {
@@ -231,40 +322,49 @@ impl Tool for WebSearchTool {
             None => (kagi.await, None),
         };
 
-        // Kagi first: it carries the user's own phrasing and the small-shop
-        // long tail, and a duplicate URL keeps the first snippet seen.
-        let mut merged: Vec<SearchResult> = Vec::new();
+        let mut lists: Vec<(Source, Vec<SearchResult>)> = Vec::new();
         let mut first_error = None;
-        let mut push = |results: Vec<SearchResult>| {
-            for r in results {
-                if !merged.iter().any(|m| m.url == r.url) {
-                    merged.push(r);
-                }
-            }
-        };
-        for answer in kagi {
+        for (i, answer) in kagi.into_iter().enumerate() {
             match answer {
-                Ok(results) => push(results),
+                Ok(results) => lists.push((Source::Kagi(i), results)),
                 Err(e) => {
                     first_error.get_or_insert(e);
                 }
             }
         }
         match perplexity {
-            Some(Ok(results)) => push(results),
+            Some(Ok(results)) => lists.push((Source::Perplexity, results)),
             // One engine failing is not worth losing the other's results.
             Some(Err(e)) => {
                 first_error.get_or_insert(KagiError::Api { status: 0, body: e.to_string() });
             }
             None => {}
         }
+        let (merged, tallies) = merge(lists);
+
+        // Counts only — no query, no URL — for the reading the traces could
+        // not give: whether what each query brought back is read or cut.
+        let metrics = crate::metrics::global();
+        metrics.search_call(granted);
+        for (source, tally) in &tallies {
+            let label = source.label();
+            metrics.search_results(&label, "kept", tally.kept);
+            metrics.search_results(&label, "duplicate", tally.duplicate);
+            metrics.search_results(&label, "cut", tally.cut);
+        }
+        tracing::info!(
+            kagi_queries = granted,
+            budget_left = self.budget.remaining(),
+            perplexity = self.perplexity.is_some(),
+            kept = merged.len(),
+            duplicates = tallies.iter().map(|(_, t)| t.duplicate).sum::<usize>(),
+            cut = tallies.iter().map(|(_, t)| t.cut).sum::<usize>(),
+            "web search"
+        );
 
         match first_error {
             Some(e) if merged.is_empty() => Err(e),
-            _ => {
-                merged.truncate(MERGED_LIMIT);
-                Ok(merged)
-            }
+            _ => Ok(merged),
         }
     }
 }
@@ -278,6 +378,111 @@ mod tests {
 
     async fn client(server: &MockServer) -> KagiClient {
         KagiClient::new(reqwest::Client::new(), "test-key".to_string(), server.uri())
+    }
+
+    fn hit(url: &str) -> SearchResult {
+        SearchResult { title: url.to_string(), url: url.to_string(), snippet: String::new() }
+    }
+
+    /// A Kagi that answers `query`, asked with `limit`, with `n` hits of
+    /// its own.
+    async fn kagi_answering(server: &MockServer, query: &str, limit: usize, n: usize) {
+        let hits: Vec<serde_json::Value> = (0..n)
+            .map(|i| json!({"url": format!("https://{query}.example/{i}"), "title": format!("{query} {i}"), "snippet": ""}))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(body_json(json!({"query": query, "limit": limit})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": hits}})))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn three_queries_share_the_list_so_the_third_is_read_not_cut() {
+        // 2026-10-16: three queries brought back 18 Kagi hits for 12 slots,
+        // and the third language's were cut whole unless the first two
+        // overlapped — billed, never read. Each is asked in full and the
+        // merge gives each its share.
+        let server = MockServer::start().await;
+        for q in ["detergent", "wasmiddel", "waschmittel"] {
+            kagi_answering(&server, q, PER_QUERY, 6).await;
+        }
+        let tool = WebSearchTool { kagi: client(&server).await, perplexity: None, budget: Default::default() };
+        let out = tool
+            .call(SearchArgs { query: "detergent".into(), also_queries: vec!["wasmiddel".into(), "waschmittel".into()] })
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 12);
+        for q in ["detergent", "wasmiddel", "waschmittel"] {
+            assert_eq!(out.iter().filter(|r| r.url.starts_with(&format!("https://{q}.example/"))).count(), 4, "{q}");
+        }
+        assert!(out[0].url.starts_with("https://detergent.example/"), "the user's own query leads");
+    }
+
+    #[test]
+    fn the_merge_tally_says_what_became_of_each_sources_hits() {
+        let hits = |prefix: &str, n: usize| (0..n).map(|i| hit(&format!("https://{prefix}/{i}"))).collect::<Vec<_>>();
+        let mut second = hits("b", 5);
+        second.insert(0, hit("https://a/0")); // repeats the first list
+        let mut third = hits("c", 2);
+        third.push(hit("https://b/1")); // repeats the second
+        let (merged, tallies) =
+            merge(vec![(Source::Kagi(0), hits("a", 10)), (Source::Kagi(1), second), (Source::Perplexity, third)]);
+        // Two queries: six slots each. The first has ten, the second five
+        // once its repeat is dropped, so one slot is spare — and it goes to
+        // the first query's seventh hit, not to Perplexity.
+        assert_eq!(merged.len(), MERGED_LIMIT);
+        assert_eq!(merged[6].url, "https://a/6", "the spare slot goes to the user's own query first");
+        assert_eq!(merged[7].url, "https://b/0", "then the second list follows, grouped");
+        assert_eq!(
+            tallies,
+            vec![
+                (Source::Kagi(0), Tally { kept: 7, duplicate: 0, cut: 3 }),
+                (Source::Kagi(1), Tally { kept: 5, duplicate: 1, cut: 0 }),
+                (Source::Perplexity, Tally { kept: 0, duplicate: 1, cut: 2 }),
+            ]
+        );
+        assert_eq!(Source::Kagi(2).label(), "kagi_3");
+        assert_eq!(merge(Vec::new()), (Vec::new(), Vec::new()), "nothing in, nothing out");
+    }
+
+    #[test]
+    fn a_query_alone_keeps_its_ten_and_perplexity_the_last_two_slots() {
+        // As it always was: the single-query case is unchanged.
+        let hits = |prefix: &str, n: usize| (0..n).map(|i| hit(&format!("https://{prefix}/{i}"))).collect::<Vec<_>>();
+        let (merged, tallies) = merge(vec![(Source::Kagi(0), hits("a", 10)), (Source::Perplexity, hits("p", 5))]);
+        assert_eq!(merged.len(), MERGED_LIMIT);
+        assert_eq!(merged[10].url, "https://p/0");
+        assert_eq!(tallies[0].1, Tally { kept: 10, duplicate: 0, cut: 0 });
+        assert_eq!(tallies[1].1, Tally { kept: 2, duplicate: 0, cut: 3 });
+    }
+
+    #[test]
+    fn short_lists_hand_their_slots_on_in_order_and_perplexity_takes_what_is_left() {
+        let hits = |prefix: &str, n: usize| (0..n).map(|i| hit(&format!("https://{prefix}/{i}"))).collect::<Vec<_>>();
+        // Three queries, four slots each; the third found one hit. Its
+        // three spare slots go to the first query's deeper hits.
+        let (merged, tallies) = merge(vec![
+            (Source::Kagi(0), hits("a", 10)),
+            (Source::Kagi(1), hits("b", 10)),
+            (Source::Kagi(2), hits("c", 1)),
+            (Source::Perplexity, hits("p", 5)),
+        ]);
+        assert_eq!(merged.len(), MERGED_LIMIT);
+        assert_eq!(tallies.iter().map(|(_, t)| t.kept).collect::<Vec<_>>(), [7, 4, 1, 0]);
+        assert_eq!(tallies.iter().map(|(_, t)| t.cut).collect::<Vec<_>>(), [3, 6, 0, 5]);
+        // Two short queries: nothing deeper to hand on, so Perplexity fills.
+        let (merged, tallies) =
+            merge(vec![(Source::Kagi(0), hits("a", 3)), (Source::Kagi(1), hits("b", 3)), (Source::Perplexity, hits("p", 9))]);
+        assert_eq!(merged.len(), MERGED_LIMIT);
+        assert_eq!(tallies.iter().map(|(_, t)| t.kept).collect::<Vec<_>>(), [3, 3, 6]);
+        assert_eq!(tallies[2].1.cut, 3);
+        // A query the budget dropped is simply not in the lists: the two
+        // that ran share as two.
+        assert_eq!(share(1), 10);
+        assert_eq!(share(2), 6);
+        assert_eq!(share(3), 4);
     }
 
     #[tokio::test]
@@ -411,7 +616,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/search"))
-            .and(body_json(json!({"query": "laundry detergent", "limit": 6})))
+            .and(body_json(json!({"query": "laundry detergent", "limit": 10})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": [
                 {"title": "EN shop", "url": "https://a.example", "snippet": ""},
                 {"title": "shared", "url": "https://shared.example", "snippet": "english"}
@@ -420,7 +625,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/search"))
-            .and(body_json(json!({"query": "wasmiddel", "limit": 6})))
+            .and(body_json(json!({"query": "wasmiddel", "limit": 10})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": [
                 {"title": "shared", "url": "https://shared.example", "snippet": "dutch"},
                 {"title": "bol.com", "url": "https://bol.example", "snippet": ""}
@@ -561,7 +766,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/search"))
-            .and(body_json(json!({"query": "ok", "limit": 6})))
+            .and(body_json(json!({"query": "ok", "limit": 10})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"search": [
                 {"title": "T", "url": "https://u", "snippet": ""}
             ]}})))
@@ -569,7 +774,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/search"))
-            .and(body_json(json!({"query": "boom", "limit": 6})))
+            .and(body_json(json!({"query": "boom", "limit": 10})))
             .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
             .mount(&server)
             .await;
@@ -584,7 +789,7 @@ mod tests {
         // but when every query fails the model must see the error
         Mock::given(method("POST"))
             .and(path("/v1/search"))
-            .and(body_json(json!({"query": "kaboom", "limit": 6})))
+            .and(body_json(json!({"query": "kaboom", "limit": 10})))
             .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
             .mount(&server)
             .await;

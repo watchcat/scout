@@ -6800,6 +6800,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hmac",
+ "rustls 0.23.42",
  "scout-api",
  "scout-core",
  "scout-web",

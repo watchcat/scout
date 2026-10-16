@@ -186,7 +186,9 @@ async fn mail_a_link(auth: &AuthState, address: String, account_id: Option<i64>,
     // a leaked `login_tokens` table then holds nothing anyone can spend,
     // for the same reason a password file holds hashes.
     let mut bytes = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    // The thread RNG is a CSPRNG (`CryptoRng`), which a token that is a
+    // way into an account has to come from.
+    rand::fill(&mut bytes);
     let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     if let Err(e) = identity::issue_token_joining(

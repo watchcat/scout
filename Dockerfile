@@ -21,7 +21,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release \
     && cp target/release/scout-telegram /scout-telegram
 
-# Runtime stage: TLS deps plus Chromium, used only to re-open pages that
+# Runtime stage: CA certificates (TLS itself is rustls, inside the binary)
+# plus Chromium, used only to re-open pages that
 # refuse a plain HTTP client (a shop behind a challenge answers 403 to
 # reqwest and serves the product page to a real browser). Chromium is the
 # bulk of this image; drop it and the bot still runs, minus that fallback.
@@ -37,7 +38,7 @@ FROM debian:bookworm-slim
 # its pages and has the model read the pictures.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 chromium fonts-liberation tini poppler-utils \
+        ca-certificates chromium fonts-liberation tini poppler-utils \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m scout \
     && mkdir -p /data \

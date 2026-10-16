@@ -162,6 +162,9 @@ impl Guard {
         let guard = *self;
         reqwest::Client::builder()
             .timeout(timeout)
+            // A proxy would resolve the name itself, past the resolver
+            // below; the fence must not depend on the environment.
+            .no_proxy()
             .dns_resolver(Arc::new(PublicResolver))
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() >= MAX_REDIRECTS {

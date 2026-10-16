@@ -4976,10 +4976,10 @@ const REACHES: &str = "(t.account_id = ? OR EXISTS (SELECT 1 FROM trip_people p 
 /// Five characters of `a-z0-9`: the part of a trip's address nobody can
 /// guess from the trip's name.
 fn address_tail() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
-    (0..5).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
+    let mut rng = rand::rng();
+    (0..5).map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char).collect()
 }
 
 /// How long a released address stays its last holder's to take back.

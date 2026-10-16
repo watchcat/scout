@@ -139,6 +139,16 @@ async fn install_menu_button(bot: Bot, launch: url::Url) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Two rustls crypto providers are linked in — aws-lc-rs behind reqwest
+    // 0.13 (rig, scout-core, scout-web) and ring behind teloxide's reqwest
+    // 0.12 — and with two on, rustls refuses to guess a process default:
+    // anything that builds a `ClientConfig` without naming a provider
+    // panics at runtime. Both reqwests ask for the default first, so this
+    // one line puts every client on aws-lc-rs and leaves ring idle. Before
+    // anything else, as rustls asks.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("the crypto provider is installed once, here");
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))

@@ -69,6 +69,29 @@ to — the one whose dates it overlaps, or a draft trip started for it.
 Nothing lands on a trip until you click Add. Everything else — newsletters, mail Scout could not
 read, arrivals you ignored — sits under Other mail for thirty days.
 
+A trip is shared by a link. Anyone on it copies one from the **People** line
+under the trip's title — `goodscout.fyi/join/<token>`, or a `t.me` link that
+opens the Mini App when it is pressed inside Telegram. The link lasts 14 days
+and admits at most 10 new people; the owner can replace it or turn it off.
+Someone without a Scout account signs in on the join page, by email or
+Telegram, and lands back on the trip — the link is also their invitation, so
+it gives them a seat. Everyone on a trip edits it as the owner does: items,
+notes, moves, flight choices, bookings pressed in from the chat. Every item
+says who added it and how — *Added by Masha, via Scout* — on the page and on
+the printed plan. The owner alone deletes the trip, changes its address,
+manages the link and takes people off it, and can hand the trip to another
+participant and stay on it as an editor.
+
+A kept trip also has an email address of its own: `lisbon-4f9qa@goodscout.fyi`,
+drawn from the trip's name, or one the owner chooses (`lisbon2026`: letters,
+digits, dots and dashes). Give that one to the hotel instead of your own. Mail
+to it is filed on that trip for everyone on it, forwarded to each person once
+— never back to whoever sent it — and announced to each on Telegram with
+**Add** and **Ignore** under it. An address that is let go — a trip address
+changed, a trip deleted, a personal handle changed — is held for 90 days for
+whoever let it go, so a hotel's next confirmation cannot reach a stranger who
+took the name.
+
 ### Trips inside Telegram
 
 The same trip page opens inside Telegram as a Mini App: a **Trips** button
@@ -92,7 +115,9 @@ pasted in an item's note with coordinates in it needs no lookup at all.
 Bookings reach the chat too. When a confirmation arrives at your booking
 address, the bot says what came and for which trip, with **Add** and
 **Ignore** under it, so a hotel booked from the phone is on the trip without
-opening anything. And a PDF ticket or confirmation sent to the bot is read
+opening anything. Mail to a trip's own address says so to everyone on the
+trip, and a late press on a booking somebody else already decided says who
+did. And a PDF ticket or confirmation sent to the bot is read
 the same way the mailed kind is: same extraction, same pending row, same
 buttons — it is not mailed back to you, since you have it already.
 
@@ -277,6 +302,17 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   until you press Add: mail never changes an itinerary on its own. Tickets
   come with it, PDFs included. Newsletters, mail Scout could not read and
   arrivals you ignored sit under Other mail for thirty days, then go
+- **Trips you plan together.** Share a trip by link — from the People line
+  under its title, or a `t.me` link inside Telegram — and whoever opens it is
+  on the trip, with or without an account yet: the join page signs them in
+  and brings them back to it. A link lasts 14 days and admits at most 10 new
+  people; the owner can replace it or turn it off. Everyone on a trip edits
+  it as the owner does, every item says who added it and how, and the owner
+  can hand the trip to another participant and stay on as an editor
+- **An address per trip.** Every kept trip gets `<name>-<5 chars>@goodscout.fyi`,
+  or one the owner chooses. Mail to it is filed on that trip for everyone on
+  it, forwarded to each person once, and announced to each on Telegram. An
+  address let go is held 90 days for whoever let it go
 - **Your phone follows along.** A toggle sends the browser thread to your
   Telegram chat as it happens, so a question asked at a desk is answered on
   the train
@@ -609,12 +645,17 @@ of JavaScript in the browser client.
   carry between rounds.
 - **A booking address reads; it never acts.** A confirmation Scout misreads
   is a pending row with the wrong date, which you refuse — not an itinerary
-  that changed behind you. An image-only PDF has no text to read, so a
-  ticket that is a photograph arrives attached and unread. Mail to a handle
-  nobody holds is dropped without a bounce, because answering would tell a
-  stranger which addresses exist, and changing your handle retires the old
-  one rather than forwarding it. Raw messages are deleted after thirty days;
-  what you added to a trip stays.
+  that changed behind you. A PDF with no text in it — printed to PDF as
+  shapes, or scanned — is drawn and read from its pictures, three pages at
+  most and a model call each; an image that is not a PDF arrives attached
+  and unread. Mail to an address nobody holds is dropped without a bounce,
+  because answering would tell a stranger which addresses exist, and an
+  address you let go is held rather than forwarded. Raw messages are
+  deleted after thirty days; what you added to a trip stays.
+- **Sharing is all or nothing.** Everyone on a trip can change everything on
+  it; there are no read-only guests. What somebody added stays when they
+  leave or are taken off. A link admits at most ten people and lasts
+  fourteen days; a trip is passed on only to someone already on it.
 - **Threads expire, and only the web can pin.** A conversation untouched
   for 48 hours is deleted, in every scope. The pin that exempts one lives in
   the browser's sidebar; there is no Telegram command for it yet. History

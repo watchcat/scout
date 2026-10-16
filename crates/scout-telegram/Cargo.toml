@@ -7,7 +7,10 @@ description = "Scout's Telegram channel"
 repository = "https://github.com/watchcat/scout"
 
 [dependencies]
-teloxide = { version = "0.17", features = ["macros"] }
+# Without its default `native-tls`: teloxide's reqwest is the one place
+# OpenSSL came in from, now that scout-core and scout-web are on reqwest
+# 0.13 and rustls. The other two defaults are kept by name.
+teloxide = { version = "0.17", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 axum = "0.8.9"
 futures-util = "0.3"

@@ -1,7 +1,7 @@
 //! What `/metrics` reports: runs, tool calls, provider errors and the
 //! store's lock.
 //!
-//! Written by hand rather than with a metrics crate. Six series in the
+//! Written by hand rather than with a metrics crate. A few series in the
 //! Prometheus text format is a page of code, and the one path that is hot —
 //! the store's lock, taken on every call — is two clock reads and three
 //! atomic adds here, with nothing behind them that could allocate or lock.
@@ -214,7 +214,7 @@ impl Metrics {
         self.provider_retries.render(&mut out, "scout_provider_retries_total", "Requests to a provider sent again after a 429, a 5xx or a refused connection.");
         self.lock_wait.render(&mut out, "scout_store_lock_wait_seconds", "Time a store call waited for the database's lock.");
         self.search_calls.render(&mut out, "scout_search_calls_total", "search_web calls, by how many Kagi queries each spent.");
-        self.search_results.render(&mut out, "scout_search_results_total", "Hits per search_web call by source (kagi_N is the Nth query, kagi_1 the user's own) and what became of them: kept for the model, a duplicate of an earlier list, or cut by the cap.");
+        self.search_results.render(&mut out, "scout_search_results_total", "Hits from search_web calls, by source (kagi_N is the Nth query, kagi_1 the user's own) and what became of them: kept for the model, a duplicate of an earlier entry, or cut for want of room.");
         out
     }
 }

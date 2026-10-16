@@ -13,12 +13,21 @@ and the pod holds it). The nightly backup is the copy:
 Needs the `duckdb` Python package. Traces are kept for the last 300 runs
 (`Core::TRACE_RUNS_KEEP`), so this is a rolling window, not history.
 
-How to read it: search_web merges, in order, Kagi for the user's own query
-(10 hits alone, 6 when translations ride along), then each translation's
-new URLs, then Perplexity's, and cuts the list at 12. The merged list does
+How to read it: search_web merges, in order, Kagi for the user's own query,
+then each translation's new URLs, then Perplexity's, into 12 slots. Until
+2026-10-16 each Kagi query was asked for 10 hits alone or 6 when
+translations rode along, and the list was cut at 12; since then every
+query is asked in full and the merge gives each an equal share of the 12
+(10 alone, 6 for two, 4 for three), slots a short list leaves free going to
+the other queries' deeper hits and then to Perplexity. The merged list does
 not say which query a hit came from, so the attribution by position below
-is a lower bound; `/metrics` carries the exact per-query tally since
-2026-10-16 (`scout_search_results_total`).
+— "within the first query's share" or past it — is a lower bound; `/metrics`
+carries the exact per-query tally since the change
+(`scout_search_results_total`).
+
+search_secondhand draws on the same allowance, one query per site it
+searches on Kagi; it is counted as one a call here, so the per-run figures
+are floors.
 """
 import collections
 import json
@@ -27,11 +36,23 @@ import sys
 
 import duckdb
 
-BUDGET = 15          # inbox::budget::QUERIES_PER_REQUEST
+BUDGET = 15          # tools::budget::QUERIES_PER_REQUEST
 MAX_QUERIES = 3      # per search_web call
 MERGED_LIMIT = 12
-PER_QUERY_ALONE = 10
-PER_QUERY_FANNED = 6
+PER_QUERY = 10
+# When the merge began sharing the list out; before it, a fanned call gave
+# the user's own query six slots. The deploy of that change, UTC.
+SHARES_CHANGED_AT = "2026-10-16 23:00:00"
+
+
+def first_share(asked, started_at):
+    """How many slots the user's own query had in a call, by the rule in
+    force when it ran."""
+    if asked <= 1:
+        return PER_QUERY
+    if str(started_at) < SHARES_CHANGED_AT:
+        return 6
+    return min(PER_QUERY, MERGED_LIMIT // asked)
 
 
 def loads(text):
@@ -62,7 +83,7 @@ def pct(a, b):
 def main(path):
     con = duckdb.connect(path, read_only=True)
     rows = con.sql(
-        """SELECT run_id, seq, tool, args, status, detail, result, nested, duration_ms
+        """SELECT run_id, seq, tool, args, status, detail, result, nested, duration_ms, started_at
            FROM run_traces WHERE kind = 'tool' ORDER BY run_id, seq"""
     ).fetchall()
     outcome_of = dict(con.sql("SELECT id, outcome FROM runs").fetchall())
@@ -75,9 +96,12 @@ def main(path):
     runs_with_search = 0
     budget_hit_runs = 0
     budget_errors = 0
+    secondhand_refused = 0
+    skipped = 0
     kagi_per_run = []
     searches_per_run = []
     secondhand_calls = 0
+    ok_calls_by_index = collections.Counter()
     novelty_by_index = collections.defaultdict(list)
     fetched_pos = collections.Counter()
     fetched_call = collections.Counter()
@@ -92,7 +116,7 @@ def main(path):
         seen = {}
         n_search = 0
         fetched = []
-        for (_, _, tool, args, status, detail, result, nested, dur) in trs:
+        for (_, _, tool, args, status, detail, result, nested, dur, started_at) in trs:
             a = loads(args)
             if tool == "search_web":
                 asked = asked_queries(a)
@@ -100,22 +124,30 @@ def main(path):
                 hit_budget |= granted < asked
                 used += granted
                 res = loads(result) if status == "ok" else None
+                if status == "ok" and not isinstance(res, list):
+                    skipped += 1  # a truncated or unreadable result: counted as no URLs
                 urls = [h.get("url") for h in res] if isinstance(res, list) else []
                 urls = [u for u in urls if isinstance(u, str) and u]
                 new = [u for u in urls if u not in seen]
                 idx = n_search
                 n_search += 1
+                if status == "ok":
+                    ok_calls_by_index[min(idx, 5)] += 1
                 if urls:
                     novelty_by_index[min(idx, 5)].append(len(new) / len(urls))
+                share = first_share(asked, started_at)
                 for pos, u in enumerate(urls):
-                    seen.setdefault(u, (idx, pos, asked))
+                    seen.setdefault(u, (idx, pos, asked, share))
                 calls.append(dict(asked=asked, n=len(urls), status=status, dur=dur, nested=nested))
                 if detail and "budget spent" in detail:
                     budget_errors += 1
             elif tool == "search_secondhand":
                 secondhand_calls += 1
-                # One query per site asked; counted as one here, a floor.
+                # One query per site asked; counted as one here, a floor. Its
+                # refusal sits inside an ok result, per site.
                 used += min(1, max(0, BUDGET - used))
+                if "not searched" in (result or ""):
+                    secondhand_refused += 1
             elif tool == "fetch_page":
                 u = a.get("url") if isinstance(a, dict) else None
                 if isinstance(u, str):
@@ -131,17 +163,18 @@ def main(path):
             if u not in seen_trim:
                 fetched_elsewhere += 1
                 continue
-            idx, pos, asked = seen_trim[u]
+            idx, pos, asked, share = seen_trim[u]
             fetched_call[min(idx, 5)] += 1
             fetched_asked[asked] += 1
             if asked >= 2:
                 fetched_exact[pos] += 1
-                fetched_pos["fanned: first 6 (query 1)" if pos < PER_QUERY_FANNED else "fanned: 7-12 (translations/Perplexity)"] += 1
+                fetched_pos["fanned: within the first query's share" if pos < share else "fanned: past it (translations/Perplexity)"] += 1
             else:
-                fetched_pos["alone: first 10 (query 1)" if pos < PER_QUERY_ALONE else "alone: 11-12 (Perplexity)"] += 1
+                fetched_pos["alone: first 10 (query 1)" if pos < PER_QUERY else "alone: 11-12 (Perplexity)"] += 1
 
     print(f"runs: {len(outcome_of)} (with traces: {len(by_run)}; with a search: {runs_with_search})")
-    print(f"search_web calls: {len(calls)} (nested: {sum(c['nested'] for c in calls)}); search_secondhand calls: {secondhand_calls}")
+    print(f"search_web calls: {len(calls)} (nested: {sum(c['nested'] for c in calls)}; results unreadable: {skipped}); "
+          f"search_secondhand calls: {secondhand_calls} (sites refused for budget: {secondhand_refused})")
     print()
     print("== queries asked per search_web call (query + translations)")
     for k in sorted({c['asked'] for c in calls}):
@@ -174,6 +207,8 @@ def main(path):
     for k, v in sorted(fetched_pos.items()):
         print(f"  {k}: {v}")
     print("  by the call that first returned it:", ", ".join(f"#{k + 1}:{v}" for k, v in sorted(fetched_call.items())))
+    print("  opened pages per ok call, by call index:", ", ".join(
+        f"#{k + 1}{'+' if k == 5 else ''}:{fetched_call[k] / ok_calls_by_index[k]:.2f}" for k in sorted(ok_calls_by_index) if ok_calls_by_index[k]))
     print("  by queries asked in that call:", ", ".join(f"{k}q:{v}" for k, v in sorted(fetched_asked.items())))
     print("  exact position within fanned (>=2-query) calls:", ", ".join(f"{k + 1}:{v}" for k, v in sorted(fetched_exact.items())))
     print()

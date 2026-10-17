@@ -130,6 +130,16 @@ impl Core {
             .build()?;
         let kagi = KagiClient::new(http.clone(), cfg.kagi_api_key.clone(), KAGI_API_BASE.to_string());
         let llm = crate::agent::llm_client(&cfg.llm_api_key, &cfg.llm_base_url)?;
+        // The side calls' provider: the main one again unless `.env` names
+        // another. Said out loud, since nothing else would show which
+        // model a title came from.
+        let side = match &cfg.side_llm {
+            Some(s) => {
+                tracing::info!(model = %s.model, base_url = %s.base_url, "the side calls go to a second provider");
+                crate::agent::SideModel { llm: crate::agent::llm_client(&s.api_key, &s.base_url)?, name: s.model.clone() }
+            }
+            None => crate::agent::SideModel { llm: llm.clone(), name: cfg.llm_model.clone() },
+        };
         let ebay = cfg.ebay_credentials.clone().map(|(id, secret)| {
             crate::tools::ebay::EbayClient::new(
                 http.clone(),
@@ -194,6 +204,7 @@ impl Core {
             llm,
             model: cfg.llm_model.clone(),
             flight_model: cfg.flight_model.clone(),
+            side,
             kagi,
             renderer,
             bol,

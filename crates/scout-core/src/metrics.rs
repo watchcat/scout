@@ -142,6 +142,9 @@ pub struct Metrics {
     search_calls: Counter,
     search_results: Counter,
     model_tokens: Counter,
+    side_calls: Counter,
+    side_call_tokens: Counter,
+    side_call_ms: Counter,
 }
 
 impl Default for Metrics {
@@ -157,6 +160,9 @@ impl Default for Metrics {
             search_calls: Counter::new(&["queries"]),
             search_results: Counter::new(&["source", "outcome"]),
             model_tokens: Counter::new(&["kind"]),
+            side_calls: Counter::new(&["call", "model", "outcome"]),
+            side_call_tokens: Counter::new(&["call", "model", "kind"]),
+            side_call_ms: Counter::new(&["call", "model"]),
         }
     }
 }
@@ -214,6 +220,27 @@ impl Metrics {
         self.model_tokens.add_n(&["output"], n(tokens.output));
     }
 
+    /// A tool-less side call ended: `ok`, `failed` or `timeout`, after
+    /// `took`. The milliseconds add up so the page gives a mean per call
+    /// and model without a histogram per label set.
+    pub fn side_call(&self, call: &str, model: &str, outcome: &str, took: Duration) {
+        self.side_calls.add(&[call, model, outcome]);
+        self.side_call_ms.add_n(&[call, model], took.as_millis().min(u64::MAX as u128) as u64);
+    }
+
+    /// What a side call cost, as the provider reported it. Reasoning apart,
+    /// since that is the cost a trial of a reasoning model has to watch.
+    pub fn side_call_tokens(&self, call: &str, model: &str, used: rig::completion::Usage) {
+        for (kind, n) in [
+            ("input", used.input_tokens),
+            ("cached", used.cached_input_tokens),
+            ("output", used.output_tokens),
+            ("reasoning", used.reasoning_tokens),
+        ] {
+            self.side_call_tokens.add_n(&[call, model, kind], n);
+        }
+    }
+
     /// The whole set in the Prometheus text format.
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -225,6 +252,9 @@ impl Metrics {
         self.lock_wait.render(&mut out, "scout_store_lock_wait_seconds", "Time a store call waited for the database's lock.");
         self.search_calls.render(&mut out, "scout_search_calls_total", "search_web calls, by how many Kagi queries each spent.");
         self.model_tokens.render(&mut out, "scout_model_tokens_total", "Tokens the model reported for runs, by kind: input, cached (the part of input served from the provider's cache), output.");
+        self.side_calls.render(&mut out, "scout_side_calls_total", "Tool-less side calls — title, continuation, extract, photo, page — by model and how they ended.");
+        self.side_call_tokens.render(&mut out, "scout_side_call_tokens_total", "Tokens the side calls used, by call, model and kind; reasoning is counted on its own, as a share of output.");
+        self.side_call_ms.render(&mut out, "scout_side_call_ms_total", "Milliseconds the side calls took, by call and model; divide by the calls for a mean.");
         self.search_results.render(&mut out, "scout_search_results_total", "Hits from search_web calls, by source (kagi_N is the Nth query, kagi_1 the user's own) and what became of them: kept for the model, a duplicate of an earlier entry, or cut for want of room.");
         out
     }
@@ -472,6 +502,9 @@ mod tests {
             "scout_search_calls_total",
             "scout_search_results_total",
             "scout_model_tokens_total",
+            "scout_side_calls_total",
+            "scout_side_call_tokens_total",
+            "scout_side_call_ms_total",
         ] {
             assert!(page.contains(&format!("# TYPE {name} ")), "{name} is missing:\n{page}");
         }

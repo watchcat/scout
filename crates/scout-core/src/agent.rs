@@ -235,6 +235,46 @@ pub fn llm_client(api_key: &str, base_url: &str) -> Result<LlmClient> {
         .build()?)
 }
 
+/// A client and the model it is asked for: what a side call is built on.
+#[derive(Clone)]
+pub struct SideModel {
+    pub llm: LlmClient,
+    pub name: String,
+}
+
+/// The side calls, named as `/metrics` counts them.
+pub const SIDE_TITLE: &str = "title";
+pub const SIDE_CONTINUATION: &str = "continuation";
+pub const SIDE_EXTRACT: &str = "extract";
+pub const SIDE_PHOTO: &str = "photo";
+pub const SIDE_PAGE: &str = "page";
+
+/// One tool-less side call, bounded by `budget`, timed and counted under
+/// `call` for the trial of a second provider: `/metrics` carries its
+/// tokens (reasoning apart), its time and how it ended, by model, so two
+/// providers' numbers sit beside each other. The agent is the caller's —
+/// each has its own preamble — but it must be built on `d.side`.
+pub(crate) async fn side_call(
+    d: &AgentDeps,
+    call: &'static str,
+    budget: std::time::Duration,
+    agent: &rig::agent::Agent<openai::completion::CompletionModel>,
+    prompt: impl Into<rig::completion::Message> + Send,
+) -> Result<String> {
+    use rig::completion::Prompt;
+    let started = std::time::Instant::now();
+    let (outcome, result) = match tokio::time::timeout(budget, agent.prompt(prompt).extended_details()).await {
+        Ok(Ok(response)) => {
+            d.metrics.side_call_tokens(call, &d.side.name, response.usage);
+            ("ok", Ok(response.output))
+        }
+        Ok(Err(e)) => ("failed", Err(e.into())),
+        Err(_) => ("timeout", Err(anyhow::anyhow!("the model did not answer in time"))),
+    };
+    d.metrics.side_call(call, &d.side.name, outcome, started.elapsed());
+    result
+}
+
 /// Everything needed to assemble a per-request agent.
 pub struct AgentDeps {
     pub llm: LlmClient,
@@ -244,6 +284,9 @@ pub struct AgentDeps {
     pub model: String,
     /// See `Config::flight_model`.
     pub flight_model: String,
+    /// Where the tool-less side calls go — the main provider again, or the
+    /// one `Config::side_llm` names — and what to ask it for.
+    pub side: SideModel,
     pub kagi: KagiClient,
     /// Headless-Chrome fallback for pages plain HTTP cannot read.
     pub renderer: Option<crate::tools::browser::Renderer>,
@@ -299,8 +342,9 @@ pub async fn continues_previous(
     new_message: &str,
 ) -> Result<bool> {
     let agent = d
+        .side
         .llm
-        .agent(&d.model)
+        .agent(&d.side.name)
         .preamble(
             "You judge whether a new chat message continues the previous \
              conversation or starts an unrelated new request. Reply with \
@@ -311,9 +355,7 @@ pub async fn continues_previous(
         "Previous conversation (latest excerpts):\n{previous_excerpt}\n\n\
          New message:\n{new_message}\n\nCONTINUE or NEW?"
     );
-    let answer = tokio::time::timeout(CONTINUES_BUDGET, rig::completion::Prompt::prompt(&agent, question))
-        .await
-        .map_err(|_| anyhow::anyhow!("the model did not answer in time"))??;
+    let answer = side_call(d, SIDE_CONTINUATION, CONTINUES_BUDGET, &agent, question).await?;
     let verdict = crate::text::strip_thinking(&answer);
     Ok(verdict.to_uppercase().contains("CONTINUE"))
 }
@@ -331,8 +373,9 @@ const TITLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// only other thing that would cut a hung connection loose.
 pub async fn title_for(d: &AgentDeps, transcript: &str) -> Result<String> {
     let agent = d
+        .side
         .llm
-        .agent(&d.model)
+        .agent(&d.side.name)
         .preamble(
             "You name chat threads. Reply with a title of at most five words \
              in the language of the conversation, no quotes, no trailing \
@@ -340,9 +383,7 @@ pub async fn title_for(d: &AgentDeps, transcript: &str) -> Result<String> {
         )
         .build();
     let question = format!("Conversation:\n{transcript}\n\nTitle:");
-    let answer = tokio::time::timeout(TITLE_BUDGET, rig::completion::Prompt::prompt(&agent, question))
-        .await
-        .map_err(|_| anyhow::anyhow!("the model did not answer in time"))??;
+    let answer = side_call(d, SIDE_TITLE, TITLE_BUDGET, &agent, question).await?;
     Ok(crate::text::strip_thinking(&answer))
 }
 
@@ -706,14 +747,76 @@ mod tests {
     #[test]
     fn the_continuation_check_has_its_own_budget() {
         // As the title call has: a source assertion, since neither can be
-        // entered without a model. The check is scoped to the function's
-        // own body, so a `timeout(CONTINUES_BUDGET` anywhere else would
-        // not count.
+        // entered without a model. The budget is the one `side_call` is
+        // handed, and the check is scoped to the function's own body.
         let src = include_str!("agent.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         let start = src.find("pub async fn continues_previous").expect("continues_previous must exist");
         let body = &src[start..start + src[start..].find("\n}\n").expect("the function ends")];
-        assert!(body.contains("timeout(CONTINUES_BUDGET"), "the continuation check must carry its own budget");
+        assert!(body.contains("CONTINUES_BUDGET, &agent"), "the continuation check must carry its own budget");
+    }
+
+    /// A model stand-in that answers every completion with `answer` and
+    /// reports a token of each kind.
+    async fn model_saying(server: &wiremock::MockServer, answer: &str) {
+        use wiremock::matchers::{method, path};
+        wiremock::Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "s1", "model": "m",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10,
+                          "prompt_tokens_details": {"cached_tokens": 2}, "completion_tokens_details": {"reasoning_tokens": 1}},
+            })))
+            .mount(server).await;
+    }
+
+    #[tokio::test]
+    async fn a_side_call_goes_to_the_side_provider_and_is_counted_by_model() {
+        // The trial of a second provider: the main model is a closed port,
+        // the side one a stand-in, and a title asks the side one — then
+        // the page says what it cost, by model, as the card asked.
+        let side = wiremock::MockServer::start().await;
+        model_saying(&side, "<think>short</think>Cheapest beans").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::for_test(dir.path().join("side.duckdb").to_str().unwrap());
+        cfg.side_llm = Some(crate::config::SideLlm { api_key: "sk".into(), base_url: side.uri(), model: "side-model".into() });
+        let mut core = crate::core::Core::start(cfg, None).unwrap();
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        core.deps.metrics = metrics;
+
+        let title = title_for(&core.deps, "me: cheapest beans?\nscout: ...").await.unwrap();
+
+        assert_eq!(title, "Cheapest beans");
+        let asked = side.received_requests().await.unwrap();
+        assert_eq!(asked.len(), 1, "the side provider was asked, and nothing went to the main one");
+        assert!(String::from_utf8_lossy(&asked[0].body).contains("\"model\":\"side-model\""));
+        let page = metrics.render();
+        for line in [
+            "scout_side_calls_total{call=\"title\",model=\"side-model\",outcome=\"ok\"} 1",
+            "scout_side_call_tokens_total{call=\"title\",model=\"side-model\",kind=\"input\"} 7",
+            "scout_side_call_tokens_total{call=\"title\",model=\"side-model\",kind=\"cached\"} 2",
+            "scout_side_call_tokens_total{call=\"title\",model=\"side-model\",kind=\"output\"} 3",
+            "scout_side_call_tokens_total{call=\"title\",model=\"side-model\",kind=\"reasoning\"} 1",
+        ] {
+            assert!(page.contains(&format!("{line}\n")), "{line} is missing:\n{page}");
+        }
+        assert!(page.contains("scout_side_call_ms_total{call=\"title\",model=\"side-model\"} "), "{page}");
+    }
+
+    #[tokio::test]
+    async fn without_a_side_provider_the_side_calls_go_to_the_main_one() {
+        let main = wiremock::MockServer::start().await;
+        model_saying(&main, "CONTINUE").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::for_test(dir.path().join("side.duckdb").to_str().unwrap());
+        cfg.llm_base_url = main.uri();
+        cfg.llm_model = "the-main-model".into();
+        let core = crate::core::Core::start(cfg, None).unwrap();
+
+        assert!(continues_previous(&core.deps, "beans", "and rice?").await.unwrap());
+        let asked = main.received_requests().await.unwrap();
+        assert_eq!(asked.len(), 1);
+        assert!(String::from_utf8_lossy(&asked[0].body).contains("\"model\":\"the-main-model\""), "the main model, by its configured name");
     }
 
     #[test]
@@ -985,6 +1088,6 @@ mod tests {
         let start = src.find("pub async fn title_for").expect("title_for must exist");
         let end = src[start..].find("\n}").expect("title_for must end") + start;
         let body = &src[start..end];
-        assert!(body.contains("timeout(TITLE_BUDGET"), "the title call must carry its own budget");
+        assert!(body.contains("TITLE_BUDGET, &agent"), "the title call must carry its own budget");
     }
 }

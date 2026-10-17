@@ -27,6 +27,15 @@ pub struct Config {
     /// separate name is how a cheaper or sharper model gets tried on
     /// flights alone.
     pub flight_model: String,
+    /// A second provider for the tool-less side calls — a thread's title,
+    /// the continuation check, a mailed booking's reading, a photo's and a
+    /// page's — so a cheaper or sharper model can be tried where no tool
+    /// call and no reasoning mode is at stake. `SIDE_LLM_MODEL` turns it
+    /// on; `SIDE_LLM_BASE_URL` and `SIDE_LLM_API_KEY` default to the main
+    /// provider's, so a cheaper model at the same provider is one variable
+    /// and another provider is three. `None` sends the side calls where
+    /// everything else goes.
+    pub side_llm: Option<SideLlm>,
     pub kagi_api_key: String,
     /// Perplexity Search API key; without it search runs on Kagi alone.
     pub perplexity_api_key: Option<String>,
@@ -218,6 +227,11 @@ impl Config {
         let llm_base_url = either("LLM_BASE_URL", "MINIMAX_BASE_URL")
             .unwrap_or_else(|| crate::agent::DEFAULT_BASE_URL.to_string());
         let llm_model = non_empty("LLM_MODEL").unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());
+        let side_llm = non_empty("SIDE_LLM_MODEL").map(|model| SideLlm {
+            api_key: non_empty("SIDE_LLM_API_KEY").unwrap_or_else(|| llm_api_key.clone()),
+            base_url: non_empty("SIDE_LLM_BASE_URL").unwrap_or_else(|| llm_base_url.clone()),
+            model,
+        });
 
         Ok(Self {
             telegram_bot_token: required("TELEGRAM_BOT_TOKEN")?,
@@ -227,6 +241,7 @@ impl Config {
             llm_api_key,
             llm_base_url,
             llm_model,
+            side_llm,
             kagi_api_key: required("KAGI_API_KEY")?,
             perplexity_api_key: non_empty("PERPLEXITY_API_KEY"),
             db_path: get("SCOUT_DB_PATH").unwrap_or_else(|| "scout.duckdb".to_string()),
@@ -248,6 +263,14 @@ impl Config {
             pdftoppm: non_empty("SCOUT_PDFTOPPM").unwrap_or_else(|| "pdftoppm".to_string()),
         })
     }
+}
+
+/// The provider the side calls go to; see `Config::side_llm`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideLlm {
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
 }
 
 /// Ordered so callers can treat the first id as "whoever set this up".
@@ -328,6 +351,24 @@ mod tests {
         assert!(err.to_string().contains("LLM_API_KEY"), "{err}");
         env.insert("LLM_API_KEY", "lk");
         assert_eq!(load(&env).unwrap().llm_api_key, "lk");
+    }
+
+    #[test]
+    fn the_side_provider_is_one_variable_at_the_same_provider_and_three_at_another() {
+        assert_eq!(load(&base_env()).unwrap().side_llm, None, "unset, the side calls go where everything else goes");
+
+        let mut env = base_env();
+        env.insert("SIDE_LLM_MODEL", "cheaper-model");
+        let side = load(&env).unwrap().side_llm.unwrap();
+        assert_eq!(side, SideLlm { api_key: "mk".into(), base_url: crate::agent::DEFAULT_BASE_URL.into(), model: "cheaper-model".into() });
+
+        env.insert("SIDE_LLM_BASE_URL", "https://other.example/v1");
+        env.insert("SIDE_LLM_API_KEY", "ok");
+        let side = load(&env).unwrap().side_llm.unwrap();
+        assert_eq!(side, SideLlm { api_key: "ok".into(), base_url: "https://other.example/v1".into(), model: "cheaper-model".into() });
+
+        env.remove("SIDE_LLM_MODEL");
+        assert_eq!(load(&env).unwrap().side_llm, None, "a key and an address name no model, so nothing is sent there");
     }
 
     #[test]

@@ -1936,7 +1936,7 @@ mod tests {
         //
         // End to end on purpose, model call included — and the model this
         // harness is configured with is a closed port on loopback
-        // (`MINIMAX_BASE_URL` in `build_app`), so the call fails on connect
+        // (`LLM_BASE_URL` in `build_app`), so the call fails on connect
         // in microseconds and nothing goes onto the network.
         let (app, core, _dir) = test_app_with_a_round().await;
         let account_id = admitted(&core, "777").await;

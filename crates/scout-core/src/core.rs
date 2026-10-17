@@ -129,7 +129,7 @@ impl Core {
             .timeout(Duration::from_secs(30))
             .build()?;
         let kagi = KagiClient::new(http.clone(), cfg.kagi_api_key.clone(), KAGI_API_BASE.to_string());
-        let llm = crate::agent::llm_client(&cfg.minimax_api_key, &cfg.minimax_base_url)?;
+        let llm = crate::agent::llm_client(&cfg.llm_api_key, &cfg.llm_base_url)?;
         let ebay = cfg.ebay_credentials.clone().map(|(id, secret)| {
             crate::tools::ebay::EbayClient::new(
                 http.clone(),
@@ -192,6 +192,7 @@ impl Core {
         let http_for_ignav = http.clone();
         let deps = AgentDeps {
             llm,
+            model: cfg.llm_model.clone(),
             flight_model: cfg.flight_model.clone(),
             kagi,
             renderer,
@@ -739,7 +740,7 @@ impl Core {
         bytes: &[u8],
         caption: Option<&str>,
     ) -> anyhow::Result<String> {
-        crate::vision::describe_photo(&self.deps.llm, bytes, caption).await
+        crate::vision::describe_photo(&self.deps, bytes, caption).await
     }
 
     /// Who may walk in, as the public page reports it.

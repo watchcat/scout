@@ -12,8 +12,11 @@ use anyhow::Result;
 use rig::client::CompletionClient;
 use rig::providers::openai;
 
-pub const MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
-pub const MODEL: &str = "minimax-m3";
+/// The provider and model a deployment gets when `.env` names none:
+/// MiniMax and its M3. `Config::llm_base_url` and `Config::llm_model` are
+/// what every call reads; these two are only their defaults.
+pub const DEFAULT_BASE_URL: &str = "https://api.minimax.io/v1";
+pub const DEFAULT_MODEL: &str = "minimax-m3";
 /// Cap on model calls per request so a confused agent can't burn credits.
 /// The full flow (query_purchases -> search -> secondhand -> up to five
 /// fetch_page opens -> compare_prices -> answer) legitimately needs ~14 now
@@ -222,9 +225,9 @@ pub type LlmClient = openai::CompletionsClient;
 /// this crate on 0.13, so the `Client` types are unrelated), so the guard
 /// lives in bot.rs instead, around the stream itself.
 ///
-/// `base_url` is `MINIMAX_BASE_URL` in production and comes from
-/// `Config::minimax_base_url`, which a self-hoster may point at a proxy of
-/// their own and which the tests point at a closed port.
+/// `base_url` comes from `Config::llm_base_url`: MiniMax unless `.env`
+/// says otherwise, which a self-hoster may point at another provider or a
+/// proxy of their own and which the tests point at a closed port.
 pub fn llm_client(api_key: &str, base_url: &str) -> Result<LlmClient> {
     Ok(openai::CompletionsClient::builder()
         .api_key(api_key)
@@ -235,6 +238,10 @@ pub fn llm_client(api_key: &str, base_url: &str) -> Result<LlmClient> {
 /// Everything needed to assemble a per-request agent.
 pub struct AgentDeps {
     pub llm: LlmClient,
+    /// The model every agent is built on; see `Config::llm_model`. Named
+    /// once here rather than in each builder, so changing the provider is
+    /// a change of `.env`.
+    pub model: String,
     /// See `Config::flight_model`.
     pub flight_model: String,
     pub kagi: KagiClient,
@@ -287,12 +294,13 @@ const CONTINUES_BUDGET: std::time::Duration = std::time::Duration::from_secs(30)
 /// request? Errors should be treated as "new" by the caller (fresh session
 /// is the safe default).
 pub async fn continues_previous(
-    llm: &LlmClient,
+    d: &AgentDeps,
     previous_excerpt: &str,
     new_message: &str,
 ) -> Result<bool> {
-    let agent = llm
-        .agent(MODEL)
+    let agent = d
+        .llm
+        .agent(&d.model)
         .preamble(
             "You judge whether a new chat message continues the previous \
              conversation or starts an unrelated new request. Reply with \
@@ -321,9 +329,10 @@ const TITLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// timeout of its own (see [`llm_client`]), and this call sits under an HTTP
 /// handler rather than under the run loop, whose `STREAM_STALL` guard is the
 /// only other thing that would cut a hung connection loose.
-pub async fn title_for(llm: &LlmClient, transcript: &str) -> Result<String> {
-    let agent = llm
-        .agent(MODEL)
+pub async fn title_for(d: &AgentDeps, transcript: &str) -> Result<String> {
+    let agent = d
+        .llm
+        .agent(&d.model)
         .preamble(
             "You name chat threads. Reply with a title of at most five words \
              in the language of the conversation, no quotes, no trailing \
@@ -580,7 +589,7 @@ pub fn wrap_up_agent(
     facts: &[(String, String)],
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     d.llm
-        .agent(MODEL)
+        .agent(&d.model)
         .preamble(&preamble_with_profile(facts, &available_tools(d)))
         .default_max_turns(1)
         .build()
@@ -641,7 +650,7 @@ pub fn build_agent(
     let flights = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
     let mut builder = d
         .llm
-        .agent(MODEL)
+        .agent(&d.model)
         .preamble(&preamble_with_profile(facts, &available_tools(d)))
         .tool(WebSearchTool {
             kagi: d.kagi.clone(),

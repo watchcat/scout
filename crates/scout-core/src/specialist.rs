@@ -743,7 +743,7 @@ mod tests {
         // where the tool errors instead of reporting.
         use rig::client::CompletionClient;
         let llm = crate::agent::llm_client("k", "http://127.0.0.1:1").unwrap();
-        let agent = llm.agent(crate::agent::MODEL).preamble("test").default_max_turns(2).build();
+        let agent = llm.agent(crate::agent::DEFAULT_MODEL).preamble("test").default_max_turns(2).build();
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
         let tool = specialist(agent, events);
 

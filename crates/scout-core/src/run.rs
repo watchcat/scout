@@ -1019,7 +1019,9 @@ mod tests {
         let mut cfg = crate::config::Config::for_test(
             dir.path().join("run.duckdb").to_str().unwrap(),
         );
-        cfg.minimax_base_url = llm.uri();
+        cfg.llm_base_url = llm.uri();
+        // Not the default: what the config names is what every call must ask for.
+        cfg.llm_model = "the-configured-model".into();
         let mut core = Core::start(cfg, None).unwrap();
         let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
         core.deps.metrics = metrics;
@@ -1231,6 +1233,19 @@ mod tests {
         assert_eq!(counted(ran.metrics, "scout_provider_errors_total{provider=\"model\",kind=\"error\"}"), 1);
         assert_eq!(counted(ran.metrics, "scout_runs_total{outcome=\"failed\"}"), 1);
         assert_eq!(counted(ran.metrics, "scout_run_duration_seconds_count"), 1);
+    }
+
+    #[tokio::test]
+    async fn every_model_call_asks_for_the_model_the_config_names() {
+        let llm = minimax(streamed_text(&["Lisbon in May is warm."]), None).await;
+        let ran = a_run_against(&llm).await;
+        assert!(ran.outcome.is_ok());
+        let bodies: Vec<String> =
+            llm.received_requests().await.unwrap().iter().map(|r| String::from_utf8_lossy(&r.body).to_string()).collect();
+        assert!(!bodies.is_empty());
+        for body in &bodies {
+            assert!(body.contains("\"model\":\"the-configured-model\""), "a call asked for another model: {body}");
+        }
     }
 
     #[tokio::test]

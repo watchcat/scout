@@ -9,17 +9,23 @@ pub struct Config {
     /// only their own. Defaults to the first id in the allowlist, which is
     /// whoever set the bot up; `SCOUT_ADMIN_USER_IDS` overrides that.
     pub admin_user_ids: HashSet<i64>,
-    pub minimax_api_key: String,
-    /// Where the OpenAI-shaped model API lives. Configurable because a
-    /// self-hoster may front MiniMax with a proxy of their own — a gateway
-    /// that meters spend, or an in-house deployment — and because the
-    /// tests need an address that refuses instead of one that answers:
-    /// `for_test` points it at a closed port so no packet leaves the
-    /// machine. Defaults to MiniMax itself.
-    pub minimax_base_url: String,
-    /// The model the flight specialist runs on. Defaults to the main
-    /// model; a separate name is how a cheaper or sharper model gets tried
-    /// on flights alone.
+    /// The model provider, as three settings, so a second provider is a
+    /// change of `.env` and not of code: any OpenAI-shaped chat API. The
+    /// key, `LLM_API_KEY`; the older `MINIMAX_API_KEY` is read when it is
+    /// unset, so a deployment that never changed its `.env` keeps working.
+    pub llm_api_key: String,
+    /// Where that API lives, `LLM_BASE_URL` (or `MINIMAX_BASE_URL`).
+    /// Configurable because a self-hoster may front the provider with a
+    /// proxy of their own — a gateway that meters spend, or an in-house
+    /// deployment — and because the tests need an address that refuses
+    /// instead of one that answers: `for_test` points it at a closed port
+    /// so no packet leaves the machine. Defaults to MiniMax itself.
+    pub llm_base_url: String,
+    /// The model every agent runs on, `LLM_MODEL`. Defaults to MiniMax M3.
+    pub llm_model: String,
+    /// The model the flight specialist runs on. Defaults to `llm_model`; a
+    /// separate name is how a cheaper or sharper model gets tried on
+    /// flights alone.
     pub flight_model: String,
     pub kagi_api_key: String,
     /// Perplexity Search API key; without it search runs on Kagi alone.
@@ -108,7 +114,7 @@ impl Config {
                 "TELEGRAM_BOT_TOKEN" => Some("tok".to_string()),
                 "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
                 "MINIMAX_API_KEY" => Some("mk".to_string()),
-                "MINIMAX_BASE_URL" => Some(base.minimax_base_url.clone()),
+                "MINIMAX_BASE_URL" => Some(base.llm_base_url.clone()),
                 "NOMINATIM_BASE_URL" => Some(base.nominatim_base_url.clone()),
                 "KAGI_API_KEY" => Some("kk".to_string()),
                 "SCOUT_DB_PATH" => Some(db_path.to_string()),
@@ -204,14 +210,23 @@ impl Config {
             None => 20,
         };
 
+        // The new name first, the MiniMax name after it, so both spellings
+        // of a deployment's `.env` read the same provider.
+        let either = |new: &str, old: &str| non_empty(new).or_else(|| non_empty(old));
+        let llm_api_key = either("LLM_API_KEY", "MINIMAX_API_KEY")
+            .with_context(|| "missing required env var LLM_API_KEY (MINIMAX_API_KEY is read too)")?;
+        let llm_base_url = either("LLM_BASE_URL", "MINIMAX_BASE_URL")
+            .unwrap_or_else(|| crate::agent::DEFAULT_BASE_URL.to_string());
+        let llm_model = non_empty("LLM_MODEL").unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());
+
         Ok(Self {
             telegram_bot_token: required("TELEGRAM_BOT_TOKEN")?,
             allowed_user_ids,
             admin_user_ids,
-            minimax_api_key: required("MINIMAX_API_KEY")?,
-            minimax_base_url: non_empty("MINIMAX_BASE_URL")
-                .unwrap_or_else(|| crate::agent::MINIMAX_BASE_URL.to_string()),
-            flight_model: non_empty("FLIGHT_MODEL").unwrap_or_else(|| crate::agent::MODEL.to_string()),
+            flight_model: non_empty("FLIGHT_MODEL").unwrap_or_else(|| llm_model.clone()),
+            llm_api_key,
+            llm_base_url,
+            llm_model,
             kagi_api_key: required("KAGI_API_KEY")?,
             perplexity_api_key: non_empty("PERPLEXITY_API_KEY"),
             db_path: get("SCOUT_DB_PATH").unwrap_or_else(|| "scout.duckdb".to_string()),
@@ -277,14 +292,42 @@ mod tests {
 
     #[test]
     fn the_flight_agent_runs_on_the_main_model_unless_told_otherwise() {
-        assert_eq!(load(&base_env()).unwrap().flight_model, crate::agent::MODEL);
+        assert_eq!(load(&base_env()).unwrap().flight_model, crate::agent::DEFAULT_MODEL);
 
         let mut env = base_env();
         env.insert("FLIGHT_MODEL", "some-other-model");
         assert_eq!(load(&env).unwrap().flight_model, "some-other-model");
 
         env.insert("FLIGHT_MODEL", " ");
-        assert_eq!(load(&env).unwrap().flight_model, crate::agent::MODEL);
+        assert_eq!(load(&env).unwrap().flight_model, crate::agent::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn the_provider_is_three_settings_and_the_minimax_names_still_read() {
+        let cfg = load(&base_env()).unwrap();
+        assert_eq!(cfg.llm_api_key, "mk", "MINIMAX_API_KEY is read when LLM_API_KEY is unset");
+        assert_eq!(cfg.llm_base_url, crate::agent::DEFAULT_BASE_URL);
+        assert_eq!(cfg.llm_model, crate::agent::DEFAULT_MODEL);
+
+        let mut env = base_env();
+        env.insert("LLM_API_KEY", "lk");
+        env.insert("LLM_BASE_URL", "https://llm.example/v1");
+        env.insert("LLM_MODEL", "other-model");
+        env.insert("MINIMAX_BASE_URL", "https://proxy.example/v1");
+        let cfg = load(&env).unwrap();
+        assert_eq!(
+            (cfg.llm_api_key.as_str(), cfg.llm_base_url.as_str(), cfg.llm_model.as_str()),
+            ("lk", "https://llm.example/v1", "other-model"),
+            "the LLM_ names win where both are set"
+        );
+        assert_eq!(cfg.flight_model, "other-model", "the flight desk follows the main model");
+
+        let mut env = base_env();
+        env.remove("MINIMAX_API_KEY");
+        let err = load(&env).expect_err("no key under either name");
+        assert!(err.to_string().contains("LLM_API_KEY"), "{err}");
+        env.insert("LLM_API_KEY", "lk");
+        assert_eq!(load(&env).unwrap().llm_api_key, "lk");
     }
 
     #[test]
@@ -334,20 +377,20 @@ mod tests {
     #[test]
     fn the_model_endpoint_defaults_to_minimax_and_can_be_pointed_elsewhere() {
         assert_eq!(
-            load(&base_env()).unwrap().minimax_base_url,
-            crate::agent::MINIMAX_BASE_URL
+            load(&base_env()).unwrap().llm_base_url,
+            crate::agent::DEFAULT_BASE_URL
         );
 
         let mut env = base_env();
         env.insert("MINIMAX_BASE_URL", "http://127.0.0.1:1");
-        assert_eq!(load(&env).unwrap().minimax_base_url, "http://127.0.0.1:1");
+        assert_eq!(load(&env).unwrap().llm_base_url, "http://127.0.0.1:1");
 
         // Blank counts as unset, like every other optional here — an empty
         // line in a .env must not point the agent at nowhere.
         env.insert("MINIMAX_BASE_URL", "  ");
         assert_eq!(
-            load(&env).unwrap().minimax_base_url,
-            crate::agent::MINIMAX_BASE_URL
+            load(&env).unwrap().llm_base_url,
+            crate::agent::DEFAULT_BASE_URL
         );
     }
 

@@ -411,9 +411,10 @@ compiles from source.
 | `ALLOWED_TELEGRAM_USER_IDS` | **yes** | — | comma-separated numeric ids |
 | `SCOUT_ADMIN_USER_IDS` | no | first allowed id | who sees everyone's numbers in `/stat` and may run `/advert`, `/invite` and `/kick`; everyone else sees only their own |
 | `INVITE_DAILY_REQUESTS` | no | `20` | messages per day for someone admitted through `/invite`. Founders are exempt |
-| `MINIMAX_API_KEY` | **yes** | — | the LLM |
-| `MINIMAX_BASE_URL` | no | `https://api.minimax.io/v1` | where the OpenAI-shaped model API lives; point it at a proxy of your own |
-| `FLIGHT_MODEL` | no | the main model | the model the flight agent runs on |
+| `LLM_API_KEY` | **yes** | — | the model provider's key. `MINIMAX_API_KEY` is still read when this is unset |
+| `LLM_BASE_URL` | no | `https://api.minimax.io/v1` | where the OpenAI-shaped chat API lives: another provider, or a proxy of your own. `MINIMAX_BASE_URL` is still read |
+| `LLM_MODEL` | no | `minimax-m3` | the model every agent runs on |
+| `FLIGHT_MODEL` | no | `LLM_MODEL` | the model the flight agent runs on |
 | `KAGI_API_KEY` | **yes** | — | search: small-retailer coverage, `site:` scoping |
 | `PERPLEXITY_API_KEY` | no | — | second engine, merged with Kagi; carries the multi-language fan-out cheaply |
 | `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` | no | — | eBay Browse API: live prices, condition, shipping |

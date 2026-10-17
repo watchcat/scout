@@ -697,13 +697,18 @@ impl Core {
     /// One statement over all of them rather than a loop: there is no
     /// per-account pass in this loop to hang it off, and the condition is
     /// the same for everyone.
+    async fn sweep_empty_drafts(&self) -> anyhow::Result<usize> {
+        let store = self.store();
+        blocking(move || store.sweep_all_empty_drafts()).await
+    }
+
     /// How long a request_log row is kept: a year and a bit, the longest
     /// window `/stat` is asked for with room to set a month against the
     /// same month last year. The daily cap reads today alone.
     const REQUEST_LOG_KEEP_DAYS: i64 = 400;
 
     async fn prune_request_log(&self) -> anyhow::Result<usize> {
-        let store = self.deps.store.clone();
+        let store = self.store();
         blocking(move || store.prune_request_log(Self::REQUEST_LOG_KEEP_DAYS)).await
     }
 
@@ -713,13 +718,8 @@ impl Core {
     const OUTBOX_KEEP_DAYS: i64 = 90;
 
     async fn prune_outbox(&self) -> anyhow::Result<usize> {
-        let store = self.deps.store.clone();
-        blocking(move || store.prune_outbox(Self::OUTBOX_KEEP_DAYS)).await
-    }
-
-    async fn sweep_empty_drafts(&self) -> anyhow::Result<usize> {
         let store = self.store();
-        blocking(move || store.sweep_all_empty_drafts()).await
+        blocking(move || store.prune_outbox(Self::OUTBOX_KEEP_DAYS)).await
     }
 
     /// Drops the attachments no mail and no trip can reach any more.
@@ -1044,12 +1044,13 @@ mod tests {
     #[test]
     fn maintenance_prunes_the_request_log_and_the_outbox() {
         // Both tables only ever grew; the loop is the one place anything
-        // deletes from them, so this is what keeps a `cargo update` from
-        // quietly dropping the calls.
+        // deletes from them, so this is what keeps a refactor from quietly
+        // dropping the calls. Scoped above the test module, which contains
+        // the names being searched for.
         let src = include_str!("core.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         assert!(src.contains("prune_request_log(Self::REQUEST_LOG_KEEP_DAYS)"), "the request log must be pruned in maintenance");
         assert!(src.contains("prune_outbox(Self::OUTBOX_KEEP_DAYS)"), "the outbox must be pruned in maintenance");
-        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
         let body = &src[start..];
         let backup = body.find("backup::is_due").expect("the backup check must exist");

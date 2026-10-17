@@ -395,7 +395,7 @@ You need four things:
 1. A bot token from [@BotFather](https://t.me/BotFather)
 2. Your numeric Telegram id from [@userinfobot](https://t.me/userinfobot) —
    Scout only answers people on the allowlist
-3. A [MiniMax API key](https://www.minimax.io) (the LLM)
+3. A key for an OpenAI-shaped chat API — [MiniMax](https://www.minimax.io) by default; see the `LLM_*` variables
 4. A [Kagi API key](https://kagi.com/settings?p=api) (search, paid)
 
 Everything else is optional and makes Scout better as you add it.
@@ -667,7 +667,7 @@ of JavaScript in the browser client.
   database file and one API budget. Rounds bound how many people there are
   and the daily cap bounds each of them; neither bounds what a single
   question can cost.
-- **Costs real money.** Kagi bills per query, MiniMax per token, and each
+- **Costs real money.** Kagi bills per query, the model provider per token, and each
   flight search is billed by whichever provider answered it. Budgets are
   capped per request: 15 search queries, 5 page opens, 20 model turns, and
   flight searches that start at 4 and grow with what you actually asked for —

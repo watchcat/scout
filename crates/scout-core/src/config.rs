@@ -214,7 +214,7 @@ impl Config {
         // of a deployment's `.env` read the same provider.
         let either = |new: &str, old: &str| non_empty(new).or_else(|| non_empty(old));
         let llm_api_key = either("LLM_API_KEY", "MINIMAX_API_KEY")
-            .with_context(|| "missing required env var LLM_API_KEY (MINIMAX_API_KEY is read too)")?;
+            .context("missing required env var LLM_API_KEY (MINIMAX_API_KEY is read too)")?;
         let llm_base_url = either("LLM_BASE_URL", "MINIMAX_BASE_URL")
             .unwrap_or_else(|| crate::agent::DEFAULT_BASE_URL.to_string());
         let llm_model = non_empty("LLM_MODEL").unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());

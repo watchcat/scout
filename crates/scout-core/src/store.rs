@@ -1919,6 +1919,12 @@ fn backup_connection(conn: &Connection, path: &Path) -> Result<()> {
 /// unmergeable: signing in by email mints a fresh account, which immediately
 /// takes a seat, and that seat would then be the proof it could never be
 /// merged away.
+///
+/// `request_log` rows are pruned after `Core::REQUEST_LOG_KEEP_DAYS`, so an
+/// account whose only trace is requests older than that reads empty here
+/// and may be merged away — losing nothing its owner made, since the other
+/// tables are what hold that, and only on the word of whoever proves its
+/// identity.
 fn is_empty_account(conn: &Connection, account_id: i64) -> Result<bool> {
     // Six `?` rather than a repeated `?1`: DuckDB's own placeholder styles
     // are `?` and `$n`, and mixing them is how this reads wrong later.
@@ -2967,7 +2973,11 @@ impl Store {
     ///
     /// `delivered` is how a channel records a turn it has already shown the
     /// reader: the row is inserted with `sent_at` set, so it occupies the
-    /// key and is never dispatched.
+    /// key and is never dispatched. Recorded again — the channel writes
+    /// its last turns on every answer — a marker is dated afresh, so a
+    /// thread the channel still answers in keeps its markers past
+    /// `prune_outbox`'s horizon, and only a thread it has not answered in
+    /// for that long can lose them.
     ///
     /// Keyed by channel as well as account and turn. Without it, the first
     /// day a second channel exists, queueing a turn for it returns `false`
@@ -2994,6 +3004,13 @@ impl Store {
             |r| r.get(0),
         )?;
         if known > 0 {
+            if delivered {
+                conn.execute(
+                    "UPDATE outbox SET sent_at = now()
+                     WHERE account_id = ? AND channel = ? AND turn_key = ? AND sent_at IS NOT NULL",
+                    params![account_id, channel, turn_key],
+                )?;
+            }
             return Ok(false);
         }
         // `now()` in the statement rather than a bound timestamp: `duckdb`
@@ -3047,9 +3064,10 @@ impl Store {
     /// so the caller can say out loud when one is given up on.
     ///
     /// At [`MIRROR_ATTEMPTS`] the row stops being returned by
-    /// `pending_mirror` and there is no way back: its `turn_key` is still
-    /// occupied, so re-enqueueing it is a no-op and toggling the mirror off
-    /// and on will not recover it. That is a thing a human should be able
+    /// `pending_mirror`, and its `turn_key` stays occupied, so re-enqueueing
+    /// it is a no-op and toggling the mirror off and on will not recover it
+    /// — until `prune_outbox` drops the row, months on, and the key is free
+    /// for a backfill to try again. That is a thing a human should be able
     /// to find in a log afterwards.
     pub fn mark_mirror_failed(&self, id: i64) -> Result<i64> {
         let conn = self.conn();
@@ -3361,10 +3379,13 @@ impl Store {
     ///
     /// Sent rows include the ones a channel wrote as already delivered,
     /// which are what stop a backfill echoing a turn Telegram showed
-    /// itself. A backfill reaches only a thread's last turns, and a thread
-    /// expires in two days unless pinned, so with a horizon of months the
-    /// one thing that can be echoed is the tail of a pinned thread idle
-    /// that long and then mirrored afresh — once.
+    /// itself. Those are dated afresh each time the channel records them
+    /// (`enqueue_mirror`), a backfill reaches only a thread's last turns,
+    /// and a thread expires in two days unless pinned — so with a horizon
+    /// of months the one thing that can be echoed is the tail of a pinned
+    /// thread Telegram has not answered in for that long, mirrored afresh:
+    /// once. A row out of attempts frees its key the same way, and a later
+    /// backfill may try that turn again.
     pub fn prune_outbox(&self, keep_days: i64) -> Result<usize> {
         let conn = self.conn();
         let cutoff = minutes_ago(keep_days * 1440);
@@ -7519,25 +7540,43 @@ CREATE TABLE segment_candidates (
         let left: i64 = s.conn().query_row("SELECT count(*) FROM request_log WHERE account_id = 1", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 2, "a row inside the year and today's stay");
         assert_eq!(s.requests_today(1).unwrap(), 1, "the daily cap still counts today");
+        let year: Vec<i64> = s.usage_stats_for(&minutes_ago(365 * 1440), 1).unwrap().into_iter().map(|(_, _, n)| n).collect();
+        assert_eq!(year.iter().sum::<i64>(), 2, "/stat over a year sees both");
         assert_eq!(s.prune_request_log(400).unwrap(), 0, "nothing to do twice");
+    }
+
+    #[test]
+    fn an_account_whose_only_trace_is_old_requests_reads_empty_once_they_are_pruned() {
+        // The merge rule counts request rows as "this account was used";
+        // pruning moves that line, and a test says so rather than letting
+        // the predicate change under it.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(1).unwrap();
+        s.log_request_at(a, "text", &minutes_ago(500 * 1440)).unwrap();
+        assert!(!is_empty_account(&s.conn(), a).unwrap());
+        s.prune_request_log(400).unwrap();
+        assert!(is_empty_account(&s.conn(), a).unwrap());
     }
 
     #[test]
     fn the_outbox_keeps_what_is_still_waiting_and_drops_what_was_sent_or_given_up_long_ago() {
         let (s, _d) = test_store();
         let a = s.account_for_telegram(1).unwrap();
-        for key in ["sent-old", "sent-new", "dead-old", "waiting-old", "shown-old"] {
-            // `shown-old` is a row a channel wrote as already delivered.
-            assert!(s.enqueue_mirror(a, "telegram", "12345", "hello", key, key == "shown-old").unwrap());
+        for key in ["sent-old", "sent-new", "dead-old", "dead-new", "waiting-old", "shown-old", "shown-again"] {
+            // `shown-*` are rows a channel wrote as already delivered.
+            assert!(s.enqueue_mirror(a, "telegram", "12345", "hello", key, key.starts_with("shown")).unwrap());
         }
         let old = minutes_ago(100 * 1440);
         {
             let conn = s.conn();
             conn.execute("UPDATE outbox SET created_at = CAST(? AS TIMESTAMP) WHERE turn_key LIKE '%-old'", params![old]).unwrap();
-            conn.execute("UPDATE outbox SET sent_at = CAST(? AS TIMESTAMP) WHERE turn_key IN ('sent-old', 'shown-old')", params![old]).unwrap();
+            conn.execute("UPDATE outbox SET sent_at = CAST(? AS TIMESTAMP) WHERE turn_key IN ('sent-old', 'shown-old', 'shown-again')", params![old]).unwrap();
             conn.execute("UPDATE outbox SET sent_at = now() WHERE turn_key = 'sent-new'", []).unwrap();
-            conn.execute("UPDATE outbox SET attempts = ? WHERE turn_key = 'dead-old'", params![MIRROR_ATTEMPTS]).unwrap();
+            conn.execute("UPDATE outbox SET attempts = ? WHERE turn_key IN ('dead-old', 'dead-new')", params![MIRROR_ATTEMPTS]).unwrap();
         }
+        // The channel records its last turns on every answer: a marker
+        // recorded again is dated afresh, and outlives the horizon.
+        assert!(!s.enqueue_mirror(a, "telegram", "12345", "hello", "shown-again", true).unwrap());
 
         assert_eq!(s.prune_outbox(90).unwrap(), 3, "sent-old, shown-old and dead-old");
 
@@ -7546,7 +7585,11 @@ CREATE TABLE segment_candidates (
             let mut stmt = conn.prepare("SELECT turn_key FROM outbox ORDER BY turn_key").unwrap();
             stmt.query_map([], |r| r.get(0)).unwrap().collect::<duckdb::Result<_>>().unwrap()
         };
-        assert_eq!(left, ["sent-new", "waiting-old"], "a row sent lately, and one still waiting however old");
+        assert_eq!(
+            left,
+            ["dead-new", "sent-new", "shown-again", "waiting-old"],
+            "a row sent or given up on lately, a marker recorded again, and one still waiting however old"
+        );
     }
 
     #[test]

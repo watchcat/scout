@@ -249,24 +249,36 @@ pub const SIDE_EXTRACT: &str = "extract";
 pub const SIDE_PHOTO: &str = "photo";
 pub const SIDE_PAGE: &str = "page";
 
-/// One tool-less side call, bounded by `budget`, timed and counted under
-/// `call` for the trial of a second provider: `/metrics` carries its
-/// tokens (reasoning apart), its time and how it ended, by model, so two
-/// providers' numbers sit beside each other. The agent is the caller's —
-/// each has its own preamble — but it must be built on `d.side`.
+/// One tool-less side call: `preamble` and `prompt` to the side model,
+/// bounded by `budget`, timed and counted under `call` for the trial of
+/// a second provider — `/metrics` carries its tokens (reasoning apart),
+/// its time and how it ended, by model, so two providers' numbers sit
+/// beside each other. The agent is built here, on `d.side`, so no site
+/// can drift back to the main model and have its numbers counted under
+/// the other's name. The answer comes back with its reasoning stripped;
+/// one that was all reasoning — the pattern `text.rs` describes — ends as
+/// `empty`, not `ok`: a model that thinks and says nothing answered in
+/// budget and failed the call, and the trial has to see that.
 pub(crate) async fn side_call(
     d: &AgentDeps,
     call: &'static str,
     budget: std::time::Duration,
-    agent: &rig::agent::Agent<openai::completion::CompletionModel>,
+    preamble: &str,
     prompt: impl Into<rig::completion::Message> + Send,
 ) -> Result<String> {
+    use rig::client::CompletionClient;
     use rig::completion::Prompt;
+    let agent = d.side.llm.agent(&d.side.name).preamble(preamble).build();
     let started = std::time::Instant::now();
     let (outcome, result) = match tokio::time::timeout(budget, agent.prompt(prompt).extended_details()).await {
         Ok(Ok(response)) => {
             d.metrics.side_call_tokens(call, &d.side.name, response.usage);
-            ("ok", Ok(response.output))
+            let text = crate::text::strip_thinking(&response.output);
+            if text.trim().is_empty() {
+                ("empty", Err(anyhow::anyhow!("the model answered with nothing besides thinking")))
+            } else {
+                ("ok", Ok(text))
+            }
         }
         Ok(Err(e)) => ("failed", Err(e.into())),
         Err(_) => ("timeout", Err(anyhow::anyhow!("the model did not answer in time"))),
@@ -341,22 +353,14 @@ pub async fn continues_previous(
     previous_excerpt: &str,
     new_message: &str,
 ) -> Result<bool> {
-    let agent = d
-        .side
-        .llm
-        .agent(&d.side.name)
-        .preamble(
-            "You judge whether a new chat message continues the previous \
-             conversation or starts an unrelated new request. Reply with \
-             exactly one word: CONTINUE or NEW.",
-        )
-        .build();
+    let preamble = "You judge whether a new chat message continues the previous \
+                    conversation or starts an unrelated new request. Reply with \
+                    exactly one word: CONTINUE or NEW.";
     let question = format!(
         "Previous conversation (latest excerpts):\n{previous_excerpt}\n\n\
          New message:\n{new_message}\n\nCONTINUE or NEW?"
     );
-    let answer = side_call(d, SIDE_CONTINUATION, CONTINUES_BUDGET, &agent, question).await?;
-    let verdict = crate::text::strip_thinking(&answer);
+    let verdict = side_call(d, SIDE_CONTINUATION, CONTINUES_BUDGET, preamble, question).await?;
     Ok(verdict.to_uppercase().contains("CONTINUE"))
 }
 
@@ -372,19 +376,12 @@ const TITLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// handler rather than under the run loop, whose `STREAM_STALL` guard is the
 /// only other thing that would cut a hung connection loose.
 pub async fn title_for(d: &AgentDeps, transcript: &str) -> Result<String> {
-    let agent = d
-        .side
-        .llm
-        .agent(&d.side.name)
-        .preamble(
-            "You name chat threads. Reply with a title of at most five words \
-             in the language of the conversation, no quotes, no trailing \
-             punctuation, nothing else.",
-        )
-        .build();
+    let preamble = "You name chat threads. Reply with a title of at most five words \
+                    in the language of the conversation, no quotes, no trailing \
+                    punctuation, nothing else.";
     let question = format!("Conversation:\n{transcript}\n\nTitle:");
-    let answer = side_call(d, SIDE_TITLE, TITLE_BUDGET, &agent, question).await?;
-    Ok(crate::text::strip_thinking(&answer))
+    let answer = side_call(d, SIDE_TITLE, TITLE_BUDGET, preamble, question).await?;
+    Ok(answer)
 }
 
 /// Cap on injected profile facts, bounding prompt growth.
@@ -753,7 +750,46 @@ mod tests {
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
         let start = src.find("pub async fn continues_previous").expect("continues_previous must exist");
         let body = &src[start..start + src[start..].find("\n}\n").expect("the function ends")];
-        assert!(body.contains("CONTINUES_BUDGET, &agent"), "the continuation check must carry its own budget");
+        assert!(body.contains("CONTINUES_BUDGET, preamble"), "the continuation check must carry its own budget");
+    }
+
+    #[test]
+    fn every_side_call_is_built_on_the_side_model_and_nowhere_else() {
+        // `side_call` builds the agent itself, so a site can only reach the
+        // main model by building its own — which is what this looks for,
+        // in the files whose model calls are side calls.
+        for (name, src) in [("vision.rs", include_str!("vision.rs")), ("inbox.rs", include_str!("inbox.rs"))] {
+            let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+            for forbidden in ["d.llm", "deps.llm", "d.model", "deps.model", ".agent("] {
+                assert!(!src.contains(forbidden), "{name} reaches a model past side_call: {forbidden}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_was_all_reasoning_is_empty_not_ok() {
+        use wiremock::matchers::{method, path};
+        let side = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "s2", "model": "m",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "<think>naming it, naming it</think>"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16},
+            })))
+            .mount(&side).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::for_test(dir.path().join("side.duckdb").to_str().unwrap());
+        cfg.side_llm = Some(crate::config::SideLlm { api_key: "sk".into(), base_url: side.uri(), model: "thinker".into() });
+        let mut core = crate::core::Core::start(cfg, None).unwrap();
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        core.deps.metrics = metrics;
+
+        let err = title_for(&core.deps, "me: beans").await.unwrap_err();
+
+        assert!(err.to_string().contains("nothing besides thinking"), "{err}");
+        let page = metrics.render();
+        assert!(page.contains("scout_side_calls_total{call=\"title\",model=\"thinker\",outcome=\"empty\"} 1\n"), "{page}");
+        assert!(page.contains("scout_side_call_tokens_total{call=\"title\",model=\"thinker\",kind=\"output\"} 9\n"), "paid for all the same: {page}");
     }
 
     /// A model stand-in that answers every completion with `answer` and
@@ -1078,16 +1114,14 @@ mod tests {
 
     #[test]
     fn the_call_that_names_a_thread_is_bounded_in_time() {
-        // No model is reachable in a test, so the budget is asserted from
-        // the source. `title_for` runs under an HTTP handler, outside the
-        // run loop's stall guard, and rig's client has no timeout — without
-        // this the request hangs as long as the connection does. Bounded to
-        // the function's own body, so a `timeout(TITLE_BUDGET` anywhere
-        // else in the file cannot stand in for it.
+        // A source assertion, since the call cannot be entered without a
+        // model. The budget is the one `side_call` is handed, and the
+        // check is scoped to the function's own body, so a `TITLE_BUDGET`
+        // anywhere else cannot stand in for it.
         let src = include_str!("agent.rs");
         let start = src.find("pub async fn title_for").expect("title_for must exist");
         let end = src[start..].find("\n}").expect("title_for must end") + start;
         let body = &src[start..end];
-        assert!(body.contains("TITLE_BUDGET, &agent"), "the title call must carry its own budget");
+        assert!(body.contains("TITLE_BUDGET, preamble"), "the title call must carry its own budget");
     }
 }

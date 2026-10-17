@@ -1,8 +1,6 @@
 use crate::agent::{side_call, AgentDeps, SIDE_PAGE, SIDE_PHOTO};
-use crate::text::strip_thinking;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use base64::prelude::{Engine, BASE64_STANDARD};
-use rig::client::CompletionClient;
 use rig::completion::message::Image;
 use rig::message::{DocumentSourceKind, ImageDetail, ImageMediaType};
 
@@ -26,7 +24,6 @@ pub async fn describe_photo(
     if let Some(c) = caption.map(str::trim).filter(|c| !c.is_empty()) {
         preamble.push_str(&format!("\nUser note about this photo: {c}"));
     }
-    let agent = d.side.llm.agent(&d.side.name).preamble(&preamble).build();
     let image = Image {
         data: DocumentSourceKind::base64(&BASE64_STANDARD.encode(image_jpeg)),
         media_type: Some(ImageMediaType::JPEG),
@@ -35,11 +32,9 @@ pub async fn describe_photo(
         detail: Some(ImageDetail::High),
         ..Default::default()
     };
-    let draft = strip_thinking(&side_call(d, SIDE_PHOTO, PHOTO_BUDGET, &agent, image).await?);
-    if draft.is_empty() {
-        bail!("vision model returned no description besides thinking output");
-    }
-    Ok(draft)
+    // An answer that was all reasoning is `side_call`'s error, and its
+    // `empty` on the page.
+    side_call(d, SIDE_PHOTO, PHOTO_BUDGET, &preamble, image).await
 }
 
 const TRANSCRIBE_PREAMBLE: &str = "\
@@ -60,7 +55,6 @@ pub const PAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 /// shapes, or scanned — so what comes back is handed to the same extractor
 /// a text PDF's words are. `page_jpeg` is a JPEG of the page.
 pub async fn transcribe_page(d: &AgentDeps, page_jpeg: &[u8]) -> Result<String> {
-    let agent = d.side.llm.agent(&d.side.name).preamble(TRANSCRIBE_PREAMBLE).build();
     let image = Image {
         data: DocumentSourceKind::base64(&BASE64_STANDARD.encode(page_jpeg)),
         media_type: Some(ImageMediaType::JPEG),
@@ -69,6 +63,6 @@ pub async fn transcribe_page(d: &AgentDeps, page_jpeg: &[u8]) -> Result<String> 
         detail: Some(ImageDetail::High),
         ..Default::default()
     };
-    let text = strip_thinking(&side_call(d, SIDE_PAGE, PAGE_BUDGET, &agent, image).await?);
+    let text = side_call(d, SIDE_PAGE, PAGE_BUDGET, TRANSCRIBE_PREAMBLE, image).await?;
     Ok(text.trim().to_string())
 }

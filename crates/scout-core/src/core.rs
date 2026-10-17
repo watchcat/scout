@@ -135,8 +135,15 @@ impl Core {
         // model a title came from.
         let side = match &cfg.side_llm {
             Some(s) => {
-                tracing::info!(model = %s.model, base_url = %s.base_url, "the side calls go to a second provider");
-                crate::agent::SideModel { llm: crate::agent::llm_client(&s.api_key, &s.base_url)?, name: s.model.clone() }
+                tracing::info!(model = %s.model, base_url = %s.base_url, "the side calls go to a second model");
+                // The same provider shares the main client's pool; another
+                // gets a client of its own.
+                let llm = if s.base_url == cfg.llm_base_url && s.api_key == cfg.llm_api_key {
+                    llm.clone()
+                } else {
+                    crate::agent::llm_client(&s.api_key, &s.base_url)?
+                };
+                crate::agent::SideModel { llm, name: s.model.clone() }
             }
             None => crate::agent::SideModel { llm: llm.clone(), name: cfg.llm_model.clone() },
         };

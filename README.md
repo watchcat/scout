@@ -683,6 +683,7 @@ of JavaScript in the browser client.
 cargo test --workspace      # 1004 tests across four crates, no network
 node --test 'crates/scout-web/src/*.test.mjs'  # the chat client's own tests
 cargo clippy --workspace --all-targets  # clean
+cargo sweep --maxsize 15000 # target/ back under 15 GB (it reached 50); the next build refills what it needs
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now
 scripts/deploy.sh           # compose: test, build, drain, hand over

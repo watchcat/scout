@@ -568,6 +568,22 @@ impl Core {
                 Err(e) => tracing::warn!(error = %e, "could not sweep the orphaned files"),
             }
 
+            // The two tables that only ever grew: a row per request, and a
+            // row per turn mirrored to Telegram. Neither is read far back —
+            // the daily cap reads today, `/stat` a window of days, a
+            // backfill a thread's last turns — so the rest goes, above the
+            // backup's continue like everything else here.
+            match self.prune_request_log().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(pruned = n, "request log rows past the year dropped"),
+                Err(e) => tracing::warn!(error = %e, "could not prune the request log"),
+            }
+            match self.prune_outbox().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(pruned = n, "outbox rows long sent or given up on dropped"),
+                Err(e) => tracing::warn!(error = %e, "could not prune the outbox"),
+            }
+
             // A draft made to hold a booking that then went somewhere else
             // belongs to no conversation, so the thread expiry above can
             // never reach it. `inbox::add_arrival` collects the one it just
@@ -680,6 +696,26 @@ impl Core {
     /// One statement over all of them rather than a loop: there is no
     /// per-account pass in this loop to hang it off, and the condition is
     /// the same for everyone.
+    /// How long a request_log row is kept: a year and a bit, the longest
+    /// window `/stat` is asked for with room to set a month against the
+    /// same month last year. The daily cap reads today alone.
+    const REQUEST_LOG_KEEP_DAYS: i64 = 400;
+
+    async fn prune_request_log(&self) -> anyhow::Result<usize> {
+        let store = self.deps.store.clone();
+        blocking(move || store.prune_request_log(Self::REQUEST_LOG_KEEP_DAYS)).await
+    }
+
+    /// How long a sent outbox row is kept. Months rather than days, because
+    /// a row a channel wrote as already shown is what keeps a backfill from
+    /// echoing that turn; see `Store::prune_outbox` for what that leaves.
+    const OUTBOX_KEEP_DAYS: i64 = 90;
+
+    async fn prune_outbox(&self) -> anyhow::Result<usize> {
+        let store = self.deps.store.clone();
+        blocking(move || store.prune_outbox(Self::OUTBOX_KEEP_DAYS)).await
+    }
+
     async fn sweep_empty_drafts(&self) -> anyhow::Result<usize> {
         let store = self.store();
         blocking(move || store.sweep_all_empty_drafts()).await
@@ -1002,6 +1038,24 @@ mod tests {
         let sweep = body.find("self.sweep_inbox()").expect("the sweep is never called from the loop");
         let backup = body.find("backup::is_due").expect("the backup check must exist");
         assert!(sweep < backup, "the sweep sits below the backup's continue and would run once a day");
+    }
+
+    #[test]
+    fn maintenance_prunes_the_request_log_and_the_outbox() {
+        // Both tables only ever grew; the loop is the one place anything
+        // deletes from them, so this is what keeps a `cargo update` from
+        // quietly dropping the calls.
+        let src = include_str!("core.rs");
+        assert!(src.contains("prune_request_log(Self::REQUEST_LOG_KEEP_DAYS)"), "the request log must be pruned in maintenance");
+        assert!(src.contains("prune_outbox(Self::OUTBOX_KEEP_DAYS)"), "the outbox must be pruned in maintenance");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
+        let body = &src[start..];
+        let backup = body.find("backup::is_due").expect("the backup check must exist");
+        for call in ["self.prune_request_log()", "self.prune_outbox()"] {
+            let at = body.find(call).unwrap_or_else(|| panic!("{call} is never called from the loop"));
+            assert!(at < backup, "{call} sits below the backup's continue and would run once a day");
+        }
     }
 
     #[test]

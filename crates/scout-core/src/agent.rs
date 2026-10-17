@@ -275,6 +275,13 @@ pub struct AgentDeps {
     pub metrics: &'static crate::metrics::Metrics,
 }
 
+/// How long the continuation check may take: the same 30 s as a title,
+/// and for the same reason — nothing else bounds it. This one runs on every
+/// Telegram message after ten quiet minutes, before any answer can start,
+/// so a hung connection here was a bot that never answered. The caller
+/// treats a miss as "new", which is the safe default anyway.
+const CONTINUES_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// One-shot classifier used when a chat resumes after the session TTL: does
 /// the new message continue the previous conversation, or start a new
 /// request? Errors should be treated as "new" by the caller (fresh session
@@ -296,7 +303,10 @@ pub async fn continues_previous(
         "Previous conversation (latest excerpts):\n{previous_excerpt}\n\n\
          New message:\n{new_message}\n\nCONTINUE or NEW?"
     );
-    let verdict = crate::text::strip_thinking(&rig::completion::Prompt::prompt(&agent, question).await?);
+    let answer = tokio::time::timeout(CONTINUES_BUDGET, rig::completion::Prompt::prompt(&agent, question))
+        .await
+        .map_err(|_| anyhow::anyhow!("the model did not answer in time"))??;
+    let verdict = crate::text::strip_thinking(&answer);
     Ok(verdict.to_uppercase().contains("CONTINUE"))
 }
 
@@ -683,6 +693,19 @@ pub fn build_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_continuation_check_has_its_own_budget() {
+        // As the title call has: a source assertion, since neither can be
+        // entered without a model. The check is scoped to the function's
+        // own body, so a `timeout(CONTINUES_BUDGET` anywhere else would
+        // not count.
+        let src = include_str!("agent.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let start = src.find("pub async fn continues_previous").expect("continues_previous must exist");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("the function ends")];
+        assert!(body.contains("timeout(CONTINUES_BUDGET"), "the continuation check must carry its own budget");
+    }
 
     #[test]
     fn every_conditional_rule_is_wired_up() {

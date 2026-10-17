@@ -3272,6 +3272,42 @@ impl Store {
         Ok(TokenOutcome::Valid { email, account_id, join })
     }
 
+    /// Drops `request_log` rows older than `keep_days`. Returns how many went.
+    ///
+    /// One row per request, and the table only ever grew. It is read by the
+    /// daily cap (today alone) and by `/stat` (a window of days the caller
+    /// names), so a year and a bit keeps every reading anyone asks for. The
+    /// cutoff is computed here rather than in SQL, as `prune_login_tokens`
+    /// does and for the reason it gives.
+    pub fn prune_request_log(&self, keep_days: i64) -> Result<usize> {
+        let conn = self.conn();
+        Ok(conn.execute(
+            "DELETE FROM request_log WHERE created_at < CAST(? AS TIMESTAMP)",
+            params![minutes_ago(keep_days * 1440)],
+        )?)
+    }
+
+    /// Drops outbox rows nothing will read again — sent, or out of attempts
+    /// — older than `keep_days`. A row still waiting its turn stays whatever
+    /// its age. Returns how many went.
+    ///
+    /// Sent rows include the ones a channel wrote as already delivered,
+    /// which are what stop a backfill echoing a turn Telegram showed
+    /// itself. A backfill reaches only a thread's last turns, and a thread
+    /// expires in two days unless pinned, so with a horizon of months the
+    /// one thing that can be echoed is the tail of a pinned thread idle
+    /// that long and then mirrored afresh — once.
+    pub fn prune_outbox(&self, keep_days: i64) -> Result<usize> {
+        let conn = self.conn();
+        let cutoff = minutes_ago(keep_days * 1440);
+        Ok(conn.execute(
+            "DELETE FROM outbox
+             WHERE (sent_at IS NOT NULL AND sent_at < CAST(? AS TIMESTAMP))
+                OR (sent_at IS NULL AND attempts >= ? AND created_at < CAST(? AS TIMESTAMP))",
+            params![cutoff, MIRROR_ATTEMPTS, cutoff],
+        )?)
+    }
+
     /// Drops login tokens that stopped being worth keeping, returning how
     /// many went. `keep_secs` is measured from a row's own expiry.
     ///
@@ -7401,6 +7437,48 @@ CREATE TABLE segment_candidates (
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
+    }
+
+    #[test]
+    fn old_request_log_rows_are_pruned_and_what_stat_and_the_cap_read_is_kept() {
+        let (s, _d) = test_store();
+        s.log_request_at(1, "text", &minutes_ago(500 * 1440)).unwrap();
+        s.log_request_at(1, "text", &minutes_ago(300 * 1440)).unwrap();
+        s.log_request(1, "text").unwrap();
+
+        assert_eq!(s.prune_request_log(400).unwrap(), 1);
+
+        let left: i64 = s.conn().query_row("SELECT count(*) FROM request_log WHERE account_id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 2, "a row inside the year and today's stay");
+        assert_eq!(s.requests_today(1).unwrap(), 1, "the daily cap still counts today");
+        assert_eq!(s.prune_request_log(400).unwrap(), 0, "nothing to do twice");
+    }
+
+    #[test]
+    fn the_outbox_keeps_what_is_still_waiting_and_drops_what_was_sent_or_given_up_long_ago() {
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(1).unwrap();
+        for key in ["sent-old", "sent-new", "dead-old", "waiting-old", "shown-old"] {
+            // `shown-old` is a row a channel wrote as already delivered.
+            assert!(s.enqueue_mirror(a, "telegram", "12345", "hello", key, key == "shown-old").unwrap());
+        }
+        let old = minutes_ago(100 * 1440);
+        {
+            let conn = s.conn();
+            conn.execute("UPDATE outbox SET created_at = CAST(? AS TIMESTAMP) WHERE turn_key LIKE '%-old'", params![old]).unwrap();
+            conn.execute("UPDATE outbox SET sent_at = CAST(? AS TIMESTAMP) WHERE turn_key IN ('sent-old', 'shown-old')", params![old]).unwrap();
+            conn.execute("UPDATE outbox SET sent_at = now() WHERE turn_key = 'sent-new'", []).unwrap();
+            conn.execute("UPDATE outbox SET attempts = ? WHERE turn_key = 'dead-old'", params![MIRROR_ATTEMPTS]).unwrap();
+        }
+
+        assert_eq!(s.prune_outbox(90).unwrap(), 3, "sent-old, shown-old and dead-old");
+
+        let left: Vec<String> = {
+            let conn = s.conn();
+            let mut stmt = conn.prepare("SELECT turn_key FROM outbox ORDER BY turn_key").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<duckdb::Result<_>>().unwrap()
+        };
+        assert_eq!(left, ["sent-new", "waiting-old"], "a row sent lately, and one still waiting however old");
     }
 
     #[test]

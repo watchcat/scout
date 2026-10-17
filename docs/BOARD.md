@@ -28,7 +28,7 @@ _(nothing)_
 - [ ] **Per-provider rate limiter** — retry covers a 429 after the fact; a token bucket per provider would avoid earning one
 
 ### Cost
-- [ ] **GPT-5.6 Luna trial** — postponed 2026-09-05. Roughly 30% cheaper than MiniMax M3 on list price, but reasoning tokens may eat it, and Luna needs the Responses API for tools + reasoning. Try it on the tool-less side calls first, once usage logging exists
+- [ ] **GPT-5.6 Luna trial** — postponed 2026-09-05. Roughly 30% cheaper than MiniMax M3 on list price, but reasoning tokens may eat it, and Luna needs the Responses API for tools + reasoning. Try it on the tool-less side calls first, once usage logging exists — Plumbing live 2026-10-17 (`d253bf1`): `SIDE_LLM_MODEL` / `SIDE_LLM_BASE_URL` / `SIDE_LLM_API_KEY` send the five tool-less side calls to a second model, each counted on `/metrics` by model (tokens with reasoning apart, ms, ok/empty/failed/timeout); `docs/2026-10-17-side-provider-trial.md` is the protocol. The trial itself needs the key and the exact model id in `.env`
 
 
 ### Hygiene

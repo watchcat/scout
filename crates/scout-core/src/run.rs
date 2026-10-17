@@ -239,9 +239,12 @@ async fn run_with(
                         }
                     }
                 }
+                // One provider call done, with what it cost. Counted here
+                // rather than from the final response's aggregate, so a run
+                // cut short — out of turns, stalled, over budget — is
+                // written as what it spent and not as free.
+                MultiTurnStreamItem::CompletionCall(call) => observer.add_usage(call.usage),
                 MultiTurnStreamItem::FinalResponse(res) => {
-                    // Aggregated by rig over every turn of the stream.
-                    observer.add_usage(res.usage());
                     final_response = Some(res);
                     return Ok(None);
                 }

@@ -9,7 +9,8 @@ be moved to the end. Two things turned out to be true instead.
 `agent::preamble_with_profile` writes the static rules first, then the
 user's facts, their search languages and shops, and the date — so the
 system prompt already has the longest shared prefix it can: every run on
-every account begins with the same several thousand tokens of rules.
+every account begins with the same several thousand tokens of rules (the
+same deployment's, since rules for tools it has no key for are left out).
 
 ## MiniMax does not cache a prefix
 

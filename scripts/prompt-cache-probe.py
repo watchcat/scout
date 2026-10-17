@@ -10,7 +10,7 @@ What to look for: a provider with a prefix cache reports most of the prompt
 as cached whenever the first thousands of tokens repeat, however the tail
 differs (rows A2, B2, C2). One that caches only exact repeats reports a hit
 on A3 and C3 alone. MiniMax M3, 2026-10-17: exact repeats only — 6000 of
-6001 on a repeat, 128 on every prefix match — so where per-user text sits in
+6001 on a repeat, about 128 on every prefix match — so where per-user text sits in
 the prompt changes nothing there (docs/2026-10-17-prompt-cache.md).
 """
 import json

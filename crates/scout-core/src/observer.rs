@@ -62,12 +62,13 @@ impl Observer {
     /// what "unknown" looks like in a sum.
     pub fn add_usage(&self, used: rig::completion::Usage) {
         let mut total = self.usage.lock().unwrap_or_else(|e| e.into_inner());
-        total.input_tokens += used.input_tokens;
-        total.output_tokens += used.output_tokens;
-        total.total_tokens += used.total_tokens;
-        total.cached_input_tokens += used.cached_input_tokens;
-        total.cache_creation_input_tokens += used.cache_creation_input_tokens;
-        total.reasoning_tokens += used.reasoning_tokens;
+        // Saturating: a provider's count is its word, not a fact.
+        total.input_tokens = total.input_tokens.saturating_add(used.input_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(used.output_tokens);
+        total.total_tokens = total.total_tokens.saturating_add(used.total_tokens);
+        total.cached_input_tokens = total.cached_input_tokens.saturating_add(used.cached_input_tokens);
+        total.cache_creation_input_tokens = total.cache_creation_input_tokens.saturating_add(used.cache_creation_input_tokens);
+        total.reasoning_tokens = total.reasoning_tokens.saturating_add(used.reasoning_tokens);
     }
 
     /// The run's tokens so far, in the store's shape.

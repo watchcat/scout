@@ -118,10 +118,12 @@ pub fn format_stats_with_tokens(
 }
 
 /// Model tokens, listed apart because the model bills for them and until
-/// now nobody knew what a run cost. Omitted when no run in the window
+/// now nobody knew what a run cost. Runs only: a thread's title, the
+/// continuation check, a mailed booking's reading and a photo's are model
+/// calls too, small and uncounted. Omitted when no run in the window
 /// reported any — a window of runs from before the counting, or none.
-/// The cache column is the part of input the provider served from its
-/// own cache: on a provider that does, the thing to watch.
+/// The header's cached figure is the part of input the provider served
+/// from its own cache: on a provider that does, the thing to watch.
 fn token_section(tokens: &BTreeMap<i64, crate::store::Tokens>, caller: i64, names: &BTreeMap<i64, String>) -> String {
     let mut users: Vec<(i64, crate::store::Tokens)> =
         tokens.iter().map(|(u, t)| (*u, *t)).filter(|(_, t)| t.input + t.output > 0).collect();
@@ -130,7 +132,7 @@ fn token_section(tokens: &BTreeMap<i64, crate::store::Tokens>, caller: i64, name
     }
     users.sort_by_key(|(user, t)| (std::cmp::Reverse(t.input + t.output), *user));
     let (input, cached, output) = users.iter().fold((0, 0, 0), |(i, c, o), (_, t)| (i + t.input, c + t.cached, o + t.output));
-    let mut out = format!("\n\nModel tokens: {} in ({} cached), {} out\n", compact(input), compact(cached), compact(output));
+    let mut out = format!("\n\nModel tokens, runs only: {} in ({} cached), {} out\n", compact(input), compact(cached), compact(output));
     for (user, t) in users {
         out.push_str(&format!(
             "{:<NAME_WIDTH$}  {user:>10}  {:>7} in  {:>7} out\n",
@@ -142,11 +144,12 @@ fn token_section(tokens: &BTreeMap<i64, crate::store::Tokens>, caller: i64, name
     out
 }
 
-/// `12.3k`, `1.2M`: a token count a phone can read in a column.
+/// `12k`, `1.2M`: a token count a phone can read in a column. The bands
+/// start where rounding lands, so 9,950 is `10k` and not `10.0k`.
 fn compact(n: i64) -> String {
     match n {
-        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
-        n if n >= 10_000 => format!("{}k", n / 1000),
+        n if n >= 999_950 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 9_950 => format!("{}k", (n + 500) / 1000),
         n if n >= 1_000 => format!("{:.1}k", n as f64 / 1e3),
         n => n.to_string(),
     }
@@ -196,12 +199,13 @@ mod token_tests {
         .into_iter()
         .collect();
         let out = token_section(&tokens, 1, &names);
-        assert!(out.starts_with("\n\nModel tokens: 1.2M in (4.0k cached), 1.6k out\n"), "{out}");
+        assert!(out.starts_with("\n\nModel tokens, runs only: 1.2M in (4.0k cached), 1.6k out\n"), "{out}");
         let lines: Vec<&str> = out.trim().lines().skip(1).collect();
         assert_eq!(lines.len(), 2, "an account with nothing counted is left out: {out}");
         assert!(lines[0].starts_with("Bob") && lines[0].contains("1.2M in") && lines[0].contains("98 out"), "the biggest first: {}", lines[0]);
         assert!(lines[1].starts_with("Alice (you)") && lines[1].contains("12k in") && lines[1].contains("1.5k out"), "{}", lines[1]);
         assert_eq!(token_section(&BTreeMap::new(), 1, &names), "");
+        assert_eq!([compact(9_950), compact(999_950), compact(1_249), compact(999)], ["10k", "1.0M", "1.2k", "999"]);
     }
 }
 

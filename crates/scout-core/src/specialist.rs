@@ -240,6 +240,8 @@ where
                 let mut repaired = false;
                 'pass: loop {
                 let mut stream = self.agent.stream_chat(prompt.as_str(), std::mem::take(&mut history)).await;
+                // Each pass gets its own `default_max_turns`, so the repair
+                // may make as many calls again; the one budget bounds both.
                 // When *this* stream last produced anything. The observer's
                 // pulse cannot answer that and must not be asked: it is the outer
                 // run's, touched below precisely so the parent counts this
@@ -247,7 +249,9 @@ where
                 // fresh while it burns the whole budget in silence. That is
                 // what a cut-short flight search cost in production — a
                 // hundred and twenty seconds indistinguishable from work.
-                let mut last_item = started;
+                // Per pass: a repair that inherited the clock pass one ran
+                // down would read as stalled at its first silent tick.
+                let mut last_item = tokio::time::Instant::now();
                 loop {
                     let next = loop {
                         match tokio::time::timeout(crate::run::STALL_CHECK, stream.next()).await {
@@ -302,9 +306,11 @@ where
                             collector.tool_finished(&internal_call_id, &text, &self.observer.events);
                             self.observer.tool_finished(&internal_call_id, &text);
                         }
+                        // One provider call done: the nested run's calls are
+                        // the parent run's cost, counted per call so a desk
+                        // cut short is written as what it spent.
+                        Ok(MultiTurnStreamItem::CompletionCall(call)) => self.observer.add_usage(call.usage),
                         Ok(MultiTurnStreamItem::FinalResponse(res)) => {
-                            // The nested run's calls are the parent run's cost.
-                            self.observer.add_usage(res.usage());
                             collector.finished(res.output());
                             // A summary that is itself a tool call, with
                             // nothing searched, is the model writing the
@@ -318,7 +324,7 @@ where
                             let nothing_searched = collector.findings.iter().all(|f| f.failed);
                             if !repaired && nothing_searched && crate::toolcall::looks_like_tool_call(&collector.summary) {
                                 repaired = true;
-                                self.observer.event("the desk wrote a tool call as text; asking it to make the call", false);
+                                self.observer.event(&format!("{} wrote a tool call as text; asking it to make the call", self.name), false);
                                 prompt = crate::toolcall::REPAIR_NOTE.to_string();
                                 history = res.messages().map(|m| m.to_vec()).unwrap_or_default();
                                 continue 'pass;
@@ -679,11 +685,35 @@ mod tests {
 
     const PROSE_CALL: &str = "<tool_call>\n<invoke name=\"probe\"><q>7</q></invoke>\n</tool_call>";
 
-    /// A scripted model whose turns are `turns`, each a whole stream.
-    fn scripted_turns(turns: Vec<Vec<rig::test_utils::MockStreamEvent>>) -> rig::agent::Agent<rig::test_utils::MockCompletionModel> {
+    /// A scripted model whose turns are `turns`, each a whole stream, and
+    /// the model itself, which records every request it was sent.
+    fn scripted_turns(
+        turns: Vec<Vec<rig::test_utils::MockStreamEvent>>,
+    ) -> (rig::agent::Agent<rig::test_utils::MockCompletionModel>, rig::test_utils::MockCompletionModel) {
         let allowed = turns.len() + 1;
         let model = rig::test_utils::MockCompletionModel::from_stream_turns(turns);
-        rig::agent::AgentBuilder::new(model).preamble("test").tool(Probe).default_max_turns(allowed).build()
+        (rig::agent::AgentBuilder::new(model.clone()).preamble("test").tool(Probe).default_max_turns(allowed).build(), model)
+    }
+
+    /// The text of a message, whoever said it.
+    fn text_of(message: &rig::completion::Message) -> String {
+        match message {
+            rig::completion::Message::User { content } => content
+                .iter()
+                .filter_map(|c| match c {
+                    rig::completion::message::UserContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect(),
+            rig::completion::Message::Assistant { content, .. } => content
+                .iter()
+                .filter_map(|c| match c {
+                    rig::completion::message::AssistantContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => String::new(),
+        }
     }
 
     #[tokio::test]
@@ -691,7 +721,7 @@ mod tests {
         use rig::test_utils::MockStreamEvent;
         // Pass one: the call written out as text, nothing made. Asked
         // again, the model makes it and answers.
-        let agent = scripted_turns(vec![
+        let (agent, model) = scripted_turns(vec![
             vec![MockStreamEvent::text(PROSE_CALL), MockStreamEvent::final_response_with_default_usage()],
             vec![MockStreamEvent::tool_call("t1", "probe", json!({"q": 7})), MockStreamEvent::final_response_with_default_usage()],
             vec![MockStreamEvent::text("Probed once."), MockStreamEvent::final_response_with_default_usage()],
@@ -711,13 +741,45 @@ mod tests {
             "the repair is in the trace: {rows:?}"
         );
         assert_eq!(rows.iter().filter(|r| r.kind == "tool").count(), 1, "the probe, once");
+        // The repair pass asked with the note, over the exchange so far:
+        // the brief first, the prose answer, then the note. Pinned against
+        // rig changing what its final response's `messages` hold.
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3, "the brief, the repair, and the answer after the call");
+        let repair: Vec<String> = requests[1].chat_history.iter().map(text_of).collect();
+        let at = |needle: &str| repair.iter().position(|t| t.contains(needle)).unwrap_or_else(|| panic!("{needle:?} is not in the repair's history: {repair:?}"));
+        assert!(at("probe seven") < at("<tool_call>"), "the brief, then the prose answer: {repair:?}");
+        assert_eq!(repair.last().map(String::as_str), Some(crate::toolcall::REPAIR_NOTE), "and the note is what it is asked");
+    }
+
+    #[tokio::test]
+    async fn a_desk_cut_short_is_written_as_what_it_spent() {
+        use rig::test_utils::{MockResponse, MockStreamEvent};
+        // One turn allowed, one call made at a cost, then out of turns: the
+        // run is cut short, and the tokens of the call that ran are counted.
+        let mut usage = rig::completion::Usage::new();
+        usage.input_tokens = 40;
+        usage.output_tokens = 4;
+        let (_, model) = scripted_turns(vec![vec![
+            MockStreamEvent::tool_call("t1", "probe", json!({"q": 7})),
+            MockStreamEvent::FinalResponse(MockResponse::with_usage(usage)),
+        ]]);
+        let agent = rig::agent::AgentBuilder::new(model).preamble("test").tool(Probe).default_max_turns(1).build();
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let observer = std::sync::Arc::new(crate::observer::Observer::new(events, 1));
+        let tool = specialist_with(agent, observer.clone());
+
+        let report = rig::tool::Tool::call(&tool, Brief { brief: "probe seven".to_string() }).await.unwrap();
+
+        assert!(report.summary.contains("cut short"), "{}", report.summary);
+        assert_eq!(observer.tokens(), crate::store::Tokens { input: 40, cached: 0, output: 4 });
     }
 
     #[tokio::test]
     async fn prose_twice_is_the_failure_it_was_and_is_asked_only_once() {
         use rig::test_utils::MockStreamEvent;
         let prose = || vec![MockStreamEvent::text(PROSE_CALL), MockStreamEvent::final_response_with_default_usage()];
-        let agent = scripted_turns(vec![prose(), prose()]);
+        let (agent, _model) = scripted_turns(vec![prose(), prose()]);
         let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
         let observer = std::sync::Arc::new(crate::observer::Observer::new(events, 1));
         let tool = specialist_with(agent, observer.clone());

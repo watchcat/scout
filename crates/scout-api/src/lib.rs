@@ -98,6 +98,16 @@ pub struct RunRow {
     /// `answered`, `cut_short` or `failed`; `None` while running.
     pub outcome: Option<String>,
     pub detail: Option<String>,
+    /// Tokens the run's model calls used, as the provider reported them:
+    /// input, the part of input served from the provider's cache, and
+    /// output. `None` while running, and on a run from before they were
+    /// kept.
+    #[serde(default)]
+    pub input_tokens: Option<i64>,
+    #[serde(default)]
+    pub cached_tokens: Option<i64>,
+    #[serde(default)]
+    pub output_tokens: Option<i64>,
 }
 
 /// A trace row as saved. `kind` is `tool` or `event`. `result` is the

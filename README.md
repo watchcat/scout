@@ -270,7 +270,8 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - Reorder reminders for things you buy periodically, delivered in Telegram
 - `/stat` for usage with a text bar chart — your own numbers, or everyone's
   if you're the admin. Flight searches are counted separately, because
-  those are the ones a provider bills for
+  those are the ones a provider bills for, and so are the model's tokens —
+  input, cached and output, as the provider reported them for each run
 - `/advert <text>` — admin only, announces something to everyone who has
   used the bot. It goes to the chat each person actually talks in, says who
   sent it, and reports who could not be reached
@@ -394,7 +395,7 @@ You need four things:
 1. A bot token from [@BotFather](https://t.me/BotFather)
 2. Your numeric Telegram id from [@userinfobot](https://t.me/userinfobot) —
    Scout only answers people on the allowlist
-3. A [MiniMax API key](https://www.minimax.io) (the LLM)
+3. A key for an OpenAI-shaped chat API — [MiniMax](https://www.minimax.io) by default; see the `LLM_*` variables
 4. A [Kagi API key](https://kagi.com/settings?p=api) (search, paid)
 
 Everything else is optional and makes Scout better as you add it.
@@ -411,9 +412,10 @@ compiles from source.
 | `ALLOWED_TELEGRAM_USER_IDS` | **yes** | — | comma-separated numeric ids |
 | `SCOUT_ADMIN_USER_IDS` | no | first allowed id | who sees everyone's numbers in `/stat` and may run `/advert`, `/invite` and `/kick`; everyone else sees only their own |
 | `INVITE_DAILY_REQUESTS` | no | `20` | messages per day for someone admitted through `/invite`. Founders are exempt |
-| `MINIMAX_API_KEY` | **yes** | — | the LLM |
-| `MINIMAX_BASE_URL` | no | `https://api.minimax.io/v1` | where the OpenAI-shaped model API lives; point it at a proxy of your own |
-| `FLIGHT_MODEL` | no | the main model | the model the flight agent runs on |
+| `LLM_API_KEY` | **yes** | — | the model provider's key. `MINIMAX_API_KEY` is still read when this is unset |
+| `LLM_BASE_URL` | no | `https://api.minimax.io/v1` | where the OpenAI-shaped chat API lives: another provider, or a proxy of your own. `MINIMAX_BASE_URL` is still read |
+| `LLM_MODEL` | no | `minimax-m3` | the model every agent runs on |
+| `FLIGHT_MODEL` | no | `LLM_MODEL` | the model the flight agent runs on |
 | `KAGI_API_KEY` | **yes** | — | search: small-retailer coverage, `site:` scoping |
 | `PERPLEXITY_API_KEY` | no | — | second engine, merged with Kagi; carries the multi-language fan-out cheaply |
 | `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` | no | — | eBay Browse API: live prices, condition, shipping |
@@ -665,7 +667,7 @@ of JavaScript in the browser client.
   database file and one API budget. Rounds bound how many people there are
   and the daily cap bounds each of them; neither bounds what a single
   question can cost.
-- **Costs real money.** Kagi bills per query, MiniMax per token, and each
+- **Costs real money.** Kagi bills per query, the model provider per token, and each
   flight search is billed by whichever provider answered it. Budgets are
   capped per request: 15 search queries, 5 page opens, 20 model turns, and
   flight searches that start at 4 and grow with what you actually asked for —
@@ -683,6 +685,7 @@ of JavaScript in the browser client.
 cargo test --workspace      # 1004 tests across four crates, no network
 node --test 'crates/scout-web/src/*.test.mjs'  # the chat client's own tests
 cargo clippy --workspace --all-targets  # clean
+cargo sweep --maxsize 15000 # target/ back under 15 GB (it reached 50); the next build refills what it needs
 RUST_LOG=debug cargo run    # verbose logs
 docker compose logs -f      # what the bot is doing right now
 scripts/deploy.sh           # compose: test, build, drain, hand over

@@ -3,7 +3,7 @@ use crate::core::Core;
 use crate::text::strip_thinking;
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
-use rig::completion::{Chat, Message as LlmMessage};
+use rig::completion::Message as LlmMessage;
 use rig::streaming::{StreamedAssistantContent, StreamingChat};
 
 /// What a run produced.
@@ -239,6 +239,11 @@ async fn run_with(
                         }
                     }
                 }
+                // One provider call done, with what it cost. Counted here
+                // rather than from the final response's aggregate, so a run
+                // cut short — out of turns, stalled, over budget — is
+                // written as what it spent and not as free.
+                MultiTurnStreamItem::CompletionCall(call) => observer.add_usage(call.usage),
                 MultiTurnStreamItem::FinalResponse(res) => {
                     final_response = Some(res);
                     return Ok(None);
@@ -298,7 +303,7 @@ async fn run_with(
     if reply.is_empty() && salvage.is_none() && history_returned && has_notes(&thinking, &streamed) {
         tracing::warn!(conversation_id, "the reply was all reasoning; asking the model to act on it");
         observer.event("the reply was all reasoning; asking the model to act on it", false);
-        reply = match tokio::time::timeout(WRAP_UP_BUDGET, agent.chat(REASONING_ONLY_NOTE, &mut history)).await {
+        reply = match tokio::time::timeout(WRAP_UP_BUDGET, chat_counted(&agent, REASONING_ONLY_NOTE, &mut history, observer)).await {
             Ok(Ok(text)) => strip_thinking(&text),
             Ok(Err(e)) => {
                 observer.metrics.provider_error("model", "error");
@@ -363,12 +368,8 @@ async fn run_with(
         );
         // The salvage attempt gets its own deadline: it must never become a
         // second way to hang.
-        reply = match tokio::time::timeout(
-            WRAP_UP_BUDGET,
-            rig::completion::Prompt::prompt(&wrap_up, asked),
-        )
-        .await
-        {
+        // No history: the notes are the whole prompt.
+        reply = match tokio::time::timeout(WRAP_UP_BUDGET, chat_counted(&wrap_up, asked, &mut Vec::new(), observer)).await {
             Ok(Ok(text)) => strip_thinking(&text),
             Ok(Err(e)) => {
                 observer.metrics.provider_error("model", "error");
@@ -415,7 +416,7 @@ async fn run_with(
     if crate::toolcall::looks_like_tool_call(&reply) {
         tracing::warn!(conversation_id, "the model wrote a tool call as text; asking it to answer");
         observer.event("the model wrote a tool call as text; asking it to answer", false);
-        reply = strip_thinking(&model_call(observer, agent.chat(crate::toolcall::REPAIR_NOTE, &mut history).await)?);
+        reply = strip_thinking(&model_call(observer, chat_counted(&agent, crate::toolcall::REPAIR_NOTE, &mut history, observer).await)?);
         if crate::toolcall::looks_like_tool_call(&reply) {
             // Twice is not a slip. The run has not answered, and an apology
             // the reader understands beats markup they cannot.
@@ -433,7 +434,7 @@ async fn run_with(
         tracing::warn!(?dead, conversation_id, "dead links in reply; asking the agent to correct it");
         observer.event("dead links in reply; asking the agent to correct it", false);
         let note = crate::links::repair_prompt(&dead);
-        reply = strip_thinking(&model_call(observer, agent.chat(note, &mut history).await)?);
+        reply = strip_thinking(&model_call(observer, chat_counted(&agent, note, &mut history, observer).await)?);
         let still_dead = crate::links::dead_links_in(&core.deps.web, &reply).await;
         if !still_dead.is_empty() {
             tracing::warn!(?still_dead, conversation_id, "dead links survived the correction; stripping");
@@ -467,6 +468,25 @@ async fn run_with(
     Ok(RunOutcome::Answered(reply))
 }
 
+/// `agent.chat`, with the tokens the turn used added to the run's: rig's
+/// own `chat` is this exact request with the usage dropped on the floor,
+/// and a repair or a wrap-up is a model call like any other. The history
+/// is extended with the turn, as `chat` extends it.
+async fn chat_counted(
+    agent: &rig::agent::Agent<rig::providers::openai::completion::CompletionModel>,
+    prompt: impl Into<LlmMessage> + Send,
+    history: &mut Vec<LlmMessage>,
+    observer: &crate::observer::Observer,
+) -> Result<String, rig::completion::PromptError> {
+    use rig::completion::Prompt;
+    let response = agent.prompt(prompt).history(history.clone()).extended_details().await?;
+    observer.add_usage(response.usage);
+    if let Some(messages) = response.messages {
+        history.extend(messages);
+    }
+    Ok(response.output)
+}
+
 /// A repair turn's answer, with a refusal counted as the model's error on
 /// the way out — the turns that end in a bare `?` otherwise leave a failed
 /// run with no provider error under it.
@@ -481,11 +501,13 @@ fn model_call<T>(observer: &crate::observer::Observer, result: Result<T, rig::co
 /// fails the reply over it: the answer is already on its way.
 async fn finish_run(store: &crate::store::Store, observer: &crate::observer::Observer, outcome: &str, detail: Option<&str>) {
     observer.metrics.run_finished(outcome, observer.elapsed());
+    let tokens = observer.tokens();
+    observer.metrics.model_tokens(tokens);
     let rows = observer.take_rows();
     let (store, run_id, outcome, detail) = (store.clone(), observer.run_id, outcome.to_string(), detail.map(str::to_string));
     if let Err(e) = crate::core::blocking(move || {
         store.append_traces(run_id, &rows)?;
-        store.close_run(run_id, &outcome, detail.as_deref())
+        store.close_run(run_id, &outcome, detail.as_deref(), Some(tokens))
     })
     .await
     {
@@ -1019,7 +1041,9 @@ mod tests {
         let mut cfg = crate::config::Config::for_test(
             dir.path().join("run.duckdb").to_str().unwrap(),
         );
-        cfg.minimax_base_url = llm.uri();
+        cfg.llm_base_url = llm.uri();
+        // Not the default: what the config names is what every call must ask for.
+        cfg.llm_model = "the-configured-model".into();
         let mut core = Core::start(cfg, None).unwrap();
         let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
         core.deps.metrics = metrics;
@@ -1231,6 +1255,39 @@ mod tests {
         assert_eq!(counted(ran.metrics, "scout_provider_errors_total{provider=\"model\",kind=\"error\"}"), 1);
         assert_eq!(counted(ran.metrics, "scout_runs_total{outcome=\"failed\"}"), 1);
         assert_eq!(counted(ran.metrics, "scout_run_duration_seconds_count"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_writes_down_what_its_model_calls_cost() {
+        // The stand-in answers with one token in and one out on every
+        // call — the streamed run and, here, the wrap-up it asks for after
+        // an all-reasoning reply — so the row carries their sum.
+        let llm = minimax_correcting(
+            streamed_text(&["<think>Still thinking.</think>"]),
+            "<think>Still weighing.</think>",
+            Some("Lisbon in May is warm."),
+        )
+        .await;
+        let ran = a_run_against(&llm).await;
+        assert!(ran.outcome.is_ok(), "{:?}", ran.outcome.as_ref().err());
+        let (run, _) = ran.saved();
+        assert_eq!((run.input_tokens, run.cached_tokens, run.output_tokens), (Some(3), Some(0), Some(3)), "stream + correction + wrap-up, one token each way");
+        let page = ran.metrics.render();
+        assert!(page.contains("scout_model_tokens_total{kind=\"input\"} 3\n"), "{page}");
+        assert!(page.contains("scout_model_tokens_total{kind=\"output\"} 3\n"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn every_model_call_asks_for_the_model_the_config_names() {
+        let llm = minimax(streamed_text(&["Lisbon in May is warm."]), None).await;
+        let ran = a_run_against(&llm).await;
+        assert!(ran.outcome.is_ok());
+        let bodies: Vec<String> =
+            llm.received_requests().await.unwrap().iter().map(|r| String::from_utf8_lossy(&r.body).to_string()).collect();
+        assert!(!bodies.is_empty());
+        for body in &bodies {
+            assert!(body.contains("\"model\":\"the-configured-model\""), "a call asked for another model: {body}");
+        }
     }
 
     #[tokio::test]

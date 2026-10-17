@@ -935,12 +935,12 @@ mod tests {
         let cfg = scout_core::config::Config::from_lookup(|k| match k {
             "TELEGRAM_BOT_TOKEN" => Some("123456:test-bot-token".to_string()),
             "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
-            "MINIMAX_API_KEY" => Some("mk".to_string()),
+            "LLM_API_KEY" => Some("mk".to_string()),
             // A port nothing listens on, as `Config::for_test` does, unless
             // the test brought a stand-in. A route that reaches the model
             // under test fails at once with a connection error instead of
             // putting a request with a bogus key on the wire.
-            "MINIMAX_BASE_URL" => Some(model_url.unwrap_or("http://127.0.0.1:1").to_string()),
+            "LLM_BASE_URL" => Some(model_url.unwrap_or("http://127.0.0.1:1").to_string()),
             "KAGI_API_KEY" => Some("kk".to_string()),
             "SCOUT_DB_PATH" => Some(db.to_str().unwrap().to_string()),
             _ => None,

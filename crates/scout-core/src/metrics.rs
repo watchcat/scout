@@ -141,6 +141,7 @@ pub struct Metrics {
     lock_wait: Histogram,
     search_calls: Counter,
     search_results: Counter,
+    model_tokens: Counter,
 }
 
 impl Default for Metrics {
@@ -155,6 +156,7 @@ impl Default for Metrics {
             lock_wait: Histogram::new(LOCK_BUCKETS),
             search_calls: Counter::new(&["queries"]),
             search_results: Counter::new(&["source", "outcome"]),
+            model_tokens: Counter::new(&["kind"]),
         }
     }
 }
@@ -204,6 +206,14 @@ impl Metrics {
         self.search_results.add_n(&[source, outcome], n as u64);
     }
 
+    /// A run's tokens, as the provider reported them, when the run closes.
+    pub fn model_tokens(&self, tokens: crate::store::Tokens) {
+        let n = |v: i64| u64::try_from(v).unwrap_or(0);
+        self.model_tokens.add_n(&["input"], n(tokens.input));
+        self.model_tokens.add_n(&["cached"], n(tokens.cached));
+        self.model_tokens.add_n(&["output"], n(tokens.output));
+    }
+
     /// The whole set in the Prometheus text format.
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -214,6 +224,7 @@ impl Metrics {
         self.provider_retries.render(&mut out, "scout_provider_retries_total", "Requests to a provider sent again after a 429, a 5xx or a refused connection.");
         self.lock_wait.render(&mut out, "scout_store_lock_wait_seconds", "Time a store call waited for the database's lock.");
         self.search_calls.render(&mut out, "scout_search_calls_total", "search_web calls, by how many Kagi queries each spent.");
+        self.model_tokens.render(&mut out, "scout_model_tokens_total", "Tokens the model reported for runs, by kind: input, cached (the part of input served from the provider's cache), output.");
         self.search_results.render(&mut out, "scout_search_results_total", "Hits from search_web calls, by source (kagi_N is the Nth query, kagi_1 the user's own) and what became of them: kept for the model, a duplicate of an earlier entry, or cut for want of room.");
         out
     }
@@ -460,6 +471,7 @@ mod tests {
             "scout_store_lock_wait_seconds",
             "scout_search_calls_total",
             "scout_search_results_total",
+            "scout_model_tokens_total",
         ] {
             assert!(page.contains(&format!("# TYPE {name} ")), "{name} is missing:\n{page}");
         }

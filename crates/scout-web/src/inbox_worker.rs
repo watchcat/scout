@@ -1582,8 +1582,8 @@ mod tests {
         let cfg = scout_core::config::Config::from_lookup(|k| match k {
             "TELEGRAM_BOT_TOKEN" => Some("123456:test-bot-token".to_string()),
             "ALLOWED_TELEGRAM_USER_IDS" => Some("111".to_string()),
-            "MINIMAX_API_KEY" => Some("mk".to_string()),
-            "MINIMAX_BASE_URL" => Some(model_url.to_string()),
+            "LLM_API_KEY" => Some("mk".to_string()),
+            "LLM_BASE_URL" => Some(model_url.to_string()),
             "KAGI_API_KEY" => Some("kk".to_string()),
             "SCOUT_DB_PATH" => Some(db.to_str().unwrap().to_string()),
             "SCOUT_PDFTOPPM" => Some(program.to_string()),

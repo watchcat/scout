@@ -57,7 +57,7 @@ pub async fn resolve_conversation(
         let store = core.deps.store.clone();
         return crate::core::blocking(move || store.start_conversation(account_id, &scope_owned)).await;
     }
-    match crate::agent::continues_previous(&core.deps.llm, &excerpt, text).await {
+    match crate::agent::continues_previous(&core.deps, &excerpt, text).await {
         Ok(true) => {
             tracing::info!(account_id, id, "session expired but topic continues; keeping context");
             let store = core.deps.store.clone();
@@ -673,7 +673,7 @@ pub async fn suggest_title(core: &Core, account_id: i64, conversation_id: i64) -
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let raw = crate::agent::title_for(&core.deps.llm, &text).await?;
+    let raw = crate::agent::title_for(&core.deps, &text).await?;
     let Some(title) = clean_title(&raw) else {
         anyhow::bail!("the model gave no usable title");
     };

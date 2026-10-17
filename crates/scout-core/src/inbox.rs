@@ -418,7 +418,7 @@ pub const EXTRACT_BUDGET: std::time::Duration = std::time::Duration::from_secs(6
 pub async fn extract(core: &Core, text: &str) -> anyhow::Result<Vec<Extraction>> {
     use rig::client::CompletionClient;
     use rig::completion::Prompt;
-    let agent = core.deps.llm.agent(crate::agent::MODEL).preamble(EXTRACT_PREAMBLE).build();
+    let agent = core.deps.llm.agent(&core.deps.model).preamble(EXTRACT_PREAMBLE).build();
     // Today, and what a yearless date means: a boarding pass says "21 SEP"
     // and nothing more, and read without this it became a flight a year
     // in the past, on its own leg beside the one it was a pass for.
@@ -906,7 +906,7 @@ where
         left -= taken;
         let mut text = Vec::new();
         for page in &pages[..taken] {
-            let words = crate::vision::transcribe_page(&core.deps.llm, page).await?;
+            let words = crate::vision::transcribe_page(&core.deps, page).await?;
             if !words.is_empty() {
                 text.push(words.chars().take(PAGE_TEXT_CAP).collect::<String>());
             }
@@ -3306,7 +3306,7 @@ mod tests {
     fn core_reading_with(llm: &wiremock::MockServer) -> (Core, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::config::Config::for_test(dir.path().join("inbox.duckdb").to_str().unwrap());
-        cfg.minimax_base_url = llm.uri();
+        cfg.llm_base_url = llm.uri();
         (Core::start(cfg, None).unwrap(), dir)
     }
 

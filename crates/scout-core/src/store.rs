@@ -406,7 +406,12 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at      TIMESTAMP NOT NULL DEFAULT current_timestamp,
     ended_at        TIMESTAMP,
     outcome         TEXT,
-    detail          TEXT
+    detail          TEXT,
+    -- What the run's model calls cost, as the provider reported them.
+    -- Last, nullable: step 26 adds them, and a run from before has none.
+    input_tokens    BIGINT,
+    cached_tokens   BIGINT,
+    output_tokens   BIGINT
 );
 CREATE SEQUENCE IF NOT EXISTS run_traces_id_seq;
 CREATE TABLE IF NOT EXISTS run_traces (
@@ -1463,6 +1468,15 @@ const STEP_25_LOGIN_JOIN: &str = r#"
 ALTER TABLE login_tokens ADD COLUMN IF NOT EXISTS join_token TEXT;
 "#;
 
+/// What a run's model calls cost in tokens, as the provider reported them
+/// — until now every model-cost figure was arithmetic on guesses. Nullable
+/// and last, as every added column here is.
+const STEP_26_RUN_TOKENS: &str = r#"
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS input_tokens BIGINT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS cached_tokens BIGINT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS output_tokens BIGINT;
+"#;
+
 /// A stay now waits for the arrival on its check-in day; every trip is
 /// put in that order once, since positions otherwise change only when the
 /// trip does.
@@ -1652,6 +1666,7 @@ fn steps() -> Vec<(i64, Step)> {
         (23, Step::Sql(STEP_23_RELEASED_ADDRESSES)),
         (24, Step::Code(step_24_stays_after_arrivals)),
         (25, Step::Sql(STEP_25_LOGIN_JOIN)),
+        (26, Step::Sql(STEP_26_RUN_TOKENS)),
     ]
 }
 
@@ -1847,6 +1862,16 @@ pub struct DocumentState {
     pub booking: bool,
 }
 
+/// What a run's model calls cost, in tokens, as the provider reported
+/// them. `cached` is the part of `input` the provider served from its own
+/// cache, not a third kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tokens {
+    pub input: i64,
+    pub cached: i64,
+    pub output: i64,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -1894,6 +1919,12 @@ fn backup_connection(conn: &Connection, path: &Path) -> Result<()> {
 /// unmergeable: signing in by email mints a fresh account, which immediately
 /// takes a seat, and that seat would then be the proof it could never be
 /// merged away.
+///
+/// `request_log` rows are pruned after `Core::REQUEST_LOG_KEEP_DAYS`, so an
+/// account whose only trace is requests older than that reads empty here
+/// and may be merged away — losing nothing its owner made, since the other
+/// tables are what hold that, and only on the word of whoever proves its
+/// identity.
 fn is_empty_account(conn: &Connection, account_id: i64) -> Result<bool> {
     // Six `?` rather than a repeated `?1`: DuckDB's own placeholder styles
     // are `?` and `$n`, and mixing them is how this reads wrong later.
@@ -2671,13 +2702,54 @@ impl Store {
         )?)
     }
 
-    pub fn close_run(&self, run_id: i64, outcome: &str, detail: Option<&str>) -> Result<()> {
+    /// Closes the run with how it ended and what its model calls cost.
+    /// `None` tokens for a close that counted nothing — the debug seed —
+    /// so the row says "unknown" rather than "free".
+    pub fn close_run(&self, run_id: i64, outcome: &str, detail: Option<&str>, tokens: Option<Tokens>) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "UPDATE runs SET ended_at = now(), outcome = ?, detail = ? WHERE id = ?",
-            params![outcome, detail, run_id],
+            "UPDATE runs SET ended_at = now(), outcome = ?, detail = ?,
+                             input_tokens = ?, cached_tokens = ?, output_tokens = ?
+             WHERE id = ?",
+            params![
+                outcome,
+                detail,
+                tokens.map(|t| t.input),
+                tokens.map(|t| t.cached),
+                tokens.map(|t| t.output),
+                run_id
+            ],
         )?;
         Ok(())
+    }
+
+    /// Tokens the runs started since `cutoff` used, summed per account:
+    /// `/stat`'s own-numbers view. Runs from before tokens were kept are
+    /// left out of the sum rather than counted as free.
+    pub fn model_tokens_for(&self, cutoff: &str, account_id: i64) -> Result<BTreeMap<i64, Tokens>> {
+        self.token_sums(cutoff, Some(account_id))
+    }
+
+    /// The same across every account. Reachable from `/stat` only when the
+    /// caller is an admin — like `usage_stats_all`, this method and its
+    /// callers are the access-control surface for cross-user data.
+    pub fn model_tokens_all(&self, cutoff: &str) -> Result<BTreeMap<i64, Tokens>> {
+        self.token_sums(cutoff, None)
+    }
+
+    fn token_sums(&self, cutoff: &str, account_id: Option<i64>) -> Result<BTreeMap<i64, Tokens>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT account_id, sum(input_tokens), sum(cached_tokens), sum(output_tokens)
+             FROM runs
+             WHERE started_at >= CAST(? AS TIMESTAMP) AND input_tokens IS NOT NULL
+               AND (? IS NULL OR account_id = ?)
+             GROUP BY account_id ORDER BY account_id ASC",
+        )?;
+        let rows = stmt.query_map(params![cutoff, account_id, account_id], |r| {
+            Ok((r.get::<_, i64>(0)?, Tokens { input: r.get(1)?, cached: r.get(2)?, output: r.get(3)? }))
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     /// Writes a run's rows in one transaction, results cut at the cap.
@@ -2725,10 +2797,12 @@ impl Store {
         let conn = self.conn();
         let run = conn
             .query_row(
-                "SELECT id, started_at::TEXT, ended_at::TEXT, outcome, detail FROM runs WHERE id = ? AND account_id = ?",
+                "SELECT id, started_at::TEXT, ended_at::TEXT, outcome, detail, input_tokens, cached_tokens, output_tokens
+                 FROM runs WHERE id = ? AND account_id = ?",
                 params![run_id, account_id],
                 |r| Ok(scout_api::RunRow {
                     id: r.get(0)?, started_at: r.get(1)?, ended_at: r.get(2)?, outcome: r.get(3)?, detail: r.get(4)?,
+                    input_tokens: r.get(5)?, cached_tokens: r.get(6)?, output_tokens: r.get(7)?,
                 }),
             )
             .optional()?;
@@ -2899,7 +2973,11 @@ impl Store {
     ///
     /// `delivered` is how a channel records a turn it has already shown the
     /// reader: the row is inserted with `sent_at` set, so it occupies the
-    /// key and is never dispatched.
+    /// key and is never dispatched. Recorded again — the channel writes
+    /// its last turns on every answer — a marker is dated afresh, so a
+    /// thread the channel still answers in keeps its markers past
+    /// `prune_outbox`'s horizon, and only a thread it has not answered in
+    /// for that long can lose them.
     ///
     /// Keyed by channel as well as account and turn. Without it, the first
     /// day a second channel exists, queueing a turn for it returns `false`
@@ -2926,6 +3004,13 @@ impl Store {
             |r| r.get(0),
         )?;
         if known > 0 {
+            if delivered {
+                conn.execute(
+                    "UPDATE outbox SET sent_at = now()
+                     WHERE account_id = ? AND channel = ? AND turn_key = ? AND sent_at IS NOT NULL",
+                    params![account_id, channel, turn_key],
+                )?;
+            }
             return Ok(false);
         }
         // `now()` in the statement rather than a bound timestamp: `duckdb`
@@ -2979,9 +3064,10 @@ impl Store {
     /// so the caller can say out loud when one is given up on.
     ///
     /// At [`MIRROR_ATTEMPTS`] the row stops being returned by
-    /// `pending_mirror` and there is no way back: its `turn_key` is still
-    /// occupied, so re-enqueueing it is a no-op and toggling the mirror off
-    /// and on will not recover it. That is a thing a human should be able
+    /// `pending_mirror`, and its `turn_key` stays occupied, so re-enqueueing
+    /// it is a no-op and toggling the mirror off and on will not recover it
+    /// — until `prune_outbox` drops the row, months on, and the key is free
+    /// for a backfill to try again. That is a thing a human should be able
     /// to find in a log afterwards.
     pub fn mark_mirror_failed(&self, id: i64) -> Result<i64> {
         let conn = self.conn();
@@ -3270,6 +3356,45 @@ impl Store {
             params![consumed_at.to_string(), token_hash],
         )?;
         Ok(TokenOutcome::Valid { email, account_id, join })
+    }
+
+    /// Drops `request_log` rows older than `keep_days`. Returns how many went.
+    ///
+    /// One row per request, and the table only ever grew. It is read by the
+    /// daily cap (today alone) and by `/stat` (a window of days the caller
+    /// names), so a year and a bit keeps every reading anyone asks for. The
+    /// cutoff is computed here rather than in SQL, as `prune_login_tokens`
+    /// does and for the reason it gives.
+    pub fn prune_request_log(&self, keep_days: i64) -> Result<usize> {
+        let conn = self.conn();
+        Ok(conn.execute(
+            "DELETE FROM request_log WHERE created_at < CAST(? AS TIMESTAMP)",
+            params![minutes_ago(keep_days * 1440)],
+        )?)
+    }
+
+    /// Drops outbox rows nothing will read again — sent, or out of attempts
+    /// — older than `keep_days`. A row still waiting its turn stays whatever
+    /// its age. Returns how many went.
+    ///
+    /// Sent rows include the ones a channel wrote as already delivered,
+    /// which are what stop a backfill echoing a turn Telegram showed
+    /// itself. Those are dated afresh each time the channel records them
+    /// (`enqueue_mirror`), a backfill reaches only a thread's last turns,
+    /// and a thread expires in two days unless pinned — so with a horizon
+    /// of months the one thing that can be echoed is the tail of a pinned
+    /// thread Telegram has not answered in for that long, mirrored afresh:
+    /// once. A row out of attempts frees its key the same way, and a later
+    /// backfill may try that turn again.
+    pub fn prune_outbox(&self, keep_days: i64) -> Result<usize> {
+        let conn = self.conn();
+        let cutoff = minutes_ago(keep_days * 1440);
+        Ok(conn.execute(
+            "DELETE FROM outbox
+             WHERE (sent_at IS NOT NULL AND sent_at < CAST(? AS TIMESTAMP))
+                OR (sent_at IS NULL AND attempts >= ? AND created_at < CAST(? AS TIMESTAMP))",
+            params![cutoff, MIRROR_ATTEMPTS, cutoff],
+        )?)
     }
 
     /// Drops login tokens that stopped being worth keeping, returning how
@@ -7397,10 +7522,74 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 25);
+        assert_eq!(s.schema_version().unwrap(), 26);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
+    }
+
+    #[test]
+    fn old_request_log_rows_are_pruned_and_what_stat_and_the_cap_read_is_kept() {
+        let (s, _d) = test_store();
+        s.log_request_at(1, "text", &minutes_ago(500 * 1440)).unwrap();
+        s.log_request_at(1, "text", &minutes_ago(300 * 1440)).unwrap();
+        s.log_request(1, "text").unwrap();
+
+        assert_eq!(s.prune_request_log(400).unwrap(), 1);
+
+        let left: i64 = s.conn().query_row("SELECT count(*) FROM request_log WHERE account_id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 2, "a row inside the year and today's stay");
+        assert_eq!(s.requests_today(1).unwrap(), 1, "the daily cap still counts today");
+        let year: Vec<i64> = s.usage_stats_for(&minutes_ago(365 * 1440), 1).unwrap().into_iter().map(|(_, _, n)| n).collect();
+        assert_eq!(year.iter().sum::<i64>(), 2, "/stat over a year sees both");
+        assert_eq!(s.prune_request_log(400).unwrap(), 0, "nothing to do twice");
+    }
+
+    #[test]
+    fn an_account_whose_only_trace_is_old_requests_reads_empty_once_they_are_pruned() {
+        // The merge rule counts request rows as "this account was used";
+        // pruning moves that line, and a test says so rather than letting
+        // the predicate change under it.
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(1).unwrap();
+        s.log_request_at(a, "text", &minutes_ago(500 * 1440)).unwrap();
+        assert!(!is_empty_account(&s.conn(), a).unwrap());
+        s.prune_request_log(400).unwrap();
+        assert!(is_empty_account(&s.conn(), a).unwrap());
+    }
+
+    #[test]
+    fn the_outbox_keeps_what_is_still_waiting_and_drops_what_was_sent_or_given_up_long_ago() {
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(1).unwrap();
+        for key in ["sent-old", "sent-new", "dead-old", "dead-new", "waiting-old", "shown-old", "shown-again"] {
+            // `shown-*` are rows a channel wrote as already delivered.
+            assert!(s.enqueue_mirror(a, "telegram", "12345", "hello", key, key.starts_with("shown")).unwrap());
+        }
+        let old = minutes_ago(100 * 1440);
+        {
+            let conn = s.conn();
+            conn.execute("UPDATE outbox SET created_at = CAST(? AS TIMESTAMP) WHERE turn_key LIKE '%-old'", params![old]).unwrap();
+            conn.execute("UPDATE outbox SET sent_at = CAST(? AS TIMESTAMP) WHERE turn_key IN ('sent-old', 'shown-old', 'shown-again')", params![old]).unwrap();
+            conn.execute("UPDATE outbox SET sent_at = now() WHERE turn_key = 'sent-new'", []).unwrap();
+            conn.execute("UPDATE outbox SET attempts = ? WHERE turn_key IN ('dead-old', 'dead-new')", params![MIRROR_ATTEMPTS]).unwrap();
+        }
+        // The channel records its last turns on every answer: a marker
+        // recorded again is dated afresh, and outlives the horizon.
+        assert!(!s.enqueue_mirror(a, "telegram", "12345", "hello", "shown-again", true).unwrap());
+
+        assert_eq!(s.prune_outbox(90).unwrap(), 3, "sent-old, shown-old and dead-old");
+
+        let left: Vec<String> = {
+            let conn = s.conn();
+            let mut stmt = conn.prepare("SELECT turn_key FROM outbox ORDER BY turn_key").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<duckdb::Result<_>>().unwrap()
+        };
+        assert_eq!(
+            left,
+            ["dead-new", "sent-new", "shown-again", "waiting-old"],
+            "a row sent or given up on lately, a marker recorded again, and one still waiting however old"
+        );
     }
 
     #[test]
@@ -7461,7 +7650,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 25);
+        assert_eq!(store.schema_version().unwrap(), 26);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -8735,6 +8924,54 @@ CREATE TABLE trips (
     }
 
     #[test]
+    fn a_closed_run_keeps_what_its_model_calls_cost_and_stat_sums_it_per_account() {
+        let (store, _dir) = test_store();
+        let me = store.account_for_telegram(1).unwrap();
+        let other = store.account_for_telegram(2).unwrap();
+        let conv = store.start_conversation(me, "direct").unwrap();
+        let others = store.start_conversation(other, "direct").unwrap();
+        let a = store.open_run(me, conv).unwrap();
+        let b = store.open_run(me, conv).unwrap();
+        let c = store.open_run(other, others).unwrap();
+        let before = store.open_run(me, conv).unwrap();
+        store.close_run(a, "answered", None, Some(Tokens { input: 1000, cached: 200, output: 50 })).unwrap();
+        store.close_run(b, "failed", Some("the model call failed"), Some(Tokens { input: 10, cached: 0, output: 0 })).unwrap();
+        store.close_run(c, "answered", None, Some(Tokens { input: 300, cached: 0, output: 20 })).unwrap();
+        // A run closed without a count — the debug seed, or an old build —
+        // says unknown, and is not summed as free.
+        store.close_run(before, "answered", None, None).unwrap();
+
+        let (row, _) = store.trace_of(a, me).unwrap().unwrap();
+        assert_eq!((row.input_tokens, row.cached_tokens, row.output_tokens), (Some(1000), Some(200), Some(50)));
+        let (row, _) = store.trace_of(before, me).unwrap().unwrap();
+        assert_eq!(row.input_tokens, None);
+
+        let cutoff = minutes_ago(60);
+        let mine = store.model_tokens_for(&cutoff, me).unwrap();
+        assert_eq!(mine.get(&me), Some(&Tokens { input: 1010, cached: 200, output: 50 }));
+        assert!(!mine.contains_key(&other), "own numbers only");
+        let all = store.model_tokens_all(&cutoff).unwrap();
+        assert_eq!(all.get(&other), Some(&Tokens { input: 300, cached: 0, output: 20 }));
+        assert!(store.model_tokens_all(&minutes_ago(-60)).unwrap().is_empty(), "nothing started in the future");
+    }
+
+    #[test]
+    fn step_26_gives_an_old_runs_table_the_token_columns_in_the_fresh_shape() {
+        let (fresh, _d) = test_store();
+        let dir = TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("old.duckdb")).unwrap();
+        conn.execute_batch(
+            "CREATE SEQUENCE runs_id_seq;
+             CREATE TABLE runs (id BIGINT PRIMARY KEY DEFAULT nextval('runs_id_seq'), account_id BIGINT NOT NULL,
+                                conversation_id BIGINT NOT NULL, started_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+                                ended_at TIMESTAMP, outcome TEXT, detail TEXT);",
+        )
+        .unwrap();
+        conn.execute_batch(STEP_26_RUN_TOKENS).unwrap();
+        assert_eq!(shape(&fresh.conn(), "runs"), shape(&conn, "runs"));
+    }
+
+    #[test]
     fn step_25_gives_an_old_login_table_the_join_column_in_the_fresh_shape() {
         let (fresh, _d) = test_store();
         let dir = TempDir::new().unwrap();
@@ -9485,7 +9722,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 25);
+        assert_eq!(store.schema_version().unwrap(), 26);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -10344,7 +10581,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 25, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 26, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -10385,7 +10622,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 25);
+        assert_eq!(s.schema_version().unwrap(), 26);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -10485,7 +10722,7 @@ CREATE TABLE conversations (
         // updated the table: the pod crash-looped on this step.
         let (_dir, path) = version_eighteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 25);
+        assert_eq!(s.schema_version().unwrap(), 26);
         let trip = s.list_trips(1).unwrap().remove(0);
         assert_eq!((trip.items[0].lat, trip.items[0].geocode_tried), (None, false));
         s.set_item_coords(trip.items[0].id, None).unwrap();
@@ -10522,7 +10759,7 @@ CREATE TABLE conversations (
     fn step_20_runs_on_a_database_that_has_items_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_nineteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 25);
+        assert_eq!(s.schema_version().unwrap(), 26);
         let item = &s.list_trips(1).unwrap()[0].items[0];
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
@@ -11225,7 +11462,7 @@ CREATE TABLE conversations (
     fn step_21_runs_on_a_database_with_trips_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 25);
+        assert_eq!(s.schema_version().unwrap(), 26);
         let trip = &s.list_trips(1).unwrap()[0];
         assert_eq!(trip.items[0].added, None, "an item from before sharing has no author");
         let (fresh, _d) = test_store();
@@ -11263,7 +11500,7 @@ CREATE TABLE conversations (
     fn step_22_runs_on_a_database_with_mail_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_one_db();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 25);
+        assert_eq!(s.schema_version().unwrap(), 26);
         let (fresh, _d) = test_store();
         // Not `mail_forwards`: `Store::open` runs `MIGRATIONS` before the
         // steps, so the table is there whatever step 22 says, and comparing
@@ -11857,7 +12094,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 25);
+        assert_eq!(store.schema_version().unwrap(), 26);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -11948,7 +12185,7 @@ CREATE TABLE messages (
 
         let run_id = store.open_run(me, conv).unwrap();
         store.append_traces(run_id, &[a_row(0, "search_web", Some(r#"{"hits":3}"#)), a_row(1, "fetch_page", None)]).unwrap();
-        store.close_run(run_id, "answered", None).unwrap();
+        store.close_run(run_id, "answered", None, Some(Tokens { input: 1200, cached: 300, output: 80 })).unwrap();
 
         let (run, rows) = store.trace_of(run_id, me).unwrap().expect("the owner reads it");
         assert_eq!(run.outcome.as_deref(), Some("answered"));
@@ -12021,7 +12258,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 25);
+        assert_eq!(store.schema_version().unwrap(), 26);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -12066,7 +12303,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 25);
+        assert_eq!(store.schema_version().unwrap(), 26);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -12142,7 +12379,7 @@ CREATE TABLE messages (
         // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 25);
+        assert_eq!(store.schema_version().unwrap(), 26);
         let part = mail_part("att_1", Some("inline"), None);
         let m = store
             .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))

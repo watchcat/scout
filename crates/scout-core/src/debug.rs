@@ -34,7 +34,7 @@ pub async fn seed_run_for_tests(core: &Core, account_id: i64, rows: Vec<scout_ap
         let conv = store.start_conversation(account_id, "direct")?;
         let id = store.open_run(account_id, conv)?;
         store.append_traces(id, &rows)?;
-        store.close_run(id, "answered", None)?;
+        store.close_run(id, "answered", None, None)?;
         Ok(id)
     })
     .await

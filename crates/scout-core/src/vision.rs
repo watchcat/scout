@@ -1,4 +1,4 @@
-use crate::agent::{LlmClient, MODEL};
+use crate::agent::AgentDeps;
 use crate::text::strip_thinking;
 use anyhow::{bail, Result};
 use base64::prelude::{Engine, BASE64_STANDARD};
@@ -15,7 +15,7 @@ explanations, no quotes.";
 
 /// Telegram photos are always JPEG.
 pub async fn describe_photo(
-    llm: &LlmClient,
+    d: &AgentDeps,
     image_jpeg: &[u8],
     caption: Option<&str>,
 ) -> Result<String> {
@@ -23,7 +23,7 @@ pub async fn describe_photo(
     if let Some(c) = caption.map(str::trim).filter(|c| !c.is_empty()) {
         preamble.push_str(&format!("\nUser note about this photo: {c}"));
     }
-    let agent = llm.agent(MODEL).preamble(&preamble).build();
+    let agent = d.llm.agent(&d.model).preamble(&preamble).build();
     let image = Image {
         data: DocumentSourceKind::base64(&BASE64_STANDARD.encode(image_jpeg)),
         media_type: Some(ImageMediaType::JPEG),
@@ -56,8 +56,8 @@ pub const PAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 /// For a PDF whose text cannot be read as text — printed to PDF as drawn
 /// shapes, or scanned — so what comes back is handed to the same extractor
 /// a text PDF's words are. `page_jpeg` is a JPEG of the page.
-pub async fn transcribe_page(llm: &LlmClient, page_jpeg: &[u8]) -> Result<String> {
-    let agent = llm.agent(MODEL).preamble(TRANSCRIBE_PREAMBLE).build();
+pub async fn transcribe_page(d: &AgentDeps, page_jpeg: &[u8]) -> Result<String> {
+    let agent = d.llm.agent(&d.model).preamble(TRANSCRIBE_PREAMBLE).build();
     let image = Image {
         data: DocumentSourceKind::base64(&BASE64_STANDARD.encode(page_jpeg)),
         media_type: Some(ImageMediaType::JPEG),

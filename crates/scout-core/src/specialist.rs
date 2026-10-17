@@ -121,12 +121,13 @@ impl Collector {
     ) -> Result<Report, SpecialistError> {
         // A summary that is itself a tool call is not an answer. The nested
         // model sometimes writes the call out as prose instead of making
-        // one (minimax-m3, measured in production; see the repair turn in
-        // run.rs). Here nothing repairs it: rig sees no structured call,
-        // ends the stream as a FinalResponse, and the markup lands in the
-        // summary with no finding behind it, which would otherwise pass
-        // as a clean, empty report. Only when nothing succeeded: a real
-        // finding is still worth handing over, whatever the prose says.
+        // one (minimax-m3, measured in production): rig sees no structured
+        // call, ends the stream as a FinalResponse, and the markup lands in
+        // the summary with no finding behind it, which would otherwise pass
+        // as a clean, empty report. `call` asks once for the call to be
+        // made; what reaches here is the second time, or a run cut short
+        // before it could ask. Only when nothing succeeded: a real finding
+        // is still worth handing over, whatever the prose says.
         let nothing_succeeded = self.findings.iter().all(|f| f.failed);
         let cut_short = match cut_short {
             None if nothing_succeeded && crate::toolcall::looks_like_tool_call(&self.summary) => {
@@ -225,14 +226,20 @@ where
         use futures::StreamExt;
         use rig::agent::MultiTurnStreamItem;
         use rig::completion::message::ToolResultContent;
-        use rig::streaming::{StreamedUserContent, StreamingPrompt};
+        use rig::streaming::{StreamedUserContent, StreamingChat};
 
         let started = tokio::time::Instant::now();
         let mut collector = Collector::default();
-        // No history on purpose: the brief is the whole conversation.
+        // No history on purpose: the brief is the whole conversation. The
+        // one exception is the repair pass below, which continues the
+        // turns the first pass made.
         let outcome: Result<Option<&'static str>, tokio::time::error::Elapsed> =
             tokio::time::timeout(self.budget, async {
-                let mut stream = self.agent.stream_prompt(args.brief.as_str()).await;
+                let mut prompt = args.brief.clone();
+                let mut history: Vec<rig::completion::Message> = Vec::new();
+                let mut repaired = false;
+                'pass: loop {
+                let mut stream = self.agent.stream_chat(prompt.as_str(), std::mem::take(&mut history)).await;
                 // When *this* stream last produced anything. The observer's
                 // pulse cannot answer that and must not be asked: it is the outer
                 // run's, touched below precisely so the parent counts this
@@ -299,6 +306,23 @@ where
                             // The nested run's calls are the parent run's cost.
                             self.observer.add_usage(res.usage());
                             collector.finished(res.output());
+                            // A summary that is itself a tool call, with
+                            // nothing searched, is the model writing the
+                            // call out as prose instead of making one —
+                            // minimax-m3 does, measured in production. Once,
+                            // it is asked to make the call, as run.rs asks
+                            // the main agent, over the turns so far and
+                            // within the same budget; the research it then
+                            // does is kept instead of thrown away. Twice is
+                            // not a slip, and `report` says so.
+                            let nothing_searched = collector.findings.iter().all(|f| f.failed);
+                            if !repaired && nothing_searched && crate::toolcall::looks_like_tool_call(&collector.summary) {
+                                repaired = true;
+                                self.observer.event("the desk wrote a tool call as text; asking it to make the call", false);
+                                prompt = crate::toolcall::REPAIR_NOTE.to_string();
+                                history = res.messages().map(|m| m.to_vec()).unwrap_or_default();
+                                continue 'pass;
+                            }
                             return None;
                         }
                         Ok(_) => {}
@@ -311,6 +335,7 @@ where
                             return Some("the model call failed");
                         }
                     }
+                }
                 }
             })
             .await;
@@ -650,6 +675,58 @@ mod tests {
             other => panic!("the chat must see the nested call: {other:?}"),
         }
         assert!(tool.observer.pulse.since() < std::time::Duration::from_secs(1), "the pulse was touched");
+    }
+
+    const PROSE_CALL: &str = "<tool_call>\n<invoke name=\"probe\"><q>7</q></invoke>\n</tool_call>";
+
+    /// A scripted model whose turns are `turns`, each a whole stream.
+    fn scripted_turns(turns: Vec<Vec<rig::test_utils::MockStreamEvent>>) -> rig::agent::Agent<rig::test_utils::MockCompletionModel> {
+        let allowed = turns.len() + 1;
+        let model = rig::test_utils::MockCompletionModel::from_stream_turns(turns);
+        rig::agent::AgentBuilder::new(model).preamble("test").tool(Probe).default_max_turns(allowed).build()
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_written_as_prose_is_asked_for_once_and_the_research_is_kept() {
+        use rig::test_utils::MockStreamEvent;
+        // Pass one: the call written out as text, nothing made. Asked
+        // again, the model makes it and answers.
+        let agent = scripted_turns(vec![
+            vec![MockStreamEvent::text(PROSE_CALL), MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::tool_call("t1", "probe", json!({"q": 7})), MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::text("Probed once."), MockStreamEvent::final_response_with_default_usage()],
+        ]);
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let observer = std::sync::Arc::new(crate::observer::Observer::new(events, 1));
+        let tool = specialist_with(agent, observer.clone());
+
+        let report = rig::tool::Tool::call(&tool, Brief { brief: "probe seven".to_string() }).await.unwrap();
+
+        assert_eq!(report.summary, "Probed once.");
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].args, json!({"q": 7}));
+        let rows = observer.take_rows();
+        assert!(
+            rows.iter().any(|r| r.kind == "event" && r.detail.as_deref().unwrap_or("").contains("tool call as text")),
+            "the repair is in the trace: {rows:?}"
+        );
+        assert_eq!(rows.iter().filter(|r| r.kind == "tool").count(), 1, "the probe, once");
+    }
+
+    #[tokio::test]
+    async fn prose_twice_is_the_failure_it_was_and_is_asked_only_once() {
+        use rig::test_utils::MockStreamEvent;
+        let prose = || vec![MockStreamEvent::text(PROSE_CALL), MockStreamEvent::final_response_with_default_usage()];
+        let agent = scripted_turns(vec![prose(), prose()]);
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let observer = std::sync::Arc::new(crate::observer::Observer::new(events, 1));
+        let tool = specialist_with(agent, observer.clone());
+
+        let err = rig::tool::Tool::call(&tool, Brief { brief: "probe seven".to_string() }).await.unwrap_err();
+
+        assert!(err.to_string().contains("tool call as text"), "got: {err}");
+        let repairs = observer.take_rows().iter().filter(|r| r.kind == "event").count();
+        assert_eq!(repairs, 1, "asked once, not until the budget runs out");
     }
 
     #[tokio::test]

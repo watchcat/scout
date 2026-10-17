@@ -100,6 +100,58 @@ fn flight_section(
     out
 }
 
+/// `format_stats`, with the model's tokens appended: what `/stat` sends.
+/// Separate from `format_stats` so the thirteen callers of that in the
+/// tests above and below stay as they are.
+pub fn format_stats_with_tokens(
+    rows: &[(i64, String, i64)],
+    days: u32,
+    today: NaiveDate,
+    caller: i64,
+    names: &BTreeMap<i64, String>,
+    flights: &BTreeMap<i64, i64>,
+    tokens: &BTreeMap<i64, crate::store::Tokens>,
+) -> String {
+    let mut out = format_stats(rows, days, today, caller, names, flights);
+    out.push_str(&token_section(tokens, caller, names));
+    out
+}
+
+/// Model tokens, listed apart because the model bills for them and until
+/// now nobody knew what a run cost. Omitted when no run in the window
+/// reported any — a window of runs from before the counting, or none.
+/// The cache column is the part of input the provider served from its
+/// own cache: on a provider that does, the thing to watch.
+fn token_section(tokens: &BTreeMap<i64, crate::store::Tokens>, caller: i64, names: &BTreeMap<i64, String>) -> String {
+    let mut users: Vec<(i64, crate::store::Tokens)> =
+        tokens.iter().map(|(u, t)| (*u, *t)).filter(|(_, t)| t.input + t.output > 0).collect();
+    if users.is_empty() {
+        return String::new();
+    }
+    users.sort_by_key(|(user, t)| (std::cmp::Reverse(t.input + t.output), *user));
+    let (input, cached, output) = users.iter().fold((0, 0, 0), |(i, c, o), (_, t)| (i + t.input, c + t.cached, o + t.output));
+    let mut out = format!("\n\nModel tokens: {} in ({} cached), {} out\n", compact(input), compact(cached), compact(output));
+    for (user, t) in users {
+        out.push_str(&format!(
+            "{:<NAME_WIDTH$}  {user:>10}  {:>7} in  {:>7} out\n",
+            display_label(user, caller, names),
+            compact(t.input),
+            compact(t.output),
+        ));
+    }
+    out
+}
+
+/// `12.3k`, `1.2M`: a token count a phone can read in a column.
+fn compact(n: i64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 10_000 => format!("{}k", n / 1000),
+        n if n >= 1_000 => format!("{:.1}k", n as f64 / 1e3),
+        n => n.to_string(),
+    }
+}
+
 /// `Alice (you)`, `Alice`, or `—` when nobody has recorded a name for that
 /// id yet. Truncation counts characters, not bytes: plenty of these names
 /// are Cyrillic.
@@ -125,6 +177,31 @@ pub fn parse_days(arg: &str) -> Result<u32, String> {
         Ok(d @ 1..=90) => Ok(d),
         Ok(_) => Err("days must be between 1 and 90".to_string()),
         Err(_) => Err(format!("not a number of days: {arg:?}")),
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    use crate::store::Tokens;
+
+    #[test]
+    fn model_tokens_get_their_own_section_and_none_means_no_section() {
+        let names: BTreeMap<i64, String> = [(1, "Alice".to_string()), (2, "Bob".to_string())].into_iter().collect();
+        let tokens: BTreeMap<i64, Tokens> = [
+            (1, Tokens { input: 12_345, cached: 4_000, output: 1_500 }),
+            (2, Tokens { input: 1_200_000, cached: 0, output: 98 }),
+            (3, Tokens::default()),
+        ]
+        .into_iter()
+        .collect();
+        let out = token_section(&tokens, 1, &names);
+        assert!(out.starts_with("\n\nModel tokens: 1.2M in (4.0k cached), 1.6k out\n"), "{out}");
+        let lines: Vec<&str> = out.trim().lines().skip(1).collect();
+        assert_eq!(lines.len(), 2, "an account with nothing counted is left out: {out}");
+        assert!(lines[0].starts_with("Bob") && lines[0].contains("1.2M in") && lines[0].contains("98 out"), "the biggest first: {}", lines[0]);
+        assert!(lines[1].starts_with("Alice (you)") && lines[1].contains("12k in") && lines[1].contains("1.5k out"), "{}", lines[1]);
+        assert_eq!(token_section(&BTreeMap::new(), 1, &names), "");
     }
 }
 
@@ -416,21 +493,22 @@ pub async fn report(core: &crate::core::Core, telegram_id: i64, arg: &str) -> St
 
     let store = core.store();
     let data = crate::core::blocking(move || {
-        let (rows, flights) = if admin {
-            (store.usage_stats_all(&cutoff)?, store.flight_searches_all(&cutoff)?)
+        let (rows, flights, tokens) = if admin {
+            (store.usage_stats_all(&cutoff)?, store.flight_searches_all(&cutoff)?, store.model_tokens_all(&cutoff)?)
         } else {
             (
                 store.usage_stats_for(&cutoff, account_id)?,
                 store.flight_searches_for(&cutoff, account_id)?,
+                store.model_tokens_for(&cutoff, account_id)?,
             )
         };
-        Ok((rows, store.display_names()?, flights))
+        Ok((rows, store.display_names()?, flights, tokens))
     })
     .await;
 
     match data {
-        Ok((rows, names, flights)) => {
-            let mut out = format_stats(&rows, days, today, account_id, &names, &flights);
+        Ok((rows, names, flights, tokens)) => {
+            let mut out = format_stats_with_tokens(&rows, days, today, account_id, &names, &flights, &tokens);
             if admin {
                 out.push_str(&backup_line(core));
             }

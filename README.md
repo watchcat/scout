@@ -270,7 +270,8 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - Reorder reminders for things you buy periodically, delivered in Telegram
 - `/stat` for usage with a text bar chart — your own numbers, or everyone's
   if you're the admin. Flight searches are counted separately, because
-  those are the ones a provider bills for
+  those are the ones a provider bills for, and so are the model's tokens —
+  input, cached and output, as the provider reported them for each run
 - `/advert <text>` — admin only, announces something to everyone who has
   used the bot. It goes to the chat each person actually talks in, says who
   sent it, and reports who could not be reached

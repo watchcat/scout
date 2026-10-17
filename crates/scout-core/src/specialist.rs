@@ -296,6 +296,8 @@ where
                             self.observer.tool_finished(&internal_call_id, &text);
                         }
                         Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                            // The nested run's calls are the parent run's cost.
+                            self.observer.add_usage(res.usage());
                             collector.finished(res.output());
                             return None;
                         }

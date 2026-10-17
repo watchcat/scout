@@ -25,6 +25,10 @@ pub struct Observer {
     /// Where tool calls and the run's end are counted: the process's set,
     /// or under test one of the test's own.
     pub(crate) metrics: &'static crate::metrics::Metrics,
+    /// What the run's model calls have cost so far, every call added as
+    /// it finishes: the streamed run, the flight desk's nested run, and
+    /// the repair and wrap-up turns.
+    usage: Mutex<rig::completion::Usage>,
 }
 
 fn now_iso() -> String {
@@ -49,7 +53,28 @@ impl Observer {
             open: Mutex::new(HashMap::new()),
             started: std::time::Instant::now(),
             metrics: crate::metrics::global(),
+            usage: Mutex::new(rig::completion::Usage::new()),
         }
+    }
+
+    /// One model call's tokens, as the provider reported them, added to
+    /// the run's. A provider that reports nothing adds zeros, which is
+    /// what "unknown" looks like in a sum.
+    pub fn add_usage(&self, used: rig::completion::Usage) {
+        let mut total = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        total.input_tokens += used.input_tokens;
+        total.output_tokens += used.output_tokens;
+        total.total_tokens += used.total_tokens;
+        total.cached_input_tokens += used.cached_input_tokens;
+        total.cache_creation_input_tokens += used.cache_creation_input_tokens;
+        total.reasoning_tokens += used.reasoning_tokens;
+    }
+
+    /// The run's tokens so far, in the store's shape.
+    pub fn tokens(&self) -> crate::store::Tokens {
+        let used = *self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let clamp = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        crate::store::Tokens { input: clamp(used.input_tokens), cached: clamp(used.cached_input_tokens), output: clamp(used.output_tokens) }
     }
 
     /// How long since the run began.
@@ -224,6 +249,23 @@ mod tests {
         assert!(page.contains("scout_tool_calls_total{tool=\"search_web\",status=\"ok\"} 1\n"), "{page}");
         assert!(page.contains("scout_tool_calls_total{tool=\"search_flights\",status=\"failed\"} 1\n"), "{page}");
         assert_eq!(page.matches("scout_tool_calls_total{").count(), 2, "{page}");
+    }
+
+    #[test]
+    fn every_model_calls_tokens_add_up_to_the_runs() {
+        let (o, _seen) = observer();
+        assert_eq!(o.tokens(), crate::store::Tokens::default(), "nothing yet");
+        let mut streamed = rig::completion::Usage::new();
+        streamed.input_tokens = 1000;
+        streamed.cached_input_tokens = 200;
+        streamed.output_tokens = 50;
+        let mut wrap_up = rig::completion::Usage::new();
+        wrap_up.input_tokens = 300;
+        wrap_up.output_tokens = 20;
+        o.add_usage(streamed);
+        o.add_usage(wrap_up);
+        o.add_usage(rig::completion::Usage::new()); // a provider that said nothing
+        assert_eq!(o.tokens(), crate::store::Tokens { input: 1300, cached: 200, output: 70 });
     }
 
     #[test]

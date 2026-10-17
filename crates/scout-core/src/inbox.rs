@@ -416,9 +416,6 @@ pub const EXTRACT_BUDGET: std::time::Duration = std::time::Duration::from_secs(6
 /// One tool-less model call. `text` is the email body plus any attachment
 /// text, already capped by the worker.
 pub async fn extract(core: &Core, text: &str) -> anyhow::Result<Vec<Extraction>> {
-    use rig::client::CompletionClient;
-    use rig::completion::Prompt;
-    let agent = core.deps.llm.agent(&core.deps.model).preamble(EXTRACT_PREAMBLE).build();
     // Today, and what a yearless date means: a boarding pass says "21 SEP"
     // and nothing more, and read without this it became a flight a year
     // in the past, on its own leg beside the one it was a pass for.
@@ -427,7 +424,7 @@ pub async fn extract(core: &Core, text: &str) -> anyhow::Result<Vec<Extraction>>
         "Today is {today}. A date stated without a year is its next occurrence from today, never a past one.\n\n\
          Forwarded email follows.\n\n---\n{text}\n---\n\nThe JSON object:"
     );
-    let answer = tokio::time::timeout(EXTRACT_BUDGET, agent.prompt(prompt)).await??;
+    let answer = crate::agent::side_call(&core.deps, crate::agent::SIDE_EXTRACT, EXTRACT_BUDGET, EXTRACT_PREAMBLE, prompt).await?;
     Extraction::parse_many(&answer)
 }
 

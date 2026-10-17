@@ -416,6 +416,8 @@ compiles from source.
 | `LLM_BASE_URL` | no | `https://api.minimax.io/v1` | where the OpenAI-shaped chat API lives: another provider, or a proxy of your own. `MINIMAX_BASE_URL` is still read |
 | `LLM_MODEL` | no | `minimax-m3` | the model every agent runs on |
 | `FLIGHT_MODEL` | no | `LLM_MODEL` | the model the flight agent runs on |
+| `SIDE_LLM_MODEL` | no | — | a second model for the tool-less side calls only (titles, the continuation check, mail extraction, photo and page reading); `/metrics` counts each call's tokens and time by model |
+| `SIDE_LLM_BASE_URL` + `SIDE_LLM_API_KEY` | no | the main provider's | where that model lives, if elsewhere |
 | `KAGI_API_KEY` | **yes** | — | search: small-retailer coverage, `site:` scoping |
 | `PERPLEXITY_API_KEY` | no | — | second engine, merged with Kagi; carries the multi-language fan-out cheaply |
 | `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` | no | — | eBay Browse API: live prices, condition, shipping |

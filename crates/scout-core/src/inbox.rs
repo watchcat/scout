@@ -2275,9 +2275,20 @@ mod tests {
         let (core, _dir) = core();
         let store = core.store();
         let a = store.account_for_telegram(1).unwrap();
-        let lisbon = store.upsert_trip(a, "Lisbon, October", None, None, None).unwrap();
-        store.add_flight(lisbon.id, "AMS", "LIS", "2026-10-12").unwrap();
-        store.add_flight(lisbon.id, "LIS", "AMS", "2026-10-19").unwrap();
+        // The dates are counted from today rather than written down: a
+        // booking dated further back than `PAST_GRACE_DAYS` is read as its
+        // next occurrence, so a fixed date quietly moves this booking a
+        // year out, off the trip's window and into a draft of its own.
+        let today = chrono::Utc::now().date_naive();
+        let out = (today + chrono::Duration::days(30)).to_string();
+        let stay_date = today + chrono::Duration::days(31);
+        let stay = stay_date.to_string();
+        let ends = (today + chrono::Duration::days(33)).to_string();
+        let back = (today + chrono::Duration::days(37)).to_string();
+        let name = format!("Lisbon, {}", stay_date.format("%B"));
+        let lisbon = store.upsert_trip(a, &name, None, None, None).unwrap();
+        store.add_flight(lisbon.id, "AMS", "LIS", &out).unwrap();
+        store.add_flight(lisbon.id, "LIS", "AMS", &back).unwrap();
 
         let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().expect("new");
         assert_eq!(record_mail(&core, a, mail_in("re_1")).await.unwrap(), None, "a redelivery is a no-op");
@@ -2289,15 +2300,15 @@ mod tests {
             confirmation_code: Some("ABC123".into()),
             price: Some(320.0),
             currency: Some("EUR".into()),
-            ends_at: Some("2026-10-15".into()),
+            ends_at: Some(ends.clone()),
             travellers: Some(vec!["Sasha".into(), "Kim".into()]),
-            ..arrival("stay", "Hotel Alfama", Some("Lisbon"), "2026-10-13")
+            ..arrival("stay", "Hotel Alfama", Some("Lisbon"), &stay)
         };
         let (ids, placement) = record_arrivals(&core, a, mail_id, vec![e]).await.unwrap();
         let id = ids[0];
         assert_eq!(placement, Some(Placement::Trip(lisbon.id)));
-        assert_eq!(trip_name(&core, a, lisbon.id).await.unwrap().as_deref(), Some("Lisbon, October"));
-        assert_eq!(view(&core, a, "d").await.unwrap().pending[0].trip_name.as_deref(), Some("Lisbon, October"));
+        assert_eq!(trip_name(&core, a, lisbon.id).await.unwrap().as_deref(), Some(name.as_str()));
+        assert_eq!(view(&core, a, "d").await.unwrap().pending[0].trip_name.as_deref(), Some(name.as_str()));
 
         let plan = match add_arrival(&core, a, id, AddTarget::Matched).await.unwrap() {
             Outcome::Done(plan) => plan,
@@ -2305,11 +2316,11 @@ mod tests {
         };
         assert_eq!(plan.trip.id, lisbon.id);
         let item = plan.trip.items.iter().find(|i| i.arrival_id == Some(id)).expect("the booking is on the trip");
-        assert_eq!((item.kind.as_str(), item.title.as_str(), item.place.as_deref(), item.date.as_str()), ("stay", "Hotel Alfama", Some("Lisbon"), "2026-10-13"));
+        assert_eq!((item.kind.as_str(), item.title.as_str(), item.place.as_deref(), item.date.as_str()), ("stay", "Hotel Alfama", Some("Lisbon"), stay.as_str()));
         assert!(item.booked);
         assert_eq!(item.confirmation_code.as_deref(), Some("ABC123"));
         assert_eq!((item.price, item.currency.as_deref()), (Some(320.0), Some("EUR")));
-        assert_eq!(item.ends_at.as_deref(), Some("2026-10-15"));
+        assert_eq!(item.ends_at.as_deref(), Some(ends.as_str()));
         // Travellers stay on the arrival row: the wire `Arrival` does not
         // carry them, so the item is not the place they are read from.
         assert_eq!(item.notes, None);

@@ -20,6 +20,17 @@ _(nothing)_
 
 ## Backlog
 
+### Shopping
+
+Spec: `docs/superpowers/specs/2026-11-17-price-watch-and-shop-browsing-design.md`. The gated cards close with the measurement as their result if the rule in the spec is not met.
+
+- [ ] **Price watch** — "tell me when it is under €300": `watch_price` starts a watch only on a page whose price Rust can read, the hourly maintenance tick re-reads each watch once a day with no model call, and one message goes out on a hit, after three unreadable days, or at sixty days; list and stop in conversation; ten live watches an account; offered only where a reminder is
+- [ ] **What the traces say about pages Scout cannot price** — `scripts/unread-pages.py` over the nightly backup, sixty days: `fetch_page` by host (price read, read only after a render, blocked, no price) and offers that reached `compare_prices` with no shipping cost; the write-up names the ten hosts the next card measures
+- [ ] **Shop reach** — those ten hosts read three ways from the node's address (plain request, one-shot render, driven session): the price, a variant's price, shipping to a postcode, a delivery date, and whether the shop refused the session; turns, tokens and seconds for the driven ones; a second table of shops with a variant or cart link. Decides the three gated cards
+- [ ] **Browser sessions** — _gated on Shop reach._ `scout-browser` drives a page over HTTP: open, read, click, type, select, back, each returning an outline; one shop a session, nothing personal typed, no downloads; three at once, 25 actions, 120 s
+- [ ] **The shop desk (`ask_shops`)** — _gated on Shop reach; needs Chromium's own pod and Browser sessions._ A second `Specialist`: a brief and up to three product pages in, one nested run a page, offers out through `report_offer`, each amount checked in Rust against the page it was read from; admins first, a reading after two weeks
+- [ ] **Cart links** — _gated on Shop reach's second table._ An offer carries the shop's own variant or cart link where it has a stable one, built in Rust from identifiers read off the page
+
 ### Scaling
 - [ ] **Lock-wait tracing** — a span around every store call with the time spent waiting on the mutex; the numbers decide the next card
 - [ ] **DB decision** — stay on DuckDB with read-only `try_clone()` connections, or move to SQLite (`rusqlite` bundled, WAL) — SQLite also removes the 10-minute C++ build that shapes the whole deploy pipeline
@@ -47,6 +58,7 @@ The repo deploys through `compose.yaml` for local and `deploy/k8s/` for producti
 
 - [ ] **`startupProbe` on the deployment** — `initialDelaySeconds: 5` on liveness is optimistic given a cold DuckDB open + the migration walk + a first Chromium paint. Add a startupProbe that watches `/healthz` and tolerates ~60 s × 5 attempts so a slow first paint is not a CrashLoopBackoff. The probe also makes it visible to `kubectl describe pod` *why* the pod is not yet ready, which a fixed `initialDelaySeconds` hides
 - [ ] **`NetworkPolicy` for egress** — the bot fetches arbitrary user-targeted URLs and renders them in Chromium; a compromise exfiltrates over the same channel. Allow-list Kagi, Perplexity, Duffel, Ignav, Resend, Nominatim, eBay, Marktplaats, Bol, Vinted and Telegram's API; default-deny everything else. `kubectl exec` still works for one-off debugging by widening the namespace's policy. Today nothing enforces the smallest-acceptable-egress principle the README claims
+- [ ] **Chromium in a pod of its own** — today a renderer taken over by a page has Scout's uid, its keys in the environment and the database a file away. A second Deployment, `scout-browser`, from the same image: no secret, no service-account token, read-only root, 1.5 Gi; a `NetworkPolicy` lets in Scout only and lets out DNS and the public internet, not the cluster; `Renderer` goes remote when `SCOUT_BROWSER_URL` is set; `scripts/check-browser-fence.sh` proves the fence after a deploy. Worth doing with or without the shop desk (`docs/superpowers/specs/2026-11-17-price-watch-and-shop-browsing-design.md`, Part 2)
 - [ ] **`ServiceMonitor` / Prometheus scrape** — `/metrics` is on `0.0.0.0:9090` with the comment "deliberately in neither Service nor Ingress" (correct), but nothing *is* scraping it either. A `monitoring.coreos.com/ServiceMonitor` (or a Loki/Promtail pipeline at the node) gives you post-mortems across time, not just at the moment you remember to run `scripts/metrics.sh`
 - [ ] **Document the missing `PodDisruptionBudget`** — single replica makes it moot today; record its absence on the deployment notes so a future "scale to 2" knows the eviction story has not been designed
 - [ ] **`/version` endpoint on the site** — returns `git_sha`, `rustc_version`, build time, the value of `RUN_BUDGET`, and the model id in use. Makes "what is running" a one-click rather than a deploy-log dive, and gives the admin `/diag` something to quote

@@ -1168,8 +1168,22 @@ pub async fn record_arrivals(
     mail_id: i64,
     readings: Vec<Extraction>,
 ) -> anyhow::Result<(Vec<i64>, Option<Placement>)> {
+    record_arrivals_on(core, account_id, mail_id, readings, chrono::Utc::now().date_naive()).await
+}
+
+/// `record_arrivals`, read on `today`. The day decides one thing here —
+/// which booking is dated far enough back to be read as its next
+/// occurrence — and it is an argument so that a test can say which day it
+/// means: one that asked the clock passed until a fortnight after the
+/// dates it had written down.
+async fn record_arrivals_on(
+    core: &Core,
+    account_id: i64,
+    mail_id: i64,
+    readings: Vec<Extraction>,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<(Vec<i64>, Option<Placement>)> {
     let store = core.store();
-    let today = chrono::Utc::now().date_naive();
     blocking(move || {
         let readings: Vec<Extraction> = readings
             .into_iter()
@@ -1837,6 +1851,28 @@ mod tests {
         (Core::start(crate::config::Config::for_test(&p), None).unwrap(), dir)
     }
 
+    /// The day these tests read their mail on: before every date they
+    /// write down, so none of them is a booking from the past. A test that
+    /// let the clock decide was a clock itself: a fortnight after a date it
+    /// had written down, that booking was read as next year's while the
+    /// others in the test stayed where they were written, and it failed on
+    /// a day nobody had changed anything.
+    fn as_of() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 1).expect("a real date")
+    }
+
+    /// `record_arrivals` on `as_of()`. It shadows the one `super::*` brings
+    /// in, so a test here does not reach the clock by calling the obvious
+    /// name; the one test that means to says `super::record_arrivals`.
+    async fn record_arrivals(
+        core: &Core,
+        account_id: i64,
+        mail_id: i64,
+        readings: Vec<Extraction>,
+    ) -> anyhow::Result<(Vec<i64>, Option<Placement>)> {
+        record_arrivals_on(core, account_id, mail_id, readings, as_of()).await
+    }
+
     /// Where one reading would land. `record_arrivals` decides this for a
     /// whole mail off one load of the trips; this is the one-booking form,
     /// for the tests that are about the rule rather than about the batch.
@@ -2275,9 +2311,23 @@ mod tests {
         let (core, _dir) = core();
         let store = core.store();
         let a = store.account_for_telegram(1).unwrap();
-        let lisbon = store.upsert_trip(a, "Lisbon, October", None, None, None).unwrap();
-        store.add_flight(lisbon.id, "AMS", "LIS", "2026-10-12").unwrap();
-        store.add_flight(lisbon.id, "LIS", "AMS", "2026-10-19").unwrap();
+        // The dates are counted from today rather than written down: a
+        // booking dated further back than `PAST_GRACE_DAYS` is read as its
+        // next occurrence, so a fixed date quietly moves this booking a
+        // year out, off the trip's window, and it is placed as a draft
+        // where the test expects the trip.
+        // This is the test that reads the real clock, through
+        // `super::record_arrivals`; the others are read on `as_of()`.
+        let today = chrono::Utc::now().date_naive();
+        let out = (today + chrono::Duration::days(30)).to_string();
+        let stay_date = today + chrono::Duration::days(31);
+        let stay = stay_date.to_string();
+        let ends = (today + chrono::Duration::days(33)).to_string();
+        let back = (today + chrono::Duration::days(37)).to_string();
+        let name = format!("Lisbon, {}", stay_date.format("%B"));
+        let lisbon = store.upsert_trip(a, &name, None, None, None).unwrap();
+        store.add_flight(lisbon.id, "AMS", "LIS", &out).unwrap();
+        store.add_flight(lisbon.id, "LIS", "AMS", &back).unwrap();
 
         let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().expect("new");
         assert_eq!(record_mail(&core, a, mail_in("re_1")).await.unwrap(), None, "a redelivery is a no-op");
@@ -2289,15 +2339,15 @@ mod tests {
             confirmation_code: Some("ABC123".into()),
             price: Some(320.0),
             currency: Some("EUR".into()),
-            ends_at: Some("2026-10-15".into()),
+            ends_at: Some(ends.clone()),
             travellers: Some(vec!["Sasha".into(), "Kim".into()]),
-            ..arrival("stay", "Hotel Alfama", Some("Lisbon"), "2026-10-13")
+            ..arrival("stay", "Hotel Alfama", Some("Lisbon"), &stay)
         };
-        let (ids, placement) = record_arrivals(&core, a, mail_id, vec![e]).await.unwrap();
+        let (ids, placement) = super::record_arrivals(&core, a, mail_id, vec![e]).await.unwrap();
         let id = ids[0];
         assert_eq!(placement, Some(Placement::Trip(lisbon.id)));
-        assert_eq!(trip_name(&core, a, lisbon.id).await.unwrap().as_deref(), Some("Lisbon, October"));
-        assert_eq!(view(&core, a, "d").await.unwrap().pending[0].trip_name.as_deref(), Some("Lisbon, October"));
+        assert_eq!(trip_name(&core, a, lisbon.id).await.unwrap().as_deref(), Some(name.as_str()));
+        assert_eq!(view(&core, a, "d").await.unwrap().pending[0].trip_name.as_deref(), Some(name.as_str()));
 
         let plan = match add_arrival(&core, a, id, AddTarget::Matched).await.unwrap() {
             Outcome::Done(plan) => plan,
@@ -2305,11 +2355,11 @@ mod tests {
         };
         assert_eq!(plan.trip.id, lisbon.id);
         let item = plan.trip.items.iter().find(|i| i.arrival_id == Some(id)).expect("the booking is on the trip");
-        assert_eq!((item.kind.as_str(), item.title.as_str(), item.place.as_deref(), item.date.as_str()), ("stay", "Hotel Alfama", Some("Lisbon"), "2026-10-13"));
+        assert_eq!((item.kind.as_str(), item.title.as_str(), item.place.as_deref(), item.date.as_str()), ("stay", "Hotel Alfama", Some("Lisbon"), stay.as_str()));
         assert!(item.booked);
         assert_eq!(item.confirmation_code.as_deref(), Some("ABC123"));
         assert_eq!((item.price, item.currency.as_deref()), (Some(320.0), Some("EUR")));
-        assert_eq!(item.ends_at.as_deref(), Some("2026-10-15"));
+        assert_eq!(item.ends_at.as_deref(), Some(ends.as_str()));
         // Travellers stay on the arrival row: the wire `Arrival` does not
         // carry them, so the item is not the place they are read from.
         assert_eq!(item.notes, None);
@@ -3411,6 +3461,29 @@ mod tests {
         assert!(pending_of_mail(&core, account_id + 1, mail_id).await.unwrap().is_empty(), "not another account's");
         ignore_arrival(&core, account_id, arrival_id).await.unwrap();
         assert!(pending_of_mail(&core, account_id, mail_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reading_is_stored_and_placed_by_the_date_the_day_it_was_read_makes_of_it() {
+        // `forward_dated` has a test of its own. This is that the rule is
+        // applied where a reading is stored, on the day that was given,
+        // and before the booking is placed: read a year late, the stay is
+        // on the trip its next occurrence falls in.
+        for (read_on, filed, on_the_trip) in [("2026-09-01", "2026-10-13", true), ("2025-09-01", "2025-10-13", false)] {
+            let (core, _dir) = core();
+            let store = core.store();
+            let a = store.account_for_telegram(1).unwrap();
+            let lisbon = store.upsert_trip(a, "Lisbon, October", None, None, None).unwrap();
+            store.add_flight(lisbon.id, "AMS", "LIS", "2026-10-12").unwrap();
+            store.add_flight(lisbon.id, "LIS", "AMS", "2026-10-19").unwrap();
+            let mail_id = record_mail(&core, a, mail_in("re_1")).await.unwrap().unwrap();
+            let today = chrono::NaiveDate::parse_from_str(read_on, "%Y-%m-%d").unwrap();
+            let stay = arrival("stay", "Hotel Alfama", Some("Lisbon"), "2025-10-13");
+            let (ids, placement) = record_arrivals_on(&core, a, mail_id, vec![stay], today).await.unwrap();
+            let stored = store.arrival_of(ids[0], a).unwrap().unwrap();
+            assert_eq!(stored.date.as_deref(), Some(filed), "read on {read_on}");
+            assert_eq!(placement == Some(Placement::Trip(lisbon.id)), on_the_trip, "read on {read_on}: {placement:?}");
+        }
     }
 
     #[test]

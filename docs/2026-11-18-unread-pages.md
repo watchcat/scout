@@ -8,6 +8,12 @@ of 2026-11-18, from `scripts/unread-pages.py` run over the nightly backup:
 sixty days, 2026-09-19 to 2026-11-17, 71 runs that opened a page or
 compared prices. Small numbers; read them as shape, not precision.
 
+> **Corrected the same day** by `docs/2026-11-18-shop-reach.md`: 23 of the
+> 167 pages counted below as "read with no price" were refusals that
+> `fetch_page` did not recognise and handed over as the page, 20 of them
+> on bol.com. A wall stopped 54 of the 282 pages asked for, not 31. Both
+> rows of the rule stay met.
+
 ## How a read ends
 
 `fetch_page` hands back the page's text, its links, and — when the page's

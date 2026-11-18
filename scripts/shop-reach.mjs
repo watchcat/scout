@@ -25,6 +25,11 @@
 //   cargo build -p scout-core --example page_as_read
 //   scripts/shop-reach.mjs read products.json out/ [--only label] [--ways plain,render,drive]
 //   scripts/shop-reach.mjs table out/ [--name-all]
+//   scripts/shop-reach.mjs follow <address>... [--needle text]...
+//
+// `follow` opens addresses one after another in a single session and says
+// where each landed and whether the page wrote each needle: how a link that
+// claims to pick a variant or fill a basket is checked.
 //
 // products.json: [{"label": "a", "host": "shop.example", "public": true,
 // "url": "https://shop.example/p/1"}]. `public` says whether the host may be
@@ -46,7 +51,7 @@ const run = promisify(execFile)
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.dirname(HERE)
 const EXTRACTOR = path.join(ROOT, 'target/debug/examples/page_as_read')
-const CHROME = process.env.SCOUT_CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+export const CHROME = process.env.SCOUT_CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 
 export const MAX_TYPED = 64
 const OUTLINE_CHARS = 6000
@@ -58,14 +63,32 @@ const NUMBERS = ['price', 'variant_price', 'shipping']
 // ---------------------------------------------------------------- deciding
 
 /// The extractor's rule (`text_writes_amount`, tools/fetch.rs): "12.99" or
-/// "12,99", not a piece of a longer number. Zero is never written as a
-/// number worth trusting, so free is confirmed by a word for it.
+/// "12,99", not a piece of a longer number. Wider than it in two ways a
+/// shop's visible page needs and embedded data does not: a whole amount is
+/// also "259,-" or "€ 259", and zero, which nobody writes as a number worth
+/// trusting, is confirmed by a word for free.
 export function textWritesAmount(text, amount) {
   if (typeof amount !== 'number' || !Number.isFinite(amount)) return false
-  if (amount === 0) return /\b(gratis|kostenlos\w*|kostenfrei\w*|free)\b/i.test(text) || /(?<![0-9.,])0[.,]00(?![0-9.,])/.test(text)
+  if (amount === 0) {
+    return /\b(gratis|kostenlos\w*|kostenfrei\w*|versandkostenfrei\w*|free)\b/i.test(text) ||
+      /\b(keine versandkosten|geen verzendkosten)\b/i.test(text) || /(?<![0-9.,])0[.,]00(?![0-9.,])/.test(text)
+  }
   const point = amount.toFixed(2)
   const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return [point, point.replace('.', ',')].some((needle) => new RegExp(`(?<![0-9.,])${escape(needle)}(?![0-9.,])`).test(text))
+  if ([point, point.replace('.', ',')].some((needle) => new RegExp(`(?<![0-9.,])${escape(needle)}(?![0-9.,])`).test(text))) return true
+  if (!Number.isInteger(amount)) return false
+  const n = String(amount)
+  const alone = `(?<![0-9.,])${n}`
+  return new RegExp(`${alone}[.,][-–—]`).test(text) ||
+    new RegExp(`(?:€|EUR)\\s?${n}(?![0-9]|[.,][0-9])`).test(text) && new RegExp(`(?:€|EUR)\\s?${alone}`).test(text) ||
+    new RegExp(`${alone}\\s?(?:€|EUR)`).test(text)
+}
+
+/// Whether two wordings name the same option: a model writes a hyphen where
+/// the page has a dash, and drops a colon.
+export function sameOption(a, b) {
+  const flat = (s) => String(s).toLowerCase().replace(/×/g, 'x').replace(/[^\p{L}\p{N}]/gu, '')
+  return flat(a) !== '' && flat(a) === flat(b)
 }
 
 const TWO_LABEL_SUFFIXES = new Set(['co.uk', 'com.hk', 'co.il', 'com.au', 'co.nz', 'com.tr', 'co.jp', 'com.br'])
@@ -114,15 +137,32 @@ export function refusedBy(status, title, text) {
   return String(text || '').length < 1500 && WALL_WORDS.test(text || '')
 }
 
+/// Why a session ends without asking the model again, or null. A model told
+/// to stop at a refusal mostly does; once it went on opening pages of a shop
+/// that had blocked it, so the loop does not leave it the choice.
+export function turnedAway({ firstWall, walls, wallsInARow }) {
+  if (firstWall) return 'the product page was refused'
+  if (wallsInARow >= 2) return 'the shop refused two pages running'
+  if (walls >= 3) return 'the shop refused three pages'
+  return null
+}
+
 /// Which of a report's findings the shown text writes. null: not reported.
 export function checkReport(report, texts) {
   const seen = texts.join('\n')
   const flat = seen.toLowerCase().replace(/\s+/g, ' ')
   const out = {}
-  for (const key of NUMBERS) out[key] = report?.[key] == null ? null : textWritesAmount(seen, Number(report[key]))
-  // The wording as quoted, less the quotation marks and the full stop a model adds.
-  const delivery = report?.delivery ? String(report.delivery).toLowerCase().replace(/\s+/g, ' ').replace(/^[\s"'“”‘’«»]+|[\s"'“”‘’«».]+$/g, '') : null
-  out.delivery = delivery ? flat.includes(delivery) : null
+  for (const key of NUMBERS) {
+    const amount = report?.[key] == null ? null : Number(report[key])
+    // Nothing costs less than nothing, and only delivery is ever free.
+    out[key] = amount === null ? null : amount < 0 || (amount === 0 && key !== 'shipping') ? false : textWritesAmount(seen, amount)
+  }
+  // The wording as quoted: one quotation among several is enough, if it is
+  // long enough to be a wording and not a word.
+  const quoted = report?.delivery
+    ? String(report.delivery).toLowerCase().replace(/\s+/g, ' ').split(/["“”«»]|(?:^|\s)['‘’]|['‘’](?:\s|$|[.,;])|\s\/\s|;/).map((q) => q.replace(/^[\s.]+|[\s.]+$/g, '')).filter((q) => q.length >= 8)
+    : null
+  out.delivery = quoted ? quoted.some((q) => flat.includes(q)) : null
   return out
 }
 
@@ -183,6 +223,7 @@ const money = (n) => (typeof n === 'number' ? n.toFixed(2) : '—')
 function cells(way) {
   if (!way) return ['not run', '', '', '', '']
   const { report, verified = {} } = way
+  if (!report || report.refused || way.refused) return ['—', '—', '—', '—']
   const cell = (key) => (report?.[key] == null ? '—' : verified[key] ? money(Number(report[key])) : `${money(Number(report[key]))} (not on the page)`)
   const delivery = report?.delivery ? (verified.delivery ? 'stated' : 'stated (not on the page)') : '—'
   return [cell('price'), cell('variant_price'), cell('shipping'), delivery]
@@ -192,13 +233,15 @@ function how(name, way) {
   if (!way) return 'not run'
   if (name === 'drive') {
     const tokens = (way.prompt_tokens + way.completion_tokens).toLocaleString('en-US')
-    const end = way.refused ? 'refused' : way.stopped === 'reported' ? 'reported' : `cut at its ${way.stopped}`
+    const end = way.refused ? 'refused' : way.stopped === 'reported' ? 'reported' : /^turned away/.test(way.stopped || '') ? 'turned away' : `cut at its ${way.stopped}`
     return `${end}; ${way.turns} turns, ${way.actions} actions, ${tokens} tokens, ${Math.round(way.seconds)} s`
   }
-  if (way.error) return `no answer`
+  if (way.error && !way.status) return 'no answer'
   if (way.challenge) return `HTTP ${way.status}, a bot check`
   if (way.status && way.status !== 200) return `HTTP ${way.status}`
   if (name === 'render' && way.unusable) return 'nothing usable'
+  // What fetch_page hands the model today as if it were the page.
+  if (way.report?.refused) return 'a refusal page, taken for the page'
   return way.product_price ? 'read, priced by the page’s own data' : 'read'
 }
 
@@ -361,6 +404,10 @@ const READER_BRIEF = `You are reading one product page for a buyer in the Nether
 
 ${ASKED}
 
+You cannot choose anything here, so report another variant only if the text itself lists another option of this same product with its own price beside it. Another product's price is not a variant's.
+"Free above an amount" is free only if this product's price is above that amount; otherwise the text has not said what delivery costs, and shipping is left out.
+Set refused only for a bot check or an access-denied page. A text that is nothing but a cookie notice is not that: report nothing and say so in the note.
+
 Call report_offer once.`
 
 function modelSettings(env) {
@@ -373,6 +420,16 @@ function modelSettings(env) {
 }
 
 async function chat(llm, messages, tools) {
+  try {
+    return await chatOnce(llm, messages, tools)
+  } catch (e) {
+    // A provider's bad minute is not a finding about a shop.
+    await sleep(3000)
+    return chatOnce(llm, messages, tools)
+  }
+}
+
+async function chatOnce(llm, messages, tools) {
   const response = await fetch(`${llm.base}/chat/completions`, {
     method: 'POST',
     headers: { authorization: `Bearer ${llm.key}`, 'content-type': 'application/json' },
@@ -403,7 +460,7 @@ async function readerReport(llm, page) {
 
 /// Runs in the page. The visible text in reading order, the pressable things
 /// numbered, whatever sits in front of the page first.
-function outlineInPage(max, from) {
+export function outlineInPage(max, from) {
   const refs = (window.__scoutRefs = {})
   let n = 0
   const parts = []
@@ -444,8 +501,8 @@ function outlineInPage(max, from) {
   }
   const walk = (node) => {
     if (node.nodeType === 3) {
-      const t = clean(node.nodeValue)
-      if (t) parts.push(t)
+      // As written, spaces and all: "259" and ",-" in two spans are one amount.
+      parts.push(node.nodeValue)
       return
     }
     if (node.nodeType !== 1 || seen.has(node)) return
@@ -455,7 +512,7 @@ function outlineInPage(max, from) {
     if (node.matches(PRESS)) {
       n += 1
       const said = describe(node)
-      if (said) { refs[n] = node; parts.push(said) } else n -= 1
+      if (said) { refs[n] = node; parts.push(` ${said} `) } else n -= 1
       return
     }
     for (const child of node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes) walk(child)
@@ -464,13 +521,13 @@ function outlineInPage(max, from) {
   const section = (title, roots) => {
     const before = parts.length
     for (const root of roots) walk(root)
-    if (parts.length > before) parts.splice(before, 0, `\n# ${title}\n`)
+    if (parts.slice(before).join('').trim()) parts.splice(before, 0, `\n# ${title}\n`)
   }
   const front = [...document.querySelectorAll('dialog[open],[role=dialog],[role=alertdialog],[aria-modal=true],[id*=cookie i],[class*=cookie i],[id*=consent i],[class*=consent i],[id*=onetrust i]')].filter((e) => shown(e))
   section('In front of the page', front)
   section('The page', [...document.querySelectorAll('main,[role=main]')])
   section('Around it', document.body ? [document.body] : [])
-  const text = parts.join(' ').replace(/ ?\n ?/g, '\n').replace(/\n{2,}/g, '\n').replace(/[ \t]{2,}/g, ' ').trim()
+  const text = parts.join('').replace(/[^\S\n]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/\n{2,}/g, '\n').trim()
   return { title: document.title, url: location.href, text: text.slice(from, from + max), more: text.length > from + max, total: text.length }
 }
 
@@ -508,8 +565,8 @@ function chooseInPage(n, option) {
   if (el.tagName !== 'SELECT') return { error: 'that is not a list; press the option itself' }
   const flat = (s) => s.replace(/\s+/g, ' ').trim().toLowerCase()
   const want = flat(option)
-  const found = [...el.options].find((o) => flat(o.textContent) === want) || [...el.options].find((o) => flat(o.textContent).includes(want))
-  if (!found) return { error: 'that list has no such option' }
+  const found = [...el.options].find((o) => sameOption(o.textContent, option)) || [...el.options].find((o) => want.length > 1 && flat(o.textContent).includes(want))
+  if (!found) return { error: `that list has no such option; it has: ${[...el.options].slice(0, 15).map((o) => flat(o.textContent)).join(' | ')}` }
   el.value = found.value
   el.dispatchEvent(new Event('input', { bubbles: true }))
   el.dispatchEvent(new Event('change', { bubbles: true }))
@@ -559,7 +616,8 @@ class Session {
   }
 
   async evaluate(func, ...values) {
-    const expression = `(${func.toString()})(${values.map((v) => JSON.stringify(v)).join(',')})`
+    // sameOption rides along: a function in the page sees nothing of this file.
+    const expression = `(() => { ${sameOption.toString()}; return (${func.toString()})(${values.map((v) => JSON.stringify(v)).join(',')}) })()`
     const { result, exceptionDetails } = await this.send('Runtime.evaluate', { expression, returnByValue: true })
     if (exceptionDetails) throw new Error(exceptionDetails.exception?.description || exceptionDetails.text)
     return result.value
@@ -638,8 +696,8 @@ async function drive(llm, url, userAgent, socksPort, limits, audit) {
   session.home = url
   const shown = []       // every outline's text, for checking the report
   const log = []
-  const out = { refused: false, walls: 0, stopped: null, turns: 0, actions: 0, prompt_tokens: 0, completion_tokens: 0, seconds: 0, report: null, verified: {}, verified_last: {}, first_status: null, final_url: null, log }
-  let pages = 0, lastGood = url, from = 0
+  const out = { refused: false, first_wall: false, model_refused: false, walls: 0, stopped: null, turns: 0, actions: 0, prompt_tokens: 0, completion_tokens: 0, seconds: 0, report: null, verified: {}, verified_last: {}, first_status: null, final_url: null, log }
+  let pages = 0, lastGood = url, from = 0, wallsInARow = 0
 
   const page = async (note, more = false) => {
     from = more ? from + OUTLINE_CHARS : 0
@@ -650,8 +708,11 @@ async function drive(llm, url, userAgent, socksPort, limits, audit) {
       await session.navigate(lastGood)
       o = await session.outline(0)
     } else if (o.url) lastGood = o.url
-    if (refusedBy(session.status, o.title, o.text)) {
+    const wall = refusedBy(session.status, o.title, o.text)
+    wallsInARow = wall ? wallsInARow + 1 : 0
+    if (wall) {
       out.walls += 1
+      if (pages === 0) out.first_wall = true
       notes.push(`This is a refusal or a bot check${session.status ? ` (HTTP ${session.status})` : ''}. Do not try to pass it; report refused.`)
     }
     shown.push(o.text)
@@ -674,6 +735,8 @@ async function drive(llm, url, userAgent, socksPort, limits, audit) {
     ]
 
     for (;;) {
+      const away = turnedAway({ firstWall: out.first_wall, walls: out.walls, wallsInARow })
+      if (away) { out.stopped = `turned away: ${away}`; break }
       const spent = out.turns >= limits.turns ? 'turns' : out.actions >= limits.actions ? 'actions' : elapsed() >= limits.seconds ? 'seconds' : null
       const last = spent || out.turns === limits.turns - 1
       if (last) history.push({ role: 'user', content: 'That is the budget. Call report_offer now with what the pages have said so far.' })
@@ -713,12 +776,14 @@ async function drive(llm, url, userAgent, socksPort, limits, audit) {
         } else if (name !== 'read') result = { error: `there is no tool called ${name}` }
         if (!result.error && name !== 'read' && name !== 'open') await session.settle()
         // What was typed is a postcode or a search term by the rule above; it is logged whole.
-        log.push({ turn: out.turns, tool: name, n: a.n ?? null, text: a.text ?? a.option ?? null, error: result.error ?? null, seconds: Math.round(elapsed()) })
+        log.push({ turn: out.turns, tool: name, n: a.n ?? null, more: a.more ?? null, text: a.text ?? a.option ?? null, error: result.error ?? null, seconds: Math.round(elapsed()) })
         history.push({ role: 'tool', tool_call_id: call.id, content: await page(result.error ? `That did nothing: ${result.error}` : result.chosen ? `Chosen: ${result.chosen}` : '', name === 'read' && !!a.more) })
       }
     }
     out.final_url = lastGood
-    out.refused = !!out.report?.refused || (out.walls > 0 && refusedBy(session.status, '', shown[shown.length - 1] || ''))
+    // Refused is the product page refused. A side page that would not open is counted in `walls`.
+    out.model_refused = !!out.report?.refused
+    out.refused = out.first_wall
     out.verified = checkReport(out.report, shown)
     out.verified_last = checkReport(out.report, shown.slice(-1))
   } catch (e) {
@@ -757,15 +822,19 @@ async function read(argv) {
       const result = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {}
       Object.assign(result, { label: product.label, host: product.host, public: !!product.public, url: product.url, model: llm.model, at: new Date().toISOString(), limits })
       const say = (what) => console.log(`${product.label}: ${what}`)
-      if (ways.includes('plain')) {
+      const attempt = async (way, work) => {
+        try { await work() } catch (e) { result[way] = { ...(result[way] || {}), failed: e.message }; say(`${way} failed: ${e.message}`) }
+        fs.writeFileSync(file, JSON.stringify(result, null, 2))
+      }
+      if (ways.includes('plain')) await attempt('plain', async () => {
         const html = path.join(outDir, `${product.label}.plain.html`)
         const got = await extractor(['get', product.url, '--proxy', `http://127.0.0.1:${bridge.port}`, '--save', html])
         result.plain = summary(got)
         const readable = got.status === 200 && !got.challenge && (got.page?.text || '').length > 0
         Object.assign(result.plain, readable ? await readerReport(llm, got.page) : { report: null, verified: {} })
         say(`plain HTTP ${got.status ?? 'none'}, ${got.bytes} bytes, would render ${got.would_render}, priced ${!!result.plain.product_price}`)
-      }
-      if (ways.includes('render')) {
+      })
+      if (ways.includes('render')) await attempt('render', async () => {
         const html = path.join(outDir, `${product.label}.render.html`)
         // A render that hangs is tried once more: the tunnel adds a hop the node does not have.
         let rendered = await renderOnce(product.url, userAgent, socks)
@@ -778,15 +847,14 @@ async function read(argv) {
         result.render = summary({ ...got, status: unusable ? null : 200, ms: rendered.ms }, { unusable, timed_out: rendered.timedOut, retried })
         Object.assign(result.render, !unusable && (got.page?.text || '').length > 0 ? await readerReport(llm, got.page) : { report: null, verified: {} })
         say(`render ${rendered.ms} ms, ${got.bytes} bytes, usable ${!unusable}, priced ${!!result.render.product_price}`)
-      }
-      if (ways.includes('drive')) {
+      })
+      if (ways.includes('drive')) await attempt('drive', async () => {
         const auditFile = path.join(outDir, `${product.label}.session.txt`)
         fs.writeFileSync(auditFile, '')
         result.drive = await drive(llm, product.url, userAgent, socks, limits, (text) => fs.appendFileSync(auditFile, text))
         const d = result.drive
         say(`drive ${d.stopped}, refused ${d.refused}, ${d.turns} turns, ${d.actions} actions, ${d.prompt_tokens + d.completion_tokens} tokens, ${Math.round(d.seconds)} s`)
-      }
-      fs.writeFileSync(file, JSON.stringify(result, null, 2))
+      })
     }
   } finally {
     bridge.close()
@@ -806,11 +874,29 @@ function table(argv) {
   console.log(tables(rows, { nameAll: argv.includes('--name-all') }))
 }
 
+async function follow(argv) {
+  const needles = argv.flatMap((a, i) => (a === '--needle' ? [argv[i + 1]] : []))
+  const addresses = argv.filter((a, i) => /^https?:/.test(a) && argv[i - 1] !== '--needle')
+  if (!addresses.length) throw new Error('usage: shop-reach.mjs follow <address>... [--needle text]...')
+  const session = await Session.open((await extractor(['headers']))['User-Agent'], Number(flag(argv, '--socks', '18080')))
+  try {
+    for (const address of addresses) {
+      await session.navigate(address)
+      const o = await session.outline(0)
+      const whole = o.more ? (await session.evaluate(outlineInPage, 200_000, 0)).text : o.text
+      const where = (u) => { try { const x = new URL(u); return x.pathname + x.search.slice(0, 40) } catch { return u } }
+      console.log(JSON.stringify({ asked: where(address), landed: where(o.url), status: session.status, title: o.title.slice(0, 50), chars: whole.length, wrote: Object.fromEntries(needles.map((n) => [n, whole.toLowerCase().includes(n.toLowerCase())])) }))
+    }
+  } finally {
+    session.close()
+  }
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [command, ...rest] = process.argv.slice(2)
-  const commands = { read, table }
+  const commands = { read, table, follow }
   if (!commands[command]) {
-    console.error('usage: shop-reach.mjs read <products.json> <out-dir> | shop-reach.mjs table <out-dir>')
+    console.error('usage: shop-reach.mjs read <products.json> <out-dir> | shop-reach.mjs table <out-dir> | shop-reach.mjs follow <address>...')
     process.exit(2)
   }
   Promise.resolve(commands[command](rest)).then(() => process.exit(0), (e) => { console.error(e.message); process.exit(1) })

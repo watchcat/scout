@@ -273,9 +273,12 @@ function how(name, way) {
   }
   if (name === 'plain' && way.status == null) return 'no answer'
   if (way.challenge) return way.status ? `HTTP ${way.status}, a bot check` : 'a bot check'
+  // The site's own notice that it will not serve this reader. From the plain request fetch_page
+  // sends a browser after it; from the render it is the end of the read.
+  if (way.refusal) return 'a block notice, not the page'
   if (way.status && way.status !== 200) return `HTTP ${way.status}`
   if (name === 'render' && way.unusable) return 'nothing usable'
-  // What fetch_page hands the model today as if it were the page.
+  // A result from before fetch_page knew a block notice: it was handed to the model as the page.
   if (way.report?.refused) return 'a refusal page, taken for the page'
   return way.product_price ? 'read, priced by the page’s own data' : 'read'
 }
@@ -349,7 +352,7 @@ function summary(read, extra = {}) {
   const page = read.page || {}
   return {
     status: read.status ?? null, bytes: read.bytes ?? 0, ms: read.ms ?? null, error: read.error ?? null,
-    would_render: read.would_render ?? null, challenge: read.challenge ?? false,
+    would_render: read.would_render ?? null, challenge: read.challenge ?? false, refusal: read.refusal ?? false,
     product_price: page.product?.price ?? null, availability: page.availability ?? null,
     text_chars: (page.text || '').length, truncated: page.truncated ?? false, ...extra,
   }
@@ -873,7 +876,7 @@ async function read(argv) {
         const html = path.join(outDir, `${product.label}.plain.html`)
         const got = await extractor(['get', product.url, '--proxy', `http://127.0.0.1:${bridge.port}`, '--save', html])
         result.plain = summary(got)
-        const readable = got.status === 200 && !got.challenge && (got.page?.text || '').length > 0
+        const readable = got.status === 200 && !got.challenge && !got.refusal && (got.page?.text || '').length > 0
         Object.assign(result.plain, readable ? await readerReport(llm, got.page) : { report: null, verified: {} })
         say(`plain HTTP ${got.status ?? 'none'}, ${got.bytes} bytes, would render ${got.would_render}, priced ${!!result.plain.product_price}`)
       })
@@ -885,8 +888,8 @@ async function read(argv) {
         if (retried) rendered = await renderOnce(product.url, userAgent, socks)
         fs.writeFileSync(html, rendered.html)
         const got = await extractor(['file', html, product.url])
-        // fetch_page takes a render only when it is not itself a shell or a check.
-        const unusable = rendered.timedOut || got.unrendered === true
+        // fetch_page takes a render only when it is not itself a shell, a check or a block notice.
+        const unusable = rendered.timedOut || got.unrendered === true || got.refusal === true
         result.render = summary({ ...got, status: unusable ? null : 200, ms: rendered.ms }, { unusable, timed_out: rendered.timedOut, retried })
         Object.assign(result.render, !unusable && (got.page?.text || '').length > 0 ? await readerReport(llm, got.page) : { report: null, verified: {} })
         say(`render ${rendered.ms} ms, ${got.bytes} bytes, usable ${!unusable}, priced ${!!result.render.product_price}`)

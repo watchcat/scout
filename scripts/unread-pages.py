@@ -24,15 +24,33 @@ asked for — whole days, the newest trace's day being the last — or those
 
 How to read it.
 
-A fetch_page call ends one of six ways. *Priced*: the page's own data —
+A fetch_page call ends one of eight ways. *Priced*: the page's own data —
 schema.org markup, microdata or the shop's embedded state — gave Rust a
 price for the product at that address. *No price*: the page was read and
 gave none; the model had its text and nothing else. *Blocked*: a wall
-(401, 403, 429, 503, or a bot check served with a 200) that the headless
-render did not clear either. *Gone*: 404 or 410. *Failed*: anything else.
-*Not opened*: refused rather than read — the run's five pages were spent,
-or the address was not one to open. A call the run died in the middle of
-has no outcome and is left out.
+(401, 403, 429, 503, a bot check, or the site's own block notice) that
+the headless render did not get past either. *Gone*: 404 or 410.
+*Failed*: anything else. *Not opened*: refused rather than read — the
+run's five pages were spent, or the address was not one to open. A call
+the run died in the middle of has no outcome and is left out.
+
+Two more came with the release that taught fetch_page what a block notice
+is. *A block notice* is the site's notice that it will not serve this
+reader, which fetch_page took for the page and handed to the model as
+one: an ordinary page of the shop, with nothing in its title or its size
+to know it by. A fetch_page that knows better refuses it, and that is
+counted under blocked; this outcome is for traces written before. There
+it is told from a page read with no price by the tool's own rule — a text
+under a limit that contains one of a list of phrases — read from the file
+the tool compiles in, crates/scout-core/src/tools/refusal_marks.txt, so
+that what is counted here is what the tool refuses. The list holds what
+Scout has met; a short page with no price that it does not know is
+counted too, for a look. *Host closed* is a page fetch_page did not open
+because its host had refused one earlier in the run. It is a page a wall
+kept back all the same, so it is counted among the pages asked for and
+among the walls, and in the host table under blocked: before that
+release each of these was a request that came back blocked, and counted
+any other way a shop would seem to refuse less for refusing sooner.
 
 The traces do not say which reads needed the headless render. fetch_page
 tries it when the plain request is refused or comes back an empty shell,
@@ -68,31 +86,80 @@ import argparse
 import collections
 import datetime
 import json
+import pathlib
 import re
 from urllib.parse import urlsplit
 
 PRICED = "priced"
 NO_PRICE = "no price"
+NOTICE = "block notice"
 BLOCKED = "blocked"
+CLOSED = "host closed"
 GONE = "gone"
 FAILED = "failed"
 NOT_OPENED = "not opened"
 READ = (PRICED, NO_PRICE)
+# What fetch_page answered as a page and so kept for the rest of the run.
+KEPT = READ + (NOTICE,)
+ASKED_FOR = (PRICED, NO_PRICE, NOTICE, BLOCKED, CLOSED, GONE, FAILED)
 # Which outcome stands for a page a run asked for more than once.
-BEST = {PRICED: 5, NO_PRICE: 4, BLOCKED: 3, GONE: 2, FAILED: 1, NOT_OPENED: 0}
+BEST = {PRICED: 7, NO_PRICE: 6, NOTICE: 5, BLOCKED: 4, CLOSED: 3, GONE: 2, FAILED: 1, NOT_OPENED: 0}
 
 # The rule the spec named before anything was measured, as (at least, in).
 NO_PRICE_AT_LEAST = (1, 10)     # of product pages read
 NO_SHIPPING_AT_LEAST = (1, 3)   # of offers handed to compare_prices
 
-WALL = re.compile(r"HTTP (401|403|429|503)\b|served a bot check")
+WALL = re.compile(r"HTTP (401|403|429|503)\b|served a bot check|served a block notice")
 MISSING = re.compile(r"HTTP (404|410)\b")
 BUDGET = "page budget spent"
 REFUSED = (BUDGET, "invalid url", "unsupported url scheme", "not on the public internet")
+AGAIN = "was not opened again"
+# The rule fetch_page tells a block notice by, in the file it compiles in.
+RULE_FILE = pathlib.Path(__file__).resolve().parent.parent / "crates/scout-core/src/tools/refusal_marks.txt"
 # A DNS name and nothing else: an address field can hold whatever the model
 # put there, and what is printed has to be a host.
 NAME = re.compile(r"\A(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*\Z")
 NO_HOST = "(no host)"
+
+
+def refusal_rule(source):
+    """The limit and the phrases, as tools/refusal.rs reads them: comments
+    and blank lines aside, one `max_chars` line and a phrase on every other."""
+    limit, marks = None, []
+    # A line ends at a newline, is trimmed of spaces, tabs and a carriage
+    # return, and a number is ASCII digits: all as in the tool's reader, so
+    # that neither takes anything the other does not.
+    for line in source.split("\n"):
+        line = line.strip(" \t\r")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("max_chars "):
+            if limit is not None:
+                raise ValueError("max_chars is given twice")
+            number = line[len("max_chars "):].strip(" \t\r")
+            if not (number.isascii() and number.isdigit()):
+                raise ValueError(f"max_chars: {number!r} is not a number")
+            limit = int(number)
+        else:
+            marks.append(line)
+    if limit is None:
+        raise ValueError("no max_chars line")
+    if not marks:
+        raise ValueError("no phrases")
+    return limit, tuple(marks)
+
+
+MAX_CHARS, MARKS = refusal_rule(RULE_FILE.read_text(encoding="utf-8"))
+
+
+def short(text):
+    return isinstance(text, str) and len(text) < MAX_CHARS
+
+
+def says_no(text):
+    """Whether a page's text is a site refusing its reader and not the page:
+    short, and saying so. `says_no` in tools/refusal.rs, on the same file."""
+    return short(text) and any(mark in text.lower() for mark in MARKS)
 
 
 def loads(text):
@@ -130,8 +197,12 @@ def outcome(status, detail, result):
         if not isinstance(page, dict):
             return FAILED  # not the tool's own shape, a cut-off result included: counted, never guessed at
         product = page.get("product")
-        return PRICED if isinstance(product, dict) and product.get("price") else NO_PRICE
+        if isinstance(product, dict) and product.get("price"):
+            return PRICED  # a page whose data prices its product was served, whatever its text says
+        return NOTICE if says_no(page.get("text")) else NO_PRICE
     text = detail or ""
+    if AGAIN in text:
+        return CLOSED
     if any(words in text for words in REFUSED):
         return NOT_OPENED
     if WALL.search(text):
@@ -152,14 +223,20 @@ def text_writes_amount(text, amount):
     )
 
 
+def walls(counts):
+    """Pages a wall kept back: blocked, a notice taken for the page, or not
+    opened because the host had already refused one."""
+    return counts[BLOCKED] + counts[NOTICE] + counts[CLOSED]
+
+
 def shortfalls(counts):
     """What fell short on a host: offers with no shipping cost, offered pages
-    read with no price, reads a wall refused."""
-    return counts["no_shipping"] + counts["offered_no_price"] + counts[BLOCKED]
+    read with no price, pages a wall kept back."""
+    return counts["no_shipping"] + counts["offered_no_price"] + walls(counts)
 
 
 def requested(counts):
-    return sum(counts[kind] for kind in (PRICED, NO_PRICE, BLOCKED, GONE, FAILED))
+    return sum(counts[kind] for kind in ASKED_FOR)
 
 
 def ranked(hosts):
@@ -205,15 +282,18 @@ def measure(rows, accounts=None):
                 url = a.get("url")
                 key = page_key(url)
                 earlier = pages.get(key)
-                if earlier and earlier[0] in READ:
+                if earlier and earlier[0] in KEPT:
                     fetch["again"] += 1  # served from the run's own memory; no request was made
                     continue
                 kind = outcome(status, detail, result)
                 refused |= kind == NOT_OPENED and BUDGET in (detail or "")
                 fetch[kind] += 1
                 touch(host(url))[kind] += 1
+                read = loads(result) if kind in READ else None
+                # Short enough to be a notice and none the list knows: worth a look.
+                fetch["short_unknown"] += kind == NO_PRICE and short(read.get("text"))
                 if earlier is None or BEST[kind] > BEST[earlier[0]]:
-                    pages[key] = (kind, loads(result) if kind in READ else None)
+                    pages[key] = (kind, read)
             elif tool == "compare_prices" and status == "ok":
                 given = [o for o in (a.get("offers") or []) if isinstance(o, dict)]
                 offers["calls"] += 1
@@ -310,7 +390,7 @@ def pct(part, whole):
 def host_line(name, c, summed=False):
     behind = f"{'':>4} {'':>5}" if summed else f"{c['runs']:>4} {c['accounts']:>5}"
     return (
-        f"  {name:<38.38} {behind} {c[PRICED]:>6} {c[NO_PRICE]:>8} {c[BLOCKED]:>7} {c[GONE] + c[FAILED]:>5} {c[NOT_OPENED]:>6}"
+        f"  {name:<38.38} {behind} {c[PRICED]:>6} {c[NO_PRICE]:>8} {c[NOTICE]:>6} {c[BLOCKED] + c[CLOSED]:>7} {c[GONE] + c[FAILED]:>5} {c[NOT_OPENED]:>6}"
         f" | {c['offers']:>6} {c['no_shipping']:>7} | {c['offered_priced']:>6} {c['offered_no_price']:>8} {c['offered_in_text']:>7}"
         f" | {shortfalls(c):>5}"
     )
@@ -337,9 +417,14 @@ def report(m, top, window, min_accounts=2):
         f"  refused rather than read: {f[NOT_OPENED]} — the page budget refused at least one in {f['runs_refused']} runs ({pct(f['runs_refused'], f['runs'])})",
         f"  pages asked for: {f['requested']}",
     ]
-    for kind, label in ((PRICED, "read with a price"), (NO_PRICE, "read with no price"), (BLOCKED, "blocked"), (GONE, "gone"), (FAILED, "failed otherwise")):
+    for kind, label in (
+        (PRICED, "read with a price"), (NO_PRICE, "read with no price"), (NOTICE, "a block notice"), (BLOCKED, "blocked"),
+        (CLOSED, "host closed"), (GONE, "gone"), (FAILED, "failed otherwise"),
+    ):
         out.append(f"    {label:<20} {f[kind]:>5}  {pct(f[kind], f['requested'])}")
     out += [
+        f"  a wall kept back — blocked, a notice taken for the page, or not opened after one: {walls(f)} ({pct(walls(f), f['requested'])})",
+        f"  read with no price in under {MAX_CHARS} characters of text, and no notice the list knows: {f['short_unknown']}",
         "",
         "== compare_prices",
         f"  calls: {o['calls']}; offers: {o['offers']}; with no shipping cost: {o['no_shipping']} ({pct(o['no_shipping'], o['offers'])})",
@@ -347,7 +432,7 @@ def report(m, top, window, min_accounts=2):
         "",
         "== the pages behind the offers (one address counted once a run)",
         f"  never asked for: {of['never_opened']}; refused rather than read: {of[NOT_OPENED]}; "
-        f"blocked: {of[BLOCKED]}; gone or failed: {of[GONE] + of[FAILED]}",
+        f"blocked: {of[BLOCKED]}; a block notice: {of[NOTICE]}; host closed: {of[CLOSED]}; gone or failed: {of[GONE] + of[FAILED]}",
         f"  read: {p['offered_read']} — with a price {of[PRICED]}, with none {of[NO_PRICE]} ({pct(of[NO_PRICE], p['offered_read'])})",
         f"    of those with none, the page's text wrote the offered amount: {of['text_writes']}; "
         f"did not: {of[NO_PRICE] - of['text_writes']} (text cut at the tool's limit in {of['text_cut']} of them)",
@@ -370,10 +455,10 @@ def report(m, top, window, min_accounts=2):
         f"  offers with no shipping cost: {pct(o['no_shipping'], o['offers'])} — the rule asks one in three: {said(r['shipping_met'])}",
         f"  needed: {'yes' if r['needed'] else 'no'}",
         "",
-        "== hosts, by what fell short there (offers with no shipping + offered pages with no price + blocked)",
-        f"  {'':<38} {'runs':>4} {'accts':>5} {'priced':>6} {'no price':>8} {'blocked':>7} {'other':>5} {'unopen':>6}"
+        "== hosts, by what fell short there (offers with no shipping + offered pages with no price + block notices + blocked, host closed among them)",
+        f"  {'':<38} {'runs':>4} {'accts':>5} {'priced':>6} {'no price':>8} {'notice':>6} {'blocked':>7} {'other':>5} {'unopen':>6}"
         f" | {'offers':>6} {'no ship':>7} | {'priced':>6} {'no price':>8} {'in text':>7} | {'short':>5}",
-        f"  {'host':<38} {'':>4} {'':>5} {'— pages asked for —':^36} | {'— offers —':^14} | {'— offered pages read —':^23} |",
+        f"  {'host':<38} {'':>4} {'':>5} {'— pages asked for —':^43} | {'— offers —':^14} | {'— offered pages read —':^23} |",
     ]
     order = ranked(m["hosts"])
     everyone = min_accounts <= 1

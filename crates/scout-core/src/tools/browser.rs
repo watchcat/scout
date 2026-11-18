@@ -110,14 +110,33 @@ pub fn find_chrome() -> Option<PathBuf> {
 pub struct Renderer {
     chrome: PathBuf,
     slots: Arc<Semaphore>,
+    /// What a test's renderer answers every address with, in place of a Chrome.
+    #[cfg(test)]
+    canned: Option<Arc<str>>,
 }
 
 impl Renderer {
     pub fn new(chrome: PathBuf) -> Self {
-        Self { chrome, slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RENDERS)) }
+        Self {
+            chrome,
+            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RENDERS)),
+            #[cfg(test)]
+            canned: None,
+        }
+    }
+
+    /// A renderer that hands back `html` whatever it is asked for, so that
+    /// what `fetch_page` does with a render can be tested without a Chrome.
+    #[cfg(test)]
+    pub(crate) fn answering(html: &str) -> Self {
+        Self { canned: Some(html.into()), ..Self::new(PathBuf::from("/no/chrome/needed")) }
     }
 
     pub async fn render(&self, url: &str) -> Result<String, BrowserError> {
+        #[cfg(test)]
+        if let Some(html) = &self.canned {
+            return Ok(html.to_string());
+        }
         let started = Instant::now();
         // Queueing is part of the deadline rather than added to it, so a
         // busy renderer cannot turn a 45-second ceiling into ninety.

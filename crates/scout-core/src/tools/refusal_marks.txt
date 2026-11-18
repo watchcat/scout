@@ -1,0 +1,59 @@
+# What a page says when it is a refusal and not the page that was asked for.
+#
+# Two readers share this file and have to agree: `tools/refusal.rs`, which
+# decides what fetch_page does with a page, and `scripts/unread-pages.py`,
+# which counts the same pages in the run traces. Comments and blank lines
+# aside, one line gives the limit and every other line is a phrase.
+#
+# A page is a refusal when its text, as fetch_page extracts it, is under
+# `max_chars` characters and contains one of the phrases, compared in lower
+# case. Both halves are needed. A product page may well mention a blocked
+# drain or a robot; a page of a thousand characters that tells its reader
+# they have been blocked is not the product page.
+#
+# The limit: the longest notice below is bol's in French, 1,223 characters
+# of text; its English is 1,097 and amazon's two are under 250. A product
+# page fills the 6,000 the tool keeps. 1,500 is also what the first count
+# of these pages in the traces looked under, on 2026-11-18.
+#
+# Every phrase was read off a page a shop served, on the day and to the
+# reader its note gives: as the page's text, or, for bol's Dutch and
+# French, as the wording that page carries for a reader with another
+# language set. None is here because a wall might say it. A phrase a real
+# page could say in passing closes a shop for the rest of a request,
+# so "captcha" is not here (every page behind reCAPTCHA says it in its
+# footer), nor "continue shopping" (so does every empty basket), nor
+# "access denied" (so does an account page to someone not signed in; the
+# title rule in tools/browser.rs knows it where it is a page's title). The
+# trace script prints how many short pages with no price the list did not
+# know: that count is where the next phrase comes from.
+max_chars 1500
+
+# bol.com, 2026-11-18.
+# To a browser sent from the production node, 9 KB
+# (docs/2026-11-18-shop-reach.md): "Access blocked. Your access to bol has
+# been temporarily blocked due to possible abuse."
+# To a plain request with fetch_page's headers, HTTP 403 and 12 KB: "IP
+# address is blocked. Your access to bol has been temporarily blocked due
+# to possible abuse from this IP address." fetch_page reads no body from a
+# 403, so this one was read with curl sending the headers that
+# `page_as_read headers` prints.
+# That page carries its Dutch and its French in a script and swaps them in
+# by a `language` cookie: "Je toegang tot bol is tijdelijk geblokkeerd
+# vanwege mogelijk misbruik vanaf dit IP adres", "Votre accès à bol a été
+# temporairement bloqué en raison d'un possible abus". A browser with a
+# fresh profile has no such cookie and is shown the English.
+access blocked
+temporarily blocked
+tijdelijk geblokkeerd
+temporairement bloqué
+
+# amazon.nl, 2026-11-18, to a plain request sent from the production node:
+# HTTP 200 and 4 KB, the whole of it "Klik op de knop hieronder om verder
+# te winkelen", one button and the footer (docs/2026-11-18-shop-reach.md).
+klik op de knop hieronder om verder te winkelen
+
+# amazon.nl, 2026-11-18, to a plain request sent from a laptop with
+# `page_as_read get`: HTTP 202 and 2 KB, in a noscript: "In order to
+# continue, we need to verify that you're not a robot."
+not a robot

@@ -44,11 +44,49 @@ def offer(url, price, shipping=None):
     return o
 
 
+# bol.com's block notice as fetch_page read it, title first: the start of it.
+NOTICE = ("bol IP address is blocked Your access to bol has been temporarily blocked "
+          "due to possible abuse from this IP address.")
+UNREADABLE = " — this site is unreadable, so do not open more pages on it; use what the search results already told you"
+NOT_AGAIN = ("shop.example already refused a page in this request, so this one was not opened again"
+             " — use what the search results already told you")
+
+
 class Outcome(unittest.TestCase):
     def test_a_read_is_priced_only_when_the_page_s_own_data_gave_a_price(self):
         self.assertEqual(up.outcome("ok", None, page(price="13.80 EUR")), up.PRICED)
         self.assertEqual(up.outcome("ok", None, page(price=None)), up.NO_PRICE)
         self.assertEqual(up.outcome("ok", None, page(product=False)), up.NO_PRICE)
+
+    def test_a_block_notice_handed_over_as_the_page_is_not_a_page_read_with_no_price(self):
+        self.assertEqual(up.outcome("ok", None, page(product=False, text=NOTICE)), up.NOTICE)
+        self.assertEqual(up.outcome("ok", None, page(price=None, text=NOTICE)), up.NOTICE)
+        # A page whose data prices its product was served, whatever its text says.
+        self.assertEqual(up.outcome("ok", None, page(price="13.80 EUR", text=NOTICE)), up.PRICED)
+        # The same words in a page's worth of text are a page.
+        self.assertEqual(up.outcome("ok", None, page(product=False, text=NOTICE + " word" * 400)), up.NO_PRICE)
+
+    def test_a_wall_the_tool_knew_for_one_is_blocked_however_it_said_so(self):
+        for detail in (
+            "www.bol.com served a block notice instead of the page" + UNREADABLE,
+            "shop.example served a bot check instead of the page, and it could not be cleared" + UNREADABLE,
+        ):
+            self.assertEqual(up.outcome("failed", detail, detail), up.BLOCKED, detail)
+
+    def test_a_page_of_a_host_that_had_refused_is_its_own_outcome_and_no_refusal_of_the_budget(self):
+        self.assertEqual(up.outcome("failed", NOT_AGAIN, None), up.CLOSED)
+
+    def test_the_wordings_read_here_are_the_ones_the_tool_writes(self):
+        # Tied by hand otherwise: reword an error in the tool and its pages would be counted as failures.
+        def source(name):
+            text = (HERE.parent / "crates/scout-core/src" / name).read_text(encoding="utf-8")
+            return " ".join(text.replace("\\\n", " ").split())  # a sentence the source wraps is still one sentence
+        fetch_rs = source("tools/fetch.rs")
+        for words in ("served a block notice", "served a bot check", up.AGAIN, up.BUDGET, "page returned HTTP", "unsupported url scheme", "invalid url"):
+            self.assertIn(words, fetch_rs, words)
+        self.assertIn("not on the public internet", source("net_guard.rs"))
+        for words in (up.AGAIN, up.BUDGET, "not on the public internet", "invalid url", "unsupported url scheme"):
+            self.assertIn(up.outcome("failed", words, None), (up.CLOSED, up.NOT_OPENED), words)
 
     def test_a_wall_is_blocked_whether_it_answers_with_a_status_or_a_challenge(self):
         for detail in (
@@ -81,6 +119,152 @@ class Outcome(unittest.TestCase):
         self.assertEqual(up.outcome("failed", "page returned HTTP 400 Bad Request", None), up.FAILED)
         # An answer that is not the tool's own shape: counted, never guessed at.
         self.assertEqual(up.outcome("ok", None, "[1, 2"), up.FAILED)
+
+
+class SaysNo(unittest.TestCase):
+    """The rule is fetch_page's own: one file of phrases, one file of cases."""
+
+    def test_the_cases_shared_with_the_tool_come_out_as_written(self):
+        cases = json.loads((up.RULE_FILE.parent / "refusal_cases.json").read_text(encoding="utf-8"))
+        self.assertGreaterEqual(len(cases), 20)
+        for case in cases:
+            text = case["text"]
+            if "pad_to" in case:
+                self.assertLessEqual(len(text), case["pad_to"], case["why"])
+                text += "." * (case["pad_to"] - len(text))
+            self.assertEqual(up.says_no(text), case["refusal"], case["why"])
+
+    def test_the_rule_is_read_from_the_file_the_tool_compiles_in(self):
+        self.assertEqual(up.RULE_FILE, HERE.parent / "crates/scout-core/src/tools/refusal_marks.txt")
+        self.assertTrue(up.RULE_FILE.is_file())
+        self.assertEqual(up.MAX_CHARS, 1500)
+        self.assertIn("temporarily blocked", up.MARKS)
+        rust = (up.RULE_FILE.parent / "refusal.rs").read_text(encoding="utf-8")
+        self.assertIn('include_str!("refusal_marks.txt")', rust)
+
+    def test_a_rule_file_without_a_limit_or_without_phrases_is_refused(self):
+        for source in (
+            "# nothing\n",
+            "max_chars 1500\n",
+            "access blocked\n",
+            "max_chars many\naccess blocked\n",
+            "max_chars +1500\naccess blocked\n",
+            "max_chars ١٥٠٠\naccess blocked\n",  # digits, and not ASCII ones
+            "max_chars 1500\nmax_chars 900\naccess blocked\n",
+        ):
+            with self.assertRaises(ValueError, msg=source):
+                up.refusal_rule(source)
+        self.assertEqual(up.refusal_rule("# a note\n\n  max_chars 20 \n  access blocked  \n"), (20, ("access blocked",)))
+        # A line ends at a newline and nowhere else, as it does for the tool.
+        self.assertEqual(up.refusal_rule("max_chars 20\r\n\taccess\x0bblocked\x1f\r\n"), (20, ("access\x0bblocked\x1f",)))
+
+    def test_what_is_not_text_does_not_say_no(self):
+        for value in (None, 5, ["access blocked"], {"text": "access blocked"}):
+            self.assertFalse(up.says_no(value))
+
+
+class Notices(unittest.TestCase):
+    def setUp(self):
+        a, b = "https://shop-a.example/p/1", "https://shop-b.example/p/1"
+        self.rows = [
+            fetch(1, 0, a, page(product=False, text=NOTICE)),   # the notice, handed over as the page
+            fetch(1, 1, a, page(product=False, text=NOTICE)),   # and kept as one: asked for again, no request is made
+            fetch(1, 2, "https://shop-a.example/p/2", page(product=False, text=NOTICE)),
+            fetch(1, 3, b, page(product=False, text="see the price in the shop")),          # short, and no notice
+            fetch(1, 4, "https://shop-b.example/p/2", page(product=False, text="word " * 400)),
+            fetch(1, 5, "https://shop-c.example/p", detail="shop-c.example served a block notice instead of the page" + UNREADABLE),
+            fetch(1, 6, "https://shop-c.example/q", detail=NOT_AGAIN),
+            compare(1, 7, [offer(a, 10.0), offer(b, 20.0)]),
+        ]
+        self.m = up.measure(self.rows, accounts={1: 10})
+
+    def test_a_notice_is_counted_apart_from_a_read_and_from_a_wall_the_tool_knew(self):
+        f = self.m["fetch"]
+        self.assertEqual((f[up.NOTICE], f[up.NO_PRICE], f[up.BLOCKED], f[up.CLOSED], f[up.NOT_OPENED]), (2, 2, 1, 1, 0))
+        self.assertEqual(f["again"], 1)
+        self.assertEqual(f["calls"], f["again"] + sum(f[kind] for kind in up.ASKED_FOR) + f[up.NOT_OPENED])
+
+    def test_a_page_not_opened_because_its_host_had_refused_is_a_page_a_wall_kept_back(self):
+        f, hosts = self.m["fetch"], self.m["hosts"]
+        # Asked for, though no request was made: before the tool closed a host this was a request that came back blocked.
+        self.assertEqual(f["requested"], 6)
+        self.assertEqual(up.walls(f), 4)
+        self.assertEqual((hosts["shop-c.example"][up.BLOCKED], hosts["shop-c.example"][up.CLOSED]), (1, 1))
+        self.assertEqual(up.shortfalls(hosts["shop-c.example"]), 2)
+        # And no refusal of the page budget: the run was not short of pages.
+        self.assertEqual((f[up.NOT_OPENED], f["runs_refused"]), (0, 0))
+
+    def test_a_shop_that_closes_sooner_does_not_seem_to_refuse_less(self):
+        url = "https://shop.example/p/{}".format
+        wall = "shop.example served a block notice instead of the page" + UNREADABLE
+        before = up.measure([fetch(1, n, url(n), detail="page returned HTTP 403 Forbidden") for n in range(3)])
+        after = up.measure([fetch(1, 0, url(0), detail=wall)] + [fetch(1, n, url(n), detail=NOT_AGAIN) for n in (1, 2)])
+        for m in (before, after):
+            self.assertEqual((m["fetch"]["requested"], up.walls(m["fetch"]), up.shortfalls(m["hosts"]["shop.example"])), (3, 3, 3))
+
+    def test_an_offered_page_its_host_had_closed_was_asked_for_and_not_read(self):
+        url = "https://shop.example/p/2"
+        m = up.measure([
+            fetch(1, 0, "https://shop.example/p/1", detail="shop.example served a block notice instead of the page" + UNREADABLE),
+            fetch(1, 1, url, detail=NOT_AGAIN),
+            fetch(1, 2, url, detail=NOT_AGAIN),   # asked for again and not opened again: two refusals, not a page served from memory
+            compare(1, 3, [offer(url, 10.0)]),
+        ])
+        self.assertEqual((m["fetch"][up.CLOSED], m["fetch"]["again"]), (2, 0))
+        self.assertEqual((m["offered"][up.CLOSED], m["offered"]["unread"], m["offered"]["never_opened"]), (1, 1, 0))
+
+    def test_short_pages_the_list_does_not_know_are_counted_for_a_look(self):
+        # shop-b's first page: no price, a few words, and none of them a phrase.
+        self.assertEqual(self.m["fetch"]["short_unknown"], 1)
+
+    def test_an_offered_page_that_was_a_notice_was_not_read(self):
+        of, p = self.m["offered"], self.m["product"]
+        self.assertEqual(of[up.NOTICE], 1)
+        self.assertEqual((of["unread"], of["unread_no_shipping"]), (1, 1))
+        # Only shop-b's page was read, so only it is a product page with no price.
+        self.assertEqual((p["offered_read"], p["offered_no_price"], p["read"], p["no_price"]), (1, 1, 1, 1))
+
+    def test_a_notice_is_a_shortfall_of_its_host(self):
+        hosts = self.m["hosts"]
+        self.assertEqual(hosts["shop-a.example"][up.NOTICE], 2)
+        self.assertEqual(hosts["shop-a.example"]["offered_no_price"], 0)
+        # Two notices and an offer that stated no shipping.
+        self.assertEqual(up.shortfalls(hosts["shop-a.example"]), 3)
+        self.assertEqual(up.ranked(hosts)[0][0], "shop-a.example")
+
+    def test_a_later_notice_stands_for_a_page_an_earlier_wall_refused(self):
+        url = "https://shop.example/p"
+        m = up.measure([
+            fetch(1, 0, url, detail="page returned HTTP 403 Forbidden"),
+            fetch(1, 1, url, page(product=False, text=NOTICE)),
+            compare(1, 2, [offer(url, 10.0)]),
+        ])
+        self.assertEqual((m["fetch"][up.BLOCKED], m["fetch"][up.NOTICE]), (1, 1))
+        self.assertEqual((m["offered"][up.NOTICE], m["offered"][up.BLOCKED]), (1, 0))
+
+    def test_the_report_sets_notices_beside_the_walls_and_adds_the_two_up(self):
+        text = up.report(self.m, top=5, window="a window", min_accounts=1)
+        lines = text.splitlines()
+        notice = next(line for line in lines if line.strip().startswith("a block notice"))
+        self.assertEqual(notice.split()[-2:], ["2", "33%"])
+        closed = next(line for line in lines if line.strip().startswith("host closed"))
+        self.assertEqual(closed.split()[-2:], ["1", "17%"])
+        self.assertIn("  a wall kept back — blocked, a notice taken for the page, or not opened after one: 4 (67%)", lines)
+        self.assertIn("  refused rather than read: 0 — the page budget refused at least one in 0 runs (0%)", lines)
+        self.assertIn("  read with no price in under 1500 characters of text, and no notice the list knows: 1", lines)
+        self.assertIn("blocked: 0; a block notice: 1; host closed: 0;", text)
+        # In the host table a page its host had closed stands with the blocked.
+        closing = next(line for line in lines if line.strip().startswith("shop-c.example"))
+        self.assertEqual(closing.split("|")[0].split()[1:], ["1", "1", "0", "0", "0", "2", "0", "0"])
+        # The host table carries the column.
+        header = next(line for line in lines if "accts" in line)
+        self.assertEqual(header.split("|")[0].split()[2:], ["priced", "no", "price", "notice", "blocked", "other", "unopen"])
+        row = next(line for line in lines if line.strip().startswith("shop-a.example"))
+        self.assertEqual(row.split("|")[0].split()[1:], ["1", "1", "0", "0", "2", "0", "0", "0"])
+        self.assertEqual(row.split("|")[-1].split(), ["3"])
+        # And nothing of the notice's own words.
+        for leak in ("temporarily blocked", "IP address"):
+            self.assertNotIn(leak, text)
 
 
 class Host(unittest.TestCase):

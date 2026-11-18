@@ -25,14 +25,20 @@ pub fn request_headers() -> [(&'static str, &'static str); 3] {
 /// - `unrendered`: whether, were this the render's own output, it would
 ///   have been thrown away as a shell or a bot check;
 /// - `challenge`: whether it would have refused the body as a bot check;
-/// - `page`: what it hands the model — text, links, stock, product.
+/// - `refusal`: whether it is the site's own notice that it will not serve
+///   this reader. From the plain request that sends a browser after it;
+///   as the render's own output it is the end of the read;
+/// - `page`: what it hands the model — text, links, stock, product — when
+///   none of the above stands in the way.
 pub fn page_as_read(html: &str, url: &str, status: Option<u16>) -> anyhow::Result<serde_json::Value> {
     let base = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid url: {e}"))?;
+    let page = fetch::extract_page(html, &base);
     Ok(serde_json::json!({
-        "would_render": status.map(|s| fetch::worth_rendering(Some(s), html)),
+        "would_render": status.map(|s| fetch::worth_rendering(Some(s), html, Some(&page))),
         "unrendered": browser::looks_unrendered(html),
         "challenge": browser::is_challenge_page(html),
-        "page": fetch::extract_page(html, &base),
+        "refusal": fetch::is_refusal(&page),
+        "page": page,
     }))
 }
 
@@ -73,6 +79,22 @@ mod tests {
         assert_eq!((wall["would_render"].clone(), wall["challenge"].clone()), (true.into(), true.into()));
         assert_eq!(page_as_read("", "https://shop.example/p", Some(403)).unwrap()["would_render"], true);
         assert_eq!(page_as_read("", "https://shop.example/p", Some(404)).unwrap()["would_render"], false);
+    }
+
+    #[test]
+    fn a_block_notice_is_told_apart_from_a_page_and_would_go_to_the_render() {
+        // bol.com's notice in shape: nothing the older tests know it by.
+        let notice = padded(
+            "<html><head><title>bol</title></head><body><h1>IP address is blocked</h1><p>Your access \
+             to bol has been temporarily blocked due to possible abuse from this IP address.</p></body></html>",
+        );
+        let read = page_as_read(&notice, "https://shop.example/p", Some(200)).unwrap();
+        assert_eq!((read["unrendered"].clone(), read["challenge"].clone()), (false.into(), false.into()));
+        assert_eq!(read["refusal"], true);
+        assert_eq!(read["would_render"], true, "a browser is sometimes served where the plain request was not");
+        // As a render's own output it is still a refusal: that is how the browser's answer is judged.
+        assert_eq!(page_as_read(&notice, "https://shop.example/p", None).unwrap()["refusal"], true);
+        assert_eq!(page_as_read(&padded(PRODUCT), "https://shop.example/widget", Some(200)).unwrap()["refusal"], false);
     }
 
     #[test]

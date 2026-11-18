@@ -680,6 +680,39 @@ pub struct FetchPageTool {
     /// same kruidvat page ate a third of the budget and left none for the
     /// Action listing the user was asking about.
     seen: std::sync::Mutex<std::collections::HashMap<String, PageContent>>,
+    hosts: std::sync::Mutex<Hosts>,
+}
+
+/// What this request has learnt of the hosts it asked, each keyed as
+/// `host_key` writes it.
+#[derive(Default)]
+struct Hosts {
+    /// Hosts a page was read from. One of these is never closed: a shop
+    /// that has served a page is not refusing its reader, whatever one of
+    /// its pages says.
+    served: std::collections::HashSet<String>,
+    /// Hosts that told this reader no — a block notice or a bot check —
+    /// with nobody left to ask. The error says not to open more pages
+    /// there; a model may open them all the same (one driving a browser
+    /// did, on 2026-11-18, at a shop that had refused it), and each would
+    /// cost a request, a Chrome and a fifth of the page budget to be told
+    /// the same. So they are not opened.
+    closed: std::collections::HashSet<String>,
+}
+
+/// A host as the request's memory keys it: without a leading `www.`, as the
+/// trace script names hosts.
+fn host_key(url: &Url) -> Option<String> {
+    url.host_str().map(|host| host.strip_prefix("www.").unwrap_or(host).to_string())
+}
+
+/// How a site told its reader no, when it is the site and not the page.
+#[derive(Clone, Copy, PartialEq)]
+enum Wall {
+    /// A bot check in place of the page, which no browser cleared.
+    BotCheck,
+    /// The site's own notice that it will not serve this reader.
+    Notice,
 }
 
 impl FetchPageTool {
@@ -689,22 +722,60 @@ impl FetchPageTool {
             renderer,
             opens: std::sync::atomic::AtomicUsize::new(0),
             seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hosts: std::sync::Mutex::new(Hosts::default()),
         }
     }
 
     /// Keeps a page for the rest of the request and hands back a copy.
-    fn remember(&self, key: String, page: PageContent) -> PageContent {
+    /// `from` is where it was read.
+    fn remember(&self, key: String, from: &Url, page: PageContent) -> PageContent {
+        if let Some(host) = host_key(from) {
+            self.hosts.lock().unwrap().served.insert(host);
+        }
         self.seen.lock().unwrap().insert(key, page.clone());
         page
     }
+
+    /// The error for a site that told its reader no. Handing a wall's text
+    /// back as page content is what let the model mistake it for a page with
+    /// nothing on it and open three more just like it, so it is told in
+    /// words. `at` is where the request ended up, which after a redirect is
+    /// not where it was sent, and `named` is what to call that host to the
+    /// model. `settled` is whether nobody was left to ask; it closes the
+    /// host for the rest of the request, unless the host has served a page
+    /// in it — and then the model is told of the page, not of the site.
+    fn unreadable(&self, at: &Url, named: &Url, wall: Wall, settled: bool) -> FetchError {
+        let mut reads_fine = false;
+        if let Some(host) = host_key(at) {
+            let mut hosts = self.hosts.lock().unwrap();
+            reads_fine = hosts.served.contains(&host);
+            if settled && !reads_fine {
+                hosts.closed.insert(host);
+            }
+        }
+        let what = match wall {
+            Wall::BotCheck => "served a bot check instead of the page, and it could not be cleared",
+            Wall::Notice => "served a block notice instead of the page",
+        };
+        let then = if reads_fine {
+            "this page is unreadable, though others of the site were read; use what the search \
+             results already told you of it"
+        } else {
+            "this site is unreadable, so do not open more pages on it; use what the search results \
+             already told you"
+        };
+        FetchError::Invalid(format!("{} {what} — {then}", named.host_str().unwrap_or("the site")))
+    }
 }
 
-/// Whether a headless render is worth trying after a plain fetch.
-///
-/// 404/410 mean the page is gone — rendering cannot bring it back, and
-/// pretending otherwise would undo the dead-link checks. A bot wall (403,
-/// 429, 503) or a challenge page served with HTTP 200 is exactly what a real
-/// browser is for.
+/// Whether what was read is the site's notice that it will not serve this
+/// reader, and not the page. A page whose data prices its product was
+/// served, whatever else it says.
+pub(crate) fn is_refusal(page: &PageContent) -> bool {
+    let priced = page.product.as_ref().is_some_and(|p| p.price.is_some());
+    !priced && super::refusal::says_no(&page.text)
+}
+
 /// Reddit's own site is a JavaScript shell behind a bot wall, but the old
 /// interface serves the same thread fully rendered — post, comments and all
 /// — to a plain GET. Measured on one thread: www gives 8 KB of interstitial,
@@ -721,14 +792,22 @@ fn readable_url(url: &Url) -> Option<Url> {
     Some(old)
 }
 
-pub(crate) fn worth_rendering(status: Option<u16>, body: &str) -> bool {
+/// Whether a headless render is worth trying after a plain fetch. `page` is
+/// what the body was read as, where there was a body to read.
+///
+/// 404/410 mean the page is gone — rendering cannot bring it back, and
+/// pretending otherwise would undo the dead-link checks. A bot wall (403,
+/// 429, 503) or a challenge page served with HTTP 200 is exactly what a real
+/// browser is for.
+pub(crate) fn worth_rendering(status: Option<u16>, body: &str, page: Option<&PageContent>) -> bool {
     match status {
         Some(404 | 410) => false,
         Some(403 | 429 | 503) | None => true,
         Some(s) if !(200..300).contains(&s) => true,
-        // A success that carries no readable content: challenge or a shell
-        // page whose body arrives by script.
-        _ => super::browser::looks_unrendered(body),
+        // A success that carries no readable content: a challenge, a shell
+        // whose body arrives by script, or the site's notice that it will
+        // not serve this reader, which a browser is not always shown.
+        _ => super::browser::looks_unrendered(body) || page.is_some_and(is_refusal),
     }
 }
 
@@ -773,6 +852,18 @@ impl Tool for FetchPageTool {
             tracing::info!(url = %url, "already read this request; serving the page again");
             return Ok(cached.clone());
         }
+        // Some hosts have a second address that answers plain GETs properly.
+        let fetched = readable_url(&url).unwrap_or_else(|| url.clone());
+        // A host that has told this request no is not asked again: see
+        // `Hosts::closed`. Before the budget, since nothing is opened.
+        if host_key(&fetched).is_some_and(|host| self.hosts.lock().unwrap().closed.contains(&host)) {
+            tracing::info!(url = %url, "the host refused a page earlier in this request; not opened");
+            return Err(FetchError::Invalid(format!(
+                "{} already refused a page in this request, so this one was not opened again — \
+                 use what the search results already told you",
+                url.host_str().unwrap_or("the site")
+            )));
+        }
         // Before the budget and before the renderer: an address inside the
         // pod or the cluster is not a page that failed, it is a page that
         // does not exist for us, and the model should hear that in words
@@ -789,8 +880,6 @@ impl Tool for FetchPageTool {
                  already have instead of opening more pages"
             )));
         }
-        // Some hosts have a second address that answers plain GETs properly.
-        let fetched = readable_url(&url).unwrap_or_else(|| url.clone());
         if fetched != url {
             tracing::info!(url = %url, via = %fetched, "using the readable host");
         }
@@ -805,38 +894,69 @@ impl Tool for FetchPageTool {
             }
         })?;
         let status = resp.status();
+        // Where the request ended up: after a redirect, the host that
+        // answered is not the one that was asked, and what is learnt is
+        // learnt of the one that answered.
+        let landed = resp.url().clone();
         let body = if status.is_success() { resp.text().await? } else { String::new() };
+        // Read once: what the plain request brought decides whether a
+        // browser is sent after it, and is what is handed back if not.
+        let plain = status.is_success().then(|| extract_page(&body, &fetched));
+        // What either reader was told in place of the page.
+        let mut wall = match &plain {
+            Some(page) if is_refusal(page) => Some(Wall::Notice),
+            Some(_) if super::browser::is_challenge_page(&body) => Some(Wall::BotCheck),
+            _ => None,
+        };
 
         // Plain HTTP could not read this page; a real browser sometimes can.
+        // `answered` is a browser that came back with anything at all: one
+        // that timed out or found no free slot says nothing about this page
+        // or the next.
+        let mut answered = false;
         if let Some(renderer) = self
             .renderer
             .as_ref()
-            .filter(|_| worth_rendering(Some(status.as_u16()), &body))
+            .filter(|_| worth_rendering(Some(status.as_u16()), &body, plain.as_ref()))
         {
             tracing::info!(url = %url, status = status.as_u16(), "retrying with headless browser");
             match renderer.render(fetched.as_str()).await {
-                Ok(html) if !super::browser::looks_unrendered(&html) => {
-                    return Ok(self.remember(key, extract_page(&html, &fetched)));
+                Ok(html) => {
+                    answered = true;
+                    let page = extract_page(&html, &fetched);
+                    if is_refusal(&page) {
+                        // bol.com shows the browser its notice as an
+                        // ordinary page of the shop, 9 KB of it.
+                        tracing::info!(url = %url, "the browser was shown a block notice");
+                        wall = Some(Wall::Notice);
+                    } else if super::browser::looks_unrendered(&html) {
+                        tracing::info!(url = %url, "render produced no usable page");
+                        if super::browser::is_challenge_page(&html) {
+                            wall = wall.or(Some(Wall::BotCheck));
+                        }
+                    } else {
+                        return Ok(self.remember(key, &landed, page));
+                    }
                 }
-                Ok(_) => tracing::info!(url = %url, "render produced no usable page"),
                 Err(e) => tracing::warn!(url = %url, error = %e, "render failed"),
             }
         }
-        if !status.is_success() {
+        // Told no, by the plain answer or by what the browser was shown —
+        // whichever status came with it. With no browser there is nobody
+        // left to ask; with one, only if it answered. The host is called
+        // what the model called it, unless a redirect took the request to
+        // another: reddit's old interface is still reddit to whoever asked.
+        if let Some(wall) = wall {
+            let named = if host_key(&landed) == host_key(&fetched) { &url } else { &landed };
+            return Err(self.unreadable(&landed, named, wall, self.renderer.is_none() || answered));
+        }
+        // A status alone is about this page: a 403 may be one directory and
+        // a 503 one bad minute, so it is reported as it was and closes
+        // nothing.
+        let Some(page) = plain else {
             return Err(FetchError::Invalid(format!("page returned HTTP {status}")));
-        }
-        // A wall that answers 200. Handing its text back as page content is
-        // what let the model mistake it for a page with nothing on it and
-        // open three more just like it.
-        if super::browser::is_challenge_page(&body) {
-            return Err(FetchError::Invalid(format!(
-                "{} served a bot check instead of the page, and it could not be cleared — \
-                 this site is unreadable, so do not open more pages on it; use what the \
-                 search results already told you",
-                url.host_str().unwrap_or("the site")
-            )));
-        }
-        Ok(self.remember(key, extract_page(&body, &fetched)))
+        };
+        Ok(self.remember(key, &landed, page))
     }
 }
 
@@ -1216,18 +1336,382 @@ mod tests {
         let real_page = "<html><body>".to_string() + &"content ".repeat(500) + "</body></html>";
 
         // Bot walls and challenges are what a browser is for.
-        assert!(worth_rendering(Some(403), ""));
-        assert!(worth_rendering(Some(429), ""));
-        assert!(worth_rendering(Some(503), ""));
-        assert!(worth_rendering(Some(200), "<html><title>Just a moment...</title></html>"));
-        assert!(worth_rendering(Some(200), "<html><body>tiny shell</body></html>"));
+        assert!(worth_rendering(Some(403), "", None));
+        assert!(worth_rendering(Some(429), "", None));
+        assert!(worth_rendering(Some(503), "", None));
+        assert!(worth_rendering(Some(200), "<html><title>Just a moment...</title></html>", None));
+        assert!(worth_rendering(Some(200), "<html><body>tiny shell</body></html>", None));
 
         // A page that is simply gone stays gone: rendering it would undo the
         // dead-link checks.
-        assert!(!worth_rendering(Some(404), ""));
-        assert!(!worth_rendering(Some(410), ""));
+        assert!(!worth_rendering(Some(404), "", None));
+        assert!(!worth_rendering(Some(410), "", None));
         // A page we could read needs no browser.
-        assert!(!worth_rendering(Some(200), &real_page));
+        let read = extract_page(&real_page, &base());
+        assert!(!worth_rendering(Some(200), &real_page, Some(&read)));
+
+        // The shop's own notice that it will not serve this reader is a
+        // page by its size and its title, and a browser is sometimes served
+        // where the plain request was not: amazon.nl, 2026-11-18.
+        let notice = block_notice();
+        let read = extract_page(&notice, &base());
+        assert!(worth_rendering(Some(200), &notice, Some(&read)));
+        // A page that is gone is gone whatever it says.
+        assert!(!worth_rendering(Some(404), &notice, Some(&read)));
+    }
+
+    /// Shaped like the block notice bol.com showed a browser on 2026-11-18:
+    /// an ordinary document of the shop, 9 KB with its styles, a title that
+    /// says nothing, a heading and a paragraph.
+    fn block_notice() -> String {
+        format!(
+            "<!DOCTYPE html><html><head><title>bol</title><style>{}</style></head><body>\
+             <div id=\"message\"><h1>Access blocked</h1><p>Your access to bol has been \
+             temporarily blocked due to possible abuse.</p></div></body></html>",
+            ".unicorn{display:block}".repeat(400)
+        )
+    }
+
+    /// The robot check amazon.nl answered a plain request with: 2 KB, so a
+    /// shell by its size, and its words inside a `noscript`.
+    const ROBOT_CHECK: &str = "<!DOCTYPE html><html lang=\"en\"><head><title></title></head><body>\
+        <div id=\"challenge-container\"></div><noscript><h1>JavaScript is disabled</h1>In order to \
+        continue, we need to verify that you're not a robot. This requires JavaScript. Enable \
+        JavaScript and then reload the page.</noscript></body></html>";
+
+    /// A page that is all script: nothing to read until a browser runs it.
+    const SHELL: &str = "<html><head><title>Shop</title></head><body><div id=\"root\"></div></body></html>";
+
+    const CHALLENGE: &str = "<html><head><title>Just a moment...</title></head><body></body></html>";
+
+    /// A product page as a browser hands it over: long, and priced in its data.
+    fn product_page() -> String {
+        format!(
+            r#"<html><head><title>Widget</title><script type="application/ld+json">
+               {{"@type":"Product","name":"Widget","offers":{{"@type":"Offer","price":"9.99",
+               "priceCurrency":"EUR","availability":"https://schema.org/InStock"}}}}</script></head>
+               <body><h1>Widget</h1><p>9,99</p><p>{}</p></body></html>"#,
+            "A widget for every purpose. ".repeat(100)
+        )
+    }
+
+    async fn serving(status: u16, body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn answering(html: &str) -> Option<crate::tools::browser::Renderer> {
+        Some(crate::tools::browser::Renderer::answering(html))
+    }
+
+    /// A browser that never answers: it will not start.
+    fn silent() -> Option<crate::tools::browser::Renderer> {
+        Some(crate::tools::browser::Renderer::new(std::path::PathBuf::from("/definitely/not/chrome")))
+    }
+
+    fn tool_with(server: &MockServer, renderer: Option<crate::tools::browser::Renderer>) -> FetchPageTool {
+        FetchPageTool::new(OpenWeb::exempting(*server.address()), renderer)
+    }
+
+    async fn requests(server: &MockServer) -> usize {
+        server.received_requests().await.expect("the mock records what it is asked").len()
+    }
+
+    /// Asks for `/p/1` and then `/p/2`, and says what the first was answered
+    /// with and whether the second was opened at all.
+    async fn two_pages(tool: &FetchPageTool, server: &MockServer) -> (String, bool) {
+        let first = tool
+            .call(FetchArgs { url: format!("{}/p/1", server.uri()) })
+            .await
+            .expect_err("the first page is refused")
+            .to_string();
+        let before = requests(server).await;
+        let second = tool.call(FetchArgs { url: format!("{}/p/2", server.uri()) }).await;
+        let opened = requests(server).await > before;
+        if !opened {
+            let msg = second.expect_err("a page that was not opened is not a page").to_string();
+            assert!(msg.contains("already refused a page in this request"), "got: {msg}");
+            assert!(msg.contains("was not opened again"), "got: {msg}");
+        }
+        (first, opened)
+    }
+
+    const NOTICE_SAID: &str = "served a block notice instead of the page";
+    const BOT_CHECK_SAID: &str = "served a bot check instead of the page";
+
+    #[test]
+    fn the_fixtures_are_what_the_tests_take_them_for() {
+        // Or the tests below would pass for the wrong reason.
+        let notice = block_notice();
+        assert!(notice.len() > 2048);
+        assert!(!crate::tools::browser::looks_unrendered(&notice), "a page by its size and its title");
+        assert!(!crate::tools::browser::is_challenge_page(&notice));
+        assert!(is_refusal(&extract_page(&notice, &base())));
+
+        assert!(crate::tools::browser::looks_unrendered(ROBOT_CHECK), "a shell by its size");
+        assert!(!crate::tools::browser::is_challenge_page(ROBOT_CHECK));
+        assert!(is_refusal(&extract_page(ROBOT_CHECK, &base())));
+
+        assert!(crate::tools::browser::looks_unrendered(SHELL));
+        assert!(!crate::tools::browser::is_challenge_page(SHELL));
+        assert!(!is_refusal(&extract_page(SHELL, &base())));
+
+        assert!(crate::tools::browser::is_challenge_page(CHALLENGE));
+        assert!(!is_refusal(&extract_page(CHALLENGE, &base())));
+        assert!(!is_refusal(&extract_page(&product_page(), &base())));
+    }
+
+    #[tokio::test]
+    async fn a_block_notice_that_answers_200_is_an_error_not_a_page() {
+        // No browser installed, so nobody else can ask.
+        let server = serving(200, &block_notice()).await;
+        let tool = tool_with(&server, None);
+        let err = tool
+            .call(FetchArgs { url: format!("{}/p/1", server.uri()) })
+            .await
+            .expect_err("a notice that the reader is blocked is not the page");
+        let msg = err.to_string();
+        assert!(msg.contains(NOTICE_SAID), "got: {msg}");
+        assert!(msg.contains("do not open more pages"), "the model is told to stop: {msg}");
+    }
+
+    #[tokio::test]
+    async fn a_notice_to_the_plain_request_goes_to_the_browser_and_what_it_is_served_is_the_page() {
+        // amazon.nl, 2026-11-18: the notice to the plain request, the
+        // product page to a browser.
+        let server = serving(200, &block_notice()).await;
+        let tool = tool_with(&server, answering(&product_page()));
+        let page = tool.call(FetchArgs { url: format!("{}/dp/1", server.uri()) }).await.unwrap();
+        assert_eq!(page.product.and_then(|p| p.price).as_deref(), Some("9.99 EUR"));
+        assert!(page.text.contains("A widget for every purpose"));
+    }
+
+    #[tokio::test]
+    async fn a_browser_shown_the_notice_is_not_handed_back_as_the_page_whatever_the_plain_answer_was() {
+        // bol.com on 2026-11-18: 403 to the plain request, and to the
+        // browser sent after it the block notice, which was returned as the
+        // product page. A shell and a failure of the server's own are the
+        // same case: what the browser was shown is a notice.
+        for (status, plain) in [(403, ""), (200, SHELL), (500, ""), (200, CHALLENGE)] {
+            let server = serving(status, plain).await;
+            let tool = tool_with(&server, answering(&block_notice()));
+            let (said, opened) = two_pages(&tool, &server).await;
+            assert!(said.contains(NOTICE_SAID), "{status}: {said}");
+            assert!(said.contains("do not open more pages"), "{status}: {said}");
+            assert!(!opened, "{status}: the browser answered, so nobody is left to ask");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_notice_the_size_of_a_shell_is_a_notice_all_the_same() {
+        // amazon.nl's robot check is 2 KB. From the plain request it goes
+        // to the browser as any shell does; shown to the browser as well, it
+        // is not the page for being small.
+        let server = serving(202, ROBOT_CHECK).await;
+        let (said, opened) = two_pages(&tool_with(&server, answering(ROBOT_CHECK)), &server).await;
+        assert!(said.contains(NOTICE_SAID), "got: {said}");
+        assert!(!opened);
+        // And where only the browser was shown it.
+        let server = serving(403, "").await;
+        let (said, opened) = two_pages(&tool_with(&server, answering(ROBOT_CHECK)), &server).await;
+        assert!(said.contains(NOTICE_SAID), "got: {said}");
+        assert!(!opened);
+        // With no browser it is what the plain request was told.
+        let server = serving(202, ROBOT_CHECK).await;
+        let (said, opened) = two_pages(&tool_with(&server, None), &server).await;
+        assert!(said.contains(NOTICE_SAID), "got: {said}");
+        assert!(!opened);
+    }
+
+    #[tokio::test]
+    async fn a_bot_check_nobody_cleared_is_said_and_closes_the_host() {
+        // To the plain request with no browser; to the plain request with a
+        // browser that came back with a shell; and to the browser, after a
+        // status that said nothing.
+        for (status, plain, browser) in [
+            (200, CHALLENGE, None),
+            (200, CHALLENGE, answering(SHELL)),
+            (200, CHALLENGE, answering(CHALLENGE)),
+            (403, "", answering(CHALLENGE)),
+        ] {
+            let sent = browser.is_some();
+            let server = serving(status, plain).await;
+            let (said, opened) = two_pages(&tool_with(&server, browser), &server).await;
+            assert!(said.contains(BOT_CHECK_SAID), "{status}, browser {sent}: {said}");
+            assert!(!opened, "{status}, browser {sent}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_browser_never_answered_leaves_the_host_open() {
+        // The browser was busy, timed out or would not start: nothing was
+        // learnt about what it would have been shown, here or on the next
+        // page.
+        for (plain, said_as) in [(block_notice(), NOTICE_SAID), (CHALLENGE.to_string(), BOT_CHECK_SAID)] {
+            let server = serving(200, &plain).await;
+            let (said, opened) = two_pages(&tool_with(&server, silent()), &server).await;
+            assert!(said.contains(said_as), "got: {said}");
+            assert!(opened, "the second page was asked for: {said_as}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_status_alone_is_reported_as_it_was_and_closes_nothing() {
+        // A 403 may be one directory and a 503 one bad minute. Whether no
+        // browser was sent, the browser never answered, or it came back
+        // with the server's own few bytes of error page: nobody was told no
+        // as a reader, so the next page is asked for.
+        let stock = "<html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1><hr>nginx</body></html>";
+        for status in [403, 429, 503, 500, 401] {
+            for browser in [None, silent(), answering(stock), answering(SHELL)] {
+                let sent = browser.is_some();
+                let server = serving(status, "").await;
+                let (said, opened) = two_pages(&tool_with(&server, browser), &server).await;
+                assert!(said.starts_with(&format!("page returned HTTP {status}")), "browser {sent}: {said}");
+                assert!(opened, "{status}, browser {sent}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_that_is_gone_is_never_taken_to_the_browser() {
+        let server = serving(404, "").await;
+        // A browser that would answer with a page, were it asked.
+        let (said, opened) = two_pages(&tool_with(&server, answering(&product_page())), &server).await;
+        assert!(said.starts_with("page returned HTTP 404"), "got: {said}");
+        assert!(opened);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_refused_is_not_opened_again_in_the_request() {
+        // Each page of a shop that has said no would cost a request, a
+        // Chrome and a fifth of the page budget, to be told the same.
+        let server = serving(403, "").await;
+        let tool = tool_with(&server, answering(&block_notice()));
+        let first = format!("{}/p/1", server.uri());
+        assert!(tool.call(FetchArgs { url: first.clone() }).await.is_err());
+        assert_eq!(requests(&server).await, 1);
+
+        for url in [format!("{}/p/2", server.uri()), format!("{}/s?q=widget", server.uri()), first] {
+            let err = tool.call(FetchArgs { url: url.clone() }).await.expect_err("the host said no");
+            let msg = err.to_string();
+            assert!(msg.contains("already refused a page in this request"), "{url}: {msg}");
+            assert!(msg.contains("was not opened again"), "{url}: {msg}");
+        }
+        assert_eq!(requests(&server).await, 1, "nothing more was sent to it");
+        assert_eq!(
+            tool.opens.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "and a page that was not opened costs none of the budget"
+        );
+
+        // The next request asks again: a refusal is remembered for a
+        // request, not for good.
+        let next = tool_with(&server, answering(&block_notice()));
+        assert!(next.call(FetchArgs { url: format!("{}/p/2", server.uri()) }).await.is_err());
+        assert_eq!(requests(&server).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_has_served_a_page_is_not_closed_by_one_that_says_no() {
+        // A shop's product page, then its account page: "access blocked"
+        // there is about that page. The shop is reading fine.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/account"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(block_notice()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(product_page()))
+            .mount(&server)
+            .await;
+        let tool = tool_with(&server, None);
+        let page = |n: u8| FetchArgs { url: format!("{}/p/{n}", server.uri()) };
+        assert!(tool.call(page(1)).await.is_ok());
+        let err = tool.call(FetchArgs { url: format!("{}/account", server.uri()) }).await.unwrap_err().to_string();
+        assert!(err.contains(NOTICE_SAID), "that page is still not a page: {err}");
+        // And the model is not told to keep away from a shop that reads fine.
+        assert!(err.contains("this page is unreadable"), "got: {err}");
+        assert!(!err.contains("this site is unreadable") && !err.contains("do not open more pages"), "got: {err}");
+        assert!(tool.call(page(2)).await.is_ok(), "and the shop is still open");
+        assert!(tool.call(page(1)).await.is_ok());
+        assert_eq!(requests(&server).await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_remembered_of_the_host_that_answered() {
+        // After a redirect that is not the host that was asked: a
+        // comparison site's link out to a shop that says no closes the
+        // shop, and says so of the shop. (Not driven through a redirect
+        // here: the test guard lets one socket through, and a second host
+        // needs a second.)
+        let tool = FetchPageTool::new(OpenWeb::new(Duration::from_secs(5)).unwrap(), None);
+        let landed = Url::parse("https://www.shop.example/blocked").unwrap();
+        let said = tool.unreadable(&landed, &landed, Wall::Notice, true).to_string();
+        assert!(said.starts_with("www.shop.example served a block notice"), "got: {said}");
+        // Its pages are refused before anything is sent, with the www or without.
+        for url in ["https://www.shop.example/p/2", "https://shop.example/p/3"] {
+            let err = tool.call(FetchArgs { url: url.into() }).await.unwrap_err().to_string();
+            assert!(err.contains("was not opened again"), "{url}: {err}");
+        }
+
+        // Reddit is asked at its old interface whichever address the model
+        // wrote, so a refusal there closes all of them, and is said of the
+        // address the model wrote.
+        let old = Url::parse("https://old.reddit.com/r/x/comments/1").unwrap();
+        let asked = Url::parse("https://www.reddit.com/r/x/comments/1").unwrap();
+        let said = tool.unreadable(&old, &asked, Wall::BotCheck, true).to_string();
+        assert!(said.starts_with("www.reddit.com served a bot check"), "got: {said}");
+        for url in ["https://www.reddit.com/r/y", "https://reddit.com/r/z", "https://old.reddit.com/r/x"] {
+            let err = tool.call(FetchArgs { url: url.into() }).await.unwrap_err().to_string();
+            assert!(err.contains("was not opened again"), "{url}: {err}");
+            assert!(err.starts_with(Url::parse(url).unwrap().host_str().unwrap()), "{url}: {err}");
+        }
+        assert_eq!(tool.opens.load(std::sync::atomic::Ordering::Relaxed), 0, "none of these cost a page");
+
+        // A refusal with somebody left to ask is said and closes nothing.
+        let other = Url::parse("https://other.example/p").unwrap();
+        assert!(tool.unreadable(&other, &other, Wall::BotCheck, false).to_string().contains(BOT_CHECK_SAID));
+        let hosts = tool.hosts.lock().unwrap();
+        assert!(hosts.closed.contains("shop.example") && hosts.closed.contains("old.reddit.com"));
+        assert!(!hosts.closed.contains("other.example"));
+    }
+
+    #[test]
+    fn a_host_is_remembered_without_its_www_and_reddit_by_the_address_that_is_asked() {
+        let key = |url: &str| host_key(&Url::parse(url).unwrap());
+        assert_eq!(key("https://www.shop.example/p/1"), key("https://shop.example/s?q=x"));
+        assert_eq!(key("https://www.shop.example/p/1").as_deref(), Some("shop.example"));
+        assert_ne!(key("https://m.shop.example/p/1"), key("https://shop.example/p/1"));
+        // Reddit is asked at its old interface, whichever address the model
+        // wrote: so that is the host a refusal is remembered of.
+        let asked = |url: &str| {
+            let url = Url::parse(url).unwrap();
+            host_key(&readable_url(&url).unwrap_or(url))
+        };
+        assert_eq!(asked("https://www.reddit.com/r/x/comments/1"), asked("https://reddit.com/r/y"));
+        assert_eq!(asked("https://www.reddit.com/r/x").as_deref(), Some("old.reddit.com"));
+    }
+
+    #[tokio::test]
+    async fn a_priced_page_is_the_page_whatever_else_it_says() {
+        // Short, and with the words of a refusal in it; but a page whose
+        // data prices its product was served.
+        let page = r#"<html><head><title>Widget</title><script type="application/ld+json">
+            {"@type":"Product","name":"Widget","offers":{"@type":"Offer","price":"13.80","priceCurrency":"EUR"}}
+            </script></head><body><h1>Widget</h1><p>13,80</p><p>Returns: the old portal is temporarily blocked.</p>"#
+            .to_string()
+            + &format!("<!-- {} --></body></html>", "padding ".repeat(400));
+        let server = serving(200, &page).await;
+        let tool = tool_with(&server, None);
+        let read = tool.call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.unwrap();
+        assert!(crate::tools::refusal::says_no(&read.text), "its text alone would be a refusal: {}", read.text);
+        assert_eq!(read.product.and_then(|p| p.price).as_deref(), Some("13.80 EUR"));
     }
 
 

@@ -172,7 +172,10 @@ seven times, all from its recommendations).
 listing/page is GONE - drop that option and mention it if relevant. Failing \
 with 403/503 or a bot-block page means the shop blocks automated access - the \
 link may still be fine, so present it using the search-result info with a \
-note that you could not verify availability. search_secondhand already \
+note that you could not verify availability. When the error says the site \
+is unreadable, that holds for the shop's other pages in this request too and \
+fetch_page will not open them: do not ask for them, present their links the \
+same way. search_secondhand already \
 removes dead listings for you (see its dead_links_removed count). Results \
 marked 'live eBay listing' or 'live Marktplaats listing' come from live \
 APIs and are already verified with current prices - do not re-verify them \

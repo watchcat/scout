@@ -95,7 +95,7 @@ Eight cells follow the page and not the check, which passed each of them:
   given, and the slogans it quoted beside that passed the check. Shop F's
   session quoted a time for the one country it delivers to.
 
-Three cells are kept with a caution. amazon.nl's "free" is for a first
+Some cells are kept with a caution. amazon.nl's "free" is for a first
 order to the Amsterdam address the page assumes, which neither session
 could change. Shop J's 17.20 is the lowest of three weight bands on its
 delivery page, and the parcel's weight is not stated. The 9.99 and 99.00
@@ -212,7 +212,7 @@ two ways do not, and the shop does not refuse it.
 | | measured | the rule asks | |
 |---|---|---|---|
 | hosts where a session read a number the reads did not, on any page it was shown | 6 of 10 | 3 | met |
-| the same, by the spec's check: on the last page it was shown | 3 of 10, 4 in the second sessions | 3 | met, barely |
+| the same, by the spec's check: on the last page it was shown | 3 of 10, 5 in the second sessions | 3 | met, barely |
 | of the six, a delivery cost above zero | 3 of 10 | | |
 | hosts that refused the session | 2 of 10 | | |
 

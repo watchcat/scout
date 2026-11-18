@@ -34,9 +34,9 @@
 //   scripts/shop-reach.mjs read products.json out/ [--only label] [--ways plain,render,drive]
 //   scripts/shop-reach.mjs table out/ [--name-all]
 //   scripts/shop-reach.mjs recheck out/      # the checks again, over the pages already saved
+//   scripts/shop-reach.mjs follow <address>... [--needle text]...
 //
 // Keep products.json and out/ outside the repository: they name hosts.
-//   scripts/shop-reach.mjs follow <address>... [--needle text]...
 //
 // `follow` opens addresses one after another in a single session and says
 // where each landed and whether the page wrote each needle: how a link that
@@ -74,7 +74,9 @@ const NUMBERS = ['price', 'variant_price', 'shipping']
 // ---------------------------------------------------------------- deciding
 
 // Free, said of delivery: the two words within a clause of each other, or
-// one of the compounds that say both. "Gratis retourneren" is not it.
+// one of the compounds that say both. "Gratis retourneren" alone is not it.
+// It still takes "free above an amount" for free, and a returns line beside
+// a delivery line: a zero it confirms wants reading, as the write-up did.
 const FREE = '(?:gratis|kostenlos\\w*|kostenfrei\\w*|free)'
 const DELIVERY = '(?:verzend\\w*|bezorg\\w*|lever\\w*|versand\\w*|liefer\\w*|deliver\\w*|shipping)'
 const FREE_DELIVERY = new RegExp(
@@ -125,8 +127,9 @@ export function sameSite(a, b) {
 }
 
 const POSTCODE_FIELD = /(post.?code|postal.?code|\bzip|plz)/
-const COUNTED = /(aantal|quantity|qty|menge|stück|stuks)/
-const PERSONAL = /(naam|name|mail|telefo|phone|handy|mobil|straat|street|stra(?:ß|ss)e|adres|address|\bort\b|stadt|city|plaats|card|kaart|karte|iban|konto|account|cvv|cvc|sicherheitscode|security.?code|wachtwoord|password|passwort|geboorte|geburt|birth|login|benutzer|user|firma|company|bedrijf)/g
+const COUNTED = /(aantal|anzahl|hoeveelheid|quantity|qty|menge|stück|stuks|huisnummer|hausnummer|house.?number)/
+const PLACE = /^(adres|address|ort|stadt|city|plaats)$/
+const PERSONAL = /(naam|name|mail|telefo|\btel\b|gsm|rufnummer|phone|handy|mobil|straat|street|stra(?:ß|ss)e|adres|address|\bort\b|wohnort|stadt|city|town|plaats|gemeente|card|kaart|karte|iban|konto|rekening|account|bsn|cvv|cvc|prüfziffer|sicherheitscode|security.?code|wachtwoord|password|passwort|kennwort|\bpin\b|geboorte|geboren|geburt|birth|\bdob\b|login|benutzer|user|kunden|klant|customer|firma|company|bedrijf)/g
 const PERSONAL_AUTOCOMPLETE = /^(name|given-name|additional-name|family-name|nickname|honorific-.*|email|tel(-.*)?|street-address|address-line\d|address-level\d|username|new-password|current-password|one-time-code|bday(-.*)?|organization(-title)?|cc-.*|sex|url|photo)$/
 
 /// Why a field may not be typed into, or null when it may. Anything a page
@@ -139,9 +142,11 @@ export function typingRefused(field, text) {
   if (['password', 'email'].includes(type)) return `a ${type} field is never typed into`
   const auto = (field.autocomplete || '').toLowerCase().split(/\s+/)
   if (auto.some((token) => PERSONAL_AUTOCOMPLETE.test(token))) return 'that field is for something personal'
+  // A search box is one whatever it suggests looking for.
+  if (type === 'search') return null
   const said = [field.name, field.id, field.placeholder, field.label, field.title].filter(Boolean).join(' ').toLowerCase()
-  // A postcode field inside an address form is still a postcode field.
-  const personal = (said.match(PERSONAL) || []).filter((word) => !(POSTCODE_FIELD.test(said) && /^(adres|address)$/.test(word)))
+  // A postcode field inside an address form, or one that takes a place as well, is still a postcode field.
+  const personal = (said.match(PERSONAL) || []).filter((word) => !(POSTCODE_FIELD.test(said) && PLACE.test(word)))
   if (personal.length) return 'that field is for something personal'
   // A numeric keypad is for a postcode or a quantity, or it is for a phone number.
   if (type === 'tel' && !POSTCODE_FIELD.test(said) && !COUNTED.test(said)) return 'a tel field is typed into only for a postcode or a quantity'
@@ -174,6 +179,7 @@ export function turnedAway({ firstWall, walls, wallsInARow }) {
 export function checkReport(report, texts) {
   const seen = texts.join('\n')
   const flat = seen.toLowerCase().replace(/\s+/g, ' ')
+  const bare = (s) => s.replace(/\([^)]*\)?/g, ' ').replace(/\s+/g, ' ')
   const out = {}
   const number = (v) => (typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)) ? Number(v) : null)
   for (const key of NUMBERS) {
@@ -184,9 +190,10 @@ export function checkReport(report, texts) {
   // The wording as quoted: one quotation among several is enough, if it is
   // long enough to be a wording and not a word.
   const quoted = report?.delivery
-    ? String(report.delivery).toLowerCase().replace(/\([^)]*\)?/g, ' ').replace(/\s+/g, ' ').split(/["“”„‟«»‹›]|(?:^|\s)['‘’‚]|['‘’](?:\s|$|[.,;])|\s\/\s|;/).map((q) => q.replace(/^[\s.]+|[\s.]+$/g, '')).filter((q) => q.length >= 8)
+    ? bare(String(report.delivery).toLowerCase()).split(/["“”„‟«»‹›]|(?:^|\s)['‘’‚]|['‘’](?:\s|$|[.,;])|\s\/\s|;/).map((q) => q.replace(/^[\s.]+|[\s.]+$/g, '')).filter((q) => q.length >= 8)
     : null
-  out.delivery = quoted ? quoted.some((q) => flat.includes(q)) : null
+  // Asides are dropped from the page too, so a wording quoted with or without its own matches.
+  out.delivery = quoted ? quoted.some((q) => flat.includes(q) || bare(flat).includes(q)) : null
   return out
 }
 
@@ -250,7 +257,8 @@ function cells(name, way) {
   // A session is refused when the loop says so; a side page that would not
   // open is not that. A fetched page the model called a refusal has nothing to show.
   if (!report || (name === 'drive' ? way.refused : report.refused)) return ['—', '—', '—', '—']
-  const cell = (key) => (report?.[key] == null ? '—' : verified[key] ? money(Number(report[key])) : `${money(Number(report[key]))} (not on the page)`)
+  const amount = (key) => (typeof report[key] === 'number' ? report[key] : typeof report[key] === 'string' && report[key].trim() !== '' && Number.isFinite(Number(report[key])) ? Number(report[key]) : null)
+  const cell = (key) => (amount(key) === null ? '—' : verified[key] ? money(amount(key)) : `${money(amount(key))} (not on the page)`)
   const delivery = report?.delivery ? (verified.delivery ? 'stated' : 'stated (not on the page)') : '—'
   return [cell('price'), cell('variant_price'), cell('shipping'), delivery]
 }
@@ -626,7 +634,8 @@ class Session {
         s.status = m.params.response.status
       } else if (m.method === 'Page.javascriptDialogOpening') {
         // An alert would hold every later call; nobody is here to read it.
-        s.send('Page.handleJavaScriptDialog', { accept: false }).catch(() => {})
+        // Declined, except the one that asks before leaving, which would keep the session there.
+        s.send('Page.handleJavaScriptDialog', { accept: m.params.type === 'beforeunload' }).catch(() => {})
       }
     })
     await s.send('Page.enable')
@@ -955,7 +964,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const [command, ...rest] = process.argv.slice(2)
   const commands = { read, table, follow, recheck }
   if (!commands[command]) {
-    console.error('usage: shop-reach.mjs read <products.json> <out-dir> | shop-reach.mjs table <out-dir> | shop-reach.mjs follow <address>...')
+    console.error('usage: shop-reach.mjs read <products.json> <out-dir> | table <out-dir> | recheck <out-dir> | follow <address>...')
     process.exit(2)
   }
   Promise.resolve(commands[command](rest)).then(() => process.exit(0), (e) => { console.error(e.message); process.exit(1) })

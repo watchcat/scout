@@ -106,6 +106,26 @@ test('what may be typed is a search term, a quantity, a postcode or a house numb
   no({ type: 'text', label: 'Postal address' })
   no({ type: 'text', id: 'visitorNameSearch' })
   no({ type: 'text', title: 'Uw naam' })
+  no({ type: 'text', label: 'Tel.' })
+  no({ type: 'text', label: 'GSM' })
+  no({ type: 'text', label: 'Rufnummer' })
+  no({ type: 'text', label: 'Wohnort' })
+  no({ type: 'text', label: 'Rekeningnummer' })
+  no({ type: 'text', label: 'Geboren am' })
+  no({ type: 'text', label: 'Kennwort' })
+  no({ type: 'text', label: 'PIN' })
+  no({ type: 'text', label: 'Klantnummer' })
+  // A search box is a search box, whatever it suggests looking for.
+  ok({ type: 'search', placeholder: 'Zoek op productnaam' }, 'kattenvoer')
+  ok({ type: 'search', placeholder: 'Suche nach Marke, Artikel, Ort' }, 'lampe')
+  no({ type: 'search', autocomplete: 'email' })
+  // Where a delivery checker takes a postcode it often offers a place as well.
+  ok({ type: 'text', label: 'PLZ / Ort' })
+  ok({ type: 'text', placeholder: 'Postcode of plaats' })
+  no({ type: 'text', label: 'Plaats' })
+  ok({ type: 'tel', label: 'Huisnummer' }, '1')
+  ok({ type: 'tel', label: 'Anzahl' }, '2')
+  ok({ type: 'tel', label: 'Hoeveelheid' }, '2')
   // A numeric keypad is how a shop asks for a postcode or a quantity; a phone number it is not.
   ok({ type: 'tel', name: 'postcode' })
   ok({ type: 'tel', label: 'Aantal' }, '2')
@@ -152,6 +172,10 @@ test('a report is checked against what the session was shown, amount by amount',
   assert.equal(checkReport({ delivery: '“morgen  in huis”' }, seen).delivery, true)
   // A sentence about the wording is not the wording.
   assert.equal(checkReport({ delivery: 'The page says morgen in huis, on the basket page' }, seen).delivery, false)
+  // The page's own wording may carry an aside; quoted whole or without it, it is the wording.
+  const aside = ['Lieferzeit: 1 - 3 Werktage (Ausland abweichend) Sofort verfügbar']
+  assert.equal(checkReport({ delivery: 'Lieferzeit: 1 - 3 Werktage (Ausland abweichend)' }, aside).delivery, true)
+  assert.equal(checkReport({ delivery: '"Lieferzeit: 1 - 3 Werktage"' }, aside).delivery, true)
   // German quotation marks, and an aside after the wording.
   assert.equal(checkReport({ delivery: '„Morgen in huis“ (so im Warenkorb)' }, seen).delivery, true)
   assert.equal(checkReport({ delivery: 'Morgen in huis (basket page)' }, seen).delivery, true)
@@ -274,6 +298,11 @@ test('the tables name a host only when it is public, and letter the rest', () =>
   rows[1].drive.refused = true
   assert.doesNotMatch(tables(rows), /driven session \| 20\.00 \|/)
   rows[1].drive.refused = false
+  // A field that is not a number is not printed as one.
+  rows[2].drive.report.shipping = ''
+  rows[2].drive.report.variant_price = 'null'
+  assert.doesNotMatch(tables(rows), /NaN|0\.00 \(not on the page\)/)
+  rows[2].drive.report.variant_price = 35
   // A fetched page the model called a refusal has nothing to show.
   rows[1].plain.report.refused = true
   assert.doesNotMatch(tables(rows), /plain request \| 20\.00 \|/)

@@ -12,21 +12,28 @@
 # they have been blocked is not the product page.
 #
 # The limit: the longest notice below is bol's in French, 1,223 characters
-# of text; its English is 1,097 and amazon's two are under 250. A product
-# page fills the 6,000 the tool keeps. 1,500 is also what the first count
-# of these pages in the traces looked under, on 2026-11-18.
+# of text and a few more once the reader's address is written into its
+# heading; its English is 1,097, or 1,160 in the traces, and amazon's two
+# are under 250. A product page fills the 6,000 the tool keeps. 1,500 is
+# also what the first count of these pages in the traces looked under, on
+# 2026-11-18.
 #
 # Every phrase was read off a page a shop served, on the day and to the
-# reader its note gives: as the page's text, or, for bol's Dutch and
-# French, as the wording that page carries for a reader with another
-# language set. None is here because a wall might say it. A phrase a real
-# page could say in passing closes a shop for the rest of a request,
-# so "captcha" is not here (every page behind reCAPTCHA says it in its
-# footer), nor "continue shopping" (so does every empty basket), nor
-# "access denied" (so does an account page to someone not signed in; the
-# title rule in tools/browser.rs knows it where it is a page's title). The
-# trace script prints how many short pages with no price the list did not
-# know: that count is where the next phrase comes from.
+# reader its note gives: as the page's text, as a page fetch_page handed
+# over and the run traces kept, or, for bol's Dutch and French, as the
+# wording that page carries for a reader with another language set. None
+# is here because a wall might say it. A phrase a real page could say in
+# passing closes a shop for the rest of a request, so "captcha" is not
+# here (every page behind reCAPTCHA says it in its footer), nor "continue
+# shopping" (so does every empty basket), nor "access denied" (so does an
+# account page to someone not signed in; the title rule in
+# tools/browser.rs knows it where it is a page's title), nor "please
+# enable JavaScript to continue" (two pages in the traces said only that,
+# but a page that renders well carries it too, in a noscript whose text
+# the extractor keeps with the rest).
+# The trace script prints how many short pages with no price the list did
+# not know: that count is where the next phrase comes from, and the last
+# three below came from it.
 max_chars 1500
 
 # bol.com, 2026-11-18.
@@ -42,7 +49,11 @@ max_chars 1500
 # by a `language` cookie: "Je toegang tot bol is tijdelijk geblokkeerd
 # vanwege mogelijk misbruik vanaf dit IP adres", "Votre accès à bol a été
 # temporairement bloqué en raison d'un possible abus". A browser with a
-# fresh profile has no such cookie and is shown the English.
+# fresh profile has no such cookie and is shown the English. In the traces
+# of the sixty days to 2026-11-17 all 20 of bol's pages say "temporarily
+# blocked": 4 under the heading "Access blocked" and 16 under "IP address
+# … is blocked", where the page has written its reader's address into the
+# heading. So the sentence is the phrase, and neither heading is relied on.
 access blocked
 temporarily blocked
 tijdelijk geblokkeerd
@@ -55,5 +66,22 @@ klik op de knop hieronder om verder te winkelen
 
 # amazon.nl, 2026-11-18, to a plain request sent from a laptop with
 # `page_as_read get`: HTTP 202 and 2 KB, in a noscript: "In order to
-# continue, we need to verify that you're not a robot."
+# continue, we need to verify that you're not a robot." The same 157
+# characters were handed over as two pages of another shop in the traces
+# of the sixty days to 2026-11-17. It is in a noscript too, like the
+# sentence about JavaScript above; what tells them apart is that this one
+# belongs to a page put in front of the shop's, which a browser that gets
+# through no longer has, and not to the shop's page itself.
 not a robot
+
+# The rest are from those traces: pages fetch_page handed to the model,
+# each on a shop one account used, so the shop is not named.
+# "We controleren of je geen robot bent." One page.
+geen robot bent
+# "Access to this page has been denied. Before we continue... Please
+# confirm you are a human (and not a bot)." One page.
+access to this page has been denied
+# "Human verification. Checking if you're human. We are running a quick
+# security check to protect this site from bots." Two pages, on two shops:
+# a check a browser may well pass, which is where such a page goes first.
+protect this site from bots

@@ -8,18 +8,23 @@ of 2026-11-18, from `scripts/unread-pages.py` run over the nightly backup:
 sixty days, 2026-09-19 to 2026-11-17, 71 runs that opened a page or
 compared prices. Small numbers; read them as shape, not precision.
 
-> **Corrected the same day** by `docs/2026-11-18-shop-reach.md`: 23 of the
-> 167 pages counted below as "read with no price" were refusals that
-> `fetch_page` did not recognise and handed over as the page, 20 of them
-> on bol.com. A wall stopped 54 of the 282 pages asked for, not 31. Both
-> rows of the rule stay met.
+> **Corrected the same day**, first by `docs/2026-11-18-shop-reach.md` and
+> then by the script itself. 26 of the 167 pages counted below as "read
+> with no price" were a site's block notice, which `fetch_page` took for
+> the page and handed over: 20 on bol.com, every page asked for there, and
+> 6 on five other hosts. So 141 pages were read with no price, and a wall
+> kept back 57 of the 282 pages asked for, not 31.
 >
-> The script has since been taught to count such a page apart, as "a block
-> notice", by the rule `fetch_page` now refuses it with. It has not been
-> run on a backup since, so the tables below stand as they were. Its rule
-> is narrower than the query that found the 23: bol's twenty are bol's
-> wording and should be counted by it; the three on other hosts have not
-> been read against it.
+> Three of the 26 were pages a run went on to offer, all three on
+> bol.com. Of product pages read, 27 of 97 had no price (28%), and 25 of
+> the 60 a run offered (42%), where the tables below say 30 of 100 and 28
+> of 63; the page's text wrote the offered amount in 21 of those 25. Of
+> the 60 offers whose page was read, 21 said delivery was free and 5 gave
+> a cost, as before of 63. Both rows of the rule stay met.
+>
+> The script now counts such a page apart, as "a block notice", by the
+> rule `fetch_page` refuses it with. Run on the same backup it prints the
+> figures of this note; the tables below are as first written.
 
 ## How a read ends
 

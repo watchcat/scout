@@ -44,8 +44,10 @@ it is told from a page read with no price by the tool's own rule — a text
 under a limit that contains one of a list of phrases — read from the file
 the tool compiles in, crates/scout-core/src/tools/refusal_marks.txt, so
 that what is counted here is what the tool refuses. The list holds what
-Scout has met; a short page with no price that it does not know is
-counted too, for a look. *Host closed* is a page fetch_page did not open
+Scout has met, and the report says how many notices each phrase gave
+away. A short page with no price that the list does not know is counted
+too, and only counted: which pages those are, and what they say, is read
+off the backup by hand. *Host closed* is a page fetch_page did not open
 because its host had refused one earlier in the run. It is a page a wall
 kept back all the same, so it is counted among the pages asked for and
 among the walls, and in the host table under blocked: before that
@@ -156,10 +158,18 @@ def short(text):
     return isinstance(text, str) and len(text) < MAX_CHARS
 
 
+def phrase_in(text):
+    """The first phrase of the list a short text contains, or None."""
+    if not short(text):
+        return None
+    lower = text.lower()
+    return next((mark for mark in MARKS if mark in lower), None)
+
+
 def says_no(text):
     """Whether a page's text is a site refusing its reader and not the page:
     short, and saying so. `says_no` in tools/refusal.rs, on the same file."""
-    return short(text) and any(mark in text.lower() for mark in MARKS)
+    return phrase_in(text) is not None
 
 
 def loads(text):
@@ -254,6 +264,7 @@ def measure(rows, accounts=None):
         by_run[row[0]].append(row)
 
     fetch = collections.Counter()
+    notices = collections.Counter()   # phrase -> block notices it gave away
     offers = collections.Counter()
     offered = collections.Counter()
     product = collections.Counter()
@@ -292,6 +303,8 @@ def measure(rows, accounts=None):
                 read = loads(result) if kind in READ else None
                 # Short enough to be a notice and none the list knows: worth a look.
                 fetch["short_unknown"] += kind == NO_PRICE and short(read.get("text"))
+                if kind == NOTICE:
+                    notices[phrase_in(loads(result).get("text"))] += 1
                 if earlier is None or BEST[kind] > BEST[earlier[0]]:
                     pages[key] = (kind, read)
             elif tool == "compare_prices" and status == "ok":
@@ -360,7 +373,7 @@ def measure(rows, accounts=None):
         counts["runs"] = len(seen_in[name])
         counts["accounts"] = len(used_by[name])
     fetch["requested"] = requested(fetch)
-    return {"fetch": fetch, "offers": offers, "offered": offered, "product": product, "hosts": dict(hosts)}
+    return {"fetch": fetch, "notices": notices, "offers": offers, "offered": offered, "product": product, "hosts": dict(hosts)}
 
 
 def at_least(part, whole, threshold):
@@ -425,6 +438,11 @@ def report(m, top, window, min_accounts=2):
     out += [
         f"  a wall kept back — blocked, a notice taken for the page, or not opened after one: {walls(f)} ({pct(walls(f), f['requested'])})",
         f"  read with no price in under {MAX_CHARS} characters of text, and no notice the list knows: {f['short_unknown']}",
+    ]
+    if m["notices"]:
+        split = ", ".join(f'"{mark}" {m["notices"][mark]}' for mark in MARKS if m["notices"][mark])
+        out.append(f"  block notices, by the first phrase of the list each contains: {split}")
+    out += [
         "",
         "== compare_prices",
         f"  calls: {o['calls']}; offers: {o['offers']}; with no shipping cost: {o['no_shipping']} ({pct(o['no_shipping'], o['offers'])})",

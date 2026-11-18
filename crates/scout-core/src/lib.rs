@@ -22,6 +22,7 @@ pub mod inbox;
 pub mod ids;
 pub mod invites;
 pub mod links;
+pub mod measure;
 pub mod metrics;
 pub mod mirror;
 pub mod net_guard;

@@ -10,15 +10,15 @@ use serde_json::json;
 pub(crate) const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
      AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
+pub(crate) const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+pub(crate) const BROWSER_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9,nl;q=0.8";
+
 /// GET with browser-like headers; shared by fetch_page and link probing.
 pub(crate) fn browser_get(http: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
     http.get(url)
         .header("User-Agent", BROWSER_USER_AGENT)
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header("Accept-Language", "en-US,en;q=0.9,nl;q=0.8")
+        .header("Accept", BROWSER_ACCEPT)
+        .header("Accept-Language", BROWSER_ACCEPT_LANGUAGE)
 }
 
 /// Readable-text cap: enough for a product/listing page's useful content
@@ -721,7 +721,7 @@ fn readable_url(url: &Url) -> Option<Url> {
     Some(old)
 }
 
-fn worth_rendering(status: Option<u16>, body: &str) -> bool {
+pub(crate) fn worth_rendering(status: Option<u16>, body: &str) -> bool {
     match status {
         Some(404 | 410) => false,
         Some(403 | 429 | 503) | None => true,
@@ -845,7 +845,7 @@ pub fn extract_page_for_test(html: &str, url: &str) -> Option<PageProduct> {
     extract_page(html, &Url::parse(url).unwrap()).product
 }
 
-fn extract_page(html: &str, base: &Url) -> PageContent {
+pub(crate) fn extract_page(html: &str, base: &Url) -> PageContent {
     let product = extract_product(html, base);
     // The product's own status beats a page-wide guess when both exist.
     let availability = product

@@ -188,11 +188,27 @@ a text under 1,500 characters that contains one of the phrases in
 `crates/scout-core/src/tools/refusal_marks.txt`. The query behind the 23
 looked under the same 1,500 characters for a longer list of words,
 "captcha" and "continue shopping" among them, which a page also says for
-other reasons; the file keeps only wording read off a page. The script
-has so far been run on made-up traces, not on a backup. bol's twenty
-should be counted by it, being bol's wording. The three on other hosts
-were found by the wider query and have not been read against the
-narrower rule.
+other reasons; the file keeps only wording read off a page.
+
+Run on the same backup with the list as first written, the script
+counted 22: bol's 20 and a robot check on two pages of one shop. It also
+counted 15 short pages with no price that the list did not know. The
+script only counts those; I read them off the backup by hand. Four were
+refusals: a robot check in Dutch on one shop, which the query had found,
+a human check on another, and a proof-of-work check on two more. Their
+wording was added, and the script now counts 26, not 23: bol's 20, and 6
+on five other hosts. It prints the split by phrase. So a wall kept back
+57 of the 282 pages asked for, and the model was not told so for 26 of
+them.
+
+Eleven short pages with no price are left that the list does not know.
+By the same reading they are a consent gate, two that say only to enable
+JavaScript, two of a shop's own "cannot be reached" page, two of a
+waiting room, a shop that has closed, and three that are simply short.
+The two that say only to enable JavaScript are walls as well and are
+still handed over as pages. The phrase list is the wrong tool for them,
+since a page that renders well carries the same sentence; they have a
+card of their own.
 
 ## Links that pick a variant or fill a basket
 

@@ -213,6 +213,22 @@ class Notices(unittest.TestCase):
         self.assertEqual((m["fetch"][up.CLOSED], m["fetch"]["again"]), (2, 0))
         self.assertEqual((m["offered"][up.CLOSED], m["offered"]["unread"], m["offered"]["never_opened"]), (1, 1, 0))
 
+    def test_notices_are_counted_by_the_wording_that_gave_each_away(self):
+        robot = "JavaScript is disabled In order to continue, we need to verify that you're not a robot."
+        both = "bol Access blocked Your access to bol has been temporarily blocked due to possible abuse."
+        m = up.measure([
+            fetch(1, 0, "https://shop.example/p/1", page(product=False, text=NOTICE)),
+            fetch(1, 1, "https://shop.example/p/2", page(product=False, text=both)),   # two phrases: the list's first counts
+            fetch(1, 2, "https://other.example/p", page(product=False, text=robot)),
+            fetch(1, 3, "https://other.example/q", page(product=False, text="nothing of the kind")),
+        ])
+        self.assertEqual(dict(m["notices"]), {"temporarily blocked": 1, "access blocked": 1, "not a robot": 1})
+        self.assertEqual(sum(m["notices"].values()), m["fetch"][up.NOTICE])
+        text = up.report(m, top=5, window="a window", min_accounts=1)
+        self.assertIn('  block notices, by the first phrase of the list each contains: "access blocked" 1, "temporarily blocked" 1, "not a robot" 1', text.splitlines())
+        # With none there is nothing to split.
+        self.assertNotIn("by the first phrase", up.report(up.measure([]), top=5, window="a window"))
+
     def test_short_pages_the_list_does_not_know_are_counted_for_a_look(self):
         # shop-b's first page: no price, a few words, and none of them a phrase.
         self.assertEqual(self.m["fetch"]["short_unknown"], 1)
@@ -262,8 +278,9 @@ class Notices(unittest.TestCase):
         row = next(line for line in lines if line.strip().startswith("shop-a.example"))
         self.assertEqual(row.split("|")[0].split()[1:], ["1", "1", "0", "0", "2", "0", "0", "0"])
         self.assertEqual(row.split("|")[-1].split(), ["3"])
-        # And nothing of the notice's own words.
-        for leak in ("temporarily blocked", "IP address"):
+        # Of a notice's own words, only the list's phrase that gave it away: the list is the repository's, the page is not.
+        self.assertIn('"temporarily blocked" 2', text)
+        for leak in ("IP address", "possible abuse", "Your access"):
             self.assertNotIn(leak, text)
 
 

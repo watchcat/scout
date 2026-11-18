@@ -115,6 +115,10 @@ mod tests {
             ("bol with a French one", "bol L'adresse IP est bloquée Votre accès à bol a été temporairement bloqué en raison d'un possible abus"),
             ("amazon's continue-shopping notice", AMAZON_NOTICE),
             ("amazon's robot check", AMAZON_CHECK),
+            // And three the run traces kept, each handed over as a page.
+            ("a robot check in Dutch", "We controleren of je geen robot bent."),
+            ("a human check", "Access to this page has been denied Before we continue... Please confirm you are a human (and not a bot)."),
+            ("a proof-of-work check", "Human verification Checking if you're human We are running a quick security check to protect this site from bots."),
         ] {
             assert!(says_no(text), "{who}: {text}");
         }
@@ -147,6 +151,10 @@ mod tests {
             "De afvoer is geblokkeerd? Bel de loodgieter.",
             // Said to anyone not signed in; `browser.rs` knows it as a title.
             "Access denied. Please sign in to see your orders.",
+            // All that two pages in the traces said; but a page that
+            // renders well carries it too, in a noscript the extractor
+            // reads with the rest.
+            "Please enable JavaScript to continue.",
         ] {
             assert!(!says_no(text), "{text}");
         }

@@ -156,7 +156,7 @@ class SaysNo(unittest.TestCase):
                 up.refusal_rule(source)
         self.assertEqual(up.refusal_rule("# a note\n\n  max_chars 20 \n  access blocked  \n"), (20, ("access blocked",)))
         # A line ends at a newline and nowhere else, as it does for the tool.
-        self.assertEqual(up.refusal_rule("max_chars 20\r\naccess\x0bblocked\r\n"), (20, ("access\x0bblocked",)))
+        self.assertEqual(up.refusal_rule("max_chars 20\r\n\taccess\x0bblocked\x1f\r\n"), (20, ("access\x0bblocked\x1f",)))
 
     def test_what_is_not_text_does_not_say_no(self):
         for value in (None, 5, ["access blocked"], {"text": "access blocked"}):

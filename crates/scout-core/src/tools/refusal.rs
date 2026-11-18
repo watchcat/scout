@@ -24,10 +24,14 @@ struct Rule {
 
 const SOURCE: &str = include_str!("refusal_marks.txt");
 
+/// What is trimmed off a line, spelt out because the script's reader
+/// trims the same and each language's own idea of white space differs.
+const BLANK: [char; 3] = [' ', '\t', '\r'];
+
 fn parse(source: &'static str) -> Result<Rule, String> {
     let mut max_chars = None;
     let mut marks = Vec::new();
-    for line in source.lines().map(str::trim) {
+    for line in source.split('\n').map(|line| line.trim_matches(BLANK)) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -35,7 +39,7 @@ fn parse(source: &'static str) -> Result<Rule, String> {
             // Digits and nothing else, so that the script's reader and this
             // one cannot disagree about a sign or a stray character.
             Some(n) if max_chars.is_none() => {
-                let n = n.trim();
+                let n = n.trim_matches(BLANK);
                 if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(format!("max_chars: {n:?} is not a number"));
                 }
@@ -204,6 +208,10 @@ mod tests {
         assert!(parse("access blocked\n").is_err());
         assert!(parse("max_chars many\naccess blocked\n").is_err());
         assert!(parse("max_chars +1500\naccess blocked\n").is_err());
+        // A line ends at a newline and is trimmed of spaces, tabs and a
+        // carriage return: nothing the script's reader does otherwise.
+        let rule = parse("max_chars 20\r\n\taccess\u{b}blocked\u{1f}\r\n").expect("parses");
+        assert_eq!(rule.marks, vec!["access\u{b}blocked\u{1f}"]);
         assert!(parse("max_chars \naccess blocked\n").is_err());
         assert!(parse("max_chars 1500\nmax_chars 900\naccess blocked\n").is_err());
         let rule = parse("# a note\n\n  max_chars 20 \n  access blocked  \n").expect("parses");

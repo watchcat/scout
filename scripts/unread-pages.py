@@ -126,16 +126,17 @@ def refusal_rule(source):
     """The limit and the phrases, as tools/refusal.rs reads them: comments
     and blank lines aside, one `max_chars` line and a phrase on every other."""
     limit, marks = None, []
-    # Lines end where Rust's `lines` ends them, and a number is ASCII digits
-    # there too: nothing either reader takes that the other does not.
+    # A line ends at a newline, is trimmed of spaces, tabs and a carriage
+    # return, and a number is ASCII digits: all as in the tool's reader, so
+    # that neither takes anything the other does not.
     for line in source.split("\n"):
-        line = line.strip()
+        line = line.strip(" \t\r")
         if not line or line.startswith("#"):
             continue
         if line.startswith("max_chars "):
             if limit is not None:
                 raise ValueError("max_chars is given twice")
-            number = line[len("max_chars "):].strip()
+            number = line[len("max_chars "):].strip(" \t\r")
             if not (number.isascii() and number.isdigit()):
                 raise ValueError(f"max_chars: {number!r} is not a number")
             limit = int(number)

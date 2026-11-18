@@ -17,8 +17,10 @@
 # of these pages in the traces looked under, on 2026-11-18.
 #
 # Every phrase was read off a page a shop served, on the day and to the
-# reader its note gives; none is here because a wall might say it. A phrase
-# a real page could say in passing closes a shop for the rest of a request,
+# reader its note gives: as the page's text, or, for bol's Dutch and
+# French, as the wording that page carries for a reader with another
+# language set. None is here because a wall might say it. A phrase a real
+# page could say in passing closes a shop for the rest of a request,
 # so "captcha" is not here (every page behind reCAPTCHA says it in its
 # footer), nor "continue shopping" (so does every empty basket), nor
 # "access denied" (so does an account page to someone not signed in; the

@@ -740,13 +740,16 @@ impl FetchPageTool {
     /// back as page content is what let the model mistake it for a page with
     /// nothing on it and open three more just like it, so it is told in
     /// words. `at` is where the request ended up, which after a redirect is
-    /// not where it was sent. `settled` is whether nobody was left to ask;
-    /// it closes the host for the rest of the request, unless the host has
-    /// served a page in it.
-    fn unreadable(&self, at: &Url, wall: Wall, settled: bool) -> FetchError {
-        if let Some(host) = host_key(at).filter(|_| settled) {
+    /// not where it was sent, and `named` is what to call that host to the
+    /// model. `settled` is whether nobody was left to ask; it closes the
+    /// host for the rest of the request, unless the host has served a page
+    /// in it — and then the model is told of the page, not of the site.
+    fn unreadable(&self, at: &Url, named: &Url, wall: Wall, settled: bool) -> FetchError {
+        let mut reads_fine = false;
+        if let Some(host) = host_key(at) {
             let mut hosts = self.hosts.lock().unwrap();
-            if !hosts.served.contains(&host) {
+            reads_fine = hosts.served.contains(&host);
+            if settled && !reads_fine {
                 hosts.closed.insert(host);
             }
         }
@@ -754,11 +757,14 @@ impl FetchPageTool {
             Wall::BotCheck => "served a bot check instead of the page, and it could not be cleared",
             Wall::Notice => "served a block notice instead of the page",
         };
-        FetchError::Invalid(format!(
-            "{} {what} — this site is unreadable, so do not open more pages on it; use what the \
-             search results already told you",
-            at.host_str().unwrap_or("the site")
-        ))
+        let then = if reads_fine {
+            "this page is unreadable, though others of the site were read; use what the search \
+             results already told you of it"
+        } else {
+            "this site is unreadable, so do not open more pages on it; use what the search results \
+             already told you"
+        };
+        FetchError::Invalid(format!("{} {what} — {then}", named.host_str().unwrap_or("the site")))
     }
 }
 
@@ -937,9 +943,12 @@ impl Tool for FetchPageTool {
         }
         // Told no, by the plain answer or by what the browser was shown —
         // whichever status came with it. With no browser there is nobody
-        // left to ask; with one, only if it answered.
+        // left to ask; with one, only if it answered. The host is called
+        // what the model called it, unless a redirect took the request to
+        // another: reddit's old interface is still reddit to whoever asked.
         if let Some(wall) = wall {
-            return Err(self.unreadable(&landed, wall, self.renderer.is_none() || answered));
+            let named = if host_key(&landed) == host_key(&fetched) { &url } else { &landed };
+            return Err(self.unreadable(&landed, named, wall, self.renderer.is_none() || answered));
         }
         // A status alone is about this page: a 403 may be one directory and
         // a 503 one bad minute, so it is reported as it was and closes
@@ -1624,8 +1633,11 @@ mod tests {
         let tool = tool_with(&server, None);
         let page = |n: u8| FetchArgs { url: format!("{}/p/{n}", server.uri()) };
         assert!(tool.call(page(1)).await.is_ok());
-        let err = tool.call(FetchArgs { url: format!("{}/account", server.uri()) }).await.unwrap_err();
-        assert!(err.to_string().contains(NOTICE_SAID), "that page is still not a page: {err}");
+        let err = tool.call(FetchArgs { url: format!("{}/account", server.uri()) }).await.unwrap_err().to_string();
+        assert!(err.contains(NOTICE_SAID), "that page is still not a page: {err}");
+        // And the model is not told to keep away from a shop that reads fine.
+        assert!(err.contains("this page is unreadable"), "got: {err}");
+        assert!(!err.contains("this site is unreadable") && !err.contains("do not open more pages"), "got: {err}");
         assert!(tool.call(page(2)).await.is_ok(), "and the shop is still open");
         assert!(tool.call(page(1)).await.is_ok());
         assert_eq!(requests(&server).await, 3);
@@ -1640,20 +1652,33 @@ mod tests {
         // needs a second.)
         let tool = FetchPageTool::new(OpenWeb::new(Duration::from_secs(5)).unwrap(), None);
         let landed = Url::parse("https://www.shop.example/blocked").unwrap();
-        let said = tool.unreadable(&landed, Wall::Notice, true).to_string();
+        let said = tool.unreadable(&landed, &landed, Wall::Notice, true).to_string();
         assert!(said.starts_with("www.shop.example served a block notice"), "got: {said}");
         // Its pages are refused before anything is sent, with the www or without.
         for url in ["https://www.shop.example/p/2", "https://shop.example/p/3"] {
             let err = tool.call(FetchArgs { url: url.into() }).await.unwrap_err().to_string();
             assert!(err.contains("was not opened again"), "{url}: {err}");
         }
-        assert_eq!(tool.opens.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Reddit is asked at its old interface whichever address the model
+        // wrote, so a refusal there closes all of them, and is said of the
+        // address the model wrote.
+        let old = Url::parse("https://old.reddit.com/r/x/comments/1").unwrap();
+        let asked = Url::parse("https://www.reddit.com/r/x/comments/1").unwrap();
+        let said = tool.unreadable(&old, &asked, Wall::BotCheck, true).to_string();
+        assert!(said.starts_with("www.reddit.com served a bot check"), "got: {said}");
+        for url in ["https://www.reddit.com/r/y", "https://reddit.com/r/z", "https://old.reddit.com/r/x"] {
+            let err = tool.call(FetchArgs { url: url.into() }).await.unwrap_err().to_string();
+            assert!(err.contains("was not opened again"), "{url}: {err}");
+            assert!(err.starts_with(Url::parse(url).unwrap().host_str().unwrap()), "{url}: {err}");
+        }
+        assert_eq!(tool.opens.load(std::sync::atomic::Ordering::Relaxed), 0, "none of these cost a page");
 
         // A refusal with somebody left to ask is said and closes nothing.
         let other = Url::parse("https://other.example/p").unwrap();
-        assert!(tool.unreadable(&other, Wall::BotCheck, false).to_string().contains(BOT_CHECK_SAID));
+        assert!(tool.unreadable(&other, &other, Wall::BotCheck, false).to_string().contains(BOT_CHECK_SAID));
         let hosts = tool.hosts.lock().unwrap();
-        assert!(hosts.closed.contains("shop.example"));
+        assert!(hosts.closed.contains("shop.example") && hosts.closed.contains("old.reddit.com"));
         assert!(!hosts.closed.contains("other.example"));
     }
 

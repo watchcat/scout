@@ -19,12 +19,23 @@
 // The session is a throwaway prototype of the spec's loop, with its rules:
 // one shop, nothing personal typed, no sign-in, no bot check attempted,
 // twelve turns, 25 actions, 120 seconds. It is not the thing to build; it is
-// what tells whether to.
+// what tells whether to. Where it keeps a rule less well than the spec asks:
+//
+// - the seconds are checked between turns, so a slow model call overruns;
+// - only a link is refused for leaving the shop before it is pressed; a
+//   redirect or a script is followed and then undone, and a new tab is not
+//   seen at all;
+// - a shop is told by its last two labels, which a shared suffix defeats;
+// - nothing refuses a checkout or a sign-in address but the brief;
+// - a press lands where the thing is, and something lying over it gets it.
 //
 //   ssh -N -D 127.0.0.1:18080 $SCOUT_SSH &          # leave by the node
 //   cargo build -p scout-core --example page_as_read
 //   scripts/shop-reach.mjs read products.json out/ [--only label] [--ways plain,render,drive]
 //   scripts/shop-reach.mjs table out/ [--name-all]
+//   scripts/shop-reach.mjs recheck out/      # the checks again, over the pages already saved
+//
+// Keep products.json and out/ outside the repository: they name hosts.
 //   scripts/shop-reach.mjs follow <address>... [--needle text]...
 //
 // `follow` opens addresses one after another in a single session and says
@@ -62,17 +73,22 @@ const NUMBERS = ['price', 'variant_price', 'shipping']
 
 // ---------------------------------------------------------------- deciding
 
+// Free, said of delivery: the two words within a clause of each other, or
+// one of the compounds that say both. "Gratis retourneren" is not it.
+const FREE = '(?:gratis|kostenlos\\w*|kostenfrei\\w*|free)'
+const DELIVERY = '(?:verzend\\w*|bezorg\\w*|lever\\w*|versand\\w*|liefer\\w*|deliver\\w*|shipping)'
+const FREE_DELIVERY = new RegExp(
+  `\\b${FREE}\\b[^.\\n]{0,30}?\\b${DELIVERY}|\\b${DELIVERY}[^.\\n]{0,30}?\\b${FREE}\\b|\\b${DELIVERY}[^.\\n]{0,30}?(?<![0-9.,])0[.,]00(?![0-9.,])` +
+  '|gratisversand|versandkostenfrei|keine versandkosten|geen verzendkosten', 'i')
+
 /// The extractor's rule (`text_writes_amount`, tools/fetch.rs): "12.99" or
 /// "12,99", not a piece of a longer number. Wider than it in two ways a
 /// shop's visible page needs and embedded data does not: a whole amount is
 /// also "259,-" or "€ 259", and zero, which nobody writes as a number worth
-/// trusting, is confirmed by a word for free.
+/// trusting, is confirmed by a word for free beside a word for delivery.
 export function textWritesAmount(text, amount) {
   if (typeof amount !== 'number' || !Number.isFinite(amount)) return false
-  if (amount === 0) {
-    return /\b(gratis|kostenlos\w*|kostenfrei\w*|versandkostenfrei\w*|free)\b/i.test(text) ||
-      /\b(keine versandkosten|geen verzendkosten)\b/i.test(text) || /(?<![0-9.,])0[.,]00(?![0-9.,])/.test(text)
-  }
+  if (amount === 0) return FREE_DELIVERY.test(text)
   const point = amount.toFixed(2)
   const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   if ([point, point.replace('.', ',')].some((needle) => new RegExp(`(?<![0-9.,])${escape(needle)}(?![0-9.,])`).test(text))) return true
@@ -108,20 +124,27 @@ export function sameSite(a, b) {
   }
 }
 
-const MAY_TYPE = /(post.?code|postal|zip|plz|huisnummer|house.?number|hausnummer|zoek|search|such|aantal|quantity|qty|menge)/
-const NEVER_TYPE = /(naam|name|mail|telefoon|phone|mobiel|straat|street|stra(ß|ss)e|adres|address|card|kaart|iban|cvv|cvc|wachtwoord|password|passwort|geboorte|birth)/
+const POSTCODE_FIELD = /(post.?code|postal.?code|\bzip|plz)/
+const COUNTED = /(aantal|quantity|qty|menge|stück|stuks)/
+const PERSONAL = /(naam|name|mail|telefo|phone|handy|mobil|straat|street|stra(?:ß|ss)e|adres|address|\bort\b|stadt|city|plaats|card|kaart|karte|iban|konto|account|cvv|cvc|sicherheitscode|security.?code|wachtwoord|password|passwort|geboorte|geburt|birth|login|benutzer|user|firma|company|bedrijf)/g
+const PERSONAL_AUTOCOMPLETE = /^(name|given-name|additional-name|family-name|nickname|honorific-.*|email|tel(-.*)?|street-address|address-line\d|address-level\d|username|new-password|current-password|one-time-code|bday(-.*)?|organization(-title)?|cc-.*|sex|url|photo)$/
 
-/// Why a field may not be typed into, or null when it may. What is left is
-/// a search term, a quantity, a postcode, a house number.
+/// Why a field may not be typed into, or null when it may. Anything a page
+/// marks as personal is refused before anything is allowed; what is left is
+/// a search term, a quantity, a postcode, a house number. (The house number
+/// is one more than the spec lists: a Dutch postcode is asked for with it.)
 export function typingRefused(field, text) {
   if (String(text).length > MAX_TYPED) return `at most ${MAX_TYPED} characters may be typed`
   const type = (field.type || 'text').toLowerCase()
-  if (['password', 'email', 'tel'].includes(type)) return `a ${type} field is never typed into`
-  const auto = (field.autocomplete || '').toLowerCase()
-  if (auto.startsWith('cc-') || /(name|email|tel|street|address-line|username|password|bday)/.test(auto)) return 'that field is for something personal'
-  const said = [field.name, field.id, field.placeholder, field.label].filter(Boolean).join(' ').toLowerCase()
-  if (MAY_TYPE.test(said)) return null
-  if (NEVER_TYPE.test(said)) return 'that field is for something personal'
+  if (['password', 'email'].includes(type)) return `a ${type} field is never typed into`
+  const auto = (field.autocomplete || '').toLowerCase().split(/\s+/)
+  if (auto.some((token) => PERSONAL_AUTOCOMPLETE.test(token))) return 'that field is for something personal'
+  const said = [field.name, field.id, field.placeholder, field.label, field.title].filter(Boolean).join(' ').toLowerCase()
+  // A postcode field inside an address form is still a postcode field.
+  const personal = (said.match(PERSONAL) || []).filter((word) => !(POSTCODE_FIELD.test(said) && /^(adres|address)$/.test(word)))
+  if (personal.length) return 'that field is for something personal'
+  // A numeric keypad is for a postcode or a quantity, or it is for a phone number.
+  if (type === 'tel' && !POSTCODE_FIELD.test(said) && !COUNTED.test(said)) return 'a tel field is typed into only for a postcode or a quantity'
   return null
 }
 
@@ -152,15 +175,16 @@ export function checkReport(report, texts) {
   const seen = texts.join('\n')
   const flat = seen.toLowerCase().replace(/\s+/g, ' ')
   const out = {}
+  const number = (v) => (typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)) ? Number(v) : null)
   for (const key of NUMBERS) {
-    const amount = report?.[key] == null ? null : Number(report[key])
+    const amount = number(report?.[key])
     // Nothing costs less than nothing, and only delivery is ever free.
     out[key] = amount === null ? null : amount < 0 || (amount === 0 && key !== 'shipping') ? false : textWritesAmount(seen, amount)
   }
   // The wording as quoted: one quotation among several is enough, if it is
   // long enough to be a wording and not a word.
   const quoted = report?.delivery
-    ? String(report.delivery).toLowerCase().replace(/\s+/g, ' ').split(/["“”«»]|(?:^|\s)['‘’]|['‘’](?:\s|$|[.,;])|\s\/\s|;/).map((q) => q.replace(/^[\s.]+|[\s.]+$/g, '')).filter((q) => q.length >= 8)
+    ? String(report.delivery).toLowerCase().replace(/\([^)]*\)?/g, ' ').replace(/\s+/g, ' ').split(/["“”„‟«»‹›]|(?:^|\s)['‘’‚]|['‘’](?:\s|$|[.,;])|\s\/\s|;/).map((q) => q.replace(/^[\s.]+|[\s.]+$/g, '')).filter((q) => q.length >= 8)
     : null
   out.delivery = quoted ? quoted.some((q) => flat.includes(q)) : null
   return out
@@ -220,10 +244,12 @@ export function trimHistory(history, keep) {
 
 const money = (n) => (typeof n === 'number' ? n.toFixed(2) : '—')
 
-function cells(way) {
-  if (!way) return ['not run', '', '', '', '']
+function cells(name, way) {
+  if (!way || way.failed) return ['—', '—', '—', '—']
   const { report, verified = {} } = way
-  if (!report || report.refused || way.refused) return ['—', '—', '—', '—']
+  // A session is refused when the loop says so; a side page that would not
+  // open is not that. A fetched page the model called a refusal has nothing to show.
+  if (!report || (name === 'drive' ? way.refused : report.refused)) return ['—', '—', '—', '—']
   const cell = (key) => (report?.[key] == null ? '—' : verified[key] ? money(Number(report[key])) : `${money(Number(report[key]))} (not on the page)`)
   const delivery = report?.delivery ? (verified.delivery ? 'stated' : 'stated (not on the page)') : '—'
   return [cell('price'), cell('variant_price'), cell('shipping'), delivery]
@@ -231,13 +257,14 @@ function cells(way) {
 
 function how(name, way) {
   if (!way) return 'not run'
+  if (way.failed && way.turns == null) return `failed: ${way.failed}`
   if (name === 'drive') {
     const tokens = (way.prompt_tokens + way.completion_tokens).toLocaleString('en-US')
     const end = way.refused ? 'refused' : way.stopped === 'reported' ? 'reported' : /^turned away/.test(way.stopped || '') ? 'turned away' : `cut at its ${way.stopped}`
     return `${end}; ${way.turns} turns, ${way.actions} actions, ${tokens} tokens, ${Math.round(way.seconds)} s`
   }
-  if (way.error && !way.status) return 'no answer'
-  if (way.challenge) return `HTTP ${way.status}, a bot check`
+  if (name === 'plain' && way.status == null) return 'no answer'
+  if (way.challenge) return way.status ? `HTTP ${way.status}, a bot check` : 'a bot check'
   if (way.status && way.status !== 200) return `HTTP ${way.status}`
   if (name === 'render' && way.unusable) return 'nothing usable'
   // What fetch_page hands the model today as if it were the page.
@@ -253,7 +280,7 @@ export function tables(rows, { nameAll = false } = {}) {
   const out = ['| shop | way | price | another variant | delivery to the postcode | when | how it went |', '|---|---|---|---|---|---|---|']
   rows.forEach((r, i) => {
     for (const [name, label] of [['plain', 'plain request'], ['render', 'one-shot render'], ['drive', 'driven session']]) {
-      out.push(`| ${name === 'plain' ? names[i] : ''} | ${label} | ${cells(r[name]).join(' | ')} | ${how(name, r[name])} |`)
+      out.push(`| ${name === 'plain' ? names[i] : ''} | ${label} | ${cells(name, r[name]).join(' | ')} | ${how(name, r[name])} |`)
     }
   })
   out.push('', '| shop | gained by the session | read otherwise than the read | a link that picks the variant | a link that fills the basket |', '|---|---|---|---|---|')
@@ -541,7 +568,7 @@ function targetInPage(n) {
   return {
     x: r.left + r.width / 2, y: r.top + r.height / 2, sized: r.width > 0 && r.height > 0,
     href: el.tagName === 'A' ? el.href : null, tag: el.tagName,
-    field: { type: el.getAttribute('type'), autocomplete: el.getAttribute('autocomplete'), name: el.getAttribute('name'), id: el.id, placeholder: el.getAttribute('placeholder'), label: (el.getAttribute('aria-label') || '') + ' ' + label },
+    field: { type: el.getAttribute('type'), autocomplete: el.getAttribute('autocomplete'), name: el.getAttribute('name'), id: el.id, placeholder: el.getAttribute('placeholder'), title: el.getAttribute('title'), label: (el.getAttribute('aria-label') || '') + ' ' + label },
   }
 }
 
@@ -597,6 +624,9 @@ class Session {
         m.error ? reject(new Error(m.error.message)) : resolve(m.result)
       } else if (m.method === 'Network.responseReceived' && m.params.type === 'Document' && m.params.frameId === s.frame) {
         s.status = m.params.response.status
+      } else if (m.method === 'Page.javascriptDialogOpening') {
+        // An alert would hold every later call; nobody is here to read it.
+        s.send('Page.handleJavaScriptDialog', { accept: false }).catch(() => {})
       }
     })
     await s.send('Page.enable')
@@ -610,7 +640,8 @@ class Session {
   send(method, params = {}) {
     return new Promise((resolve, reject) => {
       const id = ++this.id
-      this.waiting.set(id, { resolve, reject })
+      const timer = setTimeout(() => { this.waiting.delete(id); reject(new Error(`${method} did not answer`)) }, 30_000)
+      this.waiting.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v) }, reject: (e) => { clearTimeout(timer); reject(e) } })
       this.ws.send(JSON.stringify({ id, method, params }))
     })
   }
@@ -681,10 +712,13 @@ class Session {
     return {}
   }
 
-  close() {
+  /// One private profile, gone when the session closes: cookies, history and all.
+  async close() {
     try { this.ws.close() } catch {}
+    const gone = new Promise((resolve) => this.chrome.once('exit', resolve))
     this.chrome.kill('SIGKILL')
-    setTimeout(() => fs.rmSync(this.profile, { recursive: true, force: true }), 500)
+    await Promise.race([gone, sleep(3000)])
+    fs.rmSync(this.profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 })
   }
 }
 
@@ -790,7 +824,7 @@ async function drive(llm, url, userAgent, socksPort, limits, audit) {
     out.stopped = out.stopped || `error: ${e.message}`
   } finally {
     out.seconds = elapsed()
-    session.close()
+    await session.close()
   }
   return out
 }
@@ -874,6 +908,31 @@ function table(argv) {
   console.log(tables(rows, { nameAll: argv.includes('--name-all') }))
 }
 
+/// The checks again, over the pages already saved: a session's outlines
+/// from its record, a read's text from the extractor. No shop is asked anything.
+async function recheck(argv) {
+  const [outDir] = argv
+  if (!outDir) throw new Error('usage: shop-reach.mjs recheck <out-dir>')
+  for (const name of fs.readdirSync(outDir).filter((f) => f.endsWith('.json') && !['links.json', 'order.json'].includes(f))) {
+    const file = path.join(outDir, name)
+    const result = JSON.parse(fs.readFileSync(file, 'utf8'))
+    for (const way of ['plain', 'render']) {
+      const html = path.join(outDir, `${result.label}.${way}.html`)
+      if (!result[way]?.report || !fs.existsSync(html)) continue
+      const { page } = await extractor(['file', html, result.url])
+      result[way].verified = checkReport(result[way].report, [`${page.text} ${page.product?.price ?? ''}`])
+    }
+    const record = path.join(outDir, `${result.label}.session.txt`)
+    if (result.drive?.report && fs.existsSync(record)) {
+      const pages = fs.readFileSync(record, 'utf8').split(/\n===== PAGE \d+ [^\n]*=====\n/).slice(1)
+      result.drive.verified = checkReport(result.drive.report, pages)
+      result.drive.verified_last = checkReport(result.drive.report, pages.slice(-1))
+    }
+    fs.writeFileSync(file, JSON.stringify(result, null, 2))
+    console.log(`${result.label}: rechecked`)
+  }
+}
+
 async function follow(argv) {
   const needles = argv.flatMap((a, i) => (a === '--needle' ? [argv[i + 1]] : []))
   const addresses = argv.filter((a, i) => /^https?:/.test(a) && argv[i - 1] !== '--needle')
@@ -888,13 +947,13 @@ async function follow(argv) {
       console.log(JSON.stringify({ asked: where(address), landed: where(o.url), status: session.status, title: o.title.slice(0, 50), chars: whole.length, wrote: Object.fromEntries(needles.map((n) => [n, whole.toLowerCase().includes(n.toLowerCase())])) }))
     }
   } finally {
-    session.close()
+    await session.close()
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [command, ...rest] = process.argv.slice(2)
-  const commands = { read, table, follow }
+  const commands = { read, table, follow, recheck }
   if (!commands[command]) {
     console.error('usage: shop-reach.mjs read <products.json> <out-dir> | shop-reach.mjs table <out-dir> | shop-reach.mjs follow <address>...')
     process.exit(2)

@@ -18,9 +18,10 @@ pub fn request_headers() -> [(&'static str, &'static str); 3] {
 }
 
 /// What `fetch_page` would make of `html`, served at `url` with `status`
-/// (`None` when the request never got an answer):
+/// (`None` for HTML that is a render's own output and so has none):
 ///
-/// - `would_render`: whether it would have gone on to the headless render;
+/// - `would_render`: whether it would have gone on to the headless render,
+///   or null where there is no status to decide by;
 /// - `unrendered`: whether, were this the render's own output, it would
 ///   have been thrown away as a shell or a bot check;
 /// - `challenge`: whether it would have refused the body as a bot check;
@@ -28,7 +29,7 @@ pub fn request_headers() -> [(&'static str, &'static str); 3] {
 pub fn page_as_read(html: &str, url: &str, status: Option<u16>) -> anyhow::Result<serde_json::Value> {
     let base = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid url: {e}"))?;
     Ok(serde_json::json!({
-        "would_render": fetch::worth_rendering(status, html),
+        "would_render": status.map(|s| fetch::worth_rendering(Some(s), html)),
         "unrendered": browser::looks_unrendered(html),
         "challenge": browser::is_challenge_page(html),
         "page": fetch::extract_page(html, &base),
@@ -58,9 +59,9 @@ mod tests {
         assert_eq!(read["would_render"], false);
         assert_eq!(read["unrendered"], false);
         assert_eq!(read["challenge"], false);
-        // A render is judged without a status: usable, though a request with no answer would have rendered.
+        // A render's own output has no status, so there is nothing to say about going to the render.
         let rendered = page_as_read(&padded(PRODUCT), "https://shop.example/widget", None).unwrap();
-        assert_eq!((rendered["would_render"].clone(), rendered["unrendered"].clone()), (true.into(), false.into()));
+        assert_eq!((rendered["would_render"].clone(), rendered["unrendered"].clone()), (serde_json::Value::Null, false.into()));
     }
 
     #[test]
@@ -71,7 +72,6 @@ mod tests {
         let wall = page_as_read(&padded("<html><head><title>Just a moment...</title></head><body></body></html>"), "https://shop.example/p", Some(200)).unwrap();
         assert_eq!((wall["would_render"].clone(), wall["challenge"].clone()), (true.into(), true.into()));
         assert_eq!(page_as_read("", "https://shop.example/p", Some(403)).unwrap()["would_render"], true);
-        assert_eq!(page_as_read("", "https://shop.example/p", None).unwrap()["would_render"], true);
         assert_eq!(page_as_read("", "https://shop.example/p", Some(404)).unwrap()["would_render"], false);
     }
 

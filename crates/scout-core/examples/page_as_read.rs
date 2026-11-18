@@ -65,11 +65,14 @@ fn get(url: &str, proxy: Option<&str>, save: Option<&str>) -> serde_json::Value 
         let started = std::time::Instant::now();
         let response = match request.send().await {
             Ok(r) => r,
-            // No answer at all: `fetch_page` would try the render.
+            // No answer at all. `fetch_page` hands that back as the error it
+            // is, without trying the render.
             Err(e) => {
-                let mut out = read("get", "", url, None, url, Some(started.elapsed()));
-                out["error"] = format!("{e}").into();
-                return out;
+                return serde_json::json!({
+                    "way": "get", "error": format!("{e}"), "status": null, "bytes": 0, "landed": url,
+                    "would_render": false, "unrendered": true, "challenge": false,
+                    "ms": started.elapsed().as_millis() as u64,
+                });
             }
         };
         let status = response.status();

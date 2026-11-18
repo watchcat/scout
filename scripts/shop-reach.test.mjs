@@ -46,10 +46,19 @@ test('free is written in words, so zero is confirmed by one of them', () => {
   assert.ok(textWritesAmount('versandkostenfrei ab 50 €', 0))
   assert.ok(textWritesAmount('Geen verzendkosten', 0))
   assert.ok(!textWritesAmount('Versandkosten: siehe Tabelle', 0))
+  // The word has to be about delivery: other things are free on a shop's page.
+  assert.ok(textWritesAmount('Gratis bezorgd wanneer het jou uitkomt', 0))
+  assert.ok(textWritesAmount('Bezorging: gratis', 0))
+  assert.ok(textWritesAmount('FREE delivery Saturday', 0))
+  assert.ok(textWritesAmount('Gratisversand ab 30 €', 0))
+  assert.ok(!textWritesAmount('Gratis retourneren binnen 30 dagen', 0))
+  assert.ok(!textWritesAmount('Sugar free. Delivery times vary by a great many things, see the page about it', 0))
+  assert.ok(!textWritesAmount('89,90 € inkl. Versand', 0))
   assert.ok(textWritesAmount('Gratis verzending vanaf 20 euro', 0))
   assert.ok(textWritesAmount('Kostenloser Versand', 0))
   assert.ok(textWritesAmount('Free delivery', 0))
   assert.ok(textWritesAmount('Verzendkosten € 0,00', 0))
+  assert.ok(!textWritesAmount('Totaal € 0,00', 0))
   assert.ok(!textWritesAmount('Verzendkosten € 4,95', 0))
 })
 
@@ -82,6 +91,26 @@ test('what may be typed is a search term, a quantity, a postcode or a house numb
   no({ type: 'text', placeholder: 'Straatnaam' })
   no({ type: 'text', name: 'iban' })
   no({ type: 'text', label: 'Telefoonnummer' })
+  // What is personal is refused before anything is allowed, in the languages these shops speak.
+  no({ type: 'text', label: 'Telefon' })
+  no({ type: 'text', label: 'Handynummer' })
+  no({ type: 'text', label: 'Mobile number' })
+  no({ type: 'text', label: 'Ort' })
+  no({ type: 'text', label: 'Woonplaats' })
+  no({ type: 'text', autocomplete: 'address-level2' })
+  no({ type: 'text', label: 'Geburtsdatum' })
+  no({ type: 'text', label: 'Kartennummer' })
+  no({ type: 'text', label: 'Sicherheitscode' })
+  no({ type: 'text', label: 'Benutzername' })
+  no({ type: 'text', label: 'Firma' })
+  no({ type: 'text', label: 'Postal address' })
+  no({ type: 'text', id: 'visitorNameSearch' })
+  no({ type: 'text', title: 'Uw naam' })
+  // A numeric keypad is how a shop asks for a postcode or a quantity; a phone number it is not.
+  ok({ type: 'tel', name: 'postcode' })
+  ok({ type: 'tel', label: 'Aantal' }, '2')
+  no({ type: 'tel', label: 'Nummer' })
+  ok({ type: 'text', autocomplete: 'country-name' }, 'Nederland')
   // Long text is never a postcode.
   no({ type: 'text', name: 'postcode' }, 'x'.repeat(MAX_TYPED + 1))
   ok({ type: 'text', name: 'postcode' }, 'x'.repeat(MAX_TYPED))
@@ -123,6 +152,12 @@ test('a report is checked against what the session was shown, amount by amount',
   assert.equal(checkReport({ delivery: '“morgen  in huis”' }, seen).delivery, true)
   // A sentence about the wording is not the wording.
   assert.equal(checkReport({ delivery: 'The page says morgen in huis, on the basket page' }, seen).delivery, false)
+  // German quotation marks, and an aside after the wording.
+  assert.equal(checkReport({ delivery: '„Morgen in huis“ (so im Warenkorb)' }, seen).delivery, true)
+  assert.equal(checkReport({ delivery: 'Morgen in huis (basket page)' }, seen).delivery, true)
+  // A field left as an empty string or false is not a report of nothing to pay.
+  const blank = checkReport({ shipping: '', price: false, variant_price: '14.99' }, [...seen, 'gratis verzending'])
+  assert.deepEqual([blank.shipping, blank.price, blank.variant_price], [null, null, true])
   // Two quotations: one of them on the page is enough, a fragment of three letters is not.
   assert.equal(checkReport({ delivery: "'Morgen in huis' / 'Or fastest delivery today'" }, seen).delivery, true)
   assert.equal(checkReport({ delivery: "'in' / 'nowhere to be found'" }, seen).delivery, false)
@@ -176,6 +211,13 @@ test('where a session read another number than a read did, that is said, not cou
   assert.deepEqual(gained({ price: 6.99, shipping: 4.99 }, [plain, render]), ['shipping'])
 })
 
+test('the same report checked against the last page alone, which is the spec\'s rule', () => {
+  const seen = ['Widget € 12,99 Kies maat', 'Winkelmand Widget XL € 14,99 Verzendkosten € 4,95']
+  const report = { price: 12.99, variant_price: 14.99, shipping: 4.95 }
+  assert.deepEqual(checkReport(report, seen.slice(-1)), { price: false, variant_price: true, shipping: true, delivery: null })
+  assert.deepEqual(checkReport(report, seen), { price: true, variant_price: true, shipping: true, delivery: null })
+})
+
 test('what a session gained is a number it read that neither other way had', () => {
   const plain = { price: 12.99 }, render = { price: 12.99, delivery: 'morgen' }
   const drive = { price: 12.99, variant_price: 14.99, shipping: 4.95, delivery: 'morgen' }
@@ -226,6 +268,15 @@ test('the tables name a host only when it is public, and letter the rest', () =>
   // A price the session read otherwise than the read did is flagged in the second table.
   rows[0].drive.report.price = 12
   assert.match(tables(rows), /shared\.example \| shipping \| price \|/)
+  // A side page refused is not the session refused: its numbers stay in the table.
+  rows[1].drive.report.refused = true
+  assert.match(tables(rows), /driven session \| 20\.00 \|/)
+  rows[1].drive.refused = true
+  assert.doesNotMatch(tables(rows), /driven session \| 20\.00 \|/)
+  rows[1].drive.refused = false
+  // A fetched page the model called a refusal has nothing to show.
+  rows[1].plain.report.refused = true
+  assert.doesNotMatch(tables(rows), /plain request \| 20\.00 \|/)
   // The driven row carries what the session cost.
   assert.match(text, /5 turns/)
   assert.match(text, /12,800 tokens/)

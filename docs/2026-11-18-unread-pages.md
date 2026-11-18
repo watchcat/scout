@@ -13,6 +13,13 @@ compared prices. Small numbers; read them as shape, not precision.
 > `fetch_page` did not recognise and handed over as the page, 20 of them
 > on bol.com. A wall stopped 54 of the 282 pages asked for, not 31. Both
 > rows of the rule stay met.
+>
+> The script has since been taught to count such a page apart, as "a block
+> notice", by the rule `fetch_page` now refuses it with. It has not been
+> run on a backup since, so the tables below stand as they were. Its rule
+> is narrower than the query that found the 23: bol's twenty are bol's
+> wording and should be counted by it; the three on other hosts have not
+> been read against it.
 
 ## How a read ends
 

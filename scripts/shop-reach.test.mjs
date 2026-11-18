@@ -277,6 +277,19 @@ const result = (label, host, isPublic, drive, plain = null, render = null) => ({
   links: { variant: 'in the address', cart: null },
 })
 
+test('a read that came back as a block notice is said to be one, as fetch_page says it', () => {
+  const rows = [result('a', 'shared.example', true, { price: 10 })]
+  rows[0].plain = { status: 200, refusal: true, report: null, verified: {} }
+  rows[0].render = { status: null, refusal: true, unusable: true, report: null, verified: {} }
+  const lines = tables(rows).split('\n')
+  const said = (way) => lines.find((line) => line.includes(way)).split('|').at(-2).trim()
+  assert.equal(said('plain request'), 'a block notice, not the page')
+  assert.equal(said('one-shot render'), 'a block notice, not the page')
+  // A result written down before the tool knew a notice says what was true then.
+  rows[0].plain = { status: 200, report: { refused: true }, verified: {} }
+  assert.equal(tables(rows).split('\n').find((line) => line.includes('plain request')).split('|').at(-2).trim(), 'a refusal page, taken for the page')
+})
+
 test('the tables name a host only when it is public, and letter the rest', () => {
   const rows = [
     result('a', 'shared.example', true, { price: 10, shipping: 4.95 }, { price: 10 }, { price: 10 }),

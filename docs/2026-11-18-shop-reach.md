@@ -180,7 +180,19 @@ case, seen today though not in those sixty days. So a wall stopped 54 of
 the 282 pages asked for, not 31, and the model was not told so for 23 of
 them. These counts were made on the same backup, by a query that looked
 for a refusal's wording in a short page; no script in the repository
-prints them yet.
+printed them then.
+
+Since then `fetch_page` refuses such a page, and `scripts/unread-pages.py`
+counts the ones in older traces as "a block notice". Both go by one rule:
+a text under 1,500 characters that contains one of the phrases in
+`crates/scout-core/src/tools/refusal_marks.txt`. The query behind the 23
+looked under the same 1,500 characters for a longer list of words,
+"captcha" and "continue shopping" among them, which a page also says for
+other reasons; the file keeps only wording read off a page. The script
+has so far been run on made-up traces, not on a backup. bol's twenty
+should be counted by it, being bol's wording. The three on other hosts
+were found by the wider query and have not been read against the
+narrower rule.
 
 ## Links that pick a variant or fill a basket
 

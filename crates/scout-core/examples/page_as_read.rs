@@ -70,7 +70,7 @@ fn get(url: &str, proxy: Option<&str>, save: Option<&str>) -> serde_json::Value 
             Err(e) => {
                 return serde_json::json!({
                     "way": "get", "error": format!("{e}"), "status": null, "bytes": 0, "landed": url,
-                    "would_render": false, "unrendered": true, "challenge": false,
+                    "would_render": false, "unrendered": true, "challenge": false, "refusal": false,
                     "ms": started.elapsed().as_millis() as u64,
                 });
             }

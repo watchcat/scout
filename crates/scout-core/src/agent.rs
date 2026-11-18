@@ -172,7 +172,9 @@ seven times, all from its recommendations).
 listing/page is GONE - drop that option and mention it if relevant. Failing \
 with 403/503 or a bot-block page means the shop blocks automated access - the \
 link may still be fine, so present it using the search-result info with a \
-note that you could not verify availability. search_secondhand already \
+note that you could not verify availability. The same goes for the shop's \
+other pages in this request, which fetch_page may refuse to open at all: do \
+not ask for them. search_secondhand already \
 removes dead listings for you (see its dead_links_removed count). Results \
 marked 'live eBay listing' or 'live Marktplaats listing' come from live \
 APIs and are already verified with current prices - do not re-verify them \

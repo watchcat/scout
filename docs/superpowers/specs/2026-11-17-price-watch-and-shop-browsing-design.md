@@ -196,9 +196,16 @@ as `docs/<date>-unread-pages.md` the way the fan-out reading was:
 - offers handed to `compare_prices` with no shipping cost, by host —
   "absent means not stated" is already how that tool records it.
 
+A write-up is a file anyone can read, and nearly every host in the traces
+is one person's. So a write-up names a host only when two or more
+accounts used it and gives the rest as sums or unnamed rows; the operator
+has the names. This was added after the reading
+(`docs/2026-11-18-unread-pages.md`), which found 183 of 189 hosts used by
+a single account.
+
 ### Gate 2 — what a browser can reach
 
-For the ten hosts Gate 1 ranks first, from the production node (its address
+For the ten hosts Gate 1 chose, from the production node (its address
 is the one shops see), three ways of reading one product each: the plain
 request, the one-shot render, and a driven session. For each: the price, the
 price of a chosen variant, shipping to a Dutch postcode, a delivery date —
@@ -317,7 +324,9 @@ In build order. Each is a board card.
    delivery address is not offered the tools; ten live watches is the cap;
    the counters are on `/metrics`; the README says what a watch is.
 2. **What the traces say about pages Scout cannot price.** Done when the
-   script and the write-up exist, and the write-up names the ten hosts.
+   script and the write-up exist, and the ten hosts are chosen: named in
+   the write-up where two or more accounts used them, with the operator
+   otherwise.
 3. **Shop reach.** Done when the write-up has both tables for those ten
    hosts, with turns, tokens and seconds for the driven sessions, and says
    whether the rule above is met.

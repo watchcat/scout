@@ -59,7 +59,7 @@ const PERSONAL_WORDS: &[&str] = &[
     "tussenvoegsel", "voorletter", "initialen", "vervaldatum", "anschrift",
     // And from the same probe, beyond what was asked for: a person's
     // numbers with the state, a car's plate, a fax.
-    "rijksregister", "ausweis", "kenteken", "faxnummer", "faxnumber",
+    "rijksregister", "ausweis", "kenteken", "faxnummer", "faxnumber", "mobiel",
     // An address shown as a field's example says what the field wants.
     "@",
 ];
@@ -219,6 +219,8 @@ pub fn typing_refused(field: &Field, text: &str) -> Option<&'static str> {
         .chain(PERSONAL_ALONE.iter().filter(|word| says_alone(&said, word)).copied())
         .chain(says(&said, "security", "code").then_some("security code"))
         .chain(says(&said, "social", "security").then_some("social security"))
+        // A Dutch mobile number, called by the two digits it starts with.
+        .chain(says(&said, "06", "nummer").then_some("06-nummer"))
         // A postcode field inside an address form, or one that takes a
         // place as well, is still a postcode field.
         .any(|word| !(postcode && PLACES.contains(&word)));
@@ -415,6 +417,10 @@ mod tests {
         }
         no(named("text", "otp"));
         no(named("text", "ssn"));
+        // A Dutch mobile number, by its first two digits and by its name.
+        for label in ["06-nummer", "06 nummer", "Mobiel nummer", "Mobiele telefoon"] {
+            no(labelled("text", label));
+        }
         // A field that shows an address as its example wants one.
         no(placeheld("text", "jij@voorbeeld.example"));
         // Words these are only part of are not them.

@@ -388,6 +388,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_shop_that_answers_with_its_block_notice_is_a_session_over_at_its_first_page() {
+        let _one_of_few = testing::gate().await;
+        // A 200 and an ordinary page of the shop that says no: bol.com's
+        // notice in shape, which no status and no title gives away. It is
+        // known for what it is from the markup the Chrome itself hands back.
+        let pages = Pages::serve(&[(
+            "/p/widget",
+            html(&format!(
+                "<!doctype html><title>Shop</title><main><h1>Access blocked</h1><p>Your access to this shop has been \
+                 temporarily blocked due to possible abuse.</p></main><!-- {} -->",
+                "padding ".repeat(400)
+            )),
+        )])
+        .await;
+        let Some((sessions, app)) = with_chrome(&pages, Limits::default()) else { return };
+        let (status, opened) = open(&app, &pages.url("/p/widget")).await;
+        assert_eq!(status, StatusCode::OK, "{opened}");
+        assert_eq!(opened["ended"], "the page the session was opened on was refused");
+        assert_eq!(opened["notes"], json!(["This page is the shop's notice that it will not serve this reader. Nothing is done to get past it."]));
+        assert!(opened["page"]["text"].as_str().unwrap().contains("temporarily blocked"));
+        // Its Chrome is stopped and its place free before anyone asks.
+        assert_eq!(sessions.free(), 3);
+        let id = opened["session"].as_str().unwrap();
+        assert_eq!(act(&app, id, json!({ "do": "read" })).await.0, StatusCode::GONE);
+    }
+
+    #[tokio::test]
     async fn a_session_with_a_chrome_behind_it_ends_itself_when_its_time_is_up() {
         let _one_of_few = testing::gate().await;
         let pages = shop().await;

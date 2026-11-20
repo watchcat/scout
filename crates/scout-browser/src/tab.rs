@@ -47,7 +47,10 @@ pub struct Pace {
 impl Pace {
     /// The prototype's three waits, which the reading's sessions on ten
     /// shops ran with: 400 ms, then until the page had loaded for at most
-    /// twelve seconds, then 900 ms. Kept as measured, not tuned.
+    /// twelve seconds, then 900 ms. The numbers are kept as they were, not
+    /// tuned. What "loaded" goes by is not the same: the prototype asked
+    /// the document, which says "complete" of the old page until the new
+    /// one arrives; here Chrome says when the frame has stopped loading.
     pub const MEASURED: Pace =
         Pace { begun: Duration::from_millis(400), load: Duration::from_secs(12), quiet: Duration::from_millis(900) };
 }
@@ -74,7 +77,6 @@ impl Chrome {
         let pace = Pace { begun: Duration::from_millis(200), load: Duration::from_secs(10), quiet: Duration::from_millis(100) };
         Chrome { path, pace, reaching: Some(server) }
     }
-
 }
 
 /// Whether `url` may be opened as far as the guard goes: asked before
@@ -807,6 +809,24 @@ mod tests {
             let refused = chrome.open(&Shop::of(&url).unwrap(), &url).await.err();
             assert_eq!(refused, Some(Broken::Refused(NOT_PUBLIC.to_string())), "{address}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_session_runs_at_the_pace_the_reading_ran_at_unless_a_test_says_otherwise() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[("/p/widget", html(WIDGET)), ("/next", html("<title>Next</title><main>the next page</main>"))]).await;
+        let Some(path) = testing::chrome_or_skip() else { return };
+        assert_eq!(Chrome::new(path.clone()).pace, Pace::MEASURED);
+        let chrome = Chrome { pace: Pace::MEASURED, ..Chrome::reaching(path, pages.addr) };
+        let url = Url::parse(&pages.url("/p/widget")).unwrap();
+        let (mut tab, _) = chrome.open(&Shop::of(&url).unwrap(), &url).await.unwrap();
+        let pressed = std::time::Instant::now();
+        let done = tab.act(&Action::Click { n: 3 }).await.unwrap();
+        assert_eq!(done.seen.title, "Next");
+        // 400 ms for the press to begin, 900 ms for the page's scripts.
+        let took = pressed.elapsed();
+        assert!(took >= Duration::from_millis(1300) && took < Duration::from_secs(6), "{took:?}");
+        tab.close().await;
     }
 
     /// Whether `profile` is gone, and stays gone: a Chrome still alive when

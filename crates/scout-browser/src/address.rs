@@ -44,6 +44,11 @@ pub fn address_refused(shop: &Shop, url: &Url) -> Option<Refused> {
     if !shop.holds(url) {
         return Some(Refused::LeavesShop);
     }
+    // A name and a password written into the address are a sign-in the
+    // browser would make on being sent there.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Some(Refused::SignIn);
+    }
     // What stands in front of the shop's own name: `checkout.shop.example`.
     // The name itself is not read, so a shop may be called what it likes.
     let host = url.host_str().unwrap_or_default().trim_end_matches('.');
@@ -290,6 +295,14 @@ mod tests {
         assert_eq!(on_the_shop("/account/login"), Some(Refused::SignIn));
         assert_eq!(refused("https://login.shop.example/"), Some(Refused::SignIn));
         assert_eq!(refused("https://auth.shop.example/start?client=shop"), Some(Refused::SignIn));
+    }
+
+    #[test]
+    fn an_address_that_carries_a_name_and_a_password_is_a_sign_in() {
+        // A browser sent there offers them to the shop as its own.
+        assert_eq!(refused("https://klant:geheim@www.shop.example/p/widget"), Some(Refused::SignIn));
+        assert_eq!(refused("https://klant@www.shop.example/"), Some(Refused::SignIn));
+        assert_eq!(refused("https://www.shop.example/p/widget"), None);
     }
 
     #[test]

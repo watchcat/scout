@@ -198,14 +198,18 @@ struct FromPage {
 
 /// The delivery cost of an offer that states none, by its shop's kept
 /// terms: the band its order value falls in, where the terms are in the
-/// comparison's currency. The order value is the offer's price, one of
+/// comparison's currency or have no amount in them at all. The order value is the offer's price, one of
 /// that listing bought alone — `units` is how much the listing holds, not
 /// how many of it are ordered.
 fn from_delivery_page(offer: &Offer, host: Option<&String>, currency: &str, looked: &Looked) -> Option<FromPage> {
     let kept = looked.by_host.get(host?)?;
     let Terms::Costs { bands, currency: theirs } = &kept.terms else { return None };
-    if theirs != currency {
-        return None;
+    match theirs {
+        // Amounts are applied only in the comparison's own currency.
+        Some(theirs) if theirs != currency => return None,
+        // Free whatever the order comes to has none, and is free in any.
+        None if !bands.always_free() => return None,
+        _ => {}
     }
     Some(FromPage {
         cost: bands.cost_for(offer.price)?,
@@ -884,7 +888,7 @@ mod tests {
 
     /// 5.49 an order, free from 40.
     fn by_order_value() -> Terms {
-        Terms::Costs { bands: Bands::new(vec![(0.0, 5.49), (40.0, 0.0)]).unwrap(), currency: "EUR".to_string() }
+        Terms::Costs { bands: Bands::new(vec![(0.0, 5.49), (40.0, 0.0)]).unwrap(), currency: Some("EUR".to_string()) }
     }
 
     /// An offer at another shop, of which nothing is kept.
@@ -929,7 +933,7 @@ mod tests {
         assert_eq!(out.best_single.title, "at", "the dearer item is the cheaper order");
 
         // Under the shop's first band it states no cost, and none is made up.
-        let from_ten = Terms::Costs { bands: Bands::new(vec![(10.0, 5.49), (40.0, 0.0)]).unwrap(), currency: "EUR".to_string() };
+        let from_ten = Terms::Costs { bands: Bands::new(vec![(10.0, 5.49), (40.0, 0.0)]).unwrap(), currency: Some("EUR".to_string()) };
         let out = compare_with(&args(vec![offer("small", 8.0, 1, None)]), &looked(from_ten)).unwrap();
         assert_eq!((out.rows[0].shipping, out.rows[0].shipping_source, out.rows[0].landed), (None, "unknown", 8.0));
         assert!(out.notes.iter().any(|n| n.contains("no offer states shipping")), "got: {:?}", out.notes);
@@ -982,10 +986,30 @@ mod tests {
 
     #[test]
     fn terms_in_another_currency_are_not_applied() {
-        let pounds = Terms::Costs { bands: Bands::new(vec![(0.0, 5.49)]).unwrap(), currency: "GBP".to_string() };
+        let pounds = Terms::Costs { bands: Bands::new(vec![(0.0, 5.49)]).unwrap(), currency: Some("GBP".to_string()) };
         let out = compare_with(&args(vec![offer("in-euros", 10.0, 1, None)]), &looked(pounds)).unwrap();
         assert_eq!((out.rows[0].shipping, out.rows[0].landed, out.rows[0].shipping_source), (None, 10.0, "unknown"));
         assert!(out.notes.iter().any(|n| n.contains("no offer states shipping")), "got: {:?}", out.notes);
+    }
+
+    #[test]
+    fn delivery_that_is_always_free_is_applied_whatever_the_currency() {
+        // Nothing in "free whatever the order comes to" is an amount, so
+        // it is kept with no currency and is free in the comparison's.
+        let free = || Terms::Costs { bands: Bands::new(vec![(0.0, 0.0)]).unwrap(), currency: None };
+        let out = compare_with(&args(vec![offer("at-the-shop", 10.0, 1, None)]), &looked(free())).unwrap();
+        let priced = &out.rows[0];
+        assert_eq!((priced.shipping, priced.landed, priced.shipping_source, priced.free_from), (Some(0.0), 10.0, "delivery_page", None));
+        let note = out.notes.iter().find(|n| n.contains("delivery page")).unwrap_or_else(|| panic!("got: {:?}", out.notes));
+        assert!(note.contains("at-the-shop free (shop.example)"), "got: {note}");
+        let dollars = Offer { currency: "USD".to_string(), ..offer("in-dollars", 10.0, 1, None) };
+        let out = compare_with(&args(vec![dollars]), &looked(free())).unwrap();
+        assert_eq!((out.rows[0].shipping, out.rows[0].shipping_source), (Some(0.0), "delivery_page"));
+        // Amounts with no currency are no terms at all, and are applied
+        // in none.
+        let amounts = Terms::Costs { bands: Bands::new(vec![(0.0, 5.49)]).unwrap(), currency: None };
+        let out = compare_with(&args(vec![offer("at-the-shop", 10.0, 1, None)]), &looked(amounts)).unwrap();
+        assert_eq!((out.rows[0].shipping, out.rows[0].shipping_source), (None, "unknown"));
     }
 
     #[test]

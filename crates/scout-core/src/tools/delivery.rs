@@ -250,6 +250,12 @@ impl Bands {
         self.0.iter().rev().find(|(from, _)| *from <= order_value).map(|(_, cost)| *cost)
     }
 
+    /// Whether this is free whatever the order comes to: no amount in it,
+    /// neither a cost nor a value a cost starts at.
+    pub fn always_free(&self) -> bool {
+        self.0.iter().all(|(from, cost)| *from == 0.0 && *cost == 0.0)
+    }
+
     /// The order value delivery is free from, where it ever is.
     pub fn free_from(&self) -> Option<f64> {
         self.0.iter().find(|(_, cost)| *cost == 0.0).map(|(from, _)| *from)
@@ -259,8 +265,10 @@ impl Bands {
 /// What a shop's delivery page came to, for one country.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Terms {
-    /// A cost by order value, every amount of it written on the page.
-    Costs { bands: Bands, currency: String },
+    /// A cost by order value, every amount of it written on the page, and
+    /// the currency they are in. No currency where there is no amount:
+    /// delivery that is free whatever the order comes to.
+    Costs { bands: Bands, currency: Option<String> },
     /// The page says the shop does not deliver there.
     NotDelivered,
     /// The cost goes by something an offer does not say: weight, size,
@@ -348,13 +356,61 @@ fn starts_a_word(lower: &str, words: &[&str]) -> bool {
 /// has to be one: a freezer is not free.
 const FREE_WORDS: [&str; 5] = ["gratis", "kosteloos", "kostenlos", "kostenfrei", "gratuit"];
 
+/// Where `lower`, which is lower case, has a word for free: from which
+/// byte to which.
+fn free_words_in(lower: &str) -> Vec<(usize, usize)> {
+    let alone = |c: Option<char>| !c.is_some_and(char::is_alphabetic);
+    let begins = |at: usize| alone(lower[..at].chars().next_back());
+    let mut found: Vec<(usize, usize)> = FREE_WORDS
+        .iter()
+        .flat_map(|word| lower.match_indices(word))
+        .filter(|(at, _)| begins(*at))
+        .map(|(at, word)| (at, at + word.len()))
+        .collect();
+    found.extend(
+        lower
+            .match_indices("free")
+            .filter(|(at, word)| begins(*at) && alone(lower[at + word.len()..].chars().next()))
+            .map(|(at, word)| (at, at + word.len())),
+    );
+    found
+}
+
 fn says_free(text: &str) -> bool {
+    !free_words_in(&text.to_lowercase()).is_empty()
+}
+
+/// How near a word for free has to stand to a word for delivery for the
+/// page to be saying that delivery is free. The reviewer's "about 60
+/// characters": room for a clause between them, not for another subject.
+const FREE_NEAR_DELIVERY_CHARS: usize = 60;
+
+/// Whether the text says that delivery is free, and not that something
+/// is: a word for free beside one of `DELIVERY_WORDS`, before it or after.
+/// A shop that exchanges for free has "gratis" on its delivery page too.
+fn says_delivery_is_free(text: &str) -> bool {
     let lower = text.to_lowercase();
-    starts_a_word(&lower, &FREE_WORDS)
-        || lower.match_indices("free").any(|(at, word)| {
-            let alone = |c: Option<char>| !c.is_some_and(char::is_alphabetic);
-            alone(lower[..at].chars().next_back()) && alone(lower[at + word.len()..].chars().next())
+    let delivery: Vec<(usize, usize)> =
+        DELIVERY_WORDS.iter().flat_map(|word| lower.match_indices(word)).map(|(at, word)| (at, at + word.len())).collect();
+    free_words_in(&lower).iter().any(|&(start, end)| {
+        delivery.iter().any(|&(from, to)| {
+            let between = if from >= end {
+                &lower[end..from]
+            } else if to <= start {
+                &lower[to..start]
+            } else {
+                ""
+            };
+            between.chars().count() <= FREE_NEAR_DELIVERY_CHARS
         })
+    })
+}
+
+/// Whether a text as `delivery_text` cuts it was cut: it is as long as the
+/// cap. A page of exactly that length is taken for cut, which errs the
+/// safe way.
+pub(crate) fn hit_the_cap(text: &str) -> bool {
+    text.chars().count() >= DELIVERY_TEXT_CHARS
 }
 
 /// What the side model is asked. The answer has no key that holds words
@@ -459,6 +515,12 @@ const MAX_COST: f64 = 500.0;
 /// of an answer. It cannot check that a written amount answers the
 /// question asked — another country's row, an express delivery — so what
 /// is kept is the shop's page as the model read it, and is labelled so.
+///
+/// Free whatever the order comes to is the one answer with no amount in
+/// it, so no currency is asked of it and more is asked of the page: the
+/// word for free has to stand beside a word for delivery, and the text
+/// has to be the whole of what was to read. coolblue.nl's page gave this
+/// answer on 2026-11-20 from a text cut at the cap, with a null currency.
 pub(crate) fn checked(answer: Answer, text: &str, host: &str, country: &Country) -> (Terms, Option<&'static str>) {
     let home = country.is_home_of(host);
     if answer.delivers == Some(false) {
@@ -490,12 +552,26 @@ pub(crate) fn checked(answer: Answer, text: &str, host: &str, country: &Country)
     if !bands.iter().all(|(_, cost)| (0.0..=MAX_COST).contains(cost)) {
         return refused("cost out of range");
     }
-    let Some(currency) = currency_code(answer.currency.as_deref()) else { return refused("no currency") };
+    let always_free = bands.iter().all(|(from, cost)| *from == 0.0 && *cost == 0.0);
+    let currency = match currency_code(answer.currency.as_deref()) {
+        // Nothing in it is an amount, whatever the answer calls it.
+        _ if always_free => None,
+        Some(code) => Some(code),
+        None => return refused("no currency"),
+    };
     let mut amounts = bands.iter().flat_map(|(from, cost)| [*from, *cost]).filter(|amount| *amount > 0.0);
     if !amounts.all(|amount| page_states(text, amount)) {
         return refused("amount not on the page");
     }
-    if bands.iter().any(|(_, cost)| *cost == 0.0) && !says_free(text) {
+    if always_free {
+        // The rest of a cut page may say for whom, or from what value.
+        if hit_the_cap(text) {
+            return refused("free with no amount needs the whole page");
+        }
+        if !says_delivery_is_free(text) {
+            return refused("free not beside delivery");
+        }
+    } else if bands.iter().any(|(_, cost)| *cost == 0.0) && !says_free(text) {
         return refused("free not on the page");
     }
     if !home && !country.named_in(text) {
@@ -613,7 +689,7 @@ impl Kept {
     /// As the table holds it. `detail` is why not, for the operator.
     fn row(&self, detail: Option<String>) -> ShopDelivery {
         let (bands, currency) = match &self.terms {
-            Terms::Costs { bands, currency } => (serde_json::to_string(&bands.0).ok(), Some(currency.clone())),
+            Terms::Costs { bands, currency } => (serde_json::to_string(&bands.0).ok(), currency.clone()),
             _ => (None, None),
         };
         ShopDelivery { status: self.terms.status().to_string(), bands, currency, source_url: self.source_url.clone(), detail }
@@ -626,7 +702,13 @@ impl Kept {
         let terms = match row.status.as_str() {
             "terms" => {
                 let pairs: Vec<(f64, f64)> = serde_json::from_str(row.bands.as_deref()?).ok()?;
-                Terms::Costs { bands: Bands::new(pairs)?, currency: row.currency.clone()? }
+                let bands = Bands::new(pairs)?;
+                // No currency is free whatever the order comes to, and
+                // nothing else: amounts without one are not terms.
+                if row.currency.is_none() && !bands.always_free() {
+                    return None;
+                }
+                Terms::Costs { bands, currency: row.currency.clone() }
             }
             "not_delivered" => Terms::NotDelivered,
             "depends" => Terms::Depends,
@@ -1226,7 +1308,7 @@ mod tests {
         }
         // Another currency is its own code, and words that are no code are none.
         let (terms, _) = said("gbp");
-        assert_eq!(terms, Terms::Costs { bands: Bands(vec![(0.0, 5.49)]), currency: "GBP".to_string() });
+        assert_eq!(terms, Terms::Costs { bands: Bands(vec![(0.0, 5.49)]), currency: Some("GBP".to_string()) });
         for none in ["euros", "E", "", "pounds sterling"] {
             assert_eq!(said(none), (Terms::Silent, Some("no currency")), "{none:?}");
         }
@@ -1299,7 +1381,7 @@ mod tests {
     }
 
     fn costs(bands: &[(f64, f64)]) -> Terms {
-        Terms::Costs { bands: Bands(bands.to_vec()), currency: "EUR".to_string() }
+        Terms::Costs { bands: Bands(bands.to_vec()), currency: Some("EUR".to_string()) }
     }
 
     const PAGE: &str = "Levering in Nederland & België. Bestelwaarde € 10,00 - € 24,99: verzendkosten € 5,49. \
@@ -1333,6 +1415,85 @@ mod tests {
         // A freezer is not free.
         let page = format!("{page} Our freezer bags keep widgets cold.");
         assert_eq!(checked(by_order_value(&said), &page, "shop.example", nl()).0, Terms::Silent);
+    }
+
+    /// Free whatever the order comes to, as the model answers it.
+    fn always_free(currency: Option<&str>) -> Answer {
+        Answer {
+            delivers: Some(true),
+            by: Some("order_value".to_string()),
+            bands: Some(vec![AnswerBand { from: Some(0.0), cost: 0.0 }]),
+            currency: currency.map(str::to_string),
+        }
+    }
+
+    fn free() -> Terms {
+        Terms::Costs { bands: Bands(vec![(0.0, 0.0)]), currency: None }
+    }
+
+    #[test]
+    fn delivery_that_is_always_free_is_kept_without_a_currency() {
+        // coolblue.nl, 2026-11-20: the side model answered free from
+        // nothing with a null currency, and "no currency" refused it.
+        // Nothing in that answer is an amount, so nothing is in a currency.
+        let page = "Wij bezorgen gratis in heel Nederland, ook op zondag.";
+        for currency in [None, Some("EUR"), Some(""), Some("euros")] {
+            assert_eq!(checked(always_free(currency), page, "shop.example", nl()), (free(), None), "{currency:?}");
+        }
+        // The key left out altogether, and the band's start with it.
+        for said in [
+            r#"{"delivers": true, "by": "order_value", "bands": [{"from": 0, "cost": 0}]}"#,
+            r#"{"delivers": true, "by": "order_value", "bands": [{"cost": 0}], "currency": null}"#,
+        ] {
+            assert_eq!(checked(read_answer(said).unwrap(), page, "shop.example", nl()), (free(), None), "{said}");
+        }
+        // Free from a value is another answer: the value is an amount,
+        // and an amount is in a currency.
+        let from_twenty = |currency: Option<&str>| {
+            let mut answer = always_free(currency);
+            answer.bands = Some(vec![AnswerBand { from: Some(20.0), cost: 0.0 }]);
+            checked(answer, "Gratis bezorging in Nederland vanaf € 20.", "shop.example", nl())
+        };
+        assert_eq!(from_twenty(None), (Terms::Silent, Some("no currency")));
+        assert_eq!(from_twenty(Some("EUR")), (costs(&[(20.0, 0.0)]), None));
+        // And it is still only for a country the page names, or the shop's own.
+        let (terms, refused) = checked(always_free(None), "Wij bezorgen gratis, ook op zondag.", "shop.example", nl());
+        assert_eq!((terms, refused), (Terms::Silent, Some("country not on the page")));
+    }
+
+    #[test]
+    fn always_free_needs_the_word_beside_delivery_and_the_whole_page() {
+        // It is the one answer with no number for Rust to check, so the
+        // word has to be about delivery: a shop that exchanges for free
+        // has "gratis" on its page too.
+        let filler = "Onze widgets zijn er in vier kleuren. ".repeat(3);
+        let far = format!("Wij verzenden binnen Nederland. {filler}Gratis ruilen binnen dertig dagen.");
+        assert_eq!(checked(always_free(None), &far, "shop.example", nl()), (Terms::Silent, Some("free not beside delivery")));
+        for near in [
+            "Gratis verzending binnen Nederland.",
+            "In Nederland is de bezorging altijd gratis.",
+            "Free delivery in the Netherlands.",
+            "Kostenlose Lieferung in die Niederlande.",
+            "Livraison gratuite aux Pays-Bas.",
+            "Bezorging in Nederland: op werkdagen en op zaterdag, altijd gratis.",
+        ] {
+            let page = format!("{near} {filler}Gratis ruilen binnen dertig dagen.");
+            assert_eq!(checked(always_free(None), &page, "shop.example", nl()), (free(), None), "{near}");
+        }
+        // With an amount to check the word is enough wherever it stands, as it was.
+        let with_amounts = format!("Verzendkosten binnen Nederland: € 5,49 onder € 40. {filler}Daarboven gratis.");
+        let said = [(0.0, 5.49), (40.0, 0.0)];
+        assert_eq!(checked(by_order_value(&said), &with_amounts, "shop.example", nl()), (costs(&said), None));
+
+        // A text that was cut may go on to say for whom, or from what
+        // value: coolblue.nl's was cut at the cap, its first sentence
+        // about delivery at 7,065. Free with no amount is not kept of it.
+        let cut: String = format!("Gratis verzending binnen Nederland. {}", "woord ".repeat(3000)).chars().take(DELIVERY_TEXT_CHARS).collect();
+        let (terms, refused) = checked(always_free(None), &cut, "shop.example", nl());
+        assert_eq!((terms, refused), (Terms::Silent, Some("free with no amount needs the whole page")));
+        // An answer with amounts is checked against the part that was read.
+        let cut: String = format!("{with_amounts} {}", "woord ".repeat(3000)).chars().take(DELIVERY_TEXT_CHARS).collect();
+        assert_eq!(checked(by_order_value(&said), &cut, "shop.example", nl()), (costs(&said), None));
     }
 
     #[test]
@@ -1459,7 +1620,7 @@ pub(crate) mod fixtures {
     pub(crate) const READ_RIGHT: &str = r#"{"delivers": true, "by": "order_value", "bands": [{"from": 0, "cost": 5.49}, {"from": 40, "cost": 0}], "currency": "EUR"}"#;
 
     pub(crate) fn read_right() -> Terms {
-        Terms::Costs { bands: Bands(vec![(0.0, 5.49), (40.0, 0.0)]), currency: "EUR".to_string() }
+        Terms::Costs { bands: Bands(vec![(0.0, 5.49), (40.0, 0.0)]), currency: Some("EUR".to_string()) }
     }
 
     /// Past the 2 KB under which a body is taken for a shell.
@@ -1980,6 +2141,16 @@ mod desk_tests {
         let row = Kept { terms: read_right(), source_url: page }.row(Some("why".to_string()));
         assert_eq!((row.status.as_str(), row.bands.as_deref(), row.currency.as_deref()), ("terms", Some("[[0.0,5.49],[40.0,0.0]]"), Some("EUR")));
         assert_eq!(row.detail.as_deref(), Some("why"));
+        // Free whatever the order comes to has no currency, and comes
+        // back as it went in.
+        let free = Kept { terms: Terms::Costs { bands: Bands(vec![(0.0, 0.0)]), currency: None }, source_url: None };
+        let as_row = free.row(None);
+        assert_eq!((as_row.status.as_str(), as_row.bands.as_deref(), as_row.currency.as_deref()), ("terms", Some("[[0.0,0.0]]"), None));
+        assert_eq!(Kept::of(&as_row), Some(free));
+        // Amounts with no currency are not that: such a row is not read.
+        let mut amounts = as_row;
+        amounts.bands = Some("[[0.0,5.49]]".to_string());
+        assert_eq!(Kept::of(&amounts), None);
         // A row this code cannot read is as good as none: the shop is read again.
         let mut odd = row.clone();
         odd.status = "something newer".to_string();

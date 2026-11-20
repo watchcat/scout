@@ -433,10 +433,19 @@ pub(crate) fn hit_the_cap(text: &str) -> bool {
 /// on purpose: nothing a shop's page says can reach the main model or the
 /// person through it, only numbers, a yes or no, and one of two words.
 ///
-/// What it has to get across is in `the_prompt_says_the_page_is_data`. It
-/// was first put to a real model on 2026-11-20: zooplus.nl's page came
-/// back as its three bands by order value, and coolblue.nl's as free from
-/// nothing with a null currency.
+/// What it has to get across is in `the_prompt_says_the_page_is_data`.
+///
+/// Measured against the side model on 2026-11-20, the same page each time.
+/// As first written, six reads of zooplus.nl's delivery page gave its
+/// three bands by order value five times and `"by": "other"` once: the
+/// page adds a surcharge for a parcel over 31 kg, and that is what
+/// "other" took hold of. Two reads of coolblue.nl's page gave free from
+/// nothing once and "other" once. With the sentence about a surcharge and
+/// a dearer option added to the `by` key, six reads of zooplus.nl gave the
+/// bands six times, one with the first band from 0 and the others from 9,
+/// and three reads of coolblue.nl gave free from nothing once and
+/// `"by": null` twice; none answered "other". That sentence stands as it
+/// was run: reworded, those are no longer its counts.
 pub(crate) const DELIVERY_PREAMBLE: &str = "\
 You are given the text of one web shop's page about delivery, between two lines of dashes. \
 Answer with one JSON object and nothing else.
@@ -451,7 +460,9 @@ The keys:
 it does not, null when the page does not say.
 - \"by\": \"order_value\" when the delivery cost is one amount, or depends only on what the \
 order costs; \"other\" when it depends on weight, size, the product, the seller, the postcode \
-or anything else; null when the page states no cost.
+or anything else; null when the page states no cost. A surcharge for an unusually heavy or \
+bulky parcel, or a dearer option the buyer may choose instead (an evening, a set time, \
+express), does not make it \"other\": answer for the ordinary parcel and the standard option.
 - \"bands\": only with \"order_value\", lowest first: [{\"from\": the order value at or over \
 which this cost applies, 0 for the first when the page gives no lower limit, \"cost\": the \
 delivery cost, 0 when free}]. Otherwise null.
@@ -560,7 +571,7 @@ pub(crate) fn checked(answer: Answer, text: &str, host: &str, country: &Country)
         // Something an offer does not say: nothing can be applied.
         Some("other") => return (Terms::Depends, None),
         // A word nobody asked for is not "by weight or destination", which
-        // is what `depends` tells a person for thirty days.
+        // is what `depends` tells whoever compares there next.
         Some(_) => return (Terms::Silent, Some("by not understood")),
         None => return (Terms::Silent, None),
     }
@@ -691,24 +702,30 @@ const READ_BUDGET: Duration = Duration::from_secs(30);
 /// about. A guess: zooplus.nl's is 1,796 characters.
 const MIN_PAGE_CHARS: usize = 200;
 
-/// How long a reading that found something to keep is trusted — terms, a
-/// shop that does not deliver there, a cost that depends: for as long as
-/// the row is kept at all. See `store::DELIVERY_KEEP_DAYS`.
+/// How long a reading that settled something is trusted — terms, or a
+/// shop that does not deliver there: for as long as the row is kept at
+/// all. See `store::DELIVERY_KEEP_DAYS`.
 const KEEP_READ_DAYS: i64 = crate::store::DELIVERY_KEEP_DAYS;
 
-/// How long a reading that found nothing is left alone — a wall, no page,
-/// an answer Rust refused — so that such a shop is not asked by every
-/// request, and a wall that lifts is found within two days. A first guess,
-/// not a measurement. What will say whether it is right is how those rows
-/// turn out when they are read again: if a wall is still a wall, two days
-/// is asking too often.
+/// How long a reading that left nothing to apply is left alone — a wall,
+/// no page, an answer Rust refused, a cost that depends — so that such a
+/// shop is not asked by every request, and a wall that lifts is found
+/// within two days. A first guess, not a measurement. What will say
+/// whether it is right is how those rows turn out when they are read
+/// again: if a wall is still a wall, two days is asking too often.
+///
+/// `depends` is here and not with the terms because of what one read is
+/// worth: on 2026-11-20, one read in six of zooplus.nl's page answered
+/// "other" of a page that goes by order value, and whatever is read first
+/// is what is kept. A wrong `depends` must not hold a shop's real terms
+/// off for thirty days, and a right one costs one read to confirm.
 const KEEP_FAILED_DAYS: i64 = 2;
 
 /// Whether a kept reading still answers, `now`.
 fn still_good(terms: &Terms, read_at: chrono::NaiveDateTime, now: chrono::NaiveDateTime) -> bool {
     let days = match terms {
-        Terms::Costs { .. } | Terms::NotDelivered | Terms::Depends => KEEP_READ_DAYS,
-        Terms::Silent | Terms::NoPage | Terms::Unread => KEEP_FAILED_DAYS,
+        Terms::Costs { .. } | Terms::NotDelivered => KEEP_READ_DAYS,
+        Terms::Depends | Terms::Silent | Terms::NoPage | Terms::Unread => KEEP_FAILED_DAYS,
     };
     now - read_at < chrono::Duration::days(days)
 }
@@ -1459,7 +1476,8 @@ mod tests {
             assert_eq!(said(spelt), (Terms::Depends, None), "{spelt:?}");
         }
         // "flat" is not "by weight or destination", and kept as that it
-        // would say so of the shop for thirty days. Nothing is kept of it.
+        // would say so of the shop to whoever compares there next. Nothing
+        // is kept of it.
         for unknown in ["flat", "weight", "fixed", ""] {
             assert_eq!(said(unknown), (Terms::Silent, Some("by not understood")), "{unknown:?}");
         }
@@ -1478,6 +1496,20 @@ mod tests {
         // for where.
         let asked = prompt("shop.example", country("NL").unwrap(), "Verzendkosten: € 4,99");
         assert_eq!(asked, "Shop: shop.example\nCountry: Netherlands (NL)\n\n---\nVerzendkosten: € 4,99\n---\n\nThe JSON object:");
+    }
+
+    #[test]
+    fn the_prompt_says_a_surcharge_or_a_dearer_option_is_not_other() {
+        // To the letter, as it was put to the side model on 2026-11-20:
+        // the counts in the comment on the preamble are counts of this
+        // sentence, and of no rewording of it.
+        const AS_RUN: &str = "A surcharge for an unusually heavy or bulky parcel, or a dearer option the buyer may choose \
+                              instead (an evening, a set time, express), does not make it \"other\": answer for the ordinary \
+                              parcel and the standard option.";
+        assert!(DELIVERY_PREAMBLE.contains(AS_RUN), "got: {DELIVERY_PREAMBLE}");
+        // It closes the `by` key, after what null means there.
+        let by = DELIVERY_PREAMBLE.lines().find(|line| line.starts_with("- \"by\":")).expect("the by key has a line of its own");
+        assert!(by.ends_with(&format!("null when the page states no cost. {AS_RUN}")), "got: {by}");
     }
 
     #[test]
@@ -2426,14 +2458,19 @@ mod desk_tests {
     }
 
     #[test]
-    fn a_reading_is_trusted_thirty_days_and_a_failure_two() {
+    fn terms_and_a_shop_that_will_not_deliver_are_trusted_thirty_days_and_the_rest_two() {
         let read = chrono::NaiveDateTime::parse_from_str("2026-11-01 12:00", "%Y-%m-%d %H:%M").unwrap();
         let after = |days: i64, hours: i64| read + chrono::Duration::days(days) + chrono::Duration::hours(hours);
-        for terms in [read_right(), Terms::NotDelivered, Terms::Depends] {
+        for terms in [read_right(), Terms::NotDelivered] {
             assert!(still_good(&terms, read, after(29, 23)), "{terms:?}");
             assert!(!still_good(&terms, read, after(30, 0)), "{terms:?}");
         }
-        for terms in [Terms::Silent, Terms::NoPage, Terms::Unread] {
+        // `depends` goes with what found nothing. On 2026-11-20 one read
+        // in six of zooplus.nl's page said "other" of a page that goes by
+        // order value, and whatever is read first is what is kept. Wrong,
+        // it must not hold the shop's terms off for thirty days; right,
+        // it costs one read to say so again.
+        for terms in [Terms::Depends, Terms::Silent, Terms::NoPage, Terms::Unread] {
             assert!(still_good(&terms, read, after(1, 23)), "{terms:?}");
             assert!(!still_good(&terms, read, after(2, 0)), "{terms:?}");
         }

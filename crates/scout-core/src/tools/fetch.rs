@@ -39,6 +39,14 @@ pub enum FetchError {
     Http(#[from] reqwest::Error),
     #[error("{0}")]
     Invalid(String),
+    /// The site told its reader no: a block notice or a bot check where the
+    /// page should be, or a page not opened because its host had already
+    /// said so. The words are what `Invalid` would carry, for the model. It
+    /// is a kind of its own for the one caller that is not a model: the
+    /// daily price watch has to tell a shop that refuses from a page that
+    /// lost its price, and cannot do it by reading a sentence.
+    #[error("{0}")]
+    Refused(String),
 }
 
 #[derive(Deserialize)]
@@ -836,6 +844,9 @@ pub struct FetchPageTool {
     /// after plain HTTP has failed.
     pub renderer: Option<super::browser::Renderer>,
     opens: std::sync::atomic::AtomicUsize,
+    /// How many pages this reader may open: `MAX_OPENS` for a person's
+    /// request, and no bound for a pass that is nobody's. See `for_a_pass`.
+    budget: usize,
     /// Pages already read during this request. A model that re-opens one it
     /// has seen gets it back for free: without this, a repeat fetch of the
     /// same kruidvat page ate a third of the budget and left none for the
@@ -882,6 +893,7 @@ impl FetchPageTool {
             web,
             renderer,
             opens: std::sync::atomic::AtomicUsize::new(0),
+            budget: MAX_OPENS,
             seen: std::sync::Mutex::new(std::collections::HashMap::new()),
             hosts: std::sync::Mutex::new(Hosts::default()),
         }
@@ -925,7 +937,20 @@ impl FetchPageTool {
             "this site is unreadable, so do not open more pages on it; use what the search results \
              already told you"
         };
-        FetchError::Invalid(format!("{} {what} — {then}", named.host_str().unwrap_or("the site")))
+        FetchError::Refused(format!("{} {what} — {then}", named.host_str().unwrap_or("the site")))
+    }
+}
+
+impl FetchPageTool {
+    /// A reader for work that is nobody's request: the daily price-watch
+    /// pass, which opens one page a watch. It keeps what a request's reader
+    /// keeps, the pages read and the hosts that refused, for the length of
+    /// the pass, so a shop that has said no is not asked again for the
+    /// next watch on it. What it is not held to is the page budget, which
+    /// is there to stop a model opening pages and would end the pass at
+    /// its sixth watch.
+    pub(crate) fn for_a_pass(web: crate::net_guard::OpenWeb, renderer: Option<super::browser::Renderer>) -> Self {
+        Self { budget: usize::MAX, ..Self::new(web, renderer) }
     }
 }
 
@@ -1019,7 +1044,7 @@ impl Tool for FetchPageTool {
         // `Hosts::closed`. Before the budget, since nothing is opened.
         if host_key(&fetched).is_some_and(|host| self.hosts.lock().unwrap().closed.contains(&host)) {
             tracing::info!(url = %url, "the host refused a page earlier in this request; not opened");
-            return Err(FetchError::Invalid(format!(
+            return Err(FetchError::Refused(format!(
                 "{} already refused a page in this request, so this one was not opened again — \
                  use what the search results already told you",
                 url.host_str().unwrap_or("the site")
@@ -1035,7 +1060,7 @@ impl Tool for FetchPageTool {
         }
         // Counted only once the url is worth opening, so a malformed one
         // costs the model a turn but not part of its page budget.
-        if self.opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_OPENS {
+        if self.opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= self.budget {
             return Err(FetchError::Invalid(format!(
                 "page budget spent ({MAX_OPENS} opens per request) — answer with what you \
                  already have instead of opening more pages"
@@ -2554,5 +2579,78 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, FetchError::Invalid(_)), "got: {err:?}");
         assert!(err.to_string().contains("not on the public internet"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_site_saying_no_is_an_error_of_its_own_kind_and_a_status_is_not() {
+        // The words are for a model. The daily price watch is not one, and
+        // has to tell a shop that refuses from a page that is gone without
+        // reading them.
+        for (status, plain, browser) in [
+            (200, block_notice(), None),
+            (200, CHALLENGE.to_string(), None),
+            (403, String::new(), answering(&block_notice())),
+            // Told no with somebody left to ask who never answered.
+            (200, block_notice(), silent()),
+        ] {
+            let server = serving(status, &plain).await;
+            let tool = tool_with(&server, browser);
+            let err = tool.call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.unwrap_err();
+            assert!(matches!(err, FetchError::Refused(_)), "{status}: {err:?}");
+        }
+
+        // A page not opened because its host had already said no.
+        let server = serving(200, &block_notice()).await;
+        let tool = tool_with(&server, None);
+        assert!(tool.call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.is_err());
+        let err = tool.call(FetchArgs { url: format!("{}/p/2", server.uri()) }).await.unwrap_err();
+        assert!(err.to_string().contains("was not opened again"), "got: {err}");
+        assert!(matches!(err, FetchError::Refused(_)), "got: {err:?}");
+
+        // A status alone is about the page, and a page that is gone is gone.
+        for status in [404, 410, 403, 500] {
+            let server = serving(status, "").await;
+            let err = tool_with(&server, None).call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.unwrap_err();
+            assert!(matches!(err, FetchError::Invalid(_)), "{status}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reader_for_a_pass_has_no_page_budget_and_a_requests_memory() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/account"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(block_notice()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(product_page()))
+            .mount(&server)
+            .await;
+        let tool = FetchPageTool::for_a_pass(OpenWeb::exempting(*server.address()), None);
+        // Twice a request's budget, a page a watch.
+        for n in 0..MAX_OPENS * 2 {
+            let page = tool.call(FetchArgs { url: format!("{}/p/{n}", server.uri()) }).await;
+            assert!(page.is_ok(), "page {n}: {:?}", page.err());
+        }
+        // A page read in the pass is not asked for twice in it.
+        assert!(tool.call(FetchArgs { url: format!("{}/p/0", server.uri()) }).await.is_ok());
+        assert_eq!(requests(&server).await, MAX_OPENS * 2);
+
+        // And a host that says no is closed for the rest of the pass, as
+        // it is for the rest of a request.
+        let walled = serving(200, &block_notice()).await;
+        let tool = FetchPageTool::for_a_pass(OpenWeb::exempting(*walled.address()), None);
+        let (said, opened) = two_pages(&tool, &walled).await;
+        assert!(said.contains(NOTICE_SAID), "got: {said}");
+        assert!(!opened);
+
+        // What a person's request gets is as it was.
+        let tool = tool_with(&server, None);
+        for n in 0..MAX_OPENS {
+            assert!(tool.call(FetchArgs { url: format!("{}/q/{n}", server.uri()) }).await.is_ok());
+        }
+        let err = tool.call(FetchArgs { url: format!("{}/q/extra", server.uri()) }).await.unwrap_err();
+        assert!(err.to_string().contains("page budget spent"), "got: {err}");
     }
 }

@@ -173,15 +173,10 @@ impl Renderer {
     /// plain subprocess passes it every time.
     async fn render_inner(&self, url: &str) -> Result<String, BrowserError> {
         // Each render gets a throwaway profile: concurrent runs sharing one
-        // would fight over its lock.
-        let profile = std::env::temp_dir().join(format!(
-            "scout-chrome-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
+        // would fight over its lock. Its preferences are on disk before
+        // Chrome is, and without them there is no render.
+        let profile = Profile::create_in(&std::env::temp_dir())
+            .map_err(|e| BrowserError::Launch(format!("could not write the profile: {e}")))?;
 
         // `fetch_page` checked the URL, but Chrome follows redirects, runs
         // the page's scripts and resolves names on its own — any of which
@@ -191,7 +186,7 @@ impl Renderer {
             .await
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
         let mut child = tokio::process::Command::new(&self.chrome)
-            .args(chrome_args(url, &profile, proxy))
+            .args(chrome_args(url, profile.path(), proxy))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -218,12 +213,73 @@ impl Renderer {
         }
         let _ = child.start_kill();
         let _ = child.wait().await;
-        let _ = std::fs::remove_dir_all(&profile);
+        drop(profile);
 
         if html.is_empty() {
             return Err(BrowserError::Timeout);
         }
         Ok(String::from_utf8_lossy(&html).into_owned())
+    }
+}
+
+/// What a render's profile says before Chrome first reads it. These are
+/// settings Chrome takes from its profile, so they are written there and not
+/// passed on the command line.
+///
+/// `webrtc.ip_handling_policy`. The proxy carries TCP and WebRTC speaks UDP,
+/// from sockets Chrome opens itself. Measured 2026-11-20 on Chrome 157 with
+/// the flags below and no such setting: a page naming a STUN server on
+/// loopback had a datagram delivered there, by literal and by `localhost`
+/// alike, and was handed two host candidates. `disable_non_proxied_udp`
+/// leaves WebRTC only what the proxy can carry, and this proxy carries no
+/// UDP: with it no datagram arrived and gathering ended with no candidate at
+/// all, so a page's script learns no address either. The switch
+/// `--force-webrtc-ip-handling-policy` was measured too and changes nothing.
+///
+/// `net.network_prediction_options`, 2 for never. A page's speculation rules
+/// had Chrome prefetch one address and prerender another during a render
+/// (same day, same Chrome). Those loads go through the proxy — the one aimed
+/// at a second loopback listener was refused there — so this is not a way
+/// out; it is a page spending the render on addresses nobody asked for.
+/// With the setting neither request was made.
+const PREFERENCES: &str = r#"{"webrtc":{"ip_handling_policy":"disable_non_proxied_udp"},"net":{"network_prediction_options":2}}"#;
+
+/// One render's throwaway profile: on disk, preferences written, from
+/// [`Profile::create_in`] until it is dropped.
+///
+/// It used to be a path Chrome made on first use and the render removed on
+/// its way out. Now that it exists before Chrome does, removing it belongs
+/// to every way out — Chrome that would not start, a deadline that drops
+/// the render mid-read — and a drop is the one place all of them pass.
+struct Profile(PathBuf);
+
+impl Profile {
+    /// Fails rather than hand back a profile without its preferences: a
+    /// Chrome started on a bare one sends UDP wherever a page points it.
+    fn create_in(base: &std::path::Path) -> std::io::Result<Self> {
+        let profile = Self(base.join(format!(
+            "scout-chrome-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        )));
+        // `Default` is the profile Chrome uses inside a fresh data directory.
+        let default = profile.0.join("Default");
+        std::fs::create_dir_all(&default)?;
+        std::fs::write(default.join("Preferences"), PREFERENCES)?;
+        Ok(profile)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Profile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -312,6 +368,47 @@ mod tests {
         temp_env_var("SCOUT_CHROME", "/definitely/not/here", || {
             assert!(find_chrome().is_none());
         });
+    }
+
+    #[test]
+    fn a_profile_tells_chrome_to_keep_webrtc_in_the_proxy_and_load_nothing_ahead() {
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        assert!(profile.path().starts_with(base.path()));
+
+        // Where Chrome looks for it, and nothing in it but what is meant.
+        let written = std::fs::read_to_string(profile.path().join("Default").join("Preferences")).unwrap();
+        let preferences: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            preferences,
+            serde_json::json!({
+                "webrtc": {"ip_handling_policy": "disable_non_proxied_udp"},
+                "net": {"network_prediction_options": 2},
+            })
+        );
+    }
+
+    #[test]
+    fn a_profile_is_gone_when_its_render_is() {
+        // However the render ends — Chrome would not start, the deadline
+        // dropped it mid-read — what it put on disk goes with it.
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        let path = profile.path().to_path_buf();
+        assert!(path.is_dir());
+        drop(profile);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_profile_that_cannot_be_written_is_an_error_not_a_bare_profile() {
+        // A Chrome started on a profile without the preferences is a Chrome
+        // that sends UDP where it likes. A file where the directory should
+        // go cannot hold one, whoever runs the test.
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("a-file");
+        std::fs::write(&file, "").unwrap();
+        assert!(Profile::create_in(&file).is_err());
     }
 
     #[test]

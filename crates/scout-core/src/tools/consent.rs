@@ -27,16 +27,26 @@
 
 use super::fetch::{collapse_ws, decode_entities, strip_tags};
 use std::borrow::Cow;
+use std::collections::HashMap;
 
-/// What a consent dialog's own tag said of it in the renders above:
-/// `data-nosnippet`, which asks a search engine to leave the block out of
-/// its summary of the page (Cookiebot's on two hosts, OneTrust's on
-/// zooplus.nl), and the role of a dialog (amazon.nl's form). Neither is a
-/// vendor's name for itself. Each marks other things as well — the menus
-/// in amazon.nl's header and zooplus.nl's basket drawer are dialogs — so
-/// a mark says only where a block begins, and what the block says
-/// decides.
-const MARKS: [&str; 2] = ["data-nosnippet", "role=\"dialog\""];
+/// What a consent dialog's own tag said of it in the renders above: the
+/// attribute `data-nosnippet`, which asks a search engine to leave the
+/// block out of its summary of the page (Cookiebot's on two hosts,
+/// OneTrust's on zooplus.nl), and the role of a dialog (amazon.nl's
+/// form). Neither is a vendor's name for itself. Each marks other things
+/// as well — the menus in amazon.nl's header and zooplus.nl's basket
+/// drawer are dialogs — so a mark says only where a block begins, and
+/// what the block says decides.
+///
+/// Both are in lower case, as the document they are read from is.
+fn is_mark(attribute: &str, value: &str) -> bool {
+    attribute == "data-nosnippet" || (attribute == "role" && value.split_ascii_whitespace().any(|role| role == "dialog"))
+}
+
+/// Elements that have no content and no closing tag. An opening tag of
+/// one opens nothing, and a mark on one marks no block.
+const VOID: [&str; 14] =
+    ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
 
 /// How soon a marked block has to say "cookie" to be the consent dialog.
 /// The four seen say it within 75 characters of their text: amazon.nl's
@@ -55,6 +65,11 @@ const SAID_WITHIN_CHARS: usize = 200;
 /// inside a script would be counted with the rest.
 pub(super) fn read_last(html: &str) -> Cow<'_, str> {
     let lower = html.to_ascii_lowercase();
+    // Neither mark can be written without one of these, so a document
+    // with neither is not walked at all.
+    if !lower.contains("data-nosnippet") && !lower.contains("dialog") {
+        return Cow::Borrowed(html);
+    }
     let dialogs = dialogs(html, &lower);
     if dialogs.is_empty() {
         return Cow::Borrowed(html);
@@ -77,73 +92,170 @@ pub(super) fn read_last(html: &str) -> Cow<'_, str> {
 
 /// Where each consent dialog starts and ends, in the order they stand.
 /// One inside another is the outer one's.
+///
+/// The document is walked once, tag by tag. An element ends at the
+/// closing tag that brings the count of its name back to where it
+/// opened. A render is Chrome's own writing of the DOM, with every
+/// closing tag written out. A plain answer may leave out the ones HTML
+/// implies, a `<p>` that the next `<p>` ends, and there the count can
+/// run on past the element's real end. An element that is never closed
+/// is no block, and nothing of it is moved.
 fn dialogs(html: &str, lower: &str) -> Vec<(usize, usize)> {
-    let mut marks: Vec<(usize, usize)> = MARKS
-        .iter()
-        .flat_map(|mark| lower.match_indices(mark).map(|(at, _)| (at, at + mark.len())))
-        .collect();
-    marks.sort_unstable();
+    // How many elements of each name are open, and where each marked one
+    // among them began, by its name and how deep among its own name.
+    let mut open: HashMap<&str, usize> = HashMap::new();
+    let mut marked: HashMap<(&str, usize), usize> = HashMap::new();
     let mut found: Vec<(usize, usize)> = Vec::new();
-    for (at, after) in marks {
-        if found.last().is_some_and(|&(_, end)| at < end) {
+    for tag in (Tags { lower, at: 0 }) {
+        if VOID.contains(&tag.name) {
             continue;
         }
-        let Some(start) = opening_tag(lower, at, after) else { continue };
-        let Some(end) = element_end(lower, start) else { continue };
-        if opens_on_cookies(&html[start..end]) {
-            found.push((start, end));
+        let depth = open.entry(tag.name).or_default();
+        if !tag.closing {
+            *depth += 1;
+            if tag.marked {
+                marked.insert((tag.name, *depth), tag.start);
+            }
+            continue;
         }
+        // A closing tag with nothing of its name open closes nothing.
+        if *depth == 0 {
+            continue;
+        }
+        let start = marked.remove(&(tag.name, *depth));
+        *depth -= 1;
+        let Some(start) = start else { continue };
+        if !opens_on_cookies(&html[start..tag.end]) {
+            continue;
+        }
+        // Those found so far stand apart and in order. The ones that
+        // began after this one are inside it and go with it. One that
+        // began before it and has not ended before it crosses it: markup
+        // that is no tree, and the first of the two to end is kept.
+        let before = found.iter().rposition(|&(began, _)| began < start).map_or(0, |i| i + 1);
+        if before > 0 && found[before - 1].1 > start {
+            continue;
+        }
+        found.truncate(before);
+        found.push((start, tag.end));
     }
     found
 }
 
-/// Where the opening tag begins that carries the mark at `at..after` as
-/// an attribute of its own. Nothing when the mark is text between tags,
-/// or a piece of a longer name: `data-role="dialog"` is another
-/// attribute.
-fn opening_tag(lower: &str, at: usize, after: usize) -> Option<usize> {
-    let start = lower[..at].rfind('<')?;
-    let tag = &lower[start + 1..at];
-    let opens = tag.starts_with(|c: char| c.is_ascii_alphabetic()) && !tag.contains('>');
-    let whole = tag.ends_with(|c: char| c.is_ascii_whitespace())
-        && !lower[after..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    (opens && whole).then_some(start)
+/// One tag of a document, as far as this pass needs it.
+struct Tag<'a> {
+    /// Where its `<` is.
+    start: usize,
+    /// Where what follows its `>` begins.
+    end: usize,
+    /// In lower case, as the document it is read from is.
+    name: &'a str,
+    closing: bool,
+    /// An opening tag with one of the marks among its attributes.
+    marked: bool,
 }
 
-/// Where the element that opens at `start` ends: its own tag name,
-/// counted open and closed until the two balance. A render is Chrome's
-/// own writing of the DOM and always balances. Markup that does not —
-/// an element with no closing tag, a page cut short — has no end, and
-/// then nothing is moved.
-fn element_end(lower: &str, start: usize) -> Option<usize> {
-    let name = &lower[start + 1..];
-    let name = &name[..name.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))?];
-    let mut depth = 0usize;
-    let mut from = start;
-    while let Some(at) = lower[from..].find('<').map(|i| i + from) {
-        from = at + 1;
-        let rest = &lower[from..];
-        let (closing, rest) = match rest.strip_prefix('/') {
-            Some(rest) => (true, rest),
-            None => (false, rest),
-        };
-        // "<div" has to end the tag name: `<divider>` is another element.
-        let Some(after) = rest.strip_prefix(name) else { continue };
-        if !after.starts_with(|c: char| c == '>' || c == '/' || c.is_ascii_whitespace()) {
-            continue;
-        }
-        if !closing {
-            depth += 1;
-            continue;
-        }
-        // Never below one here: the tag at `start` opened it, and the
-        // close that brings it to nought is the end.
-        depth -= 1;
-        if depth == 0 {
-            return lower[at..].find('>').map(|i| at + i + 1);
+/// The tags of a lower-cased document in the order they stand, read as a
+/// browser reads them: a `<` begins a tag only before a letter, a name
+/// ends at white space, `/` or `>`, a quoted attribute value may hold a
+/// `<` or a `>`, and what is inside a comment is not markup. A tag or a
+/// comment the document ends inside is the end of its tags.
+///
+/// Read with less care, by looking back from a mark for the nearest `<`,
+/// a `<` in a `title` was taken for the tag that carried the mark and a
+/// tag left in a comment was counted with the rest.
+struct Tags<'a> {
+    lower: &'a str,
+    at: usize,
+}
+
+impl<'a> Iterator for Tags<'a> {
+    type Item = Tag<'a>;
+
+    fn next(&mut self) -> Option<Tag<'a>> {
+        let (lower, bytes) = (self.lower, self.lower.as_bytes());
+        loop {
+            let start = lower[self.at..].find('<')? + self.at;
+            if lower[start..].starts_with("<!--") {
+                // Looked for from its second dash, so that `<!-->` is a
+                // whole comment and not the start of one.
+                self.at = lower[start + 2..].find("-->")? + start + 5;
+                continue;
+            }
+            let closing = bytes.get(start + 1) == Some(&b'/');
+            let name_at = start + 1 + usize::from(closing);
+            if !bytes.get(name_at).is_some_and(u8::is_ascii_alphabetic) {
+                // A `<` in the text, a doctype: no element's tag.
+                self.at = start + 1;
+                continue;
+            }
+            let mut at = name_at;
+            while at < bytes.len() && !ends_a_name(bytes[at]) {
+                at += 1;
+            }
+            let name = &lower[name_at..at];
+            let mut marked = false;
+            loop {
+                while at < bytes.len() && (bytes[at].is_ascii_whitespace() || bytes[at] == b'/') {
+                    at += 1;
+                }
+                match bytes.get(at) {
+                    None => return None,
+                    Some(b'>') => break,
+                    Some(_) => {}
+                }
+                let (attribute, value, after) = attribute(lower, at)?;
+                marked |= !closing && is_mark(attribute, value);
+                at = after;
+            }
+            self.at = at + 1;
+            return Some(Tag { start, end: at + 1, name, closing, marked });
         }
     }
-    None
+}
+
+/// Whether a byte ends the name of a tag, or of an attribute with no
+/// value.
+fn ends_a_name(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte == b'/' || byte == b'>'
+}
+
+/// The attribute that begins at `at`: its name, its value, and where
+/// what follows it begins. Nothing when the document ends inside it, in
+/// a quoted value that never closes above all.
+fn attribute(lower: &str, at: usize) -> Option<(&str, &str, usize)> {
+    let bytes = lower.as_bytes();
+    // Its first character is the name's whatever it is, an `=` too.
+    let mut end = at + 1;
+    while end < bytes.len() && !(ends_a_name(bytes[end]) || bytes[end] == b'=') {
+        end += 1;
+    }
+    let name = &lower[at..end];
+    let mut after = end;
+    while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+        after += 1;
+    }
+    if bytes.get(after) != Some(&b'=') {
+        return Some((name, "", end));
+    }
+    after += 1;
+    while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+        after += 1;
+    }
+    match *bytes.get(after)? {
+        quote @ (b'"' | b'\'') => {
+            let close = lower[after + 1..].find(char::from(quote))? + after + 1;
+            Some((name, &lower[after + 1..close], close + 1))
+        }
+        b'>' => Some((name, "", after)),
+        _ => {
+            let mut close = after;
+            while close < bytes.len() && !(bytes[close].is_ascii_whitespace() || bytes[close] == b'>') {
+                close += 1;
+            }
+            Some((name, &lower[after..close], close))
+        }
+    }
 }
 
 /// Whether a block's text speaks of cookies from its start.
@@ -659,6 +771,118 @@ mod tests {
         ] {
             assert!(matches!(read_last(html), Cow::Borrowed(_)), "{html}");
         }
+    }
+
+    #[test]
+    fn a_less_than_sign_in_an_attribute_is_not_a_tag() {
+        // The review's input. The `<` in the title was taken for the tag
+        // that carries the mark, a `p` that no count had opened, and the
+        // paragraph's own closing tag took the count below nought: a
+        // panic in a debug build, and in a release build a block that
+        // ended at whatever `</p>` came by.
+        let html = "<html><body><p>Intro <span title=\"a<p\" data-nosnippet>We use cookies</span></p>\
+                    <p>The page.</p></body></html>";
+        assert_eq!(
+            read_last(html),
+            "<html><body><p>Intro  </p><p>The page.</p></body></html>\
+             <span title=\"a<p\" data-nosnippet>We use cookies</span>"
+        );
+        assert_eq!(read(html).text, "Intro The page. We use cookies");
+        // And a `>` in one does not end the tag it is in.
+        let dialog = "<div title=\"a > b\" data-nosnippet>Cookies</div>";
+        let html = format!("<body>{dialog}<p>The page.</p></body>");
+        assert_eq!(read_last(&html), format!("<body> <p>The page.</p></body>{dialog}"));
+    }
+
+    #[test]
+    fn a_mark_inside_an_attributes_value_is_not_a_mark() {
+        for html in [
+            "<body><div class=\"x data-nosnippet\">Cookies</div><p>The page.</p></body>",
+            "<body><div title='set role=\"dialog\" on it'>Cookies</div><p>The page.</p></body>",
+            "<body><a href=\"/help?role=dialog data-nosnippet\">Cookies</a><p>The page.</p></body>",
+        ] {
+            assert!(matches!(read_last(html), Cow::Borrowed(_)), "{html}");
+        }
+    }
+
+    #[test]
+    fn a_role_is_read_however_its_value_is_quoted() {
+        // A render always writes double quotes. A plain answer writes
+        // what its author did.
+        for dialog in [
+            "<div role='dialog'>Cookies</div>",
+            "<div role=dialog>Cookies</div>",
+            "<div role = \"dialog\" class=x>Cookies</div>",
+            "<div data-nosnippet = 'true'>Cookies</div>",
+        ] {
+            let html = format!("<body>{dialog}<p>The page.</p></body>");
+            assert_eq!(read_last(&html), format!("<body> <p>The page.</p></body>{dialog}"), "{dialog}");
+        }
+        // A role that only has the word in it is another role.
+        let html = "<body><div role=\"dialog-like\">Cookies</div><p>The page.</p></body>";
+        assert!(matches!(read_last(html), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn what_is_inside_a_comment_is_not_markup() {
+        // A tag left in a comment was counted with the rest: an opening
+        // one, and the dialog ran on to the next closing tag of its
+        // name, here the page's own, so that the page went behind its
+        // footer with it.
+        let dialog = "<div role=\"dialog\">Cookies <!-- <div class=\"old\"> --> we use them</div>";
+        let html = format!("<body><div id=\"page\">{dialog}<main>The page.</main></div><footer>Foot</footer></body>");
+        assert_eq!(
+            read_last(&html),
+            format!("<body><div id=\"page\"> <main>The page.</main></div><footer>Foot</footer></body>{dialog}")
+        );
+        // A closing one, and it ended early.
+        let dialog = "<div role=\"dialog\">Cookies <!-- </div> --> we use them</div>";
+        let html = format!("<body>{dialog}<main>The page.</main></body>");
+        assert_eq!(read_last(&html), format!("<body> <main>The page.</main></body>{dialog}"));
+        // And a dialog that is only in a comment is no dialog.
+        for html in [
+            "<body><!-- <div data-nosnippet>Cookies</div> --><p>The page.</p></body>",
+            "<body><p>The page.</p><!-- <div role=\"dialog\">Cookies</div></body>",
+        ] {
+            assert!(matches!(read_last(html), Cow::Borrowed(_)), "{html}");
+        }
+    }
+
+    #[test]
+    fn dialogs_keep_the_order_they_stand_in_whichever_mark_each_has() {
+        // The other way round from the test above: the dialog by role
+        // first. Found mark by mark and not put in order, the two would
+        // overlap what is copied and come out wrong.
+        let form = "<form role=\"dialog\"><h4>Cookies and Advertising Choices</h4></form>";
+        let other = "<div data-nosnippet=\"true\"><h2>We use cookies</h2><button>Agree</button></div>";
+        let html = format!("<body>{form}<p>one</p>{other}<p>two</p></body>");
+        assert_eq!(read_last(&html), format!("<body> <p>one</p> <p>two</p></body>{form}{other}"));
+    }
+
+    #[test]
+    fn blocks_that_cross_each_other_do_not_both_move() {
+        // Markup no browser would write and a plain answer might: the
+        // second block begins inside the first and ends outside it.
+        // The first to end is moved; the other is left as it is.
+        let html = "<body><div data-nosnippet>Cookies <span role=\"dialog\">Cookies too</div> and on</span>\
+                    <p>The page.</p></body>";
+        assert_eq!(
+            read_last(html),
+            "<body>  and on</span><p>The page.</p></body><div data-nosnippet>Cookies <span role=\"dialog\">Cookies too</div>"
+        );
+    }
+
+    #[test]
+    fn a_closing_tag_that_closes_nothing_ends_nothing() {
+        // An element that cannot have content, and a closing tag for it
+        // all the same, a long way on: the page between them is not its.
+        let html = "<body><br data-nosnippet>Cookies<p>The page.</p></br></body>";
+        assert!(matches!(read_last(html), Cow::Borrowed(_)));
+        // A closing tag before anything of its name was opened is not
+        // counted against the dialog that follows.
+        let dialog = "<div data-nosnippet>Cookies<div>we use them</div></div>";
+        let html = format!("<body></div>{dialog}<p>The page.</p></body>");
+        assert_eq!(read_last(&html), format!("<body></div> <p>The page.</p></body>{dialog}"));
     }
 
     #[test]

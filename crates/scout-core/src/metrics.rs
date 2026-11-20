@@ -248,8 +248,10 @@ impl Metrics {
     /// One shop's delivery terms were wanted for a comparison: `kept` when
     /// the table answered, the reading's own status when the shop was read
     /// now, `spent` when the request's allowance of new shops was gone and
-    /// `late` when the read outran its deadline. No host: which shop is in
-    /// the trace, for as long as a trace is kept, and nowhere else.
+    /// `late` when the read outran its deadline. And `no_country`, once a
+    /// comparison that had offers to ask about and no delivery country to
+    /// ask for. No host: which shop is in the trace, for as long as a
+    /// trace is kept, and nowhere else.
     pub fn delivery_terms(&self, outcome: &str) {
         self.delivery_terms.add(&[outcome]);
     }
@@ -277,7 +279,7 @@ impl Metrics {
         self.side_calls.render(&mut out, "scout_side_calls_total", "Tool-less side calls — title, continuation, extract, photo, page, delivery — by model and how they ended: ok, empty (all reasoning, nothing said), failed, timeout.");
         self.side_call_tokens.render(&mut out, "scout_side_call_tokens_total", "Tokens the side calls used, by call, model and kind; reasoning is counted on its own, as a share of output.");
         self.side_call_ms.render(&mut out, "scout_side_call_ms_total", "Milliseconds the side calls took, by call and model; divide by the calls for a mean.");
-        self.delivery_terms.render(&mut out, "scout_delivery_terms_total", "Shops whose delivery terms a comparison wanted, by what came of it: kept (answered from the table), what a read made of the shop's page (terms, not_delivered, depends, silent, no_page, unread), spent (past the request's allowance of new shops) or late (the read outran its deadline).");
+        self.delivery_terms.render(&mut out, "scout_delivery_terms_total", "Shops whose delivery terms a comparison wanted, by what came of it: kept (answered from the table), what a read made of the shop's page (terms, not_delivered, depends, silent, no_page, unread), spent (past the request's allowance of new shops) or late (the read outran its deadline); and no_country, once a comparison that had offers to ask about when the profile names no delivery country.");
         self.compared_offers.render(&mut out, "scout_compared_offers_total", "Offers compare_prices ranked, by where their shipping came from: offer (the model handed it over), delivery_page (the shop's kept terms) or unknown.");
         self.search_results.render(&mut out, "scout_search_results_total", "Hits from search_web calls, by source (kagi_N is the Nth query, kagi_1 the user's own) and what became of them: kept for the model, a duplicate of an earlier entry, or cut for want of room.");
         out

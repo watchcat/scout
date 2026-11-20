@@ -15,6 +15,9 @@
 //! where it can and reads a shop where it cannot, a few shops a request and
 //! all of them under one deadline. The model is the side model, asked once
 //! a shop with no tools, and all that is kept of its answer is numbers.
+//! What a failure writes down depends on whose it was: a shop that refused
+//! or kept the lookup waiting is left alone for a while, and a model that
+//! failed is nothing of the shop's.
 
 use super::fetch::{self, PageLink};
 use super::{browser, refusal};
@@ -25,7 +28,7 @@ use crate::store::{ShopDelivery, Store};
 use reqwest::Url;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -430,8 +433,10 @@ pub(crate) fn hit_the_cap(text: &str) -> bool {
 /// on purpose: nothing a shop's page says can reach the main model or the
 /// person through it, only numbers, a yes or no, and one of two words.
 ///
-/// Its wording has not met a model: the builder had no key. What it has to
-/// get across is in `the_prompt_says_the_page_is_data`.
+/// What it has to get across is in `the_prompt_says_the_page_is_data`. It
+/// was first put to a real model on 2026-11-20: zooplus.nl's page came
+/// back as its three bands by order value, and coolblue.nl's as free from
+/// nothing with a null currency.
 pub(crate) const DELIVERY_PREAMBLE: &str = "\
 You are given the text of one web shop's page about delivery, between two lines of dashes. \
 Answer with one JSON object and nothing else.
@@ -663,18 +668,23 @@ impl ShopPages {
 pub(crate) const NEW_SHOPS_PER_REQUEST: usize = 4;
 
 /// How long a comparison waits for delivery terms, all shops together
-/// and the look in the table before them. Half of the 90 s after which the run loop takes a silent run for a
-/// stalled one (`STREAM_STALL`), since rig shows nothing of a tool until
-/// it returns. A shop that is not read by then is dropped and asked again
-/// by the next request. How long a read really takes is not measured yet:
-/// `scout_side_call_ms_total{call="delivery"}` and the `late` count will
-/// say.
+/// and the look in the table before them. Half of the 90 s after which the
+/// run loop takes a silent run for a stalled one (`STREAM_STALL`), since
+/// rig shows nothing of a tool until it returns. A shop whose pages have
+/// not come by then is remembered as a failed read, so that the next
+/// comparison does not wait for it again. One read has been timed:
+/// zooplus.nl's on 2026-11-20 took 9.3 s in all. The `late` count and
+/// `scout_side_call_ms_total{call="delivery"}` will say the rest.
 pub(crate) const LOOKUP_BUDGET: Duration = Duration::from_secs(45);
 
-/// One plain request for a page. As a link probe gets (`links.rs`).
+/// One plain request for a page. Borrowed from the link probe
+/// (`links.rs`), and not measured for this call.
 const GET_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// The side model's time for one delivery page. As a title gets.
+/// The side model's time for one delivery page. Borrowed from the title
+/// call, and not measured for this one beyond a single read: zooplus.nl's
+/// page on 2026-11-20 took the side model 8.6 s, for 771 tokens in and
+/// 768 out.
 const READ_BUDGET: Duration = Duration::from_secs(30);
 
 /// A delivery page with less text than this says nothing to ask a model
@@ -768,10 +778,10 @@ pub(crate) enum Reach<'a> {
     Unguarded(&'a reqwest::Client),
 }
 
-/// One plain request for a page of `shop`, and the page, or in a few words
-/// why it is not one. No render and no second try: a shop that refuses the
-/// plain request has given its answer.
-async fn get_page(reach: &Reach<'_>, url: &Url, shop: &str) -> Result<String, String> {
+/// One plain request for a page of `shop`: the page and the address that
+/// answered, or in a few words why it is not one. No render and no second
+/// try: a shop that refuses the plain request has given its answer.
+async fn get_page(reach: &Reach<'_>, url: &Url, shop: &str) -> Result<(String, Url), String> {
     let http = match reach {
         Reach::Guarded(web) => {
             if web.guard.check(url).await.is_err() {
@@ -792,7 +802,8 @@ async fn get_page(reach: &Reach<'_>, url: &Url, shop: &str) -> Result<String, St
     }
     // After a redirect the host that answered is not the one asked, and
     // another site's page says nothing of this shop.
-    if !fetch::host_key(response.url()).is_some_and(|landed| same_shop(&landed, shop)) {
+    let landed = response.url().clone();
+    if !fetch::host_key(&landed).is_some_and(|at| same_shop(&at, shop)) {
         return Err("redirected off the shop".to_string());
     }
     let html = response.text().await.map_err(|_| "no answer".to_string())?;
@@ -808,7 +819,7 @@ async fn get_page(reach: &Reach<'_>, url: &Url, shop: &str) -> Result<String, St
     if refusal::says_no(&fetch::collapse_ws(&fetch::decode_entities(&fetch::strip_tags(&stripped)))) {
         return Err("block notice".to_string());
     }
-    Ok(html)
+    Ok((html, landed))
 }
 
 /// The delivery pages a page links, out of its HTML.
@@ -828,74 +839,111 @@ pub(crate) struct Reading {
     pub page: Option<String>,
     /// What the model was handed of it.
     pub text: Option<String>,
+    /// Whether that text was cut at the cap, and so may not be the whole
+    /// of what the page says.
+    pub cut: bool,
     /// What the model said.
     pub answer: Option<String>,
     pub terms: Terms,
     /// Why not: the check that refused the answer, or what failed.
     pub detail: Option<String>,
+    /// Whether what failed was the model and not the shop: it gave no
+    /// answer, or none that could be read.
+    pub model_failed: bool,
 }
 
-/// Reads one shop's delivery terms: at most two plain requests and one
-/// side call. `known` is where a page of the shop already read links its
-/// delivery page; without it the offer's own address is asked for, for its
-/// links alone. Nothing is stored here.
-pub(crate) async fn read_shop(
-    reach: Reach<'_>,
-    side: &SideModel,
-    metrics: &crate::metrics::Metrics,
-    known: Option<Vec<String>>,
-    host: &str,
-    offer: &Url,
-    country: &Country,
-) -> Reading {
-    let mut reading = Reading { links: Vec::new(), page: None, text: None, answer: None, terms: Terms::Unread, detail: None };
-    reading.links = match known {
-        Some(links) => links,
-        None => match get_page(&reach, offer, host).await {
-            Ok(html) => delivery_links_in(&html, offer),
+/// What a read of a shop needs: how its pages are reached, and the side
+/// model with where its call is counted.
+pub(crate) struct Reader<'a> {
+    pub reach: Reach<'a>,
+    pub side: &'a SideModel,
+    pub metrics: &'a crate::metrics::Metrics,
+}
+
+impl Reader<'_> {
+    /// Reads one shop's delivery terms: at most two plain requests and one
+    /// side call. `known` is where a page of the shop already read links
+    /// its delivery page; without it the offer's own address is asked for,
+    /// for its links alone. Nothing is stored here.
+    ///
+    /// `at_the_model` is set once the shop's pages are in hand and the
+    /// model is being asked, so that whoever gives up on a read can tell
+    /// whose time it was taking.
+    pub(crate) async fn read(
+        &self,
+        known: Option<Vec<String>>,
+        host: &str,
+        offer: &Url,
+        country: &Country,
+        at_the_model: &AtomicBool,
+    ) -> Reading {
+        let mut reading = Reading {
+            links: Vec::new(),
+            page: None,
+            text: None,
+            cut: false,
+            answer: None,
+            terms: Terms::Unread,
+            detail: None,
+            model_failed: false,
+        };
+        reading.links = match known {
+            Some(links) => links,
+            None => match get_page(&self.reach, offer, host).await {
+                // A relative link is the page's own, and the page is where
+                // the request ended up, which need not be where it was sent.
+                Ok((html, landed)) => delivery_links_in(&html, &landed),
+                Err(why) => {
+                    reading.detail = Some(why);
+                    return reading;
+                }
+            },
+        };
+        let Some(page) = reading.links.first().and_then(|link| Url::parse(link).ok()) else {
+            reading.terms = Terms::NoPage;
+            return reading;
+        };
+        reading.page = Some(page.to_string());
+        let html = match get_page(&self.reach, &page, host).await {
+            Ok((html, _)) => html,
             Err(why) => {
                 reading.detail = Some(why);
                 return reading;
             }
-        },
-    };
-    let Some(page) = reading.links.first().and_then(|link| Url::parse(link).ok()) else {
-        reading.terms = Terms::NoPage;
-        return reading;
-    };
-    reading.page = Some(page.to_string());
-    let html = match get_page(&reach, &page, host).await {
-        Ok(html) => html,
-        Err(why) => {
-            reading.detail = Some(why);
+        };
+        let text = delivery_text(&html);
+        if text.chars().count() < MIN_PAGE_CHARS {
+            reading.detail = Some("too little text".to_string());
             return reading;
         }
-    };
-    let text = delivery_text(&html);
-    if text.chars().count() < MIN_PAGE_CHARS {
-        reading.detail = Some("too little text".to_string());
-        return reading;
-    }
-    reading.text = Some(text.clone());
-    let said = match side_call_with(side, metrics, SIDE_DELIVERY, READ_BUDGET, DELIVERY_PREAMBLE, prompt(host, country, &text)).await {
-        Ok(said) => said,
-        Err(e) => {
-            // How it ended — failed, timeout, empty — is on `/metrics`.
-            tracing::warn!(host, error = %e, "the side model gave no answer about a delivery page");
-            reading.detail = Some("model: no answer".to_string());
-            return reading;
+        reading.cut = hit_the_cap(&text);
+        reading.text = Some(text.clone());
+        at_the_model.store(true, Ordering::Relaxed);
+        let asked = side_call_with(self.side, self.metrics, SIDE_DELIVERY, READ_BUDGET, DELIVERY_PREAMBLE, prompt(host, country, &text));
+        let said = match asked.await {
+            Ok(said) => said,
+            Err(e) => {
+                // How it ended — failed, timeout, empty — is on `/metrics`.
+                tracing::warn!(host, error = %e, "the side model gave no answer about a delivery page");
+                reading.detail = Some("model: no answer".to_string());
+                reading.model_failed = true;
+                return reading;
+            }
+        };
+        reading.answer = Some(said.clone());
+        match read_answer(&said) {
+            Ok(answer) => {
+                let (terms, refused) = checked(answer, &text, host, country);
+                reading.terms = terms;
+                reading.detail = refused.map(str::to_string);
+            }
+            Err(_) => {
+                reading.detail = Some("model: not the JSON asked for".to_string());
+                reading.model_failed = true;
+            }
         }
-    };
-    reading.answer = Some(said.clone());
-    match read_answer(&said) {
-        Ok(answer) => {
-            let (terms, refused) = checked(answer, &text, host, country);
-            reading.terms = terms;
-            reading.detail = refused.map(str::to_string);
-        }
-        Err(_) => reading.detail = Some("model: not the JSON asked for".to_string()),
+        reading
     }
-    reading
 }
 
 /// Where `compare_prices` asks what a shop charges to deliver. Built per
@@ -949,11 +997,19 @@ impl DeliveryDesk {
     /// allowance runs short.
     ///
     /// A shop the table has something fresh of costs nothing. The rest are
-    /// read now, all at once and under one deadline, and what is not
-    /// read by then is left for the next request. Without a delivery
-    /// country nothing is looked up or read at all.
+    /// read now, all at once and under one deadline, and a shop that is
+    /// not read by then is remembered as one that could not be. Without a
+    /// delivery country nothing is looked up or read at all.
     pub async fn terms_for(&self, wanted: &[Url]) -> Looked {
-        let Some(country) = self.country else { return Looked::default() };
+        let Some(country) = self.country else {
+            // Counted, once a comparison that had something to ask: a desk
+            // nobody needed and a desk a missing fact switches off must
+            // not look alike on the metrics page.
+            if !wanted.is_empty() {
+                self.metrics.delivery_terms("no_country");
+            }
+            return Looked::default();
+        };
         let mut looked = Looked { country: Some(country), ..Looked::default() };
         // One address a shop, in the order asked.
         let mut shops: Vec<(String, &Url)> = Vec::new();
@@ -966,8 +1022,15 @@ impl DeliveryDesk {
         if shops.is_empty() {
             return looked;
         }
-        // One deadline for the whole lookup, the table included: the
-        // store's lock may be somebody else's for a while.
+        // Before the table is asked: the store's lock may be somebody
+        // else's for a while, and the run is alive all the same.
+        self.observer.pulse.touch();
+        // Said of every shop asked about, read now or answered from the
+        // table alike: terms read for one person answer the next, and the
+        // line must not tell the second whether anybody looked lately.
+        let asked_about = if shops.len() == 1 { "1 shop".to_string() } else { format!("{} shops", shops.len()) };
+        scout_api::emit(&self.observer.events, scout_api::AgentEvent::Tool(format!("🚚 checking delivery terms at {asked_about}")));
+        // One deadline for the whole lookup, the table included.
         let deadline = tokio::time::Instant::now() + self.budget;
         let now = chrono::Utc::now().naive_utc();
         let (store, hosts) = (self.store.clone(), shops.iter().map(|(host, _)| host.clone()).collect::<Vec<_>>());
@@ -1008,17 +1071,15 @@ impl DeliveryDesk {
         if new.is_empty() {
             return looked;
         }
-        let shops_said = if new.len() == 1 { "1 shop".to_string() } else { format!("{} shops", new.len()) };
-        scout_api::emit(&self.observer.events, scout_api::AgentEvent::Tool(format!("🚚 reading delivery terms at {shops_said}")));
         // The outer stream says nothing while a tool runs, and this one
         // may run beside slow page opens: the stall guard is told the run
-        // is alive now and as each shop is done.
-        self.observer.pulse.touch();
+        // is alive as each shop is done.
         let done: Mutex<Vec<(String, Kept)>> = Mutex::new(Vec::new());
-        let reads = new.iter().map(|(host, url)| {
+        let at_the_model: Vec<AtomicBool> = new.iter().map(|_| AtomicBool::new(false)).collect();
+        let reads = new.iter().zip(&at_the_model).map(|((host, url), at_the_model)| {
             let done = &done;
             async move {
-                let kept = self.read(host, url, country).await;
+                let kept = self.read(host, url, country, at_the_model).await;
                 self.observer.pulse.touch();
                 done.lock().unwrap_or_else(|e| e.into_inner()).push((host.clone(), kept));
             }
@@ -1026,10 +1087,28 @@ impl DeliveryDesk {
         let in_time = tokio::time::timeout_at(deadline, futures::future::join_all(reads)).await.is_ok();
         let done = done.into_inner().unwrap_or_else(|e| e.into_inner());
         if !in_time {
-            for (host, _) in new.iter().filter(|(host, _)| !done.iter().any(|(read, _)| read == host)) {
+            let unfinished = new.iter().zip(&at_the_model).filter(|((host, _), _)| !done.iter().any(|(read, _)| read == host));
+            for ((host, _), at_the_model) in unfinished {
+                let at_the_model = at_the_model.load(Ordering::Relaxed);
                 self.metrics.delivery_terms("late");
-                tracing::warn!(host, budget_s = self.budget.as_secs(), "delivery terms not read in time; dropped");
+                tracing::warn!(host, at_the_model, budget_s = self.budget.as_secs(), "delivery terms not read in time");
                 self.observer.event(&format!("delivery terms not read in time: {host}"), true);
+                // A shop that kept the lookup waiting is remembered as a
+                // failed read, so the next comparison does not wait for
+                // it again. One whose pages had come and whose answer had
+                // not is the provider's lateness: nothing is written of
+                // the shop for it, as for a model that failed.
+                if !at_the_model {
+                    let (store, shop) = (self.store.clone(), host.clone());
+                    let row = Kept { terms: Terms::Unread, source_url: None }.row(Some("late".to_string()));
+                    // Not waited for: the deadline has passed, and the
+                    // comparison is owed its answer.
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = store.keep_shop_delivery(&shop, country.code, &row, chrono::Utc::now().naive_utc()) {
+                            tracing::error!(host = %shop, error = %e, "a late delivery read could not be noted");
+                        }
+                    });
+                }
             }
         }
         looked.by_host.extend(done);
@@ -1050,26 +1129,36 @@ impl DeliveryDesk {
 
     /// Reads one shop, writes down what came of it, and says so: to the
     /// log, the trace and `/metrics`. The page's text goes to none of them.
-    async fn read(&self, host: &str, offer: &Url, country: &'static Country) -> Kept {
+    async fn read(&self, host: &str, offer: &Url, country: &'static Country, at_the_model: &AtomicBool) -> Kept {
         let started = std::time::Instant::now();
-        let reading = read_shop(Reach::Guarded(&self.web), &self.side, self.metrics, self.shops.links(host), host, offer, country).await;
+        let reader = Reader { reach: Reach::Guarded(&self.web), side: &self.side, metrics: self.metrics };
+        let reading = reader.read(self.shops.links(host), host, offer, country, at_the_model).await;
         let kept = Kept { terms: reading.terms, source_url: reading.page };
         let (status, source) = (kept.terms.status(), kept.source_url.as_deref().unwrap_or_default());
-        let ms = started.elapsed().as_millis() as u64;
+        let (ms, cut) = (started.elapsed().as_millis() as u64, reading.cut);
         let mut line = format!("delivery terms read: {host} {status}");
         if !source.is_empty() {
             line.push_str(&format!(" ({source})"));
         }
         match &reading.detail {
             Some(why) => {
-                tracing::warn!(host, status, source, ms, why = %why, "delivery terms read");
+                tracing::warn!(host, status, source, ms, cut, why = %why, "delivery terms read");
                 line.push_str(&format!(": {why}"));
             }
-            None => tracing::info!(host, status, source, ms, "delivery terms read"),
+            None => tracing::info!(host, status, source, ms, cut, "delivery terms read"),
         }
         self.observer.event(&line, reading.detail.is_some());
         self.metrics.delivery_terms(status);
-        let (store, shop, row) = (self.store.clone(), host.to_string(), kept.row(reading.detail));
+        if reading.model_failed {
+            // A provider's bad hour is not the shop's. Nothing is written
+            // of the shop, and the next request reads it again.
+            return kept;
+        }
+        // Why not, and whether the text was cut at the cap: kept together,
+        // the rows say how often a cut costs an answer.
+        let noted: Vec<&str> = reading.detail.as_deref().into_iter().chain(cut.then_some("text cut")).collect();
+        let detail = (!noted.is_empty()).then(|| noted.join("; "));
+        let (store, shop, row) = (self.store.clone(), host.to_string(), kept.row(detail));
         let written = crate::core::blocking(move || store.keep_shop_delivery(&shop, country.code, &row, chrono::Utc::now().naive_utc())).await;
         if let Err(e) = written {
             // Still used for this comparison; only the next request pays.
@@ -1943,9 +2032,11 @@ mod desk_tests {
     }
 
     #[tokio::test]
-    async fn a_model_that_does_not_answer_is_kept_as_unread() {
+    async fn a_model_that_does_not_answer_is_nothing_written_of_the_shop() {
         // It fails outright; it answers in words; it answers with an
-        // amount that is not a number.
+        // amount that is not a number. None of it is the shop's doing: a
+        // provider's bad hour kept as the shop's would leave every shop
+        // of that hour unasked for two days.
         for (status, said, why) in [
             (500, "", "model: no answer"),
             (200, "The delivery costs are € 5,49, free from € 40.", "model: not the JSON asked for"),
@@ -1963,9 +2054,104 @@ mod desk_tests {
             let looked = w.desk().terms_for(&[w.url(PRODUCT)]).await;
 
             assert_eq!(looked.by_host[SHOP], Kept { terms: Terms::Unread, source_url: Some(page.clone()) }, "{why}");
-            assert_eq!(w.rows(), vec![(SHOP.to_string(), "unread".to_string(), Some(page), Some(why.to_string()))]);
+            assert!(w.rows().is_empty(), "{why}: {:?}", w.rows());
             assert!(w.counted("unread"), "{why}");
+            // The trace says what failed all the same.
+            let rows = w.observer.take_rows();
+            assert_eq!(rows[0].detail.clone().unwrap(), format!("delivery terms read: 127.0.0.1 unread ({page}): {why}"));
+            // And the next request reads the shop again.
+            let before = w.asked().await.0.len();
+            w.desk().terms_for(&[w.url(PRODUCT)]).await;
+            assert_eq!(w.asked().await.0.len(), before + 2, "{why}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_text_cut_at_the_cap_is_said_in_the_row() {
+        // How often the cut costs an answer is a count nobody has yet, so
+        // each reading says whether its text was cut: beside why not,
+        // where there is one, and alone where the terms were kept.
+        let long = delivery_page().replace("</main>", &format!("<p>{}</p></main>", "Onze widgets zijn er in vier kleuren. ".repeat(400)));
+        for (said, status, detail) in [
+            (READ_RIGHT, "terms", "text cut"),
+            (r#"{"delivers": true, "by": "order_value", "bands": [{"from": 0, "cost": 4.95}], "currency": "EUR"}"#, "silent", "amount not on the page; text cut"),
+        ] {
+            let w = World::new().await;
+            w.serve(PRODUCT, 200, &product_page(Some(DELIVERY))).await;
+            w.serve(DELIVERY, 200, &long).await;
+            w.model_says(said).await;
+
+            w.desk().terms_for(&[w.url(PRODUCT)]).await;
+
+            assert_eq!(w.rows(), vec![(SHOP.to_string(), status.to_string(), Some(w.url(DELIVERY).to_string()), Some(detail.to_string()))]);
+        }
+        // A page read whole says nothing of it.
+        let w = World::with_a_shop_that_reads_well().await;
+        w.desk().terms_for(&[w.url(PRODUCT)]).await;
+        assert_eq!(w.rows()[0].3, None);
+    }
+
+    #[tokio::test]
+    async fn a_relative_link_is_resolved_against_the_address_that_answered() {
+        // The offer's address has moved, on the same shop, and the page it
+        // leads to links its delivery page beside itself.
+        let w = World::new().await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path("/p/old"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/winkel/widget-500"))
+            .mount(&w.shop)
+            .await;
+        w.serve("/winkel/widget-500", 200, &product_page(Some("verzendkosten"))).await;
+        w.serve("/winkel/verzendkosten", 200, &delivery_page()).await;
+        w.model_says(READ_RIGHT).await;
+
+        let looked = w.desk().terms_for(&[w.url("/p/old")]).await;
+
+        let page = w.url("/winkel/verzendkosten").to_string();
+        assert_eq!(looked.by_host.get(SHOP), Some(&Kept { terms: read_right(), source_url: Some(page) }));
+    }
+
+    #[tokio::test]
+    async fn a_page_that_lands_on_another_host_is_not_this_shops() {
+        // The test guard lets one socket through, so this goes without the
+        // guard, as `measure` does: the shop is reached as `localhost`, and
+        // its addresses redirect to another site, at 127.0.0.1.
+        let elsewhere = wiremock::MockServer::start().await;
+        for (at, body) in [("/p", product_page(Some(DELIVERY))), (DELIVERY, delivery_page())] {
+            Mock::given(method("GET"))
+                .and(wiremock::matchers::path(at))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&elsewhere)
+                .await;
+        }
+        let shop = wiremock::MockServer::start().await;
+        for (at, to) in [(PRODUCT, "/p"), ("/bezorgen", DELIVERY)] {
+            Mock::given(method("GET"))
+                .and(wiremock::matchers::path(at))
+                .respond_with(ResponseTemplate::new(302).insert_header("Location", format!("{}{to}", elsewhere.uri())))
+                .mount(&shop)
+                .await;
+        }
+        let w = World::new().await;
+        w.model_says(READ_RIGHT).await;
+        let side = SideModel { llm: crate::agent::llm_client("sk", &w.model.uri()).unwrap(), name: "side-model".to_string() };
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let reader = Reader { reach: Reach::Unguarded(&http), side: &side, metrics: w.metrics };
+        let at_shop = |path: &str| format!("http://localhost:{}{path}", shop.address().port());
+        let offer = Url::parse(&at_shop(PRODUCT)).unwrap();
+        let nl = country("NL").unwrap();
+
+        // The offer's own address: its links are another site's.
+        let reading = reader.read(None, "localhost", &offer, nl, &AtomicBool::new(false)).await;
+        assert_eq!((&reading.terms, reading.detail.as_deref()), (&Terms::Unread, Some("redirected off the shop")));
+        assert!(reading.links.is_empty() && reading.page.is_none());
+        // The delivery page's address: another site's terms are not this
+        // shop's, however well they read.
+        let reading = reader.read(Some(vec![at_shop("/bezorgen")]), "localhost", &offer, nl, &AtomicBool::new(false)).await;
+        assert_eq!((&reading.terms, reading.detail.as_deref()), (&Terms::Unread, Some("redirected off the shop")));
+        assert!(reading.text.is_none());
+        assert!(w.model.received_requests().await.unwrap().is_empty(), "and nothing of it is put to the model");
+        assert_eq!(elsewhere.received_requests().await.unwrap().len(), 2, "each redirect was followed, and then refused");
     }
 
     #[tokio::test]
@@ -2061,6 +2247,11 @@ mod desk_tests {
         assert!(w.rows().is_empty());
         assert!(w.events.try_recv().is_err(), "and nothing is said of it");
         assert!(w.observer.take_rows().is_empty());
+        // It is counted, once a comparison that had something to ask: a
+        // desk nobody needed and a desk a missing fact switches off must
+        // not look alike on the metrics page.
+        desk.terms_for(&[]).await;
+        assert!(w.counted("no_country"), "{}", w.metrics.render());
     }
 
     #[tokio::test]
@@ -2081,8 +2272,55 @@ mod desk_tests {
         assert!(started.elapsed() < Duration::from_secs(3), "the lookup took {:?}", started.elapsed());
         assert_eq!(looked.by_host.keys().collect::<Vec<_>>(), ["127.0.0.2"], "what finished is used");
         assert!(looked.not_looked_up.is_empty(), "the slow shop was not past the allowance; it was late");
-        assert_eq!(w.rows().iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["127.0.0.2"], "and nothing is written of the one that did not");
         assert!(w.counted("late"), "{}", w.metrics.render());
+        // The shop that kept the lookup waiting is remembered as a failed
+        // read. Written after the comparison has its answer, so it is
+        // waited for here.
+        let late = (SHOP.to_string(), "unread".to_string(), None, Some("late".to_string()));
+        for _ in 0..100 {
+            if w.rows().contains(&late) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(w.rows().contains(&late), "{:?}", w.rows());
+        // So the next comparison does not wait for it again: it would, for
+        // the five seconds the shop takes.
+        let asked = w.asked().await.0.len();
+        let started = std::time::Instant::now();
+        let again = w.desk().terms_for(&[w.url(PRODUCT)]).await;
+        assert_eq!(again.by_host[SHOP].terms, Terms::Unread);
+        assert_eq!(w.asked().await.0.len(), asked, "the shop was not asked again");
+        assert!(started.elapsed() < Duration::from_secs(3), "it took {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_read_that_is_late_at_the_model_is_nothing_written_of_the_shop() {
+        // The shop's pages came at once; the model takes longer than the
+        // lookup may. That lateness is the provider's, and is not kept as
+        // the shop's any more than a failed answer is.
+        let w = World::new().await;
+        w.serve(PRODUCT, 200, &product_page(Some(DELIVERY))).await;
+        w.serve(DELIVERY, 200, &delivery_page()).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)).set_body_json(serde_json::json!({
+                "id": "d1", "model": "m",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": READ_RIGHT}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 700, "completion_tokens": 40, "total_tokens": 740},
+            })))
+            .mount(&w.model)
+            .await;
+        let mut desk = w.desk();
+        desk.budget = Duration::from_millis(500);
+
+        let looked = desk.terms_for(&[w.url(PRODUCT)]).await;
+
+        assert!(looked.by_host.is_empty(), "{looked:?}");
+        assert!(w.counted("late"), "{}", w.metrics.render());
+        assert_eq!(w.asked().await, (vec![PRODUCT.to_string(), DELIVERY.to_string()], 1), "the model was being asked");
+        // Long enough for a row to have been written, had one been.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(w.rows().is_empty(), "{:?}", w.rows());
     }
 
     #[tokio::test]
@@ -2128,14 +2366,17 @@ mod desk_tests {
 
         assert!(observer.pulse.since() < Duration::from_secs(10), "the pulse is {:?} old", observer.pulse.since());
 
-        // Terms out of the table are no work, and touch nothing.
+        // And on the way in, before the table is asked: the store's lock
+        // may be held, and a lookup answered from the table is alive too.
         let (sink, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut observer = crate::observer::Observer::new(sink, 8);
         observer.pulse = crate::run::Pulse::aged(Duration::from_secs(80));
         let observer = Arc::new(observer);
         let desk = DeliveryDesk::new(&w.core.deps, observer.clone(), Arc::new(ShopPages::default()), country("NL"), Vec::new());
-        desk.terms_for(&[w.url(PRODUCT)]).await;
-        assert!(observer.pulse.since() >= Duration::from_secs(80));
+        let kept = desk.terms_for(&[w.url(PRODUCT)]).await;
+        assert_eq!(kept.by_host[SHOP].terms, read_right());
+        assert_eq!(w.asked().await.0.len(), 2, "answered from the table");
+        assert!(observer.pulse.since() < Duration::from_secs(10), "the pulse is {:?} old", observer.pulse.since());
     }
 
     #[tokio::test]
@@ -2151,7 +2392,7 @@ mod desk_tests {
                 said.push(text);
             }
         }
-        assert_eq!(said, ["🚚 reading delivery terms at 1 shop"]);
+        assert_eq!(said, ["🚚 checking delivery terms at 1 shop"]);
         // The trace has a row for the shop, worded as the log line, with
         // the status and the page and nothing the page said.
         let rows = w.observer.take_rows();
@@ -2166,6 +2407,14 @@ mod desk_tests {
         let page = w.metrics.render();
         assert!(page.contains("scout_side_calls_total{call=\"delivery\",model=\"side-model\",outcome=\"ok\"} 1\n"), "{page}");
         assert!(page.contains("scout_side_call_tokens_total{call=\"delivery\",model=\"side-model\",kind=\"input\"} 700\n"), "{page}");
+
+        // The next request is told the same, though the table answers it:
+        // the line must not say whether somebody looked at that shop
+        // lately. Nothing more goes to the trace, since nothing was read.
+        w.desk().terms_for(&[w.url(PRODUCT)]).await;
+        assert!(matches!(w.events.try_recv(), Ok(AgentEvent::Tool(text)) if text == "🚚 checking delivery terms at 1 shop"));
+        assert!(w.observer.take_rows().is_empty());
+        assert_eq!(w.asked().await.0.len(), 2, "answered from the table");
 
         // A reading that is refused says which check, as an error row.
         let w = World::new().await;

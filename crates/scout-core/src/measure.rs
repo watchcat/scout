@@ -51,7 +51,8 @@ pub fn page_as_read(html: &str, url: &str, status: Option<u16>) -> anyhow::Resul
 ///
 /// - `links`: the shop's pages about delivery among the links of `page`,
 ///   best first, and `page`: the one that was asked for;
-/// - `text`: what the model was handed of it, and `text_chars`;
+/// - `text`: what the model was handed of it, `text_chars`, and
+///   `text_cut`: whether the cap cut it;
 /// - `answer`: what the model said, as it said it;
 /// - `kept`: what Rust made of that — a status, and the bands and currency
 ///   when it is terms;
@@ -76,7 +77,8 @@ pub async fn delivery_as_read(page: &str, country: &str, side: &crate::config::S
     // read back below.
     let counts = crate::metrics::Metrics::default();
     let started = std::time::Instant::now();
-    let reading = delivery::read_shop(delivery::Reach::Unguarded(&http), &model, &counts, None, &host, &offer, country).await;
+    let reader = delivery::Reader { reach: delivery::Reach::Unguarded(&http), side: &model, metrics: &counts };
+    let reading = reader.read(None, &host, &offer, country, &std::sync::atomic::AtomicBool::new(false)).await;
     let kept = match &reading.terms {
         delivery::Terms::Costs { bands, currency } => {
             serde_json::json!({"status": "terms", "bands": bands.pairs(), "currency": currency})
@@ -90,6 +92,7 @@ pub async fn delivery_as_read(page: &str, country: &str, side: &crate::config::S
         "links": reading.links,
         "page": reading.page,
         "text_chars": reading.text.as_ref().map(|text| text.chars().count()),
+        "text_cut": reading.cut,
         "text": reading.text,
         "answer": reading.answer,
         "kept": kept,
@@ -201,6 +204,7 @@ mod tests {
         assert_eq!(read["page"], page.as_str());
         assert!(read["text"].as_str().unwrap().contains("De verzendkosten zijn € 5,49"), "{read}");
         assert_eq!(read["text_chars"], read["text"].as_str().unwrap().chars().count());
+        assert_eq!(read["text_cut"], false, "and whether the cap cut it");
         // What the model answered, and what Rust kept of it.
         assert_eq!(read["answer"], READ_RIGHT);
         assert_eq!(read["kept"], serde_json::json!({"status": "terms", "bands": [[0.0, 5.49], [40.0, 0.0]], "currency": "EUR"}));

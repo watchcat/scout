@@ -8,14 +8,16 @@
 //! - it refused a link that left the shop but followed a redirect or a
 //!   script and then undid it. Here every request for the main frame's
 //!   document is held before it is sent, each hop of a redirect included,
-//!   and one to a refused address is never sent;
+//!   and one to a refused address is never sent. A page fetched or made
+//!   ready ahead of time is not such a request and would be held by
+//!   nothing, so Chrome is told to fetch nothing ahead (`chrome.rs`);
 //! - it did not see a new tab. Here another window is closed before it has
 //!   fetched anything;
 //! - a press landed on whatever lay over the thing pressed. Here a press is
 //!   only made where the thing itself is.
 
 use crate::address::{address_refused, link_refused, Refused};
-use crate::chrome::chrome_args;
+use crate::chrome::{chrome_args, write_preferences};
 use crate::drive::{Action, Broken, Browser, Done, Page, Seen, OUTLINE_CHARS};
 use crate::pipe::{CallError, Event, Pipe};
 use crate::site::Shop;
@@ -102,6 +104,7 @@ impl Browser for Chrome {
         let failed = |e: std::io::Error| Broken::Failed(e.to_string());
         let (port, proxy) = serve_socks(Guard::PUBLIC_ONLY).await.map_err(failed)?;
         let profile = tempfile::Builder::new().prefix("scout-session-").tempdir().map_err(failed)?;
+        write_preferences(profile.path()).map_err(failed)?;
         let (pipe, said) = Pipe::start(&self.path, &chrome_args(profile.path(), port, self.reaching)).map_err(failed)?;
         let pipe = Arc::new(pipe);
         let (session, frame, target) = match find_page(&pipe).await {
@@ -1197,6 +1200,69 @@ mod tests {
         assert!(!done.seen.text.contains("secret_total"), "{}", done.seen.text);
         assert_eq!(neighbour.asked(), NOTHING, "neither the link, the picture nor the script reached it");
         tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_page_cannot_send_a_datagram_past_the_guard() {
+        let _one_of_few = testing::gate().await;
+        // The guard's proxy carries TCP. A page that asks the browser for a
+        // peer connection asks it to send UDP, which no such proxy carries.
+        let listening = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listening.local_addr().unwrap().port();
+        let pages = Pages::serve(&[home(&format!(
+            r#"<p id="ice">gathering</p>
+               <script>
+                 (async () => {{
+                   const said = document.getElementById('ice')
+                   const peer = new RTCPeerConnection({{ iceServers: [{{ urls: 'stun:127.0.0.1:{port}' }}] }})
+                   peer.createDataChannel('x')
+                   peer.onicecandidate = (e) => {{ said.textContent += e.candidate ? ' candidate' : ' done' }}
+                   await peer.setLocalDescription(await peer.createOffer())
+                 }})()
+               </script>"#
+        ))])
+        .await;
+        let Some((mut tab, mut done)) = open(&pages, "/").await else { return };
+        let mut datagram = [0u8; 1500];
+        let mut arrived = None;
+        for _ in 0..150 {
+            arrived = tokio::time::timeout(Duration::from_millis(100), listening.recv_from(&mut datagram)).await.ok();
+            if arrived.is_some() || done.seen.text.contains(" done") {
+                break;
+            }
+            done = tab.act(&Action::Read { more: false }).await.unwrap();
+        }
+        assert!(arrived.is_none(), "a datagram reached 127.0.0.1:{port}, past the proxy: {arrived:?}");
+        // The page is told there is no way out, at once and without a candidate.
+        assert!(done.seen.text.contains("gathering done"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn nothing_is_fetched_ahead_of_a_press() {
+        let _one_of_few = testing::gate().await;
+        // A page may tell the browser which addresses to fetch, or to make
+        // ready whole, before anyone goes there. Those requests are not the
+        // main frame's, so nothing that judges the main frame's sees them.
+        for kind in ["prerender", "prefetch"] {
+            let pages = Pages::serve(&[
+                home(&format!(
+                    r#"<a href="/next">the next page</a> <a href="/checkout">Afrekenen</a>
+                       <script type="speculationrules">{{"{kind}": [{{"source": "list", "urls": ["/next", "/checkout"]}}]}}</script>"#
+                )),
+                page("/next", "Next"),
+                page("/checkout", "Checkout"),
+            ])
+            .await;
+            let Some((mut tab, _)) = open(&pages, "/").await else { return };
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let read = tab.act(&Action::Read { more: false }).await.unwrap();
+            assert_eq!((read.refused, pages.asked()), (NOTHING, vec!["GET /".to_string()]), "{kind}");
+            // What is pressed is fetched then, and not before.
+            assert_eq!(press(&mut tab, 1).await.seen.title, "Next", "{kind}");
+            assert_eq!(pages.asked(), ["GET /", "GET /next"], "{kind}");
+            tab.close().await;
+        }
     }
 
     // ------------------------------------------------------------ typing

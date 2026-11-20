@@ -2,12 +2,43 @@
 //!
 //! One Chrome a session, with a profile of its own that goes when the
 //! session does, as each render has in `scout-core`'s `tools/browser.rs`.
-//! Every connection it makes goes through `scout_core::net_guard`'s proxy,
-//! so a redirect, a script or a name that resolves inwards meets the fence
-//! the render meets.
+//!
+//! Every TCP connection it makes goes through `scout_core::net_guard`'s
+//! proxy, so a redirect, a script or a name that resolves inwards meets
+//! the fence the render meets. The proxy carries nothing but TCP, and a
+//! page can ask a browser for more than that; what stops the rest is in
+//! [`PREFERENCES`].
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+
+/// What a session's Chrome is told through its profile before it starts,
+/// there being no flag and no call of the protocol that was found to do it.
+///
+/// - `webrtc.ip_handling_policy`: a page's peer connection sends UDP, which
+///   a SOCKS proxy for TCP never sees. Without this a page that named a
+///   STUN server on loopback had a 20-byte datagram delivered there, past
+///   the guard (this crate's test, 2026-11-20, Chrome 157). With it no
+///   datagram leaves and no candidate is gathered. The review that found
+///   the hole measured the flag
+///   `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` to change
+///   nothing.
+/// - `net.network_prediction_options` 2, which is "never": a page's
+///   speculation rules had Chrome fetch the addresses they listed, a
+///   checkout among them, as requests that are not the main frame's and so
+///   were judged by nothing; and going there afterwards took the page made
+///   ready beforehand (the same test run). With it the addresses are
+///   fetched when they are gone to and not before. The review measured
+///   `Page.setPrerenderingAllowed(false)` not to stop it.
+pub(crate) const PREFERENCES: &str =
+    r#"{"webrtc":{"ip_handling_policy":"disable_non_proxied_udp"},"net":{"network_prediction_options":2}}"#;
+
+/// Writes [`PREFERENCES`] where a Chrome started on `profile` reads them.
+pub(crate) fn write_preferences(profile: &Path) -> std::io::Result<()> {
+    let default = profile.join("Default");
+    std::fs::create_dir_all(&default)?;
+    std::fs::write(default.join("Preferences"), PREFERENCES)
+}
 
 /// Where Chrome lives, if it does: `SCOUT_CHROME`, else the places a
 /// package puts it. The same search as `find_chrome` in `scout-core`'s
@@ -109,6 +140,17 @@ mod tests {
         assert!(args.contains(&"--headless=new".to_string()));
         // Nothing that hides what drives it.
         assert!(!args.iter().any(|arg| arg.contains("AutomationControlled") || arg.contains("enable-automation")));
+    }
+
+    #[test]
+    fn the_profile_tells_chrome_to_send_no_datagram_and_fetch_nothing_ahead() {
+        let profile = tempfile::tempdir().unwrap();
+        write_preferences(profile.path()).unwrap();
+        // Where Chrome reads them: in the profile it is started on, before it starts.
+        let written = std::fs::read_to_string(profile.path().join("Default").join("Preferences")).unwrap();
+        let read: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(read["webrtc"]["ip_handling_policy"], "disable_non_proxied_udp");
+        assert_eq!(read["net"]["network_prediction_options"], 2);
     }
 
     #[test]

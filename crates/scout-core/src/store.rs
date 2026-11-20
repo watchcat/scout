@@ -2517,6 +2517,22 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Notes that a watch is being checked now, before its page is asked
+    /// for. Returns whether the watch is still live to be checked.
+    ///
+    /// The time of the check is written first because the read may never
+    /// come back to write it: a page the parser panics on, or a process
+    /// that dies mid-read, would otherwise leave the watch first in line
+    /// for the next pass, and the next. Stamped, it has had its day.
+    pub fn mark_watch_checking(&self, id: i64, now: chrono::NaiveDateTime) -> Result<bool> {
+        let conn = self.conn();
+        let live = conn.execute(
+            "UPDATE price_watches SET last_checked_at = CAST(? AS TIMESTAMP) WHERE id = ? AND ended_at IS NULL",
+            params![stamp(now), id],
+        )?;
+        Ok(live > 0)
+    }
+
     /// Writes what a check came to, and where it ends the watch queues the
     /// one message that says so, in the same transaction: a watch that
     /// ended without its message would never be heard of, and a message
@@ -8883,6 +8899,31 @@ CREATE TABLE segment_candidates (
         assert!(s.record_watch_check(&read_at(&old, 310.0, now)).unwrap());
         let due: Vec<i64> = s.due_watches(now, ago(20)).unwrap().iter().map(|w| w.id).collect();
         assert_eq!(due, vec![on_the_hour.id, over.id]);
+    }
+
+    #[test]
+    fn a_watch_is_stamped_as_checked_before_its_page_is_read() {
+        // If the read never comes back, the process dying or the parser
+        // panicking on that page, the watch has had its turn all the
+        // same and is not first in line when the pass next runs.
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let ago = |hours: i64| now - chrono::Duration::hours(hours);
+        let first = started(&s, &new_watch(1, "https://shop.example/p/1", ago(30)));
+        let second = started(&s, &new_watch(1, "https://shop.example/p/2", ago(25)));
+        assert_eq!(s.due_watches(now, ago(20)).unwrap()[0].id, first.id);
+
+        assert!(s.mark_watch_checking(first.id, now).unwrap());
+        let due: Vec<i64> = s.due_watches(now, ago(20)).unwrap().iter().map(|w| w.id).collect();
+        assert_eq!(due, vec![second.id]);
+        // Only the time of the check moves: nothing was read yet.
+        let stamped = s.watch_for_tests(first.id).unwrap().unwrap();
+        assert_eq!(stamped, PriceWatch { last_checked_at: now, ..first.clone() });
+
+        // A watch that has ended is not stamped, and is not to be read.
+        s.stop_watch(1, second.id, ago(1)).unwrap();
+        assert!(!s.mark_watch_checking(second.id, now).unwrap());
+        assert_eq!(s.watch_for_tests(second.id).unwrap().unwrap().last_checked_at, ago(25));
     }
 
     #[test]

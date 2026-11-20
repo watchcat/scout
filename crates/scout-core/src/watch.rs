@@ -150,9 +150,10 @@ pub(crate) struct Priced {
 
 /// Something that reads a watched page. The daily pass is written against
 /// this and not against the network, so that its spacing and its endings
-/// can be tested on a clock the test holds.
+/// can be tested on a clock the test holds. The read can be sent to
+/// another thread, since the pass runs in a task of its own.
 pub(crate) trait Reader {
-    async fn read(&self, url: &str) -> Reading;
+    fn read(&self, url: &str) -> impl std::future::Future<Output = Reading> + Send;
 }
 
 /// The page read the way `fetch_page` reads one: the plain request, then
@@ -704,6 +705,13 @@ pub(crate) struct Pass {
 /// One watch's failure to be written is logged and the pass goes on; it is
 /// still due, and the next tick tries it again.
 ///
+/// And whatever a page does. A watch is stamped as checked before its page
+/// is asked for, so that a read which never comes back has still cost the
+/// watch its turn; and a read that panics, the parser on something a shop
+/// served, is caught here and counted as a request that came to nothing.
+/// Uncaught it would take the pass with it, and that page would be read
+/// first, and panic first, at every pass after.
+///
 /// Each check is counted on `metrics` by how it went, and each watch the
 /// pass ends by why.
 pub(crate) async fn check_due<R: Reader>(
@@ -731,7 +739,24 @@ pub(crate) async fn check_due<R: Reader>(
             tokio::time::sleep_until(*last + pace.spacing).await;
         }
         let id = watch.id;
-        let reading = read_within(reader, &watch.url, pace.read_budget).await;
+        let theirs = store.clone();
+        match blocking(move || theirs.mark_watch_checking(id, now)).await {
+            Ok(true) => {}
+            // Stopped since the pass listed it: the shop is not asked.
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!(watch = id, error = %e, "could not stamp a price watch as checked; left for the next tick");
+                continue;
+            }
+        }
+        let read = std::panic::AssertUnwindSafe(read_within(reader, &watch.url, pace.read_budget));
+        let reading = match futures::FutureExt::catch_unwind(read).await {
+            Ok(reading) => reading,
+            Err(_) => {
+                tracing::error!(watch = id, "reading a price watch's page panicked; counted as a request that failed");
+                Reading::Failed("reading it panicked".to_string())
+            }
+        };
         asked.insert(host, tokio::time::Instant::now());
 
         let verdict = decide(watch, &reading, now);
@@ -1788,6 +1813,92 @@ mod tests {
         // And the next tick takes up where this one stopped.
         let next = check_due(&store, counters(), &Slow, now + chrono::Duration::hours(1), &pace).await.unwrap();
         assert_eq!((next.due, next.checked, next.left), (2, 2, 0));
+    }
+
+    #[tokio::test]
+    async fn a_page_the_reader_panics_on_costs_that_watch_its_day_and_the_pass_goes_on() {
+        // The parser reads whatever a shop serves. A page it panics on
+        // must not end the pass, and must not be first in line again.
+        struct Poisoned;
+        impl Reader for Poisoned {
+            async fn read(&self, url: &str) -> Reading {
+                if url.contains("poison") {
+                    panic!("byte index 3 is not a char boundary");
+                }
+                price(310.0)
+            }
+        }
+        let (store, _dir) = a_store();
+        let now = clock();
+        let poisoned = watching_since(&store, "https://shop.example/p/poison", now - chrono::Duration::days(2)).await;
+        let fine = watching_since(&store, "https://other.example/p/1", now - chrono::Duration::days(1)).await;
+        let metrics = counters();
+
+        let pass = check_due(&store, metrics, &Poisoned, now, &UNSPACED).await.unwrap();
+
+        assert_eq!((pass.due, pass.checked, pass.ended), (2, 2, 0));
+        assert_eq!(watch(&store, fine.id).last_price, 310.0, "the watch after it was read");
+        // A read that panicked is a request that came to nothing: no
+        // price changed, no count of a page without one, and the week's
+        // clock running, which is what ends it if it never reads.
+        let after = watch(&store, poisoned.id);
+        assert_eq!((after.last_checked_at, after.last_price, after.unreadable_streak), (now, 329.0, 0));
+        assert_eq!((after.unreached_since, after.ended.clone()), (Some(now), None));
+        assert!(metrics.render().contains("scout_price_watch_checks_total{outcome=\"failed\"} 1\n"), "{}", metrics.render());
+
+        // The next tick does not start with it, or read it at all.
+        let next = check_due(&store, metrics, &Poisoned, now + chrono::Duration::hours(1), &UNSPACED).await.unwrap();
+        assert_eq!(next.due, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_whose_read_never_came_back_is_not_first_in_line_at_the_next_pass() {
+        // The process dies mid-read, or the task is dropped: nothing of
+        // the check is written after the read. The stamp before it is
+        // what keeps the same page from being the first one asked for at
+        // every start.
+        struct Never;
+        impl Reader for Never {
+            async fn read(&self, _url: &str) -> Reading {
+                std::future::pending().await
+            }
+        }
+        let (store, _dir) = a_store();
+        let now = clock();
+        let first = watching_since(&store, "https://shop.example/p/1", now - chrono::Duration::days(2)).await;
+        let second = watching_since(&store, "https://other.example/p/1", now - chrono::Duration::days(1)).await;
+        let forever = Pace { read_budget: Duration::from_secs(86_400), ..UNSPACED };
+
+        let cut = tokio::time::timeout(Duration::from_secs(1), check_due(&store, counters(), &Never, now, &forever)).await;
+        assert!(cut.is_err(), "the pass was dropped in the middle of its first read");
+
+        assert_eq!(watch(&store, first.id).last_checked_at, now);
+        assert_eq!(watch(&store, second.id).last_checked_at, second.last_checked_at, "not reached");
+        let due = store.due_watches(now + chrono::Duration::hours(1), now - chrono::Duration::hours(19)).unwrap();
+        assert_eq!(due.iter().map(|w| w.id).collect::<Vec<_>>(), vec![second.id]);
+    }
+
+    #[tokio::test]
+    async fn a_watch_stopped_before_its_turn_in_a_pass_is_not_read() {
+        // Listed as due when the pass began and stopped while it read the
+        // watches before: the shop is not asked about a watch that is over.
+        let (store, _dir) = a_store();
+        let now = clock();
+        let first = watching_since(&store, "https://shop.example/p/1", now - chrono::Duration::days(2)).await;
+        let second = watching_since(&store, "https://other.example/p/2", now - chrono::Duration::days(1)).await;
+        let (theirs, stopped) = (store.clone(), second.id);
+        let reader = Told::by(move |url: &str| {
+            if url.ends_with("/p/1") {
+                theirs.stop_watch(1, stopped, now).unwrap().expect("live until now");
+            }
+            price(310.0)
+        });
+
+        let pass = check_due(&store, counters(), &reader, now, &UNSPACED).await.unwrap();
+
+        assert_eq!((pass.due, pass.checked), (2, 1));
+        assert_eq!(reader.asked().len(), 1, "only the first: {:?}", reader.asked());
+        assert_eq!(watch(&store, first.id).last_price, 310.0);
     }
 
     #[tokio::test]

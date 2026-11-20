@@ -763,19 +763,35 @@ impl Core {
     }
 
     /// Reads again every price watch that is due and ends the ones that
-    /// are hit, unreadable three days running, or past their sixty days.
-    /// No model is asked anything: a check is a page read and a
-    /// comparison. The reader is made for the pass, so what it learns of a
-    /// host that refuses lasts the pass and no longer.
+    /// are done; see `watch::check_due` for what a pass does. No model is
+    /// asked anything: a check is a page read and a comparison. The reader
+    /// is made for the pass, so what it learns of a host that refuses
+    /// lasts the pass and no longer.
+    async fn check_watches(&self) -> anyhow::Result<crate::watch::Pass> {
+        let reader = crate::watch::PageReader::for_a_pass(self.deps.web.clone(), self.deps.renderer.clone());
+        self.check_watches_with(reader).await
+    }
+
+    /// The pass, with the reader handed in so a test can hand in its own.
+    ///
+    /// In a task of its own, awaited here. The pass reads pages nobody
+    /// here wrote, and a panic in it must come back as an error to log,
+    /// as a panic in the PDF parser does to the inbox worker: inline it
+    /// unwound through `run_maintenance` and ended backups and pruning
+    /// for the life of the process, with nothing said.
     ///
     /// A message queued is not a message sent: the channel's drain sleeps
     /// until it is told something waits, so it is woken here, as a nudge
     /// about a booking wakes it.
-    async fn check_watches(&self) -> anyhow::Result<crate::watch::Pass> {
-        let reader = crate::watch::PageReader::for_a_pass(self.deps.web.clone(), self.deps.renderer.clone());
+    async fn check_watches_with<R>(&self, reader: R) -> anyhow::Result<crate::watch::Pass>
+    where
+        R: crate::watch::Reader + Send + Sync + 'static,
+    {
+        let (store, metrics) = (self.store(), self.deps.metrics);
         let now = chrono::Utc::now().naive_utc();
-        let pass =
-            crate::watch::check_due(&self.deps.store, self.deps.metrics, &reader, now, &crate::watch::Pace::DAILY).await?;
+        let pass = tokio::spawn(async move { crate::watch::check_due(&store, metrics, &reader, now, &crate::watch::Pace::DAILY).await })
+            .await
+            .map_err(|e| anyhow::anyhow!("the price-watch pass did not finish: {e}"))??;
         if pass.ended > 0 {
             self.wake_mirror();
         }
@@ -1222,6 +1238,42 @@ mod tests {
         assert_eq!(next.due, 0);
         assert!(tokio::time::timeout(Duration::from_millis(50), core.mirror_waiting()).await.is_err());
         assert_eq!(shop.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_panics_is_an_error_to_log_and_not_the_end_of_maintenance() {
+        // The pass runs in a task of its own. Inline, a panic anywhere in
+        // it unwound through `run_maintenance` and ended that loop for
+        // good: no more backups, no more pruning, and no line in the log
+        // to say so. A reader that panics in a read is caught nearer; this
+        // one panics where nothing catches it, as its task is cleared up.
+        struct Booby;
+        impl crate::watch::Reader for Booby {
+            async fn read(&self, _url: &str) -> crate::watch::Reading {
+                crate::watch::Reading::Refused
+            }
+        }
+        impl Drop for Booby {
+            fn drop(&mut self) {
+                panic!("a panic in the pass, outside any read");
+            }
+        }
+        let shop = a_shop_pricing_its_widget_at("289.00").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (core, id) = a_core_watching(&dir, &shop, 21).await;
+
+        let err = core.check_watches_with(Booby).await.expect_err("the pass panicked");
+
+        assert!(err.to_string().contains("the price-watch pass did not finish"), "got: {err}");
+        // And this is still running, with a store that works: the watch
+        // had its check written before the panic.
+        let after = core.store().watch_for_tests(id).unwrap().unwrap();
+        assert!(after.unreached_since.is_some() && after.ended.is_none());
+        // The loop takes it for what it is: one job that failed.
+        let src = include_str!("core.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        assert!(src.contains(r#"Err(e) => tracing::warn!(error = %e, "could not check the price watches"),"#));
+        assert!(src.contains("tokio::spawn(async move { crate::watch::check_due("), "the pass must run in a task of its own");
     }
 
     #[tokio::test]

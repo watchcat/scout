@@ -7,6 +7,10 @@
 //! (`docs/2026-11-18-shop-reach.md`), so what is left after the refusals is
 //! those and a house number, which a Dutch shop asks for beside the
 //! postcode.
+//!
+//! Two things are judged: the field, by what its page says of it, and the
+//! text, by its shape. The first is a list of words and is no better than
+//! the list; the second does not depend on what a page calls anything.
 
 /// The most a session types into one field. The spec's number: a search
 /// term, a quantity and a postcode are all far shorter.
@@ -48,11 +52,17 @@ const PERSONAL_WORDS: &[&str] = &[
     "bsn", "cvv", "cvc", "prüfziffer", "sicherheitscode", "wachtwoord", "password", "passwort",
     "kennwort", "geboorte", "geboren", "geburt", "birth", "login", "benutzer", "user", "kunden",
     "klant", "customer", "firma", "company", "bedrijf",
+    // What the review of e4dd2f0 found typed into: more words for a
+    // password and a code, the middle of a Dutch name and its initials, a
+    // card's expiry, and the German for an address.
+    "passwd", "passcode", "toegangscode", "beveiligingscode", "veiligheidscode", "verificatiecode",
+    "tussenvoegsel", "voorletter", "initialen", "vervaldatum", "anschrift",
 ];
 
 /// The same, for words short enough to sit inside others: these count only
-/// standing alone, so a `sort` field is not an `ort`.
-const PERSONAL_ALONE: &[&str] = &["tel", "ort", "pin", "dob"];
+/// standing alone, so a `sort` field is not an `ort` and `passend` is not
+/// a `pass`.
+const PERSONAL_ALONE: &[&str] = &["tel", "ort", "pin", "dob", "pwd", "pass"];
 
 /// A place, which a field that also says postcode is forgiven: where a
 /// delivery checker takes a postcode it often offers a place as well.
@@ -102,6 +112,49 @@ fn says_postcode(said: &str) -> bool {
         || said.match_indices("zip").any(|(at, _)| !said[..at].chars().next_back().is_some_and(char::is_alphanumeric))
 }
 
+/// Whether a word of `text` has the shape of an email address: something,
+/// an @, and a name with a dot in it.
+fn is_email_address(text: &str) -> bool {
+    text.split_whitespace().any(|word| match word.split_once('@') {
+        Some((who, host)) => !who.is_empty() && host.split_once('.').is_some_and(|(name, rest)| !name.is_empty() && !rest.is_empty()),
+        None => false,
+    })
+}
+
+/// Whether `text` holds a payment card's number: 13 to 19 digits, written
+/// together or in groups with spaces or dashes between, whose last digit
+/// fits the rest by the check every such number is made to pass.
+///
+/// A postcode, a quantity and a house number are far too short. A barcode
+/// is 13 digits with a check of another kind, so one in ten fits this one
+/// by chance and cannot be typed as a search term; the other nine can.
+fn holds_card_number(text: &str) -> bool {
+    let fits = |digits: &str| (13..=19).contains(&digits.len()) && passes_luhn(digits);
+    text.split(|c: char| !(c.is_ascii_digit() || c == ' ' || c == '-')).any(|run| {
+        let groups: Vec<&str> = run.split([' ', '-']).filter(|group| !group.is_empty()).collect();
+        fits(&groups.concat()) || groups.iter().any(|group| fits(group))
+    })
+}
+
+/// The Luhn check: from the right, every second digit doubled, and the sum
+/// of all their digits a multiple of ten.
+fn passes_luhn(digits: &str) -> bool {
+    let sum: u32 = digits
+        .bytes()
+        .rev()
+        .enumerate()
+        .map(|(place, digit)| {
+            let digit = u32::from(digit - b'0');
+            match (place % 2, digit * 2) {
+                (0, _) => digit,
+                (_, doubled) if doubled > 9 => doubled - 9,
+                (_, doubled) => doubled,
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
+}
+
 /// Why `text` may not be typed into `field`, or `None` when it may.
 ///
 /// Anything a page marks as personal is refused before anything is
@@ -110,6 +163,17 @@ fn says_postcode(said: &str) -> bool {
 pub fn typing_refused(field: &Field, text: &str) -> Option<&'static str> {
     if text.chars().count() > MAX_TYPED {
         return Some(TOO_LONG);
+    }
+    // What is typed is read as well as where. A field tells what it is for
+    // only as truly as its page does, and a page that calls a field
+    // "search" and asks for something else is not told apart by the field.
+    // A session holds a brief and nothing more, so text in either of these
+    // shapes has no business in one, whatever the field.
+    if is_email_address(text) {
+        return Some("that is an email address, and a session types none");
+    }
+    if holds_card_number(text) {
+        return Some("that is the number of a payment card, and a session types none");
     }
     let lower = |s: &Option<String>| s.as_deref().unwrap_or_default().trim().to_lowercase();
     let kind = match lower(&field.kind) {
@@ -140,13 +204,11 @@ pub fn typing_refused(field: &Field, text: &str) -> Option<&'static str> {
     }) {
         return Some(PERSONAL);
     }
-    // A search box is one whatever it suggests looking for.
-    if kind == "search" {
-        return None;
-    }
-    let said = [&field.name, &field.id, &field.placeholder, &field.label, &field.title]
-        .map(lower)
-        .join(" ");
+    // A search box is one whatever it suggests looking for: the grey text
+    // in it ("zoek op productnaam") is a suggestion and is not read. What
+    // it is called is read like any field's.
+    let suggested = if kind == "search" { String::new() } else { lower(&field.placeholder) };
+    let said = [lower(&field.name), lower(&field.id), suggested, lower(&field.label), lower(&field.title)].join(" ");
     let postcode = says_postcode(&said);
     let personal = PERSONAL_WORDS.iter().filter(|word| said.contains(**word)).copied()
         .chain(PERSONAL_ALONE.iter().filter(|word| says_alone(&said, word)).copied())
@@ -305,6 +367,82 @@ mod tests {
         no(autocompleting("search", "email"));
         // The same suggestion on a plain text field is read as the field's subject.
         no(placeheld("text", "Zoek op productnaam"));
+    }
+
+    #[test]
+    fn what_a_search_box_is_called_is_judged_like_any_fields_name() {
+        // What it suggests looking for is the grey text in it. What it is
+        // called, by its label or its name, says what it is: a field of the
+        // kind "search" called Wachtwoord was typed into.
+        no(labelled("search", "Wachtwoord"));
+        no(Field { name: Some("email".into()), ..labelled("search", "E-mailadres") });
+        no(named("search", "customer_name"));
+        no(Field { title: Some("Uw telefoonnummer".into()), ..input("search") });
+        ok(Field { name: Some("q".into()), ..labelled("search", "Zoeken") }, "kattenvoer");
+        ok(Field { placeholder: Some("Zoek op productnaam".into()), ..labelled("search", "Zoeken") }, "kattenvoer");
+    }
+
+    #[test]
+    fn the_words_for_a_persons_own_that_the_first_list_let_through() {
+        // The review of e4dd2f0 tried these by hand; each was typed into.
+        for name in ["pwd", "passwd", "pass", "user_pass", "pass-1"] {
+            no(named("text", name));
+        }
+        for label in [
+            "Passcode", "Toegangscode", "Tussenvoegsel", "Voorletters", "Initialen", "Beveiligingscode", "Veiligheidscode", "Vervaldatum",
+            "Verificatiecode", "Anschrift",
+        ] {
+            no(labelled("text", label));
+        }
+        // A word that only has the letters in it is not one of them.
+        for label in ["Passend bij", "Kompass", "Reisepasshülle zoeken"] {
+            ok(labelled("text", label), "widget");
+        }
+    }
+
+    #[test]
+    fn what_is_typed_is_read_too_and_an_email_address_or_a_card_number_goes_nowhere() {
+        // Whatever the field: a session holds a brief and nothing else, and
+        // neither of these has any business in one.
+        let search = Field { name: Some("q".into()), ..placeheld("search", "Zoeken") };
+        let postcode = named("text", "postcode");
+        for text in [
+            "x@y.example",
+            "zoek x@y.example op",
+            "X@Y.EXAMPLE",
+            // The test number every card processor publishes, three ways of writing it.
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "4111111111111111",
+            "kaart 5500 0000 0000 0004 graag",
+            // Fifteen digits and thirteen are card numbers too.
+            "378282246310005",
+            "1234567890128",
+        ] {
+            assert!(typing_refused(&search, text).is_some(), "{text}");
+            assert!(typing_refused(&postcode, text).is_some(), "{text}");
+        }
+        assert_eq!(typing_refused(&search, "x@y.example"), Some("that is an email address, and a session types none"));
+        assert_eq!(typing_refused(&search, "4111 1111 1111 1111"), Some("that is the number of a payment card, and a session types none"));
+    }
+
+    #[test]
+    fn a_search_term_a_quantity_and_a_postcode_are_none_of_those() {
+        let search = Field { name: Some("q".into()), ..placeheld("search", "Zoeken") };
+        for text in [
+            "kattenvoer", "kattenvoer 2 kg", "2", "12", "1011 PN", "1011PN 1", "widget @ home", "50% korting", "m@x", "a.b@c", "@widget",
+            // Sixteen digits that are no card's: the last one does not fit the rest.
+            "4111 1111 1111 1112",
+            // A long number that is too short or too long to be a card's, whatever its last digit.
+            "79927398713", "12345678901234567890",
+            // Thirteen digits, as on a barcode. One such number in ten fits
+            // the rule for a card by chance and is refused; this one does not.
+            "1234567890123",
+        ] {
+            assert_eq!(typing_refused(&search, text), None, "{text}");
+        }
+        assert_eq!(typing_refused(&named("text", "postcode"), "1011 PN"), None);
+        assert_eq!(typing_refused(&named("number", "quantity"), "2"), None);
     }
 
     #[test]

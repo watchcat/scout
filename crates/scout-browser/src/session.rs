@@ -5,7 +5,7 @@
 //! seconds from the call that opened the session, over at a refusal, and
 //! nothing done for a session that is over.
 
-use crate::address::{address_refused, Refused};
+use crate::address::{address_refused, asked_address, Refused};
 use crate::drive::{Action, Broken, Browser, Done, Page};
 use crate::limits::{Budget, Limits, Slot, Slots, Spent};
 use crate::site::Shop;
@@ -151,7 +151,7 @@ impl<B: Browser> Sessions<B> {
         let budget = Budget::starting(Instant::now(), &self.limits);
         let deadline = budget.deadline();
         let refused = |why: Refused| Failure::Refused(why.why().to_string());
-        let url = Url::parse(address.trim()).map_err(|_| refused(Refused::NotWeb))?;
+        let url = asked_address(address).map_err(refused)?;
         let shop = Shop::of(&url).ok_or_else(|| refused(Refused::NotWeb))?;
         if let Some(why) = address_refused(&shop, &url) {
             return Err(refused(why));
@@ -303,6 +303,9 @@ mod tests {
         ] {
             assert_eq!(sessions.open(address).await.err(), Some(Failure::Refused(why.why().to_string())), "{address}");
         }
+        // An address is not where a page of text goes.
+        let long = format!("{WIDGET}?q={}", "x".repeat(crate::drive::ADDRESS_CHARS));
+        assert_eq!(sessions.open(&long).await.err(), Some(Failure::Refused(Refused::TooLong.why().to_string())));
         assert_eq!((browser.opened.load(Ordering::SeqCst), sessions.free()), (0, MAX_SESSIONS));
     }
 

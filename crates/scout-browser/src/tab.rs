@@ -20,7 +20,7 @@
 //!   asking in between, so that much is only known afterwards: a press
 //!   found to have landed elsewhere ends the session.
 
-use crate::address::{address_refused, link_refused, Refused};
+use crate::address::{address_refused, asked_address, link_refused};
 use crate::chrome::{chrome_args, write_preferences};
 use crate::drive::{Action, Broken, Browser, Done, Page, Seen, ADDRESS_CHARS, MARKUP_CHARS, OUTLINE_CHARS, OUTLINE_WHOLE, TITLE_CHARS};
 use crate::pipe::{CallError, Event, Pipe};
@@ -617,9 +617,12 @@ impl Tab {
 
     /// Opens another address of the shop in the session's page.
     async fn open(&mut self, address: &str, refused: &mut Vec<String>) -> Result<(), Broken> {
-        let Ok(url) = Url::parse(address.trim()) else {
-            refused.push(Refused::NotWeb.why().to_string());
-            return Ok(());
+        let url = match asked_address(address) {
+            Ok(url) => url,
+            Err(why) => {
+                refused.push(why.why().to_string());
+                return Ok(());
+            }
         };
         if let Some(why) = address_refused(&self.shop, &url) {
             refused.push(why.why().to_string());
@@ -1031,6 +1034,7 @@ mod tests {
 
     // ------------------------------------------------------------ a press
 
+    use crate::address::Refused;
     use crate::testing::{attachment, redirect, status};
 
     const NOTHING: Vec<String> = Vec::new();
@@ -1709,6 +1713,12 @@ mod tests {
         assert_eq!(type_into(&mut tab, 5, "x").await.refused, ["that field is for something personal"]);
         // And a thing that is no field at all.
         assert_eq!(type_into(&mut tab, 11, "x").await.refused, ["that is not a field that takes a line of text"]);
+        // Nor is the search box a way round it: what is typed is read too.
+        let done = type_into(&mut tab, 1, "x@y.example").await;
+        assert_eq!(done.refused, ["that is an email address, and a session types none"]);
+        let done = type_into(&mut tab, 1, "4111 1111 1111 1111").await;
+        assert_eq!(done.refused, ["that is the number of a payment card, and a session types none"]);
+        assert!(done.seen.text.contains("Typed into: nothing"), "{}", done.seen.text);
         tab.close().await;
     }
 
@@ -2017,6 +2027,8 @@ mod tests {
             (pages.url("/account/login"), Refused::SignIn.why()),
             ("file:///etc/passwd".to_string(), Refused::NotWeb.why()),
             ("not an address".to_string(), Refused::NotWeb.why()),
+            // The shop's own page, with more after the question mark than an address is for.
+            (format!("{}?q={}", pages.url("/"), "x".repeat(ADDRESS_CHARS)), Refused::TooLong.why()),
             // The shop's own page that sends on to another shop.
             (pages.url("/out"), Refused::LeavesShop.why()),
             // The same host by number on a port the guard does not let through.

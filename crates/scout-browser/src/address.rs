@@ -6,6 +6,7 @@
 //! main frame — a redirect's next hop included — and the address a page is
 //! found at after a press.
 
+use crate::drive::ADDRESS_CHARS;
 use crate::site::Shop;
 use url::Url;
 
@@ -20,6 +21,21 @@ pub enum Refused {
     Checkout,
     /// Where a person signs in or makes an account.
     SignIn,
+    /// Longer than a caller may ask a session to open.
+    TooLong,
+}
+
+/// The address a caller asks a session to open, as an address: on opening
+/// a session, and for `open` within one. Where a page goes by itself is
+/// not judged here but by [`address_refused`], at any length.
+pub fn asked_address(text: &str) -> Result<Url, Refused> {
+    let text = text.trim();
+    // What follows a `?` is free text. A session holds nothing but a
+    // brief, and an address is not where a page of it goes.
+    if text.chars().count() > ADDRESS_CHARS {
+        return Err(Refused::TooLong);
+    }
+    Url::parse(text).map_err(|_| Refused::NotWeb)
 }
 
 impl Refused {
@@ -31,6 +47,7 @@ impl Refused {
             Refused::LeavesShop => "that address leaves this shop, and a session stays on the one it was opened on",
             Refused::Checkout => "that address is a checkout, and a session goes no further than the basket",
             Refused::SignIn => "that address is for signing in, and a session never signs in",
+            Refused::TooLong => "that address is longer than the 2000 characters a session will open",
         }
     }
 }
@@ -62,21 +79,35 @@ pub fn address_refused(shop: &Shop, url: &Url) -> Option<Refused> {
         }
     }
     // A page that keeps its route after the hash is at that route; any
-    // other fragment is a place on the page.
-    let route = url.fragment().map(|f| f.trim_start_matches('!')).filter(|f| f.starts_with('/'));
-    let steps: Vec<Step> = url.path().split('/').chain(route.unwrap_or_default().split('/')).filter(|s| !s.is_empty()).map(Step::of).collect();
-    // The later step says what the page is: `/checkout/cart` is a basket
-    // and `/cart/checkout` is not.
-    let last = steps.iter().rev().find_map(|step| {
-        if step.says_checkout() {
-            Some(true)
+    // other fragment is a place on the page. A shop that keeps its route
+    // in the query has it under one of a few names; anything else in a
+    // query is what was searched for, or where a basket would go next, and
+    // not where the page is.
+    let fragment = url.fragment().map(|f| f.trim_start_matches('!')).filter(|f| f.starts_with('/')).unwrap_or_default().to_string();
+    let routes: Vec<String> = url.query_pairs().filter(|(name, _)| ROUTE_NAMES.contains(&name.to_lowercase().as_str())).map(|(_, route)| route.into_owned()).collect();
+    let steps: Vec<Step> = url
+        .path()
+        .split('/')
+        .map(percent_decoded)
+        .chain(routes.iter().flat_map(|route| route.split('/')).map(str::to_string))
+        .chain(fragment.split('/').map(percent_decoded))
+        .filter(|step| !step.is_empty())
+        .map(|step| Step::of(&step))
+        .collect();
+    // The later step says what the page is: `/checkout/cart` is a basket,
+    // and `/cart/checkout` and `/checkout/cart/payment` are not. A word for
+    // paying under a step that says the page is information is neither.
+    let mut is_checkout = false;
+    let mut is_information = false;
+    for step in &steps {
+        is_information |= step.says_information();
+        if step.says_checkout() || (step.says_paying() && !is_information) {
+            is_checkout = true;
         } else if step.says_basket() {
-            Some(false)
-        } else {
-            None
+            is_checkout = false;
         }
-    });
-    if last == Some(true) {
+    }
+    if is_checkout {
         return Some(Refused::Checkout);
     }
     if steps.iter().any(Step::says_sign_in) {
@@ -85,17 +116,28 @@ pub fn address_refused(shop: &Shop, url: &Url) -> Option<Refused> {
     None
 }
 
-// The lists below are a first guess, in Dutch, German and English, at what
-// shops call the two places. The one checkout that a session of the reading
+// The lists below are a guess, in Dutch, German and English, at what shops
+// call the two places: a first one, and then what the review of e4dd2f0
+// found it let through. The one checkout that a session of the reading
 // opened is not named in it, and no list of words is every shop's: what may
 // be typed is refused on a checkout page as on any other.
 
 /// A checkout wherever the word is written: `/onestepcheckout`,
 /// `checkout_shipping.php`.
 const CHECKOUT_WRITTEN: &[&str] = &["checkout", "afrekenen"];
-/// A checkout only as a whole step of the path, these being also words for
-/// a thing a shop sells or writes about: a toy till, a page on orders.
-const CHECKOUT_STEP: &[&str] = &["kasse", "kassa", "order", "bestelling", "bestellung"];
+/// A checkout only as a step of its own, these being also words for a
+/// thing a shop sells or says of all it sells: a toy till, a page on
+/// orders, "order it online".
+const CHECKOUT_STEP: &[&str] = &["kasse", "kassa", "order", "bestelling", "bestellung", "bestellen"];
+/// Paying, as a step of its own. Beside other words it is a page about
+/// paying, which may be the shop's page about delivery too
+/// (`/verzenden-en-betalen`), and that page a session is meant to read.
+const PAYING_STEP: &[&str] = &["betalen", "betaling", "bezahlen", "zahlung", "payment", "pay"];
+/// The little words a step of its own may begin with: `/zur-kasse`,
+/// `/naar-de-kassa`.
+const ON_THE_WAY_TO: &[&str] = &["zur", "zum", "zu", "naar", "de", "het", "to", "the", "go", "ga", "door", "verder", "weiter", "direct", "direkt", "jetzt", "nu"];
+/// A step that says what is under it is something to read.
+const INFORMATION: &[&str] = &["klantenservice", "kundenservice", "service", "help", "hulp", "hilfe", "info", "informatie", "information", "faq", "support"];
 /// The basket, which a session may look at for what delivery costs.
 const BASKET: &[&str] = &["cart", "basket", "winkelwagen", "winkelmand", "winkelmandje", "warenkorb"];
 /// Signing in, where a word starts or ends with it: `loginPost`,
@@ -103,27 +145,37 @@ const BASKET: &[&str] = &["cart", "basket", "winkelwagen", "winkelmand", "winkel
 const SIGN_IN_WRITTEN: &[&str] = &["login", "signin", "signup", "inloggen"];
 /// Signing in or making an account, as a whole step of the path.
 const SIGN_IN_STEP: &[&str] = &[
-    "logon", "anmelden", "aanmelden", "anmeldung", "register", "registreren", "registrieren",
-    "registratie", "registrierung", "registration", "auth", "oauth", "oauth2", "sso", "saml", "openid",
+    "logon", "anmelden", "aanmelden", "anmeldung", "register", "registreren", "registrieren", "registratie", "registrierung",
+    "registration", "auth", "oauth", "oauth2", "sso", "saml", "openid", "authenticate", "authentication", "authorize",
 ];
+/// A person's own corner of a shop, as a step of its own: behind a sign-in
+/// or the way to one, and nothing a session has business with.
+const ACCOUNT_STEP: &[&str] = &["account", "konto", "kundenkonto"];
+/// Whose it is said to be: `/mijn-account`, `/mein-konto`.
+const ONES_OWN: &[&str] = &["mijn", "my", "mein", "meine", "uw", "your"];
+/// A page about a password is a page for whoever has one.
+const PASSWORD: &[&str] = &["password", "wachtwoord", "passwort", "kennwort"];
+/// The names a shop keeps its route under when it keeps it in the query:
+/// `?route=checkout/checkout`, `?controller=order`.
+const ROUTE_NAMES: &[&str] = &["route", "controller", "action", "page", "view", "module", "cl", "rt", "dispatch"];
 
 /// One step of a path, or one label of a host, as its words.
 struct Step {
-    /// Lower case, without a file's extension.
-    whole: String,
-    /// The runs of letters and digits in it.
+    /// The runs of letters and digits in it, lower case, without a file's
+    /// extension.
     words: Vec<String>,
 }
 
 impl Step {
+    /// `raw` is as a person would read it: a letter written as its number
+    /// has been made the letter.
     fn of(raw: &str) -> Step {
-        let lower = percent_decoded(raw).to_lowercase();
-        let whole = match lower.rsplit_once('.') {
-            Some((name, extension)) if !name.is_empty() && (2..=5).contains(&extension.len()) && extension.chars().all(|c| c.is_ascii_alphanumeric()) => name.to_string(),
-            _ => lower,
+        let lower = raw.to_lowercase();
+        let named = match lower.rsplit_once('.') {
+            Some((name, extension)) if !name.is_empty() && (2..=5).contains(&extension.len()) && extension.chars().all(|c| c.is_ascii_alphanumeric()) => name,
+            _ => lower.as_str(),
         };
-        let words = whole.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect();
-        Step { whole, words }
+        Step { words: named.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect() }
     }
 
     /// Whether the step writes `word`, as one word or as two: `sign-in`,
@@ -132,8 +184,25 @@ impl Step {
         self.words.windows(2).any(|pair| pair[0].len() + pair[1].len() == word.len() && word.starts_with(pair[0].as_str()) && word.ends_with(pair[1].as_str()))
     }
 
+    /// Whether the step is one of `these` and nothing else, but for the
+    /// little words in `before` that may lead up to it.
+    fn is_one_of(&self, these: &[&str], before: &[&str]) -> bool {
+        match self.words.split_last() {
+            Some((last, leading)) => these.contains(&last.as_str()) && leading.iter().all(|word| before.contains(&word.as_str())),
+            None => false,
+        }
+    }
+
     fn says_checkout(&self) -> bool {
-        CHECKOUT_WRITTEN.iter().any(|c| self.words.iter().any(|w| w.contains(c)) || self.in_two(c)) || CHECKOUT_STEP.contains(&self.whole.as_str())
+        CHECKOUT_WRITTEN.iter().any(|c| self.words.iter().any(|w| w.contains(c)) || self.in_two(c)) || self.is_one_of(CHECKOUT_STEP, ON_THE_WAY_TO)
+    }
+
+    fn says_paying(&self) -> bool {
+        self.is_one_of(PAYING_STEP, ON_THE_WAY_TO)
+    }
+
+    fn says_information(&self) -> bool {
+        self.words.iter().any(|w| INFORMATION.contains(&w.as_str()))
     }
 
     fn says_basket(&self) -> bool {
@@ -142,8 +211,10 @@ impl Step {
 
     fn says_sign_in(&self) -> bool {
         SIGN_IN_WRITTEN.iter().any(|s| self.words.iter().any(|w| w.starts_with(s) || w.ends_with(s)) || self.in_two(s))
-            || SIGN_IN_STEP.contains(&self.whole.as_str())
+            || self.is_one_of(SIGN_IN_STEP, &[])
             || self.in_two("logon")
+            || self.is_one_of(ACCOUNT_STEP, ONES_OWN)
+            || self.words.iter().any(|w| PASSWORD.contains(&w.as_str()))
     }
 }
 
@@ -279,6 +350,9 @@ mod tests {
         // counter cannot be opened either. The other way round a checkout
         // named `/guestcheckout` would be let through.
         assert_eq!(on_the_shop("/p/self-checkout-kiosk"), Some(Refused::Checkout));
+        // The same for a word for a password, which is taken wherever it is
+        // a word of its own, so that `/wachtwoord-vergeten` is caught.
+        assert_eq!(on_the_shop("/p/password-notebook-a5"), Some(Refused::SignIn));
     }
 
     #[test]
@@ -298,6 +372,57 @@ mod tests {
     }
 
     #[test]
+    fn the_words_shops_were_found_to_use_that_the_first_lists_let_through() {
+        // The review of e4dd2f0 tried these by hand; each was open.
+        for path in [
+            "/zur-kasse", "/naar-de-kassa", "/bestellen", "/winkelwagen/bestellen", "/betalen", "/bezahlen", "/zahlung", "/payment", "/pay",
+            // A basket is a basket until a later step says paying.
+            "/checkout/cart/payment",
+            // A shop that keeps its route in the query.
+            "/index.php?route=checkout/checkout", "/index.php?controller=order", "/?page=checkout",
+        ] {
+            assert_eq!(on_the_shop(path), Some(Refused::Checkout), "{path}");
+        }
+        for path in [
+            "/customer/account/create", "/account/create", "/account", "/mijn-account", "/my-account", "/mein-konto", "/password/reset",
+            "/wachtwoord-vergeten", "/authenticate", "/authentication", "/authorize", "/index.php?route=account/login", "/index.php?controller=authentication",
+        ] {
+            assert_eq!(on_the_shop(path), Some(Refused::SignIn), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_page_that_says_how_to_pay_is_not_the_page_where_it_is_done() {
+        // By rule: a word for paying is a checkout as a step of its own,
+        // and not beside other words, nor under a step that says the page
+        // is information.
+        for path in [
+            "/verzenden-en-betalen", "/versand-und-zahlung", "/shipping-and-payment", "/betalen-en-verzenden", "/betaalmethoden", "/payment-methods",
+            "/klantenservice/betalen", "/klantenservice/bezorgen-en-betalen", "/service/payment", "/help/payment", "/info/zahlung", "/customer-service/pay",
+            // To order something is also what a shop says of everything it sells.
+            "/online-bestellen", "/kattenvoer-bestellen", "/p/widget-bestellen",
+            // A basket by its route, a search, a page of results, a product by its number.
+            "/index.php?route=checkout/cart", "/search?q=checkout&route=", "/cart?next=/checkout", "/p/1?page=2", "/index.php?route=product/product&product_id=1",
+            // An account book is a book.
+            "/p/account-book", "/accountancy-books", "/kontor",
+        ] {
+            assert_eq!(on_the_shop(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn an_address_a_caller_asks_for_is_a_web_address_of_no_great_length() {
+        assert_eq!(asked_address(" https://www.shop.example/p/widget ").map(|url| url.to_string()), Ok("https://www.shop.example/p/widget".to_string()));
+        assert_eq!(asked_address("not an address"), Err(Refused::NotWeb));
+        // What follows the question mark is free text, and an address is no place for a page of it.
+        let long = format!("https://www.shop.example/search?q={}", "x".repeat(ADDRESS_CHARS));
+        assert_eq!(asked_address(&long), Err(Refused::TooLong));
+        let fits = format!("https://www.shop.example/search?q={}", "x".repeat(ADDRESS_CHARS - 34));
+        assert_eq!((fits.chars().count(), asked_address(&fits).is_ok()), (ADDRESS_CHARS, true));
+        assert!(Refused::TooLong.why().contains(&ADDRESS_CHARS.to_string()));
+    }
+
+    #[test]
     fn an_address_that_carries_a_name_and_a_password_is_a_sign_in() {
         // A browser sent there offers them to the shop as its own.
         assert_eq!(refused("https://klant:geheim@www.shop.example/p/widget"), Some(Refused::SignIn));
@@ -309,7 +434,7 @@ mod tests {
     fn a_page_is_not_a_sign_in_for_having_the_letters_in_it() {
         for path in [
             "/blog/index", "/blogindex", "/designing-widgets", "/p/cash-register-toy", "/author/jansen",
-            "/catalogus", "/authentic-widgets", "/p/logo-widget", "/search?q=login", "/account", "/p/1#login",
+            "/catalogus", "/authentic-widgets", "/p/logo-widget", "/search?q=login", "/p/1#login",
         ] {
             assert_eq!(on_the_shop(path), None, "{path}");
         }
@@ -317,7 +442,7 @@ mod tests {
 
     #[test]
     fn every_refusal_says_why_in_a_sentence_of_its_own() {
-        let all = [Refused::NotWeb, Refused::LeavesShop, Refused::Checkout, Refused::SignIn];
+        let all = [Refused::NotWeb, Refused::LeavesShop, Refused::Checkout, Refused::SignIn, Refused::TooLong];
         for (i, a) in all.iter().enumerate() {
             assert!(!a.why().is_empty());
             for b in &all[i + 1..] {

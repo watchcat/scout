@@ -406,8 +406,9 @@ fn says_consent(block: &str, budget: &mut Budget) -> Option<bool> {
         }
         word.clear();
     }
+    // A block ends in its own closing tag, and that ended its last word.
     budget.read += block.len();
-    Some(CONSENT_WORDS.contains(&word.as_str()))
+    Some(false)
 }
 
 #[cfg(test)]
@@ -1106,6 +1107,43 @@ mod tests {
         let dialog = "<div data-nosnippet>Accept cookies<div>or do not</div></div>";
         let html = format!("<body></div>{dialog}<p>The page.</p></body>");
         assert_eq!(read_last(&html), format!("<body></div> <p>The page.</p></body>{dialog}"));
+    }
+
+    #[test]
+    fn whatever_the_markup_nothing_breaks_and_nothing_is_lost() {
+        // The pass once went down on a `<` in a title. So: documents put
+        // together from the pieces that have tripped it and their like,
+        // by a counter and not by chance, so that one that fails can be
+        // had again. Each must come back with every character it went
+        // in with, and a space for each dialog moved.
+        const PIECES: [&str; 44] = [
+            "<div", "<div>", "</div>", "<p>", "</p>", "<span ", "</span>", ">", "<", "\"", "'", "=", "/", " ",
+            " data-nosnippet", " role=\"dialog\"", " role='alertdialog'", " role=dialog", " title=\"a<p\"", " title='b>c'",
+            "<!--", "-->", "<!-->", "<br>", "<br data-nosnippet>", "</br>", "<img src=x>", "<a href=\"/x\">", "</a>",
+            "<form role=\"dialog\">", "</form>", "<div data-nosnippet>", "<div data-nosnippet>cookies Accept ",
+            "<form role=\"dialog\">Accept cookies ", "<span role=alertdialog>Cookies? Akkoord ", "cookies ", "Accept ",
+            "word ", "é", "€ 12,95 ", "&amp;", "&nbsp;", "<DIV DATA-NOSNIPPET>Cookies: allow ", "</DIV>",
+        ];
+        let mut state: u64 = 20_261_120;
+        let mut next = move || {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        let mut moved = 0;
+        for document in 0..4_000 {
+            let html: String = (0..next() % 60).map(|_| PIECES[next() % PIECES.len()]).collect();
+            let read = read_last(&html);
+            moved += usize::from(matches!(read, Cow::Owned(_)));
+            let sorted = |text: &str| {
+                let mut chars: Vec<char> = text.chars().filter(|c| *c != ' ').collect();
+                chars.sort_unstable();
+                chars
+            };
+            assert_eq!(sorted(&read), sorted(&html), "document {document}: {html}");
+            // And the reader that calls it reads the page through.
+            let _ = fetch::extract_page(&html, &url());
+        }
+        assert!(moved > 400, "a dialog was moved in {moved} of the 4,000, so the moving was tried too");
     }
 
     /// The dialogs of a document, how many bytes of its marked blocks

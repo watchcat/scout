@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS reminders (
 CREATE SEQUENCE IF NOT EXISTS price_watches_id_seq;
 -- A price somebody asked to be told about: "tell me when it is under 300".
 -- The page is read again once a day and the row ends once, with one
--- message, `ended_why` saying which: `hit`, `unreadable`, `expired`, or
--- `stopped` by its owner, who is sent nothing. A row with `ended_at` unset
+-- message, `ended_why` saying which: `hit`, `unreadable`, `unreached`,
+-- `expired`, or `stopped` by its owner, who is sent nothing. A row with `ended_at` unset
 -- is live. `channel` and `address` are the chat it was asked for in, as a
 -- reminder's are, and where that message goes. `url` is the address as it
 -- was given, query and all, since the query can be what picks the variant.
@@ -70,10 +70,19 @@ CREATE TABLE IF NOT EXISTS price_watches (
     first_price       DOUBLE NOT NULL,
     last_price        DOUBLE NOT NULL,
     lowest_price      DOUBLE NOT NULL,
+    -- When a check was last made, whatever came of it, and when one last
+    -- read a price. The two part when a shop refuses its reader or the
+    -- request fails: a watch can be checked every day and read nothing
+    -- for weeks, and whatever is said of it has to say which.
     last_checked_at   TIMESTAMP NOT NULL,
-    -- Days in a row the page was read and gave no price. A day the shop
-    -- refused the request is not one of them: see `watch.rs`.
+    last_read_at      TIMESTAMP NOT NULL,
+    -- Checks in a row that read the page and found no price. A check that
+    -- got no reading at all is not one of them: see `watch.rs`.
     unreadable_streak BIGINT NOT NULL DEFAULT 0,
+    -- Since when every check has come back with no reading at all, the
+    -- shop refusing or the request failing. NULL when the last check read
+    -- the page, priced or not.
+    unreached_since   TIMESTAMP,
     created_at        TIMESTAMP NOT NULL,
     expires_at        TIMESTAMP NOT NULL,
     ended_at          TIMESTAMP,
@@ -662,7 +671,11 @@ pub struct PriceWatch {
     pub last_price: f64,
     pub lowest_price: f64,
     pub last_checked_at: chrono::NaiveDateTime,
+    /// When a price was last read: at the start, or by a check since.
+    pub last_read_at: chrono::NaiveDateTime,
     pub unreadable_streak: i64,
+    /// Since when every check has got no reading at all, if the last did.
+    pub unreached_since: Option<chrono::NaiveDateTime>,
     pub created_at: chrono::NaiveDateTime,
     pub expires_at: chrono::NaiveDateTime,
     /// When it ended and why; `None` while it is live.
@@ -702,7 +715,9 @@ pub struct WatchCheck<'a> {
     pub now: chrono::NaiveDateTime,
     pub last_price: f64,
     pub lowest_price: f64,
+    pub last_read_at: chrono::NaiveDateTime,
     pub unreadable_streak: i64,
+    pub unreached_since: Option<chrono::NaiveDateTime>,
     /// Set when this check ends the watch: why, and the one message that
     /// says so.
     pub ended: Option<(&'a str, &'a str)>,
@@ -1629,7 +1644,8 @@ CREATE TABLE IF NOT EXISTS price_watches (
     url TEXT NOT NULL, title TEXT NOT NULL, currency TEXT NOT NULL,
     target DOUBLE NOT NULL, first_price DOUBLE NOT NULL, last_price DOUBLE NOT NULL,
     lowest_price DOUBLE NOT NULL, last_checked_at TIMESTAMP NOT NULL,
-    unreadable_streak BIGINT NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL,
+    last_read_at TIMESTAMP NOT NULL, unreadable_streak BIGINT NOT NULL DEFAULT 0,
+    unreached_since TIMESTAMP, created_at TIMESTAMP NOT NULL,
     expires_at TIMESTAMP NOT NULL, ended_at TIMESTAMP, ended_why TEXT
 );
 "#;
@@ -2432,13 +2448,14 @@ impl Store {
         let id: i64 = conn.query_row(
             "INSERT INTO price_watches (account_id, channel, address, url, title, currency, target,
                                         first_price, last_price, lowest_price,
-                                        last_checked_at, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP))
+                                        last_checked_at, last_read_at, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP))
              RETURNING id",
             params![
                 new.account_id, new.channel, new.address, new.url, new.title, new.currency, new.target,
                 new.price, new.price, new.price,
-                stamp(new.now), stamp(new.now), stamp(new.expires_at)
+                stamp(new.now), stamp(new.now), stamp(new.now), stamp(new.expires_at)
             ],
             |r| r.get(0),
         )?;
@@ -2523,9 +2540,14 @@ impl Store {
             let live = conn.execute(
                 "UPDATE price_watches
                  SET last_checked_at = CAST(? AS TIMESTAMP), last_price = ?, lowest_price = ?,
-                     unreadable_streak = ?, ended_at = CAST(? AS TIMESTAMP), ended_why = ?
+                     last_read_at = CAST(? AS TIMESTAMP), unreadable_streak = ?,
+                     unreached_since = CAST(? AS TIMESTAMP), ended_at = CAST(? AS TIMESTAMP), ended_why = ?
                  WHERE id = ? AND ended_at IS NULL",
-                params![stamp(check.now), check.last_price, check.lowest_price, check.unreadable_streak, ended_at, why, check.id],
+                params![
+                    stamp(check.now), check.last_price, check.lowest_price,
+                    stamp(check.last_read_at), check.unreadable_streak,
+                    check.unreached_since.map(stamp), ended_at, why, check.id
+                ],
             )?;
             if live == 0 {
                 return Ok(false);
@@ -6326,8 +6348,9 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
 /// The columns `row_to_watch` reads, in its order. The times come out as
 /// text, since `duckdb` is built here without `chrono`; see `stamp`.
 const WATCH_COLUMNS: &str = "id, account_id, channel, address, url, title, currency, target,
-    first_price, last_price, lowest_price, CAST(last_checked_at AS VARCHAR), unreadable_streak,
-    CAST(created_at AS VARCHAR), CAST(expires_at AS VARCHAR), CAST(ended_at AS VARCHAR), ended_why";
+    first_price, last_price, lowest_price, CAST(last_checked_at AS VARCHAR), CAST(last_read_at AS VARCHAR),
+    unreadable_streak, CAST(unreached_since AS VARCHAR), CAST(created_at AS VARCHAR),
+    CAST(expires_at AS VARCHAR), CAST(ended_at AS VARCHAR), ended_why";
 
 fn row_to_watch(row: &Row) -> duckdb::Result<PriceWatch> {
     // A time that will not read is the column's failure, in the row's own
@@ -6335,8 +6358,9 @@ fn row_to_watch(row: &Row) -> duckdb::Result<PriceWatch> {
     let time = |column: usize, text: String| {
         unstamp(&text).map_err(|e| duckdb::Error::FromSqlConversionFailure(column, duckdb::types::Type::Text, e.into()))
     };
-    let ended_at: Option<String> = row.get(15)?;
-    let ended_why: Option<String> = row.get(16)?;
+    let unreached_since: Option<String> = row.get(14)?;
+    let ended_at: Option<String> = row.get(17)?;
+    let ended_why: Option<String> = row.get(18)?;
     Ok(PriceWatch {
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -6350,11 +6374,13 @@ fn row_to_watch(row: &Row) -> duckdb::Result<PriceWatch> {
         last_price: row.get(9)?,
         lowest_price: row.get(10)?,
         last_checked_at: time(11, row.get(11)?)?,
-        unreadable_streak: row.get(12)?,
-        created_at: time(13, row.get(13)?)?,
-        expires_at: time(14, row.get(14)?)?,
+        last_read_at: time(12, row.get(12)?)?,
+        unreadable_streak: row.get(13)?,
+        unreached_since: unreached_since.map(|since| time(14, since)).transpose()?,
+        created_at: time(15, row.get(15)?)?,
+        expires_at: time(16, row.get(16)?)?,
         ended: match (ended_at, ended_why) {
-            (Some(at), Some(why)) => Some((time(15, at)?, why)),
+            (Some(at), Some(why)) => Some((time(17, at)?, why)),
             _ => None,
         },
     })
@@ -8740,7 +8766,9 @@ CREATE TABLE segment_candidates (
             now,
             last_price: price,
             lowest_price: price.min(watch.lowest_price),
+            last_read_at: now,
             unreadable_streak: 0,
+            unreached_since: None,
             ended: None,
         }
     }
@@ -8769,6 +8797,8 @@ CREATE TABLE segment_candidates (
         // Reading the price to start from was the first check, so the next
         // is a day on.
         assert_eq!((w.created_at, w.last_checked_at), (now, now));
+        // And the last time a price was read, which a later check may not be.
+        assert_eq!((w.last_read_at, w.unreached_since), (now, None));
         assert_eq!(w.expires_at, now + chrono::Duration::days(60));
         assert_eq!((w.unreadable_streak, w.ended.clone()), (0, None));
 
@@ -8859,17 +8889,34 @@ CREATE TABLE segment_candidates (
     fn a_check_writes_what_was_read_and_what_the_watch_started_from_stays() {
         let (s, _d) = test_store();
         let now = watch_clock();
-        let w = started(&s, &new_watch(1, "https://shop.example/p/widget", now - chrono::Duration::hours(21)));
-        assert!(s.record_watch_check(&read_at(&w, 310.0, now)).unwrap());
+        let w = started(&s, &new_watch(1, "https://shop.example/p/widget", now - chrono::Duration::hours(42)));
+        let yesterday = now - chrono::Duration::hours(21);
+        assert!(s.record_watch_check(&read_at(&w, 310.0, yesterday)).unwrap());
         // No price that day: what was read before stands, and the day is counted.
-        let unread = WatchCheck { last_price: 310.0, lowest_price: 310.0, unreadable_streak: 1, ..read_at(&w, 310.0, now) };
+        let unread = WatchCheck { last_read_at: yesterday, unreadable_streak: 1, ..read_at(&w, 310.0, now) };
         assert!(s.record_watch_check(&unread).unwrap());
 
         let after = &s.live_watches(1).unwrap()[0];
         assert_eq!((after.first_price, after.last_price, after.lowest_price), (329.0, 310.0, 310.0));
         assert_eq!((after.last_checked_at, after.unreadable_streak), (now, 1));
+        // Checked today, read yesterday: the two times are kept apart, so
+        // that a watch nobody has read for weeks cannot pass for one that
+        // was read this morning.
+        assert_eq!((after.last_read_at, after.unreached_since), (yesterday, None));
         assert_eq!((after.created_at, after.expires_at, after.target), (w.created_at, w.expires_at, w.target));
         assert!(queued(&s).is_empty(), "a watch that goes on says nothing");
+
+        // A check that got no reading at all says since when, and one that
+        // reads the page again clears it.
+        let tomorrow = now + chrono::Duration::hours(21);
+        let shut_out = WatchCheck { now: tomorrow, last_read_at: yesterday, unreached_since: Some(tomorrow), ..unread.clone() };
+        assert!(s.record_watch_check(&shut_out).unwrap());
+        let after = &s.live_watches(1).unwrap()[0];
+        assert_eq!((after.last_checked_at, after.last_read_at, after.unreached_since), (tomorrow, yesterday, Some(tomorrow)));
+        let read_again = read_at(&w, 305.0, tomorrow + chrono::Duration::hours(21));
+        assert!(s.record_watch_check(&read_again).unwrap());
+        let after = &s.live_watches(1).unwrap()[0];
+        assert_eq!((after.last_read_at, after.unreached_since), (read_again.now, None));
     }
 
     #[test]
@@ -9045,7 +9092,7 @@ CREATE TABLE segment_candidates (
         conn.execute_batch(STEP_PRICE_WATCHES).unwrap();
         let built = shape(&conn, "price_watches");
         assert_eq!(shape(&fresh.conn(), "price_watches"), built);
-        assert_eq!(built.len(), 17, "or two tables that are not there would agree");
+        assert_eq!(built.len(), 19, "or two tables that are not there would agree");
     }
 
     #[test]

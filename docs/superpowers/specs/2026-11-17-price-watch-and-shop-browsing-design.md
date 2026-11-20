@@ -144,18 +144,32 @@ and the amounts in the message are Rust's; the text is a template.
 
 Ended watches are pruned ninety days after they end, in maintenance.
 
-_As built, 2026-11-20, where it is more than the above._ The table has two
-columns more, `channel` and `address`: the chat the watch was asked for in,
-as a reminder keeps it, and where its message goes — not wherever the
-account last spoke, which in a group is the difference. An account watches
-one address once at a time; a second `watch_price` on it says which watch
-is there. A check a shop refuses (a block notice, a bot check) is counted
-`refused` and is neither a price nor one of the three days: nothing was
-learnt of the page. A watch past `expires_at` is read once more at the next
-tick and ended there: `hit` if the price got there, `expired` otherwise.
-A pass reads one page at a time, gives a read up after 90 seconds, and
-takes up no further watch after thirty minutes; what it leaves is due at
-the next tick.
+_As built, 2026-11-20, where it differs from the above._
+
+The table has four columns more. `channel` and `address` are the chat the
+watch was asked for in, as a reminder keeps it, and where its message goes:
+not wherever the account last spoke, which in a group is the difference.
+`last_read_at` is when a price was last read, apart from `last_checked_at`,
+since a watch can be checked every day and read nothing for weeks.
+`unreached_since` is since when every check has got no reading at all.
+
+An account watches one address once at a time; a second `watch_price` on
+it says which watch is there.
+
+A check ends one of three ways, and they are not counted alike. A price
+read is kept. The page read with no price counts towards the three, which
+are three checks running and not three days: the message says checks. A
+check with no reading at all, the shop refusing its reader, is neither: it
+changes no price and no count, and starts a clock that any reading of the
+page stops. Seven days on that clock end the watch as `unreached`, a fifth
+`ended_why`, with a message that says since when the page could not be read
+and when a price last was. The expiry message says the lowest price read
+and when one was last read; it does not say the price stayed up.
+
+A watch past `expires_at` is read once more at the next tick and ended
+there: `hit` if the price got there, `expired` otherwise. A pass reads one
+page at a time, gives a read up after 80 seconds, and takes up no further
+watch after thirty minutes; what it leaves is due at the next tick.
 
 `/metrics`: `scout_price_watch_checks_total{outcome}` (`read`, `unreadable`,
 `refused`) and `scout_price_watches_ended_total{why}`.

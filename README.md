@@ -274,10 +274,12 @@ The theme: **the model decides what to look for, Rust decides what's true.**
   model in the loop: a fetch, the same structured-data reading every other
   price gets, and a comparison in Rust. You get exactly one message: when
   the price is at or under what you named, with the link and what it was
-  when you asked; or when the page has given no price three days running;
-  or at sixty days, with the lowest price it read. List your watches or
-  stop one by asking. Ten at a time, and only where Scout has a Telegram
-  chat to tell you in — a watch is a promise to come back
+  when you asked; or when the page has had no price at three checks
+  running; or when nothing at all could be read for seven days running,
+  with the day a price was last read; or at sixty days, with the lowest
+  price it read. List your watches or stop one by asking. Ten at a time,
+  and only where Scout has a Telegram chat to tell you in — a watch is a
+  promise to come back
 - `/stat` for usage with a text bar chart — your own numbers, or everyone's
   if you're the admin. Flight searches are counted separately, because
   those are the ones a provider bills for, and so are the model's tokens —
@@ -656,9 +658,10 @@ of JavaScript in the browser client.
   needs a discount switched on, that is the number compared — which is why
   the first answer names the price it read, and beside it the amount the
   page strikes through where there is one. A sale that comes and goes
-  inside a day can be missed. A day the shop refuses Scout's request
-  counts neither for nor against the watch, so a shop that refuses every
-  day leaves it silent until its sixty days are up. Stock is not watched,
+  inside a day can be missed. A day the shop refuses Scout's request, or
+  the request fails, says nothing about the page and is not held against
+  it; a week of such days ends the watch, with a message that says the
+  page could not be read and when a price last was. Stock is not watched,
   only the price; and a watch tells you, it never buys.
 - **An invite link only works on an empty chat.** Telegram delivers a deep
   link's payload through the START button, and START only appears to someone

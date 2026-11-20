@@ -200,9 +200,11 @@ impl Metrics {
         self.watch_checks.add(&[outcome]);
     }
 
-    /// A price watch ended, by why: `hit`, `unreadable` after three days
-    /// with no price, `expired` at sixty days, or `stopped` by its owner.
-    /// What will say whether sixty days and ten watches were good guesses.
+    /// A price watch ended, by why: `hit`, `unreadable` after three checks
+    /// that read the page and found no price, `unreached` after a week in
+    /// which nothing could be read, `expired` at sixty days, or `stopped`
+    /// by its owner. What will say whether sixty days and ten watches were
+    /// good guesses.
     pub fn watch_ended(&self, why: &str) {
         self.watches_ended.add(&[why]);
     }
@@ -291,7 +293,7 @@ impl Metrics {
         self.run_duration.render(&mut out, "scout_run_duration_seconds", "How long a run took, from its row to its last word; the wait for a slot is not in it.");
         self.tool_calls.render(&mut out, "scout_tool_calls_total", "Tool calls the agents made, by tool and whether the tool answered.");
         self.watch_checks.render(&mut out, "scout_price_watch_checks_total", "Daily checks of price watches, by how each went: read (a price was read), unreadable (the page gave none), refused (the shop refused the request).");
-        self.watches_ended.render(&mut out, "scout_price_watches_ended_total", "Price watches ended, by why: hit, unreadable (three days running with no price), expired (sixty days) or stopped by their owner.");
+        self.watches_ended.render(&mut out, "scout_price_watches_ended_total", "Price watches ended, by why: hit, unreadable (three checks running read the page and found no price), unreached (a week with no reading at all), expired (sixty days) or stopped by their owner.");
         self.provider_errors.render(&mut out, "scout_provider_errors_total", "Requests that failed after their retries: paid APIs as they answered (client includes a not-found), and the model during runs.");
         self.provider_retries.render(&mut out, "scout_provider_retries_total", "Requests to a provider sent again after a 429, a 5xx or a refused connection.");
         self.lock_wait.render(&mut out, "scout_store_lock_wait_seconds", "Time a store call waited for the database's lock.");
@@ -615,7 +617,7 @@ mod tests {
         for outcome in ["read", "read", "unreadable", "refused", "refused", "refused"] {
             m.watch_checked(outcome);
         }
-        for why in ["hit", "expired", "stopped", "stopped", "unreadable"] {
+        for why in ["hit", "expired", "stopped", "stopped", "unreadable", "unreached"] {
             m.watch_ended(why);
         }
         let page = m.render();
@@ -629,6 +631,8 @@ mod tests {
             "scout_price_watches_ended_total{why=\"expired\"} 1",
             "scout_price_watches_ended_total{why=\"stopped\"} 2",
             "scout_price_watches_ended_total{why=\"unreadable\"} 1",
+            // Apart again: the page was not read at all for a week.
+            "scout_price_watches_ended_total{why=\"unreached\"} 1",
         ] {
             assert!(page.contains(&format!("{series}\n")), "{series} is missing:\n{page}");
         }

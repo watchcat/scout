@@ -28,9 +28,21 @@ use std::time::Duration;
 pub(crate) const MAX_LIVE: i64 = 10;
 pub(crate) const DAYS: i64 = 60;
 
-/// Daily checks in a row that may find no price before the watch ends
-/// with a message saying the page can no longer be read.
-pub(crate) const UNREADABLE_DAYS: i64 = 3;
+/// Daily checks in a row that may read the page and find no price before
+/// the watch ends with a message saying so. Checks, not days: they are
+/// twenty hours apart or more, and a check that got no reading at all is
+/// not one of them, so the three can lie further apart than three days and
+/// never closer than forty hours. The message says "checks" for that
+/// reason.
+pub(crate) const UNREADABLE_CHECKS: i64 = 3;
+
+/// Days running with no reading at all, the shop refusing or the request
+/// failing, after which a watch ends with a message that says so. The
+/// owner's rule of 2026-11-20: without it a watch its shop walls from the
+/// second day is checked for fifty-eight more and read on none, and then
+/// says the price never came down. Days by the clock, from the first check
+/// that got nothing to the one that ends it.
+pub(crate) const UNREACHED_DAYS: i64 = 7;
 
 /// How long one reading of a page may take. Its parts are bounded already,
 /// the plain request at 30 s by the client and a render at 45 s
@@ -70,9 +82,12 @@ pub(crate) const UNREADABLE: &str = "unreadable";
 pub(crate) const REFUSED: &str = "refused";
 
 /// Why a watch ended, as the table, the outbox key and `/metrics` write
-/// it. `unreadable` is the fourth, in the word above. A stop is its
-/// owner's doing and the store's to write; the word is here for the count.
+/// it. `unreadable` is one more, in the word above: the page was read and
+/// had no price. `unreached` is the other thing: for a week nothing could
+/// be read at all. A stop is its owner's doing and the store's to write;
+/// the word is here for the count.
 pub(crate) const HIT: &str = "hit";
+pub(crate) const UNREACHED: &str = "unreached";
 pub(crate) const EXPIRED: &str = "expired";
 pub(crate) const STOPPED: &str = "stopped";
 
@@ -411,21 +426,35 @@ pub struct Listed {
     pub url: String,
     /// The user is told at this or less.
     pub target: String,
-    /// The last price that was read, which is not always the last check's:
-    /// see `note`.
+    /// The last price that was read, and the day it was read on, which is
+    /// not always the day of the last check: see `note`.
     pub last_price: String,
+    pub last_price_read: String,
     pub lowest_price: String,
     pub price_when_started: String,
     pub started: String,
     pub last_checked: String,
     pub checked_until: String,
-    /// Said only when the page gave no price at the last check.
+    /// Said when the last check did not read a price, and why not: the
+    /// row would otherwise read as a price seen yesterday.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
 pub(crate) fn listed(watch: &PriceWatch) -> Listed {
     let amount = |amount: f64| money(amount, &watch.currency);
+    let note = match watch.unreached_since {
+        Some(since) => Some(format!(
+            "no check has been able to read the page since {}; the price shown was read on {}",
+            day(since),
+            day(watch.last_read_at)
+        )),
+        None if watch.unreadable_streak > 0 => Some(format!(
+            "the page gave no price at the last {} daily checks that read it; after {UNREADABLE_CHECKS} in a row the watch ends",
+            watch.unreadable_streak
+        )),
+        None => None,
+    };
     Listed {
         id: watch.id,
         title: named(&watch.title, false).to_string(),
@@ -433,17 +462,13 @@ pub(crate) fn listed(watch: &PriceWatch) -> Listed {
         url: watch.url.clone(),
         target: amount(watch.target),
         last_price: amount(watch.last_price),
+        last_price_read: day(watch.last_read_at),
         lowest_price: amount(watch.lowest_price),
         price_when_started: amount(watch.first_price),
         started: day(watch.created_at),
         last_checked: day(watch.last_checked_at),
         checked_until: day(watch.expires_at),
-        note: (watch.unreadable_streak > 0).then(|| {
-            format!(
-                "the page gave no price at the last {} of its daily checks; after {UNREADABLE_DAYS} in a row the watch ends",
-                watch.unreadable_streak
-            )
-        }),
+        note,
     }
 }
 
@@ -459,34 +484,40 @@ pub(crate) struct Verdict {
     pub outcome: &'static str,
     pub last_price: f64,
     pub lowest_price: f64,
+    pub last_read_at: chrono::NaiveDateTime,
     pub unreadable_streak: i64,
+    pub unreached_since: Option<chrono::NaiveDateTime>,
     pub ended: Option<(&'static str, String)>,
 }
 
 /// Decides a check from the watch as it stood and what was read. Nothing
 /// is read or written here, and the day is handed in.
 ///
-/// In the design's order. A price is kept, and at or under the target it
-/// is a hit. No price adds to the count of days running, and the third
-/// ends the watch. Then, for a watch still live and past its sixty days,
-/// the end of those days: so on its last day a hit is still a hit, and a
-/// shop's refusal is no reason to go on past the day the person was told.
+/// Three things can come of a check, and they are kept apart to the end:
+/// - a price. It is kept, with when it was read, and at or under the
+///   target it is a hit;
+/// - the page, read, with no price. That adds to the checks running, and
+///   the third ends the watch as `unreadable`. A price in between starts
+///   the count again;
+/// - no reading at all: the shop refused its reader. Nothing was learnt of
+///   the page, so it neither adds to that count nor wipes it, and it
+///   changes no price. What it does is start a clock, if none is running,
+///   which any reading of the page stops; a week on that clock ends the
+///   watch as `unreached`, saying since when nothing could be read. A shop
+///   that walls the reader for three days and serves it on the fourth has
+///   not lost its price, and one that walls it for good must not leave the
+///   watch looking checked.
 ///
-/// A refusal is neither a price nor a day without one. It is counted on
-/// `/metrics` and changes nothing in the row but the time of the check,
-/// which is what keeps the shop from being asked again that day. The
-/// design gives the three-day rule for a page that gave no price, and
-/// counts `refused` apart from `unreadable`; a shop that walls the reader
-/// for three days and then serves it again has not lost its price, and the
-/// message that it had would be false. What that leaves: a shop that walls
-/// the reader every day keeps its watches until they expire, unheard. The
-/// counter is how that would be seen.
+/// Then, for a watch still live and past its sixty days, the end of those
+/// days: so on its last day a hit is still a hit.
 pub(crate) fn decide(watch: &PriceWatch, reading: &Reading, now: chrono::NaiveDateTime) -> Verdict {
     let mut verdict = Verdict {
         outcome: REFUSED,
         last_price: watch.last_price,
         lowest_price: watch.lowest_price,
+        last_read_at: watch.last_read_at,
         unreadable_streak: watch.unreadable_streak,
+        unreached_since: watch.unreached_since,
         ended: None,
     };
     match reading {
@@ -494,7 +525,9 @@ pub(crate) fn decide(watch: &PriceWatch, reading: &Reading, now: chrono::NaiveDa
             verdict.outcome = READ;
             verdict.last_price = read.amount;
             verdict.lowest_price = watch.lowest_price.min(read.amount);
+            verdict.last_read_at = now;
             verdict.unreadable_streak = 0;
+            verdict.unreached_since = None;
             if at_or_under(read.amount, watch.target) {
                 verdict.ended = Some((HIT, say_hit(watch, read.amount)));
             }
@@ -504,14 +537,21 @@ pub(crate) fn decide(watch: &PriceWatch, reading: &Reading, now: chrono::NaiveDa
         Reading::Price(_) | Reading::Unreadable(_) => {
             verdict.outcome = UNREADABLE;
             verdict.unreadable_streak += 1;
-            if verdict.unreadable_streak >= UNREADABLE_DAYS {
+            verdict.unreached_since = None;
+            if verdict.unreadable_streak >= UNREADABLE_CHECKS {
                 verdict.ended = Some((UNREADABLE, say_unreadable(watch)));
             }
         }
-        Reading::Refused(_) => {}
+        Reading::Refused(_) => {
+            let since = watch.unreached_since.unwrap_or(now);
+            verdict.unreached_since = Some(since);
+            if now - since >= chrono::Duration::days(UNREACHED_DAYS) {
+                verdict.ended = Some((UNREACHED, say_unreached(watch, since)));
+            }
+        }
     }
     if verdict.ended.is_none() && now >= watch.expires_at {
-        verdict.ended = Some((EXPIRED, say_expired(watch, verdict.lowest_price)));
+        verdict.ended = Some((EXPIRED, say_expired(watch, verdict.lowest_price, verdict.last_read_at)));
     }
     verdict
 }
@@ -529,27 +569,51 @@ fn say_hit(watch: &PriceWatch, price: f64) -> String {
     )
 }
 
+/// The page was read and had no price. Said in checks, which is what was
+/// counted: three of them are not always three days.
 fn say_unreadable(watch: &PriceWatch) -> String {
     format!(
-        "I have stopped watching {} at {}: its page gave me no price to read {UNREADABLE_DAYS} days running. \
-         The last price I read was {}, and you asked to be told at {} or less. {}",
+        "I have stopped watching {} at {}: its page had no price for me at the last {UNREADABLE_CHECKS} daily \
+         checks that read it. The last price I read was {}, on {}; you asked to be told at {} or less. {}",
         named(&watch.title, false),
         shop_of(&watch.url),
         money(watch.last_price, &watch.currency),
+        day(watch.last_read_at),
         money(watch.target, &watch.currency),
         watch.url,
     )
 }
 
-fn say_expired(watch: &PriceWatch, lowest: f64) -> String {
+/// Nothing could be read for a week. It does not say the shop refused:
+/// the same week can be a shop's wall or requests that failed, and what
+/// is true of both is that the page was not read.
+fn say_unreached(watch: &PriceWatch, since: chrono::NaiveDateTime) -> String {
     format!(
-        "{} at {} did not come down to {} in the {} days I watched it, so I have stopped. \
-         The lowest price I read was {}. {}",
-        named(&watch.title, true),
+        "I have stopped watching {} at {}: I have not been able to read its page since {}, {UNREACHED_DAYS} days \
+         running. The last price I read was {}, on {}; you asked to be told at {} or less. {}",
+        named(&watch.title, false),
+        shop_of(&watch.url),
+        day(since),
+        money(watch.last_price, &watch.currency),
+        day(watch.last_read_at),
+        money(watch.target, &watch.currency),
+        watch.url,
+    )
+}
+
+/// The sixty days are up. What is said is what was read: the lowest price
+/// and when a price was last read. Not that the price stayed above the
+/// target, which nobody knows of the days the page was not read.
+fn say_expired(watch: &PriceWatch, lowest: f64, last_read_at: chrono::NaiveDateTime) -> String {
+    format!(
+        "My {} days of watching {} at {} are up, and I did not see it at {} or less. \
+         The lowest price I read was {}; the last time I read a price was {}. {}",
+        (watch.expires_at - watch.created_at).num_days(),
+        named(&watch.title, false),
         shop_of(&watch.url),
         money(watch.target, &watch.currency),
-        (watch.expires_at - watch.created_at).num_days(),
         money(lowest, &watch.currency),
+        day(last_read_at),
         watch.url,
     )
 }
@@ -635,7 +699,9 @@ pub(crate) async fn check_due<R: Reader>(
                 now,
                 last_price: decided.last_price,
                 lowest_price: decided.lowest_price,
+                last_read_at: decided.last_read_at,
                 unreadable_streak: decided.unreadable_streak,
+                unreached_since: decided.unreached_since,
                 ended: decided.ended.as_ref().map(|(why, say)| (*why, say.as_str())),
             })
         })
@@ -1034,7 +1100,16 @@ mod tests {
         let chat = ReplyTo::telegram(4242);
         let id = start(&store, &Fixed::priced(329.0), ask(&chat, WIDGET, 300.0), now).await.unwrap().started.unwrap();
         let later = now + chrono::Duration::days(2);
-        let check = crate::store::WatchCheck { id, now: later, last_price: 310.0, lowest_price: 310.0, unreadable_streak: 0, ended: None };
+        let check = crate::store::WatchCheck {
+            id,
+            now: later,
+            last_price: 310.0,
+            lowest_price: 310.0,
+            last_read_at: later,
+            unreadable_streak: 0,
+            unreached_since: None,
+            ended: None,
+        };
         assert!(store.record_watch_check(&check).unwrap());
 
         let row = listed(&store.live_watches(1).unwrap()[0]);
@@ -1042,18 +1117,57 @@ mod tests {
         assert_eq!((row.target.as_str(), row.last_price.as_str(), row.lowest_price.as_str()), ("€300.00", "€310.00", "€310.00"));
         assert_eq!(row.price_when_started, "€329.00");
         assert_eq!(row.started, now.format("%-d %B").to_string());
+        assert_eq!(row.last_price_read, later.format("%-d %B").to_string());
         assert_eq!(row.last_checked, later.format("%-d %B").to_string());
         assert_eq!(row.checked_until, (now + chrono::Duration::days(60)).format("%-d %B").to_string());
         assert_eq!(row.note, None);
 
-        // A check that read nothing leaves the price as it was, and the
-        // row says the price is older than the check.
-        assert!(store.record_watch_check(&crate::store::WatchCheck { unreadable_streak: 2, ..check }).unwrap());
+        // A check that read the page and found no price leaves the price
+        // as it was, and the row says so.
+        let next = later + chrono::Duration::days(1);
+        assert!(store.record_watch_check(&crate::store::WatchCheck { now: next, unreadable_streak: 2, ..check.clone() }).unwrap());
         let row = listed(&store.live_watches(1).unwrap()[0]);
         assert_eq!(row.last_price, "€310.00");
         assert_eq!(
             row.note.as_deref(),
-            Some("the page gave no price at the last 2 of its daily checks; after 3 in a row the watch ends")
+            Some("the page gave no price at the last 2 daily checks that read it; after 3 in a row the watch ends")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watch_nobody_has_read_for_weeks_is_not_listed_as_read_yesterday() {
+        // The review's case: started at 329.00, and the shop serves a bot
+        // check from the second day on. Thirty days in, the watch was
+        // checked yesterday and read a month ago, and the row says both.
+        let (store, _dir) = a_store();
+        let now = clock();
+        let began = now - chrono::Duration::days(30);
+        let w = watching_since(&store, WIDGET, began).await;
+        let walled_since = began + chrono::Duration::days(1);
+        let yesterday = now - chrono::Duration::days(1);
+        let check = crate::store::WatchCheck {
+            id: w.id,
+            now: yesterday,
+            last_price: 329.0,
+            lowest_price: 329.0,
+            last_read_at: began,
+            unreadable_streak: 0,
+            unreached_since: Some(walled_since),
+            ended: None,
+        };
+        assert!(store.record_watch_check(&check).unwrap());
+
+        let row = listed(&store.live_watches(1).unwrap()[0]);
+        assert_eq!(row.last_price, "€329.00");
+        assert_eq!(row.last_price_read, began.format("%-d %B").to_string());
+        assert_eq!(row.last_checked, yesterday.format("%-d %B").to_string());
+        assert_eq!(
+            row.note,
+            Some(format!(
+                "no check has been able to read the page since {}; the price shown was read on {}",
+                walled_since.format("%-d %B"),
+                began.format("%-d %B")
+            ))
         );
     }
 
@@ -1223,8 +1337,10 @@ mod tests {
                 format!("watch:{}:unreadable", w.id),
                 "4242".to_string(),
                 format!(
-                    "I have stopped watching Widget at shop.example: its page gave me no price to read 3 days running. \
-                     The last price I read was €329.00, and you asked to be told at €300.00 or less. {WIDGET}"
+                    "I have stopped watching Widget at shop.example: its page had no price for me at the last 3 daily \
+                     checks that read it. The last price I read was €329.00, on {}; you asked to be told at €300.00 or \
+                     less. {WIDGET}",
+                    w.created_at.format("%-d %B")
                 ),
             )]
         );
@@ -1259,25 +1375,85 @@ mod tests {
 
     #[tokio::test]
     async fn a_day_the_shop_refused_is_not_a_day_the_page_gave_no_price() {
-        // A shop that walls the reader for a week has said nothing about
-        // the page, and must not end the watch as a page that lost its
-        // price would.
+        // A shop that walls the reader for some days has said nothing
+        // about the page, and must not end the watch as a page that lost
+        // its price would.
         let (store, _dir) = a_store();
         let now = clock();
         let w = watching_since(&store, WIDGET, now - chrono::Duration::days(1)).await;
-        let next = daily(&store, now, 7, |_| refused()).await;
+        let next = daily(&store, now, 6, |_| refused()).await;
         let after = watch(&store, w.id);
         assert_eq!((after.unreadable_streak, after.ended.clone()), (0, None));
         assert_eq!((after.last_price, after.lowest_price), (329.0, 329.0));
         assert_eq!(after.last_checked_at, next - chrono::Duration::days(1), "it was a check all the same, and the shop is not asked again that day");
+        // But nothing was read, and the row says since when.
+        assert_eq!((after.last_read_at, after.unreached_since), (w.created_at, Some(now)));
         assert!(waiting(&store).is_empty());
 
-        // Nor does it wipe the days that did count: no price, refused, no
+        // Nor does it wipe the checks that did count: no price, refused, no
         // price, refused, no price is three readings with none in them.
         let next = daily(&store, next, 4, |day| if day % 2 == 0 { no_price() } else { refused() }).await;
         assert_eq!((watch(&store, w.id).unreadable_streak, watch(&store, w.id).ended), (2, None));
         daily(&store, next, 1, |_| no_price()).await;
         assert_eq!(watch(&store, w.id).ended.map(|(_, why)| why).as_deref(), Some("unreadable"));
+    }
+
+    #[tokio::test]
+    async fn seven_days_with_no_reading_at_all_end_the_watch_and_say_what_is_true() {
+        // The owner's rule, 2026-11-20. Left to run, a watch its shop
+        // walls from the second day would be checked for fifty-eight days
+        // and read on none of them, and then say the price never came
+        // down. It ends after a week instead, saying what happened.
+        let (store, _dir) = a_store();
+        let now = clock();
+        let began = now - chrono::Duration::days(2);
+        let w = watching_since(&store, WIDGET, began).await;
+
+        // Seven daily checks span six days: not yet.
+        let eighth = daily(&store, now, 7, |_| refused()).await;
+        let after = watch(&store, w.id);
+        assert_eq!((after.ended.clone(), after.unreached_since), (None, Some(now)));
+        assert!(waiting(&store).is_empty());
+
+        daily(&store, eighth, 1, |_| refused()).await;
+        assert_eq!(watch(&store, w.id).ended, Some((eighth, "unreached".to_string())));
+        assert_eq!(
+            waiting(&store),
+            vec![(
+                format!("watch:{}:unreached", w.id),
+                "4242".to_string(),
+                format!(
+                    "I have stopped watching Widget at shop.example: I have not been able to read its page since {}, \
+                     7 days running. The last price I read was €329.00, on {}; you asked to be told at €300.00 or \
+                     less. {WIDGET}",
+                    now.format("%-d %B"),
+                    began.format("%-d %B"),
+                ),
+            )]
+        );
+        daily(&store, eighth + chrono::Duration::days(1), 3, |_| refused()).await;
+        assert_eq!(waiting(&store).len(), 1, "and nothing after it");
+    }
+
+    #[tokio::test]
+    async fn a_reading_of_any_kind_starts_the_week_again() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let w = watching_since(&store, WIDGET, now - chrono::Duration::days(2)).await;
+        // Six days shut out, then the page is read: once with a price,
+        // once with none. Either is a reading, and the week starts over.
+        let next = daily(&store, now, 6, |_| refused()).await;
+        let next = daily(&store, next, 1, |_| price(320.0)).await;
+        assert_eq!(watch(&store, w.id).unreached_since, None);
+        let again = next;
+        let next = daily(&store, next, 6, |_| refused()).await;
+        assert_eq!(watch(&store, w.id).unreached_since, Some(again));
+        let next = daily(&store, next, 1, |_| no_price()).await;
+        let after = watch(&store, w.id);
+        assert_eq!((after.unreached_since, after.unreadable_streak, after.ended.clone()), (None, 1, None));
+        daily(&store, next, 6, |_| refused()).await;
+        assert_eq!(watch(&store, w.id).ended, None);
+        assert!(waiting(&store).is_empty());
     }
 
     #[tokio::test]
@@ -1303,13 +1479,41 @@ mod tests {
                 format!("watch:{}:expired", w.id),
                 "4242".to_string(),
                 format!(
-                    "Widget at shop.example did not come down to €300.00 in the 60 days I watched it, so I have stopped. \
-                     The lowest price I read was €305.00. {WIDGET}"
+                    "My 60 days of watching Widget at shop.example are up, and I did not see it at €300.00 or less. \
+                     The lowest price I read was €305.00; the last time I read a price was {}. {WIDGET}",
+                    now.format("%-d %B")
                 ),
             )]
         );
         check_due(&store, counters(), &Told::by(|_: &str| price(289.0)), now + chrono::Duration::days(1), &UNSPACED).await.unwrap();
         assert_eq!(waiting(&store).len(), 1, "an ended watch is not hit");
+    }
+
+    #[tokio::test]
+    async fn a_watch_that_expires_unread_says_when_it_last_read_a_price_and_claims_nothing_since() {
+        // Shut out for its last five days, short of the week that would
+        // have ended it. What it may say is what it read and when: not
+        // that the price stayed where it was.
+        let (store, _dir) = a_store();
+        let now = clock();
+        let began = now - chrono::Duration::days(60);
+        let w = watching_since(&store, WIDGET, began).await;
+        let last_read = now - chrono::Duration::days(6);
+        check_due(&store, counters(), &Told::by(|_: &str| price(310.0)), last_read, &UNSPACED).await.unwrap();
+        daily(&store, now - chrono::Duration::days(5), 6, |_| refused()).await;
+
+        assert_eq!(watch(&store, w.id).ended, Some((now, "expired".to_string())));
+        let said = waiting(&store);
+        assert_eq!(said.len(), 1);
+        assert_eq!(
+            said[0].2,
+            format!(
+                "My 60 days of watching Widget at shop.example are up, and I did not see it at €300.00 or less. \
+                 The lowest price I read was €310.00; the last time I read a price was {}. {WIDGET}",
+                last_read.format("%-d %B")
+            )
+        );
+        assert!(!said[0].2.contains("did not come down"), "nothing was read for five days: {}", said[0].2);
     }
 
     #[tokio::test]
@@ -1502,7 +1706,16 @@ mod tests {
         }
         // "gone" has had no price for two days already.
         let gone = watch(&store, ids["gone"]);
-        let two_days = crate::store::WatchCheck { id: gone.id, now: then, last_price: 329.0, lowest_price: 329.0, unreadable_streak: 2, ended: None };
+        let two_days = crate::store::WatchCheck {
+            id: gone.id,
+            now: then,
+            last_price: 329.0,
+            lowest_price: 329.0,
+            last_read_at: then,
+            unreadable_streak: 2,
+            unreached_since: None,
+            ended: None,
+        };
         assert!(store.record_watch_check(&two_days).unwrap());
 
         let (theirs, stopped) = (store.clone(), ids["stopped"]);
@@ -1571,6 +1784,7 @@ mod tests {
         let entry = entry.split("\n- ").next().unwrap().split_whitespace().collect::<Vec<_>>().join(" ");
         let spelt = |n: i64| match n {
             3 => "three",
+            7 => "seven",
             10 => "ten",
             60 => "sixty",
             other => panic!("the README has no word yet for {other}: write it there and here"),
@@ -1578,7 +1792,8 @@ mod tests {
         for said in [
             format!("{} at a time", spelt(MAX_LIVE)),
             format!("at {} days", spelt(DAYS)),
-            format!("{} days running", spelt(UNREADABLE_DAYS)),
+            format!("no price at {} checks running", spelt(UNREADABLE_CHECKS)),
+            format!("nothing at all could be read for {} days running", spelt(UNREACHED_DAYS)),
             "once a day".to_string(),
             "exactly one message".to_string(),
             "no model in the loop".to_string(),

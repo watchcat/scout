@@ -348,12 +348,13 @@ async function extractor(args) {
 }
 
 /// What a reading comes to, without the page's text.
-function summary(read, extra = {}) {
+export function summary(read, extra = {}) {
   const page = read.page || {}
   return {
     status: read.status ?? null, bytes: read.bytes ?? 0, ms: read.ms ?? null, error: read.error ?? null,
     would_render: read.would_render ?? null, challenge: read.challenge ?? false, refusal: read.refusal ?? false,
-    product_price: page.product?.price ?? null, availability: page.availability ?? null,
+    product_price: page.product?.price ?? null, struck_through_price: page.product?.struck_through_price ?? null,
+    availability: page.availability ?? null,
     text_chars: (page.text || '').length, truncated: page.truncated ?? false, ...extra,
   }
 }
@@ -438,7 +439,7 @@ Rules that are not yours to bend:
 - If the shop shows a bot check, a captcha or an access-denied page, do not try to pass it. Report refused.
 - You have twelve turns. When you have what can be had, or cannot get further, call report_offer once.`
 
-const READER_BRIEF = `You are reading one product page for a buyer in the Netherlands. Below is everything a fetch of that page returned: its text, what its markup says about stock, and the product its own data names. You cannot open anything else.
+const READER_BRIEF = `You are reading one product page for a buyer in the Netherlands. Below is everything a fetch of that page returned: its text, what its markup says about stock, and the product its own data names; a struck_through_price there is what the page gives as its regular or former price, not the price. You cannot open anything else.
 
 ${ASKED}
 

@@ -19,6 +19,7 @@ use crate::chrome::chrome_args;
 use crate::drive::{Action, Broken, Browser, Done, Page, Seen, OUTLINE_CHARS};
 use crate::pipe::{CallError, Event, Pipe};
 use crate::site::Shop;
+use crate::typing::{typing_refused, Field};
 use scout_core::net_guard::{serve_socks, Guard, SocksProxy, NOT_PUBLIC};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -216,6 +217,8 @@ struct Target {
     point: Option<Point>,
     /// What lies over it, where something does.
     covered: Option<String>,
+    /// What the page says of it as a field.
+    field: Field,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
@@ -229,6 +232,13 @@ impl Tab {
     async fn switch_on(&self) -> Result<(), CallError> {
         self.call("Page.enable", json!({})).await?;
         self.call("Network.enable", json!({})).await?;
+        // The page is treated as the window in front, as it is for a
+        // person, so that giving a field the caret runs what the page hangs
+        // on that there and then. Measured 2026-11-20 on Chrome 157:
+        // without this, a field whose own handler passes the caret on to
+        // the password field beside it still had the caret when it was
+        // looked for, and the test of that page failed.
+        self.call("Emulation.setFocusEmulationEnabled", json!({ "enabled": true })).await?;
         // Every document asked for is held until `watch` lets it go.
         self.call("Fetch.enable", json!({ "patterns": [{ "urlPattern": "*", "resourceType": "Document" }] })).await?;
         // Nothing is downloaded, and a file chooser is an event here and
@@ -412,6 +422,34 @@ impl Tab {
         Ok(())
     }
 
+    /// Types `text` into the field numbered `n`, or says in `refused` why not.
+    async fn type_into(&mut self, n: u32, text: &str, enter: bool, refused: &mut Vec<String>) -> Result<(), Broken> {
+        let target = match self.target(n).await? {
+            Ok(target) => target,
+            Err(why) => {
+                refused.push(why);
+                return Ok(());
+            }
+        };
+        if let Some(why) = typing_refused(&target.field, text) {
+            refused.push(why.to_string());
+            return Ok(());
+        }
+        // What is typed goes to whatever holds the caret, and the field
+        // that was judged is not that until the page has let it be.
+        if self.in_page_patiently("focusInPage", &[json!(n)]).await? != true {
+            refused.push("the page moved the caret away from that field, so nothing was typed".to_string());
+            return Ok(());
+        }
+        self.call("Input.insertText", json!({ "text": text })).await.map_err(gone)?;
+        if enter {
+            let key = |kind: &str| json!({ "type": kind, "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r" });
+            self.call("Input.dispatchKeyEvent", key("keyDown")).await.map_err(gone)?;
+            self.call("Input.dispatchKeyEvent", key("keyUp")).await.map_err(gone)?;
+        }
+        Ok(())
+    }
+
     /// The page as it is now, with what Chrome said in the meantime.
     async fn done(&mut self, mut refused: Vec<String>, mut notes: Vec<String>) -> Result<Done, Broken> {
         let page = self.in_page_patiently("pageInPage", &[json!(OUTLINE_CHARS), json!(self.from)]).await?;
@@ -446,6 +484,7 @@ impl Page for Tab {
                 return self.done(refused, Vec::new()).await;
             }
             Action::Click { n } => self.click(*n, &mut refused).await?,
+            Action::Type { n, text, enter } => self.type_into(*n, text, *enter, &mut refused).await?,
         }
         // Whatever was done, the next outline starts at the top of what
         // the page is now, once it has come to rest and is where it may be.
@@ -1003,6 +1042,112 @@ mod tests {
         assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
         assert!(!done.seen.text.contains("secret_total"), "{}", done.seen.text);
         assert_eq!(neighbour.asked(), NOTHING, "neither the link, the picture nor the script reached it");
+        tab.close().await;
+    }
+
+    // ------------------------------------------------------------ typing
+
+    /// A page of fields that writes down, where it can be read, the name
+    /// of every field anything is typed into.
+    const FIELDS: &str = r#"
+        <form action="/search"><input type="search" name="q" placeholder="Zoeken"></form>
+        <label>Aantal <input type="number" name="quantity" value="1"></label>
+        <label>Postcode <input name="postcode" autocomplete="postal-code"></label>
+        <label>Wachtwoord <input type="password" name="pw"></label>
+        <label>Kaartnummer <input name="cardnumber" autocomplete="cc-number"></label>
+        <label>Naam <input name="fullname" autocomplete="name"></label>
+        <label>E-mailadres <input type="email" name="email"></label>
+        <label>Telefoon <input type="tel" name="phone"></label>
+        <label>Straat en huisnummer <input name="street" autocomplete="street-address"></label>
+        <textarea name="message" aria-label="Opmerking"></textarea>
+        <button type="button">Bewaar</button>
+        <p>Typed into: <span id="typed">nothing</span></p>
+        <script>
+          document.addEventListener('input', (e) => {
+            const typed = document.getElementById('typed')
+            typed.textContent = (typed.textContent === 'nothing' ? '' : typed.textContent + ' ') + e.target.name
+          })
+        </script>"#;
+
+    async fn type_into(tab: &mut Tab, n: u32, text: &str) -> Done {
+        tab.act(&Action::Type { n, text: text.to_string(), enter: false }).await.expect("the browser answers")
+    }
+
+    #[tokio::test]
+    async fn a_search_term_a_quantity_and_a_postcode_are_typed() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(FIELDS), page("/search", "Results")]).await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert!(first.seen.text.contains(r#"[1] field "Zoeken""#) && first.seen.text.contains(r#"[3] field "Postcode""#), "{}", first.seen.text);
+        assert!(first.seen.text.contains("Typed into: nothing"), "{}", first.seen.text);
+
+        let done = type_into(&mut tab, 1, "kattenvoer").await;
+        assert_eq!(done.refused, NOTHING);
+        assert!(done.seen.text.contains(r#"[1] field "Zoeken" = "kattenvoer""#), "{}", done.seen.text);
+        // What is typed takes the place of what was there: two, not twelve.
+        let done = type_into(&mut tab, 2, "2").await;
+        assert!(done.seen.text.contains(r#"[2] field "Aantal" = "2""#), "{}", done.seen.text);
+        let done = type_into(&mut tab, 3, "1011 PN").await;
+        assert!(done.seen.text.contains(r#"[3] field "Postcode" = "1011 PN""#), "{}", done.seen.text);
+        assert!(done.seen.text.contains("Typed into: q quantity postcode"), "{}", done.seen.text);
+
+        // With Enter after it, a search term is sent.
+        let done = tab.act(&Action::Type { n: 1, text: "kattenbak".to_string(), enter: true }).await.unwrap();
+        assert_eq!((done.refused, done.seen.title.as_str()), (NOTHING, "Results"));
+        assert!(pages.asked().contains(&"GET /search?q=kattenbak".to_string()), "{:?}", pages.asked());
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn nothing_personal_is_typed_whatever_is_asked() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(FIELDS)]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        // A password, a card, a name, an email, a phone, a street, a message.
+        for n in 4..=10 {
+            let done = type_into(&mut tab, n, "x").await;
+            assert_eq!(done.refused.len(), 1, "field {n}: {:?}", done.refused);
+            // Refused before a key is pressed: the page itself saw nothing.
+            assert!(done.seen.text.contains("Typed into: nothing"), "field {n}: {}", done.seen.text);
+        }
+        assert_eq!(type_into(&mut tab, 4, "x").await.refused, ["a password field is never typed into"]);
+        assert_eq!(type_into(&mut tab, 7, "x").await.refused, ["an email field is never typed into"]);
+        assert_eq!(type_into(&mut tab, 5, "x").await.refused, ["that field is for something personal"]);
+        // And a thing that is no field at all.
+        assert_eq!(type_into(&mut tab, 11, "x").await.refused, ["that is not a field that takes a line of text"]);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn more_than_64_characters_are_typed_nowhere() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(FIELDS)]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = type_into(&mut tab, 3, &"1".repeat(65)).await;
+        assert_eq!(done.refused, ["at most 64 characters may be typed"]);
+        assert!(done.seen.text.contains("Typed into: nothing"), "{}", done.seen.text);
+        let done = type_into(&mut tab, 3, &"1".repeat(64)).await;
+        assert_eq!(done.refused, NOTHING);
+        assert!(done.seen.text.contains("Typed into: postcode"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn what_is_typed_goes_to_the_field_that_was_judged_or_nowhere() {
+        let _one_of_few = testing::gate().await;
+        // A postcode field that hands the caret to the password field
+        // beside it the moment it is given it.
+        let pages = Pages::serve(&[home(
+            r#"<label>Postcode <input name="postcode" onfocus="document.getElementById('pw').focus()"></label>
+               <label>Wachtwoord <input type="password" id="pw" name="pw"></label>
+               <p>Typed into: <span id="typed">nothing</span></p>
+               <script>document.addEventListener('input', (e) => { document.getElementById('typed').textContent = e.target.name })</script>"#,
+        )])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = type_into(&mut tab, 1, "1011 PN").await;
+        assert_eq!(done.refused, ["the page moved the caret away from that field, so nothing was typed"]);
+        assert!(done.seen.text.contains("Typed into: nothing"), "{}", done.seen.text);
         tab.close().await;
     }
 

@@ -20,6 +20,8 @@ pub enum Action {
     Read { more: bool },
     /// Press the thing numbered `n`.
     Click { n: u32 },
+    /// Type into the field numbered `n`, and press Enter after if asked.
+    Type { n: u32, text: String, enter: bool },
 }
 
 /// A page as a session is shown it.

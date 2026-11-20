@@ -72,6 +72,12 @@ pub struct PageProduct {
     pub name: Option<String>,
     /// Formatted like every other price the model sees: "13.80 EUR".
     pub price: Option<String>,
+    /// A second amount the data states beside `price` and marks as struck
+    /// through: what the page gives as its regular or former price.
+    /// Formatted like `price`, and left out of the block where there is
+    /// none. See `offered`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub struck_through_price: Option<String>,
     pub availability: Option<&'static str>,
     pub seller: Option<String>,
 }
@@ -116,7 +122,10 @@ fn script_json_blocks(html: &str, mime: &str) -> Vec<serde_json::Value> {
 /// 640 EUR for a bottle of cola reads as a real number, not a bug.
 ///
 /// Only that exact factor is corrected. Any other disagreement is left
-/// alone rather than guessed at.
+/// alone rather than guessed at. A struck-through amount beside the price
+/// is brought down with it where the same slip wrote it. One written
+/// properly would come out under the price, which a former price is not,
+/// and is kept as it stands.
 fn with_og_correction(product: PageProduct, html: &str) -> PageProduct {
     let (Some(price), Some(og)) = (product.price.as_deref(), og_price(html)) else {
         return product;
@@ -126,11 +135,20 @@ fn with_og_correction(product: PageProduct, html: &str) -> PageProduct {
     };
     if og > 0.0 && (shown / 100.0 - og).abs() < 0.005 {
         let currency = price.split_once(' ').map(|(_, c)| c.to_string());
+        let struck = product.struck_through_price.as_deref().map(|stated| {
+            let (amount, unit) = stated.split_once(' ').map_or((stated, None), |(a, c)| (a, Some(c)));
+            match (amount.parse::<f64>().map(|cents| cents / 100.0), unit) {
+                (Ok(major), Some(unit)) if major + 0.005 >= og => format!("{major:.2} {unit}"),
+                (Ok(major), None) if major + 0.005 >= og => format!("{major:.2}"),
+                _ => stated.to_string(),
+            }
+        });
         return PageProduct {
             price: Some(match currency {
                 Some(currency) => format!("{og:.2} {currency}"),
                 None => format!("{og:.2}"),
             }),
+            struck_through_price: struck,
             ..product
         };
     }
@@ -144,7 +162,47 @@ struct Candidate {
     /// broken shop theme leaks cents: japanesetaste.nl publishes "6.48" for
     /// this bottle in one JSON-LD block and "648" in another.
     decimals: bool,
+    /// The shop's own number for the article, by which its state can be
+    /// asked about the same one.
+    sku: Option<String>,
+    /// A second amount the offer states beside its price and marks as
+    /// struck through, formatted as the price is. See `offered`.
+    struck: Option<String>,
     product: PageProduct,
+}
+
+/// The amount an offer's price specification marks as struck through, in the
+/// offer's own currency. The other marks are left alone: on zooplus.nl a
+/// ListPrice is what a pack's articles cost bought singly, a UnitPrice the
+/// price a kilo, and an amount under one of its two member tiers the
+/// repeat delivery's (`autoshipment`) or its loyalty club's. All three
+/// stand beside an offer whose `price` the page does offer (2026-11-20).
+fn struck_through(offer: &serde_json::Value, currency: Option<&str>) -> Option<String> {
+    let specs = match offer.get("priceSpecification")? {
+        serde_json::Value::Array(specs) => specs.as_slice(),
+        one => std::slice::from_ref(one),
+    };
+    specs.iter().find_map(|spec| {
+        let kind = spec.get("priceType")?.as_str()?;
+        if !kind.rsplit('/').next()?.eq_ignore_ascii_case("StrikethroughPrice") {
+            return None;
+        }
+        // An amount in another currency is not a second price for this offer.
+        let theirs = spec.get("priceCurrency").and_then(|c| c.as_str());
+        if theirs.zip(currency).is_some_and(|(theirs, ours)| !theirs.eq_ignore_ascii_case(ours)) {
+            return None;
+        }
+        normalize_price(&scalar_text(spec.get("price")?)?)
+    })
+}
+
+/// A string or a number as it is written; nothing else is a value to compare.
+fn scalar_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.trim().to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// The page's OpenGraph product price, an independent statement of the same
@@ -183,18 +241,21 @@ fn collect_products(node: &serde_json::Value, out: &mut Vec<Candidate>) {
                     _ => None,
                 };
                 let raw = text(offer.get("price")).unwrap_or_default();
-                let price = normalize_price(&raw).map(|p| {
-                    match text(offer.get("priceCurrency")) {
-                        Some(currency) => format!("{p} {currency}"),
-                        None => p,
-                    }
-                });
+                let currency = text(offer.get("priceCurrency"));
+                let priced = |p: String| match &currency {
+                    Some(currency) => format!("{p} {currency}"),
+                    None => p,
+                };
+                let price = normalize_price(&raw).map(priced);
                 out.push(Candidate {
                     url: text(map.get("url")),
                     decimals: raw.contains('.') || raw.contains(','),
+                    sku: text(map.get("sku")),
+                    struck: struck_through(offer, currency.as_deref()).map(priced),
                     product: PageProduct {
                         name: text(map.get("name")),
                         price,
+                        struck_through_price: None,
                         availability: text(offer.get("availability"))
                             .as_deref()
                             .and_then(availability_word),
@@ -278,6 +339,7 @@ fn microdata_product(html: &str) -> Option<PageProduct> {
     Some(PageProduct {
         name: microdata_values(html, "name").first().cloned(),
         price: Some(format!("{price} {currency}")),
+        struck_through_price: None,
         availability: microdata_values(html, "availability")
             .first()
             .and_then(|a| availability_word(a)),
@@ -577,6 +639,7 @@ fn embedded_json_product(html: &str, page: &Url) -> Option<PageProduct> {
             name: string_field(obj, &payload, &["name", "title"]),
             price: payload_price(raw, &text)
                 .map(|price| format!("{price} {}", currency.unwrap_or_else(|| "EUR".into()))),
+            struck_through_price: None,
             availability: payload_availability(obj, &payload),
             seller: string_field(obj, &payload, &["seller", "merchant"]),
         };
@@ -586,6 +649,96 @@ fn embedded_json_product(html: &str, page: &Url) -> Option<PageProduct> {
         return Some(product);
     }
     None
+}
+
+/// Whether a product's url names this very address by its query. A shop
+/// that keeps every variant at one path tells them apart there: zooplus.nl's
+/// are `?activeVariant=…`, all at the page's own path, and read by the path
+/// alone the first one listed was every address's (2026-11-18). The address
+/// may carry more than the variant's url does.
+///
+/// Only variants are told apart so. The url has to be at the page's own
+/// path, or a shorter one sharing a tracking parameter with the address
+/// would outrank the page; and it has to have written a query itself,
+/// since one that wrote none (an empty url, a fragment) is resolved against
+/// the address and comes back carrying the address's own. `written` is the
+/// url as the markup has it, `claimed` what it resolves to.
+fn query_picks(written: &str, claimed: &Url, page: &Url) -> bool {
+    let at = |url: &Url| url.path().trim_end_matches('/').to_ascii_lowercase();
+    let wrote_one = written.split('#').next().is_some_and(|before| before.contains('?'));
+    let mut theirs = claimed.query_pairs().peekable();
+    wrote_one
+        && at(claimed) == at(page)
+        && theirs.peek().is_some()
+        && theirs.all(|pair| page.query_pairs().any(|ours| ours == pair))
+}
+
+/// The one field name under which a shop's state is heard for what an
+/// article costs: zooplus.nl's `variant_price`, in the `application/json`
+/// block it calls its data layer (2026-11-20), the only state a real page
+/// was read by. Not `price`, nor any other name with the word in it: a
+/// state can hold an article's former price under such a name, as one sale
+/// page's did, or a recommended one, or what its delivery costs, and heard
+/// as the price that puts a sale's former price in its place.
+const STATE_PRICE_KEY: &str = "variant_price";
+
+/// Every amount the page's own state holds as the price of the article
+/// `sku`. An object is the article's when it carries the same `sku`.
+fn state_prices(html: &str, sku: &str) -> Vec<String> {
+    let mut held = Vec::new();
+    for root in script_json_blocks(html, "application/json") {
+        let payload = Payload::detect(&root);
+        for obj in payload.objects(&root) {
+            let written = |value| payload.resolve(value).and_then(scalar_text);
+            if obj.get("sku").and_then(written).as_deref() != Some(sku) {
+                continue;
+            }
+            held.extend(obj.get(STATE_PRICE_KEY).and_then(written).and_then(|amount| normalize_price(&amount)));
+        }
+    }
+    held
+}
+
+/// The candidate's product at the price the page offers. Where an offer
+/// states a second amount as struck through, its `price` is by schema.org's
+/// meaning what is charged now and the other the former price. So the
+/// price stands, and the other amount is given beside it. That shops mean
+/// it so rests on little: of 12 product pages read at 8 large shops on
+/// 2026-11-20, 4 pages at 2 shops stated both, and on all 4 the page
+/// offered the `price` to anyone who buys.
+///
+/// zooplus.nl writes the same of an article its page offers at the
+/// struck-through amount, with a discount held out beside it to be
+/// activated: the offer's `price` is the amount less that discount
+/// (2026-11-20). The 5.94 Scout quoted there on 2026-11-18 for an article
+/// offered at 6.99 is 15% under it, as such an amount was two days later.
+/// The markup does not tell that page from a sale. Nor does its text:
+/// where the discount is what a repeat delivery takes off, the page writes
+/// the lower amount as well. Its own state does. On the articles read
+/// there, with such a discount and with none, the state held one price
+/// an article, the one the page offered; what it holds for an article
+/// the shop simply sells for less was not seen. So where the state holds
+/// the struck-through amount for the same article, and not the offer's
+/// `price`, that amount is the price.
+///
+/// What that leaves: a page written as zooplus.nl's whose state is missing,
+/// or holds the price under a name `state_prices` does not read, gives the
+/// amount less the discount as its `price`, with the amount the page
+/// offers beside it as struck through.
+fn offered(candidate: &Candidate, html: &str) -> PageProduct {
+    let product = candidate.product.clone();
+    let (Some(price), Some(struck)) = (product.price.clone(), candidate.struck.clone()) else {
+        return product;
+    };
+    if price == struck {
+        return product;
+    }
+    let amount = |stated: &str| stated.split(' ').next().unwrap_or(stated).to_string();
+    let held = candidate.sku.as_deref().map(|sku| state_prices(html, sku)).unwrap_or_default();
+    if held.contains(&amount(&struck)) && !held.contains(&amount(&price)) {
+        return PageProduct { price: Some(struck), ..product };
+    }
+    PageProduct { struck_through_price: Some(struck), ..product }
 }
 
 /// The product this URL is actually about. Matching is on the url path
@@ -600,31 +753,39 @@ fn extract_product(html: &str, page: &Url) -> Option<PageProduct> {
     // Ranked by (price written with decimals, length of the url match): a
     // shop that describes one product twice, once at "6.48" and once at
     // "648", is telling us which of the two it means by how it wrote it.
-    let mut best: Option<((bool, usize), PageProduct)> = None;
+    // Before either, whether the address's query picks the product: that
+    // is one variant among several, not one product described twice, and
+    // a round price is written with no decimals where nothing leaked
+    // (zooplus.nl writes 3.00 a kilo as `3`, 2026-11-20), so by the
+    // decimals a variant at a round price would lose its own address to a
+    // sibling. What this gives up: cents leaked into a variant's own node
+    // win at its address too, and only the OpenGraph amount corrects them.
+    let mut best: Option<((bool, bool, usize), &Candidate)> = None;
     for candidate in &found {
         // Relative urls are normal in schema.org and must be resolved
         // against the page — parsing them standalone fails, which silently
         // dropped the only correct block on a Shopify page.
-        let Some(claimed) = candidate
+        let Some((written, claimed)) = candidate
             .url
             .as_deref()
-            .and_then(|u| page.join(u).ok())
+            .and_then(|u| Some((u, page.join(u).ok()?)))
         else {
             continue;
         };
+        let picked = query_picks(written, &claimed, page);
         let claimed = claimed.path().trim_end_matches('/').to_ascii_lowercase();
-        let rank = (candidate.decimals, claimed.len());
+        let rank = (picked, candidate.decimals, claimed.len());
         if claimed.len() > 1
             && (path.starts_with(&claimed) || claimed.starts_with(&path))
             && best.as_ref().is_none_or(|(seen, _)| rank > *seen)
         {
-            best = Some((rank, candidate.product.clone()));
+            best = Some((rank, candidate));
         }
     }
-    best.map(|(_, p)| p)
+    best.map(|(_, c)| c)
         // A page describing exactly one product needs no disambiguation.
-        .or_else(|| (found.len() == 1).then(|| found[0].product.clone()))
-        .map(|p| with_og_correction(p, html))
+        .or_else(|| (found.len() == 1).then(|| &found[0]))
+        .map(|c| with_og_correction(offered(c, html), html))
         .or_else(|| microdata_product(html))
         // Last: shops with no schema.org markup at all, read from the JSON
         // application state they render the page from.
@@ -1304,6 +1465,345 @@ mod tests {
             .product
             .expect("product");
         assert_eq!(product.price.as_deref(), Some("648.00 EUR"));
+    }
+
+    /// zooplus.nl's product page in shape, read 2026-11-20 and cut down to
+    /// what the reading turns on. One ProductGroup whose variants share the
+    /// page's path and are told apart by the query. Where the page holds
+    /// out a discount to be activated, the Offer's `price` is the amount
+    /// less that discount, and the price the page offers for a single
+    /// delivery stands beside it as a StrikethroughPrice; the
+    /// repeat-delivery price sits under a member tier, and a pack's
+    /// ListPrice is its articles bought one by one. The page writes both
+    /// amounts, so its text settles nothing. `STATE` is its
+    /// `application/json` block.
+    const PRICED_TWICE: &str = r##"<html><head>
+      <script type="application/ld+json">
+      {"@context":"https://schema.org","@graph":[
+       {"@type":"ProductGroup","name":"Widget","productGroupID":100200,
+        "url":"https://www.zooplus.nl/shop/widgets/widget/100200",
+        "hasVariant":[
+         {"@type":"Product","name":"Widget 1 kg","sku":"100200.0",
+          "url":"https://www.zooplus.nl/shop/widgets/widget/100200?activeVariant=100200.0",
+          "offers":{"@type":"Offer","availability":"https://schema.org/InStock",
+           "price":3.82,"priceCurrency":"EUR","priceSpecification":[
+            {"@type":"UnitPriceSpecification","priceType":"https://schema.org/StrikethroughPrice","price":4.49,"priceCurrency":"EUR"},
+            {"@type":"UnitPriceSpecification","priceType":"https://schema.org/SalePrice","price":3.82,"priceCurrency":"EUR"},
+            {"@type":"UnitPriceSpecification","price":3.82,"priceCurrency":"EUR",
+             "validForMemberTier":{"@type":"MemberProgramTier","name":"autoshipment"}},
+            {"@type":"UnitPriceSpecification","priceType":"https://schema.org/UnitPrice","price":4.49,"priceCurrency":"EUR",
+             "referenceQuantity":{"@type":"QuantitativeValue","value":1,"unitCode":"KGM"}}]}},
+         {"@type":"Product","name":"Widget 12 kg","sku":"100200.3",
+          "url":"https://www.zooplus.nl/shop/widgets/widget/100200?activeVariant=100200.3",
+          "offers":{"@type":"Offer","availability":"https://schema.org/InStock",
+           "price":30.59,"priceCurrency":"EUR","priceSpecification":[
+            {"@type":"UnitPriceSpecification","priceType":"https://schema.org/StrikethroughPrice","price":35.99,"priceCurrency":"EUR"},
+            {"@type":"UnitPriceSpecification","priceType":"https://schema.org/SalePrice","price":30.59,"priceCurrency":"EUR"},
+            {"@type":"UnitPriceSpecification","price":30.59,"priceCurrency":"EUR",
+             "validForMemberTier":{"@type":"MemberProgramTier","name":"autoshipment"}},
+            {"@type":"UnitPriceSpecification","priceType":"https://schema.org/UnitPrice","price":3,"priceCurrency":"EUR",
+             "referenceQuantity":{"@type":"QuantitativeValue","value":1,"unitCode":"KGM"}}]}},
+         {"@type":"Product","name":"Widget 2 x 12 kg","sku":"100200.1",
+          "url":"https://www.zooplus.nl/shop/widgets/widget/100200?activeVariant=100200.1",
+          "offers":{"@type":"Offer","availability":"https://schema.org/InStock",
+           "price":68.99,"priceCurrency":"EUR","priceSpecification":[
+            {"@type":"UnitPriceSpecification","priceType":"https://schema.org/SalePrice","price":68.99,"priceCurrency":"EUR"},
+            {"@type":"UnitPriceSpecification","price":58.64,"priceCurrency":"EUR",
+             "validForMemberTier":{"@type":"MemberProgramTier","name":"autoshipment"}},
+            {"@type":"UnitPriceSpecification","priceType":"https://schema.org/ListPrice","price":71.98,"priceCurrency":"EUR"}]}}]}]}
+      </script>
+      <script type="application/json" id="productDataLayer">STATE</script></head>
+      <body><p>1 kg € 4,49 € 3,82 — 12 kg € 35,99 € 30,59 — 2 x 12 kg € 71,98 € 68,99 € 58,64</p>
+      <p>€ 35,99 -15% € 30,59</p></body></html>"##;
+
+    /// What the shop's own state holds beside that markup: one price an
+    /// article, the one the page offers, and as `defaultVariant` the
+    /// article the address shows: the one its query names, and at the one
+    /// address read with no query the first one listed (2026-11-20).
+    fn data_layer(shown: &str) -> String {
+        let articles = [("100200.0", "4.49", true), ("100200.3", "35.99", true), ("100200.1", "68.99", false)];
+        let article = |(sku, price, discount): &(&str, &str, bool)| {
+            format!(r#"{{"sku":"{sku}","variant_price":{price},"isArticleBasedDiscount":{discount},"bestPriceArticle":false}}"#)
+        };
+        let default = articles.iter().find(|(sku, ..)| *sku == shown).expect("an article of the fixture");
+        format!(
+            r#"{{"page_URL":"/shop/widgets/widget/100200","currency":"EUR","defaultVariant":{},"variants":[{}]}}"#,
+            article(default),
+            articles.iter().map(article).collect::<Vec<_>>().join(",")
+        )
+    }
+
+    /// The product read at the page's address with `query` after it.
+    fn priced_twice(state: &str, query: &str) -> PageProduct {
+        let address = format!("https://www.zooplus.nl/shop/widgets/widget/100200{query}");
+        extract_page(&PRICED_TWICE.replace("STATE", state), &Url::parse(&address).unwrap())
+            .product
+            .expect("the page's data names the product")
+    }
+
+    #[test]
+    fn the_price_offered_is_the_one_the_pages_state_holds_for_the_article() {
+        // The card: Scout quoted 5.94 where the page offered 6.99 for a
+        // single delivery, 2026-11-18. Read again two days later on another
+        // article, the 15% lower figure is the offer's `price` and the
+        // page's own is the one it marks as struck through.
+        let product = priced_twice(&data_layer("100200.3"), "?activeVariant=100200.3");
+        assert_eq!(product.name.as_deref(), Some("Widget 12 kg"));
+        assert_eq!(product.price.as_deref(), Some("35.99 EUR"));
+        assert_eq!(product.availability, Some("in stock"));
+        // The struck-through amount is the price here, so there is none
+        // beside it, and the block is the four fields it always was.
+        assert_eq!(product.struck_through_price, None);
+        let block = serde_json::to_value(&product).unwrap();
+        assert_eq!(block.as_object().unwrap().len(), 4, "got: {block}");
+    }
+
+    #[test]
+    fn only_the_articles_own_price_speaks_for_the_state() {
+        // A state can hold other amounts for an article than what it
+        // costs: one sale page's held the former price under a name of
+        // its own (2026-11-20), and under `price` a list can hold what an
+        // article cost before its discount. Heard as the price, any of
+        // them puts a sale's former price in its place, with nothing
+        // beside it to say so. One name is heard, the one a real page was
+        // read by: zooplus.nl's `variant_price`.
+        const ON_SALE: &str = r#"<html><head><script type="application/ld+json">
+          {"@type":"Product","name":"Widget","sku":"W1","offers":{"@type":"Offer","price":"42.50","priceCurrency":"EUR",
+           "priceSpecification":{"priceType":"https://schema.org/StrikethroughPrice","price":"64.95"}}}
+          </script><script type="application/json">STATE</script></head><body>ok</body></html>"#;
+        let on_sale = |state: &str| {
+            extract_page(&ON_SALE.replace("STATE", state), &Url::parse("https://shop.example/p/widget").unwrap())
+                .product
+                .expect("product")
+        };
+        for state in [
+            // the former price beside the current one, which sits a level down
+            r#"{"sku":"W1","compareAtPrice":64.95,"pricing":{"current":42.5}}"#,
+            // what delivery costs, in a block of its own
+            r#"{}</script><script type="application/json">{"sku":"W1","shippingPrice":64.95}"#,
+            // a recommended price, in a list of recommendations
+            r#"{"recommended":[{"sku":"W1","rrpPrice":64.95},{"sku":"W2","rrpPrice":12}]}"#,
+            r#"{"sku":"W1","oldPrice":64.95}"#,
+            // `price` itself, on its own and in a list beside a discount
+            r#"{"sku":"W1","price":"64,95","inStock":true}"#,
+            r#"{"items":[{"sku":"W1","price":64.95,"discount":30}]}"#,
+        ] {
+            let product = on_sale(state);
+            assert_eq!(product.price.as_deref(), Some("42.50 EUR"), "with {state}");
+            assert_eq!(product.struck_through_price.as_deref(), Some("64.95 EUR"), "with {state}");
+        }
+        for state in [r#"{"sku":"100200.3","oldPrice":35.99}"#, r#"{"sku":"100200.3","price":35.99}"#] {
+            let product = priced_twice(state, "?activeVariant=100200.3");
+            assert_eq!(product.price.as_deref(), Some("30.59 EUR"), "with {state}");
+            assert_eq!(product.struck_through_price.as_deref(), Some("35.99 EUR"), "with {state}");
+        }
+
+        // The one name that is heard, however the state writes the
+        // article's number and the amount.
+        let product = on_sale(r#"{"sku":"W1","variant_price":64.95}"#);
+        assert_eq!(product.price.as_deref(), Some("64.95 EUR"));
+        assert_eq!(product.struck_through_price, None);
+        let product = priced_twice(r#"{"sku":100200.3,"variant_price":"35,99"}"#, "?activeVariant=100200.3");
+        assert_eq!(product.price.as_deref(), Some("35.99 EUR"));
+    }
+
+    #[test]
+    fn an_address_that_picks_a_variant_is_read_as_that_variant() {
+        // The card's other half: every variant claims the page's path, so
+        // the first one listed was reported whichever the address asked for.
+        let pack = priced_twice(&data_layer("100200.1"), "?activeVariant=100200.1");
+        assert_eq!(pack.name.as_deref(), Some("Widget 2 x 12 kg"));
+        // A list price beside the offer is a comparison, not a second offer.
+        assert_eq!(pack.price.as_deref(), Some("68.99 EUR"));
+        assert_eq!(pack.struck_through_price, None);
+        // Whatever else the address carries.
+        let tracked = priced_twice(&data_layer("100200.1"), "?utm_source=mail&activeVariant=100200.1");
+        assert_eq!(tracked.name.as_deref(), Some("Widget 2 x 12 kg"));
+
+        // An address that picks none is still the first variant listed, at
+        // the price the state holds for it.
+        for query in ["", "?utm_source=mail"] {
+            let first = priced_twice(&data_layer("100200.0"), query);
+            assert_eq!(first.name.as_deref(), Some("Widget 1 kg"), "asked with {query:?}");
+            assert_eq!(first.price.as_deref(), Some("4.49 EUR"), "asked with {query:?}");
+        }
+    }
+
+    /// Two products of one page, as `first` and `second` write their urls.
+    fn two_products(first: (&str, &str, &str), second: (&str, &str, &str), head: &str, address: &str) -> PageProduct {
+        let product = |(name, url, price): (&str, &str, &str)| {
+            format!(
+                r#"<script type="application/ld+json">{{"@type":"Product","name":"{name}","url":"{url}",
+                   "offers":{{"@type":"Offer","price":{price},"priceCurrency":"EUR"}}}}</script>"#
+            )
+        };
+        let html = format!("<html><head>{head}{}{}</head><body>ok</body></html>", product(first), product(second));
+        extract_page(&html, &Url::parse(address).unwrap()).product.expect("product")
+    }
+
+    #[test]
+    fn a_query_picks_only_a_url_that_wrote_one_at_the_pages_own_path() {
+        // The query tells variants at one path apart, and nothing else. A
+        // range's url carrying the tracking parameter the address came
+        // with is not the page: the longer path still is.
+        let range = ("Widget (range)", "/p/widget?utm_source=mail", r#""9.99""#);
+        let blue = ("Widget blue", "/p/widget-blue", r#""13.80""#);
+        let product = two_products(range, blue, "", "https://shop.example/p/widget-blue?utm_source=mail");
+        assert_eq!(product.name.as_deref(), Some("Widget blue"));
+        assert_eq!(product.price.as_deref(), Some("13.80 EUR"));
+
+        // A url that wrote no query is resolved against the address and
+        // comes back with the address's own, which picks nothing.
+        for unwritten in ["", "#reviews", "#shown?as=tab"] {
+            let widget = ("Widget", "/p/widget", r#""13.80""#);
+            let other = ("Bought with it", unwritten, r#""9.99""#);
+            let product = two_products(widget, other, "", "https://shop.example/p/widget?utm_source=mail");
+            assert_eq!(product.name.as_deref(), Some("Widget"), "beside a url written {unwritten:?}");
+        }
+
+        // Another value under the same name picks nothing either, and the
+        // first one listed is read, as at the address with no query.
+        let small = ("Widget small", "/p/widget?variant=1", r#""5.00""#);
+        let large = ("Widget large", "/p/widget?variant=2", r#""8.00""#);
+        for (address, read) in [("?variant=2", "Widget large"), ("?variant=9", "Widget small"), ("", "Widget small")] {
+            let product = two_products(small, large, "", &format!("https://shop.example/p/widget{address}"));
+            assert_eq!(product.name.as_deref(), Some(read), "asked with {address:?}");
+        }
+    }
+
+    #[test]
+    fn at_a_variant_address_the_variant_wins_however_its_price_is_written() {
+        // A round amount with no decimals is this variant's all the same.
+        let (written, round) = (r#""price":68.99,"priceCurrency":"EUR","priceSpec"#, r#""price":69,"priceCurrency":"EUR","priceSpec"#);
+        let html = PRICED_TWICE.replace(written, round);
+        assert!(html.contains(round), "the fixture has changed under this test");
+        let address = Url::parse("https://www.zooplus.nl/shop/widgets/widget/100200?activeVariant=100200.1").unwrap();
+        let product = extract_page(&html, &address).product.expect("product");
+        assert_eq!(product.name.as_deref(), Some("Widget 2 x 12 kg"));
+        assert_eq!(product.price.as_deref(), Some("69.00 EUR"));
+
+        // What that costs: cents leaked into the variant's own node are
+        // read as its price, though the product is written out beside it.
+        // The page's OpenGraph amount is then the one thing that corrects
+        // them.
+        let whole = ("Cola", "/products/cola", r#""6.48""#);
+        let variant = ("Cola", "/products/cola?variant=1", r#""648""#);
+        let leaked = two_products(whole, variant, "", "https://shop.example/products/cola?variant=1");
+        assert_eq!(leaked.price.as_deref(), Some("648.00 EUR"));
+        let og = r#"<meta property="product:price:amount" content="6,48">"#;
+        let corrected = two_products(whole, variant, og, "https://shop.example/products/cola?variant=1");
+        assert_eq!(corrected.price.as_deref(), Some("6.48 EUR"));
+        // With no variant asked for, how the price is written decides as before.
+        let plain = two_products(whole, variant, "", "https://shop.example/products/cola");
+        assert_eq!(plain.price.as_deref(), Some("6.48 EUR"));
+    }
+
+    #[test]
+    fn a_cents_slip_is_corrected_in_the_struck_through_amount_as_in_the_price() {
+        let html = r#"<html><head><meta property="product:price:amount" content="30,59">
+          <script type="application/ld+json">
+          {"@type":"Product","name":"Widget","offers":{"@type":"Offer","price":"3059","priceCurrency":"EUR",
+           "priceSpecification":{"priceType":"https://schema.org/StrikethroughPrice","price":"3599"}}}
+          </script></head><body>ok</body></html>"#;
+        let product = extract_page(html, &Url::parse("https://shop.example/p/widget").unwrap()).product.expect("product");
+        assert_eq!(product.price.as_deref(), Some("30.59 EUR"));
+        assert_eq!(product.struck_through_price.as_deref(), Some("35.99 EUR"));
+    }
+
+    #[test]
+    fn a_struck_through_amount_written_properly_is_kept_when_the_price_is_corrected() {
+        // The slip in the price only. Brought down with it, the amount
+        // beside it would come out at 0.36, under the price it was struck
+        // through for.
+        let html = r#"<html><head><meta property="product:price:amount" content="30,59">
+          <script type="application/ld+json">
+          {"@type":"Product","name":"Widget","offers":{"@type":"Offer","price":"3059","priceCurrency":"EUR",
+           "priceSpecification":{"priceType":"https://schema.org/StrikethroughPrice","price":"35.99"}}}
+          </script></head><body>ok</body></html>"#;
+        let product = extract_page(html, &Url::parse("https://shop.example/p/widget").unwrap()).product.expect("product");
+        assert_eq!(product.price.as_deref(), Some("30.59 EUR"));
+        assert_eq!(product.struck_through_price.as_deref(), Some("35.99 EUR"));
+    }
+
+    #[test]
+    fn a_sale_is_priced_at_what_is_charged_now_with_the_former_price_beside_it() {
+        // A sale as shops write it, which the rule for zooplus.nl must
+        // leave alone. What that rests on is little: 12 product pages read
+        // at 8 large shops on 2026-11-20, 11 of them from a shop's own
+        // sale or offer listing. 4 pages, at 2 of the shops, stated a
+        // `price` with a struck-through amount beside it, and on all 4 the
+        // page offered the `price` to anyone who buys; one of the 2 shops
+        // stated its members' price as well, at the same amount, as here.
+        // A fifth page, at a third shop, stated a struck-through amount
+        // and no `price` at all.
+        let html = r#"<html><body><script type="application/ld+json">
+          {"@type":"Product","name":"Widget","sku":"100300","offers":{"@type":"Offer",
+           "price":24.5,"priceCurrency":"EUR","availability":"https://schema.org/InStock","priceSpecification":[
+            {"@type":"UnitPriceSpecification","priceType":"https://schema.org/StrikethroughPrice","price":"34.95","priceCurrency":"EUR"},
+            {"@type":"UnitPriceSpecification","price":24.5,"priceCurrency":"EUR",
+             "validForMemberTier":{"@type":"MemberProgramTier","name":"members"}}]}}
+          </script><p>34,95 24,50</p></body></html>"#;
+        let product = extract_page(html, &Url::parse("https://shop.example/p/widget").unwrap()).product.expect("product");
+        assert_eq!(product.price.as_deref(), Some("24.50 EUR"));
+        assert_eq!(product.struck_through_price.as_deref(), Some("34.95 EUR"));
+        // The model is told what the field means by the name it has in the block.
+        let block = serde_json::to_value(&product).unwrap();
+        assert_eq!(block["struck_through_price"], "34.95 EUR");
+        assert!(crate::agent::PREAMBLE.contains("'struck_through_price'"));
+    }
+
+    #[test]
+    fn a_struck_through_amount_the_state_does_not_single_out_stays_beside_the_price() {
+        // The markup is taken at its word unless the page's own state holds
+        // the struck-through amount, and that one alone, for the article.
+        // No state; one that holds both amounts, or the offer's own; what
+        // it holds for another article; the same number in a field that is
+        // not a price.
+        for state in [
+            "{}",
+            r#"[{"sku":"100200.3","variant_price":30.59},{"sku":"100200.3","variant_price":35.99}]"#,
+            r#"{"sku":"100200.3","variant_price":30.59}"#,
+            r#"{"sku":"100200.0","variant_price":35.99}"#,
+            r#"{"sku":"100200.3","weight":35.99}"#,
+        ] {
+            let product = priced_twice(state, "?activeVariant=100200.3");
+            assert_eq!(product.name.as_deref(), Some("Widget 12 kg"), "with {state}");
+            assert_eq!(product.price.as_deref(), Some("30.59 EUR"), "with {state}");
+            assert_eq!(product.struck_through_price.as_deref(), Some("35.99 EUR"), "with {state}");
+        }
+    }
+
+    /// A widget at 13.80 EUR whose offer carries `spec` as its price specification.
+    fn widget_specified(spec: &str) -> PageProduct {
+        let html = format!(
+            r#"<html><body><script type="application/ld+json">
+            {{"@type":"Product","name":"Widget","offers":{{"@type":"Offer","price":"13.80","priceCurrency":"EUR",
+              "priceSpecification":{spec}}}}}
+            </script></body></html>"#
+        );
+        extract_page(&html, &Url::parse("https://shop.example/p/widget").unwrap()).product.expect("product")
+    }
+
+    #[test]
+    fn a_struck_through_amount_that_is_no_second_price_changes_nothing() {
+        // The offer's own price repeated, an amount in another currency,
+        // and a list price.
+        for spec in [
+            r#"{"priceType":"https://schema.org/StrikethroughPrice","price":"13.80","priceCurrency":"EUR"}"#,
+            r#"[{"priceType":"StrikethroughPrice","price":12.10,"priceCurrency":"GBP"}]"#,
+            r#"{"priceType":"https://schema.org/ListPrice","price":"15.00","priceCurrency":"EUR"}"#,
+        ] {
+            let product = widget_specified(spec);
+            assert_eq!(product.price.as_deref(), Some("13.80 EUR"), "with {spec}");
+            assert_eq!(product.struck_through_price, None, "with {spec}");
+        }
+    }
+
+    #[test]
+    fn a_single_price_specification_is_read_as_a_list_of_one() {
+        let product = widget_specified(r#"{"priceType":"https://schema.org/StrikethroughPrice","price":"15,00"}"#);
+        assert_eq!(product.price.as_deref(), Some("13.80 EUR"));
+        assert_eq!(product.struck_through_price.as_deref(), Some("15.00 EUR"));
     }
 
     #[test]

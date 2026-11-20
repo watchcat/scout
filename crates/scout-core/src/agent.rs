@@ -157,7 +157,10 @@ availability are authoritative. Use that price verbatim and NEVER take a \
 price out of the page text when a product block exists - a shop page also \
 lists carousel items, other sellers, bundles and other pack sizes, and \
 nothing in the text says which price belongs to the product you asked for. \
-That is how a 13.80 EUR listing got reported as 12.99. When there is no \
+That is how a 13.80 EUR listing got reported as 12.99. A \
+'struck_through_price' in the block is what the page gives as its regular \
+or former price; 'price' is the current one, and if the page text makes it \
+conditional, say so. When there is no \
 product block, prices from the text are a guess: say so, or open a page \
 that states one.
 - fetch_page reports availability from the page's own markup: 'out of stock' \

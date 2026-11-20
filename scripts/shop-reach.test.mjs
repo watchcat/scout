@@ -8,7 +8,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   textWritesAmount, site, sameSite, typingRefused, refusedBy, checkReport, gained, differs, parseEnv,
-  trimHistory, tables, ruleMet, outlineInPage, sameOption, turnedAway, MAX_TYPED, CHROME,
+  trimHistory, tables, ruleMet, outlineInPage, sameOption, turnedAway, summary, MAX_TYPED, CHROME,
 } from './shop-reach.mjs'
 
 test('an amount is written with a point or a comma, and not as part of a longer number', () => {
@@ -288,6 +288,17 @@ test('a read that came back as a block notice is said to be one, as fetch_page s
   // A result written down before the tool knew a notice says what was true then.
   rows[0].plain = { status: 200, report: { refused: true }, verified: {} }
   assert.equal(tables(rows).split('\n').find((line) => line.includes('plain request')).split('|').at(-2).trim(), 'a refusal page, taken for the page')
+})
+
+test('what is kept of a reading is the price the data gave and the struck-through amount beside it', () => {
+  const read = { status: 200, bytes: 900, page: { text: 'a widget', availability: 'in stock', product: { name: 'Widget', price: '24.50 EUR', struck_through_price: '34.95 EUR' } } }
+  const kept = summary(read)
+  assert.equal(kept.product_price, '24.50 EUR')
+  assert.equal(kept.struck_through_price, '34.95 EUR')
+  // A page with no such amount says so, as one with no price does.
+  read.page.product = { name: 'Widget', price: '24.50 EUR' }
+  assert.equal(summary(read).struck_through_price, null)
+  assert.equal(summary({ status: 403 }).struck_through_price, null)
 })
 
 test('the tables name a host only when it is public, and letter the rest', () => {

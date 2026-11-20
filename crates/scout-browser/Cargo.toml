@@ -11,6 +11,7 @@ description = "A shop's page driven over HTTP, one shop a session"
 # `fetch_page` knows it by. That links all of scout-core into this crate;
 # nothing in scout-core knows this crate exists.
 scout-core = { path = "../scout-core" }
+axum = "0.8.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -32,5 +33,5 @@ rand = "0.10"
 # Paused time, so that a session waiting out its three minutes for a free
 # place is a test that finishes at once.
 tokio = { version = "1", features = ["net", "test-util"] }
-# The pages a session is tested on: each test serves its own, on loopback.
-axum = "0.8.9"
+# One call into the router without a socket, as scout-web's tests make it.
+tower = { version = "0.5", features = ["util"] }

@@ -14,14 +14,27 @@ use url::Url;
 pub const OUTLINE_CHARS: usize = 6000;
 
 /// What a session does to the page it has open.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// As JSON, an object that names the action under `do`:
+/// `{"do": "click", "n": 3}`, `{"do": "type", "n": 4, "text": "1011 PN"}`,
+/// `{"do": "back"}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "do", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Action {
     /// The page again; with `more`, the next part of a long one.
-    Read { more: bool },
+    Read {
+        #[serde(default)]
+        more: bool,
+    },
     /// Press the thing numbered `n`.
     Click { n: u32 },
     /// Type into the field numbered `n`, and press Enter after if asked.
-    Type { n: u32, text: String, enter: bool },
+    Type {
+        n: u32,
+        text: String,
+        #[serde(default)]
+        enter: bool,
+    },
     /// Choose an option in the list numbered `n`.
     Select { n: u32, option: String },
     /// Go back one page.
@@ -87,4 +100,48 @@ pub trait Browser: Send + Sync + 'static {
 
     /// Opens `url` in a fresh browser held to `shop`.
     fn open(&self, shop: &Shop, url: &Url) -> impl Future<Output = Result<(Self::Page, Done), Broken>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asked(json: &str) -> Result<Action, String> {
+        serde_json::from_str(json).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn each_action_is_an_object_that_names_itself() {
+        assert_eq!(asked(r#"{"do": "read"}"#), Ok(Action::Read { more: false }));
+        assert_eq!(asked(r#"{"do": "read", "more": true}"#), Ok(Action::Read { more: true }));
+        assert_eq!(asked(r#"{"do": "click", "n": 3}"#), Ok(Action::Click { n: 3 }));
+        assert_eq!(asked(r#"{"do": "type", "n": 4, "text": "1011 PN"}"#), Ok(Action::Type { n: 4, text: "1011 PN".into(), enter: false }));
+        assert_eq!(asked(r#"{"do": "type", "n": 1, "text": "kattenvoer", "enter": true}"#), Ok(Action::Type { n: 1, text: "kattenvoer".into(), enter: true }));
+        assert_eq!(asked(r#"{"do": "select", "n": 5, "option": "XL"}"#), Ok(Action::Select { n: 5, option: "XL".into() }));
+        assert_eq!(asked(r#"{"do": "back"}"#), Ok(Action::Back));
+        assert_eq!(asked(r#"{"do": "open", "url": "https://www.shop.example/delivery"}"#), Ok(Action::Open { url: "https://www.shop.example/delivery".into() }));
+    }
+
+    #[test]
+    fn an_action_that_is_not_one_of_the_six_or_is_missing_a_part_is_not_guessed_at() {
+        for json in [
+            r#"{"do": "buy"}"#,
+            r#"{"do": "evaluate", "script": "1"}"#,
+            r#"{"do": "upload", "n": 1, "path": "/etc/passwd"}"#,
+            r#"{"n": 3}"#,
+            r#"{"do": "click"}"#,
+            r#"{"do": "click", "n": -1}"#,
+            r#"{"do": "click", "n": "3"}"#,
+            r#"{"do": "type", "n": 4}"#,
+            // A part an action does not have is a mistake, not something to drop.
+            r#"{"do": "type", "n": 4, "text": "x", "entr": true}"#,
+            r#"{"do": "read", "from": 6000}"#,
+            r#""read""#,
+        ] {
+            assert!(asked(json).is_err(), "{json}");
+        }
+        // Going back has no parts, and nothing said beside it is read: it
+        // goes back one page, wherever it was told to go.
+        assert_eq!(asked(r#"{"do": "back", "to": "https://other.example/"}"#), Ok(Action::Back));
+    }
 }

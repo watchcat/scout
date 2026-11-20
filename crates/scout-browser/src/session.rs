@@ -252,90 +252,9 @@ impl<B: Browser> Sessions<B> {
 mod tests {
     use super::*;
     use crate::limits::{MAX_ACTIONS, MAX_SESSIONS, SESSION_BUDGET};
+    use crate::testing::{refusing, shown, Scripted, WIDGET};
     use scout_core::net_guard::NOT_PUBLIC;
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    const WIDGET: &str = "https://www.shop.example/p/widget";
-
-    /// A browser that answers from a script, at the speed it is told to.
-    #[derive(Clone, Default)]
-    struct Scripted {
-        /// What opening comes to; a page called "Widget" when not said.
-        opening: Arc<Mutex<Option<Result<Done, Broken>>>>,
-        /// What the next actions come to, in order; then pages called "Next".
-        answers: Arc<Mutex<VecDeque<Result<Done, Broken>>>>,
-        /// How long every action takes.
-        takes: Arc<Mutex<Duration>>,
-        opened: Arc<AtomicUsize>,
-        closed: Arc<AtomicUsize>,
-        asked: Arc<Mutex<Vec<Action>>>,
-        /// Set while an action is under way, to catch two at once.
-        busy: Arc<AtomicBool>,
-        overlapped: Arc<AtomicBool>,
-    }
-
-    struct ScriptedPage(Scripted);
-
-    fn shown(title: &str) -> Done {
-        let html = format!("<html><head><title>{title}</title></head><body>{}</body></html>", "A page of the shop. ".repeat(200));
-        Done { seen: crate::drive::Seen { title: title.into(), url: WIDGET.into(), text: format!("# The page\n{title}"), status: Some(200), html, ..Default::default() }, ..Default::default() }
-    }
-
-    fn refusing() -> Done {
-        let mut done = shown("Shop");
-        done.seen.status = Some(403);
-        done
-    }
-
-    impl Scripted {
-        fn then(&self, answers: impl IntoIterator<Item = Result<Done, Broken>>) -> &Self {
-            self.answers.lock().unwrap().extend(answers);
-            self
-        }
-
-        fn opening_with(&self, opening: Result<Done, Broken>) -> &Self {
-            *self.opening.lock().unwrap() = Some(opening);
-            self
-        }
-
-        fn taking(&self, each: Duration) -> &Self {
-            *self.takes.lock().unwrap() = each;
-            self
-        }
-
-        fn sessions(&self, limits: Limits) -> Arc<Sessions<Scripted>> {
-            Sessions::new(self.clone(), limits)
-        }
-    }
-
-    impl Browser for Scripted {
-        type Page = ScriptedPage;
-
-        async fn open(&self, _shop: &Shop, _url: &Url) -> Result<(ScriptedPage, Done), Broken> {
-            self.opened.fetch_add(1, Ordering::SeqCst);
-            let opening = self.opening.lock().unwrap().clone().unwrap_or_else(|| Ok(shown("Widget")));
-            opening.map(|done| (ScriptedPage(self.clone()), done))
-        }
-    }
-
-    impl Page for ScriptedPage {
-        async fn act(&mut self, action: &Action) -> Result<Done, Broken> {
-            if self.0.busy.swap(true, Ordering::SeqCst) {
-                self.0.overlapped.store(true, Ordering::SeqCst);
-            }
-            self.0.asked.lock().unwrap().push(action.clone());
-            let takes = *self.0.takes.lock().unwrap();
-            tokio::time::sleep(takes).await;
-            self.0.busy.store(false, Ordering::SeqCst);
-            let scripted = self.0.answers.lock().unwrap().pop_front();
-            scripted.unwrap_or_else(|| Ok(shown("Next")))
-        }
-
-        async fn close(self) {
-            self.0.closed.fetch_add(1, Ordering::SeqCst);
-        }
-    }
+    use std::sync::atomic::Ordering;
 
     const READ: Action = Action::Read { more: false };
 

@@ -35,8 +35,11 @@ pub(crate) const UNREADABLE_DAYS: i64 = 3;
 /// How long one reading of a page may take. Its parts are bounded already,
 /// the plain request at 30 s by the client and a render at 45 s
 /// (`RENDER_TIMEOUT`), the wait for a free Chrome included. This is the
-/// one bound over both, held here so that it does not rest on theirs.
-pub(crate) const READ_BUDGET: Duration = Duration::from_secs(90);
+/// one bound over both, held here so that it does not rest on theirs. It
+/// is over their sum, and under the 90 s of silence after which a run
+/// takes a tool for stalled and is cut (`STREAM_STALL` in `run.rs`): asked
+/// for a watch on a page that never answers, a person is told so.
+pub(crate) const READ_BUDGET: Duration = Duration::from_secs(80);
 
 /// How long after a check a watch is due its next: twenty hours and not
 /// twenty-four, because the tick that looks is hourly. A day's wait would
@@ -1536,6 +1539,25 @@ mod tests {
         let later = now + chrono::Duration::days(60);
         check_due(&store, metrics, &Told::by(|_: &str| price(310.0)), later, &UNSPACED).await.unwrap();
         assert!(metrics.render().contains("scout_price_watches_ended_total{why=\"expired\"} 2\n"), "{}", metrics.render());
+    }
+
+    #[test]
+    fn one_reading_fits_between_what_its_parts_may_take_and_a_runs_patience() {
+        // Over the plain request's 30 s and a render's 45 s together, or a
+        // page still being rendered would be given up on; under the 90 s
+        // after which a run with a silent tool is cut for stalled, or a
+        // person asking for a watch would lose the whole answer to it.
+        let parts = Duration::from_secs(30) + crate::tools::browser::RENDER_TIMEOUT;
+        assert!(READ_BUDGET > parts, "{READ_BUDGET:?} is not over {parts:?}");
+        let run = include_str!("run.rs");
+        assert!(
+            run.contains("const STREAM_STALL: std::time::Duration = std::time::Duration::from_secs(90);"),
+            "a run's patience with a silent tool has changed: set READ_BUDGET against the new one"
+        );
+        assert!(READ_BUDGET < Duration::from_secs(90));
+        // And the page reader's own client is the 30 s this counts on.
+        let core = include_str!("core.rs");
+        assert!(core.contains("let web = crate::net_guard::OpenWeb::new(Duration::from_secs(30))?;"), "the open web's timeout has changed");
     }
 
     #[test]

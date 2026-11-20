@@ -44,15 +44,17 @@ impl Tool for WatchPriceTool {
     type Output = WatchAnswer;
 
     fn description(&self) -> String {
-        "Start a daily price watch on one product page, for a request like 'tell me when this is \
-         under 300 euros'. Scout reads the page's current price itself, reads it again once a day, \
-         and sends the user one message when it is at or below the target; a watch ends by itself \
-         after sixty days. Pass the product page's exact URL as tool output gave it (the variant's \
-         own address where it has one), the amount the user named, and that amount's currency. \
-         Never pass or state a current price of your own. The result's `say` is the answer for the \
-         user: give it with every amount and date exactly as written. When `watching` is false no \
-         watch was started and `say` is why."
-            .to_string()
+        format!(
+            "Start a daily price watch on one product page, for a request like 'tell me when this is \
+             under 300 euros'. Scout reads the page's current price itself, reads it again once a day, \
+             and sends the user one message when it is at or below the target; a watch ends by itself \
+             after {} days. Pass the product page's exact URL as tool output gave it (the variant's \
+             own address where it has one), the amount the user named, and that amount's currency. \
+             Never pass or state a current price of your own. The result's `say` is the answer for the \
+             user: give it with every amount and date exactly as written. When `watching` is false no \
+             watch was started and `say` is why.",
+            watch::DAYS
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -321,6 +323,18 @@ mod tests {
         stop.call(StopWatchArgs { id: id + 100 }).await.unwrap();
         let page = metrics.render();
         assert!(page.contains("scout_price_watches_ended_total{why=\"stopped\"} 1\n"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn the_model_is_told_what_the_tool_does_in_the_numbers_the_watch_keeps() {
+        let (store, _d) = setup();
+        let shop = a_shop().await;
+        let told = watching(&store, &shop, 1, ReplyTo::telegram(99)).description();
+        assert!(told.contains(&format!("after {} days", watch::DAYS)), "got: {told}");
+        // What keeps the amounts Rust's: the sentence is handed over whole,
+        // and the model is told to pass no price and to change none.
+        assert!(told.contains("Never pass or state a current price of your own"), "got: {told}");
+        assert!(told.contains("every amount and date exactly as written"), "got: {told}");
     }
 
     #[test]

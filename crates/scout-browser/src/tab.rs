@@ -1,0 +1,591 @@
+//! One page of one shop in a Chrome of its own, driven over the pipe.
+//!
+//! The rules a session keeps are decided in `address.rs` and `typing.rs`;
+//! this is where they are held to a real browser. The prototype
+//! (`scripts/shop-reach.mjs`) kept some of them loosely and its header says
+//! which. What is done about each here:
+//!
+//! - it refused a link that left the shop but followed a redirect or a
+//!   script and then undid it. Here every request for the main frame's
+//!   document is held before it is sent, each hop of a redirect included,
+//!   and one to a refused address is never sent;
+//! - it did not see a new tab. Here another window is closed before it has
+//!   fetched anything;
+//! - a press landed on whatever lay over the thing pressed. Here a press is
+//!   only made where the thing itself is.
+
+use crate::address::address_refused;
+use crate::chrome::chrome_args;
+use crate::drive::{Action, Broken, Browser, Done, Page, Seen, OUTLINE_CHARS};
+use crate::pipe::{CallError, Event, Pipe};
+use crate::site::Shop;
+use scout_core::net_guard::{serve_socks, Guard, SocksProxy, NOT_PUBLIC};
+use serde_json::{json, Value};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
+use url::Url;
+
+/// What runs inside the page.
+const IN_PAGE: &str = include_str!("in_page.js");
+
+/// How long a page is given to come to rest after something is done to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pace {
+    /// A press that leads somewhere has begun to by then.
+    pub begun: Duration,
+    /// The longest a page is waited for while it loads.
+    pub load: Duration,
+    /// What a page's scripts add after it has loaded, they add within this.
+    pub quiet: Duration,
+}
+
+impl Pace {
+    /// The prototype's three waits, which the reading's sessions on ten
+    /// shops ran with: 400 ms, then until the page had loaded for at most
+    /// twelve seconds, then 900 ms. Kept as measured, not tuned.
+    pub const MEASURED: Pace =
+        Pace { begun: Duration::from_millis(400), load: Duration::from_secs(12), quiet: Duration::from_millis(900) };
+}
+
+/// The Chrome sessions run in.
+#[derive(Debug, Clone)]
+pub struct Chrome {
+    path: PathBuf,
+    pace: Pace,
+    /// A test's own page server: the one loopback socket a session's
+    /// Chrome may reach. Outside a test there is no way to set it.
+    reaching: Option<SocketAddr>,
+}
+
+impl Chrome {
+    pub fn new(path: PathBuf) -> Chrome {
+        Chrome { path, pace: Pace::MEASURED, reaching: None }
+    }
+
+    /// A Chrome for a test: let through to the test's own page server, and
+    /// not kept waiting for pages that are a few lines served from memory.
+    #[cfg(test)]
+    pub(crate) fn reaching(path: PathBuf, server: SocketAddr) -> Chrome {
+        let pace = Pace { begun: Duration::from_millis(200), load: Duration::from_secs(10), quiet: Duration::from_millis(100) };
+        Chrome { path, pace, reaching: Some(server) }
+    }
+
+    /// Whether `url` is the test's own server, which the guard would refuse
+    /// as it refuses all of loopback.
+    fn is_let_through(&self, url: &Url) -> bool {
+        self.reaching.is_some_and(|server| {
+            url.host_str() == Some(server.ip().to_string().as_str()) && url.port_or_known_default() == Some(server.port())
+        })
+    }
+}
+
+impl Browser for Chrome {
+    type Page = Tab;
+
+    async fn open(&self, shop: &Shop, url: &Url) -> Result<(Tab, Done), Broken> {
+        // The proxy would refuse it anyway; asked first so that the answer
+        // is the guard's sentence and no Chrome is started for a page that
+        // cannot be had.
+        if !self.is_let_through(url) && Guard::PUBLIC_ONLY.check(url).await.is_err() {
+            return Err(Broken::Refused(NOT_PUBLIC.to_string()));
+        }
+        let failed = |e: std::io::Error| Broken::Failed(e.to_string());
+        let (port, proxy) = serve_socks(Guard::PUBLIC_ONLY).await.map_err(failed)?;
+        let profile = tempfile::Builder::new().prefix("scout-session-").tempdir().map_err(failed)?;
+        let (pipe, said) = Pipe::start(&self.path, &chrome_args(profile.path(), port, self.reaching)).map_err(failed)?;
+        let pipe = Arc::new(pipe);
+        let (session, frame, target) = match find_page(&pipe).await {
+            Ok(found) => found,
+            Err(broken) => {
+                // Chrome first, then its profile, which goes with this scope.
+                pipe.stop().await;
+                return Err(broken);
+            }
+        };
+        let (loading, _) = watch::channel(false);
+        let shared = Arc::new(Shared { happened: Mutex::default(), loading });
+        // Listening before anything is switched on, so that nothing Chrome
+        // holds for an answer waits for a listener.
+        let watched = Watched { shop: shop.clone(), session: session.clone(), frame: frame.clone(), target };
+        let watcher = tokio::spawn(watch(pipe.clone(), said, shared.clone(), watched));
+        let mut tab =
+            Tab { pipe, session, frame, shop: shop.clone(), pace: self.pace, shared, from: 0, good: None, watcher, _proxy: proxy, _profile: profile };
+        let opened = match tab.switch_on().await {
+            Ok(()) => tab.first(url).await,
+            Err(e) => Err(gone(e)),
+        };
+        match opened {
+            Ok(done) => Ok((tab, done)),
+            Err(broken) => {
+                tab.close().await;
+                Err(broken)
+            }
+        }
+    }
+}
+
+/// The tab Chrome starts with: the protocol's session with it, its main
+/// frame, and its name among the browser's targets.
+async fn find_page(pipe: &Pipe) -> Result<(String, String, String), Broken> {
+    // Chrome answers the pipe before it has made its first tab.
+    let by = Instant::now() + Duration::from_secs(10);
+    let target = loop {
+        let targets = pipe.call("Target.getTargets", json!({}), None).await.map_err(gone)?;
+        let page = targets["targetInfos"].as_array().and_then(|all| all.iter().find(|t| t["type"] == "page"));
+        if let Some(id) = page.and_then(|t| t["targetId"].as_str()) {
+            break id.to_string();
+        }
+        if Instant::now() >= by {
+            return Err(Broken::Failed("Chrome opened no page".into()));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let attached = pipe.call("Target.attachToTarget", json!({ "targetId": target, "flatten": true }), None).await.map_err(gone)?;
+    let session = attached["sessionId"].as_str().ok_or_else(|| Broken::Failed("Chrome gave no session".into()))?.to_string();
+    let tree = pipe.call("Page.getFrameTree", json!({}), Some(&session)).await.map_err(gone)?;
+    let frame = tree["frameTree"]["frame"]["id"].as_str().ok_or_else(|| Broken::Failed("Chrome named no frame".into()))?.to_string();
+    Ok((session, frame, target))
+}
+
+/// What Chrome has said of the page since it was last asked about.
+#[derive(Debug, Default)]
+struct Happened {
+    /// The status the main frame's document came with.
+    status: Option<u16>,
+    refused: Vec<String>,
+    notes: Vec<String>,
+    crashed: bool,
+}
+
+struct Shared {
+    happened: Mutex<Happened>,
+    /// Whether the main frame is loading.
+    loading: watch::Sender<bool>,
+}
+
+impl Shared {
+    fn refuse(&self, why: String) {
+        let mut happened = self.happened.lock().unwrap();
+        // A redirect that tries the same door twice is refused once.
+        if !happened.refused.contains(&why) {
+            happened.refused.push(why);
+        }
+    }
+}
+
+/// A session's page.
+pub struct Tab {
+    pipe: Arc<Pipe>,
+    /// The protocol's own session with the page, not a browser session.
+    session: String,
+    /// The main frame, which is the one held to the shop.
+    frame: String,
+    shop: Shop,
+    pace: Pace,
+    shared: Arc<Shared>,
+    /// Where the next outline starts in a long page's text.
+    from: usize,
+    /// The last address the page was rightly at.
+    good: Option<Url>,
+    watcher: tokio::task::JoinHandle<()>,
+    _proxy: SocksProxy,
+    _profile: tempfile::TempDir,
+}
+
+fn gone(e: CallError) -> Broken {
+    Broken::Failed(e.to_string())
+}
+
+impl Tab {
+    /// Switches on what a session's rules rest on.
+    async fn switch_on(&self) -> Result<(), CallError> {
+        self.call("Page.enable", json!({})).await?;
+        self.call("Network.enable", json!({})).await?;
+        // Every document asked for is held until `watch` lets it go.
+        self.call("Fetch.enable", json!({ "patterns": [{ "urlPattern": "*", "resourceType": "Document" }] })).await?;
+        // Nothing is downloaded, and a file chooser is an event here and
+        // not a dialog: nobody answers it, so nothing is uploaded.
+        self.pipe.call("Browser.setDownloadBehavior", json!({ "behavior": "deny", "eventsEnabled": true }), None).await?;
+        self.call("Page.setInterceptFileChooserDialog", json!({ "enabled": true })).await?;
+        // Another window is attached to at birth and held there, before it
+        // has run or fetched anything; `watch` closes it.
+        let pages = json!([{ "type": "page", "exclude": false }]);
+        self.pipe
+            .call("Target.setAutoAttach", json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true, "filter": pages }), None)
+            .await?;
+        Ok(())
+    }
+
+    async fn call(&self, method: &str, params: Value) -> Result<Value, CallError> {
+        self.pipe.call(method, params, Some(&self.session)).await
+    }
+
+    /// Runs one of the functions of `in_page.js` in the page and returns
+    /// what it returned.
+    async fn in_page(&self, function: &str, args: &[Value]) -> Result<Value, CallError> {
+        // Asked for each time: the world goes when the page does, and
+        // asking again for one that is there returns the same one.
+        let world = self.call("Page.createIsolatedWorld", json!({ "frameId": self.frame, "worldName": "scout" })).await?;
+        let args = args.iter().map(Value::to_string).collect::<Vec<_>>().join(",");
+        let expression = format!("(() => {{ {IN_PAGE}\nreturn {function}({args}) }})()");
+        let answer = self
+            .call("Runtime.evaluate", json!({ "expression": expression, "contextId": world["executionContextId"], "returnByValue": true }))
+            .await?;
+        if let Some(thrown) = answer.get("exceptionDetails") {
+            let said = thrown["exception"]["description"].as_str().or(thrown["text"].as_str()).unwrap_or("the page's script failed");
+            return Err(CallError::Answered(said.to_string()));
+        }
+        Ok(answer["result"]["value"].clone())
+    }
+
+    /// The same, tried again while the page is swapping itself out: a
+    /// world asked for in the middle of a navigation is gone by the time
+    /// it is used. Three tries 700 ms apart, as the prototype's outline had.
+    async fn in_page_patiently(&self, function: &str, args: &[Value]) -> Result<Value, Broken> {
+        let mut tries = 0;
+        loop {
+            match self.in_page(function, args).await {
+                Ok(value) => return Ok(value),
+                Err(CallError::Answered(_)) if tries < 2 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+                Err(e) => return Err(gone(e)),
+            }
+        }
+    }
+
+    /// Waits for the page to come to rest after something was done to it.
+    async fn settle(&self) {
+        tokio::time::sleep(self.pace.begun).await;
+        let mut loading = self.shared.loading.subscribe();
+        let loaded_by = Instant::now() + self.pace.load;
+        loop {
+            let _ = tokio::time::timeout_at(loaded_by, loading.wait_for(|loading| !loading)).await;
+            tokio::time::sleep(self.pace.quiet).await;
+            // A page that sends itself on once it has loaded is loading again.
+            if !*loading.borrow() || Instant::now() >= loaded_by {
+                return;
+            }
+        }
+    }
+
+    /// Sends the main frame to `url` and waits for it to come to rest.
+    /// `Err` carries Chrome's own word for why it did not get there.
+    async fn go(&self, url: &Url) -> Result<Result<(), String>, Broken> {
+        let went = self.call("Page.navigate", json!({ "url": url.as_str() })).await.map_err(gone)?;
+        self.settle().await;
+        Ok(match went["errorText"].as_str() {
+            Some(error) => Err(error.to_string()),
+            None => Ok(()),
+        })
+    }
+
+    /// Opens the page a session starts on.
+    async fn first(&mut self, url: &Url) -> Result<Done, Broken> {
+        if let Err(error) = self.go(url).await? {
+            // Refused on the way, by a redirect off the shop or into its
+            // checkout: the reason is the rule's and not Chrome's "aborted".
+            return Err(match self.shared.happened.lock().unwrap().refused.first() {
+                Some(why) => Broken::Refused(why.clone()),
+                None => Broken::Unreachable(error),
+            });
+        }
+        let mut refused = Vec::new();
+        self.hold(&mut refused).await?;
+        self.done(refused, Vec::new()).await
+    }
+
+    /// Where the main frame is, by the document that is in it. Chrome's
+    /// record of where it was sent would name the address asked for even
+    /// when what is shown is Chrome's own page about failing to get there.
+    async fn address(&self) -> Result<String, Broken> {
+        Ok(self.in_page_patiently("addressInPage", &[]).await?.as_str().unwrap_or_default().to_string())
+    }
+
+    /// Checks that the page is where a session may be, and takes it back
+    /// to the last such place if it is not.
+    ///
+    /// The requests Chrome makes are judged before they are sent, but a
+    /// page can change its address without one: a route kept after the
+    /// hash, or one written by script. Those are found here, after the
+    /// fact, and undone.
+    async fn hold(&mut self, refused: &mut Vec<String>) -> Result<(), Broken> {
+        let at = self.address().await?;
+        let why = match Url::parse(&at) {
+            // Chrome's page for a page it could not get: the shop did not
+            // answer, or the guard would not let the browser dial it.
+            Ok(url) if url.scheme() == "chrome-error" => "that page could not be loaded".to_string(),
+            Ok(url) => match address_refused(&self.shop, &url) {
+                None => {
+                    self.good = Some(url);
+                    return Ok(());
+                }
+                Some(why) => why.why().to_string(),
+            },
+            Err(_) => "that led to no address at all".to_string(),
+        };
+        let Some(good) = self.good.clone() else {
+            return Err(Broken::Refused(why));
+        };
+        refused.push(format!("{why}; the session went back to the page it was on"));
+        if self.go(&good).await?.is_err() || self.address().await? != good.as_str() {
+            return Err(Broken::Failed("the page the session was on could not be opened again".into()));
+        }
+        Ok(())
+    }
+
+    /// The page as it is now, with what Chrome said in the meantime.
+    async fn done(&mut self, mut refused: Vec<String>, mut notes: Vec<String>) -> Result<Done, Broken> {
+        let page = self.in_page_patiently("pageInPage", &[json!(OUTLINE_CHARS), json!(self.from)]).await?;
+        let text = |key: &str| page[key].as_str().unwrap_or_default().to_string();
+        let status = {
+            let mut happened = self.shared.happened.lock().unwrap();
+            if happened.crashed {
+                return Err(Broken::Failed("the page crashed".into()));
+            }
+            for why in happened.refused.drain(..) {
+                if !refused.contains(&why) {
+                    refused.push(why);
+                }
+            }
+            notes.append(&mut happened.notes);
+            happened.status
+        };
+        let seen = Seen { title: text("title"), url: text("url"), text: text("text"), more: page["more"] == true, status, html: text("html") };
+        Ok(Done { refused, notes, seen })
+    }
+}
+
+impl Page for Tab {
+    async fn act(&mut self, action: &Action) -> Result<Done, Broken> {
+        let mut refused = Vec::new();
+        // A page can move itself between two actions; where it is now is
+        // settled before anything is done to it.
+        self.hold(&mut refused).await?;
+        match action {
+            Action::Read { more } => {
+                self.from = if *more { self.from + OUTLINE_CHARS } else { 0 };
+            }
+        }
+        self.hold(&mut refused).await?;
+        self.done(refused, Vec::new()).await
+    }
+
+    async fn close(self) {
+        self.watcher.abort();
+        // Chrome first, and until it is gone: the profile goes with `self`,
+        // and a Chrome still writing to it would leave half of it behind.
+        self.pipe.stop().await;
+    }
+}
+
+/// What `watch` needs to know its own page by.
+struct Watched {
+    shop: Shop,
+    session: String,
+    frame: String,
+    target: String,
+}
+
+/// Listens to Chrome for as long as it runs, and answers what cannot wait
+/// for the session's next action: a request held for a verdict, a dialog,
+/// another window.
+async fn watch(pipe: Arc<Pipe>, mut said: mpsc::UnboundedReceiver<Event>, shared: Arc<Shared>, page: Watched) {
+    while let Some(event) = said.recv().await {
+        let ours = event.session.as_deref() == Some(page.session.as_str());
+        let main = event.params["frameId"] == page.frame.as_str();
+        let on = event.session.as_deref();
+        match event.method.as_str() {
+            "Fetch.requestPaused" => {
+                let request = json!({ "requestId": event.params["requestId"] });
+                let verdict = if !ours {
+                    // Another window's, on its way to being closed.
+                    Some(None)
+                } else if main && event.params["resourceType"] == "Document" {
+                    match Url::parse(event.params["request"]["url"].as_str().unwrap_or_default()) {
+                        Ok(url) => address_refused(&page.shop, &url).map(|why| Some(why.why().to_string())),
+                        Err(_) => Some(Some("that led to no address at all".to_string())),
+                    }
+                } else {
+                    None
+                };
+                let sent = match verdict {
+                    None => pipe.send("Fetch.continueRequest", request, on).await,
+                    Some(why) => {
+                        if let Some(why) = why {
+                            shared.refuse(why);
+                        }
+                        // Aborted, and not blocked: an aborted navigation
+                        // leaves the page where it was, where a blocked one
+                        // replaces it with Chrome's page about the error.
+                        let mut request = request;
+                        request["errorReason"] = "Aborted".into();
+                        pipe.send("Fetch.failRequest", request, on).await
+                    }
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+            "Network.responseReceived" if ours && main && event.params["type"] == "Document" => {
+                let status = event.params["response"]["status"].as_u64().and_then(|status| u16::try_from(status).ok());
+                shared.happened.lock().unwrap().status = status;
+            }
+            "Page.frameStartedLoading" if ours && main => {
+                shared.loading.send_replace(true);
+            }
+            "Page.frameStoppedLoading" if ours && main => {
+                shared.loading.send_replace(false);
+            }
+            "Page.javascriptDialogOpening" if ours => {
+                // An alert would hold every later call, and nobody is here
+                // to read it. Dismissed, except the one that asks before
+                // leaving, which would keep the session where it is.
+                let leaving = event.params["type"] == "beforeunload";
+                if !leaving {
+                    let message: String = event.params["message"].as_str().unwrap_or_default().chars().take(200).collect();
+                    shared.happened.lock().unwrap().notes.push(format!("The page put up a message, which was dismissed: \"{message}\""));
+                }
+                let _ = pipe.send("Page.handleJavaScriptDialog", json!({ "accept": leaving }), on).await;
+            }
+            "Target.attachedToTarget" => {
+                let born = &event.params["targetInfo"];
+                if born["type"] == "page" && born["targetId"] != page.target.as_str() {
+                    shared.refuse("the page tried to open another window, and a session has one page".to_string());
+                    let theirs = event.params["sessionId"].as_str();
+                    // It is waiting to be let run, and the page that opened
+                    // it waits with it (measured on Chrome 157: closed
+                    // while held, the opener's own press was never
+                    // answered). So it is let run with every request of its
+                    // own held and failed above, and then closed.
+                    let _ = pipe.call("Fetch.enable", json!({ "patterns": [{ "urlPattern": "*" }] }), theirs).await;
+                    let _ = pipe.call("Runtime.runIfWaitingForDebugger", json!({}), theirs).await;
+                    let _ = pipe.call("Target.closeTarget", json!({ "targetId": born["targetId"] }), None).await;
+                }
+            }
+            "Page.fileChooserOpened" if ours => {
+                shared.refuse("the page asked for a file, and a session uploads nothing".to_string());
+            }
+            "Browser.downloadWillBegin" => {
+                shared.refuse("the page offered a file to save, and a session downloads nothing".to_string());
+            }
+            "Inspector.targetCrashed" if ours => {
+                shared.happened.lock().unwrap().crashed = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{self, html, Pages};
+
+    /// A session on `path` of a test's own server, or `None` on a machine
+    /// with no Chrome, after saying so.
+    async fn open(pages: &Pages, path: &str) -> Option<(Tab, Done)> {
+        let chrome = Chrome::reaching(testing::chrome_or_skip()?, pages.addr);
+        let url = Url::parse(&pages.url(path)).unwrap();
+        Some(chrome.open(&Shop::of(&url).unwrap(), &url).await.expect("the session opens"))
+    }
+
+    /// The page the prototype's own outline test read, less its script.
+    const WIDGET: &str = r#"<!doctype html><title>Widget</title><body>
+        <div id="cookie-banner"><p>Cookies?</p><button>Alleen noodzakelijk</button><button>Alles accepteren</button></div>
+        <main>
+          <h1>Widget</h1>
+          <p class="price"><span>259</span><span>,-</span></p>
+          <p class="price">€ <span>12</span><sup>,99</sup> per stuk</p>
+          <p>Two <b>bold</b> words and a <a href="/next">link to press</a>.</p>
+          <label for="pc">Postcode</label><input id="pc" name="postcode">
+          <select aria-label="Maat"><option>S</option><option selected>M</option></select>
+          <p style="display:none">hidden 999,99</p>
+          <button aria-hidden="true">not for anyone</button>
+        </main>
+        <footer><a href="/about">Over ons</a></footer>
+      </body>"#;
+
+    #[tokio::test]
+    async fn a_session_opens_on_a_page_and_is_shown_its_outline() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[("/p/widget", html(WIDGET))]).await;
+        let Some((tab, done)) = open(&pages, "/p/widget").await else { return };
+        let seen = &done.seen;
+        assert_eq!(done.refused, Vec::<String>::new());
+        assert_eq!(seen.title, "Widget");
+        assert_eq!(seen.url, pages.url("/p/widget"));
+        assert_eq!(seen.status, Some(200));
+        assert!(!seen.more);
+        // An amount the page writes in pieces is kept whole.
+        assert!(seen.text.contains("259,-"), "{}", seen.text);
+        assert!(seen.text.contains("12,99"), "{}", seen.text);
+        assert!(seen.text.contains("Two bold words and a"), "{}", seen.text);
+        assert!(!seen.text.contains("999,99") && !seen.text.contains("not for anyone"), "{}", seen.text);
+        // What sits in front of the page comes first, then the page, then what is around it.
+        let at = |needle: &str| seen.text.find(needle).unwrap_or_else(|| panic!("{needle} in {}", seen.text));
+        assert!(at("Alleen noodzakelijk") < at("Widget") && at("Widget") < at("Over ons"), "{}", seen.text);
+        // The things that can be pressed are numbered, in the order they are read.
+        for numbered in [
+            r#"[1] button "Alleen noodzakelijk""#,
+            r#"[2] button "Alles accepteren""#,
+            r#"[3] link "link to press""#,
+            r#"[4] field "Postcode""#,
+            r#"[5] list "Maat": S | *M"#,
+            r#"[6] link "Over ons""#,
+        ] {
+            assert!(seen.text.contains(numbered), "{numbered} in {}", seen.text);
+        }
+        // The markup rides along for the one who judges a refusal, and is the page's own.
+        assert!(seen.html.contains(r#"<p style="display:none">hidden 999,99</p>"#), "{}", seen.html);
+        assert_eq!(pages.asked(), ["GET /p/widget"]);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_long_page_is_read_in_parts_of_6000_characters() {
+        let _one_of_few = testing::gate().await;
+        let lines: String = (1..=400).map(|n| format!("<p>Line {n:03} of the widget's description.</p>")).collect();
+        let pages = Pages::serve(&[("/long", html(&format!("<title>Long</title><main>{lines}<a href='/end'>the last link</a></main>")))]).await;
+        let Some((mut tab, first)) = open(&pages, "/long").await else { return };
+        assert!(first.seen.more);
+        assert_eq!(first.seen.text.chars().count(), OUTLINE_CHARS);
+        assert!(first.seen.text.contains("Line 001") && !first.seen.text.contains("Line 400"));
+
+        let next = tab.act(&Action::Read { more: true }).await.unwrap();
+        assert!(!next.seen.text.contains("Line 001"));
+        assert!(next.seen.text.chars().count() <= OUTLINE_CHARS);
+        // Read on to the end: the parts join without a gap or a repeat.
+        let mut whole = first.seen.text.clone() + &next.seen.text;
+        let mut last = next;
+        while last.seen.more {
+            last = tab.act(&Action::Read { more: true }).await.unwrap();
+            whole += &last.seen.text;
+        }
+        for n in 1..=400 {
+            assert_eq!(whole.matches(&format!("Line {n:03} of")).count(), 1, "line {n}");
+        }
+        assert!(whole.ends_with(r#"link "the last link""#), "{}", &whole[whole.len() - 80..]);
+        // A plain read starts again at the top.
+        let again = tab.act(&Action::Read { more: false }).await.unwrap();
+        assert_eq!(again.seen.text, first.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_on_an_address_the_guard_refuses_never_starts() {
+        // No test server is let through here, so loopback is what it is to
+        // the guard. No Chrome is needed to be told no.
+        let chrome = Chrome::new(PathBuf::from("/definitely/not/chrome"));
+        for address in ["http://127.0.0.1:9090/metrics", "http://localhost:9090/", "http://169.254.169.254/latest/meta-data/", "http://10.0.0.1/"] {
+            let url = Url::parse(address).unwrap();
+            let refused = chrome.open(&Shop::of(&url).unwrap(), &url).await.err();
+            assert_eq!(refused, Some(Broken::Refused(NOT_PUBLIC.to_string())), "{address}");
+        }
+    }
+}

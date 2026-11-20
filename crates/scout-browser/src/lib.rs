@@ -9,7 +9,14 @@
 //! "Chromium in a pod of its own" and "The shop desk".
 
 pub mod address;
+pub mod chrome;
+pub mod drive;
 pub mod limits;
+pub mod pipe;
 pub mod site;
+pub mod tab;
 pub mod typing;
 pub mod wall;
+
+#[cfg(test)]
+mod testing;

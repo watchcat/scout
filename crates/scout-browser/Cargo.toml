@@ -11,9 +11,14 @@ description = "A shop's page driven over HTTP, one shop a session"
 # `fetch_page` knows it by. That links all of scout-core into this crate;
 # nothing in scout-core knows this crate exists.
 scout-core = { path = "../scout-core" }
-serde ={ version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 url = "2"
+# A session's profile directory, removed on every way out of a session,
+# a panic included, by the directory's own `Drop`.
+tempfile = "3"
 # The Public Suffix List, compiled in. "One shop a session" is a comparison
 # of registrable domains, and the list is the only thing that knows where
 # one ends: under `co.za` a shop has three labels, under a shop platform's
@@ -24,4 +29,6 @@ psl = "2"
 [dev-dependencies]
 # Paused time, so that a session waiting out its three minutes for a free
 # place is a test that finishes at once.
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["net", "test-util"] }
+# The pages a session is tested on: each test serves its own, on loopback.
+axum = "0.8.9"

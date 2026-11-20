@@ -230,6 +230,7 @@ function targetInPage(n) {
     covered: point ? null : over ? wordsOf(over) : '',
     said: saidOf(el) || '',
     field: fieldOf(el),
+    key: JSON.stringify(fieldOf(el)),
   }
 }
 
@@ -288,16 +289,63 @@ function fieldOf(el) {
   }
 }
 
-// Puts the caret in the thing numbered n and says whether it is there: what
-// is typed next goes to whatever has the focus, and a page can move it.
-function focusInPage(n) {
-  const el = numbered(n)
-  if (!el) return false
-  el.focus()
-  if (el.select) el.select()
+// What holds the caret, through whatever keeps its own inside.
+function caretHolder() {
   let active = document.activeElement
   while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement
-  return active === el
+  return active
+}
+
+// Types text into the thing numbered n, all in this one turn of script.
+//
+// `judged` is what the page said of the field when it was judged
+// (targetInPage's `key`). Giving a field the caret is something a page
+// hears, and it can answer by handing the caret on or by becoming another
+// kind of field; so both are looked at again here, after the caret is
+// given, and the text goes in before this function returns. Nothing the
+// page puts off for later, a promise or a timer, runs in between: a script
+// that is running is not interrupted by another. (The prototype, and this
+// crate at first, judged, gave the caret and typed in three calls, and a
+// promise made on focus moved the caret to a password field between the
+// second and the third.)
+//
+// What a page might still do is answer the typing itself, while it happens.
+// So where the browser says text went is listened for, and text found to
+// have gone into anything else is taken out again and reported. No page was
+// found that gets it there: one that moves the caret on hearing the typing
+// begin, a key go down, the text go in or the field's text be selected still
+// has the text in the field that was judged (the crate's test, Chrome 157).
+// The check stays for the page that was not thought of.
+function typeInPage(n, text, judged) {
+  const el = numbered(n)
+  if (!el) return NOT_NUMBERED(n)
+  el.focus()
+  if (el.select) el.select()
+  if (caretHolder() !== el) return { moved: true }
+  if (JSON.stringify(fieldOf(el)) !== judged) return { changed: true }
+  const strays = []
+  const heard = (event) => {
+    const into = event.composedPath ? event.composedPath()[0] : event.target
+    if (event.isTrusted && into !== el && !strays.includes(into)) strays.push(into)
+  }
+  addEventListener('input', heard, true)
+  const typed = document.execCommand('insertText', false, text)
+  removeEventListener('input', heard, true)
+  let left = 0
+  for (const stray of strays) {
+    // Back to what it held, if the browser will take the typing back;
+    // failing that, the text itself is cut out of it.
+    if (caretHolder() === stray) document.execCommand('undo')
+    if (typeof stray.value === 'string' && stray.value.includes(text)) stray.value = stray.value.split(text).join('')
+    if (typeof stray.value === 'string' ? stray.value.includes(text) : true) left += 1
+  }
+  return { typed, strayed: strays.length, left }
+}
+
+// Whether the thing numbered n holds the caret.
+function holdsCaretInPage(n) {
+  const el = numbered(n)
+  return !!el && caretHolder() === el
 }
 
 // Whether two wordings name the same option: a model writes a hyphen where

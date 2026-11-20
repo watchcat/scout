@@ -285,6 +285,9 @@ struct Target {
     said: String,
     /// What the page says of it as a field.
     field: Field,
+    /// The same as the page wrote it down, to hold against what the field
+    /// says of itself once it has been given the caret.
+    key: String,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
@@ -507,7 +510,7 @@ impl Tab {
     }
 
     /// Types `text` into the field numbered `n`, or says in `refused` why not.
-    async fn type_into(&mut self, n: u32, text: &str, enter: bool, refused: &mut Vec<String>) -> Result<(), Broken> {
+    async fn type_into(&mut self, n: u32, text: &str, enter: bool, refused: &mut Vec<String>, notes: &mut Vec<String>) -> Result<(), Broken> {
         let target = match self.target(n).await? {
             Ok(target) => target,
             Err(why) => {
@@ -519,14 +522,49 @@ impl Tab {
             refused.push(why.to_string());
             return Ok(());
         }
-        // What is typed goes to whatever holds the caret, and the field
-        // that was judged is not that until the page has let it be.
-        if self.in_page_patiently("focusInPage", &[json!(n)]).await? != true {
+        // The caret is given, the field is looked at again against what
+        // was judged, and the text is put in, all in one turn of script in
+        // the page: `typeInPage` says why. Asked once and not again: an
+        // answer that did not come may be of a typing that did happen.
+        let typed = match self.in_page("typeInPage", &[json!(n), json!(text), json!(target.key)]).await {
+            Ok(typed) => typed,
+            Err(CallError::Answered(why)) => {
+                refused.push(format!("the page did not say whether that was typed: {why}"));
+                return Ok(());
+            }
+            Err(e) => return Err(gone(e)),
+        };
+        if let Some(why) = typed["error"].as_str() {
+            refused.push(why.to_string());
+            return Ok(());
+        }
+        if typed["moved"] == true {
             refused.push("the page moved the caret away from that field, so nothing was typed".to_string());
             return Ok(());
         }
-        self.call("Input.insertText", json!({ "text": text })).await.map_err(gone)?;
+        if typed["changed"] == true {
+            refused.push("the page changed what that field is as it was given the caret, so nothing was typed".to_string());
+            return Ok(());
+        }
+        if typed["strayed"].as_u64().unwrap_or_default() > 0 {
+            let undone = if typed["left"].as_u64().unwrap_or_default() == 0 { "it was taken out again" } else { "not all of it could be taken out again" };
+            return Err(Broken::Strayed(format!("what was typed into {} went into another field as well; {undone}, and the session is over", target.said)));
+        }
+        if typed["typed"] != true {
+            refused.push("that field did not take what was typed".to_string());
+            return Ok(());
+        }
+        notes.push(format!("Typed into: {}", target.said));
         if enter {
+            // Enter is a key, and a key goes to whatever holds the caret
+            // when it is pressed. A page that has taken the caret elsewhere
+            // since the typing gets no Enter there. This is asked and then
+            // done, in two calls, so a page can still move the caret in
+            // between: what is pressed there is Enter and nothing typed.
+            if self.in_page_patiently("holdsCaretInPage", &[json!(n)]).await? != true {
+                refused.push("the page took the caret from that field once it was typed into, so Enter was not pressed".to_string());
+                return Ok(());
+            }
             let key = |kind: &str| json!({ "type": kind, "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r" });
             self.call("Input.dispatchKeyEvent", key("keyDown")).await.map_err(gone)?;
             self.call("Input.dispatchKeyEvent", key("keyUp")).await.map_err(gone)?;
@@ -660,7 +698,7 @@ impl Page for Tab {
                 return self.done(refused, notes).await;
             }
             Action::Click { n } => self.click(*n, &mut refused, &mut notes).await?,
-            Action::Type { n, text, enter } => self.type_into(*n, text, *enter, &mut refused).await?,
+            Action::Type { n, text, enter } => self.type_into(*n, text, *enter, &mut refused, &mut notes).await?,
             Action::Select { n, option } => self.select(*n, option, &mut refused, &mut notes).await?,
             Action::Back => self.back(&mut refused).await?,
             Action::Open { url } => self.open(url, &mut refused).await?,
@@ -1668,22 +1706,165 @@ mod tests {
         tab.close().await;
     }
 
-    #[tokio::test]
-    async fn what_is_typed_goes_to_the_field_that_was_judged_or_nowhere() {
-        let _one_of_few = testing::gate().await;
-        // A postcode field that hands the caret to the password field
-        // beside it the moment it is given it.
-        let pages = Pages::serve(&[home(
-            r#"<label>Postcode <input name="postcode" onfocus="document.getElementById('pw').focus()"></label>
+    /// A postcode field that does `on_focus` when it is given the caret,
+    /// beside a password field, on a page that writes down the name and
+    /// the kind of every field anything is typed into.
+    fn a_field_that_answers_the_caret(on_focus: &str) -> (&'static str, testing::Reply) {
+        home(&format!(
+            r#"<label>Postcode <input name="postcode" onfocus="{on_focus}"></label>
                <label>Wachtwoord <input type="password" id="pw" name="pw"></label>
                <p>Typed into: <span id="typed">nothing</span></p>
-               <script>document.addEventListener('input', (e) => { document.getElementById('typed').textContent = e.target.name })</script>"#,
-        )])
-        .await;
+               <script>
+                 document.addEventListener('input', (e) => {{
+                   const typed = document.getElementById('typed')
+                   typed.textContent = (typed.textContent === 'nothing' ? '' : typed.textContent + ' ') + e.target.name + '/' + e.target.type
+                 }})
+               </script>"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_field_that_hands_the_caret_on_as_it_is_given_it_is_not_typed_into() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[a_field_that_answers_the_caret("document.getElementById('pw').focus()")]).await;
         let Some((mut tab, _)) = open(&pages, "/").await else { return };
         let done = type_into(&mut tab, 1, "1011 PN").await;
         assert_eq!(done.refused, ["the page moved the caret away from that field, so nothing was typed"]);
         assert!(done.seen.text.contains("Typed into: nothing"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_field_that_hands_the_caret_on_a_moment_later_has_been_typed_into_by_then() {
+        let _one_of_few = testing::gate().await;
+        // The judging, the caret and the typing were three calls, and a
+        // page's script ran between them: handed on in a promise, the
+        // caret was in the password field by the time anything was typed.
+        for later in ["Promise.resolve().then(() => document.getElementById('pw').focus())", "setTimeout(() => document.getElementById('pw').focus(), 0)"] {
+            let pages = Pages::serve(&[a_field_that_answers_the_caret(later)]).await;
+            let Some((mut tab, _)) = open(&pages, "/").await else { return };
+            let done = type_into(&mut tab, 1, "1011 PN").await;
+            assert_eq!(done.refused, NOTHING, "{later}");
+            // Typed where it was judged, and nowhere else.
+            assert!(done.seen.text.contains("Typed into: postcode/text\n") || done.seen.text.ends_with("Typed into: postcode/text"), "{later}: {}", done.seen.text);
+            assert!(done.seen.text.contains(r#"field "Postcode" = "1011 PN""#), "{later}: {}", done.seen.text);
+            tab.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_field_that_becomes_another_as_it_is_given_the_caret_is_not_typed_into() {
+        let _one_of_few = testing::gate().await;
+        // Judged as a postcode field, it was a password field by the time it was typed into.
+        let pages = Pages::serve(&[a_field_that_answers_the_caret("this.type = 'password'; this.name = 'secret'")]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = type_into(&mut tab, 1, "1011 PN").await;
+        assert_eq!(done.refused, ["the page changed what that field is as it was given the caret, so nothing was typed"]);
+        assert!(done.seen.text.contains("Typed into: nothing"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_page_that_answers_the_typing_itself_does_not_get_it_into_another_field() {
+        let _one_of_few = testing::gate().await;
+        // Not the caret being given, which is looked at again before
+        // anything is typed, but the typing: a page that asks to hear when
+        // text is about to go in, or has just gone in, and moves the caret
+        // to the password field then.
+        for hears in ["onbeforeinput", "oninput", "onkeydown", "onselect"] {
+            let pages = Pages::serve(&[home(&format!(
+                r#"<label>Postcode <input name="postcode" {hears}="document.getElementById('pw').focus()"></label>
+                   <label>Wachtwoord <input type="password" id="pw" name="pw"></label>
+                   <p>Typed into: <span id="typed">nothing</span></p>
+                   <script>
+                     document.addEventListener('input', (e) => {{
+                       const typed = document.getElementById('typed')
+                       typed.textContent = (typed.textContent === 'nothing' ? '' : typed.textContent + ' ') + e.target.name + '/' + e.target.type
+                     }})
+                   </script>"#
+            ))])
+            .await;
+            let Some((mut tab, _)) = open(&pages, "/").await else { return };
+            let done = type_into(&mut tab, 1, "1011 PN").await;
+            // On Chrome 157 none of these gets the text anywhere but where
+            // it was judged. Were one to, the session would end instead.
+            assert_eq!(done.refused, NOTHING, "{hears}");
+            assert!(done.seen.text.contains(r#"field "Postcode" = "1011 PN""#), "{hears}: {}", done.seen.text);
+            assert!(done.seen.text.ends_with("Typed into: postcode/text"), "{hears}: {}", done.seen.text);
+            tab.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_says_what_was_typed_into() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(FIELDS)]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        assert_eq!(type_into(&mut tab, 3, "1011 PN").await.notes, [r#"Typed into: field "Postcode""#]);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_page_that_has_drifted_to_a_checkout_is_left_before_anything_is_done_there() {
+        let _one_of_few = testing::gate().await;
+        // The incident the reading recorded: a postcode typed on a checkout
+        // page. This page becomes one by itself, with no request, a moment
+        // after it is opened, and tells its server where it was typed into.
+        let drifting = home(
+            r#"<label>Postcode <input name="postcode"></label>
+               <script>
+                 addEventListener('input', () => navigator.sendBeacon('/typed-at' + location.pathname))
+                 if (!sessionStorage.drifted) setTimeout(() => { sessionStorage.drifted = 1; history.pushState({}, '', '/checkout'); document.title = 'Checkout' }, 600)
+               </script>"#,
+        );
+        let typed_at = |pages: &Pages| pages.asked().iter().filter(|line| line.contains("/typed-at")).cloned().collect::<Vec<_>>();
+
+        let pages = Pages::serve(std::slice::from_ref(&drifting)).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let done = type_into(&mut tab, 1, "1011 PN").await;
+        assert_eq!(done.refused[0], format!("{}; the session went back to the page it was on", Refused::Checkout.why()));
+        assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(typed_at(&pages), NOTHING, "nothing was typed anywhere, least of all at the checkout");
+        tab.close().await;
+
+        // What that check is for: the same page and the same typing with
+        // only the look at where the page is left out. This is the inside
+        // of `act`, which no caller can reach.
+        let pages = Pages::serve(&[drifting]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let mut refused = Vec::new();
+        tab.type_into(1, "1011 PN", false, &mut refused, &mut Vec::new()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(typed_at(&pages), ["POST /typed-at/checkout"]);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_link_that_may_not_be_followed_is_not_so_much_as_pressed() {
+        let _one_of_few = testing::gate().await;
+        // Refused where it is asked for would be too late for a page that
+        // hears the press itself: this one writes down that it was pressed.
+        let heard = "document.querySelector('h1').textContent = 'Pressed: ' + this.textContent";
+        let pages = Pages::serve(&[
+            home(&format!(
+                r#"<a href="https://other.example/x" onmousedown="{heard}">another shop</a> <a href="/checkout" onmousedown="{heard}">Afrekenen</a>
+                   <a href="/next#top" onmousedown="{heard}; return false" onclick="return false">the next page</a>"#
+            )),
+            page("/next", "Next"),
+        ])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        for (n, why) in [(1, Refused::LeavesShop), (2, Refused::Checkout)] {
+            let done = press(&mut tab, n).await;
+            assert_eq!(done.refused, [why.why()]);
+            assert!(done.seen.text.contains("\nHome\n"), "{}", done.seen.text);
+        }
+        // A link that may be followed is pressed, and the page hears it: so the two above were not.
+        let done = press(&mut tab, 3).await;
+        assert!(done.seen.text.contains("Pressed: the next page"), "{}", done.seen.text);
         tab.close().await;
     }
 

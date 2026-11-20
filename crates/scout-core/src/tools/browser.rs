@@ -222,9 +222,9 @@ impl Renderer {
     }
 }
 
-/// What a render's profile says before Chrome first reads it. These are
-/// settings Chrome takes from its profile, so they are written there and not
-/// passed on the command line.
+/// What a render's profile says before Chrome first reads it: two settings
+/// Chrome keeps in its profile, written there because that is where it looks
+/// for them.
 ///
 /// `webrtc.ip_handling_policy`. The proxy carries TCP and WebRTC speaks UDP,
 /// from sockets Chrome opens itself. Measured 2026-11-20 on Chrome 157 with
@@ -506,10 +506,10 @@ mod live {
     /// are skipped through; one that waits on a request the server sits on
     /// has ICE stand still until the answer comes. Gathering wants both
     /// kinds of time, so a round here is a request held 200 ms and then a
-    /// timer — with that the first datagram left 0.25 s after the page was
-    /// served. Five rounds whatever happens, so that "nothing came" is said
-    /// after a second and not at once; up to twenty-five while `done()` is
-    /// false.
+    /// timer — with that the first datagram left a quarter of a second after
+    /// the page was served. Five rounds whatever happens, so that "nothing
+    /// came" is said after a second and not at once; up to twenty-five while
+    /// `done()` is false.
     const WAIT: &str = "const wait = async (done) => {
   for (let i = 0; i < 25 && (i < 5 || !done()); i++) {
     await fetch('/tick').catch(() => {});

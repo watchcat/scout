@@ -22,6 +22,9 @@
 //! - Chrome is pointed at a SOCKS5 proxy ([`serve_socks`]) that applies the
 //!   same rule to every connection it opens, so a redirect, a script that
 //!   navigates, or a rebinding name inside the browser meets the same fence.
+//!   That is every TCP connection; the UDP a page could have Chrome send
+//!   (WebRTC) never comes this way and is turned off where Chrome is
+//!   started, in `tools/browser.rs`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;

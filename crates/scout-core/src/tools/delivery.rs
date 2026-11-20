@@ -394,7 +394,10 @@ pub(crate) fn prompt(host: &str, country: &Country, text: &str) -> String {
 /// One row of the answer's `bands`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct AnswerBand {
-    pub from: f64,
+    /// Left out or null, it is from nothing: a flat fee is answered
+    /// `[{"cost": 4.95}]` as readily as with its `"from": 0`.
+    #[serde(default)]
+    pub from: Option<f64>,
     pub cost: f64,
 }
 
@@ -422,6 +425,22 @@ pub(crate) fn read_answer(answer: &str) -> anyhow::Result<Answer> {
     Ok(serde_json::from_str(&answer[start..=end])?)
 }
 
+/// What the answer's `by` says, past how it is spelt: `Order_Value`,
+/// `order value` and `order-value` are one word.
+fn by_word(said: &str) -> String {
+    said.chars().filter(|c| !matches!(c, ' ' | '-' | '_')).flat_map(char::to_lowercase).collect()
+}
+
+/// The answer's currency as an ISO code. A model asked for the code
+/// answers with the sign or the word as well; for the euro both are read.
+fn currency_code(said: Option<&str>) -> Option<String> {
+    let said = said?.trim();
+    if said == "€" || said.eq_ignore_ascii_case("euro") {
+        return Some("EUR".to_string());
+    }
+    (said.len() == 3 && said.chars().all(|c| c.is_ascii_alphabetic())).then(|| said.to_ascii_uppercase())
+}
+
 /// More rows than a table by order value has: zooplus.nl's has three. Not
 /// a measurement of shops; a bound on what one answer can put in a row.
 const MAX_BANDS: usize = 6;
@@ -447,13 +466,16 @@ pub(crate) fn checked(answer: Answer, text: &str, host: &str, country: &Country)
         // it is a misreading more likely than a shop.
         return if home { (Terms::Silent, Some("no delivery to its own country")) } else { (Terms::NotDelivered, None) };
     }
-    match answer.by.as_deref() {
-        Some("order_value") => {}
-        // Anything else it goes by is nothing an offer says.
-        Some(_) => return (Terms::Depends, None),
+    match answer.by.as_deref().map(by_word).as_deref() {
+        Some("ordervalue") => {}
+        // Something an offer does not say: nothing can be applied.
+        Some("other") => return (Terms::Depends, None),
+        // A word nobody asked for is not "by weight or destination", which
+        // is what `depends` tells a person for thirty days.
+        Some(_) => return (Terms::Silent, Some("by not understood")),
         None => return (Terms::Silent, None),
     }
-    let bands: Vec<(f64, f64)> = answer.bands.unwrap_or_default().iter().map(|band| (band.from, band.cost)).collect();
+    let bands: Vec<(f64, f64)> = answer.bands.unwrap_or_default().iter().map(|band| (band.from.unwrap_or(0.0), band.cost)).collect();
     if bands.is_empty() {
         return (Terms::Silent, None);
     }
@@ -468,10 +490,7 @@ pub(crate) fn checked(answer: Answer, text: &str, host: &str, country: &Country)
     if !bands.iter().all(|(_, cost)| (0.0..=MAX_COST).contains(cost)) {
         return refused("cost out of range");
     }
-    let currency = answer.currency.unwrap_or_default().trim().to_uppercase();
-    if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_alphabetic()) {
-        return refused("no currency");
-    }
+    let Some(currency) = currency_code(answer.currency.as_deref()) else { return refused("no currency") };
     let mut amounts = bands.iter().flat_map(|(from, cost)| [*from, *cost]).filter(|amount| *amount > 0.0);
     if !amounts.all(|amount| page_states(text, amount)) {
         return refused("amount not on the page");
@@ -1160,7 +1179,7 @@ mod tests {
             Answer {
                 delivers: Some(true),
                 by: Some("order_value".to_string()),
-                bands: Some(vec![AnswerBand { from: 0.0, cost: 4.99 }, AnswerBand { from: 29.0, cost: 0.0 }]),
+                bands: Some(vec![AnswerBand { from: Some(0.0), cost: 4.99 }, AnswerBand { from: Some(29.0), cost: 0.0 }]),
                 currency: Some("EUR".to_string()),
             }
         );
@@ -1173,6 +1192,65 @@ mod tests {
         assert!(read_answer("I could not find the delivery costs on this page.").is_err());
         assert!(read_answer("} and then {").is_err());
         assert!(read_answer(r#"{"bands": [{"from": 0, "cost": "about five euros"}]}"#).is_err());
+        // A band may leave out where it starts: a flat fee starts at
+        // nothing. What it costs it has to say.
+        for flat in [r#"{"bands": [{"cost": 4.95}]}"#, r#"{"bands": [{"from": null, "cost": 4.95}]}"#] {
+            assert_eq!(read_answer(flat).unwrap().bands, Some(vec![AnswerBand { from: None, cost: 4.95 }]), "{flat}");
+        }
+        assert!(read_answer(r#"{"bands": [{"from": 0}]}"#).is_err());
+        assert!(read_answer(r#"{"bands": [{"from": 0, "cost": null}]}"#).is_err());
+    }
+
+    #[test]
+    fn a_flat_fee_answered_without_its_from_is_a_cost_from_nothing() {
+        let page = "Verzendkosten binnen Nederland: € 4,95 per bestelling.";
+        let mut flat = by_order_value(&[]);
+        flat.bands = Some(vec![AnswerBand { from: None, cost: 4.95 }]);
+        assert_eq!(checked(flat, page, "shop.example", nl()), (costs(&[(0.0, 4.95)]), None));
+        // Two bands that both start at nothing are not a table.
+        let mut twice = by_order_value(&[]);
+        twice.bands = Some(vec![AnswerBand { from: None, cost: 4.95 }, AnswerBand { from: None, cost: 0.0 }]);
+        assert_eq!(checked(twice, page, "shop.example", nl()), (Terms::Silent, Some("bands out of order")));
+    }
+
+    #[test]
+    fn the_euro_is_eur_however_the_model_spells_it() {
+        let page = "Verzendkosten binnen Nederland: € 5,49 per bestelling.";
+        let said = |currency: &str| {
+            let mut answer = by_order_value(&[(0.0, 5.49)]);
+            answer.currency = Some(currency.to_string());
+            checked(answer, page, "shop.example", nl())
+        };
+        for euro in ["EUR", "eur", " Eur ", "€", "euro", "EURO", "Euro"] {
+            assert_eq!(said(euro), (costs(&[(0.0, 5.49)]), None), "{euro:?}");
+        }
+        // Another currency is its own code, and words that are no code are none.
+        let (terms, _) = said("gbp");
+        assert_eq!(terms, Terms::Costs { bands: Bands(vec![(0.0, 5.49)]), currency: "GBP".to_string() });
+        for none in ["euros", "E", "", "pounds sterling"] {
+            assert_eq!(said(none), (Terms::Silent, Some("no currency")), "{none:?}");
+        }
+    }
+
+    #[test]
+    fn by_is_read_past_its_spelling_and_a_word_nobody_asked_for_is_not_weight() {
+        let page = "Verzendkosten binnen Nederland: € 5,49 per bestelling.";
+        let said = |by: &str| {
+            let mut answer = by_order_value(&[(0.0, 5.49)]);
+            answer.by = Some(by.to_string());
+            checked(answer, page, "shop.example", nl())
+        };
+        for spelt in ["order_value", "Order_Value", "order value", "ORDER-VALUE", "orderValue", " order_value "] {
+            assert_eq!(said(spelt), (costs(&[(0.0, 5.49)]), None), "{spelt:?}");
+        }
+        for spelt in ["other", "Other", " OTHER "] {
+            assert_eq!(said(spelt), (Terms::Depends, None), "{spelt:?}");
+        }
+        // "flat" is not "by weight or destination", and kept as that it
+        // would say so of the shop for thirty days. Nothing is kept of it.
+        for unknown in ["flat", "weight", "fixed", ""] {
+            assert_eq!(said(unknown), (Terms::Silent, Some("by not understood")), "{unknown:?}");
+        }
     }
 
     #[test]
@@ -1215,7 +1293,7 @@ mod tests {
         Answer {
             delivers: Some(true),
             by: Some("order_value".to_string()),
-            bands: Some(bands.iter().map(|&(from, cost)| AnswerBand { from, cost }).collect()),
+            bands: Some(bands.iter().map(|&(from, cost)| AnswerBand { from: Some(from), cost }).collect()),
             currency: Some("EUR".to_string()),
         }
     }
@@ -1307,10 +1385,6 @@ mod tests {
         let mut listed = by_order_value(&[(0.0, 17.2), (2.0, 21.5), (5.0, 27.9)]);
         listed.by = Some("other".to_string());
         assert_eq!(checked(listed, page, "shop.example", nl()).0, Terms::Depends);
-        // A word of its own for it is still not order value.
-        let mut weight = by_order_value(&[(0.0, 17.2)]);
-        weight.by = Some("weight".to_string());
-        assert_eq!(checked(weight, page, "shop.example", nl()).0, Terms::Depends);
     }
 
     #[test]

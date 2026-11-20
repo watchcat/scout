@@ -149,12 +149,11 @@ fn dialogs(html: &str, lower: &str, budget: &mut Budget) -> Vec<(usize, usize)> 
             }
             continue;
         }
-        // A closing tag with nothing of its name open closes nothing.
-        if *depth == 0 {
-            continue;
-        }
+        // A closing tag with nothing of its name open closes nothing, and
+        // the count cannot go below nought.
+        let Some(still_open) = depth.checked_sub(1) else { continue };
         let start = marked.remove(&(tag.name, *depth));
-        *depth -= 1;
+        *depth = still_open;
         let Some(start) = start else { continue };
         match says_it_is_one(&html[start..tag.end], budget) {
             Some(true) => {}

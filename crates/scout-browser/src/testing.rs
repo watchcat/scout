@@ -50,6 +50,25 @@ pub fn html(body: &str) -> Reply {
     Reply { status: 200, headers: vec![("content-type", "text/html; charset=utf-8".into())], body: body.into() }
 }
 
+/// A page with another status than 200.
+pub fn status(status: u16, body: &str) -> Reply {
+    Reply { status, ..html(body) }
+}
+
+/// A redirect.
+pub fn redirect(to: &str) -> Reply {
+    Reply { status: 302, headers: vec![("location", to.into())], body: String::new() }
+}
+
+/// A file the server wants saved, not shown.
+pub fn attachment(name: &str, body: &str) -> Reply {
+    Reply {
+        status: 200,
+        headers: vec![("content-type", "application/octet-stream".into()), ("content-disposition", format!("attachment; filename=\"{name}\""))],
+        body: body.into(),
+    }
+}
+
 /// A server on a loopback port of its own, and what it was asked for.
 pub struct Pages {
     pub addr: SocketAddr,
@@ -108,6 +127,11 @@ impl Pages {
     /// for unbidden.
     pub fn asked(&self) -> Vec<String> {
         self.asked.lock().unwrap().iter().filter(|line| !line.ends_with("/favicon.ico")).cloned().collect()
+    }
+
+    /// Whether anything asked for `path`.
+    pub fn was_asked(&self, path: &str) -> bool {
+        self.asked().iter().any(|line| line.split(' ').nth(1).is_some_and(|asked| asked.split('?').next() == Some(path)))
     }
 }
 

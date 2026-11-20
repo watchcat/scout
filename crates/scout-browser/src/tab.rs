@@ -14,7 +14,7 @@
 //! - a press landed on whatever lay over the thing pressed. Here a press is
 //!   only made where the thing itself is.
 
-use crate::address::address_refused;
+use crate::address::{address_refused, link_refused};
 use crate::chrome::chrome_args;
 use crate::drive::{Action, Broken, Browser, Done, Page, Seen, OUTLINE_CHARS};
 use crate::pipe::{CallError, Event, Pipe};
@@ -158,7 +158,10 @@ struct Happened {
     status: Option<u16>,
     refused: Vec<String>,
     notes: Vec<String>,
-    crashed: bool,
+    /// Downloads Chrome has reported stopping.
+    downloads_denied: u32,
+    /// Why the session cannot go on, once it cannot.
+    broke: Option<&'static str>,
 }
 
 struct Shared {
@@ -198,6 +201,27 @@ pub struct Tab {
 
 fn gone(e: CallError) -> Broken {
     Broken::Failed(e.to_string())
+}
+
+/// The thing a number stands for, as `targetInPage` describes it.
+#[derive(Debug, serde::Deserialize)]
+struct Target {
+    /// Where a link goes, in full.
+    href: Option<String>,
+    /// Whether it is a field for choosing a file.
+    upload: bool,
+    /// Whether it has a box on the page at all.
+    sized: bool,
+    /// Where a press would land on the thing itself, if anywhere.
+    point: Option<Point>,
+    /// What lies over it, where something does.
+    covered: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+struct Point {
+    x: f64,
+    y: f64,
 }
 
 impl Tab {
@@ -339,14 +363,63 @@ impl Tab {
         Ok(())
     }
 
+    /// What the thing numbered `n` is, or `Err` with why there is none.
+    async fn target(&self, n: u32) -> Result<Result<Target, String>, Broken> {
+        let found = self.in_page_patiently("targetInPage", &[json!(n)]).await?;
+        if let Some(error) = found["error"].as_str() {
+            return Ok(Err(error.to_string()));
+        }
+        serde_json::from_value(found).map(Ok).map_err(|e| Broken::Failed(format!("the page's answer could not be read: {e}")))
+    }
+
+    /// Presses the thing numbered `n`, or says in `refused` why it was not.
+    async fn click(&mut self, n: u32, refused: &mut Vec<String>) -> Result<(), Broken> {
+        let target = match self.target(n).await? {
+            Ok(target) => target,
+            Err(why) => {
+                refused.push(why);
+                return Ok(());
+            }
+        };
+        if target.upload {
+            refused.push("that is for choosing a file, and a session uploads nothing".to_string());
+            return Ok(());
+        }
+        // A link says where it goes, so one that may not be followed is
+        // not pressed at all. Where a press leads that does not say so
+        // beforehand is judged when Chrome asks for it.
+        if let Some(why) = target.href.as_deref().and_then(|href| link_refused(&self.shop, href)) {
+            refused.push(why.why().to_string());
+            return Ok(());
+        }
+        match (target.point, target.sized) {
+            (Some(at), _) => {
+                let mouse = |kind: &str| json!({ "type": kind, "x": at.x, "y": at.y, "button": "left", "clickCount": 1 });
+                self.call("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": at.x, "y": at.y })).await.map_err(gone)?;
+                self.call("Input.dispatchMouseEvent", mouse("mousePressed")).await.map_err(gone)?;
+                self.call("Input.dispatchMouseEvent", mouse("mouseReleased")).await.map_err(gone)?;
+            }
+            (None, true) => {
+                let over = target.covered.unwrap_or_default();
+                refused.push(format!("something lies over that and would take the press: \"{over}\""));
+            }
+            // A thing with no box, such as a tick box drawn by its label,
+            // has no place to press. It is pressed as a script would.
+            (None, false) => {
+                self.in_page_patiently("pressInPage", &[json!(n)]).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// The page as it is now, with what Chrome said in the meantime.
     async fn done(&mut self, mut refused: Vec<String>, mut notes: Vec<String>) -> Result<Done, Broken> {
         let page = self.in_page_patiently("pageInPage", &[json!(OUTLINE_CHARS), json!(self.from)]).await?;
         let text = |key: &str| page[key].as_str().unwrap_or_default().to_string();
         let status = {
             let mut happened = self.shared.happened.lock().unwrap();
-            if happened.crashed {
-                return Err(Broken::Failed("the page crashed".into()));
+            if let Some(why) = happened.broke {
+                return Err(Broken::Failed(why.into()));
             }
             for why in happened.refused.drain(..) {
                 if !refused.contains(&why) {
@@ -370,8 +443,14 @@ impl Page for Tab {
         match action {
             Action::Read { more } => {
                 self.from = if *more { self.from + OUTLINE_CHARS } else { 0 };
+                return self.done(refused, Vec::new()).await;
             }
+            Action::Click { n } => self.click(*n, &mut refused).await?,
         }
+        // Whatever was done, the next outline starts at the top of what
+        // the page is now, once it has come to rest and is where it may be.
+        self.from = 0;
+        self.settle().await;
         self.hold(&mut refused).await?;
         self.done(refused, Vec::new()).await
     }
@@ -474,8 +553,20 @@ async fn watch(pipe: Arc<Pipe>, mut said: mpsc::UnboundedReceiver<Event>, shared
             "Browser.downloadWillBegin" => {
                 shared.refuse("the page offered a file to save, and a session downloads nothing".to_string());
             }
+            "Browser.downloadProgress" => {
+                // Chrome was told to deny every download, and says here
+                // that it did. Should one ever be saved all the same, the
+                // session is not one to go on with.
+                let state = event.params["state"].as_str().unwrap_or_default();
+                let mut happened = shared.happened.lock().unwrap();
+                match state {
+                    "canceled" => happened.downloads_denied += 1,
+                    "completed" => happened.broke = Some("a file was downloaded, which a session never does"),
+                    _ => {}
+                }
+            }
             "Inspector.targetCrashed" if ours => {
-                shared.happened.lock().unwrap().crashed = true;
+                shared.happened.lock().unwrap().broke = Some("the page crashed");
             }
             _ => {}
         }
@@ -587,5 +678,342 @@ mod tests {
             let refused = chrome.open(&Shop::of(&url).unwrap(), &url).await.err();
             assert_eq!(refused, Some(Broken::Refused(NOT_PUBLIC.to_string())), "{address}");
         }
+    }
+
+    // ------------------------------------------------------------ a press
+
+    use crate::address::Refused;
+    use crate::testing::{attachment, redirect, status};
+
+    const NOTHING: Vec<String> = Vec::new();
+
+    /// A page called Home with `body` in it, at `/`.
+    fn home(body: &str) -> (&'static str, testing::Reply) {
+        ("/", html(&format!("<!doctype html><title>Home</title><main><h1>Home</h1>{body}</main>")))
+    }
+
+    fn page(path: &'static str, title: &str) -> (&'static str, testing::Reply) {
+        (path, html(&format!("<!doctype html><title>{title}</title><main><h1>{title}</h1></main>")))
+    }
+
+    async fn press(tab: &mut Tab, n: u32) -> Done {
+        tab.act(&Action::Click { n }).await.expect("the browser answers")
+    }
+
+    #[tokio::test]
+    async fn a_press_follows_a_link_to_another_page_of_the_shop() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(r#"<a href="/next">the next page</a>"#), page("/next", "Next")]).await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert!(first.seen.text.contains(r#"[1] link "the next page""#), "{}", first.seen.text);
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.refused, NOTHING);
+        assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Next", pages.url("/next").as_str()));
+        assert_eq!(pages.asked(), ["GET /", "GET /next"]);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_link_that_leaves_the_shop_is_refused_and_not_pressed() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(r#"<a href="https://other.example/x">another shop</a>"#)]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.refused, [Refused::LeavesShop.why()]);
+        assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_redirect_off_the_shop_is_refused_at_the_hop_and_the_page_stays() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[
+            home(r#"<a href="/out">a way out</a> <a href="/buy">buy it now</a>"#),
+            ("/out", redirect("https://other.example/landed")),
+            // And one that stays on the shop and ends in its checkout.
+            ("/buy", redirect("{base}/hop")),
+            ("/hop", redirect("{base}/checkout/address")),
+            page("/checkout/address", "Checkout"),
+        ])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.refused, [Refused::LeavesShop.why()]);
+        assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
+        // The first hop was the shop's and was made; the second never was.
+        assert!(pages.was_asked("/out"));
+
+        let done = press(&mut tab, 2).await;
+        assert_eq!(done.refused, [Refused::Checkout.why()]);
+        assert_eq!(done.seen.title, "Home");
+        assert!(pages.was_asked("/buy") && pages.was_asked("/hop"));
+        assert!(!pages.was_asked("/checkout/address"), "{:?}", pages.asked());
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_script_that_sends_the_page_off_the_shop_is_refused() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[
+            home(
+                r#"<button onclick="location.href = 'https://other.example/by-script'">leave by script</button>
+                   <button onclick="location.href = '/account/login'">sign in by script</button>
+                   <form action="https://other.example/form"><button>leave by a form</button></form>"#,
+            ),
+            page("/account/login", "Sign in"),
+        ])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.refused, [Refused::LeavesShop.why()]);
+        assert_eq!(done.seen.title, "Home");
+        let done = press(&mut tab, 2).await;
+        assert_eq!(done.refused, [Refused::SignIn.why()]);
+        assert_eq!(done.seen.title, "Home");
+        assert!(!pages.was_asked("/account/login"));
+        let done = press(&mut tab, 3).await;
+        assert_eq!(done.refused, [Refused::LeavesShop.why()]);
+        assert_eq!(done.seen.title, "Home");
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_checkout_or_a_sign_in_link_is_refused_before_anything_is_asked_of_the_shop() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[
+            home(r#"<a href="/checkout">Afrekenen</a> <a href="/account/login">Inloggen</a> <a href="/cart">Winkelwagen</a>"#),
+            page("/checkout", "Checkout"),
+            page("/account/login", "Sign in"),
+            page("/cart", "Basket"),
+        ])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        assert_eq!(press(&mut tab, 1).await.refused, [Refused::Checkout.why()]);
+        assert_eq!(press(&mut tab, 2).await.refused, [Refused::SignIn.why()]);
+        assert_eq!(pages.asked(), ["GET /"]);
+        // The basket is as far as a session goes, and it goes there.
+        let done = press(&mut tab, 3).await;
+        assert_eq!((done.refused, done.seen.title.as_str()), (NOTHING, "Basket"));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_checkout_reached_without_a_request_is_left_again() {
+        let _one_of_few = testing::gate().await;
+        let became = "document.title = 'Checkout'; document.querySelector('h1').textContent = 'Your order'";
+        let pages = Pages::serve(&[home(&format!(
+            r#"<button onclick="history.pushState({{}}, '', '/checkout'); {became}">by a written address</button>
+               <button onclick="location.hash = '/checkout'; {became}">by a route after the hash</button>"#
+        ))])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        for n in [1, 2] {
+            let done = press(&mut tab, n).await;
+            assert_eq!(done.refused, [format!("{}; the session went back to the page it was on", Refused::Checkout.why())], "press {n}");
+            assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()), "press {n}");
+            assert!(!done.seen.text.contains("Your order"), "{}", done.seen.text);
+        }
+        // No request for the checkout was ever made: there was none to refuse.
+        assert!(!pages.was_asked("/checkout"));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn nothing_is_downloaded() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(r#"<a href="/manual.bin">download the manual</a>"#), ("/manual.bin", attachment("widget-manual.bin", "not a manual"))]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.refused, ["the page offered a file to save, and a session downloads nothing"]);
+        assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
+        // Chrome says what became of the file, a moment after it says one
+        // was offered: stopped, and the session is still one to go on with.
+        for _ in 0..50 {
+            if tab.shared.happened.lock().unwrap().downloads_denied > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(tab.shared.happened.lock().unwrap().downloads_denied, 1);
+        assert_eq!(tab.act(&Action::Read { more: false }).await.map(|done| done.seen.title), Ok("Home".to_string()));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_link_that_would_start_another_program_is_not_pressed() {
+        let _one_of_few = testing::gate().await;
+        // Chrome is never asked for these, so nothing that judges requests
+        // would see them: the link is read before it is pressed.
+        let pages = Pages::serve(&[home(r#"<a href="mailto:?subject=widget">write to us</a> <a href="tel:0000">call us</a>"#)]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        for n in [1, 2] {
+            let done = press(&mut tab, n).await;
+            assert_eq!(done.refused, [Refused::NotWeb.why()]);
+            assert_eq!(done.seen.title, "Home");
+        }
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn nothing_is_uploaded() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(
+            r#"<label>A photo of the widget <input type="file" name="photo"></label>
+               <button onclick="document.querySelector('input').click()">choose a file</button>"#,
+        )])
+        .await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert!(first.seen.text.contains(r#"[1] file "A photo of the widget""#), "{}", first.seen.text);
+        // The field itself is not pressed.
+        assert_eq!(press(&mut tab, 1).await.refused, ["that is for choosing a file, and a session uploads nothing"]);
+        // A button that opens the chooser by script gets no chooser and no file.
+        let done = press(&mut tab, 2).await;
+        assert_eq!(done.refused, ["the page asked for a file, and a session uploads nothing"]);
+        assert_eq!(done.seen.title, "Home");
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn another_window_is_closed_before_it_has_fetched_anything() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[
+            home(
+                r#"<button onclick="const w = window.open('/popup'); document.querySelector('h1').textContent = 'Home, still'">in a window of its own</button>
+                   <a href="/elsewhere" target="_blank">in a new tab</a>"#,
+            ),
+            page("/popup", "Popup"),
+            page("/elsewhere", "Elsewhere"),
+        ])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.refused, ["the page tried to open another window, and a session has one page"]);
+        assert_eq!(done.seen.title, "Home");
+        // The page that asked for it goes on running.
+        assert!(done.seen.text.contains("Home, still"), "{}", done.seen.text);
+        assert!(!pages.was_asked("/popup"), "{:?}", pages.asked());
+        // A link that asks for a tab of its own is followed in the session's one page.
+        let done = press(&mut tab, 2).await;
+        assert_eq!((done.refused, done.seen.title.as_str()), (NOTHING, "Elsewhere"));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_permission_the_page_asks_for_is_refused_without_a_prompt() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(
+            r#"<button onclick="ask()">where am I</button><p id="answer">not asked</p>
+               <script>
+                 async function ask() {
+                   const notify = await Notification.requestPermission()
+                   const where = await new Promise((said) => navigator.geolocation.getCurrentPosition(() => said('given'), (e) => said('refused, code ' + e.code)))
+                   document.getElementById('answer').textContent = 'notifications ' + notify + '; location ' + where
+                 }
+               </script>"#,
+        )])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let mut done = press(&mut tab, 1).await;
+        // The answer comes when Chrome gives it, which is not when the page settles.
+        for _ in 0..50 {
+            if !done.seen.text.contains("not asked") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            done = tab.act(&Action::Read { more: false }).await.unwrap();
+        }
+        // Code 1 is PERMISSION_DENIED.
+        assert!(done.seen.text.contains("notifications denied; location refused, code 1"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_press_lands_on_the_thing_numbered_or_not_at_all() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(
+            r#"<button onclick="document.querySelector('h1').textContent = 'the button was pressed'">the button</button>
+               <div style="position: fixed; inset: 0; background: rgba(0, 0, 0, .5)"
+                    onclick="document.querySelector('h1').textContent = 'the overlay took the press'">Subscribe first</div>"#,
+        )])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.refused, [r#"something lies over that and would take the press: "Subscribe first""#]);
+        assert!(done.seen.text.contains("Home") && !done.seen.text.contains("took the press") && !done.seen.text.contains("was pressed"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_link_that_runs_over_two_lines_is_pressed_where_it_is() {
+        let _one_of_few = testing::gate().await;
+        // The middle of this link's box is on the second line, to the right
+        // of where the link ends: a press there lands on the paragraph.
+        let pages = Pages::serve(&[
+            home(r#"<p style="width: 300px; margin: 0; font: 16px/20px monospace">xxxxxxxxxxxxxxxxxxxx <a href="/next">aaaaaaa bbbb</a></p>"#),
+            page("/next", "Next"),
+        ])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 1).await;
+        assert_eq!((done.refused, done.seen.title.as_str()), (NOTHING, "Next"));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_number_that_is_not_on_the_page_is_said_to_be_so() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(r#"<a href="/next">the next page</a>"#)]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 99).await;
+        assert_eq!(done.refused, ["nothing is numbered 99 on this page now; read it again"]);
+        assert_eq!(pages.asked(), ["GET /"]);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_message_the_page_puts_up_is_dismissed_and_passed_on() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(r#"<button onclick="alert('Uitverkocht'); document.querySelector('h1').textContent = 'after the message'">in de winkelwagen</button>"#)]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.notes, [r#"The page put up a message, which was dismissed: "Uitverkocht""#]);
+        assert!(done.seen.text.contains("after the message"), "{}", done.seen.text);
+        assert_eq!(done.refused, NOTHING);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_guard_stands_between_a_session_and_the_rest_of_loopback() {
+        let _one_of_few = testing::gate().await;
+        // A second server, which no test lets a session through to: to the
+        // guard it is what a pod's own metrics listener is.
+        let neighbour = Pages::serve(&[("/secret", html("<title>Secret</title>secret_total 1")), ("/pixel", html("x"))]).await;
+        let pages = Pages::serve(&[home(&format!(
+            r#"<a href="http://{0}/secret">a neighbour</a><img src="http://{0}/pixel">
+               <script>fetch('http://{0}/secret').catch(() => {{}})</script>"#,
+            neighbour.addr
+        ))])
+        .await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert_eq!(first.seen.title, "Home");
+        // The same host by number, so the one-shop rule lets the link be
+        // pressed. What stops it is the proxy every connection goes through.
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.refused, ["that page could not be loaded; the session went back to the page it was on"]);
+        assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
+        assert!(!done.seen.text.contains("secret_total"), "{}", done.seen.text);
+        assert_eq!(neighbour.asked(), NOTHING, "neither the link, the picture nor the script reached it");
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_page_is_shown_with_the_status_it_came_with() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(r#"<a href="/blocked">a page the shop refuses</a>"#), ("/blocked", status(403, "<title>Shop</title>Nee."))]).await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert_eq!(first.seen.status, Some(200));
+        let done = press(&mut tab, 1).await;
+        assert_eq!((done.seen.status, done.seen.title.as_str()), (Some(403), "Shop"));
+        tab.close().await;
     }
 }

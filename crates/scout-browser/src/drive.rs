@@ -18,6 +18,8 @@ pub const OUTLINE_CHARS: usize = 6000;
 pub enum Action {
     /// The page again; with `more`, the next part of a long one.
     Read { more: bool },
+    /// Press the thing numbered `n`.
+    Click { n: u32 },
 }
 
 /// A page as a session is shown it.

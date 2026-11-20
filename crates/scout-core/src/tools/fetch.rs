@@ -53,6 +53,12 @@ pub enum FetchError {
     /// lost its price, and cannot do it by reading a sentence.
     #[error("{0}")]
     Refused(String),
+    /// The page answered with a status that is no page, and nothing else
+    /// was learnt of it. In the words it always had, for the model, and as
+    /// the number for the price watch: a 404 is a page that is gone, which
+    /// counts against a watch, and a 503 is a bad minute, which does not.
+    #[error("page returned HTTP {0}")]
+    Status(reqwest::StatusCode),
 }
 
 #[derive(Deserialize)]
@@ -83,6 +89,13 @@ pub struct PageContent {
     /// the delivery desk; the model is not shown it.
     #[serde(skip)]
     pub delivery_links: Vec<String>,
+    /// Set when this is the plain answer to a request a browser was wanted
+    /// for and none filled it: a shell whose content arrives by script. It
+    /// is handed back as it always was, and the model is not shown this;
+    /// it is for the price watch, to which such a page is not a page read
+    /// and found without a price but a page not read.
+    #[serde(skip)]
+    pub unrendered: bool,
 }
 
 /// A product as the page's schema.org markup describes it.
@@ -1170,9 +1183,12 @@ impl Tool for FetchPageTool {
         // A status alone is about this page: a 403 may be one directory and
         // a 503 one bad minute, so it is reported as it was and closes
         // nothing.
-        let Some(page) = plain else {
-            return Err(FetchError::Invalid(format!("page returned HTTP {status}")));
+        let Some(mut page) = plain else {
+            return Err(FetchError::Status(status));
         };
+        // What is left is the plain answer. Where a browser was wanted for
+        // it, none filled it: see `PageContent::unrendered`.
+        page.unrendered = worth_rendering(Some(status.as_u16()), &body, Some(&page));
         Ok(self.remember(key, &landed, page))
     }
 }
@@ -1208,7 +1224,7 @@ pub(crate) fn extract_page(html: &str, base: &Url) -> PageContent {
     } else {
         full_text
     };
-    PageContent { text, truncated, links, availability, product, delivery_links }
+    PageContent { text, truncated, links, availability, product, delivery_links, unrendered: false }
 }
 
 /// Remove `<tag ...>...</tag>` blocks wholesale (for script/style, whose
@@ -2769,12 +2785,38 @@ mod tests {
         assert!(err.to_string().contains("was not opened again"), "got: {err}");
         assert!(matches!(err, FetchError::Refused(_)), "got: {err:?}");
 
-        // A status alone is about the page, and a page that is gone is gone.
-        for status in [404, 410, 403, 500] {
+        // A status alone is about the page, and is handed over as the
+        // number it was: gone is not the same as a bad minute, and the
+        // price watch counts the two differently.
+        for status in [404, 410, 403, 429, 500, 503] {
             let server = serving(status, "").await;
             let err = tool_with(&server, None).call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.unwrap_err();
-            assert!(matches!(err, FetchError::Invalid(_)), "{status}: {err:?}");
+            assert!(matches!(&err, FetchError::Status(was) if was.as_u16() == status), "{status}: {err:?}");
+            assert!(err.to_string().starts_with(&format!("page returned HTTP {status}")), "the model reads what it read before: {err}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_shell_handed_back_because_no_browser_filled_it_is_marked_and_the_model_is_not_told() {
+        // A page whose content arrives by script, and no render came of it:
+        // none installed, none that started, or one that came back with
+        // the shell again. What is handed back is the plain answer, as
+        // before, and a caller that is not a model can know it for one.
+        for browser in [None, silent(), answering(SHELL)] {
+            let sent = browser.is_some();
+            let server = serving(200, SHELL).await;
+            let page = tool_with(&server, browser).call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.unwrap();
+            assert!(page.unrendered, "browser {sent}");
+            assert!(serde_json::to_value(&page).unwrap().get("unrendered").is_none(), "not a field of the tool's answer");
+        }
+        // A page that was read is not one: by the plain request, or by
+        // the browser sent after a shell.
+        let server = serving(200, &product_page()).await;
+        assert!(!tool_with(&server, None).call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.unwrap().unrendered);
+        let server = serving(200, SHELL).await;
+        let rendered = tool_with(&server, answering(&product_page())).call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.unwrap();
+        assert!(!rendered.unrendered);
+        assert_eq!(rendered.product.and_then(|p| p.price).as_deref(), Some("9.99 EUR"));
     }
 
     #[tokio::test]

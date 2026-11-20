@@ -75,11 +75,16 @@ const PASS_BUDGET: Duration = Duration::from_secs(30 * 60);
 /// How long a watch that has ended is kept: the design's ninety days.
 pub(crate) const KEEP_ENDED_DAYS: i64 = 90;
 
-/// How a check went, as `/metrics` is to count it: a price was `read`, the
-/// page was `unreadable`, or the shop `refused` the request.
+/// How a check went, as `/metrics` and the log count it: a price was
+/// `read`; the page was `unreadable`, read and without a price, or gone;
+/// the shop `refused` its reader; or the request `failed`. The design had
+/// the first three. The fourth was `unreadable` until an outage of forty
+/// hours was seen to be able to end every watch it touched, each one
+/// saying its page had no price.
 pub(crate) const READ: &str = "read";
 pub(crate) const UNREADABLE: &str = "unreadable";
 pub(crate) const REFUSED: &str = "refused";
+pub(crate) const FAILED: &str = "failed";
 
 /// Why a watch ended, as the table, the outbox key and `/metrics` write
 /// it. `unreadable` is one more, in the word above: the page was read and
@@ -96,18 +101,39 @@ pub(crate) const STOPPED: &str = "stopped";
 /// paragraph.
 const MAX_TITLE_CHARS: usize = 120;
 
-/// What reading a watched page came to.
+/// What reading a watched page came to. There are three ways to come
+/// back without a price and they are not alike, so they are kept apart
+/// from here to the message that ends a watch.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Reading {
     Price(Priced),
-    /// The page was asked for and no price came of it: it is gone, its data
-    /// prices nothing, or the request failed. The words say which, and
-    /// finish the sentence "this page cannot be watched: …".
+    /// The page was read and its data prices nothing, or the page is gone
+    /// (a 404, a 410). This is the page's own doing, and what the three
+    /// checks count.
     Unreadable(String),
     /// The site refused its reader, with a block notice or a bot check.
-    /// Not the same thing: nothing was learnt of the page, which may be
-    /// priced as it ever was.
-    Refused(String),
+    /// Nothing was learnt of the page, which may be priced as it ever was.
+    Refused,
+    /// The request came to nothing and nobody refused it: it failed on the
+    /// way, was not answered in time, was answered with a status that is
+    /// no page (a 403, a 429, a 5xx), or brought a shell that no browser
+    /// filled. Nothing was learnt of the page here either, and the cause
+    /// may be on Scout's side as well as the shop's.
+    Failed(String),
+}
+
+impl Reading {
+    /// Why no price was read, for the sentence "this page cannot be
+    /// watched: …" and for the log; `None` for a price. The words name no
+    /// address, no shop and no product, so that the log line they go into
+    /// says which watch and why and not what somebody is watching.
+    pub(crate) fn why(&self) -> Option<&str> {
+        match self {
+            Reading::Price(_) => None,
+            Reading::Unreadable(why) | Reading::Failed(why) => Some(why),
+            Reading::Refused => Some("the site refused its reader"),
+        }
+    }
 }
 
 /// A price as the page's own data states it.
@@ -155,9 +181,25 @@ impl PageReader {
 impl Reader for PageReader {
     async fn read(&self, url: &str) -> Reading {
         match self.tool.call(FetchArgs { url: url.to_string() }).await {
-            Ok(page) => priced(page.product),
-            Err(FetchError::Refused(said)) => Reading::Refused(said),
-            Err(e) => Reading::Unreadable(e.to_string()),
+            Ok(page) => match priced(page.product) {
+                // A page that is handed back as a shell was not read: a
+                // browser was wanted for it and none filled it. A price in
+                // its data all the same is a price.
+                Reading::Unreadable(_) if page.unrendered => {
+                    Reading::Failed("it came back as a shell that no browser filled".to_string())
+                }
+                reading => reading,
+            },
+            Err(FetchError::Refused(_)) => Reading::Refused,
+            Err(FetchError::Status(status)) if matches!(status.as_u16(), 404 | 410) => {
+                Reading::Unreadable(format!("it is gone (HTTP {})", status.as_u16()))
+            }
+            Err(FetchError::Status(status)) => Reading::Failed(format!("it answered HTTP {}", status.as_u16())),
+            // Not the error's own words: reqwest's name the address asked.
+            Err(FetchError::Http(_)) => Reading::Failed("the request for it failed".to_string()),
+            // What the tool would not open: an address that is no web
+            // address, or not a public one. Its words name no address.
+            Err(FetchError::Invalid(why)) => Reading::Failed(why),
         }
     }
 }
@@ -203,12 +245,12 @@ fn tidy_title(name: &str) -> String {
     one_line.chars().take(MAX_TITLE_CHARS).collect::<String>().trim_end().to_string()
 }
 
-/// One reading, given up on after `budget`. A page that never answers is
-/// unreadable that day, like one that answered with nothing.
+/// One reading, given up on after `budget`. A page that never answers was
+/// not read: a request that failed, not a page without a price.
 pub(crate) async fn read_within<R: Reader>(reader: &R, url: &str, budget: Duration) -> Reading {
     match tokio::time::timeout(budget, reader.read(url)).await {
         Ok(reading) => reading,
-        Err(_) => Reading::Unreadable("it did not answer in time".to_string()),
+        Err(_) => Reading::Failed(format!("it did not answer in time ({} s)", budget.as_secs())),
     }
 }
 
@@ -323,12 +365,12 @@ pub(crate) async fn start<R: Reader>(
 
     let read = match read_within(reader, &url, READ_BUDGET).await {
         Reading::Price(read) => read,
-        Reading::Unreadable(why) => {
+        Reading::Unreadable(why) | Reading::Failed(why) => {
             return Ok(Answer::not_started(format!(
                 "I cannot watch this page: {why}. A watch that cannot be checked is not started."
             )))
         }
-        Reading::Refused(_) => {
+        Reading::Refused => {
             return Ok(Answer::not_started(format!(
                 "I cannot watch this page: {shop} refused Scout's request for it, so there is no price I could \
                  check each day. A watch that cannot be checked is not started."
@@ -480,7 +522,7 @@ pub(crate) fn say_stopped(watch: &PriceWatch) -> String {
 /// the watch, why, with the one message that says so.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Verdict {
-    /// `READ`, `UNREADABLE` or `REFUSED`.
+    /// `READ`, `UNREADABLE`, `REFUSED` or `FAILED`.
     pub outcome: &'static str,
     pub last_price: f64,
     pub lowest_price: f64,
@@ -499,9 +541,9 @@ pub(crate) struct Verdict {
 /// - the page, read, with no price. That adds to the checks running, and
 ///   the third ends the watch as `unreadable`. A price in between starts
 ///   the count again;
-/// - no reading at all: the shop refused its reader. Nothing was learnt of
-///   the page, so it neither adds to that count nor wipes it, and it
-///   changes no price. What it does is start a clock, if none is running,
+/// - no reading at all: the shop refused its reader, or the request
+///   failed. Nothing was learnt of the page, so it neither adds to that
+///   count nor wipes it, and it changes no price. What it does is start a clock, if none is running,
 ///   which any reading of the page stops; a week on that clock ends the
 ///   watch as `unreached`, saying since when nothing could be read. A shop
 ///   that walls the reader for three days and serves it on the fourth has
@@ -542,7 +584,10 @@ pub(crate) fn decide(watch: &PriceWatch, reading: &Reading, now: chrono::NaiveDa
                 verdict.ended = Some((UNREADABLE, say_unreadable(watch)));
             }
         }
-        Reading::Refused(_) => {
+        Reading::Refused | Reading::Failed(_) => {
+            if matches!(reading, Reading::Failed(_)) {
+                verdict.outcome = FAILED;
+            }
             let since = watch.unreached_since.unwrap_or(now);
             verdict.unreached_since = Some(since);
             if now - since >= chrono::Duration::days(UNREACHED_DAYS) {
@@ -685,6 +730,7 @@ pub(crate) async fn check_due<R: Reader>(
         if let Some(last) = asked.get(&host) {
             tokio::time::sleep_until(*last + pace.spacing).await;
         }
+        let id = watch.id;
         let reading = read_within(reader, &watch.url, pace.read_budget).await;
         asked.insert(host, tokio::time::Instant::now());
 
@@ -692,7 +738,14 @@ pub(crate) async fn check_due<R: Reader>(
         // Counted as a check whatever becomes of the write below: the
         // request was made, and how shops answer is what this counts.
         metrics.watch_checked(verdict.outcome);
-        let (theirs, id, decided) = (store.clone(), watch.id, verdict.clone());
+        // And said, where no price was read: which watch, how it went and
+        // why. Not the address, the shop or the product, which are one
+        // person's business; the watch's number finds them for whoever
+        // may look.
+        if let Some(why) = reading.why() {
+            tracing::info!(watch = id, outcome = verdict.outcome, why, "a price watch's check read no price");
+        }
+        let (theirs, decided) = (store.clone(), verdict.clone());
         let written = blocking(move || {
             theirs.record_watch_check(&crate::store::WatchCheck {
                 id,
@@ -809,22 +862,104 @@ mod tests {
         }
     }
 
+    /// A page that is all script: nothing to read until a browser runs it.
+    const SHELL: &str = "<html><head><title>Shop</title></head><body><div id=\"root\"></div></body></html>";
+
     #[tokio::test]
-    async fn a_page_that_is_gone_is_unreadable_and_a_site_that_says_no_has_refused() {
-        // The two are kept apart from here on: a page that lost its price
-        // counts towards ending a watch, and a shop that walls the reader
-        // for a day says nothing about the page.
-        for status in [404, 410, 500] {
+    async fn only_a_page_that_was_read_or_is_gone_counts_as_a_page_with_no_price() {
+        // Three kinds of nothing, kept apart from here on. A page read
+        // and found without a price, or gone, counts towards ending a
+        // watch for having no price. A shop that walls the reader has
+        // said nothing about the page. And a request that failed has
+        // said nothing either: a bad minute at the shop, or an outage of
+        // Scout's own, is not a page that lost its price.
+        for status in [404, 410] {
             let server = serving(status, "").await;
-            match read(&server).await {
-                Reading::Unreadable(why) => assert!(why.contains(&format!("HTTP {status}")), "got: {why}"),
-                other => panic!("{status}: {other:?}"),
-            }
+            assert_eq!(read(&server).await, Reading::Unreadable(format!("it is gone (HTTP {status})")), "{status}");
+        }
+        for status in [403, 429, 500, 503] {
+            let server = serving(status, "").await;
+            assert_eq!(read(&server).await, Reading::Failed(format!("it answered HTTP {status}")), "{status}");
         }
         let challenge = "<html><head><title>Just a moment...</title></head><body></body></html>";
         for wall in [NOTICE, challenge] {
             let server = serving(200, wall).await;
-            assert!(matches!(read(&server).await, Reading::Refused(_)), "for {wall}");
+            assert_eq!(read(&server).await, Reading::Refused, "for {wall}");
+        }
+
+        // A shell no browser filled is a page not read: no browser here,
+        // or one that would not start.
+        let server = serving(200, SHELL).await;
+        let unfilled = Reading::Failed("it came back as a shell that no browser filled".to_string());
+        assert_eq!(read(&server).await, unfilled);
+        let stalled = crate::tools::browser::Renderer::new(std::path::PathBuf::from("/definitely/not/chrome"));
+        let with_one = PageReader::for_a_request(OpenWeb::exempting(*server.address()), Some(stalled));
+        assert_eq!(with_one.read(&format!("{}/p/widget", server.uri())).await, unfilled);
+        // Where a status that is no page sent the request to a browser
+        // that would not start, it is the status that is told.
+        let server = serving(503, "").await;
+        let stalled = crate::tools::browser::Renderer::new(std::path::PathBuf::from("/definitely/not/chrome"));
+        let with_one = PageReader::for_a_request(OpenWeb::exempting(*server.address()), Some(stalled));
+        assert_eq!(with_one.read(&format!("{}/p/widget", server.uri())).await, Reading::Failed("it answered HTTP 503".to_string()));
+
+        // A request that never arrived: a port nobody listens on any more.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let nobody = PageReader::for_a_request(OpenWeb::exempting(address), None);
+        assert_eq!(
+            nobody.read(&format!("http://{address}/p/widget")).await,
+            Reading::Failed("the request for it failed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn what_is_logged_of_a_check_names_no_address_no_shop_and_no_product() {
+        // Every check that reads no price is logged with why, and which
+        // page a person watches is theirs: the line carries the watch's
+        // number and a reason, never where or what.
+        let server = MockServer::start().await;
+        for (page, status, body) in [
+            ("secret-widget-gone", 404, String::new()),
+            ("secret-widget-busy", 503, String::new()),
+            ("secret-widget-walled", 200, NOTICE.to_string()),
+            ("secret-widget-shell", 200, SHELL.to_string()),
+            ("secret-widget-unpriced", 200, format!("<html><body><h1>Secret Widget</h1>{}</body></html>", "<p>A widget for every purpose.</p>".repeat(100))),
+        ] {
+            Mock::given(method("GET")).and(path(format!("/p/{page}")))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body)).mount(&server).await;
+        }
+        let host = server.address().to_string();
+        let mut seen = Vec::new();
+        for page in ["gone", "busy", "walled", "shell", "unpriced"] {
+            // A reader a page, as a watch on another shop would be: the
+            // wall must not close the host for the pages after it.
+            let reading = reader(&server).read(&format!("{}/p/secret-widget-{page}", server.uri())).await;
+            let why = reading.why().expect("not a price").to_string();
+            for private in [host.as_str(), "127.0.0.1", "secret", "widget", "Widget", "/p/", "http"] {
+                assert!(!why.contains(private), "{page}: {why:?} gives away {private:?}");
+            }
+            seen.push(why);
+        }
+        assert_eq!(
+            seen,
+            [
+                "it is gone (HTTP 404)",
+                "it answered HTTP 503",
+                "the site refused its reader",
+                "it came back as a shell that no browser filled",
+                "its data states no product",
+            ]
+        );
+        assert_eq!(read_within(&Fixed::new(price(1.0)), "https://shop.example/p", READ_BUDGET).await.why(), None);
+        // And the line itself is built from those and the watch's number.
+        let src = include_str!("watch.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests come last")];
+        assert!(src.contains(r#"tracing::info!(watch = id, outcome = verdict.outcome, why, "a price watch's check read no price")"#));
+        for line in src.lines().filter(|l| l.contains("tracing::")) {
+            for private in ["url", "title", "shop", "host", "address"] {
+                assert!(!line.contains(private), "a log line of the pass names the {private}: {line}");
+            }
         }
     }
 
@@ -837,7 +972,7 @@ mod tests {
         let guarded = PageReader::for_a_request(OpenWeb::new(std::time::Duration::from_secs(5)).unwrap(), None);
         for url in [format!("{}/metrics", server.uri()), "http://10.43.0.1/".to_string(), "ftp://shop.example/p".to_string()] {
             match guarded.read(&url).await {
-                Reading::Unreadable(why) => assert!(why.contains("not on the public internet") || why.contains("scheme"), "{url}: {why}"),
+                Reading::Failed(why) => assert!(why.contains("not on the public internet") || why.contains("scheme"), "{url}: {why}"),
                 other => panic!("{url}: {other:?}"),
             }
         }
@@ -963,9 +1098,10 @@ mod tests {
         let chat = ReplyTo::telegram(4242);
         for (reading, said) in [
             (Reading::Unreadable("its data states no product".into()), "I cannot watch this page: its data states no product."),
-            (Reading::Unreadable("page returned HTTP 404 Not Found".into()), "I cannot watch this page: page returned HTTP 404 Not Found."),
+            (Reading::Unreadable("it is gone (HTTP 404)".into()), "I cannot watch this page: it is gone (HTTP 404)."),
+            (Reading::Failed("it answered HTTP 503".into()), "I cannot watch this page: it answered HTTP 503."),
             (
-                Reading::Refused("shop.example served a block notice instead of the page".into()),
+                Reading::Refused,
                 "I cannot watch this page: shop.example refused Scout's request for it, so there is no price I could check each day.",
             ),
         ] {
@@ -1090,7 +1226,7 @@ mod tests {
         let answer = start(&store, &Silent, ask(&chat, WIDGET, 300.0), clock()).await.unwrap();
         assert_eq!(began.elapsed(), READ_BUDGET);
         assert_eq!(answer.started, None);
-        assert!(answer.say.starts_with("I cannot watch this page: it did not answer in time."), "got: {}", answer.say);
+        assert!(answer.say.starts_with("I cannot watch this page: it did not answer in time (80 s)."), "got: {}", answer.say);
     }
 
     #[tokio::test]
@@ -1204,7 +1340,11 @@ mod tests {
     }
 
     fn refused() -> Reading {
-        Reading::Refused("shop.example served a block notice instead of the page".into())
+        Reading::Refused
+    }
+
+    fn failed() -> Reading {
+        Reading::Failed("it answered HTTP 503".into())
     }
 
     /// The daily pace with no wait between two reads of a host, for the
@@ -1436,6 +1576,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_outage_is_not_a_page_with_no_price_and_ends_nothing_in_forty_hours() {
+        // Three checks that fail are forty hours of somebody's outage,
+        // the shop's or Scout's own. Counted as a page with no price they
+        // ended every watch they touched, each saying its page gave none.
+        let (store, _dir) = a_store();
+        let now = clock();
+        let w = watching_since(&store, WIDGET, now - chrono::Duration::days(2)).await;
+        for check in 0..3 {
+            let at = now + chrono::Duration::hours(20 * check);
+            check_due(&store, counters(), &Told::by(|_: &str| failed()), at, &UNSPACED).await.unwrap();
+        }
+        let after = watch(&store, w.id);
+        assert_eq!((after.unreadable_streak, after.ended.clone(), after.unreached_since), (0, None, Some(now)));
+        assert!(waiting(&store).is_empty());
+
+        // It is a week with no reading that ends it, failures and
+        // refusals alike and mixed, and the message is the week's.
+        let next = daily(&store, now + chrono::Duration::days(3), 5, |day| if day % 2 == 0 { refused() } else { failed() }).await;
+        assert_eq!(watch(&store, w.id).ended, Some((next - chrono::Duration::days(1), "unreached".to_string())));
+        let said = waiting(&store);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].2.contains("I have not been able to read its page since"), "got: {}", said[0].2);
+        assert!(!said[0].2.contains("no price for me"), "got: {}", said[0].2);
+    }
+
+    #[tokio::test]
     async fn a_reading_of_any_kind_starts_the_week_again() {
         let (store, _dir) = a_store();
         let now = clock();
@@ -1586,7 +1752,9 @@ mod tests {
         assert_eq!(began.elapsed(), READ_BUDGET, "given up on after the one reading's budget");
         assert_eq!((pass.due, pass.checked, pass.left), (2, 2, 0));
         let after = watch(&store, stuck.id);
-        assert_eq!((after.unreadable_streak, after.last_checked_at, after.ended.clone()), (1, now, None));
+        assert_eq!((after.last_checked_at, after.ended.clone()), (now, None));
+        // Nothing was read, which is not a page that had no price.
+        assert_eq!((after.unreadable_streak, after.unreached_since), (0, Some(now)));
         assert_eq!(watch(&store, fine.id).last_price, 310.0);
     }
 
@@ -1700,7 +1868,7 @@ mod tests {
         let now = clock();
         let then = now - chrono::Duration::days(1);
         let mut ids = std::collections::HashMap::new();
-        for page in ["hit", "over", "gone", "walled", "stopped"] {
+        for page in ["hit", "over", "gone", "walled", "busy", "stopped"] {
             let url = format!("https://shop.example/p/{page}");
             ids.insert(page, watching_since(&store, &url, then).await.id);
         }
@@ -1724,6 +1892,7 @@ mod tests {
             "over" => price(310.0),
             "gone" => no_price(),
             "walled" => refused(),
+            "busy" => failed(),
             _ => {
                 theirs.stop_watch(1, stopped, now).unwrap().expect("live until now");
                 price(289.0)
@@ -1733,7 +1902,7 @@ mod tests {
 
         let pass = check_due(&store, metrics, &reader, now, &UNSPACED).await.unwrap();
 
-        assert_eq!((pass.due, pass.checked, pass.ended), (5, 4, 2));
+        assert_eq!((pass.due, pass.checked, pass.ended), (6, 5, 2));
         let page = metrics.render();
         for series in [
             // The stopped one's page was read too: a check is a request
@@ -1741,6 +1910,8 @@ mod tests {
             "scout_price_watch_checks_total{outcome=\"read\"} 3",
             "scout_price_watch_checks_total{outcome=\"unreadable\"} 1",
             "scout_price_watch_checks_total{outcome=\"refused\"} 1",
+            // A request that failed is neither: nothing refused it.
+            "scout_price_watch_checks_total{outcome=\"failed\"} 1",
             "scout_price_watches_ended_total{why=\"hit\"} 1",
             "scout_price_watches_ended_total{why=\"unreadable\"} 1",
         ] {
@@ -1750,10 +1921,10 @@ mod tests {
         // stopped is the stop's to count, not the pass's.
         assert_eq!(page.matches("scout_price_watches_ended_total{").count(), 2, "{page}");
 
-        // Sixty days on, the two still live expire.
+        // Sixty days on, the three still live expire.
         let later = now + chrono::Duration::days(60);
         check_due(&store, metrics, &Told::by(|_: &str| price(310.0)), later, &UNSPACED).await.unwrap();
-        assert!(metrics.render().contains("scout_price_watches_ended_total{why=\"expired\"} 2\n"), "{}", metrics.render());
+        assert!(metrics.render().contains("scout_price_watches_ended_total{why=\"expired\"} 3\n"), "{}", metrics.render());
     }
 
     #[test]

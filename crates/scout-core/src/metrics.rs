@@ -194,8 +194,9 @@ impl Metrics {
 
     /// One daily check of a price watch, by how it went: a price was
     /// `read`, the page was `unreadable` (gone, or its data priced
-    /// nothing), or the shop `refused` the request. No host: which shop is
-    /// one person's business, and is in no counter.
+    /// nothing), the shop `refused` its reader, or the request `failed`
+    /// (not answered, or answered with a status that is no page). No host:
+    /// which shop is one person's business, and is in no counter.
     pub fn watch_checked(&self, outcome: &str) {
         self.watch_checks.add(&[outcome]);
     }
@@ -292,7 +293,7 @@ impl Metrics {
         self.runs.render(&mut out, "scout_runs_total", "Runs, by how they ended: answered, cut_short or failed once a run has a row; busy or overloaded when it never got one.");
         self.run_duration.render(&mut out, "scout_run_duration_seconds", "How long a run took, from its row to its last word; the wait for a slot is not in it.");
         self.tool_calls.render(&mut out, "scout_tool_calls_total", "Tool calls the agents made, by tool and whether the tool answered.");
-        self.watch_checks.render(&mut out, "scout_price_watch_checks_total", "Daily checks of price watches, by how each went: read (a price was read), unreadable (the page gave none), refused (the shop refused the request).");
+        self.watch_checks.render(&mut out, "scout_price_watch_checks_total", "Daily checks of price watches, by how each went: read (a price was read), unreadable (the page was read and gave none, or is gone), refused (the shop refused its reader), failed (the request came to nothing).");
         self.watches_ended.render(&mut out, "scout_price_watches_ended_total", "Price watches ended, by why: hit, unreadable (three checks running read the page and found no price), unreached (a week with no reading at all), expired (sixty days) or stopped by their owner.");
         self.provider_errors.render(&mut out, "scout_provider_errors_total", "Requests that failed after their retries: paid APIs as they answered (client includes a not-found), and the model during runs.");
         self.provider_retries.render(&mut out, "scout_provider_retries_total", "Requests to a provider sent again after a 429, a 5xx or a refused connection.");

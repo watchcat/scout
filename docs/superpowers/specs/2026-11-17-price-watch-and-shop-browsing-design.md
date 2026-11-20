@@ -157,11 +157,13 @@ An account watches one address once at a time; a second `watch_price` on
 it says which watch is there.
 
 A check ends one of three ways, and they are not counted alike. A price
-read is kept. The page read with no price counts towards the three, which
-are three checks running and not three days: the message says checks. A
-check with no reading at all, the shop refusing its reader, is neither: it
-changes no price and no count, and starts a clock that any reading of the
-page stops. Seven days on that clock end the watch as `unreached`, a fifth
+read is kept. The page read with no price, or gone (a 404, a 410), counts
+towards the three, which are three checks running and not three days: the
+message says checks. A check with no reading at all is neither: the shop
+refusing its reader, counted `refused`, or the request coming to nothing,
+counted `failed`, a fourth outcome (a transport error, no answer in 80
+seconds, a 403, 429 or 5xx, a shell no browser filled). It changes no price
+and no count, and starts a clock that any reading of the page stops. Seven days on that clock end the watch as `unreached`, a fifth
 `ended_why`, with a message that says since when the page could not be read
 and when a price last was. The expiry message says the lowest price read
 and when one was last read; it does not say the price stayed up.

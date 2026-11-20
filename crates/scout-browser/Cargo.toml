@@ -6,7 +6,12 @@ license = "MIT"
 description = "A shop's page driven over HTTP, one shop a session"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+# For `net_guard`, so that a session's Chrome leaves by the one fence the
+# render has, and for `measure`, so that a refusal page is known by what
+# `fetch_page` knows it by. That links all of scout-core into this crate;
+# nothing in scout-core knows this crate exists.
+scout-core = { path = "../scout-core" }
+serde ={ version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 url = "2"
 # The Public Suffix List, compiled in. "One shop a session" is a comparison

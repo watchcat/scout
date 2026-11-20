@@ -12,3 +12,4 @@ pub mod address;
 pub mod limits;
 pub mod site;
 pub mod typing;
+pub mod wall;

@@ -6783,6 +6783,7 @@ name = "scout-browser"
 version = "0.1.0"
 dependencies = [
  "psl",
+ "scout-core",
  "serde",
  "tokio",
  "url",

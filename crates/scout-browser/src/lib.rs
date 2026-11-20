@@ -13,6 +13,7 @@ pub mod chrome;
 pub mod drive;
 pub mod limits;
 pub mod pipe;
+pub mod session;
 pub mod site;
 pub mod tab;
 pub mod typing;

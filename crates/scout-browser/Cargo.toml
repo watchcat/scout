@@ -25,6 +25,8 @@ tempfile = "3"
 # own suffix every shop has its own, and two labels or a hand-kept list of
 # suffixes get one or the other wrong.
 psl = "2"
+# A session's name, which must not be one a caller could count up to.
+rand = "0.10"
 
 [dev-dependencies]
 # Paused time, so that a session waiting out its three minutes for a free

@@ -168,6 +168,42 @@ impl Pipe {
     pub async fn stop(&self) {
         let _ = self.chrome.lock().await.kill().await;
     }
+
+    /// The same from where nothing can be awaited: a page that is let go
+    /// of without being closed, by a call given up halfway or a server on
+    /// its way down. A killed process is gone within milliseconds, and
+    /// that short wait is the price of not leaving its profile half
+    /// removed, or the Chrome itself running with nobody to end it.
+    pub fn stop_now(&self) {
+        // Taken only here and in `stop`: if it is held, a stop is under way.
+        if let Ok(mut chrome) = self.chrome.try_lock() {
+            kill_and_wait(&mut chrome);
+        }
+    }
+
+    /// The Chrome's process, while it runs.
+    #[cfg(test)]
+    pub(crate) async fn chrome_process(&self) -> Option<u32> {
+        self.chrome.lock().await.id()
+    }
+}
+
+fn kill_and_wait(chrome: &mut Child) {
+    let _ = chrome.start_kill();
+    for _ in 0..200 {
+        if !matches!(chrome.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+impl Drop for Pipe {
+    /// Whoever lets go of the pipe last has let go of the Chrome, and what
+    /// is dropped after it, its profile above all, finds it gone.
+    fn drop(&mut self) {
+        kill_and_wait(self.chrome.get_mut());
+    }
 }
 
 #[cfg(test)]

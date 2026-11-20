@@ -581,6 +581,17 @@ impl Page for Tab {
     }
 }
 
+impl Drop for Tab {
+    /// A page that is let go of takes its Chrome with it. Without this the
+    /// task that listens to the Chrome would keep the pipe open, and the
+    /// Chrome running, for as long as the server did (found by a test: a
+    /// session dropped unclosed left its Chrome alive).
+    fn drop(&mut self) {
+        self.watcher.abort();
+        self.pipe.stop_now();
+    }
+}
+
 /// What `watch` needs to know its own page by.
 struct Watched {
     shop: Shop,
@@ -796,6 +807,51 @@ mod tests {
             let refused = chrome.open(&Shop::of(&url).unwrap(), &url).await.err();
             assert_eq!(refused, Some(Broken::Refused(NOT_PUBLIC.to_string())), "{address}");
         }
+    }
+
+    /// Whether `profile` is gone, and stays gone: a Chrome still alive when
+    /// its profile is removed writes a file or two back into it.
+    async fn gone_for_good(profile: &std::path::Path) -> bool {
+        for _ in 0..10 {
+            if profile.exists() {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn a_session_that_is_closed_leaves_nothing_of_its_profile() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[("/p/widget", html(WIDGET))]).await;
+        let Some((tab, _)) = open(&pages, "/p/widget").await else { return };
+        let profile = tab._profile.path().to_path_buf();
+        assert!(profile.join("Default").exists(), "Chrome keeps its profile where it was told to");
+        tab.close().await;
+        assert!(gone_for_good(&profile).await, "{} is still there", profile.display());
+    }
+
+    #[tokio::test]
+    async fn a_session_that_is_dropped_unclosed_leaves_nothing_either() {
+        // A call that is given up halfway, or a server on its way down,
+        // does not get to close anything: the page is simply let go of.
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[("/p/widget", html(WIDGET))]).await;
+        let Some((tab, _)) = open(&pages, "/p/widget").await else { return };
+        let profile = tab._profile.path().to_path_buf();
+        let chrome = tab.pipe.chrome_process().await.expect("a Chrome is running");
+        assert!(is_running(chrome));
+        drop(tab);
+        // The Chrome is gone by the time the page is: nothing is left to
+        // wait for that a caller who has let go would never wait for.
+        assert!(!is_running(chrome), "Chrome {chrome} outlived its session");
+        assert!(gone_for_good(&profile).await, "{} is still there", profile.display());
+    }
+
+    /// Whether a process is there to be signalled.
+    fn is_running(process: u32) -> bool {
+        std::process::Command::new("kill").args(["-0", &process.to_string()]).stderr(std::process::Stdio::null()).status().is_ok_and(|status| status.success())
     }
 
     // ------------------------------------------------------------ a press

@@ -31,7 +31,7 @@
 //! What it does not know: a dialog with neither of the marks below on
 //! its own tag. Such a one is read where it stands, as before.
 
-use super::fetch::{collapse_ws, decode_entities, strip_tags};
+use super::fetch::{collapse_ws, decode_entities};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -91,7 +91,7 @@ pub(super) fn read_last(html: &str) -> Cow<'_, str> {
     if !lower.contains("data-nosnippet") && !lower.contains("dialog") {
         return Cow::Borrowed(html);
     }
-    let dialogs = dialogs(html, &lower);
+    let dialogs = dialogs(html, &lower, &mut Budget::of(html));
     if dialogs.is_empty() {
         return Cow::Borrowed(html);
     }
@@ -121,7 +121,7 @@ pub(super) fn read_last(html: &str) -> Cow<'_, str> {
 /// implies, a `<p>` that the next `<p>` ends, and there the count can
 /// run on past the element's real end. An element that is never closed
 /// is no block, and nothing of it is moved.
-fn dialogs(html: &str, lower: &str) -> Vec<(usize, usize)> {
+fn dialogs(html: &str, lower: &str, budget: &mut Budget) -> Vec<(usize, usize)> {
     // How many elements of each name are open, and where each marked one
     // among them began, by its name and how deep among its own name.
     let mut open: HashMap<&str, usize> = HashMap::new();
@@ -146,9 +146,10 @@ fn dialogs(html: &str, lower: &str) -> Vec<(usize, usize)> {
         let start = marked.remove(&(tag.name, *depth));
         *depth -= 1;
         let Some(start) = start else { continue };
-        let block = &html[start..tag.end];
-        if !(opens_on_cookies(block) && says_consent(block)) {
-            continue;
+        match says_it_is_one(&html[start..tag.end], budget) {
+            Some(true) => {}
+            Some(false) => continue,
+            None => break,
         }
         // Those found so far stand apart and in order. The ones that
         // began after this one are inside it and go with it. One that
@@ -280,19 +281,123 @@ fn attribute(lower: &str, at: usize) -> Option<(&str, &str, usize)> {
     }
 }
 
+/// How much of a document's marked blocks may be read to see what they
+/// say: twice the document and 64 KB over, in bytes, for the whole walk.
+///
+/// The walk reads each byte of the document once. What a block says is
+/// read apart from that, and a document can be written so that the same
+/// bytes are read again and again: marked blocks one inside another,
+/// with nothing in any to say what it is, cost the square of their
+/// number. A review measured 53 seconds for 800 KB of an earlier walk,
+/// in a debug build. Of the thirteen saved pages the one that read most
+/// read 23% of itself, so twice is eight times what a page has needed.
+/// The 64 KB are for a document of a few hundred bytes, where a dialog
+/// inside a dialog is read through several times over and that is still
+/// nothing. When the budget is spent the walk ends, and the dialogs
+/// known by then are the ones moved.
+struct Budget {
+    allowed: usize,
+    read: usize,
+}
+
+impl Budget {
+    fn of(html: &str) -> Self {
+        Budget { allowed: 2 * html.len() + 64 * 1024, read: 0 }
+    }
+
+    fn left(&self) -> usize {
+        self.allowed.saturating_sub(self.read)
+    }
+}
+
+/// Whether a marked block is the consent dialog by what it says, or
+/// nothing when the budget ran out before that was known.
+fn says_it_is_one(block: &str, budget: &mut Budget) -> Option<bool> {
+    Some(opens_on_cookies(block, budget)? && says_consent(block, budget)?)
+}
+
 /// Whether a block's text speaks of cookies from its start.
-fn opens_on_cookies(block: &str) -> bool {
-    let text = collapse_ws(&decode_entities(&strip_tags(block)));
-    let opening: String = text.chars().take(SAID_WITHIN_CHARS).collect();
-    opening.to_lowercase().contains("cookie")
+fn opens_on_cookies(block: &str, budget: &mut Budget) -> Option<bool> {
+    let opening = opening_text(block, SAID_WITHIN_CHARS, budget)?;
+    Some(opening.to_lowercase().contains("cookie"))
+}
+
+/// The first `chars` characters of a block's text, made of its markup as
+/// `extract_page` makes a page's, and read no further into the block
+/// than they take: a dialog is 145 KB on one of the two hosts, and how
+/// it opens is in its first few.
+fn opening_text(block: &str, chars: usize, budget: &mut Budget) -> Option<String> {
+    let allowed = budget.left();
+    let mut raw = String::new();
+    let mut in_tag = false;
+    // Entities and runs of white space make a text shorter than what it
+    // is written in. So what has been gathered is weighed each time it
+    // has doubled, and is enough when it comes to the characters asked
+    // for and a few over: its last few may be half an entity.
+    let mut weigh_at = 4 * chars;
+    for (at, c) in block.char_indices() {
+        if at >= allowed {
+            budget.read += at;
+            return None;
+        }
+        // As `strip_tags` does it.
+        match c {
+            '<' => {
+                in_tag = true;
+                raw.push(' ');
+            }
+            '>' => in_tag = false,
+            c if !in_tag => raw.push(c),
+            _ => {}
+        }
+        if raw.len() >= weigh_at {
+            let text = collapse_ws(&decode_entities(&raw));
+            if text.chars().count() >= chars + 8 {
+                budget.read += at;
+                return Some(text.chars().take(chars).collect());
+            }
+            weigh_at = 2 * raw.len();
+        }
+    }
+    budget.read += block.len();
+    Some(collapse_ws(&decode_entities(&raw)).chars().take(chars).collect())
 }
 
 /// Whether a block's text has one of the words of consent in it,
 /// anywhere: a dialog's buttons come last, 20,000 characters in on one
-/// of the two hosts.
-fn says_consent(block: &str) -> bool {
-    let text = strip_tags(block).to_lowercase();
-    text.split(|c: char| !c.is_alphabetic()).any(|word| CONSENT_WORDS.contains(&word))
+/// of the two hosts. Read as far as the first such word and no further.
+fn says_consent(block: &str, budget: &mut Budget) -> Option<bool> {
+    let allowed = budget.left();
+    let mut word = String::new();
+    let mut in_tag = false;
+    for (at, c) in block.char_indices() {
+        if at >= allowed {
+            budget.read += at;
+            return None;
+        }
+        // The words `strip_tags` would leave: a tag ends a word, and a
+        // `>` that closes no tag is dropped from the middle of one.
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                continue;
+            }
+            _ if in_tag => continue,
+            c if c.is_alphabetic() => {
+                word.extend(c.to_lowercase());
+                continue;
+            }
+            _ => {}
+        }
+        if CONSENT_WORDS.contains(&word.as_str()) {
+            budget.read += at;
+            return Some(true);
+        }
+        word.clear();
+    }
+    budget.read += block.len();
+    Some(CONSENT_WORDS.contains(&word.as_str()))
 }
 
 #[cfg(test)]
@@ -522,7 +627,7 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::*;
-    use super::read_last;
+    use super::{dialogs, read_last, Budget};
     use crate::tools::fetch::{self, PageContent, PageLink};
     use reqwest::Url;
     use std::borrow::Cow;
@@ -974,6 +1079,64 @@ mod tests {
         let dialog = "<div data-nosnippet>Accept cookies<div>or do not</div></div>";
         let html = format!("<body></div>{dialog}<p>The page.</p></body>");
         assert_eq!(read_last(&html), format!("<body></div> <p>The page.</p></body>{dialog}"));
+    }
+
+    /// The dialogs of a document, how many bytes of its marked blocks
+    /// were read to know them, and how many were allowed.
+    fn walk(html: &str) -> (Vec<(usize, usize)>, usize, usize) {
+        let mut budget = Budget::of(html);
+        let found = dialogs(html, &html.to_ascii_lowercase(), &mut budget);
+        (found, budget.read, budget.allowed)
+    }
+
+    #[test]
+    fn a_block_is_known_by_how_it_opens_and_not_by_reading_it_through() {
+        // Cookiebot's on the second host, in shape: 58 KB of markup here
+        // and 145 KB there, that says "Consent" first of all and
+        // "cookies" 58 characters in.
+        let dialog = cookiebot("overlay", &ENGLISH, 27, 4);
+        let (found, read, _) = walk(&priced_page(&dialog));
+        assert_eq!(found.len(), 1);
+        assert!(dialog.len() > 50_000 && read < dialog.len() / 10, "read {read} bytes of a dialog of {}", dialog.len());
+        // A dialog that is not about cookies is put down as soon: a
+        // basket drawer with a long list in it.
+        let drawer = format!("<div role=\"dialog\"><h2>Your basket</h2>{}</div>", "<p>Blue widget, 12,95</p>".repeat(4_000));
+        let (found, read, _) = walk(&priced_page(&drawer));
+        assert!(found.is_empty());
+        assert!(drawer.len() > 50_000 && read < drawer.len() / 10, "read {read} bytes of a drawer of {}", drawer.len());
+    }
+
+    #[test]
+    fn a_page_built_to_be_slow_is_read_within_a_budget() {
+        // The review's page: 800 KB of an element that is marked and
+        // never closed. Each mark was followed to the end of the
+        // document, 53 seconds of it in a debug build. An element that
+        // is never closed is no block now, so nothing is read for it.
+        for unit in ["<br data-nosnippet>word ", "<p data-nosnippet>word ", "<div role=\"dialog\">cookies, accept "] {
+            let html = unit.repeat(800 * 1024 / unit.len());
+            let (found, read, _) = walk(&html);
+            assert!(found.is_empty() && read == 0, "{unit}: read {read}");
+            assert!(matches!(read_last(&html), Cow::Borrowed(_)), "{unit}");
+        }
+        // Marked blocks one inside another, each of them closed, and
+        // nothing in any to say what it is: each would be read through,
+        // 200 MB for these 100 KB. What may be read is twice the
+        // document and 64 KB, and the walk ends where that is spent.
+        let deep = 4_000;
+        for says in ["", "cookies "] {
+            let html = format!("{}{}", format!("<div data-nosnippet>{says}").repeat(deep), "</div>".repeat(deep));
+            let (found, read, allowed) = walk(&html);
+            assert!(found.is_empty(), "{says:?}");
+            assert_eq!(allowed, 2 * html.len() + 64 * 1024);
+            assert!(read > html.len() && read <= allowed, "{says:?}: read {read} where {allowed} were allowed");
+        }
+        // A dialog known before it is spent is still moved.
+        let dialog = "<div role=\"dialog\">Accept cookies</div>";
+        let html = format!("{dialog}{}{}", "<div data-nosnippet>".repeat(deep), "</div>".repeat(deep));
+        let (found, read, allowed) = walk(&html);
+        assert_eq!(found, vec![(0, dialog.len())]);
+        assert!(read <= allowed);
+        assert!(read_last(&html).ends_with(dialog));
     }
 
     #[test]

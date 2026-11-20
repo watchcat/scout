@@ -1,6 +1,8 @@
 pub mod bol;
 pub mod browser;
 pub mod budget;
+pub mod consent;
+pub mod delivery;
 pub mod duffel;
 pub mod ebay;
 pub mod fetch;

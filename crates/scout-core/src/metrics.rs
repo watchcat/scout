@@ -147,6 +147,8 @@ pub struct Metrics {
     side_calls: Counter,
     side_call_tokens: Counter,
     side_call_ms: Counter,
+    delivery_terms: Counter,
+    compared_offers: Counter,
 }
 
 impl Default for Metrics {
@@ -167,6 +169,8 @@ impl Default for Metrics {
             side_calls: Counter::new(&["call", "model", "outcome"]),
             side_call_tokens: Counter::new(&["call", "model", "kind"]),
             side_call_ms: Counter::new(&["call", "model"]),
+            delivery_terms: Counter::new(&["outcome"]),
+            compared_offers: Counter::new(&["shipping"]),
         }
     }
 }
@@ -260,6 +264,26 @@ impl Metrics {
         }
     }
 
+    /// One shop's delivery terms were wanted for a comparison: `kept` when
+    /// the table answered, the reading's own status when the shop was read
+    /// now, `spent` when the request's allowance of new shops was gone and
+    /// `late` when the read outran its deadline. And `no_country`, once a
+    /// comparison that had offers to ask about and no delivery country to
+    /// ask for. No host: which shop is in the trace, for as long as a
+    /// trace is kept, and nowhere else.
+    pub fn delivery_terms(&self, outcome: &str) {
+        self.delivery_terms.add(&[outcome]);
+    }
+
+    /// Offers `compare_prices` ranked, `n` of them, by where their
+    /// shipping came from: `offer` when the model handed it over,
+    /// `delivery_page` when the shop's kept terms gave it, `unknown` when
+    /// nothing did. The row's own three words, so the page, a trace and
+    /// `scripts/unread-pages.py` count the same thing.
+    pub fn compared_offers(&self, shipping: &str, n: usize) {
+        self.compared_offers.add_n(&[shipping], n as u64);
+    }
+
     /// The whole set in the Prometheus text format.
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -273,9 +297,11 @@ impl Metrics {
         self.lock_wait.render(&mut out, "scout_store_lock_wait_seconds", "Time a store call waited for the database's lock.");
         self.search_calls.render(&mut out, "scout_search_calls_total", "search_web calls, by how many Kagi queries each spent.");
         self.model_tokens.render(&mut out, "scout_model_tokens_total", "Tokens the model reported for runs, by kind: input, cached (the part of input served from the provider's cache), output.");
-        self.side_calls.render(&mut out, "scout_side_calls_total", "Tool-less side calls — title, continuation, extract, photo, page — by model and how they ended: ok, empty (all reasoning, nothing said), failed, timeout.");
+        self.side_calls.render(&mut out, "scout_side_calls_total", "Tool-less side calls — title, continuation, extract, photo, page, delivery — by model and how they ended: ok, empty (all reasoning, nothing said), failed, timeout.");
         self.side_call_tokens.render(&mut out, "scout_side_call_tokens_total", "Tokens the side calls used, by call, model and kind; reasoning is counted on its own, as a share of output.");
         self.side_call_ms.render(&mut out, "scout_side_call_ms_total", "Milliseconds the side calls took, by call and model; divide by the calls for a mean.");
+        self.delivery_terms.render(&mut out, "scout_delivery_terms_total", "Shops whose delivery terms a comparison wanted, by what came of it: kept (answered from the table), what a read made of the shop's page (terms, not_delivered, depends, silent, no_page, unread), spent (past the request's allowance of new shops) or late (the read outran its deadline); and no_country, once a comparison that had offers to ask about when the profile names no delivery country.");
+        self.compared_offers.render(&mut out, "scout_compared_offers_total", "Offers compare_prices ranked, by where their shipping came from: offer (the model handed it over), delivery_page (the shop's kept terms) or unknown.");
         self.search_results.render(&mut out, "scout_search_results_total", "Hits from search_web calls, by source (kagi_N is the Nth query, kagi_1 the user's own) and what became of them: kept for the model, a duplicate of an earlier entry, or cut for want of room.");
         out
     }
@@ -528,6 +554,8 @@ mod tests {
             "scout_side_calls_total",
             "scout_side_call_tokens_total",
             "scout_side_call_ms_total",
+            "scout_delivery_terms_total",
+            "scout_compared_offers_total",
         ] {
             assert!(page.contains(&format!("# TYPE {name} ")), "{name} is missing:\n{page}");
         }
@@ -545,6 +573,40 @@ mod tests {
         assert!(page.contains("scout_search_calls_total{queries=\"3\"} 1\n"), "{page}");
         assert!(page.contains("scout_search_results_total{source=\"kagi_3\",outcome=\"cut\"} 6\n"), "{page}");
         assert!(page.contains("scout_search_results_total{source=\"perplexity\",outcome=\"kept\"} 0\n"), "a source with nothing kept is still named:\n{page}");
+    }
+
+    #[test]
+    fn a_delivery_read_and_a_compared_offer_are_counted_without_a_host() {
+        let m = Metrics::default();
+        m.delivery_terms("kept");
+        m.delivery_terms("terms");
+        m.delivery_terms("terms");
+        m.delivery_terms("late");
+        m.compared_offers("offer", 4);
+        m.compared_offers("delivery_page", 2);
+        m.compared_offers("delivery_page", 1);
+        m.compared_offers("unknown", 0);
+        let page = m.render();
+        for line in [
+            "scout_delivery_terms_total{outcome=\"kept\"} 1",
+            "scout_delivery_terms_total{outcome=\"terms\"} 2",
+            "scout_delivery_terms_total{outcome=\"late\"} 1",
+            "scout_compared_offers_total{shipping=\"offer\"} 4",
+            "scout_compared_offers_total{shipping=\"delivery_page\"} 3",
+            "scout_compared_offers_total{shipping=\"unknown\"} 0",
+        ] {
+            assert!(page.contains(&format!("{line}\n")), "{line} is missing:\n{page}");
+        }
+        // Which shop is nobody's to read off a metrics page: each series
+        // has its one label and nowhere a host could go.
+        let ours: Vec<&str> = page
+            .lines()
+            .filter(|l| l.starts_with("scout_delivery_terms_total{") || l.starts_with("scout_compared_offers_total{"))
+            .collect();
+        assert_eq!(ours.len(), 6, "{ours:?}");
+        for line in ours {
+            assert_eq!(line.matches('=').count(), 1, "{line}");
+        }
     }
 
     #[test]

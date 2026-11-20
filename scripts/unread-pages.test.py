@@ -33,8 +33,14 @@ def fetch(run, seq, url, result=None, detail=None):
     return (run, seq, "fetch_page", json.dumps({"url": url}), status, detail, result if result is not None else detail)
 
 
-def compare(run, seq, offers, status="ok"):
-    return (run, seq, "compare_prices", json.dumps({"unit_name": "piece", "offers": offers}), status, None, "{}")
+def compare(run, seq, offers, status="ok", result="{}"):
+    return (run, seq, "compare_prices", json.dumps({"unit_name": "piece", "offers": offers}), status, None, result)
+
+
+def compared(offers, sources):
+    """What compare_prices answered, as the trace keeps it since it looks up
+    shops' delivery pages: a row an offer, each saying whose word its shipping is."""
+    return json.dumps({"rows": [dict(o, shipping_source=source) for o, source in zip(offers, sources)], "notes": []})
 
 
 def offer(url, price, shipping=None):
@@ -429,6 +435,79 @@ class Measure(unittest.TestCase):
         r = up.rule(up.measure([]))
         self.assertFalse(r["needed"])
         self.assertIsNone(r["no_price_share"])
+
+
+class Compared(unittest.TestCase):
+    def setUp(self):
+        self.given = [
+            offer("https://shop-a.example/p", 10.0, shipping=4.95),
+            offer("https://shop-b.example/p", 20.0),
+            offer("https://shop-c.example/p", 30.0),
+        ]
+
+    def sources(self, result):
+        o = up.measure([compare(1, 0, self.given, result=result)])["offers"]
+        return (o["from_offer"], o["from_delivery_page"], o["from_unknown"])
+
+    def test_compared_offers_are_counted_by_where_their_shipping_came_from(self):
+        # a stated it; b's came from the shop's delivery page; nobody knows c's.
+        m = up.measure([compare(1, 0, self.given, result=compared(self.given, ["offer", "delivery_page", "unknown"]))])
+        o = m["offers"]
+        self.assertEqual((o["from_offer"], o["from_delivery_page"], o["from_unknown"]), (1, 1, 1))
+        # What the model handed over is counted as it was: two stated none.
+        self.assertEqual((o["offers"], o["no_shipping"], o["calls_stating_none"]), (3, 2, 0))
+        self.assertEqual(m["hosts"]["shop-b.example"]["no_shipping"], 1)
+
+    def test_a_trace_from_before_the_field_counts_as_what_the_model_handed_over(self):
+        # Stated is the offer's word; not stated is nobody's.
+        rowless = json.dumps({"rows": [dict(o) for o in self.given]})
+        for result in ("{}", rowless, None, "", "page returned HTTP 500", json.dumps([1, 2, 3]), json.dumps({"rows": "none"})):
+            self.assertEqual(self.sources(result), (1, 0, 2), result)
+
+    def test_a_result_that_does_not_account_for_every_offer_is_not_half_believed(self):
+        # A row short, a word the script does not know, a word that is no
+        # word, and a result cut off where the trace keeps no more.
+        whole = compared(self.given, ["offer", "delivery_page", "unknown"])
+        for result in (
+            compared(self.given[:2], ["offer", "delivery_page"]),
+            compared(self.given, ["offer", "the shop said so", "unknown"]),
+            compared(self.given, ["offer", ["delivery_page"], "unknown"]),
+            whole[: len(whole) // 2],
+        ):
+            self.assertEqual(self.sources(result), (1, 0, 2), result)
+
+    def test_every_other_figure_is_the_same_with_the_field_as_without(self):
+        url = "https://shop-b.example/p"
+        rows = lambda result: [
+            fetch(1, 0, url, page(product=False, text="Nu € 20,00 in de winkel")),
+            compare(1, 1, self.given, result=result),
+        ]
+        before = up.measure(rows("{}"), accounts={1: 10})
+        after = up.measure(rows(compared(self.given, ["offer", "delivery_page", "delivery_page"])), accounts={1: 10})
+        self.assertEqual((after["offers"]["from_delivery_page"], before["offers"]["from_delivery_page"]), (2, 0))
+        told = lambda m: {k: v for k, v in m["offers"].items() if not k.startswith("from_")}
+        self.assertEqual(told(after), told(before))
+        for part in ("fetch", "notices", "offered", "product", "hosts"):
+            self.assertEqual(after[part], before[part], part)
+        self.assertEqual(up.rule(after), up.rule(before), "the rule is read off what was handed over")
+
+    def test_the_report_sets_what_was_compared_beside_what_was_handed_over(self):
+        m = up.measure([compare(1, 0, self.given, result=compared(self.given, ["offer", "delivery_page", "unknown"]))])
+        text = up.report(m, top=5, window="a window")
+        self.assertIn("calls: 1; offers: 3; with no shipping cost: 2 (67%)", text)
+        self.assertIn("shipping as compared: the offer's 1, from the shop's delivery page 1, unknown 1 (33%)", text)
+        # An old window says the same of itself as it always did, and the new line agrees with it.
+        old = up.report(up.measure([compare(1, 0, self.given)]), top=5, window="a window")
+        self.assertIn("calls: 1; offers: 3; with no shipping cost: 2 (67%)", old)
+        self.assertIn("shipping as compared: the offer's 1, from the shop's delivery page 0, unknown 2 (67%)", old)
+
+    def test_the_words_counted_here_are_the_ones_the_tool_writes(self):
+        # Tied by hand otherwise: rename a source in the tool and every offer would count as before the field.
+        prices_rs = (HERE.parent / "crates/scout-core/src/tools/prices.rs").read_text(encoding="utf-8")
+        self.assertIn("pub shipping_source: &'static str,", prices_rs)
+        for word in up.SOURCES:
+            self.assertIn(f'"{word}"', prices_rs, word)
+        self.assertEqual(up.SOURCES, ("offer", "delivery_page", "unknown"))
 
 
 def shares(no_price, read, no_shipping, offers):

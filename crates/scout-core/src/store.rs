@@ -557,7 +557,54 @@ CREATE TABLE IF NOT EXISTS arrivals (
     -- Who pressed Add or Ignore, on a trip several people share. Step 22.
     settled_by        BIGINT
 );
+-- What a shop's own delivery page said of delivery to one country, read
+-- once and kept: a fact about the shop, not about a product or about
+-- whoever asked. So there is no account here, no run and no product
+-- address, and a row read for one person answers the next. Step 27.
+CREATE TABLE IF NOT EXISTS shop_delivery (
+    -- As the request's memory keys a host: no leading `www.`.
+    host       TEXT NOT NULL,
+    -- Delivery to where: ISO alpha-2, upper case.
+    country    TEXT NOT NULL,
+    -- `terms`, `not_delivered`, `depends`, `silent`, `no_page`, `unread`.
+    status     TEXT NOT NULL,
+    -- With `terms` only: JSON `[[from, cost], ...]`, lowest order value
+    -- first. One row a shop, so a new reading replaces the old whole.
+    bands      TEXT,
+    currency   TEXT,
+    -- The delivery page that was read; NULL when none was found.
+    source_url TEXT,
+    -- Why not, in a few words, for the operator. Never the page's text.
+    detail     TEXT,
+    read_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (host, country)
+);
 "#;
+
+/// The longest a shop's delivery terms are kept, and so the longest they
+/// are trusted: a row older than this is deleted at the next write. A first
+/// guess, not a measurement. What will say whether it is right is how often
+/// a shop read again after its keep comes back with other terms than it
+/// had, which the table cannot say while it holds one row a shop.
+pub const DELIVERY_KEEP_DAYS: i64 = 30;
+
+/// What was made of a shop's delivery page, as it is written down.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShopDelivery {
+    pub status: String,
+    pub bands: Option<String>,
+    pub currency: Option<String>,
+    pub source_url: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// A kept reading, and when it was made.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptShopDelivery {
+    pub host: String,
+    pub terms: ShopDelivery,
+    pub read_at: chrono::NaiveDateTime,
+}
 
 /// A purchase as the agent sees it. `purchased_at` is an ISO `YYYY-MM-DD`
 /// string; TEXT keeps date handling trivial and sorts chronologically.
@@ -1749,6 +1796,20 @@ CREATE TABLE IF NOT EXISTS released_addresses (
 );
 "#;
 
+/// Shops' delivery terms, kept by host and country. A new table and
+/// nothing else: it is already there on any database `MIGRATIONS` has run
+/// on, which is every one, so the step is the version bump and the backup
+/// that comes with it — see `STEP_18_MAIL_PARTS` — and it still has to
+/// build the table `MIGRATIONS` does.
+const STEP_27_SHOP_DELIVERY: &str = r#"
+CREATE TABLE IF NOT EXISTS shop_delivery (
+    host TEXT NOT NULL, country TEXT NOT NULL, status TEXT NOT NULL,
+    bands TEXT, currency TEXT, source_url TEXT, detail TEXT,
+    read_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    PRIMARY KEY (host, country)
+);
+"#;
+
 fn steps() -> Vec<(i64, Step)> {
     vec![
         (1, Step::Sql(STEP_1_NEW_TABLES)),
@@ -1777,7 +1838,8 @@ fn steps() -> Vec<(i64, Step)> {
         (24, Step::Code(step_24_stays_after_arrivals)),
         (25, Step::Sql(STEP_25_LOGIN_JOIN)),
         (26, Step::Sql(STEP_26_RUN_TOKENS)),
-        (27, Step::Sql(STEP_PRICE_WATCHES)),
+        (27, Step::Sql(STEP_27_SHOP_DELIVERY)),
+        (28, Step::Sql(STEP_PRICE_WATCHES)),
     ]
 }
 
@@ -7502,6 +7564,59 @@ fn sweep_drafts_within(conn: &Connection, account_id: Option<i64>) -> Result<usi
     }
 }
 
+/// Shops' delivery terms. Named for the shop throughout: `deliveries` and
+/// `note_delivery` are where to reach a person, which is another thing.
+impl Store {
+    /// Writes down what was made of a shop's delivery page for one country,
+    /// in place of whatever was kept before, and deletes every reading —
+    /// this shop's or another's — made more than `DELIVERY_KEEP_DAYS`
+    /// before `now`. That delete is the only thing that ends a row, so a
+    /// reading outlives its keep until the next shop is read.
+    ///
+    /// `now` comes from the caller, as `make_link`'s does: the UTC-naive
+    /// clock, written as text DuckDB casts.
+    pub fn keep_shop_delivery(&self, host: &str, country: &str, row: &ShopDelivery, now: chrono::NaiveDateTime) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO shop_delivery (host, country, status, bands, currency, source_url, detail, read_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS TIMESTAMP))
+             ON CONFLICT (host, country)
+             DO UPDATE SET status = excluded.status, bands = excluded.bands, currency = excluded.currency,
+                           source_url = excluded.source_url, detail = excluded.detail, read_at = excluded.read_at",
+            params![host, country, row.status, row.bands, row.currency, row.source_url, row.detail, stamp(now)],
+        )?;
+        conn.execute(
+            "DELETE FROM shop_delivery WHERE read_at < CAST(? AS TIMESTAMP)",
+            params![stamp(now - chrono::Duration::days(DELIVERY_KEEP_DAYS))],
+        )?;
+        Ok(())
+    }
+
+    /// What is kept of these shops' delivery to `country`, however old:
+    /// whether a reading is still to be trusted is for whoever asks.
+    pub fn shop_delivery_kept(&self, hosts: &[String], country: &str) -> Result<Vec<KeptShopDelivery>> {
+        if hosts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        let holes = ["?"].repeat(hosts.len()).join(", ");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT host, status, bands, currency, source_url, detail, CAST(read_at AS VARCHAR)
+             FROM shop_delivery WHERE country = ? AND host IN ({holes}) ORDER BY host"
+        ))?;
+        let args = std::iter::once(country).chain(hosts.iter().map(String::as_str));
+        let rows = stmt.query_map(duckdb::params_from_iter(args), |r| {
+            let terms = ShopDelivery { status: r.get(1)?, bands: r.get(2)?, currency: r.get(3)?, source_url: r.get(4)?, detail: r.get(5)? };
+            Ok((r.get::<_, String>(0)?, terms, r.get::<_, String>(6)?))
+        })?;
+        rows.map(|row| {
+            let (host, terms, read_at) = row?;
+            Ok(KeptShopDelivery { host, terms, read_at: unstamp(&read_at)? })
+        })
+        .collect()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -7857,7 +7972,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -7985,7 +8100,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -8907,7 +9022,9 @@ CREATE TABLE segment_candidates (
              INSERT INTO deliveries (account_id, channel, address) VALUES (1, 'telegram', '4242');
              INSERT INTO purchases (account_id, item, store, price, currency) VALUES (1, 'widget', 'shop.example', 12.5, 'EUR');
              INSERT INTO reminders (account_id, address, item, interval_days, next_due) VALUES (1, '4242', 'widgets', 30, '2020-01-01');
-             INSERT INTO outbox (account_id, channel, address, body, turn_key) VALUES (1, 'telegram', '4242', 'waiting', 'key-1');"
+             INSERT INTO outbox (account_id, channel, address, body, turn_key) VALUES (1, 'telegram', '4242', 'waiting', 'key-1');
+             INSERT INTO shop_delivery (host, country, status, bands, currency, source_url)
+                 VALUES ('shop.example', 'NL', 'terms', '[[0, 4.95]]', 'EUR', 'https://shop.example/delivery');"
         ))
         .unwrap();
         drop(conn);
@@ -8956,8 +9073,15 @@ CREATE TABLE segment_candidates (
         assert_eq!(store.list_reminders(1).unwrap().len(), 1);
         assert_eq!(store.delivery_address(1, "telegram").unwrap().as_deref(), Some("4242"));
         assert_eq!(queued(&store).len(), 1);
+        let kept: (String, String) = store
+            .conn()
+            .query_row("SELECT status, bands FROM shop_delivery WHERE host = 'shop.example' AND country = 'NL'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(kept, ("terms".to_string(), "[[0, 4.95]]".to_string()), "the table the step before this one added, and its row");
         let (fresh, _d) = test_store();
-        for table in ["accounts", "purchases", "reminders", "outbox", "price_watches"] {
+        for table in ["accounts", "purchases", "reminders", "outbox", "shop_delivery", "price_watches"] {
             assert_eq!(shape(&fresh.conn(), table), shape(&store.conn(), table), "{table}");
         }
 
@@ -9762,6 +9886,165 @@ CREATE TABLE trips (
     }
 
     #[test]
+    fn step_27_builds_the_delivery_table_in_the_fresh_shape() {
+        // Run by itself, on a database that has never met `MIGRATIONS`:
+        // through `Store::open` the table is there before the step runs,
+        // and comparing it would set the DDL against itself.
+        let (fresh, _d) = test_store();
+        let dir = TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("old.duckdb")).unwrap();
+        conn.execute_batch(STEP_27_SHOP_DELIVERY).unwrap();
+        let built = shape(&conn, "shop_delivery");
+        assert_eq!(built.len(), 8, "the step built the table: {built:?}");
+        assert_eq!(shape(&fresh.conn(), "shop_delivery"), built);
+        // The key is not a column, so `shape` cannot see it; a second row
+        // for one shop and country can.
+        for table in [&conn, &*fresh.conn()] {
+            let row = "INSERT INTO shop_delivery (host, country, status) VALUES ('shop.example', 'NL', 'silent')";
+            table.execute(row, []).unwrap();
+            assert!(table.execute(row, []).is_err(), "one row a shop and country");
+        }
+    }
+
+    /// A database at 26 with a person's purchases, facts and runs in it:
+    /// built from `MIGRATIONS` and stripped of the table step 27 adds, and
+    /// of the one the step after it adds, which a database at 26 has not
+    /// seen either.
+    fn version_twenty_six_db() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v26.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS).unwrap();
+        conn.execute_batch(
+            "DROP TABLE shop_delivery;
+             DROP TABLE price_watches;
+             DROP SEQUENCE price_watches_id_seq;
+             CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
+             DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES (26);
+             INSERT INTO accounts (id) VALUES (1);
+             INSERT INTO purchases (account_id, item, store, price, currency) VALUES (1, 'widget', 'shop.example', 9.99, 'EUR');
+             INSERT INTO user_facts (account_id, key, value) VALUES (1, 'delivery_country', 'NL');
+             INSERT INTO runs (id, account_id, conversation_id, outcome, input_tokens, cached_tokens, output_tokens)
+                 VALUES (1, 1, 1, 'answered', 1000, 200, 50);
+             INSERT INTO run_traces (run_id, seq, kind, tool, started_at, result)
+                 VALUES (1, 0, 'tool', 'compare_prices', TIMESTAMP '2026-11-19 10:00:00', '{}');",
+        )
+        .unwrap();
+        drop(conn);
+        (dir, path)
+    }
+
+    /// Every row of the tables `version_twenty_six_db` fills, as text.
+    fn everything_in(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        for table in ["accounts", "purchases", "user_facts", "runs", "run_traces"] {
+            let mut stmt = conn.prepare(&format!("SELECT CAST({table} AS VARCHAR) FROM {table} ORDER BY 1")).unwrap();
+            let rows: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+            assert!(!rows.is_empty(), "{table} has a row to lose");
+            out.extend(rows.into_iter().map(|row| format!("{table}: {row}")));
+        }
+        out
+    }
+
+    #[test]
+    fn step_27_runs_on_a_database_with_data_in_it_and_changes_none_of_it() {
+        let (_dir, path) = version_twenty_six_db();
+        let before = everything_in(&Connection::open(&path).unwrap());
+
+        let s = Store::open(&path).unwrap();
+
+        assert_eq!(s.schema_version().unwrap(), 28);
+        assert_eq!(everything_in(&s.conn()), before, "what was there is there, as it was");
+        let (fresh, _d) = test_store();
+        assert_eq!(shape(&fresh.conn(), "shop_delivery"), shape(&s.conn(), "shop_delivery"));
+        let kept: i64 = s.conn().query_row("SELECT count(*) FROM shop_delivery", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 0, "the new table starts empty");
+        // The step is pending, so the database is copied before it runs.
+        let taken: Vec<_> = std::fs::read_dir(crate::backup::dir_for(&path)).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(taken.len(), 1, "one backup: {taken:?}");
+        assert!(taken[0].file_name().unwrap().to_str().unwrap().contains("migration-v28"), "{taken:?}");
+        assert_eq!(everything_in(&Connection::open(&taken[0]).unwrap()), before, "and the copy holds the data");
+        // A second start has nothing left to do.
+        drop(s);
+        let again = Store::open(&path).unwrap();
+        assert_eq!(again.schema_version().unwrap(), 28);
+        assert_eq!(everything_in(&again.conn()), before);
+    }
+
+    fn delivery(status: &str, bands: Option<&str>, source_url: Option<&str>, detail: Option<&str>) -> ShopDelivery {
+        ShopDelivery {
+            status: status.to_string(),
+            bands: bands.map(str::to_string),
+            currency: bands.map(|_| "EUR".to_string()),
+            source_url: source_url.map(str::to_string),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn delivery_terms_are_kept_by_host_and_country_and_a_new_reading_replaces_the_old() {
+        let (s, _d) = test_store();
+        let read = at("2026-11-20 10:00");
+        let page = "https://shop.example/delivery";
+        let terms = delivery("terms", Some("[[0.0,4.99],[29.0,0.0]]"), Some(page), None);
+        s.keep_shop_delivery("shop.example", "NL", &terms, read).unwrap();
+        s.keep_shop_delivery("shop.example", "DE", &delivery("not_delivered", None, Some(page), None), read).unwrap();
+        s.keep_shop_delivery("other.example", "NL", &delivery("depends", None, None, None), read).unwrap();
+
+        let asked = ["shop.example".to_string(), "never-read.example".to_string()];
+        let kept = s.shop_delivery_kept(&asked, "NL").unwrap();
+        assert_eq!(
+            kept,
+            vec![KeptShopDelivery { host: "shop.example".to_string(), terms: terms.clone(), read_at: read }],
+            "the shop asked about, for the country asked about, and nothing for a shop never read"
+        );
+        assert!(s.shop_delivery_kept(&[], "NL").unwrap().is_empty(), "nobody asked about, nothing kept");
+
+        // The shop is read again and says no: one row, the new one, with
+        // nothing of the old terms left beside the new status.
+        let later = at("2026-11-21 09:30");
+        s.keep_shop_delivery("shop.example", "NL", &delivery("unread", None, None, Some("http 403")), later).unwrap();
+        let kept = s.shop_delivery_kept(&asked, "NL").unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].terms, delivery("unread", None, None, Some("http 403")));
+        assert_eq!(kept[0].read_at, later);
+        // The other country's row is its own.
+        let german = s.shop_delivery_kept(&asked, "DE").unwrap();
+        assert_eq!((german[0].terms.status.as_str(), german[0].read_at), ("not_delivered", read));
+    }
+
+    #[test]
+    fn a_row_past_its_keep_is_deleted_at_the_next_write() {
+        let (s, _d) = test_store();
+        let now = at("2026-11-20 10:00");
+        let days = chrono::Duration::days;
+        let silent = delivery("silent", None, None, None);
+        s.keep_shop_delivery("old.example", "NL", &silent, now - days(DELIVERY_KEEP_DAYS + 1)).unwrap();
+        s.keep_shop_delivery("recent.example", "NL", &silent, now - days(DELIVERY_KEEP_DAYS - 1)).unwrap();
+        let hosts = |s: &Store| -> Vec<String> {
+            let conn = s.conn();
+            let mut stmt = conn.prepare("SELECT host FROM shop_delivery ORDER BY host").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(hosts(&s), ["old.example", "recent.example"], "nothing has been written since");
+
+        s.keep_shop_delivery("new.example", "NL", &silent, now).unwrap();
+
+        assert_eq!(hosts(&s), ["new.example", "recent.example"], "a row read more than the keep ago went with this write");
+    }
+
+    #[test]
+    fn the_delivery_table_has_no_column_for_who_asked() {
+        // A row read for one person answers the next: it holds a shop, a
+        // country and the terms, and nothing of an account, a run or the
+        // product whose page was open.
+        let (s, _d) = test_store();
+        let columns: Vec<String> = shape(&s.conn(), "shop_delivery").into_iter().map(|c| c.0).collect();
+        assert_eq!(columns, ["host", "country", "status", "bands", "currency", "source_url", "detail", "read_at"]);
+    }
+
+    #[test]
     fn step_25_gives_an_old_login_table_the_join_column_in_the_fresh_shape() {
         let (fresh, _d) = test_store();
         let dir = TempDir::new().unwrap();
@@ -10512,7 +10795,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -11371,7 +11654,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 28, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -11412,7 +11695,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -11512,7 +11795,7 @@ CREATE TABLE conversations (
         // updated the table: the pod crash-looped on this step.
         let (_dir, path) = version_eighteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let trip = s.list_trips(1).unwrap().remove(0);
         assert_eq!((trip.items[0].lat, trip.items[0].geocode_tried), (None, false));
         s.set_item_coords(trip.items[0].id, None).unwrap();
@@ -11549,7 +11832,7 @@ CREATE TABLE conversations (
     fn step_20_runs_on_a_database_that_has_items_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_nineteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let item = &s.list_trips(1).unwrap()[0].items[0];
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
@@ -12252,7 +12535,7 @@ CREATE TABLE conversations (
     fn step_21_runs_on_a_database_with_trips_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let trip = &s.list_trips(1).unwrap()[0];
         assert_eq!(trip.items[0].added, None, "an item from before sharing has no author");
         let (fresh, _d) = test_store();
@@ -12290,7 +12573,7 @@ CREATE TABLE conversations (
     fn step_22_runs_on_a_database_with_mail_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_one_db();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let (fresh, _d) = test_store();
         // Not `mail_forwards`: `Store::open` runs `MIGRATIONS` before the
         // steps, so the table is there whatever step 22 says, and comparing
@@ -12884,7 +13167,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -13048,7 +13331,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -13093,7 +13376,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -13169,7 +13452,7 @@ CREATE TABLE messages (
         // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         let part = mail_part("att_1", Some("inline"), None);
         let m = store
             .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))

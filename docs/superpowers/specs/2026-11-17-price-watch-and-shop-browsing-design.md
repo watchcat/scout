@@ -116,7 +116,7 @@ reason: a watch is a promise to come back.
 - `list_watches {}` — what is being watched, with the last price read.
 - `stop_watch { id }`.
 
-### `price_watches` (schema step 27)
+### `price_watches` (schema step 28)
 
 `id`, `account_id`, `url`, `title`, `currency`, `target` and `first_price`
 (`DOUBLE`, as every price column is), `last_price`, `lowest_price`,

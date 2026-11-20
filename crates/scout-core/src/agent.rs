@@ -745,6 +745,9 @@ pub fn build_agent(
         delivery_country(facts),
         between_people.clone(),
     ));
+    // The same memo for `watch_price`, which reads a page too: a shop that
+    // refused `fetch_page` in this request is not asked again for a watch.
+    let shops_for_watches = shops.clone();
     let mut builder = d
         .llm
         .agent(&d.model)
@@ -792,13 +795,14 @@ pub fn build_agent(
     // offered.
     if let Some(reply_to) = &run.reply_to {
         builder = builder
-            .tool(WatchPriceTool {
-                store: d.store.clone(),
+            .tool(WatchPriceTool::new(
+                d.store.clone(),
                 account_id,
-                reply_to: reply_to.clone(),
-                web: d.web.clone(),
-                renderer: d.renderer.clone(),
-            })
+                reply_to.clone(),
+                d.web.clone(),
+                d.renderer.clone(),
+                shops_for_watches.clone(),
+            ))
             .tool(ListWatchesTool { store: d.store.clone(), account_id })
             .tool(StopWatchTool { store: d.store.clone(), account_id, metrics: d.metrics });
     }

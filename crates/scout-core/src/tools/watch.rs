@@ -26,15 +26,65 @@ pub struct WatchAnswer {
     pub say: String,
 }
 
+/// Pages `watch_price` may read in one request. It reads a page as
+/// `fetch_page` does, a render behind it where one is wanted, and a tool
+/// with no bound of its own was a way round that tool's five: a price and
+/// a name for any page, as often as a model asked. Three because a person
+/// asking to be told about more than three things in one message has not
+/// been seen; not measured.
+const MAX_READS: usize = 3;
+
 pub struct WatchPriceTool {
-    pub store: Store,
-    pub account_id: i64,
+    store: Store,
+    account_id: i64,
     /// Where the watch's one message will go: the chat this run is in.
     /// Carried, as a reminder's is, because in a group that is the group.
-    pub reply_to: ReplyTo,
-    /// What `fetch_page` reads with, so a watch reads a page the same way.
-    pub web: crate::net_guard::OpenWeb,
-    pub renderer: Option<super::browser::Renderer>,
+    reply_to: ReplyTo,
+    /// One reader a request, as `fetch_page` has one: what it learns of a
+    /// host that refuses lasts the request.
+    reader: PageReader,
+    /// The request's memo of its shops' pages, which `fetch_page` writes
+    /// and the delivery desk reads. A shop that refused either of them is
+    /// not asked again here, and one that refuses here is noted there.
+    shops: std::sync::Arc<super::delivery::ShopPages>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl WatchPriceTool {
+    pub fn new(
+        store: Store,
+        account_id: i64,
+        reply_to: ReplyTo,
+        web: crate::net_guard::OpenWeb,
+        renderer: Option<super::browser::Renderer>,
+        shops: std::sync::Arc<super::delivery::ShopPages>,
+    ) -> Self {
+        Self {
+            store,
+            account_id,
+            reply_to,
+            reader: PageReader::for_a_request(web, renderer, shops.clone()),
+            shops,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+/// The request's reader as one call to `watch_price` may use it: not for a
+/// shop the request already knows to refuse, and counted when it is used.
+struct Metered<'a> {
+    tool: &'a WatchPriceTool,
+}
+
+impl watch::Reader for Metered<'_> {
+    async fn read(&self, url: &str) -> watch::Reading {
+        let host = reqwest::Url::parse(url).ok().as_ref().and_then(super::fetch::host_key);
+        if host.is_some_and(|host| self.tool.shops.closed(&host)) {
+            return watch::Reading::Refused;
+        }
+        self.tool.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.tool.reader.read(url).await
+    }
 }
 
 impl Tool for WatchPriceTool {
@@ -52,7 +102,7 @@ impl Tool for WatchPriceTool {
              own address where it has one), the amount the user named, and that amount's currency. \
              Never pass or state a current price of your own. The result's `say` is the answer for the \
              user: give it with every amount and date exactly as written. When `watching` is false no \
-             watch was started and `say` is why.",
+             watch was started and `say` is why. It reads at most {MAX_READS} pages a request.",
             watch::DAYS
         )
     }
@@ -70,7 +120,15 @@ impl Tool for WatchPriceTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let reader = PageReader::for_a_request(self.web.clone(), self.renderer.clone());
+        // Before anything is asked of anyone. A call that reads no page,
+        // one for an address already watched, is refused here too once the
+        // three are spent: the bound is on what the tool may cost.
+        if self.reads.load(std::sync::atomic::Ordering::Relaxed) >= MAX_READS {
+            return Err(StoreToolError(format!(
+                "watch_price has read {MAX_READS} pages in this request, which is as many as it may — do not call it \
+                 again now; tell the user which watches were started and that the rest can be asked for in a new message"
+            )));
+        }
         let ask = Ask {
             account_id: self.account_id,
             reply_to: &self.reply_to,
@@ -78,7 +136,7 @@ impl Tool for WatchPriceTool {
             target: args.target,
             currency: &args.currency,
         };
-        let answer = watch::start(&self.store, &reader, ask, chrono::Utc::now().naive_utc()).await.map_err(internal)?;
+        let answer = watch::start(&self.store, &Metered { tool: self }, ask, chrono::Utc::now().naive_utc()).await.map_err(internal)?;
         Ok(WatchAnswer { watching: answer.started.is_some(), id: answer.started, say: answer.say })
     }
 }
@@ -171,6 +229,8 @@ impl Tool for StopWatchTool {
 mod tests {
     use super::*;
     use crate::net_guard::OpenWeb;
+    use crate::tools::delivery::ShopPages;
+    use std::sync::Arc;
     use tempfile::TempDir;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -195,13 +255,27 @@ mod tests {
     }
 
     fn watching(store: &Store, shop: &MockServer, account_id: i64, reply_to: ReplyTo) -> WatchPriceTool {
-        WatchPriceTool {
-            store: store.clone(),
-            account_id,
-            reply_to,
-            web: OpenWeb::exempting(*shop.address()),
-            renderer: None,
-        }
+        watching_in(store, shop, account_id, reply_to, Arc::default())
+    }
+
+    /// The tool as one request builds it, with that request's memo of
+    /// what its shops' pages said.
+    fn watching_in(store: &Store, shop: &MockServer, account_id: i64, reply_to: ReplyTo, shops: Arc<ShopPages>) -> WatchPriceTool {
+        WatchPriceTool::new(store.clone(), account_id, reply_to, OpenWeb::exempting(*shop.address()), None, shops)
+    }
+
+    async fn asked(shop: &MockServer) -> usize {
+        shop.received_requests().await.expect("the mock records what it is asked").len()
+    }
+
+    /// A shop that answers every page with its notice that it will not
+    /// serve this reader.
+    async fn a_shop_that_refuses() -> MockServer {
+        let notice = "<html><head><title>shop</title></head><body><h1>Access blocked</h1>\
+            <p>Your access has been temporarily blocked.</p></body></html>";
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_string(notice)).mount(&server).await;
+        server
     }
 
     /// A set of counters of the test's own.
@@ -335,6 +409,94 @@ mod tests {
         // and the model is told to pass no price and to change none.
         assert!(told.contains("Never pass or state a current price of your own"), "got: {told}");
         assert!(told.contains("every amount and date exactly as written"), "got: {told}");
+    }
+
+    #[tokio::test]
+    async fn a_shop_that_refused_a_page_in_this_request_is_not_asked_again_for_a_watch() {
+        // `fetch_page` was told no a moment ago and told the model so.
+        // The watch tool reads a page too, and a second tool must not be
+        // a way to send the shop another request, and a Chrome after it.
+        let (store, _d) = setup();
+        let shop = a_shop().await;
+        let shops: Arc<ShopPages> = Arc::default();
+        shops.note_closed("127.0.0.1");
+        let tool = watching_in(&store, &shop, 1, ReplyTo::telegram(99), shops);
+
+        let answer = tool.call(under(&shop, "widget", 300.0)).await.unwrap();
+
+        assert!(!answer.watching);
+        assert!(answer.say.starts_with("I cannot watch this page: 127.0.0.1 refused Scout's request"), "got: {}", answer.say);
+        assert_eq!(asked(&shop).await, 0, "the shop was asked again");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_watch_tool_meets_is_the_requests_to_remember() {
+        let (store, _d) = setup();
+        let shop = a_shop_that_refuses().await;
+        let shops: Arc<ShopPages> = Arc::default();
+        let tool = watching_in(&store, &shop, 1, ReplyTo::telegram(99), shops.clone());
+
+        let first = tool.call(under(&shop, "widget", 300.0)).await.unwrap();
+        assert!(!first.watching && first.say.contains("refused Scout's request"), "got: {}", first.say);
+        assert!(shops.closed("127.0.0.1"), "the delivery desk of this request is not told");
+
+        // Nor is the shop asked for the next page of it.
+        let second = tool.call(under(&shop, "another", 300.0)).await.unwrap();
+        assert!(!second.watching);
+        assert_eq!(asked(&shop).await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_watch_tool_reads_three_pages_a_request_and_says_so_at_the_fourth() {
+        // Without a bound of its own it was a way round `fetch_page`'s:
+        // a price and a name for any page, as often as the model asked,
+        // each with a render behind it.
+        let (store, _d) = setup();
+        let shop = a_shop().await;
+        let tool = watching(&store, &shop, 1, ReplyTo::telegram(99));
+        for page in ["one", "two", "three"] {
+            // Over the price, so nothing starts: reading is what is counted.
+            let answer = tool.call(under(&shop, page, 1_000_000.0)).await.unwrap();
+            assert!(answer.say.starts_with("Widget is already €329.00"), "{page}: {}", answer.say);
+        }
+        let err = tool.call(under(&shop, "four", 300.0)).await.unwrap_err().to_string();
+        assert!(err.contains("has read 3 pages in this request"), "got: {err}");
+        assert!(err.contains("do not call it again"), "the model is told to stop: {err}");
+        assert_eq!(asked(&shop).await, 3, "the fourth page was not asked for");
+        assert!(store.live_watches(1).unwrap().is_empty());
+
+        // The next request has its own three.
+        let next = watching(&store, &shop, 1, ReplyTo::telegram(99));
+        assert!(next.call(under(&shop, "four", 300.0)).await.unwrap().watching);
+    }
+
+    #[tokio::test]
+    async fn a_call_that_reads_no_page_spends_none_of_the_three() {
+        let (store, _d) = setup();
+        let shop = a_shop().await;
+        let tool = watching(&store, &shop, 1, ReplyTo::telegram(99));
+        assert!(tool.call(under(&shop, "widget", 300.0)).await.unwrap().watching);
+        // Asked again for the page it is watching: answered from the table.
+        for _ in 0..5 {
+            let again = tool.call(under(&shop, "widget", 280.0)).await.unwrap();
+            assert!(again.say.starts_with("I am already watching"), "got: {}", again.say);
+        }
+        assert_eq!(asked(&shop).await, 1);
+        assert!(tool.call(under(&shop, "second", 300.0)).await.unwrap().watching);
+        assert!(tool.call(under(&shop, "third", 300.0)).await.unwrap().watching);
+        assert!(tool.call(under(&shop, "fourth", 300.0)).await.is_err());
+    }
+
+    #[test]
+    fn the_request_hands_the_watch_tool_its_own_memo_of_the_shops() {
+        // The memo is one a request, shared with `fetch_page` and the
+        // delivery desk. A source assertion, as a built agent does not
+        // say what its tools hold.
+        let src = include_str!("../agent.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let build = &src[src.find("pub fn build_agent").expect("the agent build must exist")..];
+        assert!(build.contains("let shops_for_watches = shops.clone();"), "the watch tool needs the request's memo");
+        assert!(build.contains("shops_for_watches.clone(),"), "and has to be handed it");
     }
 
     #[test]

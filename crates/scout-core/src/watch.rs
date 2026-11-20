@@ -165,10 +165,16 @@ pub(crate) struct PageReader {
 }
 
 impl PageReader {
-    /// For one `watch_price` call: a reader of its own, so the price a
-    /// watch starts from is read then and not remembered from earlier.
-    pub(crate) fn for_a_request(web: crate::net_guard::OpenWeb, renderer: Option<crate::tools::browser::Renderer>) -> Self {
-        Self { tool: FetchPageTool::new(web, renderer) }
+    /// For the `watch_price` calls of one request: a reader apart from
+    /// `fetch_page`'s, so the price a watch starts from is read then and
+    /// not remembered from a page opened earlier, and noting in the
+    /// request's memo, as that one does, a shop that tells it no.
+    pub(crate) fn for_a_request(
+        web: crate::net_guard::OpenWeb,
+        renderer: Option<crate::tools::browser::Renderer>,
+        shops: std::sync::Arc<crate::tools::delivery::ShopPages>,
+    ) -> Self {
+        Self { tool: FetchPageTool::new(web, renderer).noting(shops) }
     }
 
     /// For one daily pass over every watch that is due; see
@@ -836,7 +842,7 @@ mod tests {
     }
 
     fn reader(server: &MockServer) -> PageReader {
-        PageReader::for_a_request(OpenWeb::exempting(*server.address()), None)
+        PageReader::for_a_request(OpenWeb::exempting(*server.address()), None, Default::default())
     }
 
     async fn read(server: &MockServer) -> Reading {
@@ -918,20 +924,20 @@ mod tests {
         let unfilled = Reading::Failed("it came back as a shell that no browser filled".to_string());
         assert_eq!(read(&server).await, unfilled);
         let stalled = crate::tools::browser::Renderer::new(std::path::PathBuf::from("/definitely/not/chrome"));
-        let with_one = PageReader::for_a_request(OpenWeb::exempting(*server.address()), Some(stalled));
+        let with_one = PageReader::for_a_request(OpenWeb::exempting(*server.address()), Some(stalled), Default::default());
         assert_eq!(with_one.read(&format!("{}/p/widget", server.uri())).await, unfilled);
         // Where a status that is no page sent the request to a browser
         // that would not start, it is the status that is told.
         let server = serving(503, "").await;
         let stalled = crate::tools::browser::Renderer::new(std::path::PathBuf::from("/definitely/not/chrome"));
-        let with_one = PageReader::for_a_request(OpenWeb::exempting(*server.address()), Some(stalled));
+        let with_one = PageReader::for_a_request(OpenWeb::exempting(*server.address()), Some(stalled), Default::default());
         assert_eq!(with_one.read(&format!("{}/p/widget", server.uri())).await, Reading::Failed("it answered HTTP 503".to_string()));
 
         // A request that never arrived: a port nobody listens on any more.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let nobody = PageReader::for_a_request(OpenWeb::exempting(address), None);
+        let nobody = PageReader::for_a_request(OpenWeb::exempting(address), None, Default::default());
         assert_eq!(
             nobody.read(&format!("http://{address}/p/widget")).await,
             Reading::Failed("the request for it failed".to_string())
@@ -994,7 +1000,7 @@ mod tests {
         // have Scout ask the pod's own listeners something once a day.
         let server = MockServer::start().await;
         Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_string(widget_at("1.00"))).expect(0).mount(&server).await;
-        let guarded = PageReader::for_a_request(OpenWeb::new(std::time::Duration::from_secs(5)).unwrap(), None);
+        let guarded = PageReader::for_a_request(OpenWeb::new(std::time::Duration::from_secs(5)).unwrap(), None, Default::default());
         for url in [format!("{}/metrics", server.uri()), "http://10.43.0.1/".to_string(), "ftp://shop.example/p".to_string()] {
             match guarded.read(&url).await {
                 Reading::Failed(why) => assert!(why.contains("not on the public internet") || why.contains("scheme"), "{url}: {why}"),

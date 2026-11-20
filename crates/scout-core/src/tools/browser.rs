@@ -110,6 +110,9 @@ pub fn find_chrome() -> Option<PathBuf> {
 pub struct Renderer {
     chrome: PathBuf,
     slots: Arc<Semaphore>,
+    /// What the proxy Chrome goes through will open: the public internet,
+    /// except in a live test, whose page is on loopback.
+    guard: crate::net_guard::Guard,
     /// What a test's renderer answers every address with, in place of a Chrome.
     #[cfg(test)]
     canned: Option<Arc<str>>,
@@ -120,9 +123,17 @@ impl Renderer {
         Self {
             chrome,
             slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RENDERS)),
+            guard: crate::net_guard::Guard::PUBLIC_ONLY,
             #[cfg(test)]
             canned: None,
         }
+    }
+
+    /// A renderer whose Chrome reaches `mock` and nothing else, so that a
+    /// live test can show a real Chrome a page of its own making.
+    #[cfg(test)]
+    fn reaching_only(chrome: PathBuf, mock: std::net::SocketAddr) -> Self {
+        Self { guard: crate::net_guard::Guard::only(mock), ..Self::new(chrome) }
     }
 
     /// A renderer that hands back `html` whatever it is asked for, so that
@@ -176,7 +187,7 @@ impl Renderer {
         // the page's scripts and resolves names on its own — any of which
         // can land on the pod's own listeners. Every connection it makes
         // goes through this proxy instead, which applies the same fence.
-        let (proxy, _proxy) = crate::net_guard::serve_socks(crate::net_guard::Guard::PUBLIC_ONLY)
+        let (proxy, _proxy) = crate::net_guard::serve_socks(self.guard)
             .await
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
         let mut child = tokio::process::Command::new(&self.chrome)
@@ -303,6 +314,14 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_renderer_opens_the_public_internet_and_nothing_else() {
+        // The guard is a field so that a live test can point a real Chrome
+        // at a mock on loopback; nothing else may ever set it.
+        let renderer = Renderer::new(PathBuf::from("/usr/bin/chromium"));
+        assert_eq!(renderer.guard, crate::net_guard::Guard::PUBLIC_ONLY);
+    }
+
     #[tokio::test]
     async fn a_failed_render_hands_its_slot_back() {
         // A leaked permit is worse than no limit at all: the renderer would
@@ -349,7 +368,169 @@ mod tests {
 #[cfg(test)]
 mod live {
     //! Ignored by default: needs a real Chrome and network.
+    //!
+    //! The `a_page_…` tests need the Chrome only. Their page is served from a
+    //! mock on loopback and their renderer can reach that mock and nothing
+    //! else, so they say what a page can do from inside a render without a
+    //! packet leaving the machine.
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use tokio::net::UdpSocket;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The wait every test page makes before it writes down what it saw.
+    ///
+    /// `--dump-dom` prints the page when its virtual time runs out, and
+    /// virtual time is not time. Measured 2026-11-20, Chrome 157 with the
+    /// render's flags and a STUN server named on loopback: a page that only
+    /// opens a peer connection is printed with ICE not begun (state `new`,
+    /// nothing sent); one that then waits five seconds on a timer is printed
+    /// 0.1 s later with ICE `gathering` and still nothing sent, since timers
+    /// are skipped through; one that waits on a request the server sits on
+    /// has ICE stand still until the answer comes. Gathering wants both
+    /// kinds of time, so a round here is a request held 200 ms and then a
+    /// timer — with that the first datagram left 0.25 s after the page was
+    /// served. Five rounds whatever happens, so that "nothing came" is said
+    /// after a second and not at once; up to twenty-five while `done()` is
+    /// false.
+    const WAIT: &str = "const wait = async (done) => {
+  for (let i = 0; i < 25 && (i < 5 || !done()); i++) {
+    await fetch('/tick').catch(() => {});
+    await new Promise(r => setTimeout(r, 100));
+  }
+};";
+
+    /// A page that opens a peer connection with `CONFIG`, lets ICE gather
+    /// and writes what came of it where the dump shows it.
+    const ICE_PAGE: &str = r#"<html><head><title>ice</title></head><body><pre id="out">ice:start</pre><script>
+WAIT
+(async () => {
+  const candidates = [];
+  const pc = new RTCPeerConnection(CONFIG);
+  pc.onicecandidate = e => { if (e.candidate) candidates.push(e.candidate.candidate); };
+  pc.createDataChannel('x');
+  await pc.setLocalDescription(await pc.createOffer());
+  await wait(() => pc.iceGatheringState === 'complete');
+  document.getElementById('out').textContent =
+    'ice:done state=' + pc.iceGatheringState + ' candidates=' + candidates.length + ' ' + candidates.join(' | ');
+})();
+</script></body></html>"#;
+
+    /// Renders `page` as production would, but for the guard: Chrome reaches
+    /// the mock that serves it and nothing else.
+    async fn render_from_loopback(server: &MockServer, page: &str) -> String {
+        Mock::given(path("/tick"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(200)))
+            .mount(server)
+            .await;
+        Mock::given(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(page.replace("WAIT", WAIT), "text/html"))
+            .mount(server)
+            .await;
+        let chrome = find_chrome().expect("chrome");
+        Renderer::reaching_only(chrome, *server.address())
+            .render(&format!("{}/", server.uri()))
+            .await
+            .unwrap()
+    }
+
+    /// What the test page wrote into its `<pre>`.
+    fn said(html: &str) -> &str {
+        html.split_once(r#"<pre id="out">"#)
+            .and_then(|(_, rest)| rest.split_once("</pre>"))
+            .map(|(text, _)| text)
+            .unwrap_or("(no page)")
+    }
+
+    /// Whether anything was sent to `socket` during the render; the kernel
+    /// keeps a datagram until it is read.
+    async fn reached(socket: &UdpSocket) -> bool {
+        let mut buf = [0u8; 64];
+        tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await.is_ok()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_page_cannot_send_udp_past_the_guard() {
+        // The proxy carries TCP, and WebRTC speaks UDP: a page that names a
+        // STUN server has Chrome send it a datagram from a socket of its
+        // own. Three listeners nothing should reach — one named by literal,
+        // one by `localhost` on each loopback, which only a resolver on this
+        // machine can turn into an address.
+        let literal = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let named = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let named_port = named.local_addr().unwrap().port();
+        let named_v6 = UdpSocket::bind((Ipv6Addr::LOCALHOST, named_port)).await.ok();
+        let config = format!(
+            r#"{{iceServers: [{{urls: ["stun:127.0.0.1:{}", "stun:localhost:{named_port}"]}}]}}"#,
+            literal.local_addr().unwrap().port()
+        );
+
+        let server = MockServer::start().await;
+        let html = render_from_loopback(&server, &ICE_PAGE.replace("CONFIG", &config)).await;
+        let said = said(&html);
+
+        let mut got = Vec::new();
+        for (what, socket) in [
+            ("127.0.0.1 by literal", Some(&literal)),
+            ("127.0.0.1 as localhost", Some(&named)),
+            ("::1 as localhost", named_v6.as_ref()),
+        ] {
+            if let Some(socket) = socket {
+                if reached(socket).await {
+                    got.push(what);
+                }
+            }
+        }
+        assert!(got.is_empty(), "a datagram went round the proxy to {got:?}; the page said: {said}");
+        // Silence only counts from a script that ran to its end.
+        assert!(said.starts_with("ice:done "), "the page's script did not finish: {said}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_page_gathers_no_ice_candidates() {
+        // With no STUN server nothing is sent, but the candidates Chrome
+        // gathers are handed to the page's script, and they are how a page
+        // reads the addresses of the machine it runs on.
+        let server = MockServer::start().await;
+        let html = render_from_loopback(&server, &ICE_PAGE.replace("CONFIG", "")).await;
+        let said = said(&html);
+        assert!(said.starts_with("ice:done state=complete candidates=0 "), "the page said: {said}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_page_cannot_have_chrome_load_ahead_of_it() {
+        // Speculation rules have Chrome fetch, or wholly render, addresses
+        // the page names before anyone goes there: one beside the page, one
+        // on a listener the guard refuses.
+        let server = MockServer::start().await;
+        let inside = MockServer::start().await;
+        let rules = serde_json::json!({
+            "prefetch": [{"source": "list", "urls": ["/ahead", format!("{}/ahead", inside.uri())]}],
+            "prerender": [{"source": "list", "urls": ["/ahead-whole"]}],
+        });
+        let page = format!(
+            r#"<html><head><title>ahead</title><script type="speculationrules">{rules}</script></head>
+<body><pre id="out">start</pre><script>
+WAIT
+(async () => {{ await wait(() => true); document.getElementById('out').textContent = 'waited'; }})();
+</script></body></html>"#
+        );
+        let html = render_from_loopback(&server, &page).await;
+        assert_eq!(said(&html), "waited");
+
+        let asked = |requests: Option<Vec<wiremock::Request>>| -> Vec<String> {
+            requests.unwrap_or_default().iter().map(|r| r.url.path().to_string()).collect()
+        };
+        let inside = asked(inside.received_requests().await);
+        assert!(inside.is_empty(), "a load ahead got past the guard: {inside:?}");
+        let ahead: Vec<String> =
+            asked(server.received_requests().await).into_iter().filter(|p| p.starts_with("/ahead")).collect();
+        assert!(ahead.is_empty(), "Chrome loaded ahead of the page: {ahead:?}");
+    }
 
     #[tokio::test]
     #[ignore]

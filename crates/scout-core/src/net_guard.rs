@@ -102,19 +102,43 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Guard {
     exempt: Option<SocketAddr>,
+    /// Set by [`Guard::only`]: the public internet is refused as well.
+    #[cfg(test)]
+    sealed: bool,
 }
 
 impl Guard {
     /// Production: the public internet only.
-    pub const PUBLIC_ONLY: Guard = Guard { exempt: None };
+    pub const PUBLIC_ONLY: Guard = Guard {
+        exempt: None,
+        #[cfg(test)]
+        sealed: false,
+    };
 
     /// The public internet plus `addr` — a mock server's socket.
     #[cfg(test)]
     pub fn exempting(addr: SocketAddr) -> Self {
-        Self { exempt: Some(addr) }
+        Self { exempt: Some(addr), sealed: false }
+    }
+
+    /// `addr` and nothing else, the public internet included.
+    ///
+    /// For a live test that starts a real Chrome, which asks for its maker's
+    /// hosts before it asks for the page: measured 2026-11-20, Chrome 157
+    /// with the render's flags sent the proxy nine CONNECTs to six Google
+    /// hosts (update, sign-in, static files) ahead of the first one for the
+    /// page. Under [`Guard::exempting`] the proxy would dial every one, so a
+    /// test about loopback would be talking to the internet.
+    #[cfg(test)]
+    pub fn only(addr: SocketAddr) -> Self {
+        Self { exempt: Some(addr), sealed: true }
     }
 
     fn allows(&self, addr: SocketAddr) -> bool {
+        #[cfg(test)]
+        if self.sealed {
+            return self.exempt == Some(addr);
+        }
         is_public(addr.ip()) || self.exempt == Some(addr)
     }
 
@@ -443,6 +467,27 @@ mod tests {
         assert!(g.check(&Url::parse("http://127.0.0.1:4000/x").unwrap()).await.is_ok());
         assert!(g.check(&Url::parse("http://127.0.0.1:4001/x").unwrap()).await.is_err());
         assert!(g.check(&Url::parse("http://127.0.0.2:4000/x").unwrap()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_guard_for_one_socket_only_refuses_the_public_internet_too() {
+        // What a live test of the renderer is given: a real Chrome asks for
+        // its maker's hosts on every start, and under `exempting` the proxy
+        // would dial them.
+        let mock: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let g = Guard::only(mock);
+        assert!(g.check(&Url::parse("http://127.0.0.1:4000/x").unwrap()).await.is_ok());
+        assert!(g.check(&Url::parse("http://127.0.0.1:4001/x").unwrap()).await.is_err());
+        assert!(g.check(&Url::parse("http://1.1.1.1/").unwrap()).await.is_err());
+        // The difference from the exemption every other test uses.
+        assert!(Guard::exempting(mock).check(&Url::parse("http://1.1.1.1/").unwrap()).await.is_ok());
+
+        // And at the proxy, where Chrome meets it: refused before any dial.
+        let (proxy, _keep) = serve_socks(g).await.unwrap();
+        let (code, _) = socks_connect(proxy, 1, &[1, 1, 1, 1], 443).await;
+        assert_eq!(code, REP_NOT_ALLOWED);
+        let (code, _) = socks_connect(proxy, 1, &[127, 0, 0, 1], 4001).await;
+        assert_eq!(code, REP_NOT_ALLOWED);
     }
 
     #[tokio::test]

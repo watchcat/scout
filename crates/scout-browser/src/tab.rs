@@ -1257,10 +1257,23 @@ mod tests {
         ])
         .await;
         let Some((mut tab, _)) = open(&pages, "/").await else { return };
-        let done = press(&mut tab, 1).await;
-        assert_eq!(done.refused, ["the page tried to open another window, and a session has one page"]);
+        let mut done = press(&mut tab, 1).await;
+        // The session is told why no window came, and the page that asked
+        // for one goes on running: both once Chrome has said so and the
+        // window is closed, which is not always before the press is
+        // answered. (Seen once: the press came back with the refusal and
+        // with the page as it stood before its script went on.)
+        let mut refused = std::mem::take(&mut done.refused);
+        for _ in 0..30 {
+            if !refused.is_empty() && done.seen.text.contains("Home, still") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            done = act(&mut tab, Action::Read { more: false }).await;
+            refused.append(&mut done.refused);
+        }
+        assert_eq!(refused, ["the page tried to open another window, and a session has one page"]);
         assert_eq!(done.seen.title, "Home");
-        // The page that asked for it goes on running.
         assert!(done.seen.text.contains("Home, still"), "{}", done.seen.text);
         assert!(!pages.was_asked("/popup"), "{:?}", pages.asked());
         // A link that asks for a tab of its own is followed in the session's one page.

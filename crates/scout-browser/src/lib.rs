@@ -88,6 +88,11 @@
 //!   Chrome to die (`pipe.rs`, given up after one second) and then for its
 //!   profile to stay removed (`chrome.rs`, given up after two). A profile
 //!   that is gone at the first try is watched for a tenth of a second.
+//! - **A press that opens a window can be answered before the page has
+//!   gone on.** The page that asked waits while the window is held and
+//!   closed, and a test once saw the press come back with the page as it
+//!   stood before. That test now reads again until the page has gone on,
+//!   and a caller would have to do the same.
 //! - **What is in a frame is not read**, as in the prototype, so a consent
 //!   notice that a shop shows in one cannot be put away. Nothing that only
 //!   wraps a frame is numbered.

@@ -33,6 +33,70 @@ use std::path::{Path, PathBuf};
 pub(crate) const PREFERENCES: &str =
     r#"{"webrtc":{"ip_handling_policy":"disable_non_proxied_udp"},"net":{"network_prediction_options":2}}"#;
 
+/// A session's profile: a directory of its own, gone when the session is.
+///
+/// Gone takes more than removing it once. Chrome is several processes, and
+/// a profile removed the moment the first of them had died was now and then
+/// found there afterwards (three runs of this crate's tests left one whole
+/// profile behind, 2026-11-20, when only the first was killed). `pipe.rs`
+/// kills them together now. What a killed process had under way is still
+/// nothing this crate can time, so the profile is removed until it has
+/// stayed away for a moment.
+pub(crate) struct Profile {
+    path: PathBuf,
+    removed: std::sync::atomic::AtomicBool,
+}
+
+/// How often a profile is removed and looked for again, how many times
+/// running it must be found gone, and when to give up on one that
+/// something keeps writing: a hundred milliseconds of quiet, two seconds
+/// at most. Chosen for a process's last moments, not measured.
+const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(50);
+const GONE_FOR: u32 = 3;
+const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Profile {
+    pub(crate) fn new() -> std::io::Result<Profile> {
+        let path = tempfile::Builder::new().prefix("scout-session-").tempdir()?.keep();
+        write_preferences(&path)?;
+        Ok(Profile { path, removed: Default::default() })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Removes it once more, and says whether that was the last time needed.
+    fn gone(&self, quiet: &mut u32, since: std::time::Instant) -> bool {
+        let _ = std::fs::remove_dir_all(&self.path);
+        *quiet = if self.path.exists() { 0 } else { *quiet + 1 };
+        *quiet >= GONE_FOR || since.elapsed() >= GIVE_UP
+    }
+
+    /// Removes the profile for good, once its Chrome has been stopped.
+    pub(crate) async fn remove(&self) {
+        let (mut quiet, since) = (0, std::time::Instant::now());
+        while !self.gone(&mut quiet, since) {
+            tokio::time::sleep(LOOK_AGAIN).await;
+        }
+        self.removed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for Profile {
+    /// The same where nothing can be awaited, for a session let go of
+    /// unclosed: the thread waits the same short while.
+    fn drop(&mut self) {
+        if self.removed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let (mut quiet, since) = (0, std::time::Instant::now());
+        while !self.gone(&mut quiet, since) {
+            std::thread::sleep(LOOK_AGAIN);
+        }
+    }
+}
+
 /// Writes [`PREFERENCES`] where a Chrome started on `profile` reads them.
 pub(crate) fn write_preferences(profile: &Path) -> std::io::Result<()> {
     let default = profile.join("Default");
@@ -155,6 +219,32 @@ mod tests {
         let read: serde_json::Value = serde_json::from_str(&written).unwrap();
         assert_eq!(read["webrtc"]["ip_handling_policy"], "disable_non_proxied_udp");
         assert_eq!(read["net"]["network_prediction_options"], 2);
+    }
+
+    #[test]
+    fn a_profile_that_something_still_writes_into_is_gone_once_the_writing_stops() {
+        // Found by counting what three runs of the tests left behind when a
+        // profile was removed once, after the first of its Chrome's
+        // processes had died: one whole profile. Here a thread stands in
+        // for whatever was still writing there.
+        let profile = Profile::new().unwrap();
+        let path = profile.path().to_path_buf();
+        assert!(path.join("Default").join("Preferences").exists());
+        let writing = std::thread::spawn({
+            let cache = path.join("Default").join("Cache");
+            move || {
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+                let mut files = 0;
+                while std::time::Instant::now() < until {
+                    let _ = std::fs::create_dir_all(&cache);
+                    let _ = std::fs::write(cache.join(format!("f{files}")), b"x");
+                    files += 1;
+                }
+            }
+        });
+        drop(profile);
+        writing.join().unwrap();
+        assert!(!path.exists(), "{} is still there, with {:?} in it", path.display(), std::fs::read_dir(&path).map(|d| d.count()));
     }
 
     #[test]

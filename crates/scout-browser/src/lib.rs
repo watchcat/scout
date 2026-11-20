@@ -76,13 +76,18 @@
 //! - **It stops on Ctrl-C and on nothing else.** A `SIGTERM`, which is what
 //!   a pod is sent, ends the process without closing its sessions, and
 //!   nothing sweeps the profiles a killed server leaves in the temporary
-//!   directory. Whether its Chromes go with it was not tried.
+//!   directory. Its Chromes are then left to end themselves on finding
+//!   their pipe closed: one idle Chrome whose holder was killed outright
+//!   was gone 0.1, 0.4 and 2.7 seconds later in three tries (2026-11-20,
+//!   Chrome 157, with a stand-in for the server holding the pipe). A
+//!   Chrome in the middle of a page was not tried.
 //! - **Calls that wait for a place are not counted.** Three sessions run at
 //!   once; any number of calls may wait, each for up to its 180 seconds.
-//! - **Letting go of a page can hold a worker for up to a second.** A page
-//!   dropped unclosed waits for its Chrome to die, on the thread it is
-//!   dropped on (`pipe.rs`); a killed process is gone in milliseconds, and
-//!   the wait gives up after one second.
+//! - **Letting go of a page can hold a worker for up to three seconds.** A
+//!   page dropped unclosed waits, on the thread it is dropped on, for its
+//!   Chrome to die (`pipe.rs`, given up after one second) and then for its
+//!   profile to stay removed (`chrome.rs`, given up after two). A profile
+//!   that is gone at the first try is watched for a tenth of a second.
 //! - **What is in a frame is not read**, as in the prototype, so a consent
 //!   notice that a shop shows in one cannot be put away. Nothing that only
 //!   wraps a frame is numbered.

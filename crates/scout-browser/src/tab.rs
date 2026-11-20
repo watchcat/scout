@@ -21,7 +21,7 @@
 //!   found to have landed elsewhere ends the session.
 
 use crate::address::{address_refused, asked_address, link_refused};
-use crate::chrome::{chrome_args, write_preferences};
+use crate::chrome::{chrome_args, Profile};
 use crate::drive::{Action, Broken, Browser, Done, Page, Seen, ADDRESS_CHARS, MARKUP_CHARS, OUTLINE_CHARS, OUTLINE_WHOLE, TITLE_CHARS};
 use crate::pipe::{CallError, Event, Pipe};
 use crate::site::Shop;
@@ -115,15 +115,15 @@ impl Browser for Chrome {
         }
         let failed = |e: std::io::Error| Broken::Failed(e.to_string());
         let (port, proxy) = serve_socks(Guard::PUBLIC_ONLY).await.map_err(failed)?;
-        let profile = tempfile::Builder::new().prefix("scout-session-").tempdir().map_err(failed)?;
-        write_preferences(profile.path()).map_err(failed)?;
+        let profile = Profile::new().map_err(failed)?;
         let (pipe, said) = Pipe::start(&self.path, &chrome_args(profile.path(), port, self.reaching)).map_err(failed)?;
         let pipe = Arc::new(pipe);
         let (session, frame, target) = match find_page(&pipe).await {
             Ok(found) => found,
             Err(broken) => {
-                // Chrome first, then its profile, which goes with this scope.
+                // Chrome first, then its profile.
                 pipe.stop().await;
+                profile.remove().await;
                 return Err(broken);
             }
         };
@@ -146,7 +146,7 @@ impl Browser for Chrome {
             good: None,
             watcher,
             _proxy: proxy,
-            _profile: profile,
+            profile,
         };
         let opened = match tab.switch_on().await {
             Ok(()) => tab.first(url).await,
@@ -256,7 +256,7 @@ pub struct Tab {
     good: Option<Url>,
     watcher: tokio::task::JoinHandle<()>,
     _proxy: SocksProxy,
-    _profile: tempfile::TempDir,
+    profile: Profile,
 }
 
 fn gone(e: CallError) -> Broken {
@@ -747,9 +747,10 @@ impl Page for Tab {
 
     async fn close(self) {
         self.watcher.abort();
-        // Chrome first, and until it is gone: the profile goes with `self`,
-        // and a Chrome still writing to it would leave half of it behind.
+        // Chrome first, and until it is gone; then its profile, until that
+        // has stayed gone: `Profile` says why once is not enough.
         self.pipe.stop().await;
+        self.profile.remove().await;
     }
 }
 
@@ -1022,7 +1023,7 @@ mod tests {
         let _one_of_few = testing::gate().await;
         let pages = Pages::serve(&[("/p/widget", html(WIDGET))]).await;
         let Some((tab, _)) = open(&pages, "/p/widget").await else { return };
-        let profile = tab._profile.path().to_path_buf();
+        let profile = tab.profile.path().to_path_buf();
         assert!(profile.join("Default").exists(), "Chrome keeps its profile where it was told to");
         tab.close().await;
         assert!(gone_for_good(&profile).await, "{} is still there", profile.display());
@@ -1035,7 +1036,7 @@ mod tests {
         let _one_of_few = testing::gate().await;
         let pages = Pages::serve(&[("/p/widget", html(WIDGET))]).await;
         let Some((tab, _)) = open(&pages, "/p/widget").await else { return };
-        let profile = tab._profile.path().to_path_buf();
+        let profile = tab.profile.path().to_path_buf();
         let chrome = tab.pipe.chrome_process().await.expect("a Chrome is running");
         assert!(is_running(chrome));
         drop(tab);

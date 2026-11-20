@@ -6,6 +6,7 @@
 //! it. The pipe is two file descriptors only this process and its child
 //! hold, and the protocol on it is JSON messages ended by a zero byte.
 
+use rustix::process::{kill_process_group, Pid, Signal};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -79,6 +80,9 @@ impl Pipe {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // A process group of its own, which its helpers are born into
+            // and which `kill_all` signals as one.
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()?;
         let into = child.stdin.take().expect("stdin is piped");
@@ -129,10 +133,12 @@ impl Pipe {
         Ok(answer)
     }
 
-    /// Kills the Chrome and waits for it to be gone, so that its profile
-    /// can be removed from under it.
+    /// Kills the Chrome and what it started, and waits for the Chrome to
+    /// be gone, so that its profile can be removed from under it.
     pub async fn stop(&self) {
-        let _ = self.chrome.lock().await.kill().await;
+        let mut chrome = self.chrome.lock().await;
+        kill_all(&chrome);
+        let _ = chrome.kill().await;
     }
 
     /// The same from where nothing can be awaited: a page that is let go
@@ -293,7 +299,31 @@ fn id_of(head: &[u8]) -> Option<u64> {
     std::str::from_utf8(&digits[..end]).ok()?.parse().ok()
 }
 
+/// Kills `chrome` and every process it started.
+///
+/// Chrome is several processes, and killing the first leaves the rest to
+/// notice and end themselves. Measured 2026-11-20 on Chrome 157, looking
+/// every fifth of a second during two runs of this crate's tests at once:
+/// 18 renderers were seen alive with their Chrome already gone, none of
+/// them at the next look. A moment is all it was, but nothing here should
+/// rest on what a killed program's children do next. They are born into
+/// the group `Pipe::start` gives the Chrome, so the group is signalled:
+/// in four runs measured the same way afterwards each of 264 Chromes led
+/// a group of its own, all 2704 of their helpers were in it, and none was
+/// seen to outlive its Chrome.
+fn kill_all(chrome: &Child) {
+    // `id` is the Chrome's number, and its group's, for as long as the
+    // Chrome has not been waited for; and for that long the system gives
+    // the number to nothing else. Once it has been, there is no number
+    // here, so a second stop cannot signal a stranger's group.
+    let group = chrome.id().and_then(|id| i32::try_from(id).ok()).and_then(Pid::from_raw);
+    if let Some(group) = group {
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+}
+
 fn kill_and_wait(chrome: &mut Child) {
+    kill_all(chrome);
     let _ = chrome.start_kill();
     for _ in 0..200 {
         if !matches!(chrome.try_wait(), Ok(None)) {
@@ -433,6 +463,71 @@ mod tests {
         pipe.stop().await;
         let after = pipe.call("Browser.getVersion", json!({}), None).await.unwrap_err();
         assert!(matches!(after, CallError::Gone(_)), "{after:?}");
+    }
+
+    /// A stand-in for a Chrome, in `dir`, that starts a process of its own
+    /// as Chrome starts its helpers, and writes down which. Both end by
+    /// themselves in half a minute, so a run of this that fails leaves
+    /// nothing behind for long.
+    fn a_program_that_starts_another(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join("stand-in");
+        std::fs::write(&program, "#!/bin/sh\nsleep 30 &\necho $! > \"$0.started\"\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    /// The process `program` wrote down, once it has.
+    async fn started_by(program: &Path) -> u32 {
+        let written = program.with_extension("started");
+        for _ in 0..200 {
+            if let Some(process) = std::fs::read_to_string(&written).ok().and_then(|said| said.trim().parse().ok()) {
+                return process;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the stand-in never said what it started");
+    }
+
+    /// Whether `process` runs. One that was killed and is only still
+    /// listed, until whoever inherited it takes note, does not.
+    fn runs(process: u32) -> bool {
+        let listed = std::process::Command::new("ps").args(["-o", "stat=", "-p", &process.to_string()]).output().unwrap();
+        let state = String::from_utf8_lossy(&listed.stdout);
+        !state.trim().is_empty() && !state.trim().starts_with('Z')
+    }
+
+    /// Whether `process` is gone within two seconds.
+    async fn is_gone(process: u32) -> bool {
+        for _ in 0..200 {
+            if !runs(process) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn what_a_chrome_started_is_stopped_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = a_program_that_starts_another(dir.path());
+        let (pipe, _said) = Pipe::start(&program, &[]).unwrap();
+        let helper = started_by(&program).await;
+        assert!(runs(helper), "the stand-in's own process runs while it does");
+        pipe.stop().await;
+        assert!(is_gone(helper).await, "process {helper} outlived the program that started it");
+    }
+
+    #[tokio::test]
+    async fn what_a_chrome_started_goes_with_a_pipe_that_is_let_go_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = a_program_that_starts_another(dir.path());
+        let (pipe, _said) = Pipe::start(&program, &[]).unwrap();
+        let helper = started_by(&program).await;
+        assert!(runs(helper), "the stand-in's own process runs while it does");
+        drop(pipe);
+        assert!(is_gone(helper).await, "process {helper} outlived the program that started it");
     }
 
     #[tokio::test]

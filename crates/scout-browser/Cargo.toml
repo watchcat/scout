@@ -21,9 +21,13 @@ tracing = "0.1"
 # without a subscriber nobody reads that.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-# A session's profile directory, removed on every way out of a session,
-# a panic included, by the directory's own `Drop`.
+# A session's profile directory, made under a name nothing else has.
+# `chrome::Profile` is what removes it.
 tempfile = "3"
+# One signal to a Chrome's whole process group, so that what the Chrome
+# started is stopped with it, without unsafe code here. tempfile brings
+# this same crate in already; only its `process` part is added.
+rustix = { version = "1", features = ["process"] }
 # The Public Suffix List, compiled in. "One shop a session" is a comparison
 # of registrable domains, and the list is the only thing that knows where
 # one ends: under `co.za` a shop has three labels, under a shop platform's

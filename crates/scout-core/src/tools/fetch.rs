@@ -23,7 +23,7 @@ pub(crate) fn browser_get(http: &reqwest::Client, url: impl reqwest::IntoUrl) ->
 
 /// Readable-text cap: enough for a product/listing page's useful content
 /// without flooding the model context.
-const MAX_TEXT_CHARS: usize = 6000;
+pub(super) const MAX_TEXT_CHARS: usize = 6000;
 /// Page opens allowed per request. The preamble asks for at most this many,
 /// but a model chasing one more listing will happily open eight and burn the
 /// turn budget before it answers — so the tool enforces it too. Three
@@ -1134,8 +1134,14 @@ pub(crate) fn extract_page(html: &str, base: &Url) -> PageContent {
         .and_then(|p| p.availability)
         .or_else(|| availability(html));
     let without_scripts = strip_tag_blocks(&strip_tag_blocks(html, "script"), "style");
-    let links = extract_links(&without_scripts, base);
-    let full_text = collapse_ws(&decode_entities(&strip_tags(&without_scripts)));
+    // The page first and a consent dialog after it, wherever the document
+    // has the dialog: the text and the links kept are the first of each,
+    // and a dialog at the top of a render took them. All of the text on
+    // two hosts and a third of it on amazon.nl; 6, 28 and 10 of the
+    // thirty links. See `consent`.
+    let in_reading_order = super::consent::read_last(&without_scripts);
+    let links = extract_links(&in_reading_order, base);
+    let full_text = collapse_ws(&decode_entities(&strip_tags(&in_reading_order)));
     let truncated = full_text.chars().count() > MAX_TEXT_CHARS;
     let text = if truncated {
         full_text.chars().take(MAX_TEXT_CHARS).collect()
@@ -1147,7 +1153,7 @@ pub(crate) fn extract_page(html: &str, base: &Url) -> PageContent {
 
 /// Remove `<tag ...>...</tag>` blocks wholesale (for script/style, whose
 /// bodies are not content). ASCII-lowercased shadow keeps byte offsets valid.
-fn strip_tag_blocks(html: &str, tag: &str) -> String {
+pub(super) fn strip_tag_blocks(html: &str, tag: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
@@ -1168,7 +1174,7 @@ fn strip_tag_blocks(html: &str, tag: &str) -> String {
     out
 }
 
-fn strip_tags(html: &str) -> String {
+pub(super) fn strip_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     for c in html.chars() {
@@ -1187,7 +1193,7 @@ fn strip_tags(html: &str) -> String {
 
 /// Decode the common entities; `&amp;` last so `&amp;lt;` becomes `&lt;`,
 /// not `<`.
-fn decode_entities(s: &str) -> String {
+pub(super) fn decode_entities(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&#39;", "'")
@@ -1196,11 +1202,11 @@ fn decode_entities(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn collapse_ws(s: &str) -> String {
+pub(super) fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn extract_links(html: &str, base: &Url) -> Vec<PageLink> {
+pub(super) fn extract_links(html: &str, base: &Url) -> Vec<PageLink> {
     let lower = html.to_ascii_lowercase();
     let mut links = Vec::new();
     let mut pos = 0;
@@ -1988,6 +1994,23 @@ mod tests {
         let page = tool.call(FetchArgs { url: format!("{}/dp/1", server.uri()) }).await.unwrap();
         assert_eq!(page.product.and_then(|p| p.price).as_deref(), Some("9.99 EUR"));
         assert!(page.text.contains("A widget for every purpose"));
+    }
+
+    #[tokio::test]
+    async fn a_render_that_opens_with_a_consent_dialog_is_handed_over_from_where_the_page_begins() {
+        // amazon.nl: 503 to the plain request on 2026-11-18
+        // (docs/2026-11-18-shop-reach.md), and on 2026-11-20 a render
+        // that opens with the shop's cookie notice, a third of the text
+        // kept and ten of the thirty links, before the page it was sent
+        // for.
+        use crate::tools::consent::fixtures::{page_with_flyouts, shops_own_notice};
+        let server = serving(503, "").await;
+        let tool = tool_with(&server, answering(&page_with_flyouts(&shops_own_notice())));
+        let page = tool.call(FetchArgs { url: format!("{}/dp/1", server.uri()) }).await.unwrap();
+        let start: String = page.text.chars().take(160).collect();
+        assert!(start.starts_with("Widget, 3rd generation : Shop Skip to Main content"), "got: {start}");
+        assert!(page.text.contains("€24.99 In stock"));
+        assert!(page.links[0].url.ends_with("/ref=nav_logo"), "got: {:?}", page.links[0]);
     }
 
     #[tokio::test]

@@ -233,7 +233,8 @@ impl Renderer {
 /// alike, and was handed two host candidates. `disable_non_proxied_udp`
 /// leaves WebRTC only what the proxy can carry, and this proxy carries no
 /// UDP: with it no datagram arrived and gathering ended with no candidate at
-/// all, so a page's script learns no address either. The switch
+/// all, so a page's script learns no address either. Of the switches, the
+/// one in `chrome_args` does the same on its own and is passed as well;
 /// `--force-webrtc-ip-handling-policy` was measured too and changes nothing.
 ///
 /// `net.network_prediction_options`, 2 for never. A page's speculation rules
@@ -298,6 +299,15 @@ fn chrome_args(url: &str, profile: &std::path::Path, proxy: u16) -> Vec<String> 
         // Chrome sends localhost and loopback around any proxy unless told
         // not to — which would walk straight past the fence to :9090.
         "--proxy-bypass-list=<-loopback>".into(),
+        // The profile's preferences say this already (`PREFERENCES`), and
+        // each way holds without the other: measured 2026-11-20 on Chrome
+        // 157, with this switch and empty preferences a page's STUN datagram
+        // reached none of three loopback listeners and no ICE candidate was
+        // gathered, the same as with the preference and no switch. Said
+        // twice because either is ignored in silence by a Chrome that does
+        // not know it, and a render with neither sends UDP where a page
+        // points it.
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
         // --no-sandbox is required to run as a non-root user in a
         // container; --disable-dev-shm-usage keeps Chrome from dying on
         // the small /dev/shm a container gets.
@@ -324,6 +334,15 @@ mod tests {
         // Without this Chrome reaches 127.0.0.1 directly, proxy or not.
         assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_string()));
         assert_eq!(args.last().map(String::as_str), Some("https://shop.example/p"));
+    }
+
+    #[test]
+    fn chrome_is_told_on_its_command_line_too_to_keep_webrtc_in_the_proxy() {
+        // The second of two ways it is told; the profile's preferences are
+        // the first. Not the `--force-…` spelling, which Chrome ignores.
+        let args = chrome_args("https://shop.example/p", std::path::Path::new("/tmp/p"), 4321);
+        assert!(args.contains(&"--webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("--force-webrtc-ip-handling-policy")));
     }
 
     #[test]

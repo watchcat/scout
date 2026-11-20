@@ -275,6 +275,11 @@ impl reqwest::dns::Resolve for PublicResolver {
 /// the checked address is the one dialled. Chrome must also be told
 /// `--proxy-bypass-list=<-loopback>`, or it goes to localhost directly.
 ///
+/// TCP is all it carries (a UDP ASSOCIATE is refused with the other
+/// commands), and Chrome does not ask it to carry more: WebRTC's UDP goes
+/// out from sockets of Chrome's own. That is shut where Chrome is started,
+/// in `tools/browser.rs`, not here.
+///
 /// Returns the port; the proxy, and every tunnel it has open, stops when the
 /// returned handle is dropped.
 pub async fn serve_socks(guard: Guard) -> std::io::Result<(u16, SocksProxy)> {

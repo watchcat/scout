@@ -7,3 +7,10 @@ description = "A shop's page driven over HTTP, one shop a session"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+url = "2"
+# The Public Suffix List, compiled in. "One shop a session" is a comparison
+# of registrable domains, and the list is the only thing that knows where
+# one ends: under `co.za` a shop has three labels, under a shop platform's
+# own suffix every shop has its own, and two labels or a hand-kept list of
+# suffixes get one or the other wrong.
+psl = "2"

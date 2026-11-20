@@ -8,4 +8,6 @@
 //! `POST /render`, and nothing in `scout-core` calls it: those are the cards
 //! "Chromium in a pod of its own" and "The shop desk".
 
+pub mod address;
+pub mod site;
 pub mod typing;

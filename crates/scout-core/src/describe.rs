@@ -40,6 +40,11 @@ pub fn describe(tool: &str, args: &serde_json::Value) -> String {
         "record_purchase" => "💾 saving the purchase".to_string(),
         "remember_fact" | "forget_fact" => "💾 updating your profile".to_string(),
         "create_reminder" | "cancel_reminder" | "list_reminders" => "⏰ reminders".to_string(),
+        "watch_price" => match host(&s("url")) {
+            Some(host) => format!("🔔 reading the price at {host}"),
+            None => "🔔 price watches".to_string(),
+        },
+        "list_watches" | "stop_watch" => "🔔 price watches".to_string(),
         "ask_flights" => match s("brief") {
             b if b.is_empty() => "✈️ asking the flight desk".to_string(),
             b => format!("✈️ asking the flight desk: {b}"),
@@ -105,6 +110,19 @@ mod tests {
             describe("query_purchases", &json!({"search_term": "ariel"})),
             "📚 checking your purchase history"
         );
+    }
+
+    #[test]
+    fn a_price_watch_reads_as_what_it_is_doing() {
+        // Starting one opens the page, and the chat says whose.
+        assert_eq!(
+            describe("watch_price", &json!({"url": "https://www.bol.com/nl/nl/p/x/123/", "target": 300, "currency": "EUR"})),
+            "🔔 reading the price at bol.com"
+        );
+        assert_eq!(describe("watch_price", &json!({})), "🔔 price watches");
+        for tool in ["list_watches", "stop_watch"] {
+            assert_eq!(describe(tool, &json!({"id": 3})), "🔔 price watches", "{tool}");
+        }
     }
 
     #[test]

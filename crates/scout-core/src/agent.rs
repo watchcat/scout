@@ -8,6 +8,7 @@ use crate::tools::prices::ComparePricesTool;
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
 use crate::tools::secondhand::{effective_sites, SecondhandSearchTool};
+use crate::tools::watch::{ListWatchesTool, StopWatchTool, WatchPriceTool};
 use anyhow::Result;
 use rig::client::CompletionClient;
 use rig::providers::openai;
@@ -731,6 +732,24 @@ pub fn build_agent(
             reply_to: reply_to.clone(),
         });
     }
+    // A price watch is a promise to come back too, so its tools are offered
+    // by the reminder's rule above: only to a run with somewhere to deliver
+    // to. All three, the list and the stop with the start. Each tool tells
+    // the model what it is for in its own description; the preamble has no
+    // rule about them, so there is none to outlive them where they are not
+    // offered.
+    if let Some(reply_to) = &run.reply_to {
+        builder = builder
+            .tool(WatchPriceTool {
+                store: d.store.clone(),
+                account_id,
+                reply_to: reply_to.clone(),
+                web: d.web.clone(),
+                renderer: d.renderer.clone(),
+            })
+            .tool(ListWatchesTool { store: d.store.clone(), account_id })
+            .tool(StopWatchTool { store: d.store.clone(), account_id });
+    }
     if let Some(bol) = &d.bol {
         builder = builder.tool(crate::tools::bol::BolSearchTool { client: bol.clone() });
     }
@@ -859,6 +878,52 @@ mod tests {
         let asked = main.received_requests().await.unwrap();
         assert_eq!(asked.len(), 1);
         assert!(String::from_utf8_lossy(&asked[0].body).contains("\"model\":\"the-main-model\""), "the main model, by its configured name");
+    }
+
+    /// The tools one run's agent is given, as the model is told of them:
+    /// read off the request the agent sends, since a built agent does not
+    /// say what it holds.
+    async fn tools_offered(reply_to: Option<scout_api::ReplyTo>) -> Vec<String> {
+        use rig::completion::Prompt;
+        let main = wiremock::MockServer::start().await;
+        model_saying(&main, "ok").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::for_test(dir.path().join("tools.duckdb").to_str().unwrap());
+        cfg.llm_base_url = main.uri();
+        let core = crate::core::Core::start(cfg, None).unwrap();
+        let store = core.store();
+        let account_id = store.account_for_telegram(4242).unwrap();
+        let conversation_id = store.start_conversation(account_id, "direct").unwrap();
+        let run = scout_api::RunContext { account_id, conversation_id, reply_to, title_source: None };
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let observer = std::sync::Arc::new(crate::observer::Observer::new(events, 1));
+
+        build_agent(&core.deps, &run, &[], observer).prompt("tell me when it is under 300").await.unwrap();
+
+        let asked = main.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&asked[0].body).unwrap();
+        let tools = body["tools"].as_array().expect("the request lists its tools");
+        tools.iter().map(|tool| tool["function"]["name"].as_str().expect("a tool has a name").to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_watch_tools_are_offered_only_to_a_run_with_somewhere_to_deliver_to() {
+        // A watch is a promise to come back, as a reminder is. A run with
+        // nowhere to send the message is not shown the tools at all, so
+        // the model cannot accept a watch that would end unheard.
+        const WATCH: [&str; 3] = ["watch_price", "list_watches", "stop_watch"];
+        let with = tools_offered(Some(scout_api::ReplyTo::telegram(4242))).await;
+        for tool in WATCH {
+            assert!(with.iter().any(|t| t == tool), "{tool} is missing where there is a chat to tell: {with:?}");
+        }
+        assert!(with.iter().any(|t| t == "create_reminder"), "the tool whose rule this is: {with:?}");
+
+        let without = tools_offered(None).await;
+        for tool in WATCH {
+            assert!(!without.iter().any(|t| t == tool), "{tool} was offered with nowhere to deliver to: {without:?}");
+        }
+        assert!(!without.iter().any(|t| t == "create_reminder"));
+        assert!(without.iter().any(|t| t == "fetch_page"), "the rest are there all the same: {without:?}");
     }
 
     #[test]

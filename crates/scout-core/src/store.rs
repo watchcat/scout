@@ -2378,24 +2378,15 @@ impl Store {
             ],
             |r| r.get(0),
         )?;
-        Ok(WatchStarted::Started(PriceWatch {
-            id,
-            account_id: new.account_id,
-            channel: new.channel.to_string(),
-            address: new.address.to_string(),
-            url: new.url.to_string(),
-            title: new.title.to_string(),
-            currency: new.currency.to_string(),
-            target: new.target,
-            first_price: new.price,
-            last_price: new.price,
-            lowest_price: new.price,
-            last_checked_at: new.now,
-            unreadable_streak: 0,
-            created_at: new.now,
-            expires_at: new.expires_at,
-            ended: None,
-        }))
+        // Read back and not built from what was handed in: the table keeps
+        // time to the second, and the watch handed out is the one a later
+        // read will find.
+        let watch = conn.query_row(
+            &format!("SELECT {WATCH_COLUMNS} FROM price_watches WHERE id = ?"),
+            params![id],
+            row_to_watch,
+        )?;
+        Ok(WatchStarted::Started(watch))
     }
 
     /// An account's live watches, oldest first.

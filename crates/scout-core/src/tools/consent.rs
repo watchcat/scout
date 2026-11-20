@@ -687,7 +687,7 @@ mod tests {
     /// whatever the code now does.
     fn read_as_before(html: &str) -> (String, bool, Vec<PageLink>) {
         let without_scripts = fetch::strip_tag_blocks(&fetch::strip_tag_blocks(html, "script"), "style");
-        let links = fetch::extract_links(&without_scripts, &url());
+        let links = fetch::extract_links(&without_scripts, &url(), fetch::MAX_LINKS);
         let full = fetch::collapse_ws(&fetch::decode_entities(&fetch::strip_tags(&without_scripts)));
         let cut = full.chars().count() > fetch::MAX_TEXT_CHARS;
         (full.chars().take(fetch::MAX_TEXT_CHARS).collect(), cut, links)

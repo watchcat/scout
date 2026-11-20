@@ -83,6 +83,16 @@ offer the model handed over, not off the page: none stated, free, or a
 cost. Listings that search_secondhand finds through an API are counted
 apart from shops: eBay's arrive with their shipping cost, Marktplaats's
 with none, and neither says anything about what reading a page gives.
+
+The no-shipping figures are what the model handed to compare_prices, and
+stay that: what a page did or did not state. Since compare_prices looks
+up the shop's own delivery page for an offer that states none, its
+result says of every offer it ranked whose word the shipping is — the
+offer's, the shop's delivery page's, or nobody's — and that is counted
+beside them, from the result the trace keeps. A trace from before has no
+such word, and its offers count as they were handed over: the offer's
+where one was stated, nobody's where not. So does a result that does not
+account for every offer, such as one cut off at the trace's limit.
 """
 import argparse
 import collections
@@ -106,6 +116,10 @@ KEPT = READ + (NOTICE,)
 ASKED_FOR = (PRICED, NO_PRICE, NOTICE, BLOCKED, CLOSED, GONE, FAILED)
 # Which outcome stands for a page a run asked for more than once.
 BEST = {PRICED: 7, NO_PRICE: 6, NOTICE: 5, BLOCKED: 4, CLOSED: 3, GONE: 2, FAILED: 1, NOT_OPENED: 0}
+
+# Whose word a compared offer's shipping is, as compare_prices writes it in
+# each row's `shipping_source`.
+SOURCES = ("offer", "delivery_page", "unknown")
 
 # The rule the spec named before anything was measured, as (at least, in).
 NO_PRICE_AT_LEAST = (1, 10)     # of product pages read
@@ -233,6 +247,18 @@ def text_writes_amount(text, amount):
     )
 
 
+def shipping_sources(given, result):
+    """Whose word each compared offer's shipping is: what the comparison's
+    result says, row by row, when it says it of every offer handed over, and
+    otherwise what the model handed over — stated, or not."""
+    answered = loads(result)
+    rows = answered.get("rows") if isinstance(answered, dict) else None
+    told = [row.get("shipping_source") for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    if len(told) == len(given) and all(isinstance(source, str) and source in SOURCES for source in told):
+        return told
+    return ["unknown" if o.get("shipping") is None else "offer" for o in given]
+
+
 def walls(counts):
     """Pages a wall kept back: blocked, a notice taken for the page, or not
     opened because the host had already refused one."""
@@ -314,6 +340,8 @@ def measure(rows, accounts=None):
                 unstated = [o for o in given if o.get("shipping") is None]
                 offers["no_shipping"] += len(unstated)
                 offers["calls_stating_none"] += bool(given) and len(unstated) == len(given)
+                for source in shipping_sources(given, result):
+                    offers["from_" + source] += 1
                 for o in given:
                     counts = touch(host(o.get("url")))
                     counts["offers"] += 1
@@ -447,6 +475,8 @@ def report(m, top, window, min_accounts=2):
         "== compare_prices",
         f"  calls: {o['calls']}; offers: {o['offers']}; with no shipping cost: {o['no_shipping']} ({pct(o['no_shipping'], o['offers'])})",
         f"  calls where no offer stated shipping: {o['calls_stating_none']} ({pct(o['calls_stating_none'], o['calls'])})",
+        f"  shipping as compared: the offer's {o['from_offer']}, from the shop's delivery page {o['from_delivery_page']}, "
+        f"unknown {o['from_unknown']} ({pct(o['from_unknown'], o['offers'])})",
         "",
         "== the pages behind the offers (one address counted once a run)",
         f"  never asked for: {of['never_opened']}; refused rather than read: {of[NOT_OPENED]}; "

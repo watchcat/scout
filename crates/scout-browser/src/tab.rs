@@ -14,7 +14,7 @@
 //! - a press landed on whatever lay over the thing pressed. Here a press is
 //!   only made where the thing itself is.
 
-use crate::address::{address_refused, link_refused};
+use crate::address::{address_refused, link_refused, Refused};
 use crate::chrome::chrome_args;
 use crate::drive::{Action, Broken, Browser, Done, Page, Seen, OUTLINE_CHARS};
 use crate::pipe::{CallError, Event, Pipe};
@@ -75,23 +75,26 @@ impl Chrome {
         Chrome { path, pace, reaching: Some(server) }
     }
 
-    /// Whether `url` is the test's own server, which the guard would refuse
-    /// as it refuses all of loopback.
-    fn is_let_through(&self, url: &Url) -> bool {
-        self.reaching.is_some_and(|server| {
-            url.host_str() == Some(server.ip().to_string().as_str()) && url.port_or_known_default() == Some(server.port())
-        })
-    }
+}
+
+/// Whether `url` may be opened as far as the guard goes: asked before
+/// anything is started, so that the answer is the guard's sentence and
+/// not a browser's page about a connection that failed. A test's own
+/// server is the one address the guard would refuse that passes here.
+async fn guard_allows(reaching: Option<SocketAddr>, url: &Url) -> bool {
+    let is_the_tests_own = reaching.is_some_and(|server| {
+        url.host_str() == Some(server.ip().to_string().as_str()) && url.port_or_known_default() == Some(server.port())
+    });
+    is_the_tests_own || Guard::PUBLIC_ONLY.check(url).await.is_ok()
 }
 
 impl Browser for Chrome {
     type Page = Tab;
 
     async fn open(&self, shop: &Shop, url: &Url) -> Result<(Tab, Done), Broken> {
-        // The proxy would refuse it anyway; asked first so that the answer
-        // is the guard's sentence and no Chrome is started for a page that
-        // cannot be had.
-        if !self.is_let_through(url) && Guard::PUBLIC_ONLY.check(url).await.is_err() {
+        // The proxy would refuse it anyway, but then a Chrome would have
+        // been started for a page that cannot be had.
+        if !guard_allows(self.reaching, url).await {
             return Err(Broken::Refused(NOT_PUBLIC.to_string()));
         }
         let failed = |e: std::io::Error| Broken::Failed(e.to_string());
@@ -113,8 +116,20 @@ impl Browser for Chrome {
         // holds for an answer waits for a listener.
         let watched = Watched { shop: shop.clone(), session: session.clone(), frame: frame.clone(), target };
         let watcher = tokio::spawn(watch(pipe.clone(), said, shared.clone(), watched));
-        let mut tab =
-            Tab { pipe, session, frame, shop: shop.clone(), pace: self.pace, shared, from: 0, good: None, watcher, _proxy: proxy, _profile: profile };
+        let mut tab = Tab {
+            pipe,
+            session,
+            frame,
+            shop: shop.clone(),
+            pace: self.pace,
+            reaching: self.reaching,
+            shared,
+            from: 0,
+            good: None,
+            watcher,
+            _proxy: proxy,
+            _profile: profile,
+        };
         let opened = match tab.switch_on().await {
             Ok(()) => tab.first(url).await,
             Err(e) => Err(gone(e)),
@@ -190,6 +205,8 @@ pub struct Tab {
     frame: String,
     shop: Shop,
     pace: Pace,
+    /// The Chrome's own `reaching`: a test's page server, else nothing.
+    reaching: Option<SocketAddr>,
     shared: Arc<Shared>,
     /// Where the next outline starts in a long page's text.
     from: usize,
@@ -308,11 +325,10 @@ impl Tab {
         }
     }
 
-    /// Sends the main frame to `url` and waits for it to come to rest.
-    /// `Err` carries Chrome's own word for why it did not get there.
+    /// Sends the main frame to `url`. `Err` carries Chrome's own word for
+    /// why it did not get there. The page has still to come to rest.
     async fn go(&self, url: &Url) -> Result<Result<(), String>, Broken> {
         let went = self.call("Page.navigate", json!({ "url": url.as_str() })).await.map_err(gone)?;
-        self.settle().await;
         Ok(match went["errorText"].as_str() {
             Some(error) => Err(error.to_string()),
             None => Ok(()),
@@ -321,7 +337,9 @@ impl Tab {
 
     /// Opens the page a session starts on.
     async fn first(&mut self, url: &Url) -> Result<Done, Broken> {
-        if let Err(error) = self.go(url).await? {
+        let went = self.go(url).await?;
+        self.settle().await;
+        if let Err(error) = went {
             // Refused on the way, by a redirect off the shop or into its
             // checkout: the reason is the rule's and not Chrome's "aborted".
             return Err(match self.shared.happened.lock().unwrap().refused.first() {
@@ -367,7 +385,9 @@ impl Tab {
             return Err(Broken::Refused(why));
         };
         refused.push(format!("{why}; the session went back to the page it was on"));
-        if self.go(&good).await?.is_err() || self.address().await? != good.as_str() {
+        let went = self.go(&good).await?;
+        self.settle().await;
+        if went.is_err() || self.address().await? != good.as_str() {
             return Err(Broken::Failed("the page the session was on could not be opened again".into()));
         }
         Ok(())
@@ -450,6 +470,61 @@ impl Tab {
         Ok(())
     }
 
+    /// Chooses `option` in the list numbered `n`.
+    async fn select(&mut self, n: u32, option: &str, refused: &mut Vec<String>, notes: &mut Vec<String>) -> Result<(), Broken> {
+        let chose = self.in_page_patiently("chooseInPage", &[json!(n), json!(option)]).await?;
+        match (chose["error"].as_str(), chose["chosen"].as_str()) {
+            (Some(why), _) => refused.push(why.to_string()),
+            // Said back as the page words it, since what was asked for
+            // may have been only near it.
+            (None, Some(chosen)) => notes.push(format!("Chosen: {chosen}")),
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
+    /// Goes back one page, if the page before is one a session may be on.
+    async fn back(&mut self, refused: &mut Vec<String>) -> Result<(), Broken> {
+        let history = self.call("Page.getNavigationHistory", json!({})).await.map_err(gone)?;
+        let current = history["currentIndex"].as_u64().unwrap_or_default() as usize;
+        // Going back is no request Chrome asks leave for, so where it
+        // leads is read off the browser's record beforehand. The first
+        // entry is the empty tab Chrome began with.
+        let before = current.checked_sub(1).map(|index| &history["entries"][index]);
+        let leads_to = before.and_then(|entry| Url::parse(entry["url"].as_str().unwrap_or_default()).ok());
+        match (before, leads_to) {
+            (Some(entry), Some(url)) if url.scheme() != "about" => match address_refused(&self.shop, &url) {
+                Some(why) => refused.push(why.why().to_string()),
+                None => {
+                    self.call("Page.navigateToHistoryEntry", json!({ "entryId": entry["id"] })).await.map_err(gone)?;
+                }
+            },
+            _ => refused.push("there is no page of this shop to go back to".to_string()),
+        }
+        Ok(())
+    }
+
+    /// Opens another address of the shop in the session's page.
+    async fn open(&mut self, address: &str, refused: &mut Vec<String>) -> Result<(), Broken> {
+        let Ok(url) = Url::parse(address.trim()) else {
+            refused.push(Refused::NotWeb.why().to_string());
+            return Ok(());
+        };
+        if let Some(why) = address_refused(&self.shop, &url) {
+            refused.push(why.why().to_string());
+            return Ok(());
+        }
+        if !guard_allows(self.reaching, &url).await {
+            refused.push(NOT_PUBLIC.to_string());
+            return Ok(());
+        }
+        // Where this fails, the reason is already on its way: a redirect
+        // refused is told by the one who refused it, and a page that did
+        // not load is found, and left, when the page is next looked at.
+        let _ = self.go(&url).await?;
+        Ok(())
+    }
+
     /// The page as it is now, with what Chrome said in the meantime.
     async fn done(&mut self, mut refused: Vec<String>, mut notes: Vec<String>) -> Result<Done, Broken> {
         let page = self.in_page_patiently("pageInPage", &[json!(OUTLINE_CHARS), json!(self.from)]).await?;
@@ -475,6 +550,7 @@ impl Tab {
 impl Page for Tab {
     async fn act(&mut self, action: &Action) -> Result<Done, Broken> {
         let mut refused = Vec::new();
+        let mut notes = Vec::new();
         // A page can move itself between two actions; where it is now is
         // settled before anything is done to it.
         self.hold(&mut refused).await?;
@@ -485,13 +561,16 @@ impl Page for Tab {
             }
             Action::Click { n } => self.click(*n, &mut refused).await?,
             Action::Type { n, text, enter } => self.type_into(*n, text, *enter, &mut refused).await?,
+            Action::Select { n, option } => self.select(*n, option, &mut refused, &mut notes).await?,
+            Action::Back => self.back(&mut refused).await?,
+            Action::Open { url } => self.open(url, &mut refused).await?,
         }
         // Whatever was done, the next outline starts at the top of what
         // the page is now, once it has come to rest and is where it may be.
         self.from = 0;
         self.settle().await;
         self.hold(&mut refused).await?;
-        self.done(refused, Vec::new()).await
+        self.done(refused, notes).await
     }
 
     async fn close(self) {
@@ -721,7 +800,6 @@ mod tests {
 
     // ------------------------------------------------------------ a press
 
-    use crate::address::Refused;
     use crate::testing::{attachment, redirect, status};
 
     const NOTHING: Vec<String> = Vec::new();
@@ -1148,6 +1226,149 @@ mod tests {
         let done = type_into(&mut tab, 1, "1011 PN").await;
         assert_eq!(done.refused, ["the page moved the caret away from that field, so nothing was typed"]);
         assert!(done.seen.text.contains("Typed into: nothing"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    // ------------------------------------- a list, the way back, another page
+
+    async fn act(tab: &mut Tab, action: Action) -> Done {
+        tab.act(&action).await.expect("the browser answers")
+    }
+
+    fn choose(n: u32, option: &str) -> Action {
+        Action::Select { n, option: option.to_string() }
+    }
+
+    #[tokio::test]
+    async fn an_option_is_chosen_from_a_list_as_the_page_words_it_or_nearly() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(
+            r#"<select aria-label="Maat" onchange="document.getElementById('price').textContent = { M: '12,99', L: '13,99', XL: '14,99' }[this.value]">
+                 <option value="M" selected>M</option><option value="L">L – 40x80 cm</option><option value="XL">XL (grote maat)</option>
+               </select>
+               <p>Prijs <span id="price">12,99</span></p>
+               <a href="/next">the next page</a>"#,
+        )])
+        .await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert!(first.seen.text.contains(r#"[1] list "Maat": *M | L – 40x80 cm | XL (grote maat)"#), "{}", first.seen.text);
+
+        let done = act(&mut tab, choose(1, "XL (grote maat)")).await;
+        assert_eq!((done.refused, done.notes), (NOTHING, vec!["Chosen: xl (grote maat)".to_string()]));
+        // The page heard of it: the price beside the list is the option's.
+        assert!(done.seen.text.contains("Prijs 14,99") && done.seen.text.contains("*XL (grote maat)"), "{}", done.seen.text);
+        // A hyphen for the page's dash, and no care for case or spaces.
+        let done = act(&mut tab, choose(1, "l - 40X80 CM")).await;
+        assert!(done.seen.text.contains("Prijs 13,99"), "{}", done.seen.text);
+        // A part of the wording is enough where it is more than a letter.
+        let done = act(&mut tab, choose(1, "grote maat")).await;
+        assert!(done.seen.text.contains("Prijs 14,99"), "{}", done.seen.text);
+
+        let done = act(&mut tab, choose(1, "XXL")).await;
+        assert_eq!(done.refused, ["that list has no such option; it has: m | l – 40x80 cm | xl (grote maat)"]);
+        assert!(done.seen.text.contains("Prijs 14,99"), "nothing was changed: {}", done.seen.text);
+        let done = act(&mut tab, choose(2, "M")).await;
+        assert_eq!(done.refused, ["that is not a list; press the option itself"]);
+        let done = act(&mut tab, choose(9, "M")).await;
+        assert_eq!(done.refused, ["nothing is numbered 9 on this page now; read it again"]);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_list_that_sends_the_page_off_the_shop_is_held_like_a_link() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(
+            r#"<select aria-label="Land" onchange="location.href = this.value">
+                 <option value="">Kies een land</option><option value="https://other.example/de">Duitsland</option>
+               </select>"#,
+        )])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = act(&mut tab, choose(1, "Duitsland")).await;
+        assert_eq!(done.refused, [Refused::LeavesShop.why()]);
+        assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn back_goes_to_the_page_before_and_never_to_before_the_shop() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(r#"<a href="/next">the next page</a>"#), page("/next", "Next")]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        // What stands before the page a session opened on is the empty tab Chrome began with.
+        let done = act(&mut tab, Action::Back).await;
+        assert_eq!(done.refused, ["there is no page of this shop to go back to"]);
+        assert_eq!(done.seen.title, "Home");
+
+        assert_eq!(press(&mut tab, 1).await.seen.title, "Next");
+        let done = act(&mut tab, Action::Back).await;
+        assert_eq!((done.refused, done.seen.title.as_str(), done.seen.url.as_str()), (NOTHING, "Home", pages.url("/").as_str()));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn back_does_not_lead_to_an_address_a_session_was_taken_away_from() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(
+            r#"<button onclick="history.pushState({}, '', '/checkout'); document.title = 'Checkout'">by a written address</button>"#,
+        )])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        // The press writes a checkout's address, and the session is taken
+        // back; the browser's own record still has the checkout in it.
+        assert_eq!(press(&mut tab, 1).await.refused.len(), 1);
+        let done = act(&mut tab, Action::Back).await;
+        assert_eq!(done.refused, [Refused::Checkout.why()]);
+        assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
+        tab.close().await;
+    }
+
+    fn go_to(url: &str) -> Action {
+        Action::Open { url: url.to_string() }
+    }
+
+    #[tokio::test]
+    async fn another_page_of_the_shop_is_opened_by_its_address() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(""), page("/delivery", "Delivery"), ("/gone", status(404, "<title>Not here</title>"))]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = act(&mut tab, go_to(&pages.url("/delivery"))).await;
+        assert_eq!((done.refused, done.seen.title.as_str(), done.seen.status), (NOTHING, "Delivery", Some(200)));
+        // A page that is not there is a page, with its status, and no refusal.
+        let done = act(&mut tab, go_to(&pages.url("/gone"))).await;
+        assert_eq!((done.refused, done.seen.title.as_str(), done.seen.status), (NOTHING, "Not here", Some(404)));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_address_a_session_may_not_be_at_is_not_opened() {
+        let _one_of_few = testing::gate().await;
+        let neighbour = Pages::serve(&[("/secret", html("<title>Secret</title>secret_total 1"))]).await;
+        let pages = Pages::serve(&[
+            home(""),
+            page("/checkout", "Checkout"),
+            page("/account/login", "Sign in"),
+            ("/out", redirect("https://other.example/landed")),
+        ])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        for (address, why) in [
+            ("https://other.example/p/1".to_string(), Refused::LeavesShop.why()),
+            (pages.url("/checkout"), Refused::Checkout.why()),
+            (pages.url("/account/login"), Refused::SignIn.why()),
+            ("file:///etc/passwd".to_string(), Refused::NotWeb.why()),
+            ("not an address".to_string(), Refused::NotWeb.why()),
+            // The shop's own page that sends on to another shop.
+            (pages.url("/out"), Refused::LeavesShop.why()),
+            // The same host by number on a port the guard does not let through.
+            (neighbour.url("/secret"), NOT_PUBLIC),
+        ] {
+            let done = act(&mut tab, go_to(&address)).await;
+            assert_eq!(done.refused, [why], "{address}");
+            assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()), "{address}");
+        }
+        assert_eq!(pages.asked(), ["GET /", "GET /out"]);
+        assert_eq!(neighbour.asked(), NOTHING);
         tab.close().await;
     }
 

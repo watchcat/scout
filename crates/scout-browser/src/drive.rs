@@ -22,6 +22,12 @@ pub enum Action {
     Click { n: u32 },
     /// Type into the field numbered `n`, and press Enter after if asked.
     Type { n: u32, text: String, enter: bool },
+    /// Choose an option in the list numbered `n`.
+    Select { n: u32, option: String },
+    /// Go back one page.
+    Back,
+    /// Open another address of the same shop.
+    Open { url: String },
 }
 
 /// A page as a session is shown it.

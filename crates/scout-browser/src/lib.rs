@@ -39,6 +39,15 @@
 //! cargo run -p scout-browser        # listens on 127.0.0.1:8091, and only on loopback
 //! curl -d '{"url": "https://www.shop.example/p/widget"}' -H 'content-type: application/json' 127.0.0.1:8091/sessions
 //! ```
+//!
+//! # The tests and a machine with no Chrome
+//!
+//! About a third of the tests drive a real Chrome on pages the test serves
+//! itself. On a machine with none, each of those writes `SKIPPED, NOT RUN`
+//! and its name to stderr and passes, so the run is green and has not
+//! tested the browser. Where that must not pass for a pass, set
+//! `SCOUT_REQUIRE_CHROME` to anything: every test that wanted a Chrome
+//! then fails for the want of one.
 
 pub mod address;
 pub mod chrome;

@@ -25,15 +25,37 @@ use url::Url;
 /// them quietly either. The line is written to the process's own stderr,
 /// which the test harness does not capture, so it shows in an ordinary
 /// `cargo test` beside a test that the harness can only call "ok".
+///
+/// That is still a green run of tests that did not run. Where the browser
+/// tests are the point, `SCOUT_REQUIRE_CHROME` set to anything makes a
+/// missing Chrome a failure of each test that wanted one.
 pub fn chrome_or_skip() -> Option<PathBuf> {
-    let found = crate::chrome::find_chrome();
+    let required = std::env::var_os("SCOUT_REQUIRE_CHROME").is_some_and(|value| !value.is_empty());
+    found_or_skipped(crate::chrome::find_chrome(), required)
+}
+
+fn found_or_skipped(found: Option<PathBuf>, required: bool) -> Option<PathBuf> {
     if found.is_none() {
         // The harness names each test's thread after the test.
         let thread = std::thread::current();
         let test = thread.name().unwrap_or("a test");
+        assert!(!required, "{test}: SCOUT_REQUIRE_CHROME is set and there is no Chrome on this machine (set SCOUT_CHROME to one)");
         let _ = writeln!(std::io::stderr(), "SKIPPED, NOT RUN: {test}: no Chrome on this machine (set SCOUT_CHROME to one)");
     }
     found
+}
+
+#[test]
+#[should_panic(expected = "SCOUT_REQUIRE_CHROME is set and there is no Chrome")]
+fn a_chrome_that_is_required_and_missing_fails_the_test_that_wanted_it() {
+    found_or_skipped(None, true);
+}
+
+#[test]
+fn a_chrome_that_is_there_is_the_one_tested_with_required_or_not() {
+    let chrome = PathBuf::from("/a/chrome");
+    assert_eq!(found_or_skipped(Some(chrome.clone()), true), Some(chrome.clone()));
+    assert_eq!(found_or_skipped(Some(chrome.clone()), false), Some(chrome));
 }
 
 /// A place among the Chromes running at once in this test binary. Each

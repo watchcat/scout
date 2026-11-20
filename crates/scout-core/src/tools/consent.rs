@@ -30,6 +30,11 @@
 //!
 //! What it does not know: a dialog with neither of the marks below on
 //! its own tag. Such a one is read where it stands, as before.
+//! coolblue.nl's is one: the element `<dialog>`, open, with no role
+//! written on it and nothing to keep it out of snippets. So of the five
+//! dialogs seen, four carry a mark, and the fifth did no harm where it
+//! stood. Nor does it know a dialog whose words of consent are in a
+//! language no dialog was seen in.
 
 use super::fetch::{collapse_ws, decode_entities};
 use std::borrow::Cow;
@@ -44,9 +49,13 @@ use std::collections::HashMap;
 /// drawer are dialogs — so a mark says only where a block begins, and
 /// what the block says decides.
 ///
+/// `alertdialog` is the other role a dialog can call itself by. None
+/// was seen with it; it is here because it is the same statement.
+///
 /// Both are in lower case, as the document they are read from is.
 fn is_mark(attribute: &str, value: &str) -> bool {
-    attribute == "data-nosnippet" || (attribute == "role" && value.split_ascii_whitespace().any(|role| role == "dialog"))
+    attribute == "data-nosnippet"
+        || (attribute == "role" && value.split_ascii_whitespace().any(|role| role == "dialog" || role == "alertdialog"))
 }
 
 /// Elements that have no content and no closing tag. An opening tag of
@@ -55,12 +64,13 @@ const VOID: [&str; 14] =
     ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
 
 /// How soon a marked block has to say "cookie" to be the consent dialog.
-/// The four seen say it within 75 characters of their text: amazon.nl's
-/// at once, OneTrust's after a heading (45), Cookiebot's after the names
-/// of its tabs (58 and 74). It is the same word in the Dutch and the
-/// English they were written in. 200 is a choice, not a measurement:
-/// room for a longer heading than those, and short of a block that is
-/// about something else and comes to cookies in its small print.
+/// The four seen with a mark say it within 75 characters of their text:
+/// amazon.nl's at once, OneTrust's after a heading (45), Cookiebot's
+/// after the names of its tabs (58 and 74). It is the same word in the
+/// Dutch and the English they were written in. 200 is a choice, not a
+/// measurement: room for a longer heading than those, and short of a
+/// block that is about something else and comes to cookies in its small
+/// print.
 const SAID_WITHIN_CHARS: usize = 200;
 
 /// The words of consent, one of which a marked block has to say, whole
@@ -966,6 +976,23 @@ mod tests {
     }
 
     #[test]
+    fn an_alert_dialog_is_a_dialog_and_a_dialog_element_with_no_mark_is_not_known() {
+        // The other role a dialog can call itself by.
+        let dialog = "<div role=\"alertdialog\" aria-modal=\"true\"><h2>Cookies</h2><button>Accept</button></div>";
+        let html = format!("<body>{dialog}<p>The page.</p></body>");
+        assert_eq!(read_last(&html), format!("<body> <p>The page.</p></body>{dialog}"));
+        // coolblue.nl's, in shape and not in its words: the element
+        // `<dialog>`, open, with no role written on it and nothing to
+        // keep it out of snippets. There it stood at the end of the
+        // body. At the top of one it would be read first, as before.
+        let dialog = "<dialog aria-labelledby=\"cookie-modal-heading\" open=\"\"><div id=\"cookie-modal-heading\">\
+            Cookies</div><p>Choose which cookies you accept.</p><button>Accept all</button></dialog>";
+        let html = unpriced_page(dialog);
+        assert!(matches!(read_last(&html), Cow::Borrowed(_)));
+        assert!(read(&html).text.starts_with("Widget W-100 Blue Cookies Choose which cookies you accept. Accept all Free delivery"));
+    }
+
+    #[test]
     fn what_is_inside_a_comment_is_not_markup() {
         // A tag left in a comment was counted with the rest: an opening
         // one, and the dialog ran on to the next closing tag of its
@@ -1159,12 +1186,14 @@ mod tests {
         // refusal: nothing a dialog says is a no.
         let gate = format!("<html><head><title>Shop</title></head><body>{dialog}</body></html>");
         assert!(!fetch::is_refusal(&read(&gate)));
-        // Under 10,000 characters of dialog the notice was not known for
-        // one, by its length, and is not now: the dialog is moved, not
-        // taken out, and the rule counts it as it did.
+        // A known gap, and nothing to keep. Under 10,000 characters of
+        // dialog a block notice is not known for a refusal: the rule
+        // goes by how short a page is, and a dialog that is moved is
+        // still counted. It was so before any dialog was moved. This
+        // holds only that moving one changed nothing.
         let buried = notice(&cookiebot("popup", &DUTCH, 5, 12));
         assert!(!fetch::is_refusal(&read(&buried)));
-        // So for every page here the rule answers as it did before.
+        // For every page here the rule answers as it did before.
         for html in [
             notice(""),
             notice(dialog),

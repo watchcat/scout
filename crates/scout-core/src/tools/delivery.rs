@@ -541,8 +541,8 @@ impl ShopPages {
 /// says a comparison needs; not measured for this.
 pub(crate) const NEW_SHOPS_PER_REQUEST: usize = 4;
 
-/// How long a comparison waits for delivery terms, all shops together.
-/// Half of the 90 s after which the run loop takes a silent run for a
+/// How long a comparison waits for delivery terms, all shops together
+/// and the look in the table before them. Half of the 90 s after which the run loop takes a silent run for a
 /// stalled one (`STREAM_STALL`), since rig shows nothing of a tool until
 /// it returns. A shop that is not read by then is dropped and asked again
 /// by the next request. How long a read really takes is not measured yet:
@@ -839,14 +839,22 @@ impl DeliveryDesk {
         if shops.is_empty() {
             return looked;
         }
+        // One deadline for the whole lookup, the table included: the
+        // store's lock may be somebody else's for a while.
+        let deadline = tokio::time::Instant::now() + self.budget;
         let now = chrono::Utc::now().naive_utc();
         let (store, hosts) = (self.store.clone(), shops.iter().map(|(host, _)| host.clone()).collect::<Vec<_>>());
-        let rows = match crate::core::blocking(move || store.shop_delivery_kept(&hosts, country.code)).await {
-            Ok(rows) => rows,
+        let asked = crate::core::blocking(move || store.shop_delivery_kept(&hosts, country.code));
+        let rows = match tokio::time::timeout_at(deadline, asked).await {
+            Ok(Ok(rows)) => rows,
             // A store that cannot be read cannot be written either: the
             // shops are not read for a table that would not hold them.
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::error!(error = %e, "kept delivery terms could not be read; the comparison goes without them");
+                return looked;
+            }
+            Err(_) => {
+                tracing::error!("kept delivery terms were not read in time; the comparison goes without them");
                 return looked;
             }
         };
@@ -888,7 +896,7 @@ impl DeliveryDesk {
                 done.lock().unwrap_or_else(|e| e.into_inner()).push((host.clone(), kept));
             }
         });
-        let in_time = tokio::time::timeout(self.budget, futures::future::join_all(reads)).await.is_ok();
+        let in_time = tokio::time::timeout_at(deadline, futures::future::join_all(reads)).await.is_ok();
         let done = done.into_inner().unwrap_or_else(|e| e.into_inner());
         if !in_time {
             for (host, _) in new.iter().filter(|(host, _)| !done.iter().any(|(read, _)| read == host)) {
@@ -1781,6 +1789,32 @@ mod desk_tests {
         assert!(looked.not_looked_up.is_empty(), "the slow shop was not past the allowance; it was late");
         assert_eq!(w.rows().iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["127.0.0.2"], "and nothing is written of the one that did not");
         assert!(w.counted("late"), "{}", w.metrics.render());
+    }
+
+    #[tokio::test]
+    async fn a_store_held_past_the_deadline_leaves_the_comparison_without_delivery() {
+        // The deadline is the lookup's, not only the reads': the table is
+        // asked first, and something else may hold the database — a
+        // backup does, for as long as it takes.
+        let w = World::with_a_shop_that_reads_well().await;
+        let mut desk = w.desk();
+        desk.budget = Duration::from_millis(200);
+        let store = w.core.deps.store.clone();
+        let (taken, held) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let guard = store.conn_for_tests();
+            taken.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(1200));
+            drop(guard);
+        });
+        held.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        let looked = desk.terms_for(&[w.url(PRODUCT)]).await;
+
+        assert!(started.elapsed() < Duration::from_millis(900), "the lookup took {:?}", started.elapsed());
+        assert!(looked.by_host.is_empty() && looked.not_looked_up.is_empty(), "{looked:?}");
+        assert_eq!(w.asked().await, (vec![], 0), "and no shop is read for a table that cannot be asked");
     }
 
     #[tokio::test]

@@ -9,5 +9,6 @@
 //! "Chromium in a pod of its own" and "The shop desk".
 
 pub mod address;
+pub mod limits;
 pub mod site;
 pub mod typing;

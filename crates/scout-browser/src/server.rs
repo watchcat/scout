@@ -415,6 +415,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_side_page_the_shop_refuses_and_the_way_back_is_not_two_refusals() {
+        let _one_of_few = testing::gate().await;
+        // `wall.rs`: one side page that would not open is only that. Shown
+        // with the refused page's status, the page gone back to counted as
+        // a second refusal running and ended the session.
+        let pages = Pages::serve(&[
+            ("/", html(&format!(r#"<!doctype html><title>Home</title><main><h1>Home</h1><a href="/blocked">a page the shop refuses</a><p>{}</p></main>"#, "A page of the shop. ".repeat(200)))),
+            ("/blocked", testing::status(403, "<title>Shop</title>Nee.")),
+        ])
+        .await;
+        let Some((_sessions, app)) = with_chrome(&pages, Limits::default()) else { return };
+        let (_, opened) = open(&app, &pages.url("/")).await;
+        let id = opened["session"].as_str().unwrap().to_string();
+        let (_, refused) = act(&app, &id, json!({ "do": "click", "n": 1 })).await;
+        assert_eq!((&refused["page"]["title"], &refused["ended"], refused["notes"].as_array().map(Vec::len)), (&json!("Shop"), &Value::Null, Some(2)), "{refused}");
+        let (status, back) = act(&app, &id, json!({ "do": "back" })).await;
+        assert_eq!((status, &back["page"]["title"], &back["ended"], &back["notes"]), (StatusCode::OK, &json!("Home"), &Value::Null, &json!([])), "{back}");
+        // The session goes on.
+        assert_eq!(act(&app, &id, json!({ "do": "read" })).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn a_session_with_a_chrome_behind_it_ends_itself_when_its_time_is_up() {
         let _one_of_few = testing::gate().await;
         let pages = shop().await;

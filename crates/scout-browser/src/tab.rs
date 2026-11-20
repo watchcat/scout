@@ -44,6 +44,9 @@ const IN_PAGE: &str = include_str!("in_page.js");
 /// a second; five say what kind they were, and the rest are a count.
 const NOTES_KEPT: usize = 5;
 
+/// How many documents' statuses are remembered, for the way back to them.
+const STATUSES_KEPT: usize = 16;
+
 /// How long a page is given to come to rest after something is done to it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pace {
@@ -185,8 +188,12 @@ async fn find_page(pipe: &Pipe) -> Result<(String, String, String), Broken> {
 /// What Chrome has said of the page since it was last asked about.
 #[derive(Debug, Default)]
 struct Happened {
-    /// The status the main frame's document came with.
-    status: Option<u16>,
+    /// The status each of the main frame's last documents came with, by
+    /// the name Chrome gives a document's loading. Kept by document and not
+    /// as "the last one heard": going back shows a page again with no
+    /// request and no answer, and the last status heard is then another
+    /// page's. A handful is enough for the way back.
+    statuses: Vec<(String, u16)>,
     refused: Vec<String>,
     notes: Vec<String>,
     /// How many more there were than are kept to be told one by one.
@@ -268,6 +275,8 @@ struct Read {
     text: String,
     /// Whether the page's text went on beyond that.
     cut: bool,
+    /// Chrome's name for the loading of this document.
+    loader: String,
 }
 
 /// The thing a number stands for, as `targetInPage` describes it.
@@ -633,7 +642,11 @@ impl Tab {
         let caps = json!({ "title": TITLE_CHARS, "address": ADDRESS_CHARS, "markup": MARKUP_CHARS, "whole": OUTLINE_WHOLE });
         let page = self.in_page_patiently("pageInPage", &[caps]).await?;
         let text = |key: &str| page[key].as_str().unwrap_or_default().to_string();
-        self.read = Some(Read { title: text("title"), url: text("url"), at: text("at"), html: text("html"), text: text("text"), cut: page["cut"] == true });
+        // Which document this is, to Chrome: the status it came with is
+        // kept under that name.
+        let tree = self.call("Page.getFrameTree", json!({})).await.map_err(gone)?;
+        let loader = tree["frameTree"]["frame"]["loaderId"].as_str().unwrap_or_default().to_string();
+        self.read = Some(Read { title: text("title"), url: text("url"), at: text("at"), html: text("html"), text: text("text"), cut: page["cut"] == true, loader });
         self.from = 0;
         self.shown(refused, notes)
     }
@@ -657,7 +670,8 @@ impl Tab {
                 notes.push(format!("and {} more that are not shown", happened.untold));
                 happened.untold = 0;
             }
-            happened.status
+            let loader = self.read.as_ref().map(|read| read.loader.as_str());
+            happened.statuses.iter().find(|(known, _)| Some(known.as_str()) == loader).map(|(_, status)| *status)
         };
         let Some(read) = &self.read else {
             return Err(Broken::Failed("the page was never read".into()));
@@ -779,7 +793,13 @@ async fn watch(pipe: Arc<Pipe>, mut said: mpsc::UnboundedReceiver<Event>, shared
             }
             "Network.responseReceived" if ours && main && event.params["type"] == "Document" => {
                 let status = event.params["response"]["status"].as_u64().and_then(|status| u16::try_from(status).ok());
-                shared.happened.lock().unwrap().status = status;
+                if let (Some(loader), Some(status)) = (event.params["loaderId"].as_str(), status) {
+                    let mut happened = shared.happened.lock().unwrap();
+                    happened.statuses.retain(|(known, _)| known != loader);
+                    happened.statuses.push((loader.to_string(), status));
+                    let kept = happened.statuses.len().saturating_sub(STATUSES_KEPT);
+                    happened.statuses.drain(..kept);
+                }
             }
             "Page.frameStartedLoading" if ours && main => {
                 shared.loading.send_replace(true);
@@ -2008,6 +2028,23 @@ mod tests {
         }
         assert_eq!(pages.asked(), ["GET /", "GET /out"]);
         assert_eq!(neighbour.asked(), NOTHING);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_page_gone_back_to_is_shown_with_its_own_status_not_the_last_ones() {
+        let _one_of_few = testing::gate().await;
+        // Going back brings a page out of the browser's keeping with no
+        // request and no answer, so the last status heard is another page's.
+        let pages = Pages::serve(&[home(r#"<a href="/blocked">a page the shop refuses</a>"#), ("/blocked", status(403, "<title>Shop</title>Nee.")), page("/next", "Next")]).await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert_eq!(first.seen.status, Some(200));
+        assert_eq!(press(&mut tab, 1).await.seen.status, Some(403));
+        let back = act(&mut tab, Action::Back).await;
+        assert_eq!((back.seen.title.as_str(), back.seen.status), ("Home", Some(200)));
+        // And a page that is opened and then refused on its way elsewhere keeps its own.
+        let stayed = act(&mut tab, go_to("https://other.example/")).await;
+        assert_eq!((stayed.seen.title.as_str(), stayed.seen.status), ("Home", Some(200)));
         tab.close().await;
     }
 

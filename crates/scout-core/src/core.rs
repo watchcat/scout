@@ -774,7 +774,8 @@ impl Core {
     async fn check_watches(&self) -> anyhow::Result<crate::watch::Pass> {
         let reader = crate::watch::PageReader::for_a_pass(self.deps.web.clone(), self.deps.renderer.clone());
         let now = chrono::Utc::now().naive_utc();
-        let pass = crate::watch::check_due(&self.deps.store, &reader, now, &crate::watch::Pace::DAILY).await?;
+        let pass =
+            crate::watch::check_due(&self.deps.store, self.deps.metrics, &reader, now, &crate::watch::Pace::DAILY).await?;
         if pass.ended > 0 {
             self.wake_mirror();
         }
@@ -1194,11 +1195,17 @@ mod tests {
     async fn a_watch_that_is_hit_is_ended_by_the_tick_and_the_channel_is_woken_to_send_it() {
         let shop = a_shop_pricing_its_widget_at("289.00").await;
         let dir = tempfile::tempdir().unwrap();
-        let (core, id) = a_core_watching(&dir, &shop, 21).await;
+        let (mut core, id) = a_core_watching(&dir, &shop, 21).await;
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        core.deps.metrics = metrics;
 
         let pass = core.check_watches().await.unwrap();
 
         assert_eq!((pass.due, pass.checked, pass.ended), (1, 1, 1));
+        // Counted where `/metrics` reads, on the set the core was given.
+        let page = metrics.render();
+        assert!(page.contains("scout_price_watch_checks_total{outcome=\"read\"} 1\n"), "{page}");
+        assert!(page.contains("scout_price_watches_ended_total{why=\"hit\"} 1\n"), "{page}");
         let waiting = core.store().pending_mirror(crate::mirror::TELEGRAM, 10).unwrap();
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].turn_key, format!("watch:{id}:hit"));

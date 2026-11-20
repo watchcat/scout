@@ -748,7 +748,7 @@ pub fn build_agent(
                 renderer: d.renderer.clone(),
             })
             .tool(ListWatchesTool { store: d.store.clone(), account_id })
-            .tool(StopWatchTool { store: d.store.clone(), account_id });
+            .tool(StopWatchTool { store: d.store.clone(), account_id, metrics: d.metrics });
     }
     if let Some(bol) = &d.bol {
         builder = builder.tool(crate::tools::bol::BolSearchTool { client: bol.clone() });

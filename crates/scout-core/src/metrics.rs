@@ -136,6 +136,8 @@ pub struct Metrics {
     runs: Counter,
     run_duration: Histogram,
     tool_calls: Counter,
+    watch_checks: Counter,
+    watches_ended: Counter,
     provider_errors: Counter,
     provider_retries: Counter,
     lock_wait: Histogram,
@@ -154,6 +156,8 @@ impl Default for Metrics {
             runs: Counter::new(&["outcome"]),
             run_duration: Histogram::new(RUN_BUCKETS),
             tool_calls: Counter::new(&["tool", "status"]),
+            watch_checks: Counter::new(&["outcome"]),
+            watches_ended: Counter::new(&["why"]),
             provider_errors: Counter::new(&["provider", "kind"]),
             provider_retries: Counter::new(&["provider"]),
             lock_wait: Histogram::new(LOCK_BUCKETS),
@@ -182,6 +186,21 @@ impl Metrics {
 
     pub fn tool_call(&self, tool: &str, status: &str) {
         self.tool_calls.add(&[tool, status]);
+    }
+
+    /// One daily check of a price watch, by how it went: a price was
+    /// `read`, the page was `unreadable` (gone, or its data priced
+    /// nothing), or the shop `refused` the request. No host: which shop is
+    /// one person's business, and is in no counter.
+    pub fn watch_checked(&self, outcome: &str) {
+        self.watch_checks.add(&[outcome]);
+    }
+
+    /// A price watch ended, by why: `hit`, `unreadable` after three days
+    /// with no price, `expired` at sixty days, or `stopped` by its owner.
+    /// What will say whether sixty days and ten watches were good guesses.
+    pub fn watch_ended(&self, why: &str) {
+        self.watches_ended.add(&[why]);
     }
 
     /// A provider's request that failed for good, retries spent.
@@ -247,6 +266,8 @@ impl Metrics {
         self.runs.render(&mut out, "scout_runs_total", "Runs, by how they ended: answered, cut_short or failed once a run has a row; busy or overloaded when it never got one.");
         self.run_duration.render(&mut out, "scout_run_duration_seconds", "How long a run took, from its row to its last word; the wait for a slot is not in it.");
         self.tool_calls.render(&mut out, "scout_tool_calls_total", "Tool calls the agents made, by tool and whether the tool answered.");
+        self.watch_checks.render(&mut out, "scout_price_watch_checks_total", "Daily checks of price watches, by how each went: read (a price was read), unreadable (the page gave none), refused (the shop refused the request).");
+        self.watches_ended.render(&mut out, "scout_price_watches_ended_total", "Price watches ended, by why: hit, unreadable (three days running with no price), expired (sixty days) or stopped by their owner.");
         self.provider_errors.render(&mut out, "scout_provider_errors_total", "Requests that failed after their retries: paid APIs as they answered (client includes a not-found), and the model during runs.");
         self.provider_retries.render(&mut out, "scout_provider_retries_total", "Requests to a provider sent again after a 429, a 5xx or a refused connection.");
         self.lock_wait.render(&mut out, "scout_store_lock_wait_seconds", "Time a store call waited for the database's lock.");
@@ -496,6 +517,8 @@ mod tests {
             "scout_runs_total",
             "scout_run_duration_seconds",
             "scout_tool_calls_total",
+            "scout_price_watch_checks_total",
+            "scout_price_watches_ended_total",
             "scout_provider_errors_total",
             "scout_provider_retries_total",
             "scout_store_lock_wait_seconds",
@@ -522,6 +545,31 @@ mod tests {
         assert!(page.contains("scout_search_calls_total{queries=\"3\"} 1\n"), "{page}");
         assert!(page.contains("scout_search_results_total{source=\"kagi_3\",outcome=\"cut\"} 6\n"), "{page}");
         assert!(page.contains("scout_search_results_total{source=\"perplexity\",outcome=\"kept\"} 0\n"), "a source with nothing kept is still named:\n{page}");
+    }
+
+    #[test]
+    fn price_watch_checks_are_counted_by_how_they_went_and_endings_by_why() {
+        let m = Metrics::default();
+        for outcome in ["read", "read", "unreadable", "refused", "refused", "refused"] {
+            m.watch_checked(outcome);
+        }
+        for why in ["hit", "expired", "stopped", "stopped", "unreadable"] {
+            m.watch_ended(why);
+        }
+        let page = m.render();
+        for series in [
+            "scout_price_watch_checks_total{outcome=\"read\"} 2",
+            "scout_price_watch_checks_total{outcome=\"unreadable\"} 1",
+            // Apart from unreadable: a shop that walls the reader is not a
+            // page that lost its price, and the two call for different work.
+            "scout_price_watch_checks_total{outcome=\"refused\"} 3",
+            "scout_price_watches_ended_total{why=\"hit\"} 1",
+            "scout_price_watches_ended_total{why=\"expired\"} 1",
+            "scout_price_watches_ended_total{why=\"stopped\"} 2",
+            "scout_price_watches_ended_total{why=\"unreadable\"} 1",
+        ] {
+            assert!(page.contains(&format!("{series}\n")), "{series} is missing:\n{page}");
+        }
     }
 
     #[test]

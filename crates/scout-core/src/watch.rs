@@ -64,10 +64,12 @@ pub(crate) const READ: &str = "read";
 pub(crate) const UNREADABLE: &str = "unreadable";
 pub(crate) const REFUSED: &str = "refused";
 
-/// Why a watch ended, as the table and the outbox key write it. The fourth
-/// is `stopped`, which the store writes on its owner's word.
+/// Why a watch ended, as the table, the outbox key and `/metrics` write
+/// it. `unreadable` is the fourth, in the word above. A stop is its
+/// owner's doing and the store's to write; the word is here for the count.
 pub(crate) const HIT: &str = "hit";
 pub(crate) const EXPIRED: &str = "expired";
+pub(crate) const STOPPED: &str = "stopped";
 
 /// The longest name of a product a watch keeps. It is said back in every
 /// message about the watch, and a shop's name for a thing can be a
@@ -587,8 +589,12 @@ pub(crate) struct Pass {
 /// `read_budget`, and after `pass_budget` no further watch is taken up.
 /// One watch's failure to be written is logged and the pass goes on; it is
 /// still due, and the next tick tries it again.
+///
+/// Each check is counted on `metrics` by how it went, and each watch the
+/// pass ends by why.
 pub(crate) async fn check_due<R: Reader>(
     store: &Store,
+    metrics: &crate::metrics::Metrics,
     reader: &R,
     now: chrono::NaiveDateTime,
     pace: &Pace,
@@ -614,6 +620,9 @@ pub(crate) async fn check_due<R: Reader>(
         asked.insert(host, tokio::time::Instant::now());
 
         let verdict = decide(watch, &reading, now);
+        // Counted as a check whatever becomes of the write below: the
+        // request was made, and how shops answer is what this counts.
+        metrics.watch_checked(verdict.outcome);
         let (theirs, id, decided) = (store.clone(), watch.id, verdict.clone());
         let written = blocking(move || {
             theirs.record_watch_check(&crate::store::WatchCheck {
@@ -631,6 +640,7 @@ pub(crate) async fn check_due<R: Reader>(
                 pass.checked += 1;
                 if let Some((why, _)) = &verdict.ended {
                     pass.ended += 1;
+                    metrics.watch_ended(why);
                     tracing::info!(watch = id, why, "a price watch ended");
                 }
             }
@@ -1099,12 +1109,18 @@ mod tests {
         store.pending_mirror(crate::mirror::TELEGRAM, 100).unwrap().into_iter().map(|m| (m.turn_key, m.address, m.body)).collect()
     }
 
+    /// A set of counters nobody reads, for the tests that are not about
+    /// what `/metrics` says.
+    fn counters() -> &'static crate::metrics::Metrics {
+        Box::leak(Box::default())
+    }
+
     /// One pass a day for `days` days from `first`, the reader answering
     /// by the day. Returns the day after the last.
     async fn daily<F: Fn(usize) -> Reading + Sync>(store: &Store, first: chrono::NaiveDateTime, days: usize, by_day: F) -> chrono::NaiveDateTime {
         for n in 0..days {
             let reader = Told::by(|_: &str| by_day(n));
-            check_due(store, &reader, first + chrono::Duration::days(n as i64), &UNSPACED).await.unwrap();
+            check_due(store, counters(), &reader, first + chrono::Duration::days(n as i64), &UNSPACED).await.unwrap();
         }
         first + chrono::Duration::days(days as i64)
     }
@@ -1117,7 +1133,7 @@ mod tests {
         let w = watching_since(&store, WIDGET, began).await;
         let reader = Told::by(|_: &str| price(289.0));
 
-        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+        let pass = check_due(&store, counters(), &reader, now, &UNSPACED).await.unwrap();
 
         assert_eq!((pass.due, pass.checked, pass.ended, pass.left), (1, 1, 1, 0));
         let after = watch(&store, w.id);
@@ -1138,7 +1154,7 @@ mod tests {
         // Exactly one: the watch is over, so the passes after it neither
         // read the page nor say anything.
         for later in [1, 21, 48] {
-            check_due(&store, &reader, now + chrono::Duration::hours(later), &UNSPACED).await.unwrap();
+            check_due(&store, counters(), &reader, now + chrono::Duration::hours(later), &UNSPACED).await.unwrap();
         }
         assert_eq!(reader.asked().len(), 1);
         assert_eq!(waiting(&store).len(), 1);
@@ -1149,7 +1165,7 @@ mod tests {
         let (store, _dir) = a_store();
         let now = clock();
         let w = watching_since(&store, WIDGET, now - chrono::Duration::days(1)).await;
-        check_due(&store, &Told::by(|_: &str| price(300.0)), now, &UNSPACED).await.unwrap();
+        check_due(&store, counters(), &Told::by(|_: &str| price(300.0)), now, &UNSPACED).await.unwrap();
         assert_eq!(watch(&store, w.id).ended, Some((now, "hit".to_string())));
         assert!(waiting(&store)[0].2.starts_with("Widget is €300.00 at shop.example — exactly the €300.00 you asked for."), "got: {}", waiting(&store)[0].2);
     }
@@ -1161,7 +1177,7 @@ mod tests {
         let w = watching_since(&store, WIDGET, now - chrono::Duration::days(1)).await;
         let reader = Told::by(|_: &str| price(310.0));
 
-        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+        let pass = check_due(&store, counters(), &reader, now, &UNSPACED).await.unwrap();
         assert_eq!((pass.due, pass.checked, pass.ended), (1, 1, 0));
         let after = watch(&store, w.id);
         assert_eq!((after.last_price, after.lowest_price, after.last_checked_at, after.ended.clone()), (310.0, 310.0, now, None));
@@ -1169,15 +1185,15 @@ mod tests {
 
         // The tick is hourly and the check daily.
         for hour in 1..20 {
-            let pass = check_due(&store, &reader, now + chrono::Duration::hours(hour), &UNSPACED).await.unwrap();
+            let pass = check_due(&store, counters(), &reader, now + chrono::Duration::hours(hour), &UNSPACED).await.unwrap();
             assert_eq!(pass.due, 0, "hour {hour}");
         }
         assert_eq!(reader.asked().len(), 1);
-        check_due(&store, &reader, now + chrono::Duration::hours(20), &UNSPACED).await.unwrap();
+        check_due(&store, counters(), &reader, now + chrono::Duration::hours(20), &UNSPACED).await.unwrap();
         assert_eq!(reader.asked().len(), 2);
 
         // The lowest is the lowest ever read, not the latest.
-        check_due(&store, &Told::by(|_: &str| price(320.0)), now + chrono::Duration::hours(41), &UNSPACED).await.unwrap();
+        check_due(&store, counters(), &Told::by(|_: &str| price(320.0)), now + chrono::Duration::hours(41), &UNSPACED).await.unwrap();
         let after = watch(&store, w.id);
         assert_eq!((after.last_price, after.lowest_price), (320.0, 310.0));
     }
@@ -1267,13 +1283,13 @@ mod tests {
         let w = watching_since(&store, WIDGET, began).await;
         assert_eq!(w.expires_at, now, "sixty days to the second");
         // A dip on the tenth day that did not reach the target.
-        check_due(&store, &Told::by(|_: &str| price(305.0)), began + chrono::Duration::days(10), &UNSPACED).await.unwrap();
+        check_due(&store, counters(), &Told::by(|_: &str| price(305.0)), began + chrono::Duration::days(10), &UNSPACED).await.unwrap();
         // The day before its last it is a watch like any other.
-        check_due(&store, &Told::by(|_: &str| price(320.0)), now - chrono::Duration::days(1), &UNSPACED).await.unwrap();
+        check_due(&store, counters(), &Told::by(|_: &str| price(320.0)), now - chrono::Duration::days(1), &UNSPACED).await.unwrap();
         assert_eq!(watch(&store, w.id).ended, None);
         assert!(waiting(&store).is_empty());
 
-        let pass = check_due(&store, &Told::by(|_: &str| price(318.0)), now, &UNSPACED).await.unwrap();
+        let pass = check_due(&store, counters(), &Told::by(|_: &str| price(318.0)), now, &UNSPACED).await.unwrap();
         assert_eq!((pass.checked, pass.ended), (1, 1));
         assert_eq!(watch(&store, w.id).ended, Some((now, "expired".to_string())));
         assert_eq!(
@@ -1287,7 +1303,7 @@ mod tests {
                 ),
             )]
         );
-        check_due(&store, &Told::by(|_: &str| price(289.0)), now + chrono::Duration::days(1), &UNSPACED).await.unwrap();
+        check_due(&store, counters(), &Told::by(|_: &str| price(289.0)), now + chrono::Duration::days(1), &UNSPACED).await.unwrap();
         assert_eq!(waiting(&store).len(), 1, "an ended watch is not hit");
     }
 
@@ -1301,10 +1317,10 @@ mod tests {
             let (store, _dir) = a_store();
             let now = clock();
             let w = watching_since(&store, WIDGET, now - chrono::Duration::days(60) - chrono::Duration::minutes(30)).await;
-            check_due(&store, &Told::by(|_: &str| price(315.0)), now - chrono::Duration::hours(1), &UNSPACED).await.unwrap();
+            check_due(&store, counters(), &Told::by(|_: &str| price(315.0)), now - chrono::Duration::hours(1), &UNSPACED).await.unwrap();
             assert_eq!(watch(&store, w.id).ended, None);
 
-            check_due(&store, &Told::by(|_: &str| last.clone()), now, &UNSPACED).await.unwrap();
+            check_due(&store, counters(), &Told::by(|_: &str| last.clone()), now, &UNSPACED).await.unwrap();
             assert_eq!(watch(&store, w.id).ended, Some((now, why.to_string())), "after {last:?}");
             let said = waiting(&store);
             assert_eq!(said.len(), 1, "after {last:?}");
@@ -1323,7 +1339,7 @@ mod tests {
         let reader = Told::by(|_: &str| price(310.0));
         let began = tokio::time::Instant::now();
 
-        check_due(&store, &reader, now, &Pace::DAILY).await.unwrap();
+        check_due(&store, counters(), &reader, now, &Pace::DAILY).await.unwrap();
 
         let at: Vec<(String, u64)> = reader.asked().into_iter().map(|(url, when)| (shop_of(&url), (when - began).as_secs())).collect();
         assert_eq!(
@@ -1356,7 +1372,7 @@ mod tests {
         let fine = watching_since(&store, "https://shop.example/p/1", then).await;
         let began = tokio::time::Instant::now();
 
-        let pass = check_due(&store, &Stuck, now, &Pace::DAILY).await.unwrap();
+        let pass = check_due(&store, counters(), &Stuck, now, &Pace::DAILY).await.unwrap();
 
         assert_eq!(began.elapsed(), READ_BUDGET, "given up on after the one reading's budget");
         assert_eq!((pass.due, pass.checked, pass.left), (2, 2, 0));
@@ -1385,7 +1401,7 @@ mod tests {
         let pace = Pace { pass_budget: Duration::from_secs(150), ..Pace::DAILY };
         let began = tokio::time::Instant::now();
 
-        let pass = check_due(&store, &Slow, now, &pace).await.unwrap();
+        let pass = check_due(&store, counters(), &Slow, now, &pace).await.unwrap();
 
         // Three minute-long reads began inside two and a half minutes.
         assert_eq!(began.elapsed(), Duration::from_secs(180));
@@ -1393,7 +1409,7 @@ mod tests {
         let checked: Vec<bool> = ids.iter().map(|id| watch(&store, *id).last_checked_at == now).collect();
         assert_eq!(checked, [true, true, true, false, false], "the longest unchecked went first");
         // And the next tick takes up where this one stopped.
-        let next = check_due(&store, &Slow, now + chrono::Duration::hours(1), &pace).await.unwrap();
+        let next = check_due(&store, counters(), &Slow, now + chrono::Duration::hours(1), &pace).await.unwrap();
         assert_eq!((next.due, next.checked, next.left), (2, 2, 0));
     }
 
@@ -1410,7 +1426,7 @@ mod tests {
             price(289.0)
         });
 
-        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+        let pass = check_due(&store, counters(), &reader, now, &UNSPACED).await.unwrap();
 
         assert_eq!((pass.due, pass.checked, pass.ended), (1, 0, 0));
         assert_eq!(watch(&store, w.id).ended, Some((now, "stopped".to_string())));
@@ -1430,7 +1446,7 @@ mod tests {
         }
         let reader = PageReader::for_a_pass(OpenWeb::exempting(*shop.address()), None);
 
-        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+        let pass = check_due(&store, counters(), &reader, now, &UNSPACED).await.unwrap();
 
         assert_eq!(shop.received_requests().await.unwrap().len(), 1, "the shop said no once and was not asked again");
         assert_eq!((pass.due, pass.checked, pass.ended), (3, 3, 0));
@@ -1440,7 +1456,7 @@ mod tests {
         }
         assert!(waiting(&store).is_empty());
         // Nor an hour on: each watch was checked today, refused or not.
-        let next = check_due(&store, &reader, now + chrono::Duration::hours(1), &UNSPACED).await.unwrap();
+        let next = check_due(&store, counters(), &reader, now + chrono::Duration::hours(1), &UNSPACED).await.unwrap();
         assert_eq!(next.due, 0);
         assert_eq!(shop.received_requests().await.unwrap().len(), 1);
     }
@@ -1456,7 +1472,7 @@ mod tests {
         let w = watching_since(&store, &url, now - chrono::Duration::days(1)).await;
         let reader = PageReader::for_a_pass(OpenWeb::exempting(*shop.address()), None);
 
-        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+        let pass = check_due(&store, counters(), &reader, now, &UNSPACED).await.unwrap();
 
         assert_eq!((pass.checked, pass.ended), (1, 1));
         let asked = shop.received_requests().await.unwrap();
@@ -1467,6 +1483,59 @@ mod tests {
         assert_eq!(said[0].0, format!("watch:{}:hit", w.id));
         assert!(said[0].2.starts_with("Widget is €289.00 at 127.0.0.1 — under the €300.00 you asked for."), "got: {}", said[0].2);
         assert!(said[0].2.ends_with(&url), "got: {}", said[0].2);
+    }
+
+    #[tokio::test]
+    async fn the_page_counts_each_check_by_how_it_went_and_each_ending_by_why() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let then = now - chrono::Duration::days(1);
+        let mut ids = std::collections::HashMap::new();
+        for page in ["hit", "over", "gone", "walled", "stopped"] {
+            let url = format!("https://shop.example/p/{page}");
+            ids.insert(page, watching_since(&store, &url, then).await.id);
+        }
+        // "gone" has had no price for two days already.
+        let gone = watch(&store, ids["gone"]);
+        let two_days = crate::store::WatchCheck { id: gone.id, now: then, last_price: 329.0, lowest_price: 329.0, unreadable_streak: 2, ended: None };
+        assert!(store.record_watch_check(&two_days).unwrap());
+
+        let (theirs, stopped) = (store.clone(), ids["stopped"]);
+        let reader = Told::by(move |url: &str| match url.rsplit('/').next().unwrap() {
+            "hit" => price(289.0),
+            "over" => price(310.0),
+            "gone" => no_price(),
+            "walled" => refused(),
+            _ => {
+                theirs.stop_watch(1, stopped, now).unwrap().expect("live until now");
+                price(289.0)
+            }
+        });
+        let metrics = counters();
+
+        let pass = check_due(&store, metrics, &reader, now, &UNSPACED).await.unwrap();
+
+        assert_eq!((pass.due, pass.checked, pass.ended), (5, 4, 2));
+        let page = metrics.render();
+        for series in [
+            // The stopped one's page was read too: a check is a request
+            // made, whatever became of the watch meanwhile.
+            "scout_price_watch_checks_total{outcome=\"read\"} 3",
+            "scout_price_watch_checks_total{outcome=\"unreadable\"} 1",
+            "scout_price_watch_checks_total{outcome=\"refused\"} 1",
+            "scout_price_watches_ended_total{why=\"hit\"} 1",
+            "scout_price_watches_ended_total{why=\"unreadable\"} 1",
+        ] {
+            assert!(page.contains(&format!("{series}\n")), "{series} is missing:\n{page}");
+        }
+        // The pass ended two watches and counted two: the one its owner
+        // stopped is the stop's to count, not the pass's.
+        assert_eq!(page.matches("scout_price_watches_ended_total{").count(), 2, "{page}");
+
+        // Sixty days on, the two still live expire.
+        let later = now + chrono::Duration::days(60);
+        check_due(&store, metrics, &Told::by(|_: &str| price(310.0)), later, &UNSPACED).await.unwrap();
+        assert!(metrics.render().contains("scout_price_watches_ended_total{why=\"expired\"} 2\n"), "{}", metrics.render());
     }
 
     #[test]

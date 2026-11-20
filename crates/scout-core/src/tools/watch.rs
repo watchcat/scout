@@ -124,6 +124,8 @@ pub struct StopWatchArgs {
 pub struct StopWatchTool {
     pub store: Store,
     pub account_id: i64,
+    /// Where a stop is counted, beside the endings the daily pass counts.
+    pub metrics: &'static crate::metrics::Metrics,
 }
 
 impl Tool for StopWatchTool {
@@ -154,7 +156,10 @@ impl Tool for StopWatchTool {
             .map_err(internal)?
             .map_err(internal)?;
         Ok(match stopped {
-            Some(watch) => watch::say_stopped(&watch),
+            Some(watch) => {
+                self.metrics.watch_ended(watch::STOPPED);
+                watch::say_stopped(&watch)
+            }
             None => "no running price watch with that id; list_watches shows the ones there are".to_string(),
         })
     }
@@ -197,6 +202,11 @@ mod tests {
         }
     }
 
+    /// A set of counters of the test's own.
+    fn counters() -> &'static crate::metrics::Metrics {
+        Box::leak(Box::default())
+    }
+
     fn under(shop: &MockServer, page: &str, target: f64) -> WatchPriceArgs {
         WatchPriceArgs { url: format!("{}/p/{page}", shop.uri()), target, currency: "EUR".into() }
     }
@@ -225,7 +235,7 @@ mod tests {
         assert_eq!(handed[0]["last_price"], "€329.00");
         assert!(handed[0].get("note").is_none(), "nothing to remark on: {handed}");
 
-        let stop = StopWatchTool { store: store.clone(), account_id: 1 };
+        let stop = StopWatchTool { store: store.clone(), account_id: 1, metrics: counters() };
         assert_eq!(stop.call(StopWatchArgs { id: listed[0].id }).await.unwrap(), "Stopped watching Widget at 127.0.0.1.");
         assert!(list.call(NoArgs {}).await.unwrap().is_empty());
         let again = stop.call(StopWatchArgs { id: listed[0].id }).await.unwrap();
@@ -238,7 +248,7 @@ mod tests {
         let shop = a_shop().await;
         let mine = watching(&store, &shop, 1, ReplyTo::telegram(99)).call(under(&shop, "widget", 300.0)).await.unwrap();
         assert!(ListWatchesTool { store: store.clone(), account_id: 2 }.call(NoArgs {}).await.unwrap().is_empty());
-        let theirs = StopWatchTool { store: store.clone(), account_id: 2 };
+        let theirs = StopWatchTool { store: store.clone(), account_id: 2, metrics: counters() };
         let said = theirs.call(StopWatchArgs { id: mine.id.unwrap() }).await.unwrap();
         assert!(said.starts_with("no running price watch with that id"), "got: {said}");
         assert_eq!(ListWatchesTool { store, account_id: 1 }.call(NoArgs {}).await.unwrap().len(), 1);
@@ -295,6 +305,22 @@ mod tests {
         // What is the caller's own mistake is an error it can correct.
         let err = tool.call(under(&shop, "widget", -1.0)).await.unwrap_err();
         assert!(err.to_string().contains("target"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_watch_its_owner_stops_is_counted_as_stopped_and_a_stop_that_found_none_is_not() {
+        let (store, _d) = setup();
+        let shop = a_shop().await;
+        let started = watching(&store, &shop, 1, ReplyTo::telegram(99)).call(under(&shop, "widget", 300.0)).await.unwrap();
+        let metrics = counters();
+        let stop = StopWatchTool { store: store.clone(), account_id: 1, metrics };
+        let id = started.id.unwrap();
+        for _ in 0..2 {
+            stop.call(StopWatchArgs { id }).await.unwrap();
+        }
+        stop.call(StopWatchArgs { id: id + 100 }).await.unwrap();
+        let page = metrics.render();
+        assert!(page.contains("scout_price_watches_ended_total{why=\"stopped\"} 1\n"), "{page}");
     }
 
     #[test]

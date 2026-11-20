@@ -15,7 +15,11 @@ axum = "0.8.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+# For the binary: the guard logs each address it refuses a Chrome, and
+# without a subscriber nobody reads that.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 # A session's profile directory, removed on every way out of a session,
 # a panic included, by the directory's own `Drop`.

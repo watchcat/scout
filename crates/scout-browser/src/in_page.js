@@ -6,9 +6,37 @@
 // page's document and none of its script: the page cannot read or renumber
 // what is kept here, and cannot hand this code a getAttribute of its making.
 
+// Everything of the page's own writing that is handed on is cut to a length:
+// the name of a link or of a field is a few words, whatever the page wrote.
+// The first three are the prototype's; the rest are chosen, not measured.
+const LINK = 120
+const VALUE = 40
+const OPTIONS = 15
+const LABEL = 80
+const OPTION = 60
+const COVERED = 60
+const SAID_OF_A_FIELD = 200
+
+// The first n of s, never ending on half a letter. A letter outside the
+// first 65,536 is two units of a string here, and a cut between them leaves
+// a half that is no text at all: the answer it was in could not be read.
+function cut(s, n) {
+  if (s.length <= n) return s
+  const last = s.charCodeAt(n - 1)
+  return s.slice(0, last >= 0xd800 && last <= 0xdbff ? n - 1 : n)
+}
+
+// s with each half letter of the page's own making turned into the mark for
+// a letter that could not be read.
+function sound(s) {
+  return typeof s.toWellFormed === 'function' ? s.toWellFormed() : s.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '\ufffd')
+}
+
+const clean = (s) => (s || '').replace(/\s+/g, ' ').trim()
+
 // The visible text in reading order, the pressable things numbered, whatever
 // sits in front of the page first.
-function outlineInPage(max, from) {
+function outlineInPage(max, from, caps) {
   const refs = (globalThis.__scoutRefs = {})
   let n = 0
   const parts = []
@@ -16,7 +44,6 @@ function outlineInPage(max, from) {
   const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'IFRAME', 'OBJECT', 'CANVAS', 'VIDEO', 'AUDIO', 'HEAD'])
   const BLOCK = new Set(['DIV', 'P', 'LI', 'UL', 'OL', 'SECTION', 'ARTICLE', 'MAIN', 'HEADER', 'FOOTER', 'NAV', 'ASIDE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TR', 'TABLE', 'FORM', 'FIELDSET', 'DL', 'DT', 'DD', 'BR', 'HR', 'DIALOG', 'DETAILS', 'LABEL'])
   const PRESS = 'a[href],button,input:not([type=hidden]),select,textarea,summary,[role=button],[role=link],[role=radio],[role=option],[role=tab],[role=checkbox],[role=menuitem],[role=switch],[role=combobox]'
-  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim()
   const shown = (el) => {
     const cs = getComputedStyle(el)
     if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return false
@@ -25,20 +52,20 @@ function outlineInPage(max, from) {
   const describe = (el) => {
     const tag = el.tagName
     if (tag === 'SELECT') {
-      const options = [...el.options].slice(0, 15).map((o) => (o.selected ? '*' : '') + clean(o.textContent)).join(' | ')
+      const options = [...el.options].slice(0, OPTIONS).map((o) => (o.selected ? '*' : '') + cut(clean(o.textContent), OPTION)).join(' | ')
       return `[${n}] list "${labelOf(el)}": ${options}`
     }
     if (tag === 'INPUT' || tag === 'TEXTAREA') {
       const type = (el.getAttribute('type') || 'text').toLowerCase()
       if (type === 'checkbox' || type === 'radio') return `[${n}] ${type}${el.checked ? ' (on)' : ''} "${labelOf(el)}"`
-      if (type === 'submit' || type === 'button' || type === 'image' || type === 'reset') return `[${n}] button "${clean(el.value) || labelOf(el)}"`
+      if (type === 'submit' || type === 'button' || type === 'image' || type === 'reset') return `[${n}] button "${cut(clean(el.value), LABEL) || labelOf(el)}"`
       if (type === 'file') return `[${n}] file "${labelOf(el)}"`
       // What a password field holds is nobody's to read back.
-      const value = type === 'password' ? '' : clean(el.value).slice(0, 40)
+      const value = type === 'password' ? '' : cut(clean(el.value), VALUE)
       return `[${n}] field "${labelOf(el)}"${value ? ` = "${value}"` : ''}`
     }
     const img = el.querySelector('img[alt]')
-    const text = clean(el.innerText).slice(0, 120) || clean(el.getAttribute('aria-label') || el.getAttribute('title') || (img ? img.alt : ''))
+    const text = cut(clean(el.innerText), LINK) || cut(clean(el.getAttribute('aria-label') || el.getAttribute('title') || (img ? img.alt : '')), LINK)
     if (!text) return null
     const on = ['aria-pressed', 'aria-selected', 'aria-checked'].some((a) => el.getAttribute(a) === 'true') ? ' (on)' : ''
     const off = el.disabled || el.getAttribute('aria-disabled') === 'true' ? ' (off)' : ''
@@ -72,15 +99,16 @@ function outlineInPage(max, from) {
   section('In front of the page', front)
   section('The page', [...document.querySelectorAll('main,[role=main]')])
   section('Around it', document.body ? [document.body] : [])
-  const text = parts.join('').replace(/[^\S\n]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/\n{2,}/g, '\n').trim()
-  return { title: document.title, url: location.href, text: text.slice(from, from + max), more: text.length > from + max, total: text.length }
+  const text = sound(parts.join('').replace(/[^\S\n]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/\n{2,}/g, '\n').trim())
+  const part = cut(text.slice(from), max)
+  return { title: cut(sound(document.title), caps.title), url: cut(location.href, caps.address), text: part, next: from + part.length, more: text.length > from + part.length }
 }
 
 // The outline, and the page's own markup for the one who decides whether it
 // is a refusal: that is judged by the extractor, which reads markup.
-function pageInPage(max, from) {
-  const page = outlineInPage(max, from)
-  page.html = document.documentElement ? document.documentElement.outerHTML : ''
+function pageInPage(max, from, caps) {
+  const page = outlineInPage(max, from, caps)
+  page.html = document.documentElement ? cut(sound(document.documentElement.outerHTML), caps.markup) : ''
   return page
 }
 
@@ -90,13 +118,12 @@ function addressInPage() {
 }
 
 function labelOf(el) {
-  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim()
   const aria = el.getAttribute('aria-label')
-  if (aria) return clean(aria)
+  if (aria) return cut(clean(aria), LABEL)
   const named = namedBy(el)
-  if (named) return named
-  if (el.labels && el.labels.length) return clean(el.labels[0].innerText)
-  return clean(el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || '')
+  if (named) return cut(named, LABEL)
+  if (el.labels && el.labels.length) return cut(clean(el.labels[0].innerText), LABEL)
+  return cut(clean(el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || ''), LABEL)
 }
 
 // What aria-labelledby points at, as text.
@@ -153,10 +180,9 @@ function targetInPage(n) {
   let covered = null
   if (!point && points.length) {
     const over = at(points[0].x, points[0].y)
-    covered = over ? (over.innerText || over.getAttribute('aria-label') || over.tagName.toLowerCase()).replace(/\s+/g, ' ').trim().slice(0, 60) : ''
+    covered = over ? cut(clean(over.innerText || over.getAttribute('aria-label') || over.tagName.toLowerCase()), COVERED) : ''
   }
   const type = (el.getAttribute('type') || '').toLowerCase()
-  const label = el.labels && el.labels.length ? el.labels[0].innerText : ''
   return {
     tag: el.tagName,
     href: el.tagName === 'A' ? el.href : null,
@@ -164,11 +190,20 @@ function targetInPage(n) {
     sized: rects.length > 0,
     point,
     covered,
-    field: {
-      tag: el.tagName, type: el.getAttribute('type'), inputmode: el.getAttribute('inputmode'), autocomplete: el.getAttribute('autocomplete'),
-      name: el.getAttribute('name'), id: el.id || null, placeholder: el.getAttribute('placeholder'), title: el.getAttribute('title'),
-      label: [el.getAttribute('aria-label') || '', namedBy(el), label].join(' ').replace(/\s+/g, ' ').trim(),
-    },
+    field: fieldOf(el),
+  }
+}
+
+// What the page says of a thing as a field: what the rule on typing reads.
+// All of each, up to a length no honest name of a field comes near; a word
+// that makes a field personal is looked for anywhere in it.
+function fieldOf(el) {
+  const said = (v) => (v == null ? null : cut(sound(String(v)), SAID_OF_A_FIELD))
+  const label = el.labels && el.labels.length ? el.labels[0].innerText : ''
+  return {
+    tag: el.tagName, type: said(el.getAttribute('type')), inputmode: said(el.getAttribute('inputmode')), autocomplete: said(el.getAttribute('autocomplete')),
+    name: said(el.getAttribute('name')), id: said(el.id || null), placeholder: said(el.getAttribute('placeholder')), title: said(el.getAttribute('title')),
+    label: said(clean([el.getAttribute('aria-label') || '', namedBy(el), label].join(' '))),
   }
 }
 
@@ -205,9 +240,9 @@ function chooseInPage(n, option) {
   const flat = (s) => s.replace(/\s+/g, ' ').trim().toLowerCase()
   const want = flat(option)
   const found = [...el.options].find((o) => sameOption(o.textContent, option)) || [...el.options].find((o) => want.length > 1 && flat(o.textContent).includes(want))
-  if (!found) return { error: `that list has no such option; it has: ${[...el.options].slice(0, 15).map((o) => flat(o.textContent)).join(' | ')}` }
+  if (!found) return { error: `that list has no such option; it has: ${[...el.options].slice(0, OPTIONS).map((o) => cut(flat(o.textContent), OPTION)).join(' | ')}` }
   el.value = found.value
   el.dispatchEvent(new Event('input', { bubbles: true }))
   el.dispatchEvent(new Event('change', { bubbles: true }))
-  return { chosen: flat(found.textContent) }
+  return { chosen: cut(flat(found.textContent), OPTION) }
 }

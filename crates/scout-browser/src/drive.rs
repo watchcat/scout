@@ -13,6 +13,23 @@ use url::Url;
 /// number, and the prototype's.
 pub const OUTLINE_CHARS: usize = 6000;
 
+// A page can write any of the following at any length, and each of them
+// is handed on to whoever drives the session. The numbers are chosen, not
+// measured: each is roomy for what the thing is, and a bound at all is the
+// point. They are counted as the page counts, in the units of its strings.
+
+/// The most of a page's title that is shown. A title is a line.
+pub const TITLE_CHARS: usize = 200;
+
+/// The most of an address that is shown, and the longest a session opens:
+/// what follows a `?` is free text, and an address is not the place for a
+/// page of it.
+pub const ADDRESS_CHARS: usize = 2000;
+
+/// The most of a page's markup that is kept for judging whether it is a
+/// refusal. A refusal is a short page, and its title is at the top.
+pub const MARKUP_CHARS: usize = 2_000_000;
+
 /// What a session does to the page it has open.
 ///
 /// As JSON, an object that names the action under `do`:

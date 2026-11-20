@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
@@ -77,50 +77,11 @@ impl Pipe {
             .kill_on_drop(true)
             .spawn()?;
         let into = child.stdin.take().expect("stdin is piped");
-        let mut out = BufReader::new(child.stdout.take().expect("stdout is piped"));
+        let out = BufReader::new(child.stdout.take().expect("stdout is piped"));
         let waiting: Waiting = Arc::default();
         let (events, said) = mpsc::unbounded_channel();
-        let answers = waiting.clone();
         let closed: Arc<AtomicBool> = Arc::default();
-        let closing = closed.clone();
-        tokio::spawn(async move {
-            let mut message = Vec::new();
-            loop {
-                message.clear();
-                match out.read_until(0, &mut message).await {
-                    Ok(n) if n > 0 && message.last() == Some(&0) => {}
-                    // The pipe closed: Chrome is gone, and so is everyone's answer.
-                    _ => break,
-                }
-                message.pop();
-                let Ok(mut message) = serde_json::from_slice::<Value>(&message) else { continue };
-                match message["id"].as_u64() {
-                    Some(id) => {
-                        let result = match message["error"]["message"].as_str() {
-                            Some(error) => Err(CallError::Answered(error.to_string())),
-                            None => Ok(message["result"].take()),
-                        };
-                        if let Some(asker) = answers.lock().unwrap().remove(&id) {
-                            let _ = asker.send(result);
-                        }
-                    }
-                    None => {
-                        let event = Event {
-                            method: message["method"].as_str().unwrap_or_default().to_string(),
-                            session: message["sessionId"].as_str().map(str::to_string),
-                            params: message["params"].take(),
-                        };
-                        if events.send(event).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            // Dropping the senders tells every caller still waiting.
-            let mut answers = answers.lock().unwrap();
-            closing.store(true, Ordering::Relaxed);
-            answers.clear();
-        });
+        tokio::spawn(listen(out, MAX_MESSAGE, waiting.clone(), events, closed.clone()));
         Ok((Pipe { into: tokio::sync::Mutex::new(into), next: AtomicU64::new(1), waiting, closed, chrome: tokio::sync::Mutex::new(child) }, said))
     }
 
@@ -188,6 +149,145 @@ impl Pipe {
     }
 }
 
+/// The most one message from Chrome may weigh. What a session asks the page
+/// for is cut to size in the page (`in_page.js`), the page's markup at two
+/// megabytes being the largest of it; this is several times that, for
+/// whatever Chrome says that nobody cut. A message past it is not kept.
+const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+
+/// Reads what Chrome says until the pipe closes: answers to whoever asked,
+/// the rest to `events`.
+async fn listen<R: AsyncBufRead + Unpin>(mut out: R, max: usize, answers: Waiting, events: mpsc::UnboundedSender<Event>, closing: Arc<AtomicBool>) {
+    // The pipe closing, or failing, ends the loop: Chrome is gone, and so
+    // is everyone's answer.
+    while let Ok(Some((mut message, whole))) = next_message(&mut out, max).await {
+        mend_surrogates(&mut message);
+        let read = if whole { serde_json::from_slice::<Value>(&message).ok() } else { None };
+        let Some(mut message) = read else {
+            // Not dropped in silence: a call left unanswered waits half a
+            // minute and then blames the browser for hanging.
+            let why = if whole { "the browser's answer could not be read" } else { "the browser's answer was too large to read" };
+            match id_of(&message).and_then(|id| answers.lock().unwrap().remove(&id)) {
+                Some(asker) => {
+                    let _ = asker.send(Err(CallError::Answered(why.to_string())));
+                }
+                None => tracing::warn!(why, "something Chrome said unasked was dropped"),
+            }
+            continue;
+        };
+        match message["id"].as_u64() {
+            Some(id) => {
+                let result = match message["error"]["message"].as_str() {
+                    Some(error) => Err(CallError::Answered(error.to_string())),
+                    None => Ok(message["result"].take()),
+                };
+                if let Some(asker) = answers.lock().unwrap().remove(&id) {
+                    let _ = asker.send(result);
+                }
+            }
+            None => {
+                let event = Event {
+                    method: message["method"].as_str().unwrap_or_default().to_string(),
+                    session: message["sessionId"].as_str().map(str::to_string),
+                    params: message["params"].take(),
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    // Dropping the senders tells every caller still waiting.
+    let mut answers = answers.lock().unwrap();
+    closing.store(true, Ordering::Relaxed);
+    answers.clear();
+}
+
+/// How much of a message that is too large is kept: enough to see whose
+/// answer it was.
+const HEAD: usize = 64;
+
+/// The next message, up to its zero byte, and whether all of it was kept.
+/// One longer than `max` is read to its end and thrown away but for its
+/// first bytes, so that what follows it is still read from its start.
+async fn next_message<R: AsyncBufRead + Unpin>(out: &mut R, max: usize) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+    let mut message = Vec::new();
+    let mut whole = true;
+    loop {
+        let available = out.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(None);
+        }
+        let (taken, ended) = match available.iter().position(|byte| *byte == 0) {
+            Some(at) => (at, true),
+            None => (available.len(), false),
+        };
+        if whole && message.len() + taken > max {
+            whole = false;
+            message.extend_from_slice(&available[..taken]);
+            message.truncate(HEAD);
+        } else if whole {
+            message.extend_from_slice(&available[..taken]);
+        }
+        out.consume(taken + usize::from(ended));
+        if ended {
+            return Ok(Some((message, whole)));
+        }
+    }
+}
+
+/// Half a letter made a whole mark. A page's text may hold half of a
+/// two-part letter (JavaScript's strings are allowed to), Chrome writes it
+/// out as it is, and a message with one in it is no JSON to a strict
+/// reader: the whole message would be lost for one broken letter.
+///
+/// Chrome writes such a half as `\uD83D`. Each one that is not followed by
+/// its other half, or not preceded by its first, becomes `�`, in
+/// place: the two are the same length.
+fn mend_surrogates(message: &mut [u8]) {
+    /// The number a `\uXXXX` at `at` writes, if one is written there.
+    fn escape(message: &[u8], at: usize) -> Option<u32> {
+        let written = message.get(at..at + 6)?;
+        if &written[..2] != b"\\u" {
+            return None;
+        }
+        u32::from_str_radix(std::str::from_utf8(&written[2..]).ok()?, 16).ok()
+    }
+    let mut at = 0;
+    while at < message.len() {
+        if message[at] != b'\\' {
+            at += 1;
+            continue;
+        }
+        match escape(message, at) {
+            Some(first) if (0xD800..0xDC00).contains(&first) => {
+                if escape(message, at + 6).is_some_and(|second| (0xDC00..0xE000).contains(&second)) {
+                    at += 12;
+                } else {
+                    message[at + 2..at + 6].copy_from_slice(b"fffd");
+                    at += 6;
+                }
+            }
+            Some(second) if (0xDC00..0xE000).contains(&second) => {
+                message[at + 2..at + 6].copy_from_slice(b"fffd");
+                at += 6;
+            }
+            Some(_) => at += 6,
+            // Any other escape is a backslash and one character: `\\`
+            // among them, after which a `u` is a letter.
+            None => at += 2,
+        }
+    }
+}
+
+/// The id of the call a message answers, read off its first bytes, for a
+/// message that cannot be read whole. Chrome writes an answer's id first.
+fn id_of(head: &[u8]) -> Option<u64> {
+    let digits = head.strip_prefix(b"{\"id\":")?;
+    let end = digits.iter().position(|byte| !byte.is_ascii_digit()).unwrap_or(digits.len());
+    std::str::from_utf8(&digits[..end]).ok()?.parse().ok()
+}
+
 fn kill_and_wait(chrome: &mut Child) {
     let _ = chrome.start_kill();
     for _ in 0..200 {
@@ -210,6 +310,102 @@ impl Drop for Pipe {
 mod tests {
     use super::*;
     use crate::testing;
+
+    fn mended(json: &str) -> String {
+        let mut bytes = json.as_bytes().to_vec();
+        mend_surrogates(&mut bytes);
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn half_a_letter_is_made_a_whole_mark_and_a_whole_letter_is_left_alone() {
+        assert_eq!(mended(r#"{"t":"a\ud83d"}"#), r#"{"t":"a\ufffd"}"#);
+        assert_eq!(mended(r#"{"t":"\ude00b"}"#), r#"{"t":"\ufffdb"}"#);
+        assert_eq!(mended(r#"{"t":"\uD83D\uDE00 \uD83D"}"#), r#"{"t":"\uD83D\uDE00 \ufffd"}"#);
+        assert_eq!(mended(r#"{"t":"\ud83d\u0041"}"#), r#"{"t":"\ufffd\u0041"}"#);
+        assert_eq!(mended(r#"{"t":"\ud83d\ud83d\ude00"}"#), r#"{"t":"\ufffd\ud83d\ude00"}"#);
+        for whole in [r#"{"t":"\ud83d\ude00"}"#, r#"{"t":"plain \u00e9 text"}"#, r#"{"t":""}"#] {
+            assert_eq!(mended(whole), whole);
+        }
+        // A backslash written out and then the letters u d 8 3 d is text.
+        assert_eq!(mended(r#"{"t":"\\ud83d"}"#), r#"{"t":"\\ud83d"}"#);
+        assert_eq!(mended(r#"{"t":"\\\ud83d"}"#), r#"{"t":"\\\ufffd"}"#);
+        // Cut off in the middle of an escape, it is left for the reader to refuse.
+        assert_eq!(mended(r#"{"t":"\ud8"#), r#"{"t":"\ud8"#);
+        // And what comes out is something a strict reader takes.
+        let read: Value = serde_json::from_str(&mended(r#"{"t":"aaa\ud83d en de rest"}"#)).unwrap();
+        assert_eq!(read["t"], "aaa\u{fffd} en de rest");
+    }
+
+    #[test]
+    fn the_call_a_message_answers_is_read_off_its_first_bytes() {
+        assert_eq!(id_of(br#"{"id":12,"result":{"value":"xxxxxxxx"#), Some(12));
+        assert_eq!(id_of(br#"{"id":7}"#), Some(7));
+        assert_eq!(id_of(br#"{"method":"Page.frameNavigated","params":{"id":3}}"#), None);
+        assert_eq!(id_of(b"not a message"), None);
+        assert_eq!(id_of(b""), None);
+    }
+
+    /// What `asked` calls were answered with, and what was said unasked,
+    /// when Chrome says `said` and then closes the pipe. `None`: the call
+    /// was left without an answer when the pipe closed.
+    async fn heard(said: &[u8], asked: &[u64], max: usize) -> (Vec<Option<Result<Value, CallError>>>, Vec<Event>) {
+        let waiting: Waiting = Arc::default();
+        let mut answers = Vec::new();
+        for id in asked {
+            let (asker, answer) = oneshot::channel();
+            waiting.lock().unwrap().insert(*id, asker);
+            answers.push(answer);
+        }
+        let (events, mut unasked) = mpsc::unbounded_channel();
+        let closed: Arc<AtomicBool> = Arc::default();
+        listen(said, max, waiting, events, closed.clone()).await;
+        assert!(closed.load(Ordering::Relaxed), "the pipe is known to be closed once it is");
+        let mut said_unasked = Vec::new();
+        while let Ok(event) = unasked.try_recv() {
+            said_unasked.push(event);
+        }
+        (answers.into_iter().map(|mut answer| answer.try_recv().ok()).collect(), said_unasked)
+    }
+
+    #[tokio::test]
+    async fn an_answer_goes_to_whoever_asked_and_the_rest_to_whoever_listens() {
+        let said = b"{\"id\":1,\"result\":{\"value\":2}}\0{\"method\":\"Page.frameStoppedLoading\",\"params\":{\"frameId\":\"F\"},\"sessionId\":\"S\"}\0{\"id\":2,\"error\":{\"message\":\"No such thing\"}}\0";
+        let (answers, unasked) = heard(said, &[1, 2, 3], MAX_MESSAGE).await;
+        assert_eq!(answers[0], Some(Ok(json!({ "value": 2 }))));
+        assert_eq!(answers[1], Some(Err(CallError::Answered("No such thing".to_string()))));
+        assert_eq!(answers[2], None, "a call still waiting when the pipe closes is told so by its closing");
+        assert_eq!((unasked.len(), unasked[0].method.as_str(), unasked[0].session.as_deref()), (1, "Page.frameStoppedLoading", Some("S")));
+        assert_eq!(unasked[0].params["frameId"], "F");
+    }
+
+    #[tokio::test]
+    async fn half_a_letter_in_an_answer_does_not_lose_the_answer() {
+        let said = b"{\"id\":1,\"result\":{\"value\":\"aaa\\ud83d\"}}\0{\"method\":\"Page.javascriptDialogOpening\",\"params\":{\"message\":\"\\ude00\"}}\0";
+        let (answers, unasked) = heard(said, &[1], MAX_MESSAGE).await;
+        assert_eq!(answers[0], Some(Ok(json!({ "value": "aaa\u{fffd}" }))));
+        // A message to dismiss that was dropped unread would hold the page for good.
+        assert_eq!((unasked.len(), &unasked[0].params["message"]), (1, &json!("\u{fffd}")));
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_cannot_be_read_is_an_error_to_whoever_asked_and_not_a_silence() {
+        let said = b"{\"id\":1,\"result\":{\"value\":tru}}\0{\"id\":2,\"result\":{}}\0";
+        let (answers, _) = heard(said, &[1, 2], MAX_MESSAGE).await;
+        assert_eq!(answers[0], Some(Err(CallError::Answered("the browser's answer could not be read".to_string()))));
+        assert_eq!(answers[1], Some(Ok(json!({}))), "and the next message is read as if nothing had happened");
+    }
+
+    #[tokio::test]
+    async fn an_answer_too_large_to_keep_ends_that_call_and_not_the_pipe() {
+        let large = format!("{{\"id\":1,\"result\":{{\"value\":\"{}\"}}}}\0{{\"id\":2,\"result\":{{}}}}\0", "x".repeat(500));
+        let (answers, _) = heard(large.as_bytes(), &[1, 2], 100).await;
+        assert_eq!(answers[0], Some(Err(CallError::Answered("the browser's answer was too large to read".to_string()))));
+        assert_eq!(answers[1], Some(Ok(json!({}))));
+        // One byte under the limit is read.
+        let fits = "{\"id\":1,\"result\":{}}\0";
+        assert_eq!(heard(fits.as_bytes(), &[1], fits.len() - 1).await.0[0], Some(Ok(json!({}))));
+    }
 
     #[tokio::test]
     async fn chrome_answers_over_the_pipe_and_opens_no_port() {

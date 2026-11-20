@@ -18,7 +18,7 @@
 
 use crate::address::{address_refused, link_refused, Refused};
 use crate::chrome::{chrome_args, write_preferences};
-use crate::drive::{Action, Broken, Browser, Done, Page, Seen, OUTLINE_CHARS};
+use crate::drive::{Action, Broken, Browser, Done, Page, Seen, ADDRESS_CHARS, MARKUP_CHARS, OUTLINE_CHARS, TITLE_CHARS};
 use crate::pipe::{CallError, Event, Pipe};
 use crate::site::Shop;
 use crate::typing::{typing_refused, Field};
@@ -34,6 +34,11 @@ use url::Url;
 
 /// What runs inside the page.
 const IN_PAGE: &str = include_str!("in_page.js");
+
+/// How many of the things a page did unasked are told one by one after an
+/// action: messages it put up, most of all. A page can put up a hundred in
+/// a second; five say what kind they were, and the rest are a count.
+const NOTES_KEPT: usize = 5;
 
 /// How long a page is given to come to rest after something is done to it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -130,6 +135,7 @@ impl Browser for Chrome {
             reaching: self.reaching,
             shared,
             from: 0,
+            next: 0,
             good: None,
             watcher,
             _proxy: proxy,
@@ -179,6 +185,8 @@ struct Happened {
     status: Option<u16>,
     refused: Vec<String>,
     notes: Vec<String>,
+    /// How many more there were than are kept to be told one by one.
+    untold: usize,
     /// Downloads Chrome has reported stopping.
     downloads_denied: u32,
     /// Why the session cannot go on, once it cannot.
@@ -195,8 +203,24 @@ impl Shared {
     fn refuse(&self, why: String) {
         let mut happened = self.happened.lock().unwrap();
         // A redirect that tries the same door twice is refused once.
-        if !happened.refused.contains(&why) {
+        if happened.refused.contains(&why) {
+            return;
+        }
+        if happened.refused.len() < NOTES_KEPT {
             happened.refused.push(why);
+        } else {
+            happened.untold += 1;
+        }
+    }
+
+    /// Something the page did that whoever drives is told of: the first
+    /// few as they were, the rest as a number.
+    fn note(&self, what: String) {
+        let mut happened = self.happened.lock().unwrap();
+        if happened.notes.len() < NOTES_KEPT {
+            happened.notes.push(what);
+        } else {
+            happened.untold += 1;
         }
     }
 }
@@ -215,6 +239,8 @@ pub struct Tab {
     shared: Arc<Shared>,
     /// Where the next outline starts in a long page's text.
     from: usize,
+    /// Where the part after it would start, as the page counted it.
+    next: usize,
     /// The last address the page was rightly at.
     good: Option<Url>,
     watcher: tokio::task::JoinHandle<()>,
@@ -532,8 +558,10 @@ impl Tab {
 
     /// The page as it is now, with what Chrome said in the meantime.
     async fn done(&mut self, mut refused: Vec<String>, mut notes: Vec<String>) -> Result<Done, Broken> {
-        let page = self.in_page_patiently("pageInPage", &[json!(OUTLINE_CHARS), json!(self.from)]).await?;
+        let caps = json!({ "title": TITLE_CHARS, "address": ADDRESS_CHARS, "markup": MARKUP_CHARS });
+        let page = self.in_page_patiently("pageInPage", &[json!(OUTLINE_CHARS), json!(self.from), caps]).await?;
         let text = |key: &str| page[key].as_str().unwrap_or_default().to_string();
+        self.next = page["next"].as_u64().unwrap_or_default() as usize;
         let status = {
             let mut happened = self.shared.happened.lock().unwrap();
             if let Some(why) = happened.broke {
@@ -545,6 +573,10 @@ impl Tab {
                 }
             }
             notes.append(&mut happened.notes);
+            if happened.untold > 0 {
+                notes.push(format!("and {} more that are not shown", happened.untold));
+                happened.untold = 0;
+            }
             happened.status
         };
         let seen = Seen { title: text("title"), url: text("url"), text: text("text"), more: page["more"] == true, status, html: text("html") };
@@ -561,7 +593,7 @@ impl Page for Tab {
         self.hold(&mut refused).await?;
         match action {
             Action::Read { more } => {
-                self.from = if *more { self.from + OUTLINE_CHARS } else { 0 };
+                self.from = if *more { self.next } else { 0 };
                 return self.done(refused, Vec::new()).await;
             }
             Action::Click { n } => self.click(*n, &mut refused).await?,
@@ -662,7 +694,7 @@ async fn watch(pipe: Arc<Pipe>, mut said: mpsc::UnboundedReceiver<Event>, shared
                 let leaving = event.params["type"] == "beforeunload";
                 if !leaving {
                     let message: String = event.params["message"].as_str().unwrap_or_default().chars().take(200).collect();
-                    shared.happened.lock().unwrap().notes.push(format!("The page put up a message, which was dismissed: \"{message}\""));
+                    shared.note(format!("The page put up a message, which was dismissed: \"{message}\""));
                 }
                 let _ = pipe.send("Page.handleJavaScriptDialog", json!({ "accept": leaving }), on).await;
             }
@@ -1199,6 +1231,93 @@ mod tests {
         assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
         assert!(!done.seen.text.contains("secret_total"), "{}", done.seen.text);
         assert_eq!(neighbour.asked(), NOTHING, "neither the link, the picture nor the script reached it");
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_letter_in_two_parts_is_never_cut_in_half() {
+        let _one_of_few = testing::gate().await;
+        // A link's text is cut at 120, and a picture letter lies across the
+        // cut. Cut by the half, the answer was no JSON, was dropped unread,
+        // and the session died half a minute later of a browser "not answering".
+        let link = format!("{}\u{1F600} en de rest van de naam", "a".repeat(119));
+        let pages = Pages::serve(&[
+            home(&format!(
+                r#"<a href="/next">{link}</a><select aria-label="Smaak"><option>{link}</option></select>
+                   <label>{link} <input name="q" value="{link}"></label>"#
+            )),
+            page("/next", "Next"),
+        ])
+        .await;
+        let opening = std::time::Instant::now();
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert!(opening.elapsed() < Duration::from_secs(15), "{:?}", opening.elapsed());
+        // The letter that does not fit whole is left out whole.
+        assert!(first.seen.text.contains(&format!("[1] link \"{}\" ", "a".repeat(119))), "{}", first.seen.text);
+        assert!(!first.seen.text.contains('\u{fffd}'), "a letter was cut in half: {}", first.seen.text);
+        // And what a list answers a wrong choice with is cut the same way.
+        let done = act(&mut tab, choose(2, "geen")).await;
+        assert!(!done.refused[0].contains('\u{fffd}'), "{:?}", done.refused);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn half_a_letter_of_the_pages_own_making_is_read_as_a_mark() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(
+            r#"<p id="p"></p><button onclick="alert('uit\ud83d')">koop</button>
+               <script>document.title = 'Widget \ud83d'; document.getElementById('p').textContent = 'halve \ude00 letter'</script>"#,
+        )])
+        .await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert_eq!(first.seen.title, "Widget \u{fffd}");
+        assert!(first.seen.text.contains("halve \u{fffd} letter"), "{}", first.seen.text);
+        // A message with half a letter in it is still dismissed, or the page would be held for good.
+        let done = press(&mut tab, 1).await;
+        assert!(done.notes.iter().any(|note| note.contains("uit\u{fffd}")), "{:?}", done.notes);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn what_a_page_can_make_long_is_cut_to_size() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[
+            home(
+                r#"<select aria-label="Smaak"><option>kip</option><option>zalm</option></select>
+                   <script>
+                     document.title = 'T'.repeat(200000)
+                     history.replaceState({}, '', '/?' + 'q'.repeat(100000))
+                     document.querySelector('option').textContent = 'o'.repeat(300000)
+                     document.querySelector('select').setAttribute('aria-label', 'L'.repeat(100000))
+                   </script>"#,
+            ),
+            ("/heavy", html(&format!("<!doctype html><title>Heavy</title><main><h1>Heavy</h1><!-- {} --></main>", "x".repeat(3_000_000)))),
+        ])
+        .await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert_eq!(first.seen.title.chars().count(), TITLE_CHARS);
+        assert_eq!(first.seen.url.chars().count(), ADDRESS_CHARS);
+        // A list's name and its options are a few words each, whatever the page wrote.
+        let list = first.seen.text.lines().find(|line| line.contains("[1] list")).expect("the list is numbered");
+        assert!(list.chars().count() < 300, "{} characters", list.chars().count());
+        let done = act(&mut tab, choose(1, "rund")).await;
+        assert!(done.refused[0].chars().count() < 300, "{} characters", done.refused[0].chars().count());
+        // A page of three million characters is judged by its first two million and is still a page.
+        let heavy = act(&mut tab, go_to(&pages.url("/heavy"))).await;
+        assert_eq!((heavy.seen.title.as_str(), heavy.seen.html.len()), ("Heavy", MARKUP_CHARS));
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn messages_without_end_are_told_as_a_few_and_a_count() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(r#"<script>setInterval(() => alert('x'.repeat(500)), 1)</script>"#)]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let done = tab.act(&Action::Read { more: false }).await.unwrap();
+        assert_eq!(done.notes.len(), NOTES_KEPT + 1, "{:?}", done.notes.iter().map(String::len).collect::<Vec<_>>());
+        assert!(done.notes.iter().all(|note| note.chars().count() < 300));
+        assert!(done.notes[NOTES_KEPT].starts_with("and ") && done.notes[NOTES_KEPT].ends_with(" more that are not shown"), "{}", done.notes[NOTES_KEPT]);
         tab.close().await;
     }
 

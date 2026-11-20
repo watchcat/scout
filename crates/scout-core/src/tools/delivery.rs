@@ -124,14 +124,27 @@ pub(crate) const DELIVERY_TEXT_CHARS: usize = 12_000;
 /// of the surcharge by weight. Here it is the inside of the page's `main`
 /// where it has one — zooplus.nl's holds its table and terms in 1,796
 /// characters — and the whole page where it has not.
+///
+/// A `main` that says less than a page has to say to be worth asking
+/// about is not taken alone: some pages keep a heading in it and their
+/// terms beside it. And not every page has one: coolblue.nl's delivery
+/// page has none, and its 12,000 characters on 2026-11-20 were a cut
+/// text with the first sentence about delivery at 7,065.
 pub(crate) fn delivery_text(html: &str) -> String {
     let html = fetch::strip_tag_blocks(&fetch::strip_tag_blocks(html, "script"), "style");
-    let part = main_of(&html).unwrap_or(&html);
+    let text = match main_of(&html).map(text_of) {
+        Some(own) if own.chars().count() >= MIN_PAGE_CHARS => own,
+        _ => text_of(&html),
+    };
+    text.chars().take(DELIVERY_TEXT_CHARS).collect()
+}
+
+/// A part of a page as text, whole.
+fn text_of(part: &str) -> String {
     // The euro sign first: `decode_entities` does not know it, and a whole
     // amount is known for one by the sign beside it (`page_states`).
     let part = part.replace("&euro;", "€").replace("&#8364;", "€").replace("&#x20ac;", "€").replace("&#x20AC;", "€");
-    let text = fetch::collapse_ws(&fetch::decode_entities(&fetch::strip_tags(&part)));
-    text.chars().take(DELIVERY_TEXT_CHARS).collect()
+    fetch::collapse_ws(&fetch::decode_entities(&fetch::strip_tags(&part)))
 }
 
 /// The inside of the page's `main` element, from the first that opens to
@@ -526,7 +539,16 @@ pub(crate) fn checked(answer: Answer, text: &str, host: &str, country: &Country)
     if answer.delivers == Some(false) {
         // A shop under the country's own domain that does not deliver in
         // it is a misreading more likely than a shop.
-        return if home { (Terms::Silent, Some("no delivery to its own country")) } else { (Terms::NotDelivered, None) };
+        if home {
+            return (Terms::Silent, Some("no delivery to its own country"));
+        }
+        // "Not there" is believed of a page that says where: one that
+        // names no country is speaking to its own customers, and what it
+        // leaves unsaid is not a refusal of anyone.
+        if !COUNTRIES.iter().any(|known| known.named_in(text)) {
+            return (Terms::Silent, Some("not delivered, with no country on the page"));
+        }
+        return (Terms::NotDelivered, None);
     }
     match answer.by.as_deref().map(by_word).as_deref() {
         Some("ordervalue") => {}
@@ -537,7 +559,11 @@ pub(crate) fn checked(answer: Answer, text: &str, host: &str, country: &Country)
         Some(_) => return (Terms::Silent, Some("by not understood")),
         None => return (Terms::Silent, None),
     }
-    let bands: Vec<(f64, f64)> = answer.bands.unwrap_or_default().iter().map(|band| (band.from.unwrap_or(0.0), band.cost)).collect();
+    // To the cent, before anything is checked or kept: a number that went
+    // through a model's arithmetic is not always the one it read.
+    let cents = |amount: f64| (amount * 100.0).round() / 100.0;
+    let bands: Vec<(f64, f64)> =
+        answer.bands.unwrap_or_default().iter().map(|band| (cents(band.from.unwrap_or(0.0)), cents(band.cost))).collect();
     if bands.is_empty() {
         return (Terms::Silent, None);
     }
@@ -1192,6 +1218,21 @@ mod tests {
     }
 
     #[test]
+    fn a_main_that_says_almost_nothing_gives_way_to_the_whole_page() {
+        // Some pages keep a heading in their `main` and the terms beside
+        // it. Under what a page needs to be worth asking about, the
+        // `main` is not the page's own part after all.
+        let html = format!("<html><body><nav>Widgets</nav><main><h1>Verzendkosten</h1></main><div>{TABLE}</div></body></html>");
+        let text = delivery_text(&html);
+        assert!(text.starts_with("Widgets Verzendkosten Levertijden"), "got: {text}");
+        assert!(text.contains("Verzendkosten: gratis"), "got: {text}");
+        // One that says enough is still taken alone.
+        let html = format!("<html><body><nav>Widgets</nav><main>{TABLE}</main><div>Nieuwsbrief</div></body></html>");
+        let text = delivery_text(&html);
+        assert!(text.starts_with("Levertijden") && !text.contains("Nieuwsbrief"), "got: {text}");
+    }
+
+    #[test]
     fn a_custom_element_is_not_main() {
         // `<main-menu>` begins as `<main` does; the table is in neither it
         // nor a `main`, so the whole page is the text.
@@ -1403,6 +1444,17 @@ mod tests {
     }
 
     #[test]
+    fn amounts_are_rounded_to_cents_before_they_are_checked_and_kept() {
+        // A number that went through a model's arithmetic is not always
+        // the one it read: 5.49 comes back as 5.4900000001.
+        let said = by_order_value(&[(9.999999, 5.4900000001), (25.0, 3.49000001), (39.9999999, 0.0)]);
+        assert_eq!(checked(said, PAGE, "shop.example", nl()), (costs(&[(10.0, 5.49), (25.0, 3.49), (40.0, 0.0)]), None));
+        // Rounded is not the same as near: half a cent off is another amount.
+        let (terms, refused) = checked(by_order_value(&[(10.0, 5.484)]), PAGE, "shop.example", nl());
+        assert_eq!((terms, refused), (Terms::Silent, Some("amount not on the page")));
+    }
+
+    #[test]
     fn free_is_kept_only_where_the_page_says_free() {
         let said = [(0.0, 5.49), (40.0, 0.0)];
         let page = "Verzendkosten binnen Nederland: € 5,49 voor bestellingen onder € 40.";
@@ -1526,7 +1578,14 @@ mod tests {
         // Whatever else the answer holds.
         let mut with_costs = by_order_value(&[(0.0, 6.9)]);
         with_costs.delivers = Some(false);
-        assert_eq!(checked(with_costs, "Verzendkosten: € 6,90.", "shop.example", nl()).0, Terms::NotDelivered);
+        assert_eq!(checked(with_costs, "Verzendkosten binnen België: € 6,90.", "shop.example", nl()).0, Terms::NotDelivered);
+        // A page that names no country at all is a shop speaking to its
+        // own customers. Kept as "does not deliver there", it would say
+        // so to everyone for thirty days on the strength of nothing.
+        for domestic in ["Verzendkosten: € 6,90. Wij verzenden niet naar het buitenland.", "Wij bezorgen op werkdagen."] {
+            let (terms, refused) = checked(no.clone(), domestic, "shop.example", nl());
+            assert_eq!((terms, refused), (Terms::Silent, Some("not delivered, with no country on the page")), "{domestic}");
+        }
         // Of a shop under the country's own domain it is not believed:
         // nothing is said of it either way.
         let (terms, refused) = checked(no, "Wij leveren alleen in België.", "shop.example", &EXAMPLELAND);

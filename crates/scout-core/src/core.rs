@@ -613,6 +613,28 @@ impl Core {
                 tracing::warn!(error = %e, "could not collect the empty drafts");
             }
 
+            // Price watches: each one due is read again, and one that
+            // ends has its message queued for the channel. Last of the
+            // jobs above the backup's `continue`, since it is the one
+            // that waits on the network and the rest are a statement
+            // each; it ends by its own clock, see `watch::check_due`.
+            match self.check_watches().await {
+                Ok(pass) if pass.due == 0 => {}
+                Ok(pass) => tracing::info!(
+                    due = pass.due,
+                    checked = pass.checked,
+                    ended = pass.ended,
+                    left = pass.left,
+                    "price watches checked"
+                ),
+                Err(e) => tracing::warn!(error = %e, "could not check the price watches"),
+            }
+            match self.prune_watches().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(pruned = n, "price watches long ended dropped"),
+                Err(e) => tracing::warn!(error = %e, "could not prune the price watches"),
+            }
+
             match crate::backup::is_due(&dir) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -738,6 +760,33 @@ impl Core {
     async fn prune_outbox(&self) -> anyhow::Result<usize> {
         let store = self.store();
         blocking(move || store.prune_outbox(Self::OUTBOX_KEEP_DAYS)).await
+    }
+
+    /// Reads again every price watch that is due and ends the ones that
+    /// are hit, unreadable three days running, or past their sixty days.
+    /// No model is asked anything: a check is a page read and a
+    /// comparison. The reader is made for the pass, so what it learns of a
+    /// host that refuses lasts the pass and no longer.
+    ///
+    /// A message queued is not a message sent: the channel's drain sleeps
+    /// until it is told something waits, so it is woken here, as a nudge
+    /// about a booking wakes it.
+    async fn check_watches(&self) -> anyhow::Result<crate::watch::Pass> {
+        let reader = crate::watch::PageReader::for_a_pass(self.deps.web.clone(), self.deps.renderer.clone());
+        let now = chrono::Utc::now().naive_utc();
+        let pass = crate::watch::check_due(&self.deps.store, &reader, now, &crate::watch::Pace::DAILY).await?;
+        if pass.ended > 0 {
+            self.wake_mirror();
+        }
+        Ok(pass)
+    }
+
+    /// Drops the price watches that ended `watch::KEEP_ENDED_DAYS` ago or
+    /// longer. Returns how many went. A live one is never dropped here.
+    async fn prune_watches(&self) -> anyhow::Result<usize> {
+        let store = self.store();
+        let before = chrono::Utc::now().naive_utc() - chrono::Duration::days(crate::watch::KEEP_ENDED_DAYS);
+        blocking(move || store.prune_watches(before)).await
     }
 
     /// Drops the attachments no mail and no trip can reach any more.
@@ -1076,6 +1125,127 @@ mod tests {
             let at = body.find(call).unwrap_or_else(|| panic!("{call} is never called from the loop"));
             assert!(at < backup, "{call} sits below the backup's continue and would run once a day");
         }
+    }
+
+    #[test]
+    fn maintenance_checks_the_price_watches_and_drops_the_long_ended_ones() {
+        // The daily check has no other caller: without it a watch is a
+        // row nothing ever reads again, and its owner waits for a message
+        // that cannot come. From the loop itself and above the backup's
+        // `continue`, or it would run on the one tick a day a backup is
+        // due.
+        let src = include_str!("core.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        let start = src.find("pub async fn run_maintenance").expect("the loop must exist");
+        let body = &src[start..];
+        let backup = body.find("backup::is_due").expect("the backup check must exist");
+        for call in ["self.check_watches()", "self.prune_watches()"] {
+            let at = body.find(call).unwrap_or_else(|| panic!("{call} is never called from the loop"));
+            assert!(at < backup, "{call} sits below the backup's continue and would run once a day");
+        }
+        assert!(src.contains("prune_watches(before)"), "ended watches must be pruned by the date worked out here");
+    }
+
+    /// A core that reads pages from `shop` and nowhere else, with one
+    /// account whose watch on `shop`'s widget was last checked `hours`
+    /// ago: read at 329.00 then, wanted at 300.00.
+    async fn a_core_watching(dir: &tempfile::TempDir, shop: &wiremock::MockServer, hours: i64) -> (Core, i64) {
+        let mut core = Core::start(Config::for_test(dir.path().join("watch.duckdb").to_str().unwrap()), None).unwrap();
+        core.deps.web = crate::net_guard::OpenWeb::exempting(*shop.address());
+        core.deps.renderer = None;
+        let store = core.store();
+        let account_id = store.account_for_telegram(4242).unwrap();
+        let then = chrono::Utc::now().naive_utc() - chrono::Duration::hours(hours);
+        let url = format!("{}/p/widget", shop.uri());
+        let new = crate::store::NewWatch {
+            account_id,
+            channel: "telegram",
+            address: "4242",
+            url: &url,
+            title: "Widget",
+            currency: "EUR",
+            target: 300.0,
+            price: 329.0,
+            now: then,
+            expires_at: then + chrono::Duration::days(crate::watch::DAYS),
+        };
+        let crate::store::WatchStarted::Started(watch) = store.start_watch(&new, crate::watch::MAX_LIVE).unwrap() else {
+            panic!("the watch did not start")
+        };
+        (core, watch.id)
+    }
+
+    async fn a_shop_pricing_its_widget_at(price: &str) -> wiremock::MockServer {
+        let page = format!(
+            r#"<html><head><title>Widget</title><script type="application/ld+json">
+               {{"@type":"Product","name":"Widget","offers":{{"@type":"Offer","price":"{price}","priceCurrency":"EUR"}}}}
+               </script></head><body><h1>Widget</h1><p>{}</p></body></html>"#,
+            "A widget for every purpose. ".repeat(100)
+        );
+        let shop = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(page))
+            .mount(&shop)
+            .await;
+        shop
+    }
+
+    #[tokio::test]
+    async fn a_watch_that_is_hit_is_ended_by_the_tick_and_the_channel_is_woken_to_send_it() {
+        let shop = a_shop_pricing_its_widget_at("289.00").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (core, id) = a_core_watching(&dir, &shop, 21).await;
+
+        let pass = core.check_watches().await.unwrap();
+
+        assert_eq!((pass.due, pass.checked, pass.ended), (1, 1, 1));
+        let waiting = core.store().pending_mirror(crate::mirror::TELEGRAM, 10).unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].turn_key, format!("watch:{id}:hit"));
+        assert_eq!(waiting[0].address, "4242");
+        assert!(waiting[0].body.starts_with("Widget is €289.00 at 127.0.0.1 — under the €300.00 you asked for."), "got: {}", waiting[0].body);
+        // Queued is not sent: the drain sleeps for a minute at a time
+        // unless it is told something is waiting.
+        tokio::time::timeout(Duration::from_millis(200), core.mirror_waiting())
+            .await
+            .expect("the channel was not woken for the message");
+
+        // The next tick finds nothing to do and wakes nobody.
+        let next = core.check_watches().await.unwrap();
+        assert_eq!(next.due, 0);
+        assert!(tokio::time::timeout(Duration::from_millis(50), core.mirror_waiting()).await.is_err());
+        assert_eq!(shop.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_watch_checked_this_morning_is_left_alone_by_the_ticks_of_the_day() {
+        let shop = a_shop_pricing_its_widget_at("289.00").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _id) = a_core_watching(&dir, &shop, 3).await;
+
+        let pass = core.check_watches().await.unwrap();
+
+        assert_eq!(pass.due, 0);
+        assert!(shop.received_requests().await.unwrap().is_empty(), "the shop was asked before its day was up");
+        assert!(core.store().pending_mirror(crate::mirror::TELEGRAM, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_watch_is_dropped_ninety_days_after_it_ended() {
+        let shop = a_shop_pricing_its_widget_at("329.00").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (core, id) = a_core_watching(&dir, &shop, 24 * 100).await;
+        let store = core.store();
+        let account_id = store.account_for_telegram(4242).unwrap();
+        let ago = |days: i64| chrono::Utc::now().naive_utc() - chrono::Duration::days(days);
+
+        store.stop_watch(account_id, id, ago(89)).unwrap().expect("live until stopped");
+        assert_eq!(core.prune_watches().await.unwrap(), 0, "a day short");
+        assert!(store.watch_for_tests(id).unwrap().is_some());
+
+        store.conn_for_tests().execute("UPDATE price_watches SET ended_at = ended_at - INTERVAL 2 DAY", []).unwrap();
+        assert_eq!(core.prune_watches().await.unwrap(), 1);
+        assert_eq!(store.watch_for_tests(id).unwrap(), None);
     }
 
     #[test]

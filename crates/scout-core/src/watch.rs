@@ -38,6 +38,37 @@ pub(crate) const UNREADABLE_DAYS: i64 = 3;
 /// one bound over both, held here so that it does not rest on theirs.
 pub(crate) const READ_BUDGET: Duration = Duration::from_secs(90);
 
+/// How long after a check a watch is due its next: twenty hours and not
+/// twenty-four, because the tick that looks is hourly. A day's wait would
+/// be met only by the tick after it, and the check would slide an hour
+/// later every day.
+const CHECK_EVERY_HOURS: i64 = 20;
+
+/// The least time between two reads of one host in a pass, the design's
+/// figure. Several people can watch one shop, and a daily check has no
+/// reason to arrive as a burst.
+const SPACING: Duration = Duration::from_secs(5);
+
+/// How long a pass may go on taking up watches. It runs inside the hourly
+/// maintenance tick, ahead of the nightly backup, and reads one page at a
+/// time, so it is cut well short of the hour; what it leaves is still due
+/// and is taken up by the next tick, longest unchecked first.
+const PASS_BUDGET: Duration = Duration::from_secs(30 * 60);
+
+/// How long a watch that has ended is kept: the design's ninety days.
+pub(crate) const KEEP_ENDED_DAYS: i64 = 90;
+
+/// How a check went, as `/metrics` is to count it: a price was `read`, the
+/// page was `unreadable`, or the shop `refused` the request.
+pub(crate) const READ: &str = "read";
+pub(crate) const UNREADABLE: &str = "unreadable";
+pub(crate) const REFUSED: &str = "refused";
+
+/// Why a watch ended, as the table and the outbox key write it. The fourth
+/// is `stopped`, which the store writes on its owner's word.
+pub(crate) const HIT: &str = "hit";
+pub(crate) const EXPIRED: &str = "expired";
+
 /// The longest name of a product a watch keeps. It is said back in every
 /// message about the watch, and a shop's name for a thing can be a
 /// paragraph.
@@ -411,6 +442,203 @@ pub(crate) fn listed(watch: &PriceWatch) -> Listed {
 
 pub(crate) fn say_stopped(watch: &PriceWatch) -> String {
     format!("Stopped watching {} at {}.", named(&watch.title, false), shop_of(&watch.url))
+}
+
+/// What one check of a watch comes to: what to write, and where it ends
+/// the watch, why, with the one message that says so.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Verdict {
+    /// `READ`, `UNREADABLE` or `REFUSED`.
+    pub outcome: &'static str,
+    pub last_price: f64,
+    pub lowest_price: f64,
+    pub unreadable_streak: i64,
+    pub ended: Option<(&'static str, String)>,
+}
+
+/// Decides a check from the watch as it stood and what was read. Nothing
+/// is read or written here, and the day is handed in.
+///
+/// In the design's order. A price is kept, and at or under the target it
+/// is a hit. No price adds to the count of days running, and the third
+/// ends the watch. Then, for a watch still live and past its sixty days,
+/// the end of those days: so on its last day a hit is still a hit, and a
+/// shop's refusal is no reason to go on past the day the person was told.
+///
+/// A refusal is neither a price nor a day without one. It is counted on
+/// `/metrics` and changes nothing in the row but the time of the check,
+/// which is what keeps the shop from being asked again that day. The
+/// design gives the three-day rule for a page that gave no price, and
+/// counts `refused` apart from `unreadable`; a shop that walls the reader
+/// for three days and then serves it again has not lost its price, and the
+/// message that it had would be false. What that leaves: a shop that walls
+/// the reader every day keeps its watches until they expire, unheard. The
+/// counter is how that would be seen.
+pub(crate) fn decide(watch: &PriceWatch, reading: &Reading, now: chrono::NaiveDateTime) -> Verdict {
+    let mut verdict = Verdict {
+        outcome: REFUSED,
+        last_price: watch.last_price,
+        lowest_price: watch.lowest_price,
+        unreadable_streak: watch.unreadable_streak,
+        ended: None,
+    };
+    match reading {
+        Reading::Price(read) if read.currency == watch.currency => {
+            verdict.outcome = READ;
+            verdict.last_price = read.amount;
+            verdict.lowest_price = watch.lowest_price.min(read.amount);
+            verdict.unreadable_streak = 0;
+            if at_or_under(read.amount, watch.target) {
+                verdict.ended = Some((HIT, say_hit(watch, read.amount)));
+            }
+        }
+        // A price in another currency than the watch's is no price for it:
+        // nothing is compared across currencies, here as at the start.
+        Reading::Price(_) | Reading::Unreadable(_) => {
+            verdict.outcome = UNREADABLE;
+            verdict.unreadable_streak += 1;
+            if verdict.unreadable_streak >= UNREADABLE_DAYS {
+                verdict.ended = Some((UNREADABLE, say_unreadable(watch)));
+            }
+        }
+        Reading::Refused(_) => {}
+    }
+    if verdict.ended.is_none() && now >= watch.expires_at {
+        verdict.ended = Some((EXPIRED, say_expired(watch, verdict.lowest_price)));
+    }
+    verdict
+}
+
+fn say_hit(watch: &PriceWatch, price: f64) -> String {
+    format!(
+        "{} is {} at {} — {} you asked for. It was {} on {}. {}",
+        named(&watch.title, true),
+        money(price, &watch.currency),
+        shop_of(&watch.url),
+        against(price, watch.target, &watch.currency),
+        money(watch.first_price, &watch.currency),
+        day(watch.created_at),
+        watch.url,
+    )
+}
+
+fn say_unreadable(watch: &PriceWatch) -> String {
+    format!(
+        "I have stopped watching {} at {}: its page gave me no price to read {UNREADABLE_DAYS} days running. \
+         The last price I read was {}, and you asked to be told at {} or less. {}",
+        named(&watch.title, false),
+        shop_of(&watch.url),
+        money(watch.last_price, &watch.currency),
+        money(watch.target, &watch.currency),
+        watch.url,
+    )
+}
+
+fn say_expired(watch: &PriceWatch, lowest: f64) -> String {
+    format!(
+        "{} at {} did not come down to {} in the {} days I watched it, so I have stopped. \
+         The lowest price I read was {}. {}",
+        named(&watch.title, true),
+        shop_of(&watch.url),
+        money(watch.target, &watch.currency),
+        (watch.expires_at - watch.created_at).num_days(),
+        money(lowest, &watch.currency),
+        watch.url,
+    )
+}
+
+/// How a pass paces itself. `Pace::DAILY` is the one production runs at;
+/// a test hands in another to not wait out the seconds it is not about.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Pace {
+    pub spacing: Duration,
+    pub read_budget: Duration,
+    pub pass_budget: Duration,
+}
+
+impl Pace {
+    pub(crate) const DAILY: Pace = Pace { spacing: SPACING, read_budget: READ_BUDGET, pass_budget: PASS_BUDGET };
+}
+
+/// What a pass did, for the log line and for whoever wakes the channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Pass {
+    /// Watches that were due when the pass began.
+    pub due: usize,
+    /// Of those, the ones read and written. One stopped by its owner while
+    /// its page was read is not among them.
+    pub checked: usize,
+    /// Watches this pass ended, each with its one message queued.
+    pub ended: usize,
+    /// Still due when the pass ran out of time: the next tick's.
+    pub left: usize,
+}
+
+/// Checks every watch that is due at `now`: reads its page, decides, and
+/// writes what came of it. One page at a time, so the pass never holds
+/// more than one of the two Chromes a person's request may be waiting for.
+///
+/// The store's lock is held to list the watches and again to write each
+/// check, and never while a page is being read: a pass that waited on the
+/// network with it would stall every chat. A watch stopped in that gap is
+/// left as its owner left it; `record_watch_check` sees to that.
+///
+/// The pass ends whatever a host does: each read is given up on after
+/// `read_budget`, and after `pass_budget` no further watch is taken up.
+/// One watch's failure to be written is logged and the pass goes on; it is
+/// still due, and the next tick tries it again.
+pub(crate) async fn check_due<R: Reader>(
+    store: &Store,
+    reader: &R,
+    now: chrono::NaiveDateTime,
+    pace: &Pace,
+) -> anyhow::Result<Pass> {
+    let theirs = store.clone();
+    let due = blocking(move || theirs.due_watches(now, now - chrono::Duration::hours(CHECK_EVERY_HOURS))).await?;
+    let began = tokio::time::Instant::now();
+    let mut pass = Pass { due: due.len(), ..Pass::default() };
+    // When each host was last asked, by the name a shop is called by: with
+    // its `www.` or without, it is one shop's server.
+    let mut asked: std::collections::HashMap<String, tokio::time::Instant> = std::collections::HashMap::new();
+    for (n, watch) in due.iter().enumerate() {
+        if began.elapsed() >= pace.pass_budget {
+            pass.left = due.len() - n;
+            tracing::warn!(left = pass.left, "the price-watch pass ran out of time; the rest wait for the next tick");
+            break;
+        }
+        let host = shop_of(&watch.url);
+        if let Some(last) = asked.get(&host) {
+            tokio::time::sleep_until(*last + pace.spacing).await;
+        }
+        let reading = read_within(reader, &watch.url, pace.read_budget).await;
+        asked.insert(host, tokio::time::Instant::now());
+
+        let verdict = decide(watch, &reading, now);
+        let (theirs, id, decided) = (store.clone(), watch.id, verdict.clone());
+        let written = blocking(move || {
+            theirs.record_watch_check(&crate::store::WatchCheck {
+                id,
+                now,
+                last_price: decided.last_price,
+                lowest_price: decided.lowest_price,
+                unreadable_streak: decided.unreadable_streak,
+                ended: decided.ended.as_ref().map(|(why, say)| (*why, say.as_str())),
+            })
+        })
+        .await;
+        match written {
+            Ok(true) => {
+                pass.checked += 1;
+                if let Some((why, _)) = &verdict.ended {
+                    pass.ended += 1;
+                    tracing::info!(watch = id, why, "a price watch ended");
+                }
+            }
+            Ok(false) => tracing::info!(watch = id, "a price watch was stopped while its page was read; nothing written"),
+            Err(e) => tracing::warn!(watch = id, error = %e, "could not write a price watch's check; it stays due"),
+        }
+    }
+    Ok(pass)
 }
 
 #[cfg(test)]
@@ -812,6 +1040,446 @@ mod tests {
             row.note.as_deref(),
             Some("the page gave no price at the last 2 of its daily checks; after 3 in a row the watch ends")
         );
+    }
+
+    /// A reader that answers each address by a rule of the test's, and
+    /// notes which address it was asked for and when.
+    struct Told<F> {
+        answer: F,
+        asked: std::sync::Mutex<Vec<(String, tokio::time::Instant)>>,
+    }
+
+    impl<F: Fn(&str) -> Reading + Sync> Told<F> {
+        fn by(answer: F) -> Self {
+            Self { answer, asked: std::sync::Mutex::new(Vec::new()) }
+        }
+
+        fn asked(&self) -> Vec<(String, tokio::time::Instant)> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl<F: Fn(&str) -> Reading + Sync> Reader for Told<F> {
+        async fn read(&self, url: &str) -> Reading {
+            self.asked.lock().unwrap().push((url.to_string(), tokio::time::Instant::now()));
+            (self.answer)(url)
+        }
+    }
+
+    fn price(amount: f64) -> Reading {
+        Reading::Price(Priced { amount, currency: "EUR".into(), title: Some("Widget".into()), struck_through: None })
+    }
+
+    fn no_price() -> Reading {
+        Reading::Unreadable("its data states no product".into())
+    }
+
+    fn refused() -> Reading {
+        Reading::Refused("shop.example served a block notice instead of the page".into())
+    }
+
+    /// The daily pace with no wait between two reads of a host, for the
+    /// tests that are not about the wait.
+    const UNSPACED: Pace = Pace { spacing: Duration::ZERO, ..Pace::DAILY };
+
+    /// A widget read at 329.00 and wanted at 300.00 since `then`, to be
+    /// told of in chat 4242.
+    async fn watching_since(store: &Store, url: &str, then: chrono::NaiveDateTime) -> PriceWatch {
+        let chat = ReplyTo::telegram(4242);
+        let id = start(store, &Fixed::priced(329.0), ask(&chat, url, 300.0), then).await.unwrap().started.unwrap();
+        store.watch_for_tests(id).unwrap().unwrap()
+    }
+
+    fn watch(store: &Store, id: i64) -> PriceWatch {
+        store.watch_for_tests(id).unwrap().unwrap()
+    }
+
+    /// What is waiting to be sent, as (key, address, body).
+    fn waiting(store: &Store) -> Vec<(String, String, String)> {
+        store.pending_mirror(crate::mirror::TELEGRAM, 100).unwrap().into_iter().map(|m| (m.turn_key, m.address, m.body)).collect()
+    }
+
+    /// One pass a day for `days` days from `first`, the reader answering
+    /// by the day. Returns the day after the last.
+    async fn daily<F: Fn(usize) -> Reading + Sync>(store: &Store, first: chrono::NaiveDateTime, days: usize, by_day: F) -> chrono::NaiveDateTime {
+        for n in 0..days {
+            let reader = Told::by(|_: &str| by_day(n));
+            check_due(store, &reader, first + chrono::Duration::days(n as i64), &UNSPACED).await.unwrap();
+        }
+        first + chrono::Duration::days(days as i64)
+    }
+
+    #[tokio::test]
+    async fn a_hit_ends_the_watch_and_is_said_once_with_the_amounts_and_the_link() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let began = now - chrono::Duration::days(3);
+        let w = watching_since(&store, WIDGET, began).await;
+        let reader = Told::by(|_: &str| price(289.0));
+
+        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+
+        assert_eq!((pass.due, pass.checked, pass.ended, pass.left), (1, 1, 1, 0));
+        let after = watch(&store, w.id);
+        assert_eq!(after.ended, Some((now, "hit".to_string())));
+        assert_eq!((after.last_price, after.lowest_price, after.first_price), (289.0, 289.0, 329.0));
+        assert_eq!(
+            waiting(&store),
+            vec![(
+                format!("watch:{}:hit", w.id),
+                "4242".to_string(),
+                format!(
+                    "Widget is €289.00 at shop.example — under the €300.00 you asked for. It was €329.00 on {}. {WIDGET}",
+                    began.format("%-d %B")
+                ),
+            )]
+        );
+
+        // Exactly one: the watch is over, so the passes after it neither
+        // read the page nor say anything.
+        for later in [1, 21, 48] {
+            check_due(&store, &reader, now + chrono::Duration::hours(later), &UNSPACED).await.unwrap();
+        }
+        assert_eq!(reader.asked().len(), 1);
+        assert_eq!(waiting(&store).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_price_exactly_at_the_target_is_a_hit_and_says_exactly() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let w = watching_since(&store, WIDGET, now - chrono::Duration::days(1)).await;
+        check_due(&store, &Told::by(|_: &str| price(300.0)), now, &UNSPACED).await.unwrap();
+        assert_eq!(watch(&store, w.id).ended, Some((now, "hit".to_string())));
+        assert!(waiting(&store)[0].2.starts_with("Widget is €300.00 at shop.example — exactly the €300.00 you asked for."), "got: {}", waiting(&store)[0].2);
+    }
+
+    #[tokio::test]
+    async fn a_price_still_over_the_target_is_kept_and_the_page_is_not_read_again_that_day() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let w = watching_since(&store, WIDGET, now - chrono::Duration::days(1)).await;
+        let reader = Told::by(|_: &str| price(310.0));
+
+        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+        assert_eq!((pass.due, pass.checked, pass.ended), (1, 1, 0));
+        let after = watch(&store, w.id);
+        assert_eq!((after.last_price, after.lowest_price, after.last_checked_at, after.ended.clone()), (310.0, 310.0, now, None));
+        assert!(waiting(&store).is_empty(), "nothing is said of a watch that goes on");
+
+        // The tick is hourly and the check daily.
+        for hour in 1..20 {
+            let pass = check_due(&store, &reader, now + chrono::Duration::hours(hour), &UNSPACED).await.unwrap();
+            assert_eq!(pass.due, 0, "hour {hour}");
+        }
+        assert_eq!(reader.asked().len(), 1);
+        check_due(&store, &reader, now + chrono::Duration::hours(20), &UNSPACED).await.unwrap();
+        assert_eq!(reader.asked().len(), 2);
+
+        // The lowest is the lowest ever read, not the latest.
+        check_due(&store, &Told::by(|_: &str| price(320.0)), now + chrono::Duration::hours(41), &UNSPACED).await.unwrap();
+        let after = watch(&store, w.id);
+        assert_eq!((after.last_price, after.lowest_price), (320.0, 310.0));
+    }
+
+    #[tokio::test]
+    async fn three_days_running_with_no_price_end_the_watch_with_one_message() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let w = watching_since(&store, WIDGET, now - chrono::Duration::days(5)).await;
+
+        // Two days, and it is still watched and nothing is said.
+        let third = daily(&store, now, 2, |_| no_price()).await;
+        let after = watch(&store, w.id);
+        assert_eq!((after.unreadable_streak, after.ended.clone(), after.last_price), (2, None, 329.0));
+        assert!(waiting(&store).is_empty());
+
+        let fourth = daily(&store, third, 1, |_| no_price()).await;
+        assert_eq!(watch(&store, w.id).ended, Some((third, "unreadable".to_string())));
+        assert_eq!(
+            waiting(&store),
+            vec![(
+                format!("watch:{}:unreadable", w.id),
+                "4242".to_string(),
+                format!(
+                    "I have stopped watching Widget at shop.example: its page gave me no price to read 3 days running. \
+                     The last price I read was €329.00, and you asked to be told at €300.00 or less. {WIDGET}"
+                ),
+            )]
+        );
+        daily(&store, fourth, 3, |_| no_price()).await;
+        assert_eq!(waiting(&store).len(), 1, "and nothing after it");
+    }
+
+    #[tokio::test]
+    async fn a_price_read_in_between_starts_the_count_of_unreadable_days_again() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let w = watching_since(&store, WIDGET, now - chrono::Duration::days(5)).await;
+        // No price, no price, a price, no price, no price: never three running.
+        daily(&store, now, 5, |day| if day == 2 { price(320.0) } else { no_price() }).await;
+        let after = watch(&store, w.id);
+        assert_eq!((after.unreadable_streak, after.ended.clone(), after.last_price), (2, None, 320.0));
+        assert!(waiting(&store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_price_in_another_currency_than_the_watchs_is_no_price_for_it() {
+        // A shop that starts answering in another currency has not come
+        // down to a target named in the first: nothing is compared.
+        let (store, _dir) = a_store();
+        let now = clock();
+        let w = watching_since(&store, WIDGET, now - chrono::Duration::days(5)).await;
+        let in_dollars = || Reading::Price(Priced { amount: 250.0, currency: "USD".into(), title: None, struck_through: None });
+        daily(&store, now, 1, |_| in_dollars()).await;
+        let after = watch(&store, w.id);
+        assert_eq!((after.unreadable_streak, after.last_price, after.lowest_price, after.ended.clone()), (1, 329.0, 329.0, None));
+    }
+
+    #[tokio::test]
+    async fn a_day_the_shop_refused_is_not_a_day_the_page_gave_no_price() {
+        // A shop that walls the reader for a week has said nothing about
+        // the page, and must not end the watch as a page that lost its
+        // price would.
+        let (store, _dir) = a_store();
+        let now = clock();
+        let w = watching_since(&store, WIDGET, now - chrono::Duration::days(1)).await;
+        let next = daily(&store, now, 7, |_| refused()).await;
+        let after = watch(&store, w.id);
+        assert_eq!((after.unreadable_streak, after.ended.clone()), (0, None));
+        assert_eq!((after.last_price, after.lowest_price), (329.0, 329.0));
+        assert_eq!(after.last_checked_at, next - chrono::Duration::days(1), "it was a check all the same, and the shop is not asked again that day");
+        assert!(waiting(&store).is_empty());
+
+        // Nor does it wipe the days that did count: no price, refused, no
+        // price, refused, no price is three readings with none in them.
+        let next = daily(&store, next, 4, |day| if day % 2 == 0 { no_price() } else { refused() }).await;
+        assert_eq!((watch(&store, w.id).unreadable_streak, watch(&store, w.id).ended), (2, None));
+        daily(&store, next, 1, |_| no_price()).await;
+        assert_eq!(watch(&store, w.id).ended.map(|(_, why)| why).as_deref(), Some("unreadable"));
+    }
+
+    #[tokio::test]
+    async fn at_sixty_days_a_watch_ends_with_the_lowest_price_it_read() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let began = now - chrono::Duration::days(60);
+        let w = watching_since(&store, WIDGET, began).await;
+        assert_eq!(w.expires_at, now, "sixty days to the second");
+        // A dip on the tenth day that did not reach the target.
+        check_due(&store, &Told::by(|_: &str| price(305.0)), began + chrono::Duration::days(10), &UNSPACED).await.unwrap();
+        // The day before its last it is a watch like any other.
+        check_due(&store, &Told::by(|_: &str| price(320.0)), now - chrono::Duration::days(1), &UNSPACED).await.unwrap();
+        assert_eq!(watch(&store, w.id).ended, None);
+        assert!(waiting(&store).is_empty());
+
+        let pass = check_due(&store, &Told::by(|_: &str| price(318.0)), now, &UNSPACED).await.unwrap();
+        assert_eq!((pass.checked, pass.ended), (1, 1));
+        assert_eq!(watch(&store, w.id).ended, Some((now, "expired".to_string())));
+        assert_eq!(
+            waiting(&store),
+            vec![(
+                format!("watch:{}:expired", w.id),
+                "4242".to_string(),
+                format!(
+                    "Widget at shop.example did not come down to €300.00 in the 60 days I watched it, so I have stopped. \
+                     The lowest price I read was €305.00. {WIDGET}"
+                ),
+            )]
+        );
+        check_due(&store, &Told::by(|_: &str| price(289.0)), now + chrono::Duration::days(1), &UNSPACED).await.unwrap();
+        assert_eq!(waiting(&store).len(), 1, "an ended watch is not hit");
+    }
+
+    #[tokio::test]
+    async fn the_last_reading_decides_how_a_watch_past_its_sixty_days_ends() {
+        // One message whichever: a price that got there on the last day
+        // is a hit, and anything else, a shop's refusal included, is the
+        // end of the sixty days. Checked an hour before or not, a watch
+        // past its end is read once more and ended.
+        for (last, why) in [(price(289.0), "hit"), (price(310.0), "expired"), (no_price(), "expired"), (refused(), "expired")] {
+            let (store, _dir) = a_store();
+            let now = clock();
+            let w = watching_since(&store, WIDGET, now - chrono::Duration::days(60) - chrono::Duration::minutes(30)).await;
+            check_due(&store, &Told::by(|_: &str| price(315.0)), now - chrono::Duration::hours(1), &UNSPACED).await.unwrap();
+            assert_eq!(watch(&store, w.id).ended, None);
+
+            check_due(&store, &Told::by(|_: &str| last.clone()), now, &UNSPACED).await.unwrap();
+            assert_eq!(watch(&store, w.id).ended, Some((now, why.to_string())), "after {last:?}");
+            let said = waiting(&store);
+            assert_eq!(said.len(), 1, "after {last:?}");
+            assert_eq!(said[0].0, format!("watch:{}:{why}", w.id));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reads_of_one_host_are_five_seconds_apart_and_another_host_is_not_kept_waiting() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let then = now - chrono::Duration::days(1);
+        for url in ["https://www.shop.example/p/1", "https://shop.example/p/2", "https://other.example/p/1", "https://shop.example/p/3"] {
+            watching_since(&store, url, then).await;
+        }
+        let reader = Told::by(|_: &str| price(310.0));
+        let began = tokio::time::Instant::now();
+
+        check_due(&store, &reader, now, &Pace::DAILY).await.unwrap();
+
+        let at: Vec<(String, u64)> = reader.asked().into_iter().map(|(url, when)| (shop_of(&url), (when - began).as_secs())).collect();
+        assert_eq!(
+            at,
+            vec![
+                ("shop.example".to_string(), 0),
+                // With the www or without, it is one shop's server.
+                ("shop.example".to_string(), 5),
+                ("other.example".to_string(), 5),
+                ("shop.example".to_string(), 10),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_host_that_never_answers_costs_its_watch_a_day_and_the_pass_goes_on() {
+        struct Stuck;
+        impl Reader for Stuck {
+            async fn read(&self, url: &str) -> Reading {
+                if url.contains("stuck.example") {
+                    std::future::pending::<()>().await;
+                }
+                price(310.0)
+            }
+        }
+        let (store, _dir) = a_store();
+        let now = clock();
+        let then = now - chrono::Duration::days(1);
+        let stuck = watching_since(&store, "https://stuck.example/p/1", then).await;
+        let fine = watching_since(&store, "https://shop.example/p/1", then).await;
+        let began = tokio::time::Instant::now();
+
+        let pass = check_due(&store, &Stuck, now, &Pace::DAILY).await.unwrap();
+
+        assert_eq!(began.elapsed(), READ_BUDGET, "given up on after the one reading's budget");
+        assert_eq!((pass.due, pass.checked, pass.left), (2, 2, 0));
+        let after = watch(&store, stuck.id);
+        assert_eq!((after.unreadable_streak, after.last_checked_at, after.ended.clone()), (1, now, None));
+        assert_eq!(watch(&store, fine.id).last_price, 310.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_out_of_time_leaves_the_rest_due_for_the_next_tick() {
+        struct Slow;
+        impl Reader for Slow {
+            async fn read(&self, _url: &str) -> Reading {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                price(310.0)
+            }
+        }
+        let (store, _dir) = a_store();
+        let now = clock();
+        // Five watches, the first the longest unchecked.
+        let mut ids = Vec::new();
+        for n in 0..5 {
+            let then = now - chrono::Duration::days(2) + chrono::Duration::minutes(n);
+            ids.push(watching_since(&store, &format!("https://shop{n}.example/p"), then).await.id);
+        }
+        let pace = Pace { pass_budget: Duration::from_secs(150), ..Pace::DAILY };
+        let began = tokio::time::Instant::now();
+
+        let pass = check_due(&store, &Slow, now, &pace).await.unwrap();
+
+        // Three minute-long reads began inside two and a half minutes.
+        assert_eq!(began.elapsed(), Duration::from_secs(180));
+        assert_eq!((pass.due, pass.checked, pass.left), (5, 3, 2));
+        let checked: Vec<bool> = ids.iter().map(|id| watch(&store, *id).last_checked_at == now).collect();
+        assert_eq!(checked, [true, true, true, false, false], "the longest unchecked went first");
+        // And the next tick takes up where this one stopped.
+        let next = check_due(&store, &Slow, now + chrono::Duration::hours(1), &pace).await.unwrap();
+        assert_eq!((next.due, next.checked, next.left), (2, 2, 0));
+    }
+
+    #[tokio::test]
+    async fn a_watch_stopped_while_its_page_was_being_read_is_sent_nothing() {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let w = watching_since(&store, WIDGET, now - chrono::Duration::days(1)).await;
+        // The page is read with the store's lock let go: its owner stops
+        // the watch in that moment, and the read comes back with a hit.
+        let (theirs, id) = (store.clone(), w.id);
+        let reader = Told::by(move |_: &str| {
+            theirs.stop_watch(1, id, now).unwrap().expect("live until now");
+            price(289.0)
+        });
+
+        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+
+        assert_eq!((pass.due, pass.checked, pass.ended), (1, 0, 0));
+        assert_eq!(watch(&store, w.id).ended, Some((now, "stopped".to_string())));
+        assert!(waiting(&store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_shop_that_refuses_is_asked_once_in_a_pass_however_many_watches_it_has() {
+        // Through the real reader, which is where a pass remembers a host
+        // that said no: three watches on one shop, one request.
+        let shop = serving(200, NOTICE).await;
+        let (store, _dir) = a_store();
+        let now = clock();
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            ids.push(watching_since(&store, &format!("{}/p/{n}", shop.uri()), now - chrono::Duration::days(1)).await.id);
+        }
+        let reader = PageReader::for_a_pass(OpenWeb::exempting(*shop.address()), None);
+
+        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+
+        assert_eq!(shop.received_requests().await.unwrap().len(), 1, "the shop said no once and was not asked again");
+        assert_eq!((pass.due, pass.checked, pass.ended), (3, 3, 0));
+        for id in ids {
+            let after = watch(&store, id);
+            assert_eq!((after.unreadable_streak, after.last_checked_at, after.ended.clone()), (0, now, None), "watch {id}");
+        }
+        assert!(waiting(&store).is_empty());
+        // Nor an hour on: each watch was checked today, refused or not.
+        let next = check_due(&store, &reader, now + chrono::Duration::hours(1), &UNSPACED).await.unwrap();
+        assert_eq!(next.due, 0);
+        assert_eq!(shop.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pass_reads_a_real_page_and_queues_the_hit_for_the_channel_to_send() {
+        // The whole road with nothing stood in for but the shop: the page
+        // over HTTP, the product block, the comparison, the outbox.
+        let shop = serving(200, &widget_at("289.00")).await;
+        let (store, _dir) = a_store();
+        let now = clock();
+        let url = format!("{}/p/widget?variant=2", shop.uri());
+        let w = watching_since(&store, &url, now - chrono::Duration::days(1)).await;
+        let reader = PageReader::for_a_pass(OpenWeb::exempting(*shop.address()), None);
+
+        let pass = check_due(&store, &reader, now, &UNSPACED).await.unwrap();
+
+        assert_eq!((pass.checked, pass.ended), (1, 1));
+        let asked = shop.received_requests().await.unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].url.query(), Some("variant=2"), "the address the watch was started on, query and all");
+        let said = waiting(&store);
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].0, format!("watch:{}:hit", w.id));
+        assert!(said[0].2.starts_with("Widget is €289.00 at 127.0.0.1 — under the €300.00 you asked for."), "got: {}", said[0].2);
+        assert!(said[0].2.ends_with(&url), "got: {}", said[0].2);
+    }
+
+    #[test]
+    fn a_check_costs_http_and_nothing_else() {
+        // No model is asked whether a price is under a target. A source
+        // assertion, as `every_side_call_is_built_on_the_side_model_and_nowhere_else`
+        // is: this file reaches no model and holds nothing one could be
+        // reached through.
+        let src = include_str!("watch.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests come last")];
+        for forbidden in ["AgentDeps", "side_call", ".llm", ".agent(", "completion", "Prompt"] {
+            assert!(!src.contains(forbidden), "watch.rs reaches for a model: {forbidden}");
+        }
     }
 
     #[test]

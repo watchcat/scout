@@ -65,6 +65,11 @@ impl Pipe {
     /// Starts `chrome` with `args` and the pipe, and returns it with
     /// everything it will say unasked.
     pub fn start(chrome: &Path, args: &[String]) -> std::io::Result<(Pipe, mpsc::UnboundedReceiver<Event>)> {
+        // The shell's `exec` looks a name with no slash in it up along
+        // PATH. What is started is the program at a place, or nothing.
+        if !chrome.is_absolute() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} is not a whole path to a Chrome", chrome.display())));
+        }
         let mut child = Command::new("/bin/sh")
             .arg("-c")
             .arg(INTO_CHROME)
@@ -428,6 +433,14 @@ mod tests {
         pipe.stop().await;
         let after = pipe.call("Browser.getVersion", json!({}), None).await.unwrap_err();
         assert!(matches!(after, CallError::Gone(_)), "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn a_chrome_given_by_name_alone_is_not_started() {
+        // `exec` in a shell looks a bare name up along PATH. `true` is a
+        // program on every machine, and must not be run for being asked for.
+        let refused = Pipe::start(Path::new("true"), &[]).err().map(|e| e.kind());
+        assert_eq!(refused, Some(std::io::ErrorKind::InvalidInput));
     }
 
     #[tokio::test]

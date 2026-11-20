@@ -36,8 +36,9 @@ impl Shop {
 }
 
 /// The part of a host that one party registered: `shop.example` of
-/// `www.shop.example`, `shop.co.uk` of `www.shop.co.uk`. An IP address is
-/// its own site, and so is a name the list knows no owner for.
+/// `www.shop.example`, and three labels where the suffix has two, as under
+/// `co.uk`. An IP address is its own site, and so is a name the list knows
+/// no owner for.
 pub fn site(host: &Host<&str>) -> String {
     match host {
         Host::Domain(name) => {
@@ -71,8 +72,9 @@ mod tests {
         assert_eq!(site_of("https://www.shop.example/p/1"), "shop.example");
         assert_eq!(site_of("https://checkout.shop.example/"), "shop.example");
         assert_eq!(site_of("https://shop.example/"), "shop.example");
-        assert_eq!(site_of("https://www.shop.co.uk/"), "shop.co.uk");
-        assert_eq!(site_of("https://shop.com.hk/"), "shop.com.hk");
+        // Under a suffix of two labels a shop has three. The names are made up.
+        assert_eq!(site_of("https://www.scout-fixture-a.co.uk/"), "scout-fixture-a.co.uk");
+        assert_eq!(site_of("https://scout-fixture-a.com.hk/"), "scout-fixture-a.com.hk");
         assert!(same("https://www.shop.example/p/1", "https://basket.shop.example/"));
         assert!(same("https://www.shop.example/p/1", "http://shop.example:8080/x"));
         assert!(!same("https://www.shop.example/p/1", "https://pay.example/shop.example"));
@@ -92,7 +94,7 @@ mod tests {
         assert!(!same("https://scout-fixture-a.github.io/", "https://scout-fixture-b.github.io/"));
         assert!(same("https://scout-fixture-a.myshopify.com/", "https://scout-fixture-a.myshopify.com/cart"));
         // A suffix alone is nobody's shop, and no shop under it is the same.
-        assert!(!same("https://co.uk/", "https://shop.co.uk/"));
+        assert!(!same("https://co.uk/", "https://scout-fixture-a.co.uk/"));
     }
 
     #[test]
@@ -113,8 +115,10 @@ mod tests {
         assert!(!same("http://127.0.0.1:8080/p", "http://127.0.0.2:8080/p"));
         assert!(!same("http://127.0.0.1:8080/p", "http://localhost:8080/p"));
         assert!(same("http://[::1]:8080/p", "http://[::1]/q"));
-        // The last labels of a number are not a registrable domain.
-        assert!(!same("http://10.0.0.1/", "http://20.0.0.1/"));
+        // The last labels of a number are not a registrable domain: these
+        // two, both from ranges nobody has on the internet, end alike.
+        assert!(!same("http://10.0.0.1/", "http://192.168.0.1/"));
+        assert_eq!(site_of("http://192.0.2.7/"), "192.0.2.7");
         assert_eq!(site_of("http://localhost:3000/"), "localhost");
     }
 

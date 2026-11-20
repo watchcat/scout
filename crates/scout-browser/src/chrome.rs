@@ -43,7 +43,8 @@ pub(crate) fn write_preferences(profile: &Path) -> std::io::Result<()> {
 /// Where Chrome lives, if it does: `SCOUT_CHROME`, else the places a
 /// package puts it. The same search as `find_chrome` in `scout-core`'s
 /// `tools/browser.rs`, which is private with the rest of `tools`; a path
-/// set and not there finds nothing, as there.
+/// set and not there finds nothing, as there. Narrower than there in one
+/// thing: the variable has to be a whole path.
 pub fn find_chrome() -> Option<PathBuf> {
     chrome_from(std::env::var("SCOUT_CHROME").ok())
 }
@@ -51,7 +52,10 @@ pub fn find_chrome() -> Option<PathBuf> {
 fn chrome_from(named: Option<String>) -> Option<PathBuf> {
     if let Some(path) = named {
         let path = PathBuf::from(path);
-        return path.exists().then_some(path);
+        // A whole path, from the root. What starts a Chrome hands the name
+        // to a shell's `exec`, which looks a name with no slash in it up
+        // along PATH: the file found here would not be the program run.
+        return (path.is_absolute() && path.exists()).then_some(path);
     }
     [
         "/usr/bin/chromium",
@@ -164,5 +168,16 @@ mod tests {
         // to another Chrome than the one that was named.
         assert_eq!(chrome_from(Some("/definitely/not/here".to_string())), None);
         assert_eq!(chrome_from(Some("/bin/sh".to_string())), Some(PathBuf::from("/bin/sh")));
+    }
+
+    #[test]
+    fn a_chrome_is_named_by_where_it_is_and_not_by_what_it_is_called() {
+        // A bare name is looked for along PATH by whatever runs it, so the
+        // program that would run is not the file that was found here. These
+        // are files where the tests run, and none of them is a place.
+        for named in ["Cargo.toml", "src/main.rs", "./Cargo.toml", "sh", ""] {
+            assert_eq!(chrome_from(Some(named.to_string())), None, "{named:?}");
+        }
+        assert!(std::path::Path::new("Cargo.toml").exists(), "the test stands where it thinks it does");
     }
 }

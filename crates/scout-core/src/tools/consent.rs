@@ -15,12 +15,18 @@
 //! the page, where the cut did not reach it.
 //!
 //! So a dialog is read where those two put it: after the page. It is
-//! moved and not taken out, because the rule that knows a dialog can be
-//! wrong, and a block it mistakes then loses its place and not its
-//! words; because a page that is nothing but its consent gate still
-//! reads as one, and not as a page with nothing on it; and because the
-//! refusal rule (`refusal.rs`) goes by how much text there is and what
-//! it says, which a move leaves as it was.
+//! moved and not taken out. A page that is nothing but its consent gate
+//! then still reads as one, and not as a page with nothing on it; and
+//! the refusal rule (`refusal.rs`) goes by how much text there is and
+//! what it says, which a move leaves as it was.
+//!
+//! Moving is no safety for a block wrongly taken for a dialog. On a page
+//! longer than the 6,000 characters kept, what goes behind the page is
+//! not read at all. So the rule is narrow: a block is the consent dialog
+//! when its own tag carries a mark, its text says "cookie" at once, and
+//! it says a word of consent. With the first two alone, a review of
+//! this module had it move a shop's quick view of a packet of cookies
+//! and its description of a cookie cutter.
 //!
 //! What it does not know: a dialog with neither of the marks below on
 //! its own tag. Such a one is read where it stands, as before.
@@ -56,6 +62,21 @@ const VOID: [&str; 14] =
 /// room for a longer heading than those, and short of a block that is
 /// about something else and comes to cookies in its small print.
 const SAID_WITHIN_CHARS: usize = 200;
+
+/// The words of consent, one of which a marked block has to say, whole
+/// and in whatever case, to be the consent dialog. Each was read off a
+/// dialog in the saved renders: "toestemming" and "toestaan" in
+/// Cookiebot's Dutch, "consent" and "allow" in its English, "agree" and
+/// "accept" on amazon.nl, "toestemming" and "akkoord" in OneTrust's on
+/// zooplus.nl, "accepteren" on coolblue.nl. Each of the four that carry
+/// a mark says two of them. None is here because a dialog might say it:
+/// no German or French dialog was seen, and one in either language is
+/// not known by its words.
+///
+/// Whole words, because a shop says "allows" and "acceptable" of what
+/// it sells.
+const CONSENT_WORDS: [&str; 8] =
+    ["accept", "accepteren", "agree", "akkoord", "allow", "consent", "toestaan", "toestemming"];
 
 /// The document with every consent dialog moved to its end, so that the
 /// page is read first and the dialog with whatever room is left. A
@@ -125,7 +146,8 @@ fn dialogs(html: &str, lower: &str) -> Vec<(usize, usize)> {
         let start = marked.remove(&(tag.name, *depth));
         *depth -= 1;
         let Some(start) = start else { continue };
-        if !opens_on_cookies(&html[start..tag.end]) {
+        let block = &html[start..tag.end];
+        if !(opens_on_cookies(block) && says_consent(block)) {
             continue;
         }
         // Those found so far stand apart and in order. The ones that
@@ -263,6 +285,14 @@ fn opens_on_cookies(block: &str) -> bool {
     let text = collapse_ws(&decode_entities(&strip_tags(block)));
     let opening: String = text.chars().take(SAID_WITHIN_CHARS).collect();
     opening.to_lowercase().contains("cookie")
+}
+
+/// Whether a block's text has one of the words of consent in it,
+/// anywhere: a dialog's buttons come last, 20,000 characters in on one
+/// of the two hosts.
+fn says_consent(block: &str) -> bool {
+    let text = strip_tags(block).to_lowercase();
+    text.split(|c: char| !c.is_alphabetic()).any(|word| CONSENT_WORDS.contains(&word))
 }
 
 #[cfg(test)]
@@ -704,7 +734,7 @@ mod tests {
         // A tag whose name only begins with the dialog's is not one of
         // its own: counted as one, the line break here would be an
         // element opened and never closed.
-        let dialog = "<b data-nosnippet>We use cookies<br>on this site.</b>";
+        let dialog = "<b data-nosnippet>We use cookies<br>if you agree.</b>";
         let html = format!("<body>{dialog}<p>The page.</p></body>");
         assert_eq!(read_last(&html), format!("<body> <p>The page.</p></body>{dialog}"));
     }
@@ -715,7 +745,7 @@ mod tests {
         // inside it: one block, moved once.
         let outer = "<div id=\"onetrust-consent-sdk\" data-nosnippet=\"true\"><div role=\"dialog\" aria-modal=\"true\">\
             <h2>We use cookies</h2><button>Agree</button></div></div>";
-        let form = "<form role=\"dialog\"><h4>Cookies and Advertising Choices</h4></form>";
+        let form = "<form role=\"dialog\"><h4>Cookies and Advertising Choices</h4><button>Accept</button></form>";
         let html = format!("<body>{outer}<p>one</p>{form}<p>two</p></body>");
         assert_eq!(read_last(&html), format!("<body> <p>one</p> <p>two</p></body>{outer}{form}"));
     }
@@ -723,22 +753,22 @@ mod tests {
     #[test]
     fn a_mark_counts_only_as_an_attribute_of_an_opening_tag() {
         for dialog in [
-            "<div data-nosnippet>Cookies</div>",
-            "<div data-nosnippet=\"true\">Cookies</div>",
-            "<div class=\"banner\"\n     data-nosnippet=\"\"\n>Cookies</div>",
-            "<section id=\"consent\" role=\"dialog\">Cookies</section>",
+            "<div data-nosnippet>Accept cookies</div>",
+            "<div data-nosnippet=\"true\">Accept cookies</div>",
+            "<div class=\"banner\"\n     data-nosnippet=\"\"\n>Accept cookies</div>",
+            "<section id=\"consent\" role=\"dialog\">Accept cookies</section>",
             // A plain answer in capitals.
-            "<FORM ROLE=\"dialog\">Cookies</FORM>",
+            "<FORM ROLE=\"dialog\">Accept cookies</FORM>",
         ] {
             let html = format!("<body>{dialog}<p>The page.</p></body>");
             assert_eq!(read_last(&html), format!("<body> <p>The page.</p></body>{dialog}"), "{dialog}");
         }
         for html in [
             // The words of a page that explains the marks.
-            "<body><p>Cookies: give the banner role=\"dialog\" and data-nosnippet.</p><p>The page.</p></body>",
+            "<body><p>Accept cookies: give the banner role=\"dialog\" and data-nosnippet.</p><p>The page.</p></body>",
             // Other attributes that end as the marks do, or begin as they do.
-            "<body><div data-role=\"dialog\">Cookies</div><p>The page.</p></body>",
-            "<body><div data-nosnippet-off>Cookies</div><p>The page.</p></body>",
+            "<body><div data-role=\"dialog\">Accept cookies</div><p>The page.</p></body>",
+            "<body><div data-nosnippet-off>Accept cookies</div><p>The page.</p></body>",
         ] {
             assert!(matches!(read_last(html), Cow::Borrowed(_)), "{html}");
         }
@@ -748,13 +778,13 @@ mod tests {
     fn a_marked_block_is_the_dialog_only_if_it_opens_on_cookies() {
         // The word, whole, within the first 200 characters of its text.
         let block = |lead: usize| {
-            format!("<body><div role=\"dialog\"><p>{}</p> cookies, in the small print</div><p>The page.</p></body>", "x".repeat(lead))
+            format!("<body><div role=\"dialog\"><p>{}</p> cookies, accept them or not</div><p>The page.</p></body>", "x".repeat(lead))
         };
         assert!(matches!(read_last(&block(193)), Cow::Owned(_)), "the word ends at the 200th character");
         assert!(matches!(read_last(&block(194)), Cow::Borrowed(_)), "and here one past it");
         // In whatever case, and as part of a longer word.
         for says in ["COOKIES", "Cookie-Einstellungen", "Deze website maakt gebruik van cookies"] {
-            let html = format!("<body><div data-nosnippet><h2>{says}</h2></div><p>The page.</p></body>");
+            let html = format!("<body><div data-nosnippet><h2>{says}</h2><button>Accept</button></div><p>The page.</p></body>");
             assert!(matches!(read_last(&html), Cow::Owned(_)), "{says}");
         }
     }
@@ -763,9 +793,9 @@ mod tests {
     fn markup_that_does_not_balance_is_left_as_it_is() {
         for html in [
             // Never closed.
-            "<body><div data-nosnippet><p>We use cookies.</p><p>The page.</p></body>",
+            "<body><div data-nosnippet><p>We use cookies. Accept?</p><p>The page.</p></body>",
             // An element that has no closing tag.
-            "<body><img data-nosnippet alt=\"cookies\"><p>Cookies. The page.</p></body>",
+            "<body><img data-nosnippet alt=\"cookies\"><p>Cookies: accept? The page.</p></body>",
             // A page cut short inside the tag itself.
             "<body><p>The page.</p><div role=\"dialog\"",
         ] {
@@ -782,14 +812,21 @@ mod tests {
         // ended at whatever `</p>` came by.
         let html = "<html><body><p>Intro <span title=\"a<p\" data-nosnippet>We use cookies</span></p>\
                     <p>The page.</p></body></html>";
+        // Read rightly, it is a span that says nothing of consent, and
+        // it is left where it is.
+        assert!(matches!(read_last(html), Cow::Borrowed(_)));
+        assert_eq!(read(html).text, "Intro We use cookies The page.");
+        // With a word of consent in it the span is a dialog, and the
+        // span is what moves, all of it and nothing else.
+        let html = html.replace("We use cookies", "We use cookies. Accept?");
         assert_eq!(
-            read_last(html),
+            read_last(&html),
             "<html><body><p>Intro  </p><p>The page.</p></body></html>\
-             <span title=\"a<p\" data-nosnippet>We use cookies</span>"
+             <span title=\"a<p\" data-nosnippet>We use cookies. Accept?</span>"
         );
-        assert_eq!(read(html).text, "Intro The page. We use cookies");
+        assert_eq!(read(&html).text, "Intro The page. We use cookies. Accept?");
         // And a `>` in one does not end the tag it is in.
-        let dialog = "<div title=\"a > b\" data-nosnippet>Cookies</div>";
+        let dialog = "<div title=\"a > b\" data-nosnippet><p>Accept cookies</p></div>";
         let html = format!("<body>{dialog}<p>The page.</p></body>");
         assert_eq!(read_last(&html), format!("<body> <p>The page.</p></body>{dialog}"));
     }
@@ -797,9 +834,9 @@ mod tests {
     #[test]
     fn a_mark_inside_an_attributes_value_is_not_a_mark() {
         for html in [
-            "<body><div class=\"x data-nosnippet\">Cookies</div><p>The page.</p></body>",
-            "<body><div title='set role=\"dialog\" on it'>Cookies</div><p>The page.</p></body>",
-            "<body><a href=\"/help?role=dialog data-nosnippet\">Cookies</a><p>The page.</p></body>",
+            "<body><div class=\"x data-nosnippet\">Accept cookies</div><p>The page.</p></body>",
+            "<body><div title='set role=\"dialog\" on it'>Accept cookies</div><p>The page.</p></body>",
+            "<body><a href=\"/help?role=dialog data-nosnippet\">Accept cookies</a><p>The page.</p></body>",
         ] {
             assert!(matches!(read_last(html), Cow::Borrowed(_)), "{html}");
         }
@@ -810,16 +847,16 @@ mod tests {
         // A render always writes double quotes. A plain answer writes
         // what its author did.
         for dialog in [
-            "<div role='dialog'>Cookies</div>",
-            "<div role=dialog>Cookies</div>",
-            "<div role = \"dialog\" class=x>Cookies</div>",
-            "<div data-nosnippet = 'true'>Cookies</div>",
+            "<div role='dialog'>Accept cookies</div>",
+            "<div role=dialog>Accept cookies</div>",
+            "<div role = \"dialog\" class=x>Accept cookies</div>",
+            "<div data-nosnippet = 'true'>Accept cookies</div>",
         ] {
             let html = format!("<body>{dialog}<p>The page.</p></body>");
             assert_eq!(read_last(&html), format!("<body> <p>The page.</p></body>{dialog}"), "{dialog}");
         }
         // A role that only has the word in it is another role.
-        let html = "<body><div role=\"dialog-like\">Cookies</div><p>The page.</p></body>";
+        let html = "<body><div role=\"dialog-like\">Accept cookies</div><p>The page.</p></body>";
         assert!(matches!(read_last(html), Cow::Borrowed(_)));
     }
 
@@ -829,20 +866,20 @@ mod tests {
         // one, and the dialog ran on to the next closing tag of its
         // name, here the page's own, so that the page went behind its
         // footer with it.
-        let dialog = "<div role=\"dialog\">Cookies <!-- <div class=\"old\"> --> we use them</div>";
+        let dialog = "<div role=\"dialog\">Cookies <!-- <div class=\"old\"> --> accept them</div>";
         let html = format!("<body><div id=\"page\">{dialog}<main>The page.</main></div><footer>Foot</footer></body>");
         assert_eq!(
             read_last(&html),
             format!("<body><div id=\"page\"> <main>The page.</main></div><footer>Foot</footer></body>{dialog}")
         );
         // A closing one, and it ended early.
-        let dialog = "<div role=\"dialog\">Cookies <!-- </div> --> we use them</div>";
+        let dialog = "<div role=\"dialog\">Cookies <!-- </div> --> accept them</div>";
         let html = format!("<body>{dialog}<main>The page.</main></body>");
         assert_eq!(read_last(&html), format!("<body> <main>The page.</main></body>{dialog}"));
         // And a dialog that is only in a comment is no dialog.
         for html in [
-            "<body><!-- <div data-nosnippet>Cookies</div> --><p>The page.</p></body>",
-            "<body><p>The page.</p><!-- <div role=\"dialog\">Cookies</div></body>",
+            "<body><!-- <div data-nosnippet>Accept cookies</div> --><p>The page.</p></body>",
+            "<body><p>The page.</p><!-- <div role=\"dialog\">Accept cookies</div></body>",
         ] {
             assert!(matches!(read_last(html), Cow::Borrowed(_)), "{html}");
         }
@@ -853,7 +890,7 @@ mod tests {
         // The other way round from the test above: the dialog by role
         // first. Found mark by mark and not put in order, the two would
         // overlap what is copied and come out wrong.
-        let form = "<form role=\"dialog\"><h4>Cookies and Advertising Choices</h4></form>";
+        let form = "<form role=\"dialog\"><h4>Cookies and Advertising Choices</h4><button>Accept</button></form>";
         let other = "<div data-nosnippet=\"true\"><h2>We use cookies</h2><button>Agree</button></div>";
         let html = format!("<body>{form}<p>one</p>{other}<p>two</p></body>");
         assert_eq!(read_last(&html), format!("<body> <p>one</p> <p>two</p></body>{form}{other}"));
@@ -864,23 +901,77 @@ mod tests {
         // Markup no browser would write and a plain answer might: the
         // second block begins inside the first and ends outside it.
         // The first to end is moved; the other is left as it is.
-        let html = "<body><div data-nosnippet>Cookies <span role=\"dialog\">Cookies too</div> and on</span>\
+        let html = "<body><div data-nosnippet>Accept cookies <span role=\"dialog\">Cookies, agree?</div> and on</span>\
                     <p>The page.</p></body>";
         assert_eq!(
             read_last(html),
-            "<body>  and on</span><p>The page.</p></body><div data-nosnippet>Cookies <span role=\"dialog\">Cookies too</div>"
+            "<body>  and on</span><p>The page.</p></body>\
+             <div data-nosnippet>Accept cookies <span role=\"dialog\">Cookies, agree?</div>"
         );
+    }
+
+    #[test]
+    fn a_block_of_the_page_that_is_about_biscuits_stays_where_it_is() {
+        // The review's two probes, in shape. Each has a mark and opens
+        // on the word, and each was moved behind the page: on a page
+        // longer than the 6,000 characters kept, that is taken out.
+        let quick_view = "<div class=\"modal quick-view\" role=\"dialog\" aria-modal=\"true\">\
+            <h2>Chocolate chip cookies 200 g</h2><p class=\"price\">€ 2,49</p><p>Baked with butter. Contains \
+            wheat, milk and egg.</p><a href=\"/basket/add/7\">Add to basket</a></div>";
+        let description = "<div class=\"description\" data-nosnippet><h2>Cookie cutter set</h2><p>Twelve steel \
+            cutters in a tin. It allows for any shape, and is acceptable in a dishwasher.</p></div>";
+        for (what, html) in [
+            ("a quick view that is a dialog by its role", unpriced_page(quick_view)),
+            ("a description kept out of snippets", priced_page(description)),
+        ] {
+            assert!(matches!(read_last(&html), Cow::Borrowed(_)), "{what}");
+            let (text, cut, links) = read_as_before(&html);
+            let page = read(&html);
+            assert_eq!((page.text, page.truncated, page.links), (text, cut, links), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_dialog_says_a_word_of_consent_and_says_it_whole() {
+        let block = |says: &str| format!("<body><div data-nosnippet><h2>Cookies</h2><p>{says}</p></div><p>The page.</p></body>");
+        // What the dialogs seen say, wherever in the block and in
+        // whatever case.
+        for says in [
+            "Toestemming",
+            "Alles toestaan",
+            "Consent",
+            "ALLOW ALL",
+            "If you agree, we may use them.",
+            "Accept",
+            "Akkoord en verdergaan",
+            "Alles accepteren",
+        ] {
+            assert!(matches!(read_last(&block(says)), Cow::Owned(_)), "{says}");
+        }
+        let far = format!("{} <button>Accept</button>", "We use them to count visitors. ".repeat(400));
+        assert!(matches!(read_last(&block(&far)), Cow::Owned(_)), "its buttons come last, 12,000 characters in");
+        // A longer word with one of them in it is another word, and a
+        // block that says none is the page's.
+        for says in [
+            "This tin allows for any shape.",
+            "Acceptable in a dishwasher.",
+            "Read the user agreement.",
+            "Twelve to a pack.",
+            "",
+        ] {
+            assert!(matches!(read_last(&block(says)), Cow::Borrowed(_)), "{says}");
+        }
     }
 
     #[test]
     fn a_closing_tag_that_closes_nothing_ends_nothing() {
         // An element that cannot have content, and a closing tag for it
         // all the same, a long way on: the page between them is not its.
-        let html = "<body><br data-nosnippet>Cookies<p>The page.</p></br></body>";
+        let html = "<body><br data-nosnippet>Accept cookies<p>The page.</p></br></body>";
         assert!(matches!(read_last(html), Cow::Borrowed(_)));
         // A closing tag before anything of its name was opened is not
         // counted against the dialog that follows.
-        let dialog = "<div data-nosnippet>Cookies<div>we use them</div></div>";
+        let dialog = "<div data-nosnippet>Accept cookies<div>or do not</div></div>";
         let html = format!("<body></div>{dialog}<p>The page.</p></body>");
         assert_eq!(read_last(&html), format!("<body></div> <p>The page.</p></body>{dialog}"));
     }

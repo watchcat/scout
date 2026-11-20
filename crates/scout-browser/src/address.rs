@@ -129,6 +129,10 @@ const CHECKOUT_WRITTEN: &[&str] = &["checkout", "afrekenen"];
 /// thing a shop sells or says of all it sells: a toy till, a page on
 /// orders, "order it online".
 const CHECKOUT_STEP: &[&str] = &["kasse", "kassa", "order", "bestelling", "bestellung", "bestellen"];
+/// What is done with an order at a checkout: `/bestelling-afronden`,
+/// `/place-order`. With one of the words above and nothing else, a step is
+/// still a checkout; `/bestelling-volgen` is a parcel being followed.
+const CHECKOUT_DOING: &[&str] = &["afronden", "plaatsen", "abschliessen", "abschließen", "absenden", "bevestigen", "confirm", "place", "complete"];
 /// Paying, as a step of its own. Beside other words it is a page about
 /// paying, which may be the shop's page about delivery too
 /// (`/verzenden-en-betalen`), and that page a session is meant to read.
@@ -147,6 +151,7 @@ const SIGN_IN_WRITTEN: &[&str] = &["login", "signin", "signup", "inloggen"];
 const SIGN_IN_STEP: &[&str] = &[
     "logon", "anmelden", "aanmelden", "anmeldung", "register", "registreren", "registrieren", "registratie", "registrierung",
     "registration", "auth", "oauth", "oauth2", "sso", "saml", "openid", "authenticate", "authentication", "authorize",
+    "registreer", "inschrijven",
 ];
 /// A person's own corner of a shop, as a step of its own: behind a sign-in
 /// or the way to one, and nothing a session has business with.
@@ -170,7 +175,9 @@ impl Step {
     /// `raw` is as a person would read it: a letter written as its number
     /// has been made the letter.
     fn of(raw: &str) -> Step {
-        let lower = raw.to_lowercase();
+        // What follows a semicolon in a step is a server's own note to
+        // itself (`/kasse;jsessionid=1`) and not part of the step's name.
+        let lower = raw.split(';').next().unwrap_or_default().to_lowercase();
         let named = match lower.rsplit_once('.') {
             Some((name, extension)) if !name.is_empty() && (2..=5).contains(&extension.len()) && extension.chars().all(|c| c.is_ascii_alphanumeric()) => name,
             _ => lower.as_str(),
@@ -194,7 +201,11 @@ impl Step {
     }
 
     fn says_checkout(&self) -> bool {
-        CHECKOUT_WRITTEN.iter().any(|c| self.words.iter().any(|w| w.contains(c)) || self.in_two(c)) || self.is_one_of(CHECKOUT_STEP, ON_THE_WAY_TO)
+        let is = |list: &[&str], word: &String| list.contains(&word.as_str());
+        CHECKOUT_WRITTEN.iter().any(|c| self.words.iter().any(|w| w.contains(c)) || self.in_two(c))
+            // One of the words that are a checkout only alone, with nothing
+            // beside it but the way there and what is done there.
+            || (self.words.iter().any(|w| is(CHECKOUT_STEP, w)) && self.words.iter().all(|w| is(CHECKOUT_STEP, w) || is(ON_THE_WAY_TO, w) || is(CHECKOUT_DOING, w)))
     }
 
     fn says_paying(&self) -> bool {
@@ -388,6 +399,27 @@ mod tests {
             "/wachtwoord-vergeten", "/authenticate", "/authentication", "/authorize", "/index.php?route=account/login", "/index.php?controller=authentication",
         ] {
             assert_eq!(on_the_shop(path), Some(Refused::SignIn), "{path}");
+        }
+    }
+
+    #[test]
+    fn more_of_what_the_reviews_probe_found_open_than_was_asked_for() {
+        // The same probe listed these beside the ones above. Each says
+        // only one thing, so each is taken.
+        for path in [
+            // What a server writes after a semicolon is its own, not part of the step.
+            "/kasse;jsessionid=1", "/checkout;jsessionid=ABC",
+            // The order, and the doing of it.
+            "/bestelling-afronden", "/bestelling-plaatsen", "/bestellung-abschliessen", "/place-order", "/order-confirm",
+        ] {
+            assert_eq!(on_the_shop(path), Some(Refused::Checkout), "{path}");
+        }
+        for path in ["/registreer", "/inschrijven", "/account;jsessionid=1"] {
+            assert_eq!(on_the_shop(path), Some(Refused::SignIn), "{path}");
+        }
+        // And these, which say something else beside it, are still open.
+        for path in ["/pre-order", "/order-status", "/p/widget;colour=blue", "/bestelling-volgen", "/nieuwsbrief-inschrijven"] {
+            assert_eq!(on_the_shop(path), None, "{path}");
         }
     }
 

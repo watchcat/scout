@@ -57,12 +57,17 @@ const PERSONAL_WORDS: &[&str] = &[
     // card's expiry, and the German for an address.
     "passwd", "passcode", "toegangscode", "beveiligingscode", "veiligheidscode", "verificatiecode",
     "tussenvoegsel", "voorletter", "initialen", "vervaldatum", "anschrift",
+    // And from the same probe, beyond what was asked for: a person's
+    // numbers with the state, a car's plate, a fax.
+    "rijksregister", "ausweis", "kenteken", "faxnummer", "faxnumber",
+    // An address shown as a field's example says what the field wants.
+    "@",
 ];
 
 /// The same, for words short enough to sit inside others: these count only
-/// standing alone, so a `sort` field is not an `ort` and `passend` is not
-/// a `pass`.
-const PERSONAL_ALONE: &[&str] = &["tel", "ort", "pin", "dob", "pwd", "pass"];
+/// standing alone, so a `sort` field is not an `ort`, `passend` is not a
+/// `pass` and `bicolor` is not a `bic`.
+const PERSONAL_ALONE: &[&str] = &["tel", "ort", "pin", "dob", "pwd", "pass", "otp", "sms", "fax", "ssn", "bic"];
 
 /// A place, which a field that also says postcode is forgiven: where a
 /// delivery checker takes a postcode it often offers a place as well.
@@ -213,6 +218,7 @@ pub fn typing_refused(field: &Field, text: &str) -> Option<&'static str> {
     let personal = PERSONAL_WORDS.iter().filter(|word| said.contains(**word)).copied()
         .chain(PERSONAL_ALONE.iter().filter(|word| says_alone(&said, word)).copied())
         .chain(says(&said, "security", "code").then_some("security code"))
+        .chain(says(&said, "social", "security").then_some("social security"))
         // A postcode field inside an address form, or one that takes a
         // place as well, is still a postcode field.
         .any(|word| !(postcode && PLACES.contains(&word)));
@@ -396,6 +402,23 @@ mod tests {
         }
         // A word that only has the letters in it is not one of them.
         for label in ["Passend bij", "Kompass", "Reisepasshülle zoeken"] {
+            ok(labelled("text", label), "widget");
+        }
+    }
+
+    #[test]
+    fn more_of_what_the_reviews_probe_found_typed_into_than_was_asked_for() {
+        // The same probe listed these beside the ones above, and none of
+        // them is a search term, a quantity or a postcode.
+        for label in ["SMS-code", "Fax", "Faxnummer", "Kenteken", "Rijksregisternummer", "Social security number", "Personalausweisnummer", "BIC"] {
+            no(labelled("text", label));
+        }
+        no(named("text", "otp"));
+        no(named("text", "ssn"));
+        // A field that shows an address as its example wants one.
+        no(placeheld("text", "jij@voorbeeld.example"));
+        // Words these are only part of are not them.
+        for label in ["Fabric", "Kleur", "Bicolor", "Smaak"] {
             ok(labelled("text", label), "widget");
         }
     }

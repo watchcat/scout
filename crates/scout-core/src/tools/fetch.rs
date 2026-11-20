@@ -31,6 +31,12 @@ const MAX_TEXT_CHARS: usize = 6000;
 /// four shops needs four pages, and the fifth is headroom.
 const MAX_OPENS: usize = 5;
 const MAX_LINKS: usize = 30;
+/// Links looked at on a page, of which the model is still handed the first
+/// `MAX_LINKS`. The rest are read for one thing: where the shop links its
+/// page about delivery, which sits in a footer. On zooplus.nl's delivery
+/// page (2026-11-20) those links are the 1st, 315th, 319th and 386th of 392
+/// with a text, the first only because a banner leads the page.
+pub(crate) const SCAN_LINKS: usize = 1000;
 const MAX_LINK_TEXT_CHARS: usize = 120;
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +70,11 @@ pub struct PageContent {
     /// the visible text of a shop page carries prices for carousels, other
     /// sellers and unrelated pack sizes, and nothing distinguishes them.
     pub product: Option<PageProduct>,
+    /// Where the page links the shop's own pages about delivery, best
+    /// first, from all its links and not only the ones handed over. For
+    /// the delivery desk; the model is not shown it.
+    #[serde(skip)]
+    pub delivery_links: Vec<String>,
 }
 
 /// A product as the page's schema.org markup describes it.
@@ -681,6 +692,8 @@ pub struct FetchPageTool {
     /// Action listing the user was asking about.
     seen: std::sync::Mutex<std::collections::HashMap<String, PageContent>>,
     hosts: std::sync::Mutex<Hosts>,
+    /// The request's memo of shops' pages, where it has one: see `noting`.
+    shops: Option<std::sync::Arc<super::delivery::ShopPages>>,
 }
 
 /// What this request has learnt of the hosts it asked, each keyed as
@@ -702,7 +715,7 @@ struct Hosts {
 
 /// A host as the request's memory keys it: without a leading `www.`, as the
 /// trace script names hosts.
-fn host_key(url: &Url) -> Option<String> {
+pub(crate) fn host_key(url: &Url) -> Option<String> {
     url.host_str().map(|host| host.strip_prefix("www.").unwrap_or(host).to_string())
 }
 
@@ -723,13 +736,28 @@ impl FetchPageTool {
             opens: std::sync::atomic::AtomicUsize::new(0),
             seen: std::sync::Mutex::new(std::collections::HashMap::new()),
             hosts: std::sync::Mutex::new(Hosts::default()),
+            shops: None,
         }
+    }
+
+    /// Notes for the delivery desk of the same request where each page
+    /// read links its shop's delivery page, and which hosts are closed.
+    pub fn noting(mut self, shops: std::sync::Arc<super::delivery::ShopPages>) -> Self {
+        self.shops = Some(shops);
+        self
     }
 
     /// Keeps a page for the rest of the request and hands back a copy.
     /// `from` is where it was read.
     fn remember(&self, key: String, from: &Url, page: PageContent) -> PageContent {
         if let Some(host) = host_key(from) {
+            if let Some(shops) = &self.shops {
+                // Only links on the host that answered. After a redirect
+                // to another host the page's links were told apart by the
+                // address that was asked, and none found is not none there.
+                let own = |link: &&String| Url::parse(link).ok().as_ref().and_then(host_key).is_some_and(|at| super::delivery::same_shop(&at, &host));
+                shops.note_links(&host, &page.delivery_links.iter().filter(own).cloned().collect::<Vec<_>>());
+            }
             self.hosts.lock().unwrap().served.insert(host);
         }
         self.seen.lock().unwrap().insert(key, page.clone());
@@ -750,6 +778,9 @@ impl FetchPageTool {
             let mut hosts = self.hosts.lock().unwrap();
             reads_fine = hosts.served.contains(&host);
             if settled && !reads_fine {
+                if let Some(shops) = &self.shops {
+                    shops.note_closed(&host);
+                }
                 hosts.closed.insert(host);
             }
         }
@@ -973,7 +1004,9 @@ pub(crate) fn extract_page(html: &str, base: &Url) -> PageContent {
         .and_then(|p| p.availability)
         .or_else(|| availability(html));
     let without_scripts = strip_tag_blocks(&strip_tag_blocks(html, "script"), "style");
-    let links = extract_links(&without_scripts, base);
+    let mut links = extract_links(&without_scripts, base, SCAN_LINKS);
+    let delivery_links = super::delivery::delivery_links(&links, base);
+    links.truncate(MAX_LINKS);
     let full_text = collapse_ws(&decode_entities(&strip_tags(&without_scripts)));
     let truncated = full_text.chars().count() > MAX_TEXT_CHARS;
     let text = if truncated {
@@ -981,12 +1014,12 @@ pub(crate) fn extract_page(html: &str, base: &Url) -> PageContent {
     } else {
         full_text
     };
-    PageContent { text, truncated, links, availability, product }
+    PageContent { text, truncated, links, availability, product, delivery_links }
 }
 
 /// Remove `<tag ...>...</tag>` blocks wholesale (for script/style, whose
 /// bodies are not content). ASCII-lowercased shadow keeps byte offsets valid.
-fn strip_tag_blocks(html: &str, tag: &str) -> String {
+pub(crate) fn strip_tag_blocks(html: &str, tag: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
@@ -1007,7 +1040,7 @@ fn strip_tag_blocks(html: &str, tag: &str) -> String {
     out
 }
 
-fn strip_tags(html: &str) -> String {
+pub(crate) fn strip_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     for c in html.chars() {
@@ -1026,7 +1059,7 @@ fn strip_tags(html: &str) -> String {
 
 /// Decode the common entities; `&amp;` last so `&amp;lt;` becomes `&lt;`,
 /// not `<`.
-fn decode_entities(s: &str) -> String {
+pub(crate) fn decode_entities(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&#39;", "'")
@@ -1035,11 +1068,11 @@ fn decode_entities(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn collapse_ws(s: &str) -> String {
+pub(crate) fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn extract_links(html: &str, base: &Url) -> Vec<PageLink> {
+pub(crate) fn extract_links(html: &str, base: &Url, cap: usize) -> Vec<PageLink> {
     let lower = html.to_ascii_lowercase();
     let mut links = Vec::new();
     let mut pos = 0;
@@ -1079,7 +1112,7 @@ fn extract_links(html: &str, base: &Url) -> Vec<PageLink> {
             url: abs.to_string(),
             text: text.chars().take(MAX_LINK_TEXT_CHARS).collect(),
         });
-        if links.len() >= MAX_LINKS {
+        if links.len() >= cap {
             break;
         }
     }
@@ -1163,6 +1196,86 @@ mod tests {
             .collect();
         let page = extract_page(&format!("<body>{many}</body>"), &base());
         assert_eq!(page.links.len(), MAX_LINKS);
+    }
+
+    #[test]
+    fn a_page_keeps_its_delivery_links_past_the_thirty_it_hands_over_and_does_not_serialise_them() {
+        // zooplus.nl, 2026-11-20: but for a banner, the links to its
+        // delivery pages are some three hundred links down the page.
+        let products: String = (0..300).map(|i| format!("<a href=\"/p/{i}\">Widget {i}</a>")).collect();
+        let html = format!("<body>{products}<a href=\"/klantenservice/verzendkosten\">Verzendkosten</a></body>");
+        let page = extract_page(&html, &base());
+        assert_eq!(page.links.len(), MAX_LINKS, "the model is handed the first thirty, as before");
+        assert!(page.links.iter().all(|l| l.text.starts_with("Widget")));
+        assert_eq!(page.delivery_links, vec!["https://shop.example/klantenservice/verzendkosten".to_string()]);
+        // It is Scout's own: what the model is handed has the keys it had.
+        let handed = serde_json::to_value(&page).unwrap();
+        let keys: Vec<&str> = handed.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["availability", "links", "product", "text", "truncated"]);
+        // A page with none keeps none.
+        assert!(extract_page(&format!("<body>{products}</body>"), &base()).delivery_links.is_empty());
+        // And the scan has an end, however long the page.
+        let endless: String = (0..SCAN_LINKS).map(|i| format!("<a href=\"/p/{i}\">Widget {i}</a>")).collect();
+        let html = format!("<body>{endless}<a href=\"/klantenservice/verzendkosten\">Verzendkosten</a></body>");
+        assert!(extract_page(&html, &base()).delivery_links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_page_and_a_closed_host_are_noted_for_the_request() {
+        use crate::tools::delivery::ShopPages;
+        // A page is read: where it links the shop's delivery page is noted
+        // of the host, for the delivery desk of the same request.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/p/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><h1>Widget</h1><a href="/p/2">Other widget</a><a href="/klantenservice/verzendkosten">Verzendkosten</a></body></html>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/p/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"<html><body><h1>Other widget</h1><a href="/p/1">Widget</a></body></html>"#))
+            .mount(&server)
+            .await;
+        let shops = std::sync::Arc::new(ShopPages::default());
+        let tool = tool_with(&server, None).noting(shops.clone());
+        assert_eq!(shops.links("127.0.0.1"), None, "nothing is known before a page is read");
+        // A page that links no delivery page leaves it unknown: the desk
+        // will look for itself.
+        tool.call(FetchArgs { url: format!("{}/p/2", server.uri()) }).await.unwrap();
+        assert_eq!(shops.links("127.0.0.1"), None);
+        tool.call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.unwrap();
+        assert_eq!(shops.links("127.0.0.1"), Some(vec![format!("{}/klantenservice/verzendkosten", server.uri())]));
+        assert!(!shops.closed("127.0.0.1"));
+
+        // A host that told the reader no, with nobody left to ask, is
+        // closed for the desk as it is for the tool.
+        let server = serving(200, &block_notice()).await;
+        let shops = std::sync::Arc::new(ShopPages::default());
+        let tool = tool_with(&server, None).noting(shops.clone());
+        assert!(tool.call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.is_err());
+        assert!(shops.closed("127.0.0.1"));
+        assert_eq!(shops.links("127.0.0.1"), None);
+        // One the browser never answered for is left open, for both.
+        let server = serving(200, &block_notice()).await;
+        let shops = std::sync::Arc::new(ShopPages::default());
+        let tool = tool_with(&server, silent()).noting(shops.clone());
+        assert!(tool.call(FetchArgs { url: format!("{}/p/1", server.uri()) }).await.is_err());
+        assert!(!shops.closed("127.0.0.1"));
+
+        // After a redirect to another host the links were told apart by
+        // the address that was asked, so of the host that answered nothing
+        // is noted: none found there is not none.
+        let shops = std::sync::Arc::new(ShopPages::default());
+        let tool = FetchPageTool::new(OpenWeb::new(Duration::from_secs(5)).unwrap(), None).noting(shops.clone());
+        let asked = Url::parse("https://shop.example/p/1").unwrap();
+        let page = extract_page(r#"<body><a href="/verzendkosten">Verzendkosten</a></body>"#, &asked);
+        assert_eq!(page.delivery_links.len(), 1);
+        tool.remember("k".into(), &Url::parse("https://other.example/p/1").unwrap(), page.clone());
+        assert_eq!((shops.links("other.example"), shops.links("shop.example")), (None, None));
+        tool.remember("k".into(), &Url::parse("https://www.shop.example/p/1").unwrap(), page);
+        assert_eq!(shops.links("shop.example"), Some(vec!["https://shop.example/verzendkosten".to_string()]));
     }
 
     #[tokio::test]

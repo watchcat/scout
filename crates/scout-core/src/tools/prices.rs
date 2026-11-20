@@ -1,6 +1,10 @@
+use super::delivery::{DeliveryDesk, Looked, Terms, NEW_SHOPS_PER_REQUEST};
+use super::fetch;
+use reqwest::Url;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 
 /// One purchasable offer as the model extracted it. `units` is how many
 /// countable things the listing contains (3 for a 3-pack); `shipping` absent
@@ -46,7 +50,17 @@ pub struct Row {
     /// price + shipping; equals price when shipping is unknown.
     pub landed: f64,
     pub per_unit: f64,
+    /// Whether `landed` includes a delivery cost, whoever's word it is.
     pub shipping_known: bool,
+    /// Whose word `shipping` is: `offer` when the model handed it over as
+    /// the listing's, `delivery_page` when it is the shop's kept delivery
+    /// terms for an order of this value, `unknown` when nobody's.
+    pub shipping_source: &'static str,
+    /// With `delivery_page`: the page of the shop the cost was read from.
+    pub delivery_page: Option<String>,
+    /// With `delivery_page`: the order value the shop delivers free from,
+    /// when this offer is under it.
+    pub free_from: Option<f64>,
     pub condition: Option<String>,
     pub note: Option<String>,
 }
@@ -98,6 +112,8 @@ fn round_per_unit(x: f64) -> f64 {
 /// offer used to win.
 struct Ranked {
     row: Row,
+    /// The offer's shop, as the delivery desk keys one.
+    host: Option<String>,
     per_unit: f64,
     /// Position in the input, the only dependable identity for an offer: the
     /// preamble forbids inventing URLs, so pack variants of one product page
@@ -155,6 +171,58 @@ fn validate(args: &CompareArgs) -> Result<(), PriceCompareError> {
 
 /// Rank offers by landed cost per unit. Pure: no I/O, no model, no clock.
 pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
+    compare_with(args, &Looked::default())
+}
+
+/// An offer's shop, as the delivery desk keys one.
+fn shop_of(offer: &Offer) -> Option<String> {
+    Url::parse(offer.url.trim()).ok().as_ref().and_then(fetch::host_key)
+}
+
+/// The addresses of the offers that state no shipping, cheapest first: by
+/// item price per unit, which is all that is known of them yet. The desk
+/// reads a few new shops a request, so the offers that decide the pick are
+/// the ones asked about when it cannot read them all.
+fn unstated_cheapest_first(args: &CompareArgs) -> Vec<Url> {
+    let mut unstated: Vec<&Offer> = args.offers.iter().filter(|o| o.shipping.is_none()).collect();
+    unstated.sort_by(|a, b| (a.price / a.units as f64).total_cmp(&(b.price / b.units as f64)));
+    unstated.iter().filter_map(|o| Url::parse(o.url.trim()).ok()).collect()
+}
+
+/// What a shop's kept terms make of delivering one offer.
+struct FromPage {
+    cost: f64,
+    page: Option<String>,
+    free_from: Option<f64>,
+}
+
+/// The delivery cost of an offer that states none, by its shop's kept
+/// terms: the band its order value falls in, where the terms are in the
+/// comparison's currency. The order value is the offer's price, one of
+/// that listing bought alone — `units` is how much the listing holds, not
+/// how many of it are ordered.
+fn from_delivery_page(offer: &Offer, host: Option<&String>, currency: &str, looked: &Looked) -> Option<FromPage> {
+    let kept = looked.by_host.get(host?)?;
+    let Terms::Costs { bands, currency: theirs } = &kept.terms else { return None };
+    if theirs != currency {
+        return None;
+    }
+    Some(FromPage {
+        cost: bands.cost_for(offer.price)?,
+        page: kept.source_url.clone(),
+        free_from: bands.free_from().filter(|from| offer.price < *from),
+    })
+}
+
+/// `compare`, with what the delivery desk found for the shops of the
+/// offers that state no shipping. Still pure: the looking up is done.
+///
+/// A stated shipping is never replaced, whatever the shop's page says: the
+/// listing is nearer the product than the shop's general terms are. An
+/// offer that states none gets its shop's cost for an order of its value,
+/// is ranked on it, and says in `shipping_source` and in a note that the
+/// cost is the delivery page's word and not the listing's.
+pub fn compare_with(args: &CompareArgs, looked: &Looked) -> Result<Comparison, PriceCompareError> {
     validate(args)?;
     let currency = args.offers[0].currency.trim().to_uppercase();
 
@@ -163,21 +231,35 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
         .iter()
         .enumerate()
         .map(|(idx, o)| {
-            let landed = o.price + o.shipping.unwrap_or(0.0);
+            let host = shop_of(o);
+            let from_page = match o.shipping {
+                Some(_) => None,
+                None => from_delivery_page(o, host.as_ref(), &currency, looked),
+            };
+            let (shipping, shipping_source) = match (o.shipping, &from_page) {
+                (Some(stated), _) => (Some(stated), "offer"),
+                (None, Some(found)) => (Some(found.cost), "delivery_page"),
+                (None, None) => (None, "unknown"),
+            };
+            let landed = o.price + shipping.unwrap_or(0.0);
             let per_unit = landed / o.units as f64;
             Ranked {
                 per_unit,
                 idx,
+                host,
                 row: Row {
                     title: o.title.clone(),
                     url: o.url.clone(),
                     shop: o.shop.clone(),
                     units: o.units,
                     price: round2(o.price),
-                    shipping: o.shipping.map(round2),
+                    shipping: shipping.map(round2),
                     landed: round2(landed),
                     per_unit: round_per_unit(per_unit),
-                    shipping_known: o.shipping.is_some(),
+                    shipping_known: shipping.is_some(),
+                    shipping_source,
+                    free_from: from_page.as_ref().and_then(|found| found.free_from).map(round2),
+                    delivery_page: from_page.and_then(|found| found.page),
                     condition: o.condition.clone(),
                     note: o.note.clone(),
                 },
@@ -215,10 +297,13 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
     let best_single = best_single.row.clone();
     let best_per_unit = best_per_unit.row.clone();
 
+    let delivery_notes = delivery_notes(&ranked, looked);
     let rows: Vec<Row> = ranked.into_iter().map(|r| r.row).collect();
 
     let mut notes = Vec::new();
-    let unknown = rows.len() - rows.iter().filter(|r| r.shipping_known).count();
+    // An offer priced from the shop's delivery page is not item-only, so
+    // these two go by what nobody knows.
+    let unknown = rows.iter().filter(|r| !r.shipping_known).count();
     if unknown == rows.len() {
         notes.push(
             "no offer states shipping; every figure here is item-only and excludes delivery — \
@@ -238,6 +323,7 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
             named.join("; ")
         ));
     }
+    notes.extend(delivery_notes);
     // The same page cannot be two different packs at two different prices;
     // one of them was pasted from another listing.
     for (i, row) in rows.iter().enumerate() {
@@ -283,9 +369,76 @@ pub fn compare(args: &CompareArgs) -> Result<Comparison, PriceCompareError> {
     })
 }
 
-/// Stateless: all the inputs come from the model, all the rules are in
-/// `compare`.
-pub struct ComparePricesTool;
+/// What the reply has to say of delivery that the desk looked up: whose
+/// word an added cost is, which shop will not deliver, which charges by
+/// something an offer does not say, and which nobody read. No date is
+/// given for any of it: terms read for one person answer the next, and a
+/// date would tell the second when somebody looked at that shop.
+fn delivery_notes(ranked: &[Ranked], looked: &Looked) -> Vec<String> {
+    let mut notes = Vec::new();
+    let added: Vec<String> = ranked
+        .iter()
+        .filter(|r| r.row.shipping_source == "delivery_page")
+        .take(5)
+        .map(|r| {
+            let cost = match r.row.shipping {
+                Some(cost) if cost > 0.0 => format!("+{cost:.2}"),
+                _ => "free".to_string(),
+            };
+            let host = r.host.as_deref().unwrap_or_default();
+            match r.row.free_from {
+                Some(from) => format!("{} {cost} ({host}; free from {from:.2})", r.row.title),
+                None => format!("{} {cost} ({host})", r.row.title),
+            }
+        })
+        .collect();
+    if !added.is_empty() {
+        notes.push(format!(
+            "delivery added from the shop's own delivery page, not from the listing: {} — say \"delivery per the \
+             shop's delivery page\" for these, never that the listing states it",
+            added.join("; ")
+        ));
+    }
+    // Once a shop, in the order its offers rank, and only for a shop whose
+    // terms were asked for: one with an offer that states no shipping.
+    let mut said: Vec<&str> = Vec::new();
+    for r in ranked.iter().filter(|r| r.row.shipping_source == "unknown") {
+        let Some(host) = r.host.as_deref().filter(|host| !said.contains(host)) else { continue };
+        let Some(kept) = looked.by_host.get(host) else { continue };
+        said.push(host);
+        match &kept.terms {
+            Terms::NotDelivered => {
+                let country = looked.country.map_or("", |c| c.english);
+                notes.push(format!(
+                    "{host}: its delivery page says it does not deliver to the delivery country ({country}) — say so \
+                     beside that option"
+                ));
+            }
+            Terms::Depends => {
+                let terms = kept.source_url.as_deref().unwrap_or(host);
+                notes.push(format!("{host}: delivery is charged by weight or destination, so none was added — its terms: {terms}"));
+            }
+            _ => {}
+        }
+    }
+    if !looked.not_looked_up.is_empty() {
+        notes.push(format!(
+            "delivery was not looked up at {}: {NEW_SHOPS_PER_REQUEST} new shops a request — those prices stay item-only",
+            looked.not_looked_up.join(", ")
+        ));
+    }
+    notes
+}
+
+/// All the inputs come from the model and all the rules are in
+/// `compare_with`. The one thing the tool does besides is ask the delivery
+/// desk about the shops of the offers that state no shipping — after the
+/// call has been found well-formed, so that a call the model has to make
+/// again costs no shop a request. Without a desk it is `compare`.
+#[derive(Default)]
+pub struct ComparePricesTool {
+    pub delivery: Option<Arc<DeliveryDesk>>,
+}
 
 impl Tool for ComparePricesTool {
     const NAME: &'static str = "compare_prices";
@@ -302,7 +455,10 @@ impl Tool for ComparePricesTool {
          one-off), the best price per unit (best_per_unit, usually a \
          multipack), a ranked table and notes. Use its numbers \
          verbatim — do not recompute them. Omit shipping for an offer when the \
-         page does not state it; never guess it."
+         page does not state it; never guess it. An offer sent without \
+         shipping may come back with a cost Scout read from the shop's own \
+         delivery page: its row is marked shipping_source: delivery_page, \
+         and the notes say how to word it."
             .to_string()
     }
 
@@ -348,13 +504,23 @@ impl Tool for ComparePricesTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        compare(&args)
+        validate(&args)?;
+        let Some(desk) = &self.delivery else { return compare(&args) };
+        let looked = desk.terms_for(&unstated_cheapest_first(&args)).await;
+        let comparison = compare_with(&args, &looked)?;
+        for source in ["offer", "delivery_page", "unknown"] {
+            desk.count_compared(source, comparison.rows.iter().filter(|r| r.shipping_source == source).count());
+        }
+        Ok(comparison)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::delivery::fixtures::{World, DELIVERY, PRODUCT};
+    use crate::tools::delivery::{self, Bands, Kept, Terms};
+    use std::collections::HashMap;
 
     fn offer(title: &str, price: f64, units: u32, shipping: Option<f64>) -> Offer {
         Offer {
@@ -663,7 +829,7 @@ mod tests {
 
     #[test]
     fn model_facing_text_ties_units_to_unit_name_and_explains_best_single() {
-        let params = ComparePricesTool.parameters();
+        let params = ComparePricesTool::default().parameters();
         let units = params["properties"]["offers"]["items"]["properties"]["units"]["description"]
             .as_str()
             .expect("units has a description");
@@ -674,8 +840,12 @@ mod tests {
         assert!(units.contains("same unit"), "got: {units}");
 
         // best_single is the smallest pack available, not necessarily one.
-        let description = ComparePricesTool.description();
+        let description = ComparePricesTool::default().description();
         assert!(description.contains("smallest pack"), "got: {description}");
+        // An offer sent without shipping can come back with one, and the
+        // model has to know whose word it is before it reads the notes.
+        assert!(description.contains("shipping_source"), "got: {description}");
+        assert!(description.contains("the shop's own delivery page"), "got: {description}");
     }
 
     #[tokio::test]
@@ -694,9 +864,292 @@ mod tests {
         // units defaults to 1 when the model omits it
         assert_eq!(args.offers[1].units, 1);
 
-        let out = ComparePricesTool.call(args).await.unwrap();
+        let out = ComparePricesTool::default().call(args).await.unwrap();
         assert_eq!(out.best_per_unit.title, "3 pack");
         assert_eq!(out.best_single.title, "single");
         assert_eq!(ComparePricesTool::NAME, "compare_prices");
+    }
+
+    const DELIVERY_PAGE: &str = "https://shop.example/verzendkosten";
+
+    /// What the desk hands back when `shop.example`'s terms are kept, for
+    /// delivery to the Netherlands.
+    fn looked(terms: Terms) -> Looked {
+        Looked {
+            by_host: [("shop.example".to_string(), Kept { terms, source_url: Some(DELIVERY_PAGE.to_string()) })].into(),
+            not_looked_up: Vec::new(),
+            country: delivery::country("NL"),
+        }
+    }
+
+    /// 5.49 an order, free from 40.
+    fn by_order_value() -> Terms {
+        Terms::Costs { bands: Bands::new(vec![(0.0, 5.49), (40.0, 0.0)]).unwrap(), currency: "EUR".to_string() }
+    }
+
+    /// An offer at another shop, of which nothing is kept.
+    fn elsewhere(title: &str, price: f64, shipping: Option<f64>) -> Offer {
+        Offer { url: format!("https://other.example/{title}"), shop: Some("other.example".to_string()), ..offer(title, price, 1, shipping) }
+    }
+
+    fn row<'a>(out: &'a Comparison, title: &str) -> &'a Row {
+        out.rows.iter().find(|r| r.title == title).unwrap_or_else(|| panic!("no row {title:?}"))
+    }
+
+    #[test]
+    fn kept_terms_price_an_offer_that_states_no_shipping() {
+        // On the item's price the shop's widget wins. Delivered, it does not.
+        let offers = || vec![offer("at-the-shop", 10.0, 1, None), elsewhere("delivered", 12.0, Some(1.0))];
+        let item_only = compare(&args(offers())).unwrap();
+        assert_eq!(item_only.best_single.title, "at-the-shop", "as it was ranked before");
+
+        let out = compare_with(&args(offers()), &looked(by_order_value())).unwrap();
+
+        let priced = row(&out, "at-the-shop");
+        assert_eq!((priced.price, priced.shipping, priced.landed, priced.per_unit), (10.0, Some(5.49), 15.49, 15.49));
+        assert!(priced.shipping_known, "its landed price includes delivery now");
+        assert_eq!(out.best_single.title, "delivered", "and it is ranked on that");
+        assert_eq!(out.rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec!["delivered", "at-the-shop"]);
+        assert!(!out.notes.iter().any(|n| n.contains("item-only") || n.contains("no offer states shipping")), "got: {:?}", out.notes);
+
+        // The cost is the order's, so a pack carries it once.
+        let out = compare_with(&args(vec![offer("3-pack", 30.0, 3, None)]), &looked(by_order_value())).unwrap();
+        assert_eq!((out.rows[0].landed, out.rows[0].per_unit), (35.49, 11.83));
+    }
+
+    #[test]
+    fn an_offer_at_the_free_value_is_delivered_free_and_one_under_it_says_from_what() {
+        let out = compare_with(&args(vec![offer("under", 39.99, 1, None), offer("at", 40.0, 1, None)]), &looked(by_order_value())).unwrap();
+
+        let under = row(&out, "under");
+        assert_eq!((under.shipping, under.landed, under.free_from), (Some(5.49), 45.48, Some(40.0)));
+        let at = row(&out, "at");
+        assert_eq!((at.shipping, at.landed, at.free_from), (Some(0.0), 40.0, None), "nothing to say of a value it has reached");
+        assert_eq!(at.shipping_source, "delivery_page", "free by the shop's page, not by the listing");
+        assert_eq!(out.best_single.title, "at", "the dearer item is the cheaper order");
+
+        // Under the shop's first band it states no cost, and none is made up.
+        let from_ten = Terms::Costs { bands: Bands::new(vec![(10.0, 5.49), (40.0, 0.0)]).unwrap(), currency: "EUR".to_string() };
+        let out = compare_with(&args(vec![offer("small", 8.0, 1, None)]), &looked(from_ten)).unwrap();
+        assert_eq!((out.rows[0].shipping, out.rows[0].shipping_source, out.rows[0].landed), (None, "unknown", 8.0));
+        assert!(out.notes.iter().any(|n| n.contains("no offer states shipping")), "got: {:?}", out.notes);
+    }
+
+    #[test]
+    fn a_stated_shipping_is_never_replaced() {
+        // The shop's page says 5.49; the listing said 2.50, and free.
+        let out = compare_with(
+            &args(vec![offer("stated", 10.0, 1, Some(2.5)), offer("stated-free", 11.0, 1, Some(0.0))]),
+            &looked(by_order_value()),
+        )
+        .unwrap();
+
+        let stated = row(&out, "stated");
+        assert_eq!((stated.shipping, stated.landed, stated.shipping_source), (Some(2.5), 12.5, "offer"));
+        assert_eq!((stated.delivery_page.as_deref(), stated.free_from), (None, None));
+        let free = row(&out, "stated-free");
+        assert_eq!((free.shipping, free.landed, free.shipping_source), (Some(0.0), 11.0, "offer"));
+        assert!(!out.notes.iter().any(|n| n.contains("delivery page")), "got: {:?}", out.notes);
+    }
+
+    #[test]
+    fn a_cost_from_the_delivery_page_is_named_as_that_and_never_as_stated() {
+        let out = compare_with(
+            &args(vec![offer("from-page", 10.0, 1, None), elsewhere("from-listing", 12.0, Some(1.0)), elsewhere("nobody-knows", 9.0, None)]),
+            &looked(by_order_value()),
+        )
+        .unwrap();
+
+        // The field, on every row.
+        let from_page = row(&out, "from-page");
+        assert_eq!(from_page.shipping_source, "delivery_page");
+        assert_eq!(from_page.delivery_page.as_deref(), Some(DELIVERY_PAGE));
+        assert_eq!(row(&out, "from-listing").shipping_source, "offer");
+        assert_eq!(row(&out, "nobody-knows").shipping_source, "unknown");
+        let handed = serde_json::to_value(&out).unwrap();
+        let sources: Vec<&str> = handed["rows"].as_array().unwrap().iter().map(|r| r["shipping_source"].as_str().unwrap()).collect();
+        assert_eq!(sources, ["unknown", "offer", "delivery_page"], "as the model reads it, cheapest first");
+
+        // And the note, which says whose word the cost is.
+        let note = out.notes.iter().find(|n| n.contains("delivery page")).unwrap_or_else(|| panic!("got: {:?}", out.notes));
+        assert!(note.starts_with("delivery added from the shop's own delivery page, not from the listing: from-page +5.49 (shop.example; free from 40.00)"), "got: {note}");
+        assert!(note.contains("never that the listing states it"), "got: {note}");
+        assert!(!note.contains("nobody-knows") && !note.contains("from-listing"), "got: {note}");
+        // What nobody knows is still named as item-only, and only that.
+        let item_only = out.notes.iter().find(|n| n.contains("item-only")).unwrap_or_else(|| panic!("got: {:?}", out.notes));
+        assert!(item_only.contains("nobody-knows") && !item_only.contains("from-page"), "got: {item_only}");
+    }
+
+    #[test]
+    fn terms_in_another_currency_are_not_applied() {
+        let pounds = Terms::Costs { bands: Bands::new(vec![(0.0, 5.49)]).unwrap(), currency: "GBP".to_string() };
+        let out = compare_with(&args(vec![offer("in-euros", 10.0, 1, None)]), &looked(pounds)).unwrap();
+        assert_eq!((out.rows[0].shipping, out.rows[0].landed, out.rows[0].shipping_source), (None, 10.0, "unknown"));
+        assert!(out.notes.iter().any(|n| n.contains("no offer states shipping")), "got: {:?}", out.notes);
+    }
+
+    #[test]
+    fn a_shop_that_will_not_deliver_or_charges_by_weight_is_said_and_costs_nothing_added() {
+        let offers = || vec![offer("unstated", 10.0, 1, None), elsewhere("stated", 12.0, Some(1.0))];
+        let out = compare_with(&args(offers()), &looked(Terms::NotDelivered)).unwrap();
+        assert_eq!((row(&out, "unstated").shipping, row(&out, "unstated").shipping_source), (None, "unknown"));
+        assert!(
+            out.notes.contains(
+                &"shop.example: its delivery page says it does not deliver to the delivery country (Netherlands) — say so \
+                  beside that option"
+                    .to_string()
+            ),
+            "got: {:?}",
+            out.notes
+        );
+
+        let out = compare_with(&args(offers()), &looked(Terms::Depends)).unwrap();
+        assert_eq!(row(&out, "unstated").shipping, None);
+        assert!(
+            out.notes.contains(&format!(
+                "shop.example: delivery is charged by weight or destination, so none was added — its terms: {DELIVERY_PAGE}"
+            )),
+            "got: {:?}",
+            out.notes
+        );
+
+        // A page that said nothing, was not found or could not be read
+        // leaves the offer as it was, with no word about why.
+        for nothing in [Terms::Silent, Terms::NoPage, Terms::Unread] {
+            let out = compare_with(&args(offers()), &looked(nothing)).unwrap();
+            assert_eq!(row(&out, "unstated").shipping_source, "unknown");
+            assert!(!out.notes.iter().any(|n| n.contains("delivery page") || n.contains("its terms")), "got: {:?}", out.notes);
+            assert!(out.notes.iter().any(|n| n.contains("item-only") && n.contains("unstated")), "got: {:?}", out.notes);
+        }
+
+        // A shop of an offer that states its shipping gets no note: its
+        // terms were never asked for.
+        let out = compare_with(&args(vec![offer("stated", 10.0, 1, Some(2.5))]), &looked(Terms::NotDelivered)).unwrap();
+        assert!(!out.notes.iter().any(|n| n.contains("does not deliver")), "got: {:?}", out.notes);
+    }
+
+    #[test]
+    fn shops_past_the_allowance_are_named_as_not_looked_up() {
+        let asked = Looked {
+            by_host: HashMap::new(),
+            not_looked_up: vec!["fifth.example".to_string(), "sixth.example".to_string()],
+            country: delivery::country("NL"),
+        };
+        let out = compare_with(&args(vec![offer("a", 10.0, 1, None)]), &asked).unwrap();
+        assert!(
+            out.notes.contains(
+                &"delivery was not looked up at fifth.example, sixth.example: 4 new shops a request — those prices stay \
+                  item-only"
+                    .to_string()
+            ),
+            "got: {:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn with_nothing_looked_up_the_comparison_is_the_one_it_always_was() {
+        // No delivery country, or no desk at all: the same ranking and the
+        // same notes, and each row says where its shipping came from.
+        let offers = || vec![offer("unstated", 5.0, 1, None), elsewhere("stated", 9.0, Some(1.0))];
+        let plain = compare(&args(offers())).unwrap();
+        let unasked = compare_with(&args(offers()), &Looked::default()).unwrap();
+        assert_eq!(serde_json::to_value(&plain).unwrap(), serde_json::to_value(&unasked).unwrap());
+        assert_eq!(plain.best_single.title, "unstated");
+        assert_eq!(plain.notes.len(), 2, "item-only, and no bulk option: {:?}", plain.notes);
+        assert_eq!((row(&plain, "unstated").shipping_source, row(&plain, "stated").shipping_source), ("unknown", "offer"));
+        assert!(plain.rows.iter().all(|r| r.delivery_page.is_none() && r.free_from.is_none()));
+    }
+
+    #[test]
+    fn the_shops_asked_about_are_those_of_unstated_offers_cheapest_per_unit_first() {
+        // The allowance may run out, so the offers that decide the pick go
+        // first: by item price per unit, which is all that is known yet.
+        let at = |host: &str, price: f64, units: u32, shipping: Option<f64>| Offer {
+            url: format!("https://{host}/p"),
+            ..offer(host, price, units, shipping)
+        };
+        let call = args(vec![
+            at("dear.example", 30.0, 1, None),
+            at("stated.example", 1.0, 1, Some(2.0)),
+            at("pack.example", 40.0, 4, None),
+            Offer { url: "not an address".to_string(), ..offer("unreadable", 1.0, 1, None) },
+            at("cheap.example", 20.0, 1, None),
+        ]);
+        let asked: Vec<String> = unstated_cheapest_first(&call).iter().map(|url| url.host_str().unwrap().to_string()).collect();
+        assert_eq!(asked, ["pack.example", "cheap.example", "dear.example"]);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_call_is_refused_before_anything_is_read() {
+        let w = World::with_a_shop_that_reads_well().await;
+        let tool = ComparePricesTool { delivery: Some(Arc::new(w.desk())) };
+        let at_the_shop = |title: &str| Offer { url: w.url(PRODUCT).to_string(), ..offer(title, 12.95, 1, None) };
+
+        let mixed = tool
+            .call(args(vec![at_the_shop("euros"), Offer { currency: "USD".to_string(), ..at_the_shop("dollars") }]))
+            .await
+            .unwrap_err();
+        assert!(mixed.to_string().contains("same currency"), "got: {mixed}");
+        let blank = tool.call(args_in("  ", vec![at_the_shop("unit")])).await.unwrap_err();
+        assert!(blank.to_string().contains("unit_name"), "got: {blank}");
+
+        assert_eq!(w.asked().await, (vec![], 0), "neither the shop nor the model was asked");
+        assert!(w.rows().is_empty());
+    }
+
+    #[tokio::test]
+    async fn compare_prices_looks_up_delivery_for_the_offers_that_state_none() {
+        let w = World::with_a_shop_that_reads_well().await;
+        let tool = ComparePricesTool { delivery: Some(Arc::new(w.desk())) };
+        let product = w.url(PRODUCT).to_string();
+        let call: CompareArgs = serde_json::from_value(serde_json::json!({
+            "unit_name": "widget",
+            "offers": [
+                {"title": "at the shop", "url": product, "price": 12.95, "currency": "EUR"},
+                {"title": "stated", "url": "https://other.example/widget", "price": 13.50, "currency": "EUR", "shipping": 3.95},
+            ]
+        }))
+        .unwrap();
+
+        let out = tool.call(call).await.unwrap();
+
+        let page = w.url(DELIVERY).to_string();
+        let priced = row(&out, "at the shop");
+        assert_eq!((priced.shipping, priced.landed, priced.shipping_source), (Some(5.49), 18.44, "delivery_page"));
+        assert_eq!((priced.delivery_page.as_deref(), priced.free_from), (Some(page.as_str()), Some(40.0)));
+        assert_eq!(out.best_single.title, "stated", "17.45 delivered against 18.44");
+        // The shop of the offer that stated its shipping was not asked.
+        assert_eq!(w.asked().await, (vec![PRODUCT.to_string(), DELIVERY.to_string()], 1));
+        // What goes back to the main model is numbers and the page's
+        // address: nothing the shop's page said.
+        let handed = serde_json::to_string(&out).unwrap();
+        for said in ["Wij bezorgen", "werkdagen", "afhaalpunt", "bezorging gratis", "Widget 500"] {
+            assert!(!handed.contains(said), "{said:?} reached the model: {handed}");
+        }
+        let counts = w.metrics.render();
+        for line in [
+            "scout_compared_offers_total{shipping=\"delivery_page\"} 1",
+            "scout_compared_offers_total{shipping=\"offer\"} 1",
+            "scout_compared_offers_total{shipping=\"unknown\"} 0",
+        ] {
+            assert!(counts.contains(&format!("{line}\n")), "{line} is missing:\n{counts}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_delivery_country_nothing_is_read_and_nothing_changes() {
+        let w = World::with_a_shop_that_reads_well().await;
+        let nowhere = DeliveryDesk::new(&w.core.deps, w.observer.clone(), Arc::new(delivery::ShopPages::default()), None, Vec::new());
+        let tool = ComparePricesTool { delivery: Some(Arc::new(nowhere)) };
+        let offers = || vec![Offer { url: w.url(PRODUCT).to_string(), ..offer("at the shop", 12.95, 1, None) }, elsewhere("stated", 13.5, Some(3.95))];
+
+        let out = tool.call(args(offers())).await.unwrap();
+
+        assert_eq!(serde_json::to_value(&out).unwrap(), serde_json::to_value(compare(&args(offers())).unwrap()).unwrap());
+        assert!(!out.notes.iter().any(|n| n.contains("country") || n.contains("delivery page")), "nothing is said of it: {:?}", out.notes);
+        assert_eq!(w.asked().await, (vec![], 0));
+        // The offers are counted all the same.
+        assert!(w.metrics.render().contains("scout_compared_offers_total{shipping=\"unknown\"} 1\n"), "{}", w.metrics.render());
     }
 }

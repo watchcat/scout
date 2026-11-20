@@ -219,19 +219,7 @@ impl Config {
             None => 20,
         };
 
-        // The new name first, the MiniMax name after it, so both spellings
-        // of a deployment's `.env` read the same provider.
-        let either = |new: &str, old: &str| non_empty(new).or_else(|| non_empty(old));
-        let llm_api_key = either("LLM_API_KEY", "MINIMAX_API_KEY")
-            .context("missing required env var LLM_API_KEY (MINIMAX_API_KEY is read too)")?;
-        let llm_base_url = either("LLM_BASE_URL", "MINIMAX_BASE_URL")
-            .unwrap_or_else(|| crate::agent::DEFAULT_BASE_URL.to_string());
-        let llm_model = non_empty("LLM_MODEL").unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());
-        let side_llm = non_empty("SIDE_LLM_MODEL").map(|model| SideLlm {
-            api_key: non_empty("SIDE_LLM_API_KEY").unwrap_or_else(|| llm_api_key.clone()),
-            base_url: non_empty("SIDE_LLM_BASE_URL").unwrap_or_else(|| llm_base_url.clone()),
-            model,
-        });
+        let Models { llm_api_key, llm_base_url, llm_model, side_llm } = Models::from_lookup(&get)?;
 
         Ok(Self {
             telegram_bot_token: required("TELEGRAM_BOT_TOKEN")?,
@@ -271,6 +259,57 @@ pub struct SideLlm {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+}
+
+impl SideLlm {
+    /// Where the side calls go, by the environment alone: the side
+    /// provider where one is named, and the main one where not.
+    ///
+    /// For a tool run outside Scout that needs the model and nothing else
+    /// a `Config` asks for — `examples/delivery_as_read.rs` measures a
+    /// prompt and has no use for a bot's token.
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let models = Models::from_lookup(&get)?;
+        Ok(models.side_llm.unwrap_or(SideLlm {
+            api_key: models.llm_api_key,
+            base_url: models.llm_base_url,
+            model: models.llm_model,
+        }))
+    }
+}
+
+/// The model settings as the environment gives them. Read in one place so
+/// that a `Config` and a `SideLlm` read alone cannot come to differ on a
+/// name or on which of two wins.
+struct Models {
+    llm_api_key: String,
+    llm_base_url: String,
+    llm_model: String,
+    side_llm: Option<SideLlm>,
+}
+
+impl Models {
+    fn from_lookup(get: &impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let non_empty = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+        // The new name first, the MiniMax name after it, so both spellings
+        // of a deployment's `.env` read the same provider.
+        let either = |new: &str, old: &str| non_empty(new).or_else(|| non_empty(old));
+        let llm_api_key = either("LLM_API_KEY", "MINIMAX_API_KEY")
+            .context("missing required env var LLM_API_KEY (MINIMAX_API_KEY is read too)")?;
+        let llm_base_url = either("LLM_BASE_URL", "MINIMAX_BASE_URL")
+            .unwrap_or_else(|| crate::agent::DEFAULT_BASE_URL.to_string());
+        let llm_model = non_empty("LLM_MODEL").unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());
+        let side_llm = non_empty("SIDE_LLM_MODEL").map(|model| SideLlm {
+            api_key: non_empty("SIDE_LLM_API_KEY").unwrap_or_else(|| llm_api_key.clone()),
+            base_url: non_empty("SIDE_LLM_BASE_URL").unwrap_or_else(|| llm_base_url.clone()),
+            model,
+        });
+        Ok(Self { llm_api_key, llm_base_url, llm_model, side_llm })
+    }
 }
 
 /// Ordered so callers can treat the first id as "whoever set this up".
@@ -369,6 +408,56 @@ mod tests {
 
         env.remove("SIDE_LLM_MODEL");
         assert_eq!(load(&env).unwrap().side_llm, None, "a key and an address name no model, so nothing is sent there");
+    }
+
+    #[test]
+    fn where_the_side_calls_go_can_be_read_without_the_rest_of_a_config() {
+        // For a tool run outside Scout, such as an example that measures a
+        // prompt: the model's settings alone, by the same names and in the
+        // same order a Config reads them, and none of the bot's.
+        let only = |pairs: &[(&'static str, &'static str)]| {
+            let env: HashMap<&str, &str> = pairs.iter().copied().collect();
+            SideLlm::from_lookup(|k| env.get(k).map(|v| v.to_string()))
+        };
+        let side = |api_key: &str, base_url: &str, model: &str| SideLlm {
+            api_key: api_key.into(),
+            base_url: base_url.into(),
+            model: model.into(),
+        };
+        // No side provider: the side calls go to the main one.
+        assert_eq!(only(&[("MINIMAX_API_KEY", "mk")]).unwrap(), side("mk", crate::agent::DEFAULT_BASE_URL, crate::agent::DEFAULT_MODEL));
+        assert_eq!(
+            only(&[("LLM_API_KEY", "lk"), ("LLM_BASE_URL", "https://llm.example/v1"), ("LLM_MODEL", "main-model")]).unwrap(),
+            side("lk", "https://llm.example/v1", "main-model")
+        );
+        // One named: that one, with the main provider's key and address
+        // where it gives none of its own.
+        assert_eq!(
+            only(&[("LLM_API_KEY", "lk"), ("LLM_MODEL", "main-model"), ("SIDE_LLM_MODEL", "cheaper-model")]).unwrap(),
+            side("lk", crate::agent::DEFAULT_BASE_URL, "cheaper-model")
+        );
+        assert_eq!(
+            only(&[
+                ("LLM_API_KEY", "lk"),
+                ("SIDE_LLM_MODEL", "cheaper-model"),
+                ("SIDE_LLM_BASE_URL", "https://other.example/v1"),
+                ("SIDE_LLM_API_KEY", "ok"),
+            ])
+            .unwrap(),
+            side("ok", "https://other.example/v1", "cheaper-model")
+        );
+        // No key under either name is said by name; a token for Telegram
+        // or a key for search is not asked for.
+        let err = only(&[("LLM_MODEL", "main-model")]).expect_err("no key");
+        assert!(err.to_string().contains("LLM_API_KEY"), "{err}");
+
+        // And it is where a Config of the same environment sends them.
+        let mut env = base_env();
+        let alone = |env: &HashMap<&str, &str>| SideLlm::from_lookup(|k| env.get(k).map(|v| v.to_string())).unwrap();
+        let cfg = load(&env).unwrap();
+        assert_eq!(alone(&env), side(&cfg.llm_api_key, &cfg.llm_base_url, &cfg.llm_model));
+        env.insert("SIDE_LLM_MODEL", "cheaper-model");
+        assert_eq!(Some(alone(&env)), load(&env).unwrap().side_llm);
     }
 
     #[test]

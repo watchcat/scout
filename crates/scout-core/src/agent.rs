@@ -251,6 +251,9 @@ pub const SIDE_CONTINUATION: &str = "continuation";
 pub const SIDE_EXTRACT: &str = "extract";
 pub const SIDE_PHOTO: &str = "photo";
 pub const SIDE_PAGE: &str = "page";
+/// A shop's delivery page, read for its terms. Not `page`: that one is a
+/// PDF's page read from its picture.
+pub const SIDE_DELIVERY: &str = "delivery";
 
 /// One tool-less side call: `preamble` and `prompt` to the side model,
 /// bounded by `budget`, timed and counted under `call` for the trial of
@@ -269,13 +272,28 @@ pub(crate) async fn side_call(
     preamble: &str,
     prompt: impl Into<rig::completion::Message> + Send,
 ) -> Result<String> {
+    side_call_with(&d.side, d.metrics, call, budget, preamble, prompt).await
+}
+
+/// `side_call` for a caller that cannot hold the deps: a rig tool owns its
+/// fields, and `AgentDeps` is only ever borrowed. Such a caller keeps the
+/// side model and the metrics and asks through this, so its call is built,
+/// bounded and counted as every other.
+pub(crate) async fn side_call_with(
+    side: &SideModel,
+    metrics: &crate::metrics::Metrics,
+    call: &'static str,
+    budget: std::time::Duration,
+    preamble: &str,
+    prompt: impl Into<rig::completion::Message> + Send,
+) -> Result<String> {
     use rig::client::CompletionClient;
     use rig::completion::Prompt;
-    let agent = d.side.llm.agent(&d.side.name).preamble(preamble).build();
+    let agent = side.llm.agent(&side.name).preamble(preamble).build();
     let started = std::time::Instant::now();
     let (outcome, result) = match tokio::time::timeout(budget, agent.prompt(prompt).extended_details()).await {
         Ok(Ok(response)) => {
-            d.metrics.side_call_tokens(call, &d.side.name, response.usage);
+            metrics.side_call_tokens(call, &side.name, response.usage);
             let text = crate::text::strip_thinking(&response.output);
             if text.trim().is_empty() {
                 ("empty", Err(anyhow::anyhow!("the model answered with nothing besides thinking")))
@@ -286,7 +304,7 @@ pub(crate) async fn side_call(
         Ok(Err(e)) => ("failed", Err(e.into())),
         Err(_) => ("timeout", Err(anyhow::anyhow!("the model did not answer in time"))),
     };
-    d.metrics.side_call(call, &d.side.name, outcome, started.elapsed());
+    metrics.side_call(call, &side.name, outcome, started.elapsed());
     result
 }
 
@@ -668,6 +686,24 @@ pub fn fare_market(facts: &[(String, String)]) -> Option<String> {
         })
 }
 
+/// The country delivery is asked about: the profile's, never the model's
+/// choice. The `delivery_country` fact decides where there is one, and
+/// otherwise any other `delivery_` fact, since a real profile keeps a city
+/// ("Hilversum, NL"). Of a value only its last part after a comma is
+/// read, as a code or a name `tools::delivery` knows. It is not tokenised
+/// as `search_languages` does it: `de`, `at` and `it` are words, and a
+/// wrong language costs a query where a wrong country prices a delivery.
+///
+/// Not `fare_market`, which is the flights' and reads "Hilversum, NL" as
+/// nothing.
+pub(crate) fn delivery_country(facts: &[(String, String)]) -> Option<&'static crate::tools::delivery::Country> {
+    let named = |value: &str| crate::tools::delivery::country(value.rsplit(',').next().unwrap_or(value));
+    match facts.iter().find(|(key, _)| key == "delivery_country") {
+        Some((_, value)) => named(value),
+        None => facts.iter().filter(|(key, _)| key.starts_with("delivery_")).find_map(|(_, value)| named(value)),
+    }
+}
+
 /// The booking fee in force, or nothing when flights are not configured.
 pub(crate) fn markup_rate(d: &AgentDeps) -> f64 {
     d.duffel.as_ref().map_or(0.0, |c| c.markup_rate())
@@ -689,6 +725,22 @@ pub fn build_agent(
     // One memo per request: a route asked for twice in one question is
     // answered from it rather than bought again.
     let flights = std::sync::Arc::new(crate::tools::budget::FlightBudget::default());
+    // One desk per request for what the shops charge to deliver: it holds
+    // the request's allowance of new shops. The country it asks about is
+    // the profile's, and the marketplaces of the second-hand list are not
+    // asked at all, since delivery there is between two people.
+    let between_people = effective_sites(facts, &d.secondhand_sites);
+    // And one memo of what fetch_page learns of the shops' pages, which
+    // the desk reads: where a shop links its delivery page, and which
+    // shops said no.
+    let shops = std::sync::Arc::new(crate::tools::delivery::ShopPages::default());
+    let delivery = std::sync::Arc::new(crate::tools::delivery::DeliveryDesk::new(
+        d,
+        observer.clone(),
+        shops.clone(),
+        delivery_country(facts),
+        between_people.clone(),
+    ));
     let mut builder = d
         .llm
         .agent(&d.model)
@@ -698,16 +750,16 @@ pub fn build_agent(
             perplexity: d.perplexity.clone(),
             budget: budget.clone(),
         })
-        .tool(FetchPageTool::new(d.web.clone(), d.renderer.clone()))
+        .tool(FetchPageTool::new(d.web.clone(), d.renderer.clone()).noting(shops))
         .tool(SecondhandSearchTool {
             client: d.kagi.clone(),
             web: d.web.clone(),
             ebay: d.ebay.clone(),
             marktplaats: d.marktplaats.clone(),
-            sites: effective_sites(facts, &d.secondhand_sites),
+            sites: between_people,
             budget,
         })
-        .tool(ComparePricesTool)
+        .tool(ComparePricesTool { delivery: Some(delivery) })
         .tool(RecordPurchaseTool { store: d.store.clone(), account_id })
         .tool(QueryPurchasesTool { store: d.store.clone(), account_id })
         .tool(ListRemindersTool { store: d.store.clone(), account_id })
@@ -761,7 +813,11 @@ mod tests {
         // `side_call` builds the agent itself, so a site can only reach the
         // main model by building its own — which is what this looks for,
         // in the files whose model calls are side calls.
-        for (name, src) in [("vision.rs", include_str!("vision.rs")), ("inbox.rs", include_str!("inbox.rs"))] {
+        for (name, src) in [
+            ("vision.rs", include_str!("vision.rs")),
+            ("inbox.rs", include_str!("inbox.rs")),
+            ("tools/delivery.rs", include_str!("tools/delivery.rs")),
+        ] {
             let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
             for forbidden in ["d.llm", "deps.llm", "d.model", "deps.model", ".agent("] {
                 assert!(!src.contains(forbidden), "{name} reaches a model past side_call: {forbidden}");
@@ -840,6 +896,38 @@ mod tests {
             assert!(page.contains(&format!("{line}\n")), "{line} is missing:\n{page}");
         }
         assert!(page.contains("scout_side_call_ms_total{call=\"title\",model=\"side-model\"} "), "{page}");
+    }
+
+    #[tokio::test]
+    async fn a_side_call_needs_only_the_side_model_and_is_counted_under_its_own_name() {
+        // A tool owns its fields and cannot hold the deps `side_call`
+        // borrows. The delivery desk holds the side model and the metrics,
+        // and asks through this: the same call, timed and counted the same.
+        let side = wiremock::MockServer::start().await;
+        model_saying(&side, "<think>reading the table</think>{\"delivers\": true}").await;
+        let model = SideModel { llm: llm_client("sk", &side.uri()).unwrap(), name: "side-model".into() };
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+
+        let answer = side_call_with(&model, metrics, SIDE_DELIVERY, TITLE_BUDGET, "One JSON object.", "Shop: shop.example")
+            .await
+            .unwrap();
+
+        assert_eq!(answer, "{\"delivers\": true}", "the reasoning is stripped, as for any side call");
+        let asked = side.received_requests().await.unwrap();
+        assert_eq!(asked.len(), 1);
+        let body = String::from_utf8_lossy(&asked[0].body).to_string();
+        assert!(body.contains("\"model\":\"side-model\""), "{body}");
+        assert!(body.contains("One JSON object.") && body.contains("Shop: shop.example"), "{body}");
+        let page = metrics.render();
+        for line in [
+            "scout_side_calls_total{call=\"delivery\",model=\"side-model\",outcome=\"ok\"} 1",
+            "scout_side_call_tokens_total{call=\"delivery\",model=\"side-model\",kind=\"input\"} 7",
+            "scout_side_call_tokens_total{call=\"delivery\",model=\"side-model\",kind=\"output\"} 3",
+        ] {
+            assert!(page.contains(&format!("{line}\n")), "{line} is missing:\n{page}");
+        }
+        assert!(page.contains("scout_side_call_ms_total{call=\"delivery\",model=\"side-model\"} "), "{page}");
+        assert!(page.contains("page, delivery"), "the page's help names the call: {page}");
     }
 
     #[tokio::test]
@@ -958,6 +1046,26 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_build_hands_the_desk_to_compare_prices_and_the_memo_to_fetch_page() {
+        // A source assertion, as for the observer above. Without the desk
+        // the tool is the pure one: every comparison would go without
+        // delivery while every test of the desk stayed green.
+        let src = include_str!("agent.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
+        assert!(src.contains(".tool(ComparePricesTool { delivery: Some(delivery) })"), "compare_prices must be given the desk");
+        assert!(src.contains("DeliveryDesk::new("), "which is built per request");
+        // The country is the profile's and the marketplaces are the
+        // person's own list: neither is the model's to choose.
+        assert!(src.contains("delivery_country(facts),"), "the desk must be told the profile's country");
+        assert!(src.contains("between_people.clone(),"), "and which sites are between people");
+        // One memo for the request, written by fetch_page and read by the
+        // desk: a page the model opened is not fetched again for its
+        // links, and a shop that refused is not asked again.
+        assert!(src.contains("FetchPageTool::new(d.web.clone(), d.renderer.clone()).noting(shops)"), "fetch_page must note what it reads");
+        assert!(src.contains("        shops.clone(),\n        delivery_country(facts),"), "and the desk must be given the same memo");
+    }
+
+    #[test]
     fn the_fare_market_comes_from_the_delivery_country() {
         // Without this Ignav answers in USD, rank() drops every row for
         // being in another currency, and the second provider silently does
@@ -973,6 +1081,31 @@ mod tests {
         // guessing a country for someone.
         assert_eq!(fare_market(&[]), None);
         assert_eq!(fare_market(&facts(&[("shoe_size", "44")])), None);
+    }
+
+    #[test]
+    fn the_delivery_country_is_the_profiles_and_a_city_with_a_code_counts() {
+        let code = |pairs: &[(&str, &str)]| delivery_country(&facts(pairs)).map(|c| c.code);
+        assert_eq!(code(&[("delivery_country", "NL")]), Some("NL"));
+        assert_eq!(code(&[("delivery_country", "nl")]), Some("NL"));
+        assert_eq!(code(&[("delivery_country", "Netherlands")]), Some("NL"));
+        assert_eq!(code(&[("delivery_country", "Deutschland")]), Some("DE"));
+        // A real profile stores a city, not a country, as
+        // `search_languages_come_from_the_delivery_country` says.
+        assert_eq!(code(&[("delivery_city", "Hilversum, NL")]), Some("NL"));
+        assert_eq!(code(&[("delivery_address", "Dorpsstraat 1, Hilversum, Netherlands")]), Some("NL"));
+        // Where the country is said outright, that decides, whatever
+        // else is kept and wherever it sorts.
+        assert_eq!(code(&[("delivery_city", "Hilversum, NL"), ("delivery_country", "Germany")]), Some("DE"));
+        assert_eq!(code(&[("delivery_city", "Hilversum, NL"), ("delivery_country", "Japan")]), None, "not a guess from an older fact");
+        // Not tokenised, as the search languages are: `de`, `at` and
+        // `it` are words.
+        assert_eq!(code(&[("delivery_note", "leave it at the door, de buren zijn thuis")]), None);
+        // A country the table does not have, and nothing known at all:
+        // nothing is read for a country nobody named.
+        assert_eq!(code(&[("delivery_country", "JP")]), None);
+        assert_eq!(code(&[("shoe_size", "44")]), None);
+        assert_eq!(code(&[]), None);
     }
 
     #[test]

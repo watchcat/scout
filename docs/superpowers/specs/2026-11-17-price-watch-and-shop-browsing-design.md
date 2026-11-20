@@ -144,6 +144,19 @@ and the amounts in the message are Rust's; the text is a template.
 
 Ended watches are pruned ninety days after they end, in maintenance.
 
+_As built, 2026-11-20, where it is more than the above._ The table has two
+columns more, `channel` and `address`: the chat the watch was asked for in,
+as a reminder keeps it, and where its message goes — not wherever the
+account last spoke, which in a group is the difference. An account watches
+one address once at a time; a second `watch_price` on it says which watch
+is there. A check a shop refuses (a block notice, a bot check) is counted
+`refused` and is neither a price nor one of the three days: nothing was
+learnt of the page. A watch past `expires_at` is read once more at the next
+tick and ended there: `hit` if the price got there, `expired` otherwise.
+A pass reads one page at a time, gives a read up after 90 seconds, and
+takes up no further watch after thirty minutes; what it leaves is due at
+the next tick.
+
 `/metrics`: `scout_price_watch_checks_total{outcome}` (`read`, `unreadable`,
 `refused`) and `scout_price_watches_ended_total{why}`.
 

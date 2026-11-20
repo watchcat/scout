@@ -1539,6 +1539,35 @@ mod tests {
     }
 
     #[test]
+    fn the_readme_says_what_a_watch_is_in_the_numbers_held_here() {
+        // The README spells the numbers out, and nothing else would notice
+        // one of them changing here and not there.
+        let readme = include_str!("../../../README.md");
+        let entry = readme.split("- **Price watches.**").nth(1).expect("the README says what a price watch is");
+        let entry = entry.split("\n- ").next().unwrap().split_whitespace().collect::<Vec<_>>().join(" ");
+        let spelt = |n: i64| match n {
+            3 => "three",
+            10 => "ten",
+            60 => "sixty",
+            other => panic!("the README has no word yet for {other}: write it there and here"),
+        };
+        for said in [
+            format!("{} at a time", spelt(MAX_LIVE)),
+            format!("at {} days", spelt(DAYS)),
+            format!("{} days running", spelt(UNREADABLE_DAYS)),
+            "once a day".to_string(),
+            "exactly one message".to_string(),
+            "no model in the loop".to_string(),
+            "says what it read".to_string(),
+        ] {
+            assert!(entry.to_lowercase().contains(&said), "the README's entry does not say {said:?}: {entry}");
+        }
+        // And what a watch does not promise is said where the limits are.
+        let limits = readme.split("## Honest limitations").nth(1).expect("the README has its limitations");
+        assert!(limits.contains("**A watch reads the page's own number, once a day.**"));
+    }
+
+    #[test]
     fn a_check_costs_http_and_nothing_else() {
         // No model is asked whether a price is under a target. A source
         // assertion, as `every_side_call_is_built_on_the_side_model_and_nowhere_else`

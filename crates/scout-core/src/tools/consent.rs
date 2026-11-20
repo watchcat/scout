@@ -33,8 +33,12 @@
 //! coolblue.nl's is one: the element `<dialog>`, open, with no role
 //! written on it and nothing to keep it out of snippets. So of the five
 //! dialogs seen, four carry a mark, and the fifth did no harm where it
-//! stood. Nor does it know a dialog whose words of consent are in a
-//! language no dialog was seen in.
+//! stood.
+//!
+//! Dialogs were seen in Dutch and in English only. The German and the
+//! French words of consent below are what the same consent tools write
+//! in those languages, and are untested on a real page. A dialog in any
+//! other language is not known by its words.
 
 use super::fetch::{collapse_ws, decode_entities};
 use std::borrow::Cow;
@@ -79,14 +83,41 @@ const SAID_WITHIN_CHARS: usize = 200;
 /// Cookiebot's Dutch, "consent" and "allow" in its English, "agree" and
 /// "accept" on amazon.nl, "toestemming" and "akkoord" in OneTrust's on
 /// zooplus.nl, "accepteren" on coolblue.nl. Each of the four that carry
-/// a mark says two of them. None is here because a dialog might say it:
-/// no German or French dialog was seen, and one in either language is
-/// not known by its words.
+/// a mark says two of them. None of these eight is here because a
+/// dialog might say it.
 ///
 /// Whole words, because a shop says "allows" and "acceptable" of what
 /// it sells.
 const CONSENT_WORDS: [&str; 8] =
     ["accept", "accepteren", "agree", "akkoord", "allow", "consent", "toestaan", "toestemming"];
+
+/// The same words of consent in German and in French, as the same
+/// consent tools write them there. These nine are here because a dialog
+/// might say them: none was read off a saved dialog, which were in Dutch
+/// and in English only, and none has been tried on a real page. They are
+/// kept apart from the eight so that it stays plain which is which.
+///
+/// What lets them in unseen is where the check stands. A word of consent
+/// is the third thing asked of a block, after the mark on its tag and
+/// "cookie" in its first words, so a word here that no dialog says moves
+/// nothing by being here. Left out, a German or a French dialog stayed
+/// in front of its page for want of a word.
+const CONSENT_WORDS_NOT_SEEN: [&str; 9] = [
+    "akzeptieren",
+    "zustimmen",
+    "zustimmung",
+    "einverstanden",
+    "zulassen",
+    "erlauben",
+    "accepter",
+    "autoriser",
+    "consentement",
+];
+
+/// Whether a word, in lower case, is one of consent.
+fn is_of_consent(word: &str) -> bool {
+    CONSENT_WORDS.contains(&word) || CONSENT_WORDS_NOT_SEEN.contains(&word)
+}
 
 /// The document with every consent dialog moved to its end, so that the
 /// page is read first and the dialog with whatever room is left. A
@@ -399,7 +430,7 @@ fn says_consent(block: &str, budget: &mut Budget) -> Option<bool> {
             }
             _ => {}
         }
-        if CONSENT_WORDS.contains(&word.as_str()) {
+        if is_of_consent(&word) {
             budget.read += at;
             return Some(true);
         }
@@ -1090,6 +1121,42 @@ mod tests {
             "Read the user agreement.",
             "Twelve to a pack.",
             "",
+        ] {
+            assert!(matches!(read_last(&block(says)), Cow::Borrowed(_)), "{says}");
+        }
+    }
+
+    #[test]
+    fn a_dialog_in_german_or_in_french_is_known_by_its_word_of_consent() {
+        // No dialog was seen in either language. These are the words
+        // the same consent tools write there, taken on trust and made
+        // up here into blocks that say no other word of consent.
+        let block = |says: &str| format!("<body><div data-nosnippet><h2>Cookies</h2><p>{says}</p></div><p>The page.</p></body>");
+        for says in [
+            "Alle akzeptieren",
+            "Ich möchte zustimmen",
+            "Zustimmung",
+            "Einverstanden",
+            "Alle zulassen",
+            "Auswahl erlauben",
+            "ZUSTIMMEN",
+        ] {
+            let html = block(says);
+            assert_eq!(read(&html).text, format!("The page. Cookies {says}"), "German: {says}");
+        }
+        for says in ["Tout accepter", "Tout autoriser", "Consentement", "ACCEPTER"] {
+            let html = block(says);
+            assert_eq!(read(&html).text, format!("The page. Cookies {says}"), "French: {says}");
+        }
+        // Whole words here as well, and a block of the page in either
+        // language that says none of them stays where it is.
+        for says in [
+            "Akzeptierte Zahlungsarten",
+            "Zulassungsfrei",
+            "Mit Erlaubnis des Herstellers",
+            "Autorisation du fabricant",
+            "Kekse mit Schokolade, 200 g. In den Warenkorb.",
+            "Biscuits au chocolat, 200 g. Ajouter au panier.",
         ] {
             assert!(matches!(read_last(&block(says)), Cow::Borrowed(_)), "{says}");
         }

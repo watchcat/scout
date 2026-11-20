@@ -28,9 +28,9 @@ pub struct Config {
     /// flights alone.
     pub flight_model: String,
     /// A second provider for the tool-less side calls — a thread's title,
-    /// the continuation check, a mailed booking's reading, a photo's and a
-    /// page's — so a cheaper or sharper model can be tried where no tool
-    /// call and no reasoning mode is at stake. `SIDE_LLM_MODEL` turns it
+    /// the continuation check, a mailed booking's reading, a photo's, a
+    /// page's and a shop's delivery page's — so a cheaper or sharper model
+    /// can be tried where no tool call and no reasoning mode is at stake. `SIDE_LLM_MODEL` turns it
     /// on; `SIDE_LLM_BASE_URL` and `SIDE_LLM_API_KEY` default to the main
     /// provider's, so a cheaper model at the same provider is one variable
     /// and another provider is three. `None` sends the side calls where

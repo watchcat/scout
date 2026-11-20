@@ -6764,6 +6764,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scout-browser"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "scout-core"
 version = "0.1.0"
 dependencies = [

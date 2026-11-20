@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/scout-api", "crates/scout-core", "crates/scout-telegram", "crates/scout-web"]
+members = ["crates/scout-api", "crates/scout-browser", "crates/scout-core", "crates/scout-telegram", "crates/scout-web"]
 
 # Dev profile tuned for size: the default debug=2 is what bloats duckdb-sys's
 # libduckdb.a to ~1.4 GB and every other C++-or-large-dep object file along

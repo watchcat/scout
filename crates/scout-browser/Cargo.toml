@@ -1,0 +1,9 @@
+[package]
+name = "scout-browser"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A shop's page driven over HTTP, one shop a session"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

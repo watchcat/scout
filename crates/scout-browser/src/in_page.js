@@ -324,7 +324,10 @@ function typeInPage(n, text, judged) {
   el.focus()
   if (el.select) el.select()
   if (caretHolder() !== el) return { moved: true }
-  if (JSON.stringify(fieldOf(el)) !== judged) return { changed: true }
+  // Not what was judged: nothing is typed, and what it is now goes back to
+  // be judged as that.
+  const now = fieldOf(el)
+  if (JSON.stringify(now) !== judged) return { changed: true, field: now, key: JSON.stringify(now) }
   const strays = []
   const heard = (event) => {
     const into = event.composedPath ? event.composedPath()[0] : event.target

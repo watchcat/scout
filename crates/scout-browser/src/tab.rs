@@ -533,15 +533,37 @@ impl Tab {
         }
         // The caret is given, the field is looked at again against what
         // was judged, and the text is put in, all in one turn of script in
-        // the page: `typeInPage` says why. Asked once and not again: an
-        // answer that did not come may be of a typing that did happen.
-        let typed = match self.in_page("typeInPage", &[json!(n), json!(text), json!(target.key)]).await {
-            Ok(typed) => typed,
-            Err(CallError::Answered(why)) => {
-                refused.push(format!("the page did not say whether that was typed: {why}"));
+        // the page: `typeInPage` says why. A field that is no longer what
+        // was judged is not typed into; what it has become is judged, and
+        // if that may be typed into it is asked again, as that. Twice: a
+        // field that is another each time it is looked at is left alone.
+        let mut key = target.key;
+        let mut tries = 0;
+        let typed = loop {
+            // Each asking is made once and not again: an answer that did
+            // not come may be of a typing that did happen.
+            let typed = match self.in_page("typeInPage", &[json!(n), json!(text), json!(key)]).await {
+                Ok(typed) => typed,
+                Err(CallError::Answered(why)) => {
+                    refused.push(format!("the page did not say whether that was typed: {why}"));
+                    return Ok(());
+                }
+                Err(e) => return Err(gone(e)),
+            };
+            if typed["changed"] != true {
+                break typed;
+            }
+            let became: Field = serde_json::from_value(typed["field"].clone()).map_err(|e| Broken::Failed(format!("the page's answer could not be read: {e}")))?;
+            if let Some(why) = typing_refused(&became, text) {
+                refused.push(why.to_string());
                 return Ok(());
             }
-            Err(e) => return Err(gone(e)),
+            tries += 1;
+            if tries > 2 {
+                refused.push("the page changes what that field is each time it is given the caret, so nothing was typed".to_string());
+                return Ok(());
+            }
+            key = typed["key"].as_str().unwrap_or_default().to_string();
         };
         if let Some(why) = typed["error"].as_str() {
             refused.push(why.to_string());
@@ -549,10 +571,6 @@ impl Tab {
         }
         if typed["moved"] == true {
             refused.push("the page moved the caret away from that field, so nothing was typed".to_string());
-            return Ok(());
-        }
-        if typed["changed"] == true {
-            refused.push("the page changed what that field is as it was given the caret, so nothing was typed".to_string());
             return Ok(());
         }
         if typed["strayed"].as_u64().unwrap_or_default() > 0 {
@@ -1789,7 +1807,32 @@ mod tests {
         let pages = Pages::serve(&[a_field_that_answers_the_caret("this.type = 'password'; this.name = 'secret'")]).await;
         let Some((mut tab, _)) = open(&pages, "/").await else { return };
         let done = type_into(&mut tab, 1, "1011 PN").await;
-        assert_eq!(done.refused, ["the page changed what that field is as it was given the caret, so nothing was typed"]);
+        // Judged again as what it has become, and refused as that.
+        assert_eq!(done.refused, ["a password field is never typed into"]);
+        assert!(done.seen.text.contains("Typed into: nothing"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_field_that_only_drops_its_grey_text_when_given_the_caret_is_typed_into() {
+        let _one_of_few = testing::gate().await;
+        // Changing on being given the caret is not in itself a trick: what
+        // the field has become is judged, and this is still a postcode field.
+        let pages = Pages::serve(&[a_field_that_answers_the_caret("this.placeholder = ''; this.title = 'Postcode'")]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = type_into(&mut tab, 1, "1011 PN").await;
+        assert_eq!(done.refused, NOTHING);
+        assert!(done.seen.text.ends_with("Typed into: postcode/text"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_field_that_is_another_every_time_it_is_looked_at_is_not_typed_into() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[a_field_that_answers_the_caret("this.title = 'Postcode ' + Math.random(); this.blur()")]).await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = type_into(&mut tab, 1, "1011 PN").await;
+        assert_eq!(done.refused.len(), 1, "{:?}", done.refused);
         assert!(done.seen.text.contains("Typed into: nothing"), "{}", done.seen.text);
         tab.close().await;
     }

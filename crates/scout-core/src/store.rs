@@ -2403,10 +2403,12 @@ impl Store {
     /// watching this address already.
     ///
     /// Both are checked here, under the lock the insert holds, and not only
-    /// by whoever calls: a model repeats a tool call it had no answer to in
-    /// time, and two watches on one page are two messages the day it is
-    /// hit. The address is compared as it is written, since one that
-    /// differs in its query can be another variant at another price.
+    /// by whoever calls. A model does ask twice for one thing: two of three
+    /// page opens in one production run were the same page (see
+    /// `re_reading_a_page_is_free` in `fetch.rs`), and two watches on one
+    /// page are two messages the day it is hit. The address is compared as
+    /// it is written, since one that differs in its query can be another
+    /// variant at another price.
     pub fn start_watch(&self, new: &NewWatch<'_>, cap: i64) -> Result<WatchStarted> {
         let conn = self.conn();
         let there = conn
@@ -8809,8 +8811,8 @@ CREATE TABLE segment_candidates (
 
     #[test]
     fn one_account_watches_one_address_once_at_a_time() {
-        // A model repeats a tool call it had no answer to in time, and two
-        // watches on one page are two messages on the day it is hit.
+        // A model does ask twice for one thing, and two watches on one
+        // page are two messages on the day it is hit.
         let (s, _d) = test_store();
         let now = watch_clock();
         let url = "https://shop.example/p/widget";

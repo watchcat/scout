@@ -41,10 +41,12 @@ pub(crate) const UNREADABLE_DAYS: i64 = 3;
 /// for a watch on a page that never answers, a person is told so.
 pub(crate) const READ_BUDGET: Duration = Duration::from_secs(80);
 
-/// How long after a check a watch is due its next: twenty hours and not
-/// twenty-four, because the tick that looks is hourly. A day's wait would
-/// be met only by the tick after it, and the check would slide an hour
-/// later every day.
+/// How long after a check a watch is due its next: the design's twenty
+/// hours. The tick that looks is hourly, so a watch is read every twenty
+/// hours or twenty-one: somewhat oftener than daily, at an hour that
+/// moves round the clock. A wait of twenty-four would be met by the same
+/// hour's tick or missed by a moment and left to the next, and "once a
+/// day" would then be less than once a day.
 const CHECK_EVERY_HOURS: i64 = 20;
 
 /// The least time between two reads of one host in a pass, the design's

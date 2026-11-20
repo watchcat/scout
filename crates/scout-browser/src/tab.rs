@@ -13,12 +13,16 @@
 //!   nothing, so Chrome is told to fetch nothing ahead (`chrome.rs`);
 //! - it did not see a new tab. Here another window is closed before it has
 //!   fetched anything;
-//! - a press landed on whatever lay over the thing pressed. Here a press is
-//!   only made where the thing itself is.
+//! - a press landed on whatever lay over the thing pressed. Here the page
+//!   is asked what is under the pointer before it comes and again once it
+//!   is there, and nothing is pressed unless it is the thing numbered. The
+//!   pointer going down and coming up are two things a page hears with no
+//!   asking in between, so that much is only known afterwards: a press
+//!   found to have landed elsewhere ends the session.
 
 use crate::address::{address_refused, link_refused, Refused};
 use crate::chrome::{chrome_args, write_preferences};
-use crate::drive::{Action, Broken, Browser, Done, Page, Seen, ADDRESS_CHARS, MARKUP_CHARS, OUTLINE_CHARS, TITLE_CHARS};
+use crate::drive::{Action, Broken, Browser, Done, Page, Seen, ADDRESS_CHARS, MARKUP_CHARS, OUTLINE_CHARS, OUTLINE_WHOLE, TITLE_CHARS};
 use crate::pipe::{CallError, Event, Pipe};
 use crate::site::Shop;
 use crate::typing::{typing_refused, Field};
@@ -134,8 +138,8 @@ impl Browser for Chrome {
             pace: self.pace,
             reaching: self.reaching,
             shared,
+            read: None,
             from: 0,
-            next: 0,
             good: None,
             watcher,
             _proxy: proxy,
@@ -237,10 +241,10 @@ pub struct Tab {
     /// The Chrome's own `reaching`: a test's page server, else nothing.
     reaching: Option<SocketAddr>,
     shared: Arc<Shared>,
-    /// Where the next outline starts in a long page's text.
+    /// The page as it was last read whole.
+    read: Option<Read>,
+    /// Where in that reading's text the part being shown starts.
     from: usize,
-    /// Where the part after it would start, as the page counted it.
-    next: usize,
     /// The last address the page was rightly at.
     good: Option<Url>,
     watcher: tokio::task::JoinHandle<()>,
@@ -252,6 +256,20 @@ fn gone(e: CallError) -> Broken {
     Broken::Failed(e.to_string())
 }
 
+/// A page as it was read whole. Kept so that reading on hands out more of
+/// the same reading: the numbers in it are the ones the page still has.
+struct Read {
+    title: String,
+    url: String,
+    /// Where the page was, in full: `url` is cut to a length.
+    at: String,
+    html: String,
+    /// All of the outline's text, up to [`OUTLINE_WHOLE`].
+    text: String,
+    /// Whether the page's text went on beyond that.
+    cut: bool,
+}
+
 /// The thing a number stands for, as `targetInPage` describes it.
 #[derive(Debug, serde::Deserialize)]
 struct Target {
@@ -259,12 +277,12 @@ struct Target {
     href: Option<String>,
     /// Whether it is a field for choosing a file.
     upload: bool,
-    /// Whether it has a box on the page at all.
-    sized: bool,
     /// Where a press would land on the thing itself, if anywhere.
     point: Option<Point>,
     /// What lies over it, where something does.
     covered: Option<String>,
+    /// Its kind and its words, as the outline writes them after a number.
+    said: String,
     /// What the page says of it as a field.
     field: Field,
 }
@@ -434,7 +452,7 @@ impl Tab {
     }
 
     /// Presses the thing numbered `n`, or says in `refused` why it was not.
-    async fn click(&mut self, n: u32, refused: &mut Vec<String>) -> Result<(), Broken> {
+    async fn click(&mut self, n: u32, refused: &mut Vec<String>, notes: &mut Vec<String>) -> Result<(), Broken> {
         let target = match self.target(n).await? {
             Ok(target) => target,
             Err(why) => {
@@ -453,23 +471,38 @@ impl Tab {
             refused.push(why.why().to_string());
             return Ok(());
         }
-        match (target.point, target.sized) {
-            (Some(at), _) => {
-                let mouse = |kind: &str| json!({ "type": kind, "x": at.x, "y": at.y, "button": "left", "clickCount": 1 });
-                self.call("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": at.x, "y": at.y })).await.map_err(gone)?;
-                self.call("Input.dispatchMouseEvent", mouse("mousePressed")).await.map_err(gone)?;
-                self.call("Input.dispatchMouseEvent", mouse("mouseReleased")).await.map_err(gone)?;
-            }
-            (None, true) => {
-                let over = target.covered.unwrap_or_default();
-                refused.push(format!("something lies over that and would take the press: \"{over}\""));
-            }
-            // A thing with no box, such as a tick box drawn by its label,
-            // has no place to press. It is pressed as a script would.
-            (None, false) => {
-                self.in_page_patiently("pressInPage", &[json!(n)]).await?;
-            }
+        let Some(at) = target.point else {
+            let over = target.covered.unwrap_or_default();
+            refused.push(format!("something lies over that and would take the press: \"{over}\""));
+            return Ok(());
+        };
+        // The press is three things to the page: the pointer arriving, going
+        // down, and coming up. The page hears each and may answer it.
+        self.in_page_patiently("armInPage", &[json!(n)]).await?;
+        self.call("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": at.x, "y": at.y })).await.map_err(gone)?;
+        // After the first, the page is asked again what is under the
+        // pointer: a page that answers its arriving by sliding something
+        // else there has not yet been pressed, and is not.
+        let hit = self.in_page_patiently("hitInPage", &[json!(n), json!(at.x), json!(at.y)]).await?;
+        if hit["on"] != true {
+            let _ = self.in_page("pressedInPage", &[]).await;
+            let over = hit["over"].as_str().unwrap_or_default();
+            refused.push(format!("something came to lie over that as the pointer reached it, and would take the press: \"{over}\""));
+            return Ok(());
         }
+        let mouse = |kind: &str| json!({ "type": kind, "x": at.x, "y": at.y, "button": "left", "clickCount": 1 });
+        self.call("Input.dispatchMouseEvent", mouse("mousePressed")).await.map_err(gone)?;
+        self.call("Input.dispatchMouseEvent", mouse("mouseReleased")).await.map_err(gone)?;
+        // Between down and up nothing can be asked, so where the press
+        // landed is asked afterwards. A press that went to a new page has
+        // nobody left to say; one that is known to have landed on something
+        // else cannot be taken back, and nothing more is done on this page.
+        let took = self.in_page("pressedInPage", &[]).await.unwrap_or(Value::Null);
+        let elsewhere = [&took["down"], &took["click"]].into_iter().filter_map(Value::as_str).find(|on| *on != "it");
+        if let Some(other) = elsewhere {
+            return Err(Broken::Strayed(format!("a press meant for {} landed on something else (\"{other}\"), and the session is over", target.said)));
+        }
+        notes.push(format!("Pressed: {}", target.said));
         Ok(())
     }
 
@@ -556,12 +589,21 @@ impl Tab {
         Ok(())
     }
 
-    /// The page as it is now, with what Chrome said in the meantime.
-    async fn done(&mut self, mut refused: Vec<String>, mut notes: Vec<String>) -> Result<Done, Broken> {
-        let caps = json!({ "title": TITLE_CHARS, "address": ADDRESS_CHARS, "markup": MARKUP_CHARS });
-        let page = self.in_page_patiently("pageInPage", &[json!(OUTLINE_CHARS), json!(self.from), caps]).await?;
+    /// Reads the page afresh, which numbers everything on it anew, and
+    /// shows it from the top, with what Chrome said in the meantime.
+    async fn done(&mut self, refused: Vec<String>, notes: Vec<String>) -> Result<Done, Broken> {
+        let caps = json!({ "title": TITLE_CHARS, "address": ADDRESS_CHARS, "markup": MARKUP_CHARS, "whole": OUTLINE_WHOLE });
+        let page = self.in_page_patiently("pageInPage", &[caps]).await?;
         let text = |key: &str| page[key].as_str().unwrap_or_default().to_string();
-        self.next = page["next"].as_u64().unwrap_or_default() as usize;
+        self.read = Some(Read { title: text("title"), url: text("url"), at: text("at"), html: text("html"), text: text("text"), cut: page["cut"] == true });
+        self.from = 0;
+        self.shown(refused, notes)
+    }
+
+    /// The part at `self.from` of the page as it was last read, with what
+    /// Chrome said in the meantime. Nothing is asked of the page, so
+    /// nothing on it is numbered again.
+    fn shown(&mut self, mut refused: Vec<String>, mut notes: Vec<String>) -> Result<Done, Broken> {
         let status = {
             let mut happened = self.shared.happened.lock().unwrap();
             if let Some(why) = happened.broke {
@@ -579,7 +621,15 @@ impl Tab {
             }
             happened.status
         };
-        let seen = Seen { title: text("title"), url: text("url"), text: text("text"), more: page["more"] == true, status, html: text("html") };
+        let Some(read) = &self.read else {
+            return Err(Broken::Failed("the page was never read".into()));
+        };
+        let text: String = read.text.chars().skip(self.from).take(OUTLINE_CHARS).collect();
+        let more = read.text.chars().nth(self.from + OUTLINE_CHARS).is_some();
+        if !more && read.cut {
+            notes.push(format!("The page goes on, and a session reads no more than {OUTLINE_WHOLE} characters of one."));
+        }
+        let seen = Seen { title: read.title.clone(), url: read.url.clone(), text, more, status, html: read.html.clone() };
         Ok(Done { refused, notes, seen })
     }
 }
@@ -592,19 +642,31 @@ impl Page for Tab {
         // settled before anything is done to it.
         self.hold(&mut refused).await?;
         match action {
-            Action::Read { more } => {
-                self.from = if *more { self.next } else { 0 };
-                return self.done(refused, Vec::new()).await;
+            Action::Read { more: false } => return self.done(refused, notes).await,
+            Action::Read { more: true } => {
+                // Reading on is more of the page as it was read, numbers
+                // and all: read afresh, the page as it has become since
+                // would be numbered anew, and a number the caller holds
+                // would stand for something else.
+                let still_there = match &self.read {
+                    Some(read) => self.address().await? == read.at,
+                    None => false,
+                };
+                if still_there {
+                    self.from += OUTLINE_CHARS;
+                    return self.shown(refused, notes);
+                }
+                notes.push("The page is no longer the one that was being read. This is the page as it is, from the top.".to_string());
+                return self.done(refused, notes).await;
             }
-            Action::Click { n } => self.click(*n, &mut refused).await?,
+            Action::Click { n } => self.click(*n, &mut refused, &mut notes).await?,
             Action::Type { n, text, enter } => self.type_into(*n, text, *enter, &mut refused).await?,
             Action::Select { n, option } => self.select(*n, option, &mut refused, &mut notes).await?,
             Action::Back => self.back(&mut refused).await?,
             Action::Open { url } => self.open(url, &mut refused).await?,
         }
-        // Whatever was done, the next outline starts at the top of what
-        // the page is now, once it has come to rest and is where it may be.
-        self.from = 0;
+        // Whatever was done, the page is read afresh once it has come to
+        // rest and is where it may be.
         self.settle().await;
         self.hold(&mut refused).await?;
         self.done(refused, notes).await
@@ -1204,7 +1266,7 @@ mod tests {
         let pages = Pages::serve(&[home(r#"<button onclick="alert('Uitverkocht'); document.querySelector('h1').textContent = 'after the message'">in de winkelwagen</button>"#)]).await;
         let Some((mut tab, _)) = open(&pages, "/").await else { return };
         let done = press(&mut tab, 1).await;
-        assert_eq!(done.notes, [r#"The page put up a message, which was dismissed: "Uitverkocht""#]);
+        assert_eq!(done.notes, [r#"Pressed: button "in de winkelwagen""#, r#"The page put up a message, which was dismissed: "Uitverkocht""#]);
         assert!(done.seen.text.contains("after the message"), "{}", done.seen.text);
         assert_eq!(done.refused, NOTHING);
         tab.close().await;
@@ -1231,6 +1293,141 @@ mod tests {
         assert_eq!((done.seen.title.as_str(), done.seen.url.as_str()), ("Home", pages.url("/").as_str()));
         assert!(!done.seen.text.contains("secret_total"), "{}", done.seen.text);
         assert_eq!(neighbour.asked(), NOTHING, "neither the link, the picture nor the script reached it");
+        tab.close().await;
+    }
+
+    // ------------------------------- what a number stands for, and what is seen
+
+    #[tokio::test]
+    async fn a_number_means_what_it_meant_when_the_page_was_read_on() {
+        let _one_of_few = testing::gate().await;
+        // A page that puts a button in front of everything a moment after
+        // it is first read. Numbered again at every read, 1 became that
+        // button, and "press 1" after reading on pressed it.
+        let lines: String = (1..=400).map(|n| format!("<p>Line {n:03} of the widget's description.</p>")).collect();
+        let pages = Pages::serve(&[
+            home(&format!(
+                r#"<a href="/next">the next page</a>{lines}
+                   <script>
+                     setTimeout(() => {{
+                       const button = document.createElement('button')
+                       button.textContent = 'Nu kopen'
+                       button.onclick = () => {{ document.title = 'Bought' }}
+                       document.querySelector('main').prepend(button)
+                     }}, 1000)
+                   </script>"#
+            )),
+            page("/next", "Next"),
+        ])
+        .await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert!(first.seen.text.contains(r#"[1] link "the next page""#), "{}", &first.seen.text[..200]);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let on = tab.act(&Action::Read { more: true }).await.unwrap();
+        // Reading on goes on where the first part stopped, in the page as it was read.
+        let joined = first.seen.text.clone() + &on.seen.text;
+        assert!(!on.seen.text.contains("Nu kopen") && joined.matches("Line 158 of").count() == 1, "{}", &on.seen.text[..200]);
+        let done = press(&mut tab, 1).await;
+        assert_eq!((done.seen.title.as_str(), done.refused), ("Next", NOTHING));
+        // And every press says what it pressed, so a caller can see it was what it meant.
+        assert_eq!(done.notes, [r#"Pressed: link "the next page""#]);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_press_that_something_slides_under_is_not_made() {
+        let _one_of_few = testing::gate().await;
+        // The pointer arriving is itself something a page hears, before the press.
+        let pages = Pages::serve(&[home(
+            r#"<button onmouseover="document.getElementById('other').style.cssText = 'position: fixed; inset: 0; display: block'"
+                       onclick="document.title = 'The button was pressed'">the button</button>
+               <button id="other" style="display: none" onclick="document.title = 'Nu kopen was pressed'">Nu kopen</button>"#,
+        )])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let done = press(&mut tab, 1).await;
+        assert_eq!(done.refused, [r#"something came to lie over that as the pointer reached it, and would take the press: "Nu kopen""#]);
+        assert_eq!(done.seen.title, "Home");
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_press_that_lands_elsewhere_all_the_same_is_the_end_of_the_session() {
+        let _one_of_few = testing::gate().await;
+        // Between the pointer going down and coming up there is no asking
+        // the page anything: what can be done is to know afterwards.
+        let pages = Pages::serve(&[home(
+            r#"<button onmousedown="document.getElementById('other').style.cssText = 'position: fixed; inset: 0; display: block'">the button</button>
+               <button id="other" style="display: none">Nu kopen</button>"#,
+        )])
+        .await;
+        let Some((mut tab, _)) = open(&pages, "/").await else { return };
+        let broken = tab.act(&Action::Click { n: 1 }).await.unwrap_err();
+        assert!(matches!(&broken, Broken::Strayed(why) if why.contains(r#"button "the button""#) && why.contains("landed on something else")), "{broken:?}");
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_thing_that_only_wraps_a_frame_is_not_numbered() {
+        let _one_of_few = testing::gate().await;
+        // What is in a frame is not read, so a press that would go into
+        // one presses something nobody was shown.
+        let pages = Pages::serve(&[home(
+            r#"<div role="button" aria-label="Volgende" style="width: 300px; height: 100px"><iframe style="width: 300px; height: 100px; border: 0"
+                 srcdoc="<button style='width: 300px; height: 100px' onclick='parent.document.title = &quot;The frame was pressed&quot;'>Betaal nu</button>"></iframe></div>
+               <button onclick="document.title = 'The button was pressed'">the button</button>"#,
+        )])
+        .await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        assert!(!first.seen.text.contains("Volgende"), "{}", first.seen.text);
+        assert!(first.seen.text.contains(r#"[1] button "the button""#), "{}", first.seen.text);
+        assert_eq!(press(&mut tab, 1).await.seen.title, "The button was pressed");
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn what_a_page_hides_is_neither_read_nor_numbered() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(
+            r#"<p>Seen text.</p>
+               <span style="position: absolute; left: -9999px">Text put off the page.</span>
+               <span style="opacity: 0">Text made transparent.</span>
+               <span style="font-size: 0">Text of no size.</span>
+               <span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Text cut down to a dot.</span>
+               <a href="/trap" style="position: absolute; width: 0; height: 0; overflow: hidden">A link of no size</a>
+               <a href="/trap" style="opacity: 0">A link made transparent</a>
+               <label style="display: inline-block; padding: 8px">
+                 <input type="checkbox" name="gift" style="position: absolute; opacity: 0; width: 0; height: 0"> Als cadeau inpakken
+               </label>
+               <a href="/next">A link that is there</a>"#,
+        )])
+        .await;
+        let Some((mut tab, first)) = open(&pages, "/").await else { return };
+        let text = &first.seen.text;
+        assert!(text.contains("Seen text."), "{text}");
+        for hidden in ["off the page", "transparent", "no size", "a dot"] {
+            assert!(!text.contains(hidden), "{hidden:?} in {text}");
+        }
+        // A tick box drawn by its label is seen by its label, and is pressed there.
+        assert!(text.contains(r#"[1] checkbox "Als cadeau inpakken""#) && text.contains(r#"[2] link "A link that is there""#), "{text}");
+        let done = press(&mut tab, 1).await;
+        assert!(done.seen.text.contains(r#"[1] checkbox (on) "Als cadeau inpakken""#), "{}", done.seen.text);
+        assert_eq!(done.notes, [r#"Pressed: checkbox "Als cadeau inpakken""#]);
+        tab.close().await;
+    }
+
+    #[tokio::test]
+    async fn what_a_password_field_holds_is_not_read_back() {
+        let _one_of_few = testing::gate().await;
+        let pages = Pages::serve(&[home(
+            r#"<label>Wachtwoord <input type="password" name="pw" value="geheim-van-de-winkel"></label>
+               <label>Kortingscode <input type="text" name="code" value="WIDGET10"></label>"#,
+        )])
+        .await;
+        let Some((tab, first)) = open(&pages, "/").await else { return };
+        // What an ordinary field holds is shown, which is how the other is known to be kept back.
+        assert!(first.seen.text.contains(r#"[2] field "Kortingscode" = "WIDGET10""#), "{}", first.seen.text);
+        assert!(first.seen.text.contains(r#"[1] field "Wachtwoord""#) && !first.seen.text.contains("geheim"), "{}", first.seen.text);
         tab.close().await;
     }
 

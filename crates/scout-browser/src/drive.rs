@@ -9,9 +9,13 @@ use crate::site::Shop;
 use std::future::Future;
 use url::Url;
 
-/// How much of a page's visible text one outline carries. The spec's
-/// number, and the prototype's.
+/// How much of a page's text one outline carries. The spec's number, and
+/// the prototype's.
 pub const OUTLINE_CHARS: usize = 6000;
+
+/// How much of one page's text is read at all: twenty parts. A session has
+/// 25 actions for everything, so no session reads a page further than this.
+pub const OUTLINE_WHOLE: usize = 20 * OUTLINE_CHARS;
 
 // A page can write any of the following at any length, and each of them
 // is handed on to whoever drives the session. The numbers are chosen, not
@@ -65,8 +69,10 @@ pub enum Action {
 pub struct Seen {
     pub title: String,
     pub url: String,
-    /// The visible text with the things that can be pressed numbered, at
-    /// most [`OUTLINE_CHARS`] of it.
+    /// The page's text with the things that can be pressed numbered, at
+    /// most [`OUTLINE_CHARS`] of it. Less what the page hides in the usual
+    /// ways (`lookOf` in `in_page.js` says which), and no nearer to "what a
+    /// person sees" than that: text in the colour of its ground is read.
     pub text: String,
     /// Whether the page goes on after this part.
     pub more: bool,
@@ -100,6 +106,10 @@ pub enum Broken {
     /// The browser could not be started, went away or stopped answering.
     #[error("the browser failed: {0}")]
     Failed(String),
+    /// Something was done that a session's rules exist to prevent, and was
+    /// only known afterwards. Nothing more is done with such a page.
+    #[error("{0}")]
+    Strayed(String),
 }
 
 /// One page of one shop, in a browser of its own.

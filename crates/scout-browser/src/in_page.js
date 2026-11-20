@@ -1,6 +1,8 @@
-// What a session runs inside the page. Ported from scripts/shop-reach.mjs,
-// the prototype the reading of 2026-11-18 was made with: outlineInPage is its
-// function of that name, and the rest are its small helpers.
+// What a session runs inside the page. It began as a port of
+// scripts/shop-reach.mjs, the prototype the reading of 2026-11-18 was made
+// with: outlineInPage is its function of that name, and choosing from a
+// list is its too. Where something is done otherwise than there, the place
+// says what the prototype did and why that was not kept.
 //
 // It runs in a world of its own (Page.createIsolatedWorld), which shares the
 // page's document and none of its script: the page cannot read or renumber

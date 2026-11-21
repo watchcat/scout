@@ -230,11 +230,14 @@ impl Renderer {
 /// from sockets Chrome opens itself. Measured 2026-11-20 on Chrome 157 with
 /// the flags below and no such setting: a page naming a STUN server on
 /// loopback had a datagram delivered there, by literal and by `localhost`
-/// alike, and was handed two host candidates. `disable_non_proxied_udp`
-/// leaves WebRTC only what the proxy can carry, and this proxy carries no
-/// UDP: with it no datagram arrived and gathering ended with no candidate at
-/// all, so a page's script learns no address either. Of the switches, the
-/// one in `chrome_args` does the same on its own and is passed as well;
+/// alike, and was handed two host candidates. Measured the day after: a
+/// TURN server is reached the same way, and so is any address a page gives
+/// one of its own connections as its peer's, with no server named at all.
+/// `disable_non_proxied_udp` leaves WebRTC only what the proxy can carry,
+/// and this proxy carries no UDP: with it nothing arrived by any of those
+/// ways and gathering ended with no candidate at all, so a page's script
+/// learns no address either. Of the switches, the one in `chrome_args` does
+/// the same on its own and is passed as well;
 /// `--force-webrtc-ip-handling-policy` was measured too and changes nothing.
 ///
 /// `net.network_prediction_options`, 2 for never. A page's speculation rules
@@ -303,9 +306,10 @@ fn chrome_args(url: &str, profile: &std::path::Path, proxy: u16) -> Vec<String> 
         // each way holds without the other: measured 2026-11-20 on Chrome
         // 157, with this switch and empty preferences a page's STUN datagram
         // reached none of three loopback listeners and no ICE candidate was
-        // gathered, the same as with the preference and no switch. Said
-        // twice because either is ignored in silence by a Chrome that does
-        // not know it, and a render with neither sends UDP where a page
+        // gathered, the same as with the preference and no switch; the day
+        // after, the same of a TURN server and of a peer the page names.
+        // Said twice because either is ignored in silence by a Chrome that
+        // does not know it, and a render with neither sends UDP where a page
         // points it.
         "--webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
         // --no-sandbox is required to run as a non-root user in a
@@ -486,9 +490,17 @@ mod live {
     //! Ignored by default: needs a real Chrome and network.
     //!
     //! The `a_page_…` tests need the Chrome only. Their page is served from a
-    //! mock on loopback and their renderer can reach that mock and nothing
-    //! else, so they say what a page can do from inside a render without a
-    //! packet leaving the machine.
+    //! mock on loopback and their renderer's proxy opens that mock and
+    //! nothing else, so they say what a page can do from inside a render
+    //! with no connection made to anything but this machine. (The names
+    //! Chrome asks the proxy for on its own account are still looked up
+    //! before they are refused.)
+    //!
+    //! WebRTC is shut twice, by the profile's preference and by a switch,
+    //! and these tests run the renderer as it is, with both: they say the
+    //! pair holds, not which half. Each was measured holding alone on
+    //! 2026-11-20 — see `PREFERENCES` and `chrome_args` — and that is to be
+    //! measured again, one taken out at a time, when Chrome changes.
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::net::UdpSocket;
@@ -518,18 +530,48 @@ mod live {
 };";
 
     /// A page that opens a peer connection with `CONFIG`, lets ICE gather
-    /// and writes what came of it where the dump shows it.
+    /// and writes what came of it where the dump shows it. The wait is
+    /// begun first, so its held request is out before the page awaits
+    /// anything of WebRTC's: a page with enough such awaits ahead of its
+    /// first request can be printed before it reaches the wait.
     const ICE_PAGE: &str = r#"<html><head><title>ice</title></head><body><pre id="out">ice:start</pre><script>
 WAIT
 (async () => {
   const candidates = [];
-  const pc = new RTCPeerConnection(CONFIG);
+  let pc;
+  const waited = wait(() => pc && pc.iceGatheringState === 'complete');
+  pc = new RTCPeerConnection(CONFIG);
   pc.onicecandidate = e => { if (e.candidate) candidates.push(e.candidate.candidate); };
   pc.createDataChannel('x');
   await pc.setLocalDescription(await pc.createOffer());
-  await wait(() => pc.iceGatheringState === 'complete');
+  await waited;
   document.getElementById('out').textContent =
     'ice:done state=' + pc.iceGatheringState + ' candidates=' + candidates.length + ' ' + candidates.join(' | ');
+})();
+</script></body></html>"#;
+
+    /// A page that needs no server to have Chrome send UDP: it pairs two
+    /// connections of its own and hands one a remote candidate at
+    /// 127.0.0.1:`PORT`, which Chrome then checks for a peer.
+    const PEER_PAGE: &str = r#"<html><head><title>peer</title></head><body><pre id="out">peer:start</pre><script>
+WAIT
+(async () => {
+  let note = '';
+  const waited = wait(() => false);
+  try {
+    const a = new RTCPeerConnection(), b = new RTCPeerConnection();
+    a.createDataChannel('x');
+    const offer = await a.createOffer();
+    await a.setLocalDescription(offer);
+    await b.setRemoteDescription(offer);
+    const answer = await b.createAnswer();
+    await b.setLocalDescription(answer);
+    await a.setRemoteDescription(answer);
+    await a.addIceCandidate({candidate: 'candidate:2 1 udp 2113937151 127.0.0.1 PORT typ host', sdpMid: '0', sdpMLineIndex: 0});
+    note = ' candidate=added';
+  } catch (e) { note = ' error=' + e; }
+  await waited;
+  document.getElementById('out').textContent = 'peer:done' + note;
 })();
 </script></body></html>"#;
 
@@ -570,17 +612,22 @@ WAIT
     #[ignore]
     async fn a_page_cannot_send_udp_past_the_guard() {
         // The proxy carries TCP, and WebRTC speaks UDP: a page that names a
-        // STUN server has Chrome send it a datagram from a socket of its
-        // own. Three listeners nothing should reach — one named by literal,
-        // one by `localhost` on each loopback, which only a resolver on this
-        // machine can turn into an address.
+        // STUN or a TURN server has Chrome send it a datagram from a socket
+        // of its own. Four listeners nothing should reach — a STUN server
+        // named by literal, one by `localhost` on each loopback, which only
+        // a resolver on this machine can turn into an address, and a TURN
+        // server.
         let literal = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let named = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let named_port = named.local_addr().unwrap().port();
         let named_v6 = UdpSocket::bind((Ipv6Addr::LOCALHOST, named_port)).await.ok();
+        let turn = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let config = format!(
-            r#"{{iceServers: [{{urls: ["stun:127.0.0.1:{}", "stun:localhost:{named_port}"]}}]}}"#,
-            literal.local_addr().unwrap().port()
+            r#"{{iceServers: [
+  {{urls: ["stun:127.0.0.1:{}", "stun:localhost:{named_port}"]}},
+  {{urls: "turn:127.0.0.1:{}?transport=udp", username: "u", credential: "c"}}]}}"#,
+            literal.local_addr().unwrap().port(),
+            turn.local_addr().unwrap().port()
         );
 
         let server = MockServer::start().await;
@@ -592,6 +639,7 @@ WAIT
             ("127.0.0.1 by literal", Some(&literal)),
             ("127.0.0.1 as localhost", Some(&named)),
             ("::1 as localhost", named_v6.as_ref()),
+            ("127.0.0.1 as a TURN server", Some(&turn)),
         ] {
             if let Some(socket) = socket {
                 if reached(socket).await {
@@ -602,6 +650,25 @@ WAIT
         assert!(got.is_empty(), "a datagram went round the proxy to {got:?}; the page said: {said}");
         // Silence only counts from a script that ran to its end.
         assert!(said.starts_with("ice:done "), "the page's script did not finish: {said}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_page_cannot_send_udp_to_a_peer_it_names() {
+        // No server is needed for this one, so a policy that only stopped
+        // Chrome asking servers would leave it open: the page tells one of
+        // its own connections that its peer is at an address of the page's
+        // choosing, and Chrome sends a check there to see.
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let page = PEER_PAGE.replace("PORT", &peer.local_addr().unwrap().port().to_string());
+
+        let server = MockServer::start().await;
+        let html = render_from_loopback(&server, &page).await;
+        let said = said(&html);
+
+        assert!(!reached(&peer).await, "a check went round the proxy to the peer the page named; the page said: {said}");
+        // The candidate was taken and the wait ran out, or nothing was tried.
+        assert_eq!(said, "peer:done candidate=added");
     }
 
     #[tokio::test]
@@ -639,7 +706,8 @@ WAIT
         assert_eq!(said(&html), "waited");
 
         let asked = |requests: Option<Vec<wiremock::Request>>| -> Vec<String> {
-            requests.unwrap_or_default().iter().map(|r| r.url.path().to_string()).collect()
+            let requests = requests.expect("the mock records what it is asked");
+            requests.iter().map(|r| r.url.path().to_string()).collect()
         };
         let inside = asked(inside.received_requests().await);
         assert!(inside.is_empty(), "a load ahead got past the guard: {inside:?}");

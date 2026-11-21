@@ -1,12 +1,13 @@
 //! A price somebody asked to be told about.
 //!
 //! "Tell me when it is under 300." A watch is started on a page whose price
-//! Rust can read, and that page is read again once a day until the price is
-//! at or under what was asked, the page has given no price three days
-//! running, or sixty days are up. Each of those ends the watch with one
-//! message. No model is called to check a watch, and none ever supplies a
-//! price: the price read, the comparison and every amount in a message are
-//! this file's.
+//! Rust can read, and that page is read again once a day until one of four
+//! things: the price is at or under what was asked; the page has been read
+//! three checks running and had no price; nothing at all could be read for
+//! seven days; or sixty days are up. Each ends the watch with one message,
+//! which says what was read and when and nothing that was not. No model is
+//! called to check a watch, and none ever supplies a price: the price read,
+//! the comparison and every amount in a message are this file's.
 //!
 //! What a watch reads is `fetch_page`'s product block: the page's own
 //! machine-readable price for the address the watch was started on. Where

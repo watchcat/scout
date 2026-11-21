@@ -9289,7 +9289,14 @@ CREATE TABLE segment_candidates (
         // The file named is copied first and is itself never opened, so it
         // can be rehearsed on again. What is printed is tables and counts,
         // and nothing a row holds.
-        let source = std::env::var("SCOUT_REHEARSAL_DB").expect("SCOUT_REHEARSAL_DB names a copy of a database");
+        //
+        // With no file named there is nothing to rehearse on, and the run
+        // of every ignored test the README gives must not fail for it: it
+        // says it did nothing, and that is not a pass of anything.
+        let Ok(source) = std::env::var("SCOUT_REHEARSAL_DB") else {
+            println!("NOT RUN: SCOUT_REHEARSAL_DB names no copy of a database, so nothing was rehearsed");
+            return;
+        };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("rehearsal.duckdb");
         std::fs::copy(&source, &path).unwrap();

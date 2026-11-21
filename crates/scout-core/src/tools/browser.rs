@@ -282,9 +282,12 @@ impl Profile {
                 .unwrap_or_default(),
             MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        // Made, never adopted: a directory already there is not ours to
-        // write into, nor — which is why this comes before the value that
-        // removes on drop — ours to remove.
+        // The temp directory itself may be there or not, as it could be when
+        // Chrome made the whole path. The profile is another matter — made,
+        // never adopted: a directory already there is not ours to write
+        // into, nor — which is why this comes before the value that removes
+        // on drop — ours to remove.
+        std::fs::create_dir_all(base)?;
         private_dir(&path)?;
         let profile = Self(path);
         // `Default` is the profile Chrome uses inside a fresh data directory.
@@ -496,6 +499,32 @@ mod tests {
         });
         let distinct: std::collections::HashSet<_> = made.iter().collect();
         assert_eq!(distinct.len(), made.len(), "two profiles shared a directory");
+    }
+
+    #[test]
+    fn a_directory_already_there_is_never_taken_for_a_profile() {
+        // The count in the name keeps two renders apart, so no other test
+        // would notice this going: a directory that exists is another
+        // render's, with a Chrome running on it, and a profile made over it
+        // would be removed from under that Chrome when ours is dropped.
+        let base = tempfile::tempdir().unwrap();
+        let theirs = base.path().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::write(theirs.join("in-use"), "").unwrap();
+        let err = private_dir(&theirs).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(theirs.join("in-use").exists());
+    }
+
+    #[test]
+    fn a_profile_is_made_where_no_temp_directory_is_yet() {
+        // Chrome made the whole path when it made the profile itself, so a
+        // temp directory nobody had created yet cost nothing. It still must
+        // not: every render would fail on it.
+        let base = tempfile::tempdir().unwrap();
+        let not_yet = base.path().join("tmp").join("scout");
+        let profile = Profile::create_in(&not_yet).unwrap();
+        assert!(profile.path().join("Default").join("Preferences").is_file());
     }
 
     #[test]

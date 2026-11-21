@@ -26,9 +26,13 @@ test('Chrome is started as tools/browser.rs starts it, less what only a containe
   const name = (arg) => arg.split('=')[0]
   const notHere = ['--no-sandbox', '--disable-dev-shm-usage', '--dump-dom', '--virtual-time-budget']
   assert.deepEqual(ours.map(name).sort(), theirs.map((t) => t.name).filter((n) => !notHere.includes(n)).sort())
-  // A switch written out in full there is written the same here.
+  // And each says what it says there, to the letter but for what Rust fills
+  // in: `socks5://` is what has the proxy, and not Chrome, resolve a name.
+  const escaped = (text) => text.replace(/[.*+?^$()|[\]\\]/g, '\\$&')
   for (const { name: n, whole } of theirs) {
-    if (!notHere.includes(n) && !whole.includes('{')) assert.ok(ours.includes(whole), whole)
+    if (notHere.includes(n)) continue
+    const shape = new RegExp('^' + whole.split(/\{[^}]*\}/).map(escaped).join('.+') + '$')
+    assert.ok(ours.some((arg) => shape.test(arg)), whole)
   }
 })
 

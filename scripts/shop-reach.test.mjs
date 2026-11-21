@@ -9,7 +9,45 @@ import path from 'node:path'
 import {
   textWritesAmount, site, sameSite, typingRefused, refusedBy, checkReport, gained, differs, parseEnv,
   trimHistory, tables, ruleMet, outlineInPage, sameOption, turnedAway, summary, MAX_TYPED, CHROME,
+  chromeArgs, newProfile,
 } from './shop-reach.mjs'
+
+const RENDERER = fs.readFileSync(new URL('../crates/scout-core/src/tools/browser.rs', import.meta.url), 'utf8')
+
+test('Chrome is started as tools/browser.rs starts it, less what only a container or a one-shot render needs', () => {
+  // Read off the Rust, so that a switch added there is missed here by a
+  // failing test and not by whoever next runs a real shop's page on this
+  // machine: the WebRTC switch was added there on 2026-11-20 and this list,
+  // a copy by hand, went on without it.
+  const body = RENDERER.slice(RENDERER.indexOf('fn chrome_args('))
+  const theirs = [...body.slice(0, body.indexOf('\n}\n')).matchAll(/"(--[a-z0-9-]+)(=[^"]*)?"/g)].map((m) => ({ name: m[1], whole: m[1] + (m[2] || '') }))
+  assert.ok(theirs.length > 10, 'chrome_args was not found where it was')
+  const ours = chromeArgs('UA', 4321, '/tmp/p')
+  const name = (arg) => arg.split('=')[0]
+  const notHere = ['--no-sandbox', '--disable-dev-shm-usage', '--dump-dom', '--virtual-time-budget']
+  assert.deepEqual(ours.map(name).sort(), theirs.map((t) => t.name).filter((n) => !notHere.includes(n)).sort())
+  // And each says what it says there, to the letter but for what Rust fills
+  // in: `socks5://` is what has the proxy, and not Chrome, resolve a name.
+  const escaped = (text) => text.replace(/[.*+?^$()|[\]\\]/g, '\\$&')
+  for (const { name: n, whole } of theirs) {
+    if (notHere.includes(n)) continue
+    const shape = new RegExp('^' + whole.split(/\{[^}]*\}/).map(escaped).join('.+') + '$')
+    assert.ok(ours.some((arg) => shape.test(arg)), whole)
+  }
+})
+
+test('a profile says what tools/browser.rs has it say, before Chrome first reads it', () => {
+  const theirs = JSON.parse(RENDERER.match(/const PREFERENCES: &str = r#"(.*)"#;/)[1])
+  const profile = newProfile('shop-reach-test-')
+  try {
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(profile, 'Default', 'Preferences'), 'utf8')), theirs)
+    assert.equal(fs.statSync(profile).mode & 0o777, 0o700)
+    assert.equal(fs.statSync(path.join(profile, 'Default')).mode & 0o777, 0o700)
+    assert.equal(fs.statSync(path.join(profile, 'Default', 'Preferences')).mode & 0o777, 0o600)
+  } finally {
+    fs.rmSync(profile, { recursive: true, force: true })
+  }
+})
 
 test('an amount is written with a point or a comma, and not as part of a longer number', () => {
   assert.ok(textWritesAmount('Nu voor € 12,99 per stuk', 12.99))

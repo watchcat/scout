@@ -110,6 +110,9 @@ pub fn find_chrome() -> Option<PathBuf> {
 pub struct Renderer {
     chrome: PathBuf,
     slots: Arc<Semaphore>,
+    /// What the proxy Chrome goes through will open: the public internet,
+    /// except in a live test, whose page is on loopback.
+    guard: crate::net_guard::Guard,
     /// What a test's renderer answers every address with, in place of a Chrome.
     #[cfg(test)]
     canned: Option<Arc<str>>,
@@ -120,9 +123,17 @@ impl Renderer {
         Self {
             chrome,
             slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RENDERS)),
+            guard: crate::net_guard::Guard::PUBLIC_ONLY,
             #[cfg(test)]
             canned: None,
         }
+    }
+
+    /// A renderer whose Chrome reaches `mock` and nothing else, so that a
+    /// live test can show a real Chrome a page of its own making.
+    #[cfg(test)]
+    fn reaching_only(chrome: PathBuf, mock: std::net::SocketAddr) -> Self {
+        Self { guard: crate::net_guard::Guard::only(mock), ..Self::new(chrome) }
     }
 
     /// A renderer that hands back `html` whatever it is asked for, so that
@@ -162,21 +173,16 @@ impl Renderer {
     /// plain subprocess passes it every time.
     async fn render_inner(&self, url: &str) -> Result<String, BrowserError> {
         // Each render gets a throwaway profile: concurrent runs sharing one
-        // would fight over its lock.
-        let profile = std::env::temp_dir().join(format!(
-            "scout-chrome-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
+        // would fight over its lock. Its preferences are on disk before
+        // Chrome is, and without them there is no render.
+        let profile = Profile::create_in(&std::env::temp_dir())
+            .map_err(|e| BrowserError::Launch(format!("could not write the profile: {e}")))?;
 
         // `fetch_page` checked the URL, but Chrome follows redirects, runs
         // the page's scripts and resolves names on its own — any of which
         // can land on the pod's own listeners. Every connection it makes
         // goes through this proxy instead, which applies the same fence.
-        let (proxy, _proxy) = crate::net_guard::serve_socks(crate::net_guard::Guard::PUBLIC_ONLY)
+        let (proxy, _proxy) = crate::net_guard::serve_socks(self.guard)
             .await
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
         let mut child = tokio::process::Command::new(&self.chrome)
@@ -207,7 +213,7 @@ impl Renderer {
         }
         let _ = child.start_kill();
         let _ = child.wait().await;
-        let _ = std::fs::remove_dir_all(&profile);
+        drop(profile);
 
         if html.is_empty() {
             return Err(BrowserError::Timeout);
@@ -216,13 +222,115 @@ impl Renderer {
     }
 }
 
+/// What a render's profile says before Chrome first reads it: two settings
+/// Chrome keeps in its profile, written there because that is where it looks
+/// for them.
+///
+/// `webrtc.ip_handling_policy`. The proxy carries TCP and WebRTC speaks UDP,
+/// from sockets Chrome opens itself. Measured 2026-11-20 on Chrome 157 with
+/// the flags below and no such setting: a page naming a STUN server on
+/// loopback had a datagram delivered there, by literal and by `localhost`
+/// alike, and was handed two host candidates. Measured the day after: a
+/// TURN server is reached the same way, and so is any address a page gives
+/// one of its own connections as its peer's, with no server named at all.
+/// `disable_non_proxied_udp` leaves WebRTC only what the proxy can carry,
+/// and this proxy carries no UDP: with it nothing arrived by any of those
+/// ways and gathering ended with no candidate at all, so a page's script
+/// learns no address either. Of the switches, the one in `chrome_args` does
+/// the same on its own and is passed as well;
+/// `--force-webrtc-ip-handling-policy` was measured too and changes nothing.
+///
+/// `net.network_prediction_options`, 2 for never. A page's speculation rules
+/// had Chrome prefetch one address and prerender another during a render
+/// (same day, same Chrome). Those loads go through the proxy — the one aimed
+/// at a second loopback listener was refused there — so this is not a way
+/// out; it is a page spending the render on addresses nobody asked for.
+/// With the setting neither request was made.
+const PREFERENCES: &str = r#"{"webrtc":{"ip_handling_policy":"disable_non_proxied_udp"},"net":{"network_prediction_options":2}}"#;
+
+/// One render's throwaway profile: on disk, preferences written, from
+/// [`Profile::create_in`] until it is dropped.
+///
+/// It used to be a path Chrome made on first use and the render removed on
+/// its way out. Now that it exists before Chrome does, removing it belongs
+/// to every way out — Chrome that would not start, a deadline that drops
+/// the render mid-read — and a drop is the one place all of them pass.
+///
+/// On the deadline's way out the removal is an attempt and no more: Chrome
+/// has been sent its kill and not waited for, and what is left of it can
+/// still be writing. Measured 2026-11-21 on Chrome 157, 48 renders cut
+/// between 0.2 and 4 seconds in: two left their directory behind, files and
+/// all. Before, every render cut that way left its whole profile; a render
+/// that ends in the ordinary way left nothing, then or now.
+struct Profile(PathBuf);
+
+impl Profile {
+    /// Fails rather than hand back a profile without its preferences: a
+    /// Chrome started on a bare one sends UDP wherever a page points it.
+    fn create_in(base: &std::path::Path) -> std::io::Result<Self> {
+        // The count is what keeps two renders apart. The clock alone does
+        // not: sixteen threads making sixty-four profiles each landed
+        // twenty of them in a directory another already had (2026-11-21, on
+        // a Mac, whose clock ticks in microseconds).
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = base.join(format!(
+            "scout-chrome-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+            MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // The temp directory itself may be there or not, as it could be when
+        // Chrome made the whole path. The profile is another matter — made,
+        // never adopted: a directory already there is not ours to write
+        // into, nor — which is why this comes before the value that removes
+        // on drop — ours to remove.
+        std::fs::create_dir_all(base)?;
+        private_dir(&path)?;
+        let profile = Self(path);
+        // `Default` is the profile Chrome uses inside a fresh data directory.
+        let default = profile.0.join("Default");
+        private_dir(&default)?;
+        let mut preferences = std::fs::OpenOptions::new();
+        preferences.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut preferences, 0o600);
+        std::io::Write::write_all(&mut preferences.open(default.join("Preferences"))?, PREFERENCES.as_bytes())?;
+        Ok(profile)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// Makes one directory, its owner's alone, as Chrome makes its own profile
+/// (`a_profile_is_its_owners_alone` has the modes).
+fn private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut dir = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+    dir.create(path)
+}
+
+impl Drop for Profile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Chrome's command line for one render through the proxy on `proxy`.
-fn chrome_args(url: &str, profile: &std::path::Path, proxy: u16) -> Vec<String> {
+///
+/// It takes a [`Profile`] and not a path, so that a command line can only be
+/// made for a profile whose preferences are already on disk.
+fn chrome_args(url: &str, profile: &Profile, proxy: u16) -> Vec<String> {
     vec![
         "--headless=new".into(),
         "--dump-dom".into(),
         format!("--virtual-time-budget={VIRTUAL_TIME_BUDGET_MS}"),
-        format!("--user-data-dir={}", profile.display()),
+        format!("--user-data-dir={}", profile.path().display()),
         format!("--user-agent={}", super::fetch::BROWSER_USER_AGENT),
         // socks5, not socks4 or http: Chrome then sends the hostname and
         // leaves resolving it to the proxy, so the name is checked and
@@ -231,6 +339,16 @@ fn chrome_args(url: &str, profile: &std::path::Path, proxy: u16) -> Vec<String> 
         // Chrome sends localhost and loopback around any proxy unless told
         // not to — which would walk straight past the fence to :9090.
         "--proxy-bypass-list=<-loopback>".into(),
+        // The profile's preferences say this already (`PREFERENCES`), and
+        // each way holds without the other: measured 2026-11-20 on Chrome
+        // 157, with this switch and empty preferences a page's STUN datagram
+        // reached none of three loopback listeners and no ICE candidate was
+        // gathered, the same as with the preference and no switch; the day
+        // after, the same of a TURN server and of a peer the page names.
+        // Said twice because either is ignored in silence by a Chrome that
+        // does not know it, and a render with neither sends UDP where a page
+        // points it.
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
         // --no-sandbox is required to run as a non-root user in a
         // container; --disable-dev-shm-usage keeps Chrome from dying on
         // the small /dev/shm a container gets.
@@ -252,11 +370,28 @@ mod tests {
 
     #[test]
     fn chrome_goes_through_the_guard_proxy_loopback_included() {
-        let args = chrome_args("https://shop.example/p", std::path::Path::new("/tmp/p"), 4321);
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        let args = chrome_args("https://shop.example/p", &profile, 4321);
+        // A command line is made from a profile that has been written, so
+        // that there is no Chrome without its preferences; and it is that
+        // profile Chrome is sent to.
+        assert!(args.contains(&format!("--user-data-dir={}", profile.path().display())));
         assert!(args.contains(&"--proxy-server=socks5://127.0.0.1:4321".to_string()));
         // Without this Chrome reaches 127.0.0.1 directly, proxy or not.
         assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_string()));
         assert_eq!(args.last().map(String::as_str), Some("https://shop.example/p"));
+    }
+
+    #[test]
+    fn chrome_is_told_on_its_command_line_too_to_keep_webrtc_in_the_proxy() {
+        // The second of two ways it is told; the profile's preferences are
+        // the first. Not the `--force-…` spelling, which Chrome ignores.
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        let args = chrome_args("https://shop.example/p", &profile, 4321);
+        assert!(args.contains(&"--webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("--force-webrtc-ip-handling-policy")));
     }
 
     #[test]
@@ -301,6 +436,127 @@ mod tests {
         temp_env_var("SCOUT_CHROME", "/definitely/not/here", || {
             assert!(find_chrome().is_none());
         });
+    }
+
+    #[test]
+    fn a_profile_tells_chrome_to_keep_webrtc_in_the_proxy_and_load_nothing_ahead() {
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        assert!(profile.path().starts_with(base.path()));
+
+        // Where Chrome looks for it, and nothing in it but what is meant.
+        let written = std::fs::read_to_string(profile.path().join("Default").join("Preferences")).unwrap();
+        let preferences: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            preferences,
+            serde_json::json!({
+                "webrtc": {"ip_handling_policy": "disable_non_proxied_udp"},
+                "net": {"network_prediction_options": 2},
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_is_its_owners_alone() {
+        // As Chrome makes one itself (measured 2026-11-21, Chrome 157: 700
+        // on the directory and on `Default`, 600 on `Preferences`). Made by
+        // us it must not be any wider: it holds what a render's pages left.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(profile.path()), 0o700);
+        assert_eq!(mode(&profile.path().join("Default")), 0o700);
+        assert_eq!(mode(&profile.path().join("Default").join("Preferences")), 0o600);
+    }
+
+    #[test]
+    fn profiles_made_in_the_same_instant_are_not_one_directory() {
+        // Two renders run at once, and the clock in the name ticks in
+        // microseconds on a Mac: two profiles of one name would be one
+        // directory, and the first render to end would take it from under
+        // the other's Chrome.
+        let base = tempfile::tempdir().unwrap();
+        let made: Vec<PathBuf> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..64)
+                            .map(|_| {
+                                let profile = Profile::create_in(base.path()).unwrap();
+                                let path = profile.path().to_path_buf();
+                                // Kept on disk, so a second one of the same
+                                // name has something to collide with.
+                                std::mem::forget(profile);
+                                path
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads.into_iter().flat_map(|t| t.join().unwrap()).collect()
+        });
+        let distinct: std::collections::HashSet<_> = made.iter().collect();
+        assert_eq!(distinct.len(), made.len(), "two profiles shared a directory");
+    }
+
+    #[test]
+    fn a_directory_already_there_is_never_taken_for_a_profile() {
+        // The count in the name keeps two renders apart, so no other test
+        // would notice this going: a directory that exists is another
+        // render's, with a Chrome running on it, and a profile made over it
+        // would be removed from under that Chrome when ours is dropped.
+        let base = tempfile::tempdir().unwrap();
+        let theirs = base.path().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::write(theirs.join("in-use"), "").unwrap();
+        let err = private_dir(&theirs).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(theirs.join("in-use").exists());
+    }
+
+    #[test]
+    fn a_profile_is_made_where_no_temp_directory_is_yet() {
+        // Chrome made the whole path when it made the profile itself, so a
+        // temp directory nobody had created yet cost nothing. It still must
+        // not: every render would fail on it.
+        let base = tempfile::tempdir().unwrap();
+        let not_yet = base.path().join("tmp").join("scout");
+        let profile = Profile::create_in(&not_yet).unwrap();
+        assert!(profile.path().join("Default").join("Preferences").is_file());
+    }
+
+    #[test]
+    fn a_profile_is_gone_when_its_render_is() {
+        // However the render ends — Chrome would not start, the deadline
+        // dropped it mid-read — the drop takes the directory with it. (What
+        // a Chrome still dying can put back afterwards is on `Profile`.)
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        let path = profile.path().to_path_buf();
+        assert!(path.is_dir());
+        drop(profile);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_profile_that_cannot_be_written_is_an_error_not_a_bare_profile() {
+        // A Chrome started on a profile without the preferences is a Chrome
+        // that sends UDP where it likes. A file where the directory should
+        // go cannot hold one, whoever runs the test.
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("a-file");
+        std::fs::write(&file, "").unwrap();
+        assert!(Profile::create_in(&file).is_err());
+    }
+
+    #[test]
+    fn a_renderer_opens_the_public_internet_and_nothing_else() {
+        // The guard is a field so that a live test can point a real Chrome
+        // at a mock on loopback; nothing else may ever set it.
+        let renderer = Renderer::new(PathBuf::from("/usr/bin/chromium"));
+        assert_eq!(renderer.guard, crate::net_guard::Guard::PUBLIC_ONLY);
     }
 
     #[tokio::test]
@@ -349,7 +605,233 @@ mod tests {
 #[cfg(test)]
 mod live {
     //! Ignored by default: needs a real Chrome and network.
+    //!
+    //! The `a_page_…` tests need the Chrome only. Their page is served from a
+    //! mock on loopback and their renderer's proxy opens that mock and
+    //! nothing else, so they say what a page can do from inside a render
+    //! with no connection made to anything but this machine. (The names
+    //! Chrome asks the proxy for on its own account are still looked up
+    //! before they are refused.)
+    //!
+    //! WebRTC is shut twice, by the profile's preference and by a switch,
+    //! and these tests run the renderer as it is, with both: they say the
+    //! pair holds, not which half. Each was measured holding alone on
+    //! 2026-11-20 — see `PREFERENCES` and `chrome_args` — and that is to be
+    //! measured again, one taken out at a time, when Chrome changes.
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use tokio::net::UdpSocket;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The wait every test page makes before it writes down what it saw.
+    ///
+    /// `--dump-dom` prints the page when its virtual time runs out, and
+    /// virtual time is not time. Measured 2026-11-20, Chrome 157 with the
+    /// render's flags and a STUN server named on loopback: a page that only
+    /// opens a peer connection is printed with ICE not begun (state `new`,
+    /// nothing sent); one that then waits five seconds on a timer is printed
+    /// 0.1 s later with ICE `gathering` and still nothing sent, since timers
+    /// are skipped through; one that waits on a request the server sits on
+    /// has ICE stand still until the answer comes. Gathering wants both
+    /// kinds of time, so a round here is a request held 200 ms and then a
+    /// timer — with that the first datagram left a quarter of a second after
+    /// the page was served. Five rounds whatever happens, so that "nothing
+    /// came" is said after a second and not at once; up to twenty-five while
+    /// `done()` is false.
+    const WAIT: &str = "const wait = async (done) => {
+  for (let i = 0; i < 25 && (i < 5 || !done()); i++) {
+    await fetch('/tick').catch(() => {});
+    await new Promise(r => setTimeout(r, 100));
+  }
+};";
+
+    /// A page that opens a peer connection with `CONFIG`, lets ICE gather
+    /// and writes what came of it where the dump shows it. The wait is
+    /// begun first, so its held request is out before the page awaits
+    /// anything of WebRTC's: a page with enough such awaits ahead of its
+    /// first request can be printed before it reaches the wait.
+    const ICE_PAGE: &str = r#"<html><head><title>ice</title></head><body><pre id="out">ice:start</pre><script>
+WAIT
+(async () => {
+  const candidates = [];
+  let pc;
+  const waited = wait(() => pc && pc.iceGatheringState === 'complete');
+  pc = new RTCPeerConnection(CONFIG);
+  pc.onicecandidate = e => { if (e.candidate) candidates.push(e.candidate.candidate); };
+  pc.createDataChannel('x');
+  await pc.setLocalDescription(await pc.createOffer());
+  await waited;
+  document.getElementById('out').textContent =
+    'ice:done state=' + pc.iceGatheringState + ' candidates=' + candidates.length + ' ' + candidates.join(' | ');
+})();
+</script></body></html>"#;
+
+    /// A page that needs no server to have Chrome send UDP: it pairs two
+    /// connections of its own and hands one a remote candidate at
+    /// 127.0.0.1:`PORT`, which Chrome then checks for a peer.
+    const PEER_PAGE: &str = r#"<html><head><title>peer</title></head><body><pre id="out">peer:start</pre><script>
+WAIT
+(async () => {
+  let note = '';
+  const waited = wait(() => false);
+  try {
+    const a = new RTCPeerConnection(), b = new RTCPeerConnection();
+    a.createDataChannel('x');
+    const offer = await a.createOffer();
+    await a.setLocalDescription(offer);
+    await b.setRemoteDescription(offer);
+    const answer = await b.createAnswer();
+    await b.setLocalDescription(answer);
+    await a.setRemoteDescription(answer);
+    await a.addIceCandidate({candidate: 'candidate:2 1 udp 2113937151 127.0.0.1 PORT typ host', sdpMid: '0', sdpMLineIndex: 0});
+    note = ' candidate=added';
+  } catch (e) { note = ' error=' + e; }
+  await waited;
+  document.getElementById('out').textContent = 'peer:done' + note;
+})();
+</script></body></html>"#;
+
+    /// Renders `page` as production would, but for the guard: Chrome reaches
+    /// the mock that serves it and nothing else.
+    async fn render_from_loopback(server: &MockServer, page: &str) -> String {
+        Mock::given(path("/tick"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(200)))
+            .mount(server)
+            .await;
+        Mock::given(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(page.replace("WAIT", WAIT), "text/html"))
+            .mount(server)
+            .await;
+        let chrome = find_chrome().expect("chrome");
+        Renderer::reaching_only(chrome, *server.address())
+            .render(&format!("{}/", server.uri()))
+            .await
+            .unwrap()
+    }
+
+    /// What the test page wrote into its `<pre>`.
+    fn said(html: &str) -> &str {
+        html.split_once(r#"<pre id="out">"#)
+            .and_then(|(_, rest)| rest.split_once("</pre>"))
+            .map(|(text, _)| text)
+            .unwrap_or("(no page)")
+    }
+
+    /// Whether anything was sent to `socket` during the render; the kernel
+    /// keeps a datagram until it is read.
+    async fn reached(socket: &UdpSocket) -> bool {
+        let mut buf = [0u8; 64];
+        tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await.is_ok()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_page_cannot_send_udp_past_the_guard() {
+        // The proxy carries TCP, and WebRTC speaks UDP: a page that names a
+        // STUN or a TURN server has Chrome send it a datagram from a socket
+        // of its own. Four listeners nothing should reach — a STUN server
+        // named by literal, one by `localhost` on each loopback, which only
+        // a resolver on this machine can turn into an address, and a TURN
+        // server.
+        let literal = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let named = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let named_port = named.local_addr().unwrap().port();
+        let named_v6 = UdpSocket::bind((Ipv6Addr::LOCALHOST, named_port)).await.ok();
+        let turn = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let config = format!(
+            r#"{{iceServers: [
+  {{urls: ["stun:127.0.0.1:{}", "stun:localhost:{named_port}"]}},
+  {{urls: "turn:127.0.0.1:{}?transport=udp", username: "u", credential: "c"}}]}}"#,
+            literal.local_addr().unwrap().port(),
+            turn.local_addr().unwrap().port()
+        );
+
+        let server = MockServer::start().await;
+        let html = render_from_loopback(&server, &ICE_PAGE.replace("CONFIG", &config)).await;
+        let said = said(&html);
+
+        let mut got = Vec::new();
+        for (what, socket) in [
+            ("127.0.0.1 by literal", Some(&literal)),
+            ("127.0.0.1 as localhost", Some(&named)),
+            ("::1 as localhost", named_v6.as_ref()),
+            ("127.0.0.1 as a TURN server", Some(&turn)),
+        ] {
+            if let Some(socket) = socket {
+                if reached(socket).await {
+                    got.push(what);
+                }
+            }
+        }
+        assert!(got.is_empty(), "a datagram went round the proxy to {got:?}; the page said: {said}");
+        // Silence only counts from a script that ran to its end.
+        assert!(said.starts_with("ice:done "), "the page's script did not finish: {said}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_page_cannot_send_udp_to_a_peer_it_names() {
+        // No server is needed for this one, so a policy that only stopped
+        // Chrome asking servers would leave it open: the page tells one of
+        // its own connections that its peer is at an address of the page's
+        // choosing, and Chrome sends a check there to see.
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let page = PEER_PAGE.replace("PORT", &peer.local_addr().unwrap().port().to_string());
+
+        let server = MockServer::start().await;
+        let html = render_from_loopback(&server, &page).await;
+        let said = said(&html);
+
+        assert!(!reached(&peer).await, "a check went round the proxy to the peer the page named; the page said: {said}");
+        // The candidate was taken and the wait ran out, or nothing was tried.
+        assert_eq!(said, "peer:done candidate=added");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_page_gathers_no_ice_candidates() {
+        // With no STUN server nothing is sent, but the candidates Chrome
+        // gathers are handed to the page's script, and they are how a page
+        // reads the addresses of the machine it runs on.
+        let server = MockServer::start().await;
+        let html = render_from_loopback(&server, &ICE_PAGE.replace("CONFIG", "")).await;
+        let said = said(&html);
+        assert!(said.starts_with("ice:done state=complete candidates=0 "), "the page said: {said}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_page_cannot_have_chrome_load_ahead_of_it() {
+        // Speculation rules have Chrome fetch, or wholly render, addresses
+        // the page names before anyone goes there: one beside the page, one
+        // on a listener the guard refuses.
+        let server = MockServer::start().await;
+        let inside = MockServer::start().await;
+        let rules = serde_json::json!({
+            "prefetch": [{"source": "list", "urls": ["/ahead", format!("{}/ahead", inside.uri())]}],
+            "prerender": [{"source": "list", "urls": ["/ahead-whole"]}],
+        });
+        let page = format!(
+            r#"<html><head><title>ahead</title><script type="speculationrules">{rules}</script></head>
+<body><pre id="out">start</pre><script>
+WAIT
+(async () => {{ await wait(() => true); document.getElementById('out').textContent = 'waited'; }})();
+</script></body></html>"#
+        );
+        let html = render_from_loopback(&server, &page).await;
+        assert_eq!(said(&html), "waited");
+
+        let asked = |requests: Option<Vec<wiremock::Request>>| -> Vec<String> {
+            let requests = requests.expect("the mock records what it is asked");
+            requests.iter().map(|r| r.url.path().to_string()).collect()
+        };
+        let inside = asked(inside.received_requests().await);
+        assert!(inside.is_empty(), "a load ahead got past the guard: {inside:?}");
+        let ahead: Vec<String> =
+            asked(server.received_requests().await).into_iter().filter(|p| p.starts_with("/ahead")).collect();
+        assert!(ahead.is_empty(), "Chrome loaded ahead of the page: {ahead:?}");
+    }
 
     #[tokio::test]
     #[ignore]

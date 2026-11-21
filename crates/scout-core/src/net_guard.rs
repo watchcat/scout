@@ -22,6 +22,9 @@
 //! - Chrome is pointed at a SOCKS5 proxy ([`serve_socks`]) that applies the
 //!   same rule to every connection it opens, so a redirect, a script that
 //!   navigates, or a rebinding name inside the browser meets the same fence.
+//!   That is every TCP connection; the UDP a page could have Chrome send
+//!   (WebRTC) never comes this way and is turned off where Chrome is
+//!   started, in `tools/browser.rs`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -102,19 +105,43 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Guard {
     exempt: Option<SocketAddr>,
+    /// Set by [`Guard::only`]: the public internet is refused as well.
+    #[cfg(test)]
+    sealed: bool,
 }
 
 impl Guard {
     /// Production: the public internet only.
-    pub const PUBLIC_ONLY: Guard = Guard { exempt: None };
+    pub const PUBLIC_ONLY: Guard = Guard {
+        exempt: None,
+        #[cfg(test)]
+        sealed: false,
+    };
 
     /// The public internet plus `addr` — a mock server's socket.
     #[cfg(test)]
     pub fn exempting(addr: SocketAddr) -> Self {
-        Self { exempt: Some(addr) }
+        Self { exempt: Some(addr), sealed: false }
+    }
+
+    /// `addr` and nothing else, the public internet included.
+    ///
+    /// For a live test that starts a real Chrome, which asks for its maker's
+    /// hosts before it asks for the page: measured 2026-11-20, Chrome 157
+    /// with the render's flags sent the proxy nine CONNECTs to six Google
+    /// hosts (update, sign-in, static files) ahead of the first one for the
+    /// page. Under [`Guard::exempting`] the proxy would dial every one, so a
+    /// test about loopback would be talking to the internet.
+    #[cfg(test)]
+    pub fn only(addr: SocketAddr) -> Self {
+        Self { exempt: Some(addr), sealed: true }
     }
 
     fn allows(&self, addr: SocketAddr) -> bool {
+        #[cfg(test)]
+        if self.sealed {
+            return self.exempt == Some(addr);
+        }
         is_public(addr.ip()) || self.exempt == Some(addr)
     }
 
@@ -250,6 +277,12 @@ impl reqwest::dns::Resolve for PublicResolver {
 /// rather than an address, so the name is resolved here, checked here, and
 /// the checked address is the one dialled. Chrome must also be told
 /// `--proxy-bypass-list=<-loopback>`, or it goes to localhost directly.
+///
+/// TCP is all it carries (a UDP ASSOCIATE is refused with the other
+/// commands), and Chrome does not ask it to carry more: measured 2026-11-20
+/// on Chrome 157, the proxy was sent CONNECT and nothing else while a page
+/// had Chrome send STUN datagrams from sockets of its own. That UDP is shut
+/// where Chrome is started, in `tools/browser.rs`, not here.
 ///
 /// Returns the port; the proxy, and every tunnel it has open, stops when the
 /// returned handle is dropped.
@@ -446,6 +479,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_guard_for_one_socket_only_refuses_the_public_internet_too() {
+        // What a live test of the renderer is given: a real Chrome asks for
+        // its maker's hosts on every start, and under `exempting` the proxy
+        // would dial them.
+        let mock: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let g = Guard::only(mock);
+        assert!(g.check(&Url::parse("http://127.0.0.1:4000/x").unwrap()).await.is_ok());
+        assert!(g.check(&Url::parse("http://127.0.0.1:4001/x").unwrap()).await.is_err());
+        // 192.0.2.1 is an address kept for documentation: public by the
+        // guard's rule, and nobody's, so that a guard which stopped
+        // refusing it would dial nothing real from this test.
+        assert!(g.check(&Url::parse("http://192.0.2.1/").unwrap()).await.is_err());
+        // The difference from the exemption every other test uses.
+        assert!(Guard::exempting(mock).check(&Url::parse("http://192.0.2.1/").unwrap()).await.is_ok());
+
+        // And at the proxy, where Chrome meets it: refused before any dial.
+        let (proxy, _keep) = serve_socks(g).await.unwrap();
+        let (code, _) = socks_connect(proxy, 1, &[192, 0, 2, 1], 443).await;
+        assert_eq!(code, REP_NOT_ALLOWED);
+        let (code, _) = socks_connect(proxy, 1, &[127, 0, 0, 1], 4001).await;
+        assert_eq!(code, REP_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
     async fn the_client_refuses_a_redirect_to_loopback_and_never_reaches_it() {
         let public = MockServer::start().await;
         let private = MockServer::start().await;
@@ -528,6 +585,29 @@ mod tests {
         ] {
             let (code, _) = socks_connect(proxy, atyp, addr, 9090).await;
             assert_eq!(code, REP_NOT_ALLOWED, "atyp {atyp} {addr:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_renderer_proxy_carries_tcp_and_refuses_to_relay_udp() {
+        // SOCKS5 has a command for UDP (3, UDP ASSOCIATE) and one for
+        // listening (2, BIND). A proxy that granted either would be handing
+        // out sockets the fence never judged an address for.
+        let server = MockServer::start().await;
+        let (proxy, _keep) = serve_socks(Guard::exempting(*server.address())).await.unwrap();
+        for command in [2u8, 3] {
+            let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy)).await.unwrap();
+            s.write_all(&[5, 1, 0]).await.unwrap();
+            let mut hello = [0u8; 2];
+            s.read_exact(&mut hello).await.unwrap();
+            // To the one address this proxy would CONNECT to, so that the
+            // command is all there is to refuse.
+            let mut request = vec![5, command, 0, 1, 127, 0, 0, 1];
+            request.extend_from_slice(&server.address().port().to_be_bytes());
+            s.write_all(&request).await.unwrap();
+            let mut reply = [0u8; 10];
+            s.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[1], REP_COMMAND, "command {command}");
         }
     }
 

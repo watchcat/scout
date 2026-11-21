@@ -807,6 +807,7 @@ pub fn build_agent(
                 d.web.clone(),
                 d.renderer.clone(),
                 shops_for_watches.clone(),
+                d.metrics,
             ))
             .tool(ListWatchesTool { store: d.store.clone(), account_id })
             .tool(StopWatchTool { store: d.store.clone(), account_id, metrics: d.metrics });

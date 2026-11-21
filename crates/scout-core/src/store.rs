@@ -2632,6 +2632,12 @@ impl Store {
         }
     }
 
+    /// How many watches are live, everyone's together.
+    pub fn count_live_watches(&self) -> Result<i64> {
+        let conn = self.conn();
+        Ok(conn.query_row("SELECT count(*) FROM price_watches WHERE ended_at IS NULL", [], |r| r.get(0))?)
+    }
+
     /// Drops watches that ended before `ended_before`. Returns how many
     /// went. A live watch stays whatever its age: ending one is the daily
     /// check's to do, with the message that goes with it.

@@ -48,6 +48,8 @@ pub struct WatchPriceTool {
     /// not asked again here, and one that refuses here is noted there.
     shops: std::sync::Arc<super::delivery::ShopPages>,
     reads: std::sync::atomic::AtomicUsize,
+    /// Where each call is counted by what came of it.
+    metrics: &'static crate::metrics::Metrics,
 }
 
 impl WatchPriceTool {
@@ -58,6 +60,7 @@ impl WatchPriceTool {
         web: crate::net_guard::OpenWeb,
         renderer: Option<super::browser::Renderer>,
         shops: std::sync::Arc<super::delivery::ShopPages>,
+        metrics: &'static crate::metrics::Metrics,
     ) -> Self {
         Self {
             store,
@@ -66,6 +69,7 @@ impl WatchPriceTool {
             reader: PageReader::for_a_request(web, renderer, shops.clone()),
             shops,
             reads: std::sync::atomic::AtomicUsize::new(0),
+            metrics,
         }
     }
 }
@@ -126,6 +130,7 @@ impl Tool for WatchPriceTool {
         // one for an address already watched, is refused here too once the
         // three are spent: the bound is on what the tool may cost.
         if self.reads.load(std::sync::atomic::Ordering::Relaxed) >= MAX_READS {
+            self.metrics.watch_asked("reads_spent");
             return Err(StoreToolError(format!(
                 "watch_price has read {MAX_READS} pages in this request, which is as many as it may — do not call it \
                  again now; tell the user which watches were started and that the rest can be asked for in a new message"
@@ -138,7 +143,16 @@ impl Tool for WatchPriceTool {
             target: args.target,
             currency: &args.currency,
         };
-        let answer = watch::start(&self.store, &Metered { tool: self }, ask, chrono::Utc::now().naive_utc()).await.map_err(internal)?;
+        let answer = match watch::start(&self.store, &Metered { tool: self }, ask, chrono::Utc::now().naive_utc()).await {
+            Ok(answer) => answer,
+            Err(e) => {
+                // A target that is no amount, or the store's own failure:
+                // an error to the model either way, and not a refusal.
+                self.metrics.watch_asked("invalid");
+                return Err(internal(e));
+            }
+        };
+        self.metrics.watch_asked(answer.outcome);
         Ok(WatchAnswer { watching: answer.started.is_some(), id: answer.started, say: answer.say })
     }
 }
@@ -263,7 +277,7 @@ mod tests {
     /// The tool as one request builds it, with that request's memo of
     /// what its shops' pages said.
     fn watching_in(store: &Store, shop: &MockServer, account_id: i64, reply_to: ReplyTo, shops: Arc<ShopPages>) -> WatchPriceTool {
-        WatchPriceTool::new(store.clone(), account_id, reply_to, OpenWeb::exempting(*shop.address()), None, shops)
+        WatchPriceTool::new(store.clone(), account_id, reply_to, OpenWeb::exempting(*shop.address()), None, shops, counters())
     }
 
     async fn asked(shop: &MockServer) -> usize {
@@ -490,6 +504,33 @@ mod tests {
         assert!(tool.call(under(&shop, "second", 300.0)).await.unwrap().watching);
         assert!(tool.call(under(&shop, "third", 300.0)).await.unwrap().watching);
         assert!(tool.call(under(&shop, "fourth", 300.0)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn each_call_is_counted_by_what_came_of_it() {
+        let (store, _d) = setup();
+        let shop = a_shop().await;
+        let metrics = counters();
+        let tool = WatchPriceTool::new(store.clone(), 1, ReplyTo::telegram(99), OpenWeb::exempting(*shop.address()), None, Arc::default(), metrics);
+        tool.call(under(&shop, "widget", 300.0)).await.unwrap();
+        tool.call(under(&shop, "widget", 280.0)).await.unwrap();
+        tool.call(under(&shop, "second", 400.0)).await.unwrap();
+        tool.call(under(&shop, "third", -1.0)).await.unwrap_err();
+        tool.call(under(&shop, "third", 300.0)).await.unwrap();
+        tool.call(under(&shop, "fourth", 300.0)).await.unwrap_err();
+
+        let page = metrics.render();
+        for series in [
+            "scout_price_watch_requests_total{outcome=\"started\"} 2",
+            "scout_price_watch_requests_total{outcome=\"watching_already\"} 1",
+            "scout_price_watch_requests_total{outcome=\"already_under\"} 1",
+            // The two the tool answers with an error: a target that is no
+            // amount, and a fourth page in one request.
+            "scout_price_watch_requests_total{outcome=\"invalid\"} 1",
+            "scout_price_watch_requests_total{outcome=\"reads_spent\"} 1",
+        ] {
+            assert!(page.contains(&format!("{series}\n")), "{series} is missing:\n{page}");
+        }
     }
 
     #[test]

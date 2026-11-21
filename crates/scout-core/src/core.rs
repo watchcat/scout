@@ -625,6 +625,7 @@ impl Core {
                     checked = pass.checked,
                     ended = pass.ended,
                     left = pass.left,
+                    took_ms = pass.took.as_millis() as u64,
                     "price watches checked"
                 ),
                 Err(e) => tracing::warn!(error = %e, "could not check the price watches"),
@@ -1161,6 +1162,8 @@ mod tests {
             assert!(at < backup, "{call} sits below the backup's continue and would run once a day");
         }
         assert!(src.contains("prune_watches(before)"), "ended watches must be pruned by the date worked out here");
+        // The line the first week is read by says how long a pass took.
+        assert!(body.contains("took_ms = pass.took.as_millis() as u64,"), "the pass's log line must carry its duration");
     }
 
     /// A core that reads pages from `shop` and nowhere else, with one

@@ -433,11 +433,16 @@ pub(crate) struct Ask<'a> {
 pub(crate) struct Answer {
     pub started: Option<i64>,
     pub say: String,
+    /// How the request went, in a word for `/metrics`: `started`, or what
+    /// stopped it. A refusal is an answer, and an answer is `ok` to the
+    /// tool-call counter, so without this nothing would show how many
+    /// requests for a watch became one and what became of the rest.
+    pub outcome: &'static str,
 }
 
 impl Answer {
-    fn not_started(say: String) -> Self {
-        Self { started: None, say }
+    fn not_started(outcome: &'static str, say: String) -> Self {
+        Self { started: None, say, outcome }
     }
 }
 
@@ -464,7 +469,7 @@ pub(crate) async fn start<R: Reader>(
     }
     let url = ask.url.trim().to_string();
     if url.chars().count() > MAX_URL_CHARS {
-        return Ok(Answer::not_started(format!(
+        return Ok(Answer::not_started("address_too_long", format!(
             "I cannot watch this page: its address is over {MAX_URL_CHARS} characters long. \
              A watch that cannot be checked is not started."
         )));
@@ -477,28 +482,30 @@ pub(crate) async fn start<R: Reader>(
     let (theirs, account_id) = (store.clone(), ask.account_id);
     let live = blocking(move || theirs.live_watches(account_id)).await?;
     if let Some(there) = live.iter().find(|watch| watch.url == url) {
-        return Ok(Answer::not_started(say_already(there)));
+        return Ok(Answer::not_started("watching_already", say_already(there)));
     }
     if live.len() as i64 >= MAX_LIVE {
-        return Ok(Answer::not_started(say_full()));
+        return Ok(Answer::not_started("at_cap", say_full()));
     }
 
     let read = match read_within(reader, &url, READ_BUDGET).await {
         Reading::Price(read) => read,
-        Reading::Unreadable(why) | Reading::Failed(why) => {
-            return Ok(Answer::not_started(format!(
+        reading @ (Reading::Unreadable(_) | Reading::Failed(_)) => {
+            let outcome = if matches!(reading, Reading::Failed(_)) { FAILED } else { "no_price" };
+            let why = reading.why().unwrap_or_default();
+            return Ok(Answer::not_started(outcome, format!(
                 "I cannot watch this page: {why}. A watch that cannot be checked is not started."
-            )))
+            )));
         }
         Reading::Refused => {
-            return Ok(Answer::not_started(format!(
+            return Ok(Answer::not_started(REFUSED, format!(
                 "I cannot watch this page: {shop} refused Scout's request for it, so there is no price I could \
                  check each day. A watch that cannot be checked is not started."
             )))
         }
     };
     if read.currency != currency {
-        return Ok(Answer::not_started(format!(
+        return Ok(Answer::not_started("other_currency", format!(
             "I cannot watch this for an amount in {currency}: the page prices it in {theirs} ({price} now), and I do \
              not compare across currencies. Ask again with the amount in {theirs}.",
             theirs = read.currency,
@@ -507,7 +514,7 @@ pub(crate) async fn start<R: Reader>(
     }
     let title = read.title.clone().unwrap_or_default();
     if at_or_under(read.amount, ask.target) {
-        return Ok(Answer::not_started(format!(
+        return Ok(Answer::not_started("already_under", format!(
             "{} is already {} at {shop}, {} you asked about, so there is nothing to watch for. {url}",
             named(&title, true),
             money(read.amount, &currency),
@@ -538,9 +545,11 @@ pub(crate) async fn start<R: Reader>(
     })
     .await?;
     Ok(match started {
-        WatchStarted::Started(watch) => Answer { started: Some(watch.id), say: say_watching(&watch, read.struck_through) },
-        WatchStarted::Already(there) => Answer::not_started(say_already(&there)),
-        WatchStarted::Full => Answer::not_started(say_full()),
+        WatchStarted::Started(watch) => {
+            Answer { started: Some(watch.id), say: say_watching(&watch, read.struck_through), outcome: "started" }
+        }
+        WatchStarted::Already(there) => Answer::not_started("watching_already", say_already(&there)),
+        WatchStarted::Full => Answer::not_started("at_cap", say_full()),
     })
 }
 
@@ -829,6 +838,10 @@ pub(crate) struct Pass {
     pub ended: usize,
     /// Still due when the pass ran out of time: the next tick's.
     pub left: usize,
+    /// How long the pass took, its waits between two reads of a host
+    /// included. For the log: the first week will say whether thirty
+    /// minutes is room enough.
+    pub took: Duration,
 }
 
 /// Checks every watch that is due at `now`: reads its page, decides, and
@@ -936,6 +949,15 @@ pub(crate) async fn check_due<R: Reader>(
             Ok(false) => tracing::info!(watch = id, "a price watch was stopped while its page was read; nothing written"),
             Err(e) => tracing::warn!(watch = id, error = %e, "could not write a price watch's check; it stays due"),
         }
+    }
+    pass.took = began.elapsed();
+    // How many are running after the pass, for `/metrics`: counted here,
+    // once an hour, so the number is as old as the last pass and costs
+    // the page nothing to show.
+    let theirs = store.clone();
+    match blocking(move || theirs.count_live_watches()).await {
+        Ok(live) => metrics.watches_live(live),
+        Err(e) => tracing::warn!(error = %e, "could not count the live price watches"),
     }
     Ok(pass)
 }
@@ -1430,6 +1452,37 @@ mod tests {
         let cent = Fixed::priced(0.05);
         assert!(start(&store, &cent, ask(&chat, "https://shop.example/p/penny", 0.01), clock()).await.unwrap().started.is_some());
         assert_eq!(read.asked(), 1, "only the watch that started read its page");
+    }
+
+    #[tokio::test]
+    async fn every_answer_says_how_the_request_went_in_a_word_for_the_count() {
+        // A refusal is an answer, and to the tool-call counter an answer
+        // is `ok`. What became of requests for a watch would otherwise
+        // show nowhere: how many started, and what stopped the rest.
+        let chat = ReplyTo::telegram(4242);
+        async fn asked(reading: Reading, target: f64, currency: &str) -> &'static str {
+            let (store, _dir) = a_store();
+            let chat = ReplyTo::telegram(4242);
+            let ask = Ask { currency, ..ask(&chat, WIDGET, target) };
+            start(&store, &Fixed::new(reading), ask, clock()).await.unwrap().outcome
+        }
+        assert_eq!(asked(price(329.0), 300.0, "EUR").await, "started");
+        assert_eq!(asked(price(289.0), 300.0, "EUR").await, "already_under");
+        assert_eq!(asked(price(329.0), 300.0, "USD").await, "other_currency");
+        assert_eq!(asked(no_price(), 300.0, "EUR").await, "no_price");
+        assert_eq!(asked(refused(), 300.0, "EUR").await, "refused");
+        assert_eq!(asked(failed(), 300.0, "EUR").await, "failed");
+
+        let (store, _dir) = a_store();
+        let read = Fixed::priced(329.0);
+        assert_eq!(start(&store, &read, ask(&chat, WIDGET, 300.0), clock()).await.unwrap().outcome, "started");
+        assert_eq!(start(&store, &read, ask(&chat, WIDGET, 280.0), clock()).await.unwrap().outcome, "watching_already");
+        let long = format!("https://shop.example/p/{}", "w".repeat(2000));
+        assert_eq!(start(&store, &read, ask(&chat, &long, 300.0), clock()).await.unwrap().outcome, "address_too_long");
+        for n in 1..10 {
+            start(&store, &read, ask(&chat, &format!("https://shop.example/p/{n}"), 300.0), clock()).await.unwrap();
+        }
+        assert_eq!(start(&store, &read, ask(&chat, "https://shop.example/p/10", 300.0), clock()).await.unwrap().outcome, "at_cap");
     }
 
     #[tokio::test]
@@ -2097,6 +2150,7 @@ mod tests {
         // Three minute-long reads began inside two and a half minutes.
         assert_eq!(began.elapsed(), Duration::from_secs(180));
         assert_eq!((pass.due, pass.checked, pass.left), (5, 3, 2));
+        assert_eq!(pass.took, Duration::from_secs(180), "and the pass says how long it took, for the log");
         let checked: Vec<bool> = ids.iter().map(|id| watch(&store, *id).last_checked_at == now).collect();
         assert_eq!(checked, [true, true, true, false, false], "the longest unchecked went first");
         // And the next tick takes up where this one stopped.
@@ -2320,6 +2374,9 @@ mod tests {
         // The pass ended two watches and counted two: the one its owner
         // stopped is the stop's to count, not the pass's.
         assert_eq!(page.matches("scout_price_watches_ended_total{").count(), 2, "{page}");
+        // And how many are running now: six, less the two it ended and
+        // the one that was stopped.
+        assert!(page.contains("scout_price_watches_live 3\n"), "{page}");
 
         // Sixty days on, the three still live expire.
         let later = now + chrono::Duration::days(60);

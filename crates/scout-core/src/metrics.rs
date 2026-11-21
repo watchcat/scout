@@ -136,6 +136,8 @@ pub struct Metrics {
     runs: Counter,
     run_duration: Histogram,
     tool_calls: Counter,
+    watch_requests: Counter,
+    watches_live: AtomicU64,
     watch_checks: Counter,
     watches_ended: Counter,
     outbox_given_up: Counter,
@@ -159,6 +161,8 @@ impl Default for Metrics {
             runs: Counter::new(&["outcome"]),
             run_duration: Histogram::new(RUN_BUCKETS),
             tool_calls: Counter::new(&["tool", "status"]),
+            watch_requests: Counter::new(&["outcome"]),
+            watches_live: AtomicU64::new(0),
             watch_checks: Counter::new(&["outcome"]),
             watches_ended: Counter::new(&["why"]),
             outbox_given_up: Counter::new(&["kind"]),
@@ -192,6 +196,21 @@ impl Metrics {
 
     pub fn tool_call(&self, tool: &str, status: &str) {
         self.tool_calls.add(&[tool, status]);
+    }
+
+    /// A request for a price watch, by what came of it: `started`, or the
+    /// word for what stopped it (`already_under`, `no_price`, `refused`,
+    /// `failed`, `other_currency`, `watching_already`, `at_cap`,
+    /// `address_too_long`, and from the tool `reads_spent` and `invalid`).
+    /// The words are `watch.rs`'s and the tool's own.
+    pub fn watch_asked(&self, outcome: &str) {
+        self.watch_requests.add(&[outcome]);
+    }
+
+    /// How many price watches are live, everyone's together, as the daily
+    /// pass last counted them: a number that is set, not added to.
+    pub fn watches_live(&self, live: i64) {
+        self.watches_live.store(u64::try_from(live).unwrap_or(0), Ordering::Relaxed);
     }
 
     /// One daily check of a price watch, by how it went: a price was
@@ -303,6 +322,9 @@ impl Metrics {
         self.runs.render(&mut out, "scout_runs_total", "Runs, by how they ended: answered, cut_short or failed once a run has a row; busy or overloaded when it never got one.");
         self.run_duration.render(&mut out, "scout_run_duration_seconds", "How long a run took, from its row to its last word; the wait for a slot is not in it.");
         self.tool_calls.render(&mut out, "scout_tool_calls_total", "Tool calls the agents made, by tool and whether the tool answered.");
+        self.watch_requests.render(&mut out, "scout_price_watch_requests_total", "Requests for a price watch, by what came of them: started, or what stopped it (already_under, no_price, refused, failed, other_currency, watching_already, at_cap, address_too_long, reads_spent, invalid).");
+        header(&mut out, "scout_price_watches_live", "Price watches running, everyone's together, as the last hourly pass counted them.", "gauge");
+        out.push_str(&format!("scout_price_watches_live {}\n", self.watches_live.load(Ordering::Relaxed)));
         self.watch_checks.render(&mut out, "scout_price_watch_checks_total", "Daily checks of price watches, by how each went: read (a price was read), unreadable (the page was read and gave none, or is gone), refused (the shop refused its reader), failed (the request came to nothing).");
         self.outbox_given_up.render(&mut out, "scout_outbox_given_up_total", "Messages the outbox gave up on, their attempts spent, by kind: watch (a price watch's one message), inbox (a nudge about a booking), turn (a mirrored turn).");
         self.watches_ended.render(&mut out, "scout_price_watches_ended_total", "Price watches ended, by why: hit, unreadable (three checks running read the page and found no price), unreached (a week with no reading at all), expired (sixty days) or stopped by their owner.");
@@ -560,6 +582,8 @@ mod tests {
             "scout_price_watch_checks_total",
             "scout_price_watches_ended_total",
             "scout_outbox_given_up_total",
+            "scout_price_watch_requests_total",
+            "scout_price_watches_live",
             "scout_provider_errors_total",
             "scout_provider_retries_total",
             "scout_store_lock_wait_seconds",
@@ -649,6 +673,24 @@ mod tests {
         ] {
             assert!(page.contains(&format!("{series}\n")), "{series} is missing:\n{page}");
         }
+    }
+
+    #[test]
+    fn the_live_watches_are_a_number_that_is_set_and_requests_a_count_by_how_they_went() {
+        let m = Metrics::default();
+        assert!(m.render().contains("# TYPE scout_price_watches_live gauge\nscout_price_watches_live 0\n"), "{}", m.render());
+        m.watches_live(7);
+        m.watches_live(4);
+        // Not seven and four: how many there are now, as last counted.
+        assert!(m.render().contains("scout_price_watches_live 4\n"), "{}", m.render());
+
+        for outcome in ["started", "started", "already_under", "refused"] {
+            m.watch_asked(outcome);
+        }
+        let page = m.render();
+        assert!(page.contains("scout_price_watch_requests_total{outcome=\"started\"} 2\n"), "{page}");
+        assert!(page.contains("scout_price_watch_requests_total{outcome=\"already_under\"} 1\n"), "{page}");
+        assert!(page.contains("scout_price_watch_requests_total{outcome=\"refused\"} 1\n"), "{page}");
     }
 
     #[test]

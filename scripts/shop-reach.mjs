@@ -359,17 +359,33 @@ export function summary(read, extra = {}) {
   }
 }
 
-function chromeArgs(userAgent, socksPort, profile) {
+// tools/browser.rs, PREFERENCES. Without the first, a shop's page read here can
+// have Chrome send UDP from this machine to any address it names, the tunnel
+// notwithstanding: the proxy carries TCP only (measured there, 2026-11-20).
+const PREFERENCES = { webrtc: { ip_handling_policy: 'disable_non_proxied_udp' }, net: { network_prediction_options: 2 } }
+
+/// A throwaway profile with its preferences written before any Chrome reads
+/// it, as tools/browser.rs makes one. `mkdtemp` makes it the owner's alone.
+export function newProfile(prefix) {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+  fs.mkdirSync(path.join(profile, 'Default'), { mode: 0o700 })
+  fs.writeFileSync(path.join(profile, 'Default', 'Preferences'), JSON.stringify(PREFERENCES), { mode: 0o600 })
+  return profile
+}
+
+export function chromeArgs(userAgent, socksPort, profile) {
   // tools/browser.rs, chrome_args — less the two flags only a container needs.
+  // A test reads that function and holds this list to it.
   return [
     '--headless=new', `--user-data-dir=${profile}`, `--user-agent=${userAgent}`,
     `--proxy-server=socks5://127.0.0.1:${socksPort}`, '--proxy-bypass-list=<-loopback>',
+    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
     '--disable-gpu', '--disable-extensions', '--no-first-run', '--window-size=1280,1024', '--lang=nl-NL', '--mute-audio',
   ]
 }
 
 function renderOnce(url, userAgent, socksPort) {
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'shop-reach-render-'))
+  const profile = newProfile('shop-reach-render-')
   const started = Date.now()
   return new Promise((resolve) => {
     const chrome = spawn(CHROME, [...chromeArgs(userAgent, socksPort, profile), '--dump-dom', `--virtual-time-budget=${VIRTUAL_TIME_BUDGET_MS}`, url], { stdio: ['ignore', 'pipe', 'ignore'] })
@@ -617,7 +633,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 class Session {
   static async open(userAgent, socksPort) {
     const s = new Session()
-    s.profile = fs.mkdtempSync(path.join(os.tmpdir(), 'shop-reach-session-'))
+    s.profile = newProfile('shop-reach-session-')
     s.chrome = spawn(CHROME, [...chromeArgs(userAgent, socksPort, s.profile), '--remote-debugging-port=0', 'about:blank'], { stdio: 'ignore' })
     const portFile = path.join(s.profile, 'DevToolsActivePort')
     for (let i = 0; i < 100 && !fs.existsSync(portFile); i++) await sleep(100)

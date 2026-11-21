@@ -661,8 +661,13 @@ of JavaScript in the browser client.
   inside a day can be missed. A day the shop refuses Scout's request, or
   the request fails, says nothing about the page and is not held against
   it; a week of such days ends the watch, with a message that says the
-  page could not be read and when a price last was. Stock is not watched,
-  only the price; and a watch tells you, it never buys.
+  page could not be read and when a price last was. An address can come to
+  show another product, a discontinued one redirecting to its accessory,
+  and the price there is read as the watched one: when the name differs
+  from the name the watch began with, the message says what the page now
+  calls it and asks you to check. Stock is not watched, only the price: a
+  hit on a page whose data says out of stock is sent, and says so. And a
+  watch tells you; it never buys.
 - **An invite link only works on an empty chat.** Telegram delivers a deep
   link's payload through the START button, and START only appears to someone
   who has never messaged the bot. So a link is right for a public post and

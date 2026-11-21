@@ -96,6 +96,11 @@ pub(crate) const UNREACHED: &str = "unreached";
 pub(crate) const EXPIRED: &str = "expired";
 pub(crate) const STOPPED: &str = "stopped";
 
+/// The longest address a watch is started on. An address is kept, read
+/// daily and sent back in a message; the longest a browser will take is
+/// about this, and one longer is not somebody's product page.
+const MAX_URL_CHARS: usize = 2000;
+
 /// The longest name of a product a watch keeps. It is said back in every
 /// message about the watch, and a shop's name for a thing can be a
 /// paragraph.
@@ -146,6 +151,9 @@ pub(crate) struct Priced {
     /// What the data gives beside the price as the regular or former one.
     /// Said once, in the first answer, and neither kept nor compared.
     pub struck_through: Option<f64>,
+    /// Whether the block says the product cannot be bought now. Not
+    /// watched and not waited out: a hit says it beside the price.
+    pub out_of_stock: bool,
 }
 
 /// Something that reads a watched page. The daily pass is written against
@@ -242,14 +250,60 @@ fn priced(product: Option<PageProduct>) -> Reading {
         currency: currency.to_uppercase(),
         title: product.name.as_deref().map(tidy_title).filter(|title| !title.is_empty()),
         struck_through,
+        out_of_stock: product.availability == Some("out of stock"),
     })
 }
 
-/// A product's name as a watch keeps it: one line, and no longer than a
-/// name. It is the page's text, and goes into messages to a person.
+/// A product's name as a watch keeps it: one line, no longer than a name,
+/// and nothing in it that Telegram would make more than text of.
+///
+/// The name is the page's own words and goes into a message Scout sends
+/// unasked. Telegram turns an address into a link, `/word` into a command
+/// to tap and `@word` into a mention, so a page, or whoever wrote one,
+/// would be choosing what Scout's message links to. A word that is an
+/// address by its scheme or its `www.` is left out. Elsewhere the mark
+/// that makes the link is taken and the word kept: a dot between a letter
+/// or digit and a letter, which is how a host is written and how "2.0"
+/// and "1.5 kg" are not; the slash a word opens with; an `@` anywhere.
 fn tidy_title(name: &str) -> String {
-    let one_line = name.split_whitespace().collect::<Vec<_>>().join(" ");
-    one_line.chars().take(MAX_TITLE_CHARS).collect::<String>().trim_end().to_string()
+    let mut words: Vec<String> = Vec::new();
+    for word in name.split_whitespace() {
+        let lower = word.to_lowercase();
+        if lower.contains("://") || lower.starts_with("www.") {
+            continue;
+        }
+        let letters: Vec<char> = word.chars().collect();
+        let plain: String = letters
+            .iter()
+            .enumerate()
+            .map(|(at, c)| {
+                let before = at.checked_sub(1).and_then(|at| letters.get(at));
+                let after = letters.get(at + 1);
+                match c {
+                    '@' => ' ',
+                    // A command is a slash with a word after it. One that
+                    // stands alone, between two sizes, is punctuation.
+                    '/' if at == 0 && after.is_some_and(|c| c.is_alphanumeric() || *c == '_') => ' ',
+                    '.' if before.is_some_and(|c| c.is_alphanumeric()) && after.is_some_and(|c| c.is_alphabetic()) => ' ',
+                    other => *other,
+                }
+            })
+            .collect();
+        words.extend(plain.split_whitespace().map(str::to_string));
+    }
+    words.join(" ").chars().take(MAX_TITLE_CHARS).collect::<String>().trim_end().to_string()
+}
+
+/// Whether two names are one product's, as far as a name can say: the
+/// same letters whatever their case, since both were kept as `tidy_title`
+/// keeps one, spacing settled and cut at the same length. A name that is
+/// missing on either side is not a different name: there is nothing to set
+/// against the other, and nothing is claimed of it.
+fn same_name(kept: &str, read_now: Option<&str>) -> bool {
+    match read_now {
+        Some(now) if !kept.is_empty() && !now.is_empty() => kept.to_lowercase() == now.to_lowercase(),
+        _ => true,
+    }
 }
 
 /// One reading, given up on after `budget`. A page that never answers was
@@ -348,14 +402,22 @@ pub(crate) async fn start<R: Reader>(
     ask: Ask<'_>,
     now: chrono::NaiveDateTime,
 ) -> anyhow::Result<Answer> {
-    if !ask.target.is_finite() || ask.target <= 0.0 {
-        anyhow::bail!("target must be an amount above zero, as the user named it");
+    // A cent is the least a shop prices in, and the comparison is made in
+    // cents: under one there is nothing for a price to come down to.
+    if !ask.target.is_finite() || ask.target < 0.01 {
+        anyhow::bail!("target must be an amount of one cent or more, as the user named it");
     }
     let currency = ask.currency.trim().to_uppercase();
     if currency.is_empty() {
         anyhow::bail!("currency must be the ISO code of the target's currency, for example EUR");
     }
     let url = ask.url.trim().to_string();
+    if url.chars().count() > MAX_URL_CHARS {
+        return Ok(Answer::not_started(format!(
+            "I cannot watch this page: its address is over {MAX_URL_CHARS} characters long. \
+             A watch that cannot be checked is not started."
+        )));
+    }
     let shop = shop_of(&url);
 
     // Before the page is asked for anything. The store decides both again
@@ -578,7 +640,7 @@ pub(crate) fn decide(watch: &PriceWatch, reading: &Reading, now: chrono::NaiveDa
             verdict.unreadable_streak = 0;
             verdict.unreached_since = None;
             if at_or_under(read.amount, watch.target) {
-                verdict.ended = Some((HIT, say_hit(watch, read.amount)));
+                verdict.ended = Some((HIT, say_hit(watch, read)));
             }
         }
         // A price in another currency than the watch's is no price for it:
@@ -608,17 +670,38 @@ pub(crate) fn decide(watch: &PriceWatch, reading: &Reading, now: chrono::NaiveDa
     verdict
 }
 
-fn say_hit(watch: &PriceWatch, price: f64) -> String {
-    format!(
-        "{} is {} at {} — {} you asked for. It was {} on {}. {}",
+/// The hit. Beside the amounts it says two things the block may say that
+/// the person would otherwise find out at the shop.
+///
+/// That the page says the product is out of stock: said, and not waited
+/// out, by the owner's word of 2026-11-20. The price is what was asked
+/// about.
+///
+/// And that the page now names another thing than the watch was started
+/// on. A discontinued product's address can redirect to its accessory, or
+/// a page be given to the next model, and the price read there is under
+/// the target and not the thing's. Nothing in the data says so but the
+/// name, so the name is shown and the person asked to look; see
+/// `same_name` for what counts as another. The watch ends all the same:
+/// whatever the page has become, it is no longer the watch that was asked
+/// for, and one message is what was promised.
+fn say_hit(watch: &PriceWatch, read: &Priced) -> String {
+    let mut said = format!(
+        "{} is {} at {} — {} you asked for. It was {} on {}.",
         named(&watch.title, true),
-        money(price, &watch.currency),
+        money(read.amount, &watch.currency),
         shop_of(&watch.url),
-        against(price, watch.target, &watch.currency),
+        against(read.amount, watch.target, &watch.currency),
         money(watch.first_price, &watch.currency),
         day(watch.created_at),
-        watch.url,
-    )
+    );
+    if read.out_of_stock {
+        said.push_str(" The page says it is out of stock.");
+    }
+    if let Some(now) = read.title.as_deref().filter(|now| !same_name(&watch.title, Some(now))) {
+        said.push_str(&format!(" The page now calls this \"{now}\": please check it is still what you meant."));
+    }
+    format!("{said} {}", watch.url)
 }
 
 /// The page was read and had no price. Said in checks, which is what was
@@ -854,7 +937,7 @@ mod tests {
         let server = serving(200, &widget_at("329.00")).await;
         assert_eq!(
             read(&server).await,
-            Reading::Price(Priced { amount: 329.0, currency: "EUR".into(), title: Some("Widget".into()), struck_through: None })
+            Reading::Price(Priced { amount: 329.0, currency: "EUR".into(), title: Some("Widget".into()), struck_through: None, out_of_stock: false })
         );
 
         // With amounts all over its text and none in its data, a page has
@@ -1043,7 +1126,7 @@ mod tests {
         }
 
         fn priced(amount: f64) -> Self {
-            Self::new(Reading::Price(Priced { amount, currency: "EUR".into(), title: Some("Widget".into()), struck_through: None }))
+            Self::new(Reading::Price(Priced { amount, currency: "EUR".into(), title: Some("Widget".into()), struck_through: None, out_of_stock: false }))
         }
 
         fn asked(&self) -> usize {
@@ -1110,6 +1193,7 @@ mod tests {
             currency: "EUR".into(),
             title: Some("Widget 12 kg".into()),
             struck_through: Some(35.99),
+            out_of_stock: false,
         }));
         let answer = start(&store, &read, ask(&chat, WIDGET, 28.0), now).await.unwrap();
         let until = (now + chrono::Duration::days(60)).format("%-d %B");
@@ -1235,10 +1319,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_address_too_long_to_be_one_and_a_target_under_a_cent_start_nothing() {
+        let (store, _dir) = a_store();
+        let chat = ReplyTo::telegram(4242);
+        let read = Fixed::priced(329.0);
+        let long = format!("https://shop.example/p/{}", "w".repeat(2000));
+        let answer = start(&store, &read, ask(&chat, &long, 300.0), clock()).await.unwrap();
+        assert_eq!(answer.started, None);
+        assert_eq!(answer.say, "I cannot watch this page: its address is over 2000 characters long. A watch that cannot be checked is not started.");
+        let just = format!("https://shop.example/p/{}", "w".repeat(2000 - "https://shop.example/p/".len()));
+        assert_eq!(just.chars().count(), 2000);
+        assert!(start(&store, &read, ask(&chat, &just, 300.0), clock()).await.unwrap().started.is_some());
+
+        // Under a cent there is no price to come down to.
+        for target in [0.009, 0.004, 0.0001] {
+            let err = start(&store, &read, ask(&chat, WIDGET, target), clock()).await.unwrap_err();
+            assert!(err.to_string().contains("one cent"), "{target}: {err}");
+        }
+        let cent = Fixed::priced(0.05);
+        assert!(start(&store, &cent, ask(&chat, "https://shop.example/p/penny", 0.01), clock()).await.unwrap().started.is_some());
+        assert_eq!(read.asked(), 1, "only the watch that started read its page");
+    }
+
+    #[tokio::test]
     async fn a_page_that_names_no_product_is_watched_as_this_product() {
         let (store, _dir) = a_store();
         let chat = ReplyTo::telegram(4242);
-        let nameless = Fixed::new(Reading::Price(Priced { amount: 329.0, currency: "EUR".into(), title: None, struck_through: None }));
+        let nameless = Fixed::new(Reading::Price(Priced { amount: 329.0, currency: "EUR".into(), title: None, struck_through: None, out_of_stock: false }));
         let answer = start(&store, &nameless, ask(&chat, WIDGET, 300.0), clock()).await.unwrap();
         assert!(answer.say.starts_with("Watching this product at shop.example: €329.00 now"), "got: {}", answer.say);
     }
@@ -1363,7 +1470,7 @@ mod tests {
     }
 
     fn price(amount: f64) -> Reading {
-        Reading::Price(Priced { amount, currency: "EUR".into(), title: Some("Widget".into()), struck_through: None })
+        Reading::Price(Priced { amount, currency: "EUR".into(), title: Some("Widget".into()), struck_through: None, out_of_stock: false })
     }
 
     fn no_price() -> Reading {
@@ -1448,6 +1555,91 @@ mod tests {
         }
         assert_eq!(reader.asked().len(), 1);
         assert_eq!(waiting(&store).len(), 1);
+    }
+
+    /// A hit on a watch for "Widget" at 329.00, read now at `amount`
+    /// under the name the page gives today.
+    async fn hit_under_the_name(now_called: Option<&str>, started_as: Option<&str>, out_of_stock: bool) -> String {
+        let (store, _dir) = a_store();
+        let now = clock();
+        let chat = ReplyTo::telegram(4242);
+        let named = |title: Option<&str>, amount: f64, out_of_stock: bool| {
+            Reading::Price(Priced { amount, currency: "EUR".into(), title: title.map(tidy_title), struck_through: None, out_of_stock })
+        };
+        let began = now - chrono::Duration::days(1);
+        start(&store, &Fixed::new(named(started_as, 329.0, false)), ask(&chat, WIDGET, 300.0), began).await.unwrap().started.unwrap();
+        check_due(&store, counters(), &Told::by(|_: &str| named(now_called, 19.0, out_of_stock)), now, &UNSPACED).await.unwrap();
+        let said = waiting(&store);
+        assert_eq!(said.len(), 1, "one message whatever the page is called now");
+        assert!(said[0].0.ends_with(":hit"));
+        said[0].2.clone()
+    }
+
+    #[tokio::test]
+    async fn a_hit_on_a_page_that_now_names_something_else_says_so_and_asks() {
+        // A product is discontinued and its address redirects to the
+        // accessory; or the page is reused for the next model. The price
+        // read is under the target, and it is not the thing's. Nothing in
+        // the data says so but the name, so the name is shown and asked
+        // about; the watch still ends, with its one message.
+        let said = hit_under_the_name(Some("Widget charging cable"), Some("Widget"), false).await;
+        assert!(said.starts_with("Widget is €19.00 at shop.example — under the €300.00 you asked for."), "got: {said}");
+        assert!(
+            said.ends_with(&format!(
+                "The page now calls this \"Widget charging cable\": please check it is still what you meant. {WIDGET}"
+            )),
+            "got: {said}"
+        );
+
+        // The same name is the same name however it is cased and spaced.
+        for same in ["Widget", "WIDGET", "  widget\n"] {
+            let said = hit_under_the_name(Some(same), Some("Widget"), false).await;
+            assert!(!said.contains("now calls this"), "{same:?}: {said}");
+        }
+        // And at the length a name is kept: a long one read again in
+        // full is the name that was cut when the watch began.
+        let long = "Widget ".repeat(40);
+        let said = hit_under_the_name(Some(&long), Some(&long), false).await;
+        assert!(!said.contains("now calls this"), "got: {said}");
+        let other = format!("{long} mark two");
+        assert!(!hit_under_the_name(Some(&other), Some(&long), false).await.contains("now calls this"), "the difference is past what is kept");
+
+        // With no name on one side there is nothing to set against the
+        // other, and nothing is claimed.
+        for (now_called, started_as) in [(None, Some("Widget")), (Some("Widget"), None), (None, None)] {
+            let said = hit_under_the_name(now_called, started_as, false).await;
+            assert!(!said.contains("now calls this"), "{now_called:?} after {started_as:?}: {said}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hit_says_when_the_page_says_the_thing_is_out_of_stock() {
+        // Said, not waited out: the price is what was asked about, and
+        // the person decides what a price on a sold-out page is worth.
+        let said = hit_under_the_name(Some("Widget"), Some("Widget"), true).await;
+        assert!(
+            said.ends_with(&format!("It was €329.00 on {}. The page says it is out of stock. {WIDGET}", (clock() - chrono::Duration::days(1)).format("%-d %B"))),
+            "got: {said}"
+        );
+        assert!(!hit_under_the_name(Some("Widget"), Some("Widget"), false).await.contains("stock"));
+        // Both remarks, when both are true.
+        let said = hit_under_the_name(Some("Gadget"), Some("Widget"), true).await;
+        assert!(said.contains("The page says it is out of stock. The page now calls this \"Gadget\""), "got: {said}");
+    }
+
+    #[tokio::test]
+    async fn stock_is_read_from_the_product_block_and_the_seller_is_not_read_at_all() {
+        let offer = r#""price":"289.00","priceCurrency":"EUR","availability":"https://schema.org/OutOfStock","seller":{"name":"Some Seller"}"#;
+        let server = serving(200, &product_page("Widget", offer)).await;
+        match read(&server).await {
+            Reading::Price(read) => assert!(read.out_of_stock, "{read:?}"),
+            other => panic!("{other:?}"),
+        }
+        let server = serving(200, &widget_at("289.00")).await;
+        assert!(matches!(read(&server).await, Reading::Price(Priced { out_of_stock: false, .. })), "a page that says nothing is not sold out");
+        let src = include_str!("watch.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("the tests come last")];
+        assert!(!src.contains(".seller"), "a watch's messages name no seller");
     }
 
     #[tokio::test]
@@ -1538,7 +1730,7 @@ mod tests {
         let (store, _dir) = a_store();
         let now = clock();
         let w = watching_since(&store, WIDGET, now - chrono::Duration::days(5)).await;
-        let in_dollars = || Reading::Price(Priced { amount: 250.0, currency: "USD".into(), title: None, struck_through: None });
+        let in_dollars = || Reading::Price(Priced { amount: 250.0, currency: "USD".into(), title: None, struck_through: None, out_of_stock: false });
         daily(&store, now, 1, |_| in_dollars()).await;
         let after = watch(&store, w.id);
         assert_eq!((after.unreadable_streak, after.last_price, after.lowest_price, after.ended.clone()), (1, 329.0, 329.0, None));
@@ -2131,6 +2323,70 @@ mod tests {
         assert_eq!(shop_of("https://www.bol.com/nl/nl/p/x/123/"), "bol.com");
         assert_eq!(shop_of("https://shop.example/p/widget?variant=2"), "shop.example");
         assert_eq!(shop_of("not an address"), "the shop");
+    }
+
+    #[test]
+    fn a_products_name_cannot_carry_a_link_a_command_or_a_mention_into_a_message() {
+        // The name is the page's text and goes into a Telegram message as
+        // it is. Telegram makes a link of an address, a tappable command
+        // of `/word` and a mention of `@word`, and a shop's page, or
+        // whoever wrote one, would be choosing what a message from Scout
+        // links to.
+        for (name, kept) in [
+            ("Widget https://evil.example/claim now", "Widget now"),
+            ("Widget www.evil.example/claim", "Widget"),
+            ("Widget evil.example/claim", "Widget evil example/claim"),
+            ("Widget t.me/joinchat/abc", "Widget t me/joinchat/abc"),
+            ("Shop24.example Widget", "Shop24 example Widget"),
+            ("/start Widget", "start Widget"),
+            ("Widget by @someone", "Widget by someone"),
+            ("Widget a@b.example", "Widget a b example"),
+            ("HTTP://EVIL.EXAMPLE Widget", "Widget"),
+        ] {
+            assert_eq!(tidy_title(name), kept, "from {name:?}");
+        }
+        // What a name really has in it is left alone: a size, a version,
+        // a fraction, a slash between two things.
+        for name in ["Widget 2.0", "Widget 1.5 kg", "Widget 3,5 mm / 2 m", "Widget A/B 1/2", "Widget (v2.1) 50%"] {
+            assert_eq!(tidy_title(name), name);
+        }
+    }
+
+    #[test]
+    fn a_price_that_is_no_amount_and_a_struck_amount_in_another_currency_are_not_read() {
+        // `fetch_page` writes neither today: its prices are above zero
+        // and a struck-through amount is in its offer's own currency. A
+        // block is not trusted to stay that way by the reader of it.
+        let block = |price: &str, struck: Option<&str>| PageProduct {
+            name: Some("Widget".into()),
+            price: Some(price.into()),
+            struck_through_price: struck.map(str::to_string),
+            availability: None,
+            seller: None,
+        };
+        for price in ["0.00 EUR", "-5.00 EUR", "NaN EUR", "inf EUR", "free EUR"] {
+            assert_eq!(
+                priced(Some(block(price, None))),
+                Reading::Unreadable("its data states a price that is not an amount".to_string()),
+                "for {price}"
+            );
+        }
+        let struck = |stated: &str| match priced(Some(block("30.59 EUR", Some(stated)))) {
+            Reading::Price(read) => read.struck_through,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(struck("35.99 EUR"), Some(35.99));
+        assert_eq!(struck("35.99 USD"), None, "another currency's amount is no second price for this one");
+        for stated in ["0.00 EUR", "-1.00 EUR", "35.99", "soon EUR"] {
+            assert_eq!(struck(stated), None, "for {stated}");
+        }
+    }
+
+    #[test]
+    fn the_pace_production_runs_at_is_the_one_the_design_and_the_notes_give() {
+        assert_eq!(Pace::DAILY.spacing, Duration::from_secs(5));
+        assert_eq!(Pace::DAILY.read_budget, READ_BUDGET);
+        assert_eq!(Pace::DAILY.pass_budget, Duration::from_secs(30 * 60), "half the hour between two ticks");
     }
 
     #[test]

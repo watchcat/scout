@@ -100,7 +100,9 @@ impl Tool for WatchPriceTool {
              and sends the user one message when it is at or below the target; a watch ends by itself \
              after {} days. Pass the product page's exact URL as tool output gave it (the variant's \
              own address where it has one), the amount the user named, and that amount's currency. \
-             Never pass or state a current price of your own. The result's `say` is the answer for the \
+             Never pass or state a current price of your own. The target is an amount the user said: \
+             when they gave none, or a relative one ('20% cheaper', 'when it drops'), ask them for the \
+             amount and call this after; do no sums for it. The result's `say` is the answer for the \
              user: give it with every amount and date exactly as written. When `watching` is false no \
              watch was started and `say` is why. It reads at most {MAX_READS} pages a request.",
             watch::DAYS
@@ -409,6 +411,9 @@ mod tests {
         // and the model is told to pass no price and to change none.
         assert!(told.contains("Never pass or state a current price of your own"), "got: {told}");
         assert!(told.contains("every amount and date exactly as written"), "got: {told}");
+        // Nor does it work a target out: "20% cheaper" is a sum, and the
+        // model is told to ask for the amount.
+        assert!(told.contains("ask them for the amount") && told.contains("do no sums for it"), "got: {told}");
     }
 
     #[tokio::test]

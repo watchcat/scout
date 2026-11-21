@@ -186,7 +186,7 @@ impl Renderer {
             .await
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
         let mut child = tokio::process::Command::new(&self.chrome)
-            .args(chrome_args(url, profile.path(), proxy))
+            .args(chrome_args(url, &profile, proxy))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -255,30 +255,61 @@ const PREFERENCES: &str = r#"{"webrtc":{"ip_handling_policy":"disable_non_proxie
 /// its way out. Now that it exists before Chrome does, removing it belongs
 /// to every way out — Chrome that would not start, a deadline that drops
 /// the render mid-read — and a drop is the one place all of them pass.
+///
+/// On the deadline's way out the removal is an attempt and no more: Chrome
+/// has been sent its kill and not waited for, and what is left of it can
+/// still be writing. Measured 2026-11-21 on Chrome 157, 48 renders cut
+/// between 0.2 and 4 seconds in: two left their directory behind, files and
+/// all. Before, every render cut that way left its whole profile; a render
+/// that ends in the ordinary way left nothing, then or now.
 struct Profile(PathBuf);
 
 impl Profile {
     /// Fails rather than hand back a profile without its preferences: a
     /// Chrome started on a bare one sends UDP wherever a page points it.
     fn create_in(base: &std::path::Path) -> std::io::Result<Self> {
-        let profile = Self(base.join(format!(
-            "scout-chrome-{}-{}",
+        // The count is what keeps two renders apart. The clock alone does
+        // not: sixteen threads making sixty-four profiles each landed
+        // twenty of them in a directory another already had (2026-11-21, on
+        // a Mac, whose clock ticks in microseconds).
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = base.join(format!(
+            "scout-chrome-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        )));
+                .unwrap_or_default(),
+            MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // Made, never adopted: a directory already there is not ours to
+        // write into, nor — which is why this comes before the value that
+        // removes on drop — ours to remove.
+        private_dir(&path)?;
+        let profile = Self(path);
         // `Default` is the profile Chrome uses inside a fresh data directory.
         let default = profile.0.join("Default");
-        std::fs::create_dir_all(&default)?;
-        std::fs::write(default.join("Preferences"), PREFERENCES)?;
+        private_dir(&default)?;
+        let mut preferences = std::fs::OpenOptions::new();
+        preferences.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut preferences, 0o600);
+        std::io::Write::write_all(&mut preferences.open(default.join("Preferences"))?, PREFERENCES.as_bytes())?;
         Ok(profile)
     }
 
     fn path(&self) -> &std::path::Path {
         &self.0
     }
+}
+
+/// Makes one directory, its owner's alone, as Chrome makes its own profile
+/// (`a_profile_is_its_owners_alone` has the modes).
+fn private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut dir = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+    dir.create(path)
 }
 
 impl Drop for Profile {
@@ -288,12 +319,15 @@ impl Drop for Profile {
 }
 
 /// Chrome's command line for one render through the proxy on `proxy`.
-fn chrome_args(url: &str, profile: &std::path::Path, proxy: u16) -> Vec<String> {
+///
+/// It takes a [`Profile`] and not a path, so that a command line can only be
+/// made for a profile whose preferences are already on disk.
+fn chrome_args(url: &str, profile: &Profile, proxy: u16) -> Vec<String> {
     vec![
         "--headless=new".into(),
         "--dump-dom".into(),
         format!("--virtual-time-budget={VIRTUAL_TIME_BUDGET_MS}"),
-        format!("--user-data-dir={}", profile.display()),
+        format!("--user-data-dir={}", profile.path().display()),
         format!("--user-agent={}", super::fetch::BROWSER_USER_AGENT),
         // socks5, not socks4 or http: Chrome then sends the hostname and
         // leaves resolving it to the proxy, so the name is checked and
@@ -333,7 +367,13 @@ mod tests {
 
     #[test]
     fn chrome_goes_through_the_guard_proxy_loopback_included() {
-        let args = chrome_args("https://shop.example/p", std::path::Path::new("/tmp/p"), 4321);
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        let args = chrome_args("https://shop.example/p", &profile, 4321);
+        // A command line is made from a profile that has been written, so
+        // that there is no Chrome without its preferences; and it is that
+        // profile Chrome is sent to.
+        assert!(args.contains(&format!("--user-data-dir={}", profile.path().display())));
         assert!(args.contains(&"--proxy-server=socks5://127.0.0.1:4321".to_string()));
         // Without this Chrome reaches 127.0.0.1 directly, proxy or not.
         assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_string()));
@@ -344,7 +384,9 @@ mod tests {
     fn chrome_is_told_on_its_command_line_too_to_keep_webrtc_in_the_proxy() {
         // The second of two ways it is told; the profile's preferences are
         // the first. Not the `--force-…` spelling, which Chrome ignores.
-        let args = chrome_args("https://shop.example/p", std::path::Path::new("/tmp/p"), 4321);
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        let args = chrome_args("https://shop.example/p", &profile, 4321);
         assert!(args.contains(&"--webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()));
         assert!(!args.iter().any(|a| a.starts_with("--force-webrtc-ip-handling-policy")));
     }
@@ -411,10 +453,56 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_is_its_owners_alone() {
+        // As Chrome makes one itself (measured 2026-11-21, Chrome 157: 700
+        // on the directory and on `Default`, 600 on `Preferences`). Made by
+        // us it must not be any wider: it holds what a render's pages left.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let profile = Profile::create_in(base.path()).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(profile.path()), 0o700);
+        assert_eq!(mode(&profile.path().join("Default")), 0o700);
+        assert_eq!(mode(&profile.path().join("Default").join("Preferences")), 0o600);
+    }
+
+    #[test]
+    fn profiles_made_in_the_same_instant_are_not_one_directory() {
+        // Two renders run at once, and the clock in the name ticks in
+        // microseconds on a Mac: two profiles of one name would be one
+        // directory, and the first render to end would take it from under
+        // the other's Chrome.
+        let base = tempfile::tempdir().unwrap();
+        let made: Vec<PathBuf> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..64)
+                            .map(|_| {
+                                let profile = Profile::create_in(base.path()).unwrap();
+                                let path = profile.path().to_path_buf();
+                                // Kept on disk, so a second one of the same
+                                // name has something to collide with.
+                                std::mem::forget(profile);
+                                path
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads.into_iter().flat_map(|t| t.join().unwrap()).collect()
+        });
+        let distinct: std::collections::HashSet<_> = made.iter().collect();
+        assert_eq!(distinct.len(), made.len(), "two profiles shared a directory");
+    }
+
     #[test]
     fn a_profile_is_gone_when_its_render_is() {
         // However the render ends — Chrome would not start, the deadline
-        // dropped it mid-read — what it put on disk goes with it.
+        // dropped it mid-read — the drop takes the directory with it. (What
+        // a Chrome still dying can put back afterwards is on `Profile`.)
         let base = tempfile::tempdir().unwrap();
         let profile = Profile::create_in(base.path()).unwrap();
         let path = profile.path().to_path_buf();

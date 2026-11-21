@@ -279,9 +279,10 @@ impl reqwest::dns::Resolve for PublicResolver {
 /// `--proxy-bypass-list=<-loopback>`, or it goes to localhost directly.
 ///
 /// TCP is all it carries (a UDP ASSOCIATE is refused with the other
-/// commands), and Chrome does not ask it to carry more: WebRTC's UDP goes
-/// out from sockets of Chrome's own. That is shut where Chrome is started,
-/// in `tools/browser.rs`, not here.
+/// commands), and Chrome does not ask it to carry more: measured 2026-11-20
+/// on Chrome 157, the proxy was sent CONNECT and nothing else while a page
+/// had Chrome send STUN datagrams from sockets of its own. That UDP is shut
+/// where Chrome is started, in `tools/browser.rs`, not here.
 ///
 /// Returns the port; the proxy, and every tunnel it has open, stops when the
 /// returned handle is dropped.
@@ -486,13 +487,16 @@ mod tests {
         let g = Guard::only(mock);
         assert!(g.check(&Url::parse("http://127.0.0.1:4000/x").unwrap()).await.is_ok());
         assert!(g.check(&Url::parse("http://127.0.0.1:4001/x").unwrap()).await.is_err());
-        assert!(g.check(&Url::parse("http://1.1.1.1/").unwrap()).await.is_err());
+        // 192.0.2.1 is an address kept for documentation: public by the
+        // guard's rule, and nobody's, so that a guard which stopped
+        // refusing it would dial nothing real from this test.
+        assert!(g.check(&Url::parse("http://192.0.2.1/").unwrap()).await.is_err());
         // The difference from the exemption every other test uses.
-        assert!(Guard::exempting(mock).check(&Url::parse("http://1.1.1.1/").unwrap()).await.is_ok());
+        assert!(Guard::exempting(mock).check(&Url::parse("http://192.0.2.1/").unwrap()).await.is_ok());
 
         // And at the proxy, where Chrome meets it: refused before any dial.
         let (proxy, _keep) = serve_socks(g).await.unwrap();
-        let (code, _) = socks_connect(proxy, 1, &[1, 1, 1, 1], 443).await;
+        let (code, _) = socks_connect(proxy, 1, &[192, 0, 2, 1], 443).await;
         assert_eq!(code, REP_NOT_ALLOWED);
         let (code, _) = socks_connect(proxy, 1, &[127, 0, 0, 1], 4001).await;
         assert_eq!(code, REP_NOT_ALLOWED);
@@ -581,6 +585,29 @@ mod tests {
         ] {
             let (code, _) = socks_connect(proxy, atyp, addr, 9090).await;
             assert_eq!(code, REP_NOT_ALLOWED, "atyp {atyp} {addr:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_renderer_proxy_carries_tcp_and_refuses_to_relay_udp() {
+        // SOCKS5 has a command for UDP (3, UDP ASSOCIATE) and one for
+        // listening (2, BIND). A proxy that granted either would be handing
+        // out sockets the fence never judged an address for.
+        let server = MockServer::start().await;
+        let (proxy, _keep) = serve_socks(Guard::exempting(*server.address())).await.unwrap();
+        for command in [2u8, 3] {
+            let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy)).await.unwrap();
+            s.write_all(&[5, 1, 0]).await.unwrap();
+            let mut hello = [0u8; 2];
+            s.read_exact(&mut hello).await.unwrap();
+            // To the one address this proxy would CONNECT to, so that the
+            // command is all there is to refuse.
+            let mut request = vec![5, command, 0, 1, 127, 0, 0, 1];
+            request.extend_from_slice(&server.address().port().to_be_bytes());
+            s.write_all(&request).await.unwrap();
+            let mut reply = [0u8; 10];
+            s.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[1], REP_COMMAND, "command {command}");
         }
     }
 

@@ -8,6 +8,7 @@ use crate::tools::prices::ComparePricesTool;
 use crate::tools::purchases::{QueryPurchasesTool, RecordPurchaseTool};
 use crate::tools::reminders::{CancelReminderTool, CreateReminderTool, ListRemindersTool};
 use crate::tools::secondhand::{effective_sites, SecondhandSearchTool};
+use crate::tools::watch::{ListWatchesTool, StopWatchTool, WatchPriceTool};
 use anyhow::Result;
 use rig::client::CompletionClient;
 use rig::providers::openai;
@@ -720,6 +721,9 @@ pub fn build_agent(
     d: &AgentDeps,
     run: &scout_api::RunContext,
     facts: &[(String, String)],
+    // Where a price watch asked for in this run would be delivered, as
+    // `watch::deliver_to` worked it out, or nowhere.
+    watch_to: Option<scout_api::ReplyTo>,
     observer: std::sync::Arc<crate::observer::Observer>,
 ) -> rig::agent::Agent<openai::completion::CompletionModel> {
     let account_id = run.account_id;
@@ -744,6 +748,9 @@ pub fn build_agent(
         delivery_country(facts),
         between_people.clone(),
     ));
+    // The same memo for `watch_price`, which reads a page too: a shop that
+    // refused `fetch_page` in this request is not asked again for a watch.
+    let shops_for_watches = shops.clone();
     let mut builder = d
         .llm
         .agent(&d.model)
@@ -782,6 +789,28 @@ pub fn build_agent(
             account_id,
             reply_to: reply_to.clone(),
         });
+    }
+    // A price watch is a promise to come back too, so its tools are offered
+    // as the reminder's is above: only to a run with somewhere to deliver
+    // to. The somewhere is narrower than a reminder's, and worked out by
+    // the run loop: a group only if this run is that group's, otherwise
+    // the person's private chat. All three, the list and the stop with the
+    // start. Each tool tells the model what it is for in its own
+    // description; the preamble has no rule about them, so there is none
+    // to outlive them where they are not offered.
+    if let Some(reply_to) = &watch_to {
+        builder = builder
+            .tool(WatchPriceTool::new(
+                d.store.clone(),
+                account_id,
+                reply_to.clone(),
+                d.web.clone(),
+                d.renderer.clone(),
+                shops_for_watches.clone(),
+                d.metrics,
+            ))
+            .tool(ListWatchesTool { store: d.store.clone(), account_id })
+            .tool(StopWatchTool { store: d.store.clone(), account_id, metrics: d.metrics });
     }
     if let Some(bol) = &d.bol {
         builder = builder.tool(crate::tools::bol::BolSearchTool { client: bol.clone() });
@@ -949,6 +978,85 @@ mod tests {
         assert!(String::from_utf8_lossy(&asked[0].body).contains("\"model\":\"the-main-model\""), "the main model, by its configured name");
     }
 
+    /// The tools one run's agent is given, as the model is told of them:
+    /// read off the request the agent sends, since a built agent does not
+    /// say what it holds. The run is by an account whose Telegram ids are
+    /// `telegram`, in a thread of `scope`, with `reply_to` as its channel
+    /// handed it; where a watch may be delivered is worked out from those
+    /// as the run loop does.
+    async fn tools_offered(telegram: &[i64], scope: &str, reply_to: Option<scout_api::ReplyTo>) -> Vec<String> {
+        use rig::completion::Prompt;
+        let main = wiremock::MockServer::start().await;
+        model_saying(&main, "ok").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::for_test(dir.path().join("tools.duckdb").to_str().unwrap());
+        cfg.llm_base_url = main.uri();
+        let core = crate::core::Core::start(cfg, None).unwrap();
+        let store = core.store();
+        let account_id = store.account_for_identity("email", "a@example.com").unwrap();
+        for id in telegram {
+            store.link_identity(account_id, "telegram", &id.to_string()).unwrap();
+        }
+        let conversation_id = store.start_conversation(account_id, scope).unwrap();
+        let run = scout_api::RunContext { account_id, conversation_id, reply_to, title_source: None };
+        let (events, _seen) = tokio::sync::mpsc::unbounded_channel();
+        let observer = std::sync::Arc::new(crate::observer::Observer::new(events, 1));
+
+        let watch_to = crate::watch::deliver_to(&store, &run).await;
+        build_agent(&core.deps, &run, &[], watch_to, observer).prompt("tell me when it is under 300").await.unwrap();
+
+        let asked = main.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&asked[0].body).unwrap();
+        let tools = body["tools"].as_array().expect("the request lists its tools");
+        tools.iter().map(|tool| tool["function"]["name"].as_str().expect("a tool has a name").to_string()).collect()
+    }
+
+    const WATCH: [&str; 3] = ["watch_price", "list_watches", "stop_watch"];
+
+    #[tokio::test]
+    async fn the_watch_tools_are_offered_only_to_a_run_with_somewhere_to_deliver_to() {
+        // A watch is a promise to come back, as a reminder is. A run with
+        // nowhere to send the message is not shown the tools at all, so
+        // the model cannot accept a watch that would end unheard.
+        let with = tools_offered(&[4242], "direct", Some(scout_api::ReplyTo::telegram(4242))).await;
+        for tool in WATCH {
+            assert!(with.iter().any(|t| t == tool), "{tool} is missing where there is a chat to tell: {with:?}");
+        }
+        assert!(with.iter().any(|t| t == "create_reminder"), "the tool whose rule this is: {with:?}");
+
+        let without = tools_offered(&[4242], "direct", None).await;
+        for tool in WATCH {
+            assert!(!without.iter().any(|t| t == tool), "{tool} was offered with nowhere to deliver to: {without:?}");
+        }
+        assert!(!without.iter().any(|t| t == "create_reminder"));
+        assert!(without.iter().any(|t| t == "fetch_page"), "the rest are there all the same: {without:?}");
+    }
+
+    #[tokio::test]
+    async fn a_run_from_telegram_always_has_the_watch_tools_and_a_group_is_no_place_for_a_run_from_elsewhere() {
+        // The cheapest-price note the bot appends names `watch_price`,
+        // which holds because a message on Telegram always came in a chat
+        // the person can be told in: their own, or the group it was
+        // asked in.
+        let group = scout_api::ReplyTo::telegram(-100_123);
+        for (scope, reply_to) in [("direct", scout_api::ReplyTo::telegram(4242)), ("telegram:-100123", group.clone())] {
+            let offered = tools_offered(&[4242], scope, Some(reply_to)).await;
+            assert!(WATCH.iter().all(|tool| offered.iter().any(|t| t == tool)), "in {scope}: {offered:?}");
+        }
+
+        // From the browser the address is wherever the account last spoke
+        // on Telegram, and that can be a group. A watch message names a
+        // product, a target and a price: it goes there only when it was
+        // asked for there. With no private chat to be had, two Telegram
+        // accounts and no way to say which, the tools are not offered;
+        // the reminder's rule is its own and is not changed here.
+        let offered = tools_offered(&[4242, 4343], "direct", Some(group)).await;
+        for tool in WATCH {
+            assert!(!offered.iter().any(|t| t == tool), "{tool} was offered with a group as its only address: {offered:?}");
+        }
+        assert!(offered.iter().any(|t| t == "create_reminder"), "{offered:?}");
+    }
+
     #[test]
     fn every_conditional_rule_is_wired_up() {
         // The guard against a third UnknownToolCall. Adding a rule that
@@ -1045,7 +1153,10 @@ mod tests {
     fn the_run_loop_hands_one_observer_to_the_agent_build() {
         let src = include_str!("run.rs");
         let src = &src[..src.find("#[cfg(test)]").expect("the tests must come last")];
-        assert!(src.contains("build_agent(&core.deps, run, &facts, observer.clone())"), "the observer must reach build_agent");
+        assert!(src.contains("build_agent(&core.deps, run, &facts, watch_to, observer.clone())"), "the observer must reach build_agent");
+        // And where a watch may be delivered is worked out by the loop,
+        // off the runtime's threads, and handed in beside it.
+        assert!(src.contains("let watch_to = crate::watch::deliver_to(&core.deps.store, run).await;"), "the watch tools need their address");
     }
 
     #[test]

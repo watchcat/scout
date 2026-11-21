@@ -116,7 +116,7 @@ reason: a watch is a promise to come back.
 - `list_watches {}` — what is being watched, with the last price read.
 - `stop_watch { id }`.
 
-### `price_watches` (schema step 27)
+### `price_watches` (schema step 28)
 
 `id`, `account_id`, `url`, `title`, `currency`, `target` and `first_price`
 (`DOUBLE`, as every price column is), `last_price`, `lowest_price`,
@@ -143,6 +143,55 @@ through the outbox the way an inbox nudge does (`inbox::nudge`), keyed
 and the amounts in the message are Rust's; the text is a template.
 
 Ended watches are pruned ninety days after they end, in maintenance.
+
+_As built, 2026-11-20, where it differs from the above._
+
+The table has four columns more. `channel` and `address` are where the
+watch's message goes, worked out when it starts: the group it was asked
+for in, or else the person's private chat.
+`last_read_at` is when a price was last read, apart from `last_checked_at`,
+since a watch can be checked every day and read nothing for weeks.
+`unreached_since` is since when every check has got no reading at all.
+
+An account watches one address once at a time; a second `watch_price` on
+it says which watch is there.
+
+A check ends one of three ways, and they are not counted alike. A price
+read is kept. The page read with no price, or gone (a 404, a 410), counts
+towards the three, which are three checks running and not three days: the
+message says checks. A check with no reading at all is neither: the shop
+refusing its reader, counted `refused`, or the request coming to nothing,
+counted `failed`, a fourth outcome (a transport error, no answer in 80
+seconds, a 403, 429 or 5xx, a shell no browser filled). It changes no price
+and no count, and starts a clock that any reading of the page stops. Seven days on that clock end the watch as `unreached`, a fifth
+`ended_why`, with a message that says since when the page could not be read
+and when a price last was. The expiry message says the lowest price read
+and when one was last read; it does not say the price stayed up.
+
+A watch past `expires_at` is read once more at the next tick and ended
+there: `hit` if the price got there, `expired` otherwise. A pass reads one
+page at a time, gives a read up after 80 seconds, and takes up no further
+watch after thirty minutes; what it leaves is due at the next tick. It runs
+in a task of its own, stamps a watch as checked before its page is read,
+and counts a read that panics as a request that failed.
+
+A hit says two more things where the page's data gives them: that the
+product is out of stock, and that the page now names another thing than
+the watch began with, asking the person to check. It ends the watch all
+the same.
+
+`watch_price` shares the request's memory of shops that refused and reads
+at most three pages a request. A watch is delivered to a group only when
+it was asked for in that group, and otherwise to the person's private
+chat; with none to be had the tools are not offered. Its message is tried
+for a day before the outbox gives it up, where a mirrored turn is tried
+five times.
+
+On `/metrics`, beside the two series below: the checks have a fourth
+outcome, `failed`; `scout_price_watch_requests_total{outcome}` counts what
+became of each request for a watch; `scout_price_watches_live` is how many
+are running; `scout_outbox_given_up_total{kind}` counts messages the outbox
+gave up on.
 
 `/metrics`: `scout_price_watch_checks_total{outcome}` (`read`, `unreadable`,
 `refused`) and `scout_price_watches_ended_total{why}`.

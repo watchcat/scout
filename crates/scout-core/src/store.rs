@@ -12,6 +12,24 @@ use std::sync::{Arc, Mutex};
 /// would otherwise be retried against forever.
 pub const MIRROR_ATTEMPTS: i64 = 5;
 
+/// How many times a price watch's message is tried: the five every row
+/// gets, a minute apart as the drain comes round, and then one an hour, so
+/// that the last is twenty-three hours after the message was queued. A
+/// mirrored turn that is lost is a line of a thread the reader has in the
+/// browser. A watch's message is the only word its owner ever gets of how
+/// the watch ended, and the watch is over when it is queued: five minutes
+/// of Telegram being down must not be the end of it.
+pub const WATCH_MESSAGE_ATTEMPTS: i64 = MIRROR_ATTEMPTS + 23;
+
+/// What a send that failed came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirrorFailure {
+    /// How many attempts the row has spent now.
+    pub attempts: i64,
+    /// Whether that was its last: it will not be offered again.
+    pub given_up: bool,
+}
+
 /// How many times the extractor is pointed at one mail before it is left
 /// as failed. Same reasoning as `MIRROR_ATTEMPTS`: nothing bounds a mail
 /// the model keeps choking on except this.
@@ -47,6 +65,46 @@ CREATE TABLE IF NOT EXISTS reminders (
     next_due TEXT NOT NULL,
     active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+CREATE SEQUENCE IF NOT EXISTS price_watches_id_seq;
+-- A price somebody asked to be told about: "tell me when it is under 300".
+-- The page is read again once a day and the row ends once, with one
+-- message, `ended_why` saying which: `hit`, `unreadable`, `unreached`,
+-- `expired`, or `stopped` by its owner, who is sent nothing. A row with `ended_at` unset
+-- is live. `channel` and `address` are the chat it was asked for in, as a
+-- reminder's are, and where that message goes. `url` is the address as it
+-- was given, query and all, since the query can be what picks the variant.
+-- Every time is written by the caller, in UTC: none has a default, so
+-- none can be the server's local clock.
+CREATE TABLE IF NOT EXISTS price_watches (
+    id                BIGINT PRIMARY KEY DEFAULT nextval('price_watches_id_seq'),
+    account_id        BIGINT NOT NULL,
+    channel           TEXT NOT NULL,
+    address           TEXT NOT NULL,
+    url               TEXT NOT NULL,
+    title             TEXT NOT NULL,
+    currency          TEXT NOT NULL,
+    target            DOUBLE NOT NULL,
+    first_price       DOUBLE NOT NULL,
+    last_price        DOUBLE NOT NULL,
+    lowest_price      DOUBLE NOT NULL,
+    -- When a check was last made, whatever came of it, and when one last
+    -- read a price. The two part when a shop refuses its reader or the
+    -- request fails: a watch can be checked every day and read nothing
+    -- for weeks, and whatever is said of it has to say which.
+    last_checked_at   TIMESTAMP NOT NULL,
+    last_read_at      TIMESTAMP NOT NULL,
+    -- Checks in a row that read the page and found no price. A check that
+    -- got no reading at all is not one of them: see `watch.rs`.
+    unreadable_streak BIGINT NOT NULL DEFAULT 0,
+    -- Since when every check has come back with no reading at all, the
+    -- shop refusing or the request failing. NULL when the last check read
+    -- the page, priced or not.
+    unreached_since   TIMESTAMP,
+    created_at        TIMESTAMP NOT NULL,
+    expires_at        TIMESTAMP NOT NULL,
+    ended_at          TIMESTAMP,
+    ended_why         TEXT
 );
 CREATE TABLE IF NOT EXISTS user_facts (
     account_id BIGINT NOT NULL,
@@ -613,6 +671,74 @@ pub struct Reminder {
     pub item: String,
     pub interval_days: i64,
     pub next_due: String, // YYYY-MM-DD
+}
+
+/// A row of `price_watches`: see the table for what its columns mean and
+/// `watch.rs` for what is done with one. Times are UTC.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PriceWatch {
+    pub id: i64,
+    pub account_id: i64,
+    pub channel: String,
+    pub address: String,
+    pub url: String,
+    pub title: String,
+    pub currency: String,
+    pub target: f64,
+    pub first_price: f64,
+    pub last_price: f64,
+    pub lowest_price: f64,
+    pub last_checked_at: chrono::NaiveDateTime,
+    /// When a price was last read: at the start, or by a check since.
+    pub last_read_at: chrono::NaiveDateTime,
+    pub unreadable_streak: i64,
+    /// Since when every check has got no reading at all, if the last did.
+    pub unreached_since: Option<chrono::NaiveDateTime>,
+    pub created_at: chrono::NaiveDateTime,
+    pub expires_at: chrono::NaiveDateTime,
+    /// When it ended and why; `None` while it is live.
+    pub ended: Option<(chrono::NaiveDateTime, String)>,
+}
+
+/// A watch to start. `price` is what Rust read off the page a moment ago,
+/// and so the watch's first, last and lowest price at once.
+#[derive(Debug, Clone)]
+pub struct NewWatch<'a> {
+    pub account_id: i64,
+    pub channel: &'a str,
+    pub address: &'a str,
+    pub url: &'a str,
+    pub title: &'a str,
+    pub currency: &'a str,
+    pub target: f64,
+    pub price: f64,
+    pub now: chrono::NaiveDateTime,
+    pub expires_at: chrono::NaiveDateTime,
+}
+
+/// What asking for a watch came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WatchStarted {
+    Started(PriceWatch),
+    /// The account has as many live watches as it may.
+    Full,
+    /// The account is watching this address already: the watch there is.
+    Already(PriceWatch),
+}
+
+/// What one daily check of a watch came to, for `record_watch_check`.
+#[derive(Debug, Clone)]
+pub struct WatchCheck<'a> {
+    pub id: i64,
+    pub now: chrono::NaiveDateTime,
+    pub last_price: f64,
+    pub lowest_price: f64,
+    pub last_read_at: chrono::NaiveDateTime,
+    pub unreadable_streak: i64,
+    pub unreached_since: Option<chrono::NaiveDateTime>,
+    /// Set when this check ends the watch: why, and the one message that
+    /// says so.
+    pub ended: Option<(&'a str, &'a str)>,
 }
 
 /// A named plan. `id` is not serialised: it is noise to the model, and
@@ -1524,6 +1650,24 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS cached_tokens BIGINT;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS output_tokens BIGINT;
 "#;
 
+/// Price watches. A new table and nothing else, so the step is the version
+/// bump and the backup that comes with it; see `STEP_18_MAIL_PARTS` for why
+/// the table is there before the step runs, and why the step has to build
+/// it right all the same.
+const STEP_PRICE_WATCHES: &str = r#"
+CREATE SEQUENCE IF NOT EXISTS price_watches_id_seq;
+CREATE TABLE IF NOT EXISTS price_watches (
+    id BIGINT PRIMARY KEY DEFAULT nextval('price_watches_id_seq'),
+    account_id BIGINT NOT NULL, channel TEXT NOT NULL, address TEXT NOT NULL,
+    url TEXT NOT NULL, title TEXT NOT NULL, currency TEXT NOT NULL,
+    target DOUBLE NOT NULL, first_price DOUBLE NOT NULL, last_price DOUBLE NOT NULL,
+    lowest_price DOUBLE NOT NULL, last_checked_at TIMESTAMP NOT NULL,
+    last_read_at TIMESTAMP NOT NULL, unreadable_streak BIGINT NOT NULL DEFAULT 0,
+    unreached_since TIMESTAMP, created_at TIMESTAMP NOT NULL,
+    expires_at TIMESTAMP NOT NULL, ended_at TIMESTAMP, ended_why TEXT
+);
+"#;
+
 /// A stay now waits for the arrival on its check-in day; every trip is
 /// put in that order once, since positions otherwise change only when the
 /// trip does.
@@ -1729,6 +1873,7 @@ fn steps() -> Vec<(i64, Step)> {
         (25, Step::Sql(STEP_25_LOGIN_JOIN)),
         (26, Step::Sql(STEP_26_RUN_TOKENS)),
         (27, Step::Sql(STEP_27_SHOP_DELIVERY)),
+        (28, Step::Sql(STEP_PRICE_WATCHES)),
     ]
 }
 
@@ -2000,7 +2145,12 @@ fn is_empty_account(conn: &Connection, account_id: i64) -> Result<bool> {
         params![account_id, account_id, account_id, account_id, account_id, account_id],
         |r| r.get(0),
     )?;
-    Ok(held == 0)
+    // A price watch is held as a reminder is, and asked about apart so the
+    // statement above stays as it was. An ended one counts until it is
+    // pruned: its account is still the one that was told how it ended.
+    let watches: i64 =
+        conn.query_row("SELECT count(*) FROM price_watches WHERE account_id = ?", params![account_id], |r| r.get(0))?;
+    Ok(held + watches == 0)
 }
 
 /// Moves everything `absorbed` can prove or be reached by onto `survivor`,
@@ -2281,6 +2431,231 @@ impl Store {
             params![next_due, id],
         )?;
         Ok(())
+    }
+
+    /// Starts a watch, unless the account has `cap` live ones or is
+    /// watching this address already.
+    ///
+    /// Both are checked here, under the lock the insert holds, and not only
+    /// by whoever calls. A model does ask twice for one thing: two of three
+    /// page opens in one production run were the same page (see
+    /// `re_reading_a_page_is_free` in `fetch.rs`), and two watches on one
+    /// page are two messages the day it is hit. The address is compared as
+    /// it is written, since one that differs in its query can be another
+    /// variant at another price.
+    pub fn start_watch(&self, new: &NewWatch<'_>, cap: i64) -> Result<WatchStarted> {
+        let conn = self.conn();
+        let there = conn
+            .query_row(
+                &format!("SELECT {WATCH_COLUMNS} FROM price_watches WHERE account_id = ? AND url = ? AND ended_at IS NULL"),
+                params![new.account_id, new.url],
+                row_to_watch,
+            )
+            .optional()?;
+        if let Some(there) = there {
+            return Ok(WatchStarted::Already(there));
+        }
+        let live: i64 = conn.query_row(
+            "SELECT count(*) FROM price_watches WHERE account_id = ? AND ended_at IS NULL",
+            params![new.account_id],
+            |r| r.get(0),
+        )?;
+        if live >= cap {
+            return Ok(WatchStarted::Full);
+        }
+        let id: i64 = conn.query_row(
+            "INSERT INTO price_watches (account_id, channel, address, url, title, currency, target,
+                                        first_price, last_price, lowest_price,
+                                        last_checked_at, last_read_at, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP))
+             RETURNING id",
+            params![
+                new.account_id, new.channel, new.address, new.url, new.title, new.currency, new.target,
+                new.price, new.price, new.price,
+                stamp(new.now), stamp(new.now), stamp(new.now), stamp(new.expires_at)
+            ],
+            |r| r.get(0),
+        )?;
+        // Read back and not built from what was handed in: the table keeps
+        // time to the second, and the watch handed out is the one a later
+        // read will find.
+        let watch = conn.query_row(
+            &format!("SELECT {WATCH_COLUMNS} FROM price_watches WHERE id = ?"),
+            params![id],
+            row_to_watch,
+        )?;
+        Ok(WatchStarted::Started(watch))
+    }
+
+    /// An account's live watches, oldest first.
+    pub fn live_watches(&self, account_id: i64) -> Result<Vec<PriceWatch>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WATCH_COLUMNS} FROM price_watches WHERE account_id = ? AND ended_at IS NULL ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params![account_id], row_to_watch)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Ends a live watch on its owner's word and hands it back, or `None`
+    /// when this account has no live watch of that id. It queues no
+    /// message: whoever stopped it was told so in the conversation.
+    pub fn stop_watch(&self, account_id: i64, id: i64, now: chrono::NaiveDateTime) -> Result<Option<PriceWatch>> {
+        let conn = self.conn();
+        let stopped = conn.execute(
+            "UPDATE price_watches SET ended_at = CAST(? AS TIMESTAMP), ended_why = 'stopped'
+             WHERE id = ? AND account_id = ? AND ended_at IS NULL",
+            params![stamp(now), id, account_id],
+        )?;
+        if stopped == 0 {
+            return Ok(None);
+        }
+        let row = conn.query_row(
+            &format!("SELECT {WATCH_COLUMNS} FROM price_watches WHERE id = ?"),
+            params![id],
+            row_to_watch,
+        )?;
+        Ok(Some(row))
+    }
+
+    /// Every account's live watches that are due a check: last checked at
+    /// or before `checked_before`, or past their own end. The longest
+    /// unchecked come first, so a pass that runs out of time leaves the
+    /// ones that have waited least.
+    pub fn due_watches(&self, now: chrono::NaiveDateTime, checked_before: chrono::NaiveDateTime) -> Result<Vec<PriceWatch>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WATCH_COLUMNS} FROM price_watches
+             WHERE ended_at IS NULL
+               AND (last_checked_at <= CAST(? AS TIMESTAMP) OR expires_at <= CAST(? AS TIMESTAMP))
+             ORDER BY last_checked_at, id"
+        ))?;
+        let rows = stmt.query_map(params![stamp(checked_before), stamp(now)], row_to_watch)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// The scope of a conversation, `direct` or a group's
+    /// `telegram:<chat>`, or `None` when the thread is gone. For deciding
+    /// whether a run came from a group: see `watch::deliver_to`.
+    pub fn conversation_scope(&self, conversation_id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row("SELECT scope FROM conversations WHERE id = ?", params![conversation_id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Notes that a watch is being checked now, before its page is asked
+    /// for. Returns whether the watch is still live to be checked.
+    ///
+    /// The time of the check is written first because the read may never
+    /// come back to write it: a page the parser panics on, or a process
+    /// that dies mid-read, would otherwise leave the watch first in line
+    /// for the next pass, and the next. Stamped, it has had its day.
+    pub fn mark_watch_checking(&self, id: i64, now: chrono::NaiveDateTime) -> Result<bool> {
+        let conn = self.conn();
+        let live = conn.execute(
+            "UPDATE price_watches SET last_checked_at = CAST(? AS TIMESTAMP) WHERE id = ? AND ended_at IS NULL",
+            params![stamp(now), id],
+        )?;
+        Ok(live > 0)
+    }
+
+    /// Writes what a check came to, and where it ends the watch queues the
+    /// one message that says so, in the same transaction: a watch that
+    /// ended without its message would never be heard of, and a message
+    /// whose watch stayed live would be sent again the next day.
+    ///
+    /// Returns whether the watch was still live to be written to. The page
+    /// was read with this lock let go, and its owner may have stopped the
+    /// watch meanwhile; then nothing is written and nothing is said.
+    ///
+    /// The message goes to the chat the watch was asked for in, keyed
+    /// `watch:<id>:<why>`. Check-then-insert, for the reason
+    /// `enqueue_mirror` gives; a row already under that key is the message.
+    pub fn record_watch_check(&self, check: &WatchCheck<'_>) -> Result<bool> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN")?;
+        let written = (|| -> Result<bool> {
+            let (ended_at, why) = match check.ended {
+                Some((why, _)) => (Some(stamp(check.now)), Some(why)),
+                None => (None, None),
+            };
+            let live = conn.execute(
+                "UPDATE price_watches
+                 SET last_checked_at = CAST(? AS TIMESTAMP), last_price = ?, lowest_price = ?,
+                     last_read_at = CAST(? AS TIMESTAMP), unreadable_streak = ?,
+                     unreached_since = CAST(? AS TIMESTAMP), ended_at = CAST(? AS TIMESTAMP), ended_why = ?
+                 WHERE id = ? AND ended_at IS NULL",
+                params![
+                    stamp(check.now), check.last_price, check.lowest_price,
+                    stamp(check.last_read_at), check.unreadable_streak,
+                    check.unreached_since.map(stamp), ended_at, why, check.id
+                ],
+            )?;
+            if live == 0 {
+                return Ok(false);
+            }
+            let Some((why, body)) = check.ended else { return Ok(true) };
+            let (account_id, channel, address): (i64, String, String) = conn.query_row(
+                "SELECT account_id, channel, address FROM price_watches WHERE id = ?",
+                params![check.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let key = format!("watch:{}:{why}", check.id);
+            let said: i64 = conn.query_row(
+                "SELECT count(*) FROM outbox WHERE account_id = ? AND channel = ? AND turn_key = ?",
+                params![account_id, channel, key],
+                |r| r.get(0),
+            )?;
+            if said == 0 {
+                // Dated by the check and not by the table's default, which
+                // is the server's local clock: how long the message has
+                // waited decides when it is tried again.
+                conn.execute(
+                    "INSERT INTO outbox (id, account_id, channel, address, body, turn_key, created_at)
+                     VALUES (nextval('outbox_id_seq'), ?, ?, ?, ?, ?, CAST(? AS TIMESTAMP))",
+                    params![account_id, channel, address, body, key, stamp(check.now)],
+                )?;
+            }
+            Ok(true)
+        })();
+        match written {
+            Ok(written) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(written)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// How many watches are live, everyone's together.
+    pub fn count_live_watches(&self) -> Result<i64> {
+        let conn = self.conn();
+        Ok(conn.query_row("SELECT count(*) FROM price_watches WHERE ended_at IS NULL", [], |r| r.get(0))?)
+    }
+
+    /// Drops watches that ended before `ended_before`. Returns how many
+    /// went. A live watch stays whatever its age: ending one is the daily
+    /// check's to do, with the message that goes with it.
+    pub fn prune_watches(&self, ended_before: chrono::NaiveDateTime) -> Result<usize> {
+        let conn = self.conn();
+        Ok(conn.execute(
+            "DELETE FROM price_watches WHERE ended_at IS NOT NULL AND ended_at < CAST(? AS TIMESTAMP)",
+            params![stamp(ended_before)],
+        )?)
+    }
+
+    /// One watch, live or ended, for a test to look at what became of it.
+    #[cfg(test)]
+    pub(crate) fn watch_for_tests(&self, id: i64) -> Result<Option<PriceWatch>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(&format!("SELECT {WATCH_COLUMNS} FROM price_watches WHERE id = ?"), params![id], row_to_watch)
+            .optional()?)
     }
 
     /// Insert or overwrite one user-profile fact.
@@ -3095,14 +3470,26 @@ impl Store {
     /// Oldest first because a thread delivered out of order is worse than
     /// one delivered late. Rows past [`MIRROR_ATTEMPTS`] are left behind
     /// rather than returned.
+    ///
+    /// But for a price watch's message, by its key. Past its first five
+    /// attempts it is offered again once it is an hour old for each
+    /// attempt past the fourth, up to [`WATCH_MESSAGE_ATTEMPTS`]: one try
+    /// an hour for most of a day. Counted from when it was queued, which
+    /// needs no column the table does not have; the cost is that a bot
+    /// which was down for hours spends the hours it missed a minute apart
+    /// when it comes back.
     pub fn pending_mirror(&self, channel: &str, limit: usize) -> Result<Vec<PendingMirror>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, account_id, address, body, turn_key FROM outbox
-             WHERE channel = ? AND sent_at IS NULL AND attempts < ?
+             WHERE channel = ? AND sent_at IS NULL
+               AND (attempts < ?
+                    OR (turn_key LIKE 'watch:%' AND attempts < ?
+                        AND created_at <= CAST(? AS TIMESTAMP) - to_hours(CAST(attempts - ? + 1 AS BIGINT))))
              ORDER BY id LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![channel, MIRROR_ATTEMPTS, limit as i64], |r| {
+        let now = stamp(chrono::Utc::now().naive_utc());
+        let rows = stmt.query_map(params![channel, MIRROR_ATTEMPTS, WATCH_MESSAGE_ATTEMPTS, now, MIRROR_ATTEMPTS, limit as i64], |r| {
             Ok(PendingMirror {
                 id: r.get(0)?,
                 account_id: r.get(1)?,
@@ -3122,8 +3509,9 @@ impl Store {
         Ok(())
     }
 
-    /// It did not arrive. Returns how many attempts the row has now spent,
-    /// so the caller can say out loud when one is given up on.
+    /// It did not arrive. Returns how many attempts the row has now spent
+    /// and whether that was the last, so the caller can say out loud when
+    /// one is given up on.
     ///
     /// At [`MIRROR_ATTEMPTS`] the row stops being returned by
     /// `pending_mirror`, and its `turn_key` stays occupied, so re-enqueueing
@@ -3131,12 +3519,28 @@ impl Store {
     /// — until `prune_outbox` drops the row, months on, and the key is free
     /// for a backfill to try again. That is a thing a human should be able
     /// to find in a log afterwards.
-    pub fn mark_mirror_failed(&self, id: i64) -> Result<i64> {
+    ///
+    /// And on `/metrics`, where a give-up is counted here by the kind of
+    /// message it was: `watch`, `inbox` for a nudge about a booking, or
+    /// `turn`. A price watch's message has more attempts before it is one;
+    /// see [`WATCH_MESSAGE_ATTEMPTS`].
+    pub fn mark_mirror_failed(&self, id: i64) -> Result<MirrorFailure> {
         let conn = self.conn();
         conn.execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?", params![id])?;
-        let attempts: i64 =
-            conn.query_row("SELECT attempts FROM outbox WHERE id = ?", params![id], |r| r.get(0))?;
-        Ok(attempts)
+        let (attempts, key): (i64, String) =
+            conn.query_row("SELECT attempts, turn_key FROM outbox WHERE id = ?", params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let (kind, allowed) = match key.split_once(':') {
+            Some(("watch", _)) => ("watch", WATCH_MESSAGE_ATTEMPTS),
+            Some(("inbox", _)) => ("inbox", MIRROR_ATTEMPTS),
+            _ => ("turn", MIRROR_ATTEMPTS),
+        };
+        // On the attempt that spends the last, and not on one after it:
+        // a row past its allowance is not offered, so there is none.
+        let given_up = attempts >= allowed;
+        if attempts == allowed {
+            self.metrics.outbox_given_up(kind);
+        }
+        Ok(MirrorFailure { attempts, given_up })
     }
 
     pub fn mirror_enabled(&self, account_id: i64) -> Result<bool> {
@@ -6023,6 +6427,47 @@ fn row_to_reminder(row: &Row) -> duckdb::Result<Reminder> {
     })
 }
 
+/// The columns `row_to_watch` reads, in its order. The times come out as
+/// text, since `duckdb` is built here without `chrono`; see `stamp`.
+const WATCH_COLUMNS: &str = "id, account_id, channel, address, url, title, currency, target,
+    first_price, last_price, lowest_price, CAST(last_checked_at AS VARCHAR), CAST(last_read_at AS VARCHAR),
+    unreadable_streak, CAST(unreached_since AS VARCHAR), CAST(created_at AS VARCHAR),
+    CAST(expires_at AS VARCHAR), CAST(ended_at AS VARCHAR), ended_why";
+
+fn row_to_watch(row: &Row) -> duckdb::Result<PriceWatch> {
+    // A time that will not read is the column's failure, in the row's own
+    // kind of error, so that one `?` serves the row.
+    let time = |column: usize, text: String| {
+        unstamp(&text).map_err(|e| duckdb::Error::FromSqlConversionFailure(column, duckdb::types::Type::Text, e.into()))
+    };
+    let unreached_since: Option<String> = row.get(14)?;
+    let ended_at: Option<String> = row.get(17)?;
+    let ended_why: Option<String> = row.get(18)?;
+    Ok(PriceWatch {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        channel: row.get(2)?,
+        address: row.get(3)?,
+        url: row.get(4)?,
+        title: row.get(5)?,
+        currency: row.get(6)?,
+        target: row.get(7)?,
+        first_price: row.get(8)?,
+        last_price: row.get(9)?,
+        lowest_price: row.get(10)?,
+        last_checked_at: time(11, row.get(11)?)?,
+        last_read_at: time(12, row.get(12)?)?,
+        unreadable_streak: row.get(13)?,
+        unreached_since: unreached_since.map(|since| time(14, since)).transpose()?,
+        created_at: time(15, row.get(15)?)?,
+        expires_at: time(16, row.get(16)?)?,
+        ended: match (ended_at, ended_why) {
+            (Some(at), Some(why)) => Some((time(17, at)?, why)),
+            _ => None,
+        },
+    })
+}
+
 /// The select `arrival_row` reads — columns, FROM and joins — so the two
 /// readers cannot drift. The trip join is not scoped to the arrival's
 /// account: a booking placed on a trip shared with that account must still
@@ -7637,7 +8082,7 @@ CREATE TABLE segment_candidates (
     #[test]
     fn a_fresh_database_has_somewhere_to_put_login_tokens() {
         let (s, _d) = test_store();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         // A fresh database is built by MIGRATIONS and a migrated one by
         // steps(); this fails if only one of the two learned about the table.
         s.issue_login_token("hash-x", "a@example.com", None, 900).unwrap();
@@ -7765,7 +8210,7 @@ CREATE TABLE segment_candidates (
         // it.
         let (_dir, path) = legacy_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         store.issue_login_token("hash-migrated", "m@example.com", None, 900).unwrap();
         assert_eq!(
             store.consume_login_token("hash-migrated").unwrap(),
@@ -8362,6 +8807,534 @@ CREATE TABLE segment_candidates (
         s.set_next_due(r.id, "2026-08-01").unwrap();
         assert!(s.due_reminders("2026-07-22").unwrap().is_empty());
         assert_eq!(s.list_reminders(1).unwrap()[0].next_due, "2026-08-01");
+    }
+
+    /// Now, to the second, as the table keeps time. Every date in the
+    /// price-watch tests below is counted from it, so none of them can be
+    /// passed by the calendar.
+    fn watch_clock() -> chrono::NaiveDateTime {
+        use chrono::Timelike;
+        chrono::Utc::now().naive_utc().with_nanosecond(0).unwrap()
+    }
+
+    /// A widget read at 329.00 EUR and wanted at 300.00, asked for in chat
+    /// 4242, sixty days from `now`.
+    fn new_watch(account_id: i64, url: &str, now: chrono::NaiveDateTime) -> NewWatch<'_> {
+        NewWatch {
+            account_id,
+            channel: "telegram",
+            address: "4242",
+            url,
+            title: "Widget",
+            currency: "EUR",
+            target: 300.0,
+            price: 329.0,
+            now,
+            expires_at: now + chrono::Duration::days(60),
+        }
+    }
+
+    fn started(s: &Store, new: &NewWatch<'_>) -> PriceWatch {
+        match s.start_watch(new, 10).unwrap() {
+            WatchStarted::Started(watch) => watch,
+            other => panic!("the watch did not start: {other:?}"),
+        }
+    }
+
+    /// A check that read `price` and ends nothing.
+    fn read_at(watch: &PriceWatch, price: f64, now: chrono::NaiveDateTime) -> WatchCheck<'static> {
+        WatchCheck {
+            id: watch.id,
+            now,
+            last_price: price,
+            lowest_price: price.min(watch.lowest_price),
+            last_read_at: now,
+            unreadable_streak: 0,
+            unreached_since: None,
+            ended: None,
+        }
+    }
+
+    /// The outbox as (account, channel, address, body, key, sent).
+    fn queued(s: &Store) -> Vec<(i64, String, String, String, String, bool)> {
+        let conn = s.conn();
+        let mut stmt = conn
+            .prepare("SELECT account_id, channel, address, body, turn_key, sent_at IS NOT NULL FROM outbox ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_watch_starts_from_the_price_read_and_is_listed_and_stopped_by_its_owner_only() {
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let w = started(&s, &new_watch(1, "https://shop.example/p/widget?variant=2", now));
+        assert_eq!((w.first_price, w.last_price, w.lowest_price), (329.0, 329.0, 329.0));
+        assert_eq!((w.target, w.currency.as_str(), w.title.as_str()), (300.0, "EUR", "Widget"));
+        assert_eq!(w.url, "https://shop.example/p/widget?variant=2", "the address as given, query and all");
+        assert_eq!((w.channel.as_str(), w.address.as_str()), ("telegram", "4242"));
+        // Reading the price to start from was the first check, so the next
+        // is a day on.
+        assert_eq!((w.created_at, w.last_checked_at), (now, now));
+        // And the last time a price was read, which a later check may not be.
+        assert_eq!((w.last_read_at, w.unreached_since), (now, None));
+        assert_eq!(w.expires_at, now + chrono::Duration::days(60));
+        assert_eq!((w.unreadable_streak, w.ended.clone()), (0, None));
+
+        assert_eq!(s.live_watches(1).unwrap(), vec![w.clone()]);
+        assert!(s.live_watches(2).unwrap().is_empty(), "another account's list is its own");
+
+        let later = now + chrono::Duration::hours(3);
+        assert_eq!(s.stop_watch(2, w.id, later).unwrap(), None, "not theirs to stop");
+        assert_eq!(s.live_watches(1).unwrap().len(), 1);
+        let stopped = s.stop_watch(1, w.id, later).unwrap().expect("its owner stops it");
+        assert_eq!(stopped.ended, Some((later, "stopped".to_string())));
+        assert!(s.live_watches(1).unwrap().is_empty());
+        assert_eq!(s.stop_watch(1, w.id, later).unwrap(), None, "a second stop finds nothing live");
+        assert!(queued(&s).is_empty(), "whoever stopped it knows, and is sent nothing");
+    }
+
+    #[test]
+    fn an_account_is_refused_a_watch_past_the_cap_until_one_of_its_own_ends() {
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let cap = 3;
+        let urls: Vec<String> = (0..=cap).map(|n| format!("https://shop.example/p/{n}")).collect();
+        let start = |account: i64, url: &str| s.start_watch(&new_watch(account, url, now), cap).unwrap();
+        let mut live = Vec::new();
+        for url in &urls[..3] {
+            match start(1, url) {
+                WatchStarted::Started(watch) => live.push(watch),
+                other => panic!("{url}: {other:?}"),
+            }
+        }
+        assert!(matches!(start(1, &urls[3]), WatchStarted::Full), "a fourth, at a cap of three");
+        assert_eq!(s.live_watches(1).unwrap().len(), 3, "and nothing was written for it");
+        assert!(matches!(start(2, &urls[3]), WatchStarted::Started(_)), "the cap is each account's own");
+
+        // An ended watch is not a live one, and its place is free.
+        s.stop_watch(1, live[0].id, now).unwrap();
+        assert!(matches!(start(1, &urls[3]), WatchStarted::Started(_)));
+        assert!(matches!(start(1, &urls[0]), WatchStarted::Full));
+    }
+
+    #[test]
+    fn one_account_watches_one_address_once_at_a_time() {
+        // A model does ask twice for one thing, and two watches on one
+        // page are two messages on the day it is hit.
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let url = "https://shop.example/p/widget";
+        let first = started(&s, &new_watch(1, url, now));
+        match s.start_watch(&NewWatch { target: 280.0, ..new_watch(1, url, now) }, 10).unwrap() {
+            WatchStarted::Already(there) => assert_eq!(there, first, "the watch there is, as it was"),
+            other => panic!("a second watch on one address: {other:?}"),
+        }
+        assert_eq!(s.live_watches(1).unwrap().len(), 1);
+
+        // Another variant's address is another page, and another account's
+        // watch is its own.
+        started(&s, &new_watch(1, "https://shop.example/p/widget?variant=2", now));
+        started(&s, &new_watch(2, url, now));
+        // Once it has ended, the address can be watched afresh.
+        s.stop_watch(1, first.id, now).unwrap();
+        started(&s, &NewWatch { target: 280.0, ..new_watch(1, url, now) });
+    }
+
+    #[test]
+    fn a_watch_is_due_twenty_hours_after_its_last_check_or_once_it_is_past_its_end() {
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let ago = |hours: i64| now - chrono::Duration::hours(hours);
+        let old = started(&s, &new_watch(1, "https://shop.example/p/old", ago(21)));
+        let on_the_hour = started(&s, &new_watch(1, "https://shop.example/p/on-the-hour", ago(20)));
+        let fresh = started(&s, &new_watch(1, "https://shop.example/p/fresh", ago(19)));
+        // Checked as lately, but its sixty days ran out an hour ago.
+        let over = started(&s, &NewWatch { expires_at: ago(1), ..new_watch(2, "https://shop.example/p/over", ago(19)) });
+        let stopped = started(&s, &new_watch(2, "https://shop.example/p/stopped", ago(30)));
+        s.stop_watch(2, stopped.id, ago(25)).unwrap();
+
+        let due: Vec<i64> = s.due_watches(now, ago(20)).unwrap().iter().map(|w| w.id).collect();
+        assert_eq!(due, vec![old.id, on_the_hour.id, over.id], "everyone's, the longest unchecked first");
+        assert!(!due.contains(&fresh.id) && !due.contains(&stopped.id));
+
+        // A check that ends nothing is still a check: not due again today.
+        assert!(s.record_watch_check(&read_at(&old, 310.0, now)).unwrap());
+        let due: Vec<i64> = s.due_watches(now, ago(20)).unwrap().iter().map(|w| w.id).collect();
+        assert_eq!(due, vec![on_the_hour.id, over.id]);
+    }
+
+    #[test]
+    fn a_conversations_scope_says_whether_it_is_a_groups() {
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(4242).unwrap();
+        let direct = s.start_conversation(a, "direct").unwrap();
+        let group = s.start_conversation(a, "telegram:-100123").unwrap();
+        assert_eq!(s.conversation_scope(direct).unwrap().as_deref(), Some("direct"));
+        assert_eq!(s.conversation_scope(group).unwrap().as_deref(), Some("telegram:-100123"));
+        assert_eq!(s.conversation_scope(group + 100).unwrap(), None, "a thread that is gone has none");
+    }
+
+    #[test]
+    fn a_watch_is_stamped_as_checked_before_its_page_is_read() {
+        // If the read never comes back, the process dying or the parser
+        // panicking on that page, the watch has had its turn all the
+        // same and is not first in line when the pass next runs.
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let ago = |hours: i64| now - chrono::Duration::hours(hours);
+        let first = started(&s, &new_watch(1, "https://shop.example/p/1", ago(30)));
+        let second = started(&s, &new_watch(1, "https://shop.example/p/2", ago(25)));
+        assert_eq!(s.due_watches(now, ago(20)).unwrap()[0].id, first.id);
+
+        assert!(s.mark_watch_checking(first.id, now).unwrap());
+        let due: Vec<i64> = s.due_watches(now, ago(20)).unwrap().iter().map(|w| w.id).collect();
+        assert_eq!(due, vec![second.id]);
+        // Only the time of the check moves: nothing was read yet.
+        let stamped = s.watch_for_tests(first.id).unwrap().unwrap();
+        assert_eq!(stamped, PriceWatch { last_checked_at: now, ..first.clone() });
+
+        // A watch that has ended is not stamped, and is not to be read.
+        s.stop_watch(1, second.id, ago(1)).unwrap();
+        assert!(!s.mark_watch_checking(second.id, now).unwrap());
+        assert_eq!(s.watch_for_tests(second.id).unwrap().unwrap().last_checked_at, ago(25));
+    }
+
+    #[test]
+    fn a_check_writes_what_was_read_and_what_the_watch_started_from_stays() {
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let w = started(&s, &new_watch(1, "https://shop.example/p/widget", now - chrono::Duration::hours(42)));
+        let yesterday = now - chrono::Duration::hours(21);
+        assert!(s.record_watch_check(&read_at(&w, 310.0, yesterday)).unwrap());
+        // No price that day: what was read before stands, and the day is counted.
+        let unread = WatchCheck { last_read_at: yesterday, unreadable_streak: 1, ..read_at(&w, 310.0, now) };
+        assert!(s.record_watch_check(&unread).unwrap());
+
+        let after = &s.live_watches(1).unwrap()[0];
+        assert_eq!((after.first_price, after.last_price, after.lowest_price), (329.0, 310.0, 310.0));
+        assert_eq!((after.last_checked_at, after.unreadable_streak), (now, 1));
+        // Checked today, read yesterday: the two times are kept apart, so
+        // that a watch nobody has read for weeks cannot pass for one that
+        // was read this morning.
+        assert_eq!((after.last_read_at, after.unreached_since), (yesterday, None));
+        assert_eq!((after.created_at, after.expires_at, after.target), (w.created_at, w.expires_at, w.target));
+        assert!(queued(&s).is_empty(), "a watch that goes on says nothing");
+
+        // A check that got no reading at all says since when, and one that
+        // reads the page again clears it.
+        let tomorrow = now + chrono::Duration::hours(21);
+        let shut_out = WatchCheck { now: tomorrow, last_read_at: yesterday, unreached_since: Some(tomorrow), ..unread.clone() };
+        assert!(s.record_watch_check(&shut_out).unwrap());
+        let after = &s.live_watches(1).unwrap()[0];
+        assert_eq!((after.last_checked_at, after.last_read_at, after.unreached_since), (tomorrow, yesterday, Some(tomorrow)));
+        let read_again = read_at(&w, 305.0, tomorrow + chrono::Duration::hours(21));
+        assert!(s.record_watch_check(&read_again).unwrap());
+        let after = &s.live_watches(1).unwrap()[0];
+        assert_eq!((after.last_read_at, after.unreached_since), (read_again.now, None));
+    }
+
+    #[test]
+    fn a_check_that_ends_a_watch_queues_its_one_message_in_the_same_write() {
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let w = started(&s, &new_watch(1, "https://shop.example/p/widget", now - chrono::Duration::hours(21)));
+        let hit = WatchCheck { ended: Some(("hit", "Widget is €289.00")), ..read_at(&w, 289.0, now) };
+        assert!(s.record_watch_check(&hit).unwrap());
+
+        assert!(s.live_watches(1).unwrap().is_empty());
+        let ended = s.watch_for_tests(w.id).unwrap().expect("ended, not gone");
+        assert_eq!(ended.ended, Some((now, "hit".to_string())));
+        assert_eq!((ended.last_price, ended.lowest_price), (289.0, 289.0));
+        // To the chat the watch was asked for in, under a key of its own.
+        let key = format!("watch:{}:hit", w.id);
+        assert_eq!(
+            queued(&s),
+            vec![(1, "telegram".to_string(), "4242".to_string(), "Widget is €289.00".to_string(), key.clone(), false)]
+        );
+        let waiting = s.pending_mirror("telegram", 10).unwrap();
+        assert_eq!(waiting.len(), 1, "and the channel's drain finds it");
+        assert_eq!((waiting[0].body.as_str(), waiting[0].turn_key.as_str()), ("Widget is €289.00", key.as_str()));
+
+        // Whatever is retried, it is said once: an ended watch takes no
+        // further check, under this ending or another.
+        assert!(!s.record_watch_check(&hit).unwrap());
+        assert!(!s.record_watch_check(&WatchCheck { ended: Some(("expired", "Widget did not get there")), ..hit }).unwrap());
+        assert_eq!(queued(&s).len(), 1);
+        assert_eq!(s.watch_for_tests(w.id).unwrap().unwrap().ended, Some((now, "hit".to_string())));
+    }
+
+    #[test]
+    fn a_check_of_a_watch_stopped_while_its_page_was_read_writes_nothing_and_says_nothing() {
+        // The page is read with the store's lock let go, and its owner can
+        // stop the watch meanwhile. A hit reported after that would be a
+        // message about a watch they had already ended.
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let w = started(&s, &new_watch(1, "https://shop.example/p/widget", now - chrono::Duration::hours(21)));
+        let stopped_at = now - chrono::Duration::minutes(1);
+        s.stop_watch(1, w.id, stopped_at).unwrap();
+
+        let hit = WatchCheck { ended: Some(("hit", "Widget is €289.00")), ..read_at(&w, 289.0, now) };
+        assert!(!s.record_watch_check(&hit).unwrap());
+        assert!(queued(&s).is_empty());
+        let row = s.watch_for_tests(w.id).unwrap().unwrap();
+        assert_eq!(row.ended, Some((stopped_at, "stopped".to_string())));
+        assert_eq!(row.last_price, 329.0, "nor is the price of a stopped watch moved");
+    }
+
+    #[test]
+    fn an_ending_is_not_said_again_over_a_message_already_queued_under_its_key() {
+        // The outbox's own key is the last fence: a row there under this
+        // watch's ending is the message, sent or waiting.
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let w = started(&s, &new_watch(1, "https://shop.example/p/widget", now - chrono::Duration::hours(21)));
+        let key = format!("watch:{}:hit", w.id);
+        assert!(s.enqueue_mirror(1, "telegram", "4242", "said before", &key, false).unwrap());
+        let hit = WatchCheck { ended: Some(("hit", "Widget is €289.00")), ..read_at(&w, 289.0, now) };
+        assert!(s.record_watch_check(&hit).unwrap(), "the watch still ends");
+        assert_eq!(queued(&s).len(), 1);
+        assert_eq!(queued(&s)[0].3, "said before");
+    }
+
+    #[test]
+    fn an_ending_whose_message_could_not_be_queued_is_not_an_ending() {
+        // Both or neither. A watch ended with nothing queued is one its
+        // owner never hears of again, so a failure to queue leaves it live
+        // and due, for the next pass to end.
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let checked = now - chrono::Duration::hours(21);
+        let w = started(&s, &new_watch(1, "https://shop.example/p/widget", checked));
+        let hit = WatchCheck { ended: Some(("hit", "Widget is €289.00")), ..read_at(&w, 289.0, now) };
+
+        s.conn().execute_batch("ALTER TABLE outbox RENAME TO outbox_away").unwrap();
+        assert!(s.record_watch_check(&hit).is_err());
+        assert_eq!(s.live_watches(1).unwrap(), vec![w.clone()], "as it was, to the price and the hour");
+
+        s.conn().execute_batch("ALTER TABLE outbox_away RENAME TO outbox").unwrap();
+        assert!(s.record_watch_check(&hit).unwrap(), "and the lock is free of the failed write");
+        assert_eq!(queued(&s).len(), 1);
+    }
+
+    #[test]
+    fn a_watch_goes_ninety_days_after_it_ended_and_a_live_one_stays() {
+        let (s, _d) = test_store();
+        let now = watch_clock();
+        let ago = |days: i64| now - chrono::Duration::days(days);
+        let long_over = started(&s, &new_watch(1, "https://shop.example/p/1", ago(120)));
+        let lately_over = started(&s, &new_watch(1, "https://shop.example/p/2", ago(120)));
+        // However old: ending a watch is the daily check's to do, not the sweep's.
+        let live = started(&s, &new_watch(1, "https://shop.example/p/3", ago(200)));
+        s.stop_watch(1, long_over.id, ago(91)).unwrap();
+        s.stop_watch(1, lately_over.id, ago(89)).unwrap();
+
+        assert_eq!(s.prune_watches(ago(90)).unwrap(), 1);
+        assert_eq!(s.watch_for_tests(long_over.id).unwrap(), None);
+        assert!(s.watch_for_tests(lately_over.id).unwrap().is_some());
+        assert_eq!(s.live_watches(1).unwrap().iter().map(|w| w.id).collect::<Vec<_>>(), vec![live.id]);
+        assert_eq!(s.prune_watches(ago(90)).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_account_with_a_price_watch_holds_something_and_is_not_merged_away() {
+        // A watch is a promise to its account. Were the account absorbed,
+        // the row would point at nobody: off its owner's list, outside
+        // their cap, and stopped by no one.
+        let (s, _d) = test_store();
+        s.account_for_identity("email", "a@example.com").unwrap();
+        let other = s.account_for_identity("telegram", "11").unwrap();
+        s.log_request(other, "text").unwrap();
+        assert_eq!(
+            s.link_identity(other, "email", "a@example.com").unwrap(),
+            LinkOutcome::Merged { account_id: other },
+            "an account with nothing of its own is absorbed"
+        );
+
+        let watcher = s.account_for_identity("email", "b@example.com").unwrap();
+        started(&s, &new_watch(watcher, "https://shop.example/p/widget", watch_clock()));
+        assert_eq!(s.link_identity(other, "email", "b@example.com").unwrap(), LinkOutcome::TakenByAnother);
+        assert_eq!(s.live_watches(watcher).unwrap().len(), 1);
+    }
+
+    /// A database as the step before price watches left it, with a
+    /// person's rows in it and no `price_watches` at all, and the version
+    /// it is recorded at. Built by dropping the table from the finished
+    /// shape, as `version_seventeen_db` is, so it cannot drift from what
+    /// `MIGRATIONS` says the rest is. The version is read off the list of
+    /// steps: the one before the step that adds the table, whatever number
+    /// that step has.
+    fn db_from_before_price_watches() -> (TempDir, std::path::PathBuf, i64) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("before-watches.duckdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS).unwrap();
+        let at = steps()
+            .iter()
+            .position(|(_, step)| matches!(step, Step::Sql(sql) if *sql == STEP_PRICE_WATCHES))
+            .expect("the step that adds the table is in the list");
+        let version = steps()[at - 1].0;
+        conn.execute_batch(&format!(
+            "DROP TABLE price_watches;
+             DROP SEQUENCE price_watches_id_seq;
+             CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
+             DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES ({version});
+             INSERT INTO accounts (id) VALUES (1);
+             INSERT INTO identities (account_id, kind, external_id) VALUES (1, 'telegram', '4242');
+             INSERT INTO deliveries (account_id, channel, address) VALUES (1, 'telegram', '4242');
+             INSERT INTO purchases (account_id, item, store, price, currency) VALUES (1, 'widget', 'shop.example', 12.5, 'EUR');
+             INSERT INTO reminders (account_id, address, item, interval_days, next_due) VALUES (1, '4242', 'widgets', 30, '2020-01-01');
+             INSERT INTO outbox (account_id, channel, address, body, turn_key) VALUES (1, 'telegram', '4242', 'waiting', 'key-1');
+             INSERT INTO shop_delivery (host, country, status, bands, currency, source_url)
+                 VALUES ('shop.example', 'NL', 'terms', '[[0, 4.95]]', 'EUR', 'https://shop.example/delivery');"
+        ))
+        .unwrap();
+        drop(conn);
+        (dir, path, version)
+    }
+
+    #[test]
+    fn the_step_that_adds_price_watches_builds_the_table_a_fresh_database_has() {
+        // Two descriptions of one table, `MIGRATIONS` and the step, and
+        // opening a store cannot set them against each other: see
+        // `the_step_that_adds_mail_parts_builds_the_table_a_fresh_database_has`.
+        // So the step runs by itself, on a database that has seen nothing.
+        let (fresh, _d1) = test_store();
+        let dir = TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("step.duckdb")).unwrap();
+        conn.execute_batch(STEP_PRICE_WATCHES).unwrap();
+        let built = shape(&conn, "price_watches");
+        assert_eq!(shape(&fresh.conn(), "price_watches"), built);
+        assert_eq!(built.len(), 19, "or two tables that are not there would agree");
+    }
+
+    #[test]
+    fn a_database_from_before_price_watches_is_backed_up_keeps_its_rows_and_takes_a_watch() {
+        // What a deploy of this step does to the database it meets. The
+        // table itself comes from `MIGRATIONS`, which runs first on every
+        // open; what the step earns is the version, and the copy a pending
+        // step makes the runner take before it. See
+        // `a_migrated_database_gets_login_tokens_too_not_just_a_fresh_one`.
+        let (_dir, path, before) = db_from_before_price_watches();
+        let latest = steps().last().expect("there are steps").0;
+        assert!(latest > before, "the fixture has a step pending");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), latest);
+
+        let taken: Vec<_> = std::fs::read_dir(crate::backup::dir_for(&path)).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(taken.len(), 1, "one copy, taken before the step");
+        let name = taken[0].file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.ends_with(&format!("-migration-v{latest}.duckdb")), "named for the version it was taken on the way to: {name}");
+        let copy = Connection::open(&taken[0]).unwrap();
+        let version: i64 = copy.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, before, "the copy is of the database as it was");
+        drop(copy);
+
+        // Nothing that was there is touched.
+        assert_eq!(store.query_purchases(1, None, 10).unwrap().len(), 1);
+        assert_eq!(store.list_reminders(1).unwrap().len(), 1);
+        assert_eq!(store.delivery_address(1, "telegram").unwrap().as_deref(), Some("4242"));
+        assert_eq!(queued(&store).len(), 1);
+        let kept: (String, String) = store
+            .conn()
+            .query_row("SELECT status, bands FROM shop_delivery WHERE host = 'shop.example' AND country = 'NL'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(kept, ("terms".to_string(), "[[0, 4.95]]".to_string()), "the table the step before this one added, and its row");
+        let (fresh, _d) = test_store();
+        for table in ["accounts", "purchases", "reminders", "outbox", "shop_delivery", "price_watches"] {
+            assert_eq!(shape(&fresh.conn(), table), shape(&store.conn(), table), "{table}");
+        }
+
+        // And the new table is in use from the first open.
+        assert!(store.live_watches(1).unwrap().is_empty());
+        let w = started(&store, &new_watch(1, "https://shop.example/p/widget", watch_clock()));
+        assert_eq!(w.id, 1);
+        // A second open finds nothing pending and takes no second copy.
+        drop(store);
+        drop(Store::open(&path).unwrap());
+        assert_eq!(std::fs::read_dir(crate::backup::dir_for(&path)).unwrap().count(), 1);
+    }
+
+    /// Every table of the database and how many rows it holds.
+    fn row_counts(conn: &Connection) -> BTreeMap<String, i64> {
+        let mut stmt = conn
+            .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name")
+            .unwrap();
+        let tables: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        tables
+            .into_iter()
+            .map(|table| {
+                let rows = conn.query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |r| r.get(0)).unwrap();
+                (table, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn a_copy_of_a_database_keeps_every_row_through_the_pending_steps() {
+        // A rehearsal for a deploy that brings a step, on a copy of a
+        // database with people's rows in it:
+        //
+        //   SCOUT_REHEARSAL_DB=/path/to/a/copy.duckdb cargo test -p scout-core \
+        //     a_copy_of_a_database -- --ignored --nocapture
+        //
+        // The file named is copied first and is itself never opened, so it
+        // can be rehearsed on again. What is printed is tables and counts,
+        // and nothing a row holds.
+        //
+        // With no file named there is nothing to rehearse on, and the run
+        // of every ignored test the README gives must not fail for it: it
+        // says it did nothing, and that is not a pass of anything.
+        let Ok(source) = std::env::var("SCOUT_REHEARSAL_DB") else {
+            println!("NOT RUN: SCOUT_REHEARSAL_DB names no copy of a database, so nothing was rehearsed");
+            return;
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rehearsal.duckdb");
+        std::fs::copy(&source, &path).unwrap();
+
+        let (before, recorded) = {
+            let conn = Connection::open(&path).unwrap();
+            let recorded: Option<i64> = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).ok();
+            (row_counts(&conn), recorded)
+        };
+        let store = Store::open(&path).unwrap();
+        let latest = steps().last().expect("there are steps").0;
+        let after = row_counts(&store.conn());
+        println!("recorded at {recorded:?}, now at {}", store.schema_version().unwrap());
+        let tables: std::collections::BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+        for table in tables {
+            println!("  {table}: {:?} -> {:?}", before.get(table), after.get(table));
+        }
+        assert_eq!(store.schema_version().unwrap(), latest);
+
+        // The steps up to 5 moved every row onto an account, between
+        // tables, and are pinned by tests of their own. Past them no step
+        // adds or drops a row of a table that was already there, and a
+        // table a step brings arrives empty. The two a step fills from
+        // rows already held are named: 14 copied the flights into them.
+        if recorded.is_some_and(|version| version >= 5) {
+            for (table, rows) in &after {
+                match before.get(table) {
+                    Some(held) => assert_eq!(rows, held, "{table} had {held} rows and has {rows}"),
+                    None if ["trip_items", "item_candidates"].contains(&table.as_str()) => {}
+                    None => assert_eq!(*rows, 0, "{table} is new and has {rows} rows"),
+                }
+            }
+            for table in before.keys() {
+                assert!(after.contains_key(table), "{table} is gone");
+            }
+        }
+        let backups = std::fs::read_dir(crate::backup::dir_for(&path)).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(backups, usize::from(recorded != Some(latest)), "one copy before a pending step, none without one");
     }
 
     #[test]
@@ -9108,7 +10081,9 @@ CREATE TABLE trips (
     }
 
     /// A database at 26 with a person's purchases, facts and runs in it:
-    /// built from `MIGRATIONS` and stripped of the one table step 27 adds.
+    /// built from `MIGRATIONS` and stripped of the table step 27 adds, and
+    /// of the one the step after it adds, which a database at 26 has not
+    /// seen either.
     fn version_twenty_six_db() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("v26.duckdb");
@@ -9116,6 +10091,8 @@ CREATE TABLE trips (
         conn.execute_batch(MIGRATIONS).unwrap();
         conn.execute_batch(
             "DROP TABLE shop_delivery;
+             DROP TABLE price_watches;
+             DROP SEQUENCE price_watches_id_seq;
              CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL);
              DELETE FROM schema_version;
              INSERT INTO schema_version VALUES (26);
@@ -9151,7 +10128,7 @@ CREATE TABLE trips (
 
         let s = Store::open(&path).unwrap();
 
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         assert_eq!(everything_in(&s.conn()), before, "what was there is there, as it was");
         let (fresh, _d) = test_store();
         assert_eq!(shape(&fresh.conn(), "shop_delivery"), shape(&s.conn(), "shop_delivery"));
@@ -9160,12 +10137,12 @@ CREATE TABLE trips (
         // The step is pending, so the database is copied before it runs.
         let taken: Vec<_> = std::fs::read_dir(crate::backup::dir_for(&path)).unwrap().map(|e| e.unwrap().path()).collect();
         assert_eq!(taken.len(), 1, "one backup: {taken:?}");
-        assert!(taken[0].file_name().unwrap().to_str().unwrap().contains("migration-v27"), "{taken:?}");
+        assert!(taken[0].file_name().unwrap().to_str().unwrap().contains("migration-v28"), "{taken:?}");
         assert_eq!(everything_in(&Connection::open(&taken[0]).unwrap()), before, "and the copy holds the data");
         // A second start has nothing left to do.
         drop(s);
         let again = Store::open(&path).unwrap();
-        assert_eq!(again.schema_version().unwrap(), 27);
+        assert_eq!(again.schema_version().unwrap(), 28);
         assert_eq!(everything_in(&again.conn()), before);
     }
 
@@ -9992,7 +10969,7 @@ CREATE TABLE trips (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         let trip = store.find_trip(1, "Lisbon").unwrap().unwrap();
         assert_eq!(trip.items.len(), 2);
         assert_eq!((trip.items[0].position, trip.items[0].date.as_str(), trip.items[0].kind.as_str()), (1, "2026-10-12", "flight"));
@@ -10696,11 +11673,92 @@ CREATE TABLE trips (
             // The count comes back so the drain can tell a retry from a row
             // it has just given up on — the log line said "it stays queued"
             // on the fifth failure, which was the one time it did not.
-            assert_eq!(s.mark_mirror_failed(id).unwrap(), attempt);
+            assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: attempt, given_up: false });
             assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1, "gave up too early");
         }
-        assert_eq!(s.mark_mirror_failed(id).unwrap(), MIRROR_ATTEMPTS);
+        assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: MIRROR_ATTEMPTS, given_up: true });
         assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "retried forever");
+        // However long it waits: only a watch's message is tried again later.
+        s.conn().execute("UPDATE outbox SET created_at = created_at - INTERVAL 30 DAY", []).unwrap();
+        assert!(s.pending_mirror("telegram", 10).unwrap().is_empty());
+    }
+
+    /// A store counting on a set of the test's own, since every other
+    /// test in the binary counts on the process's.
+    fn store_counting() -> (Store, TempDir, &'static crate::metrics::Metrics) {
+        let (mut s, dir) = test_store();
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        s.metrics = metrics;
+        (s, dir, metrics)
+    }
+
+    #[test]
+    fn a_watchs_message_is_tried_for_a_day_before_it_is_given_up() {
+        // A watch ends once and says so once. Given up after five tries a
+        // minute apart, as a mirrored turn is, the row said `hit` and the
+        // person heard nothing because Telegram was down for six minutes.
+        let (s, _d, metrics) = store_counting();
+        let now = chrono::Utc::now().naive_utc();
+        let w = started(&s, &new_watch(1, "https://shop.example/p/widget", now - chrono::Duration::hours(21)));
+        let hit = WatchCheck { ended: Some(("hit", "Widget is €289.00")), ..read_at(&w, 289.0, now) };
+        assert!(s.record_watch_check(&hit).unwrap());
+        let id = s.pending_mirror("telegram", 10).unwrap()[0].id;
+        // Queued on the clock the watch runs on, so its day is a day.
+        let queued_at: String = s.conn().query_row("SELECT CAST(created_at AS VARCHAR) FROM outbox WHERE id = ?", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(unstamp(&queued_at).unwrap(), unstamp(&stamp(now)).unwrap());
+
+        // The first five as any message's: at once, as the drain comes round.
+        for attempt in 1..=MIRROR_ATTEMPTS {
+            assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1, "attempt {attempt}");
+            assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: attempt, given_up: false });
+        }
+        // Then one an hour. Not before its hour,
+        assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "retried within the hour");
+        let wait = |hours: i64| {
+            s.conn().execute(&format!("UPDATE outbox SET created_at = created_at - INTERVAL {hours} HOUR WHERE id = ?"), params![id]).unwrap();
+        };
+        wait(1);
+        // and when it comes, once: a failure puts the next an hour on.
+        for attempt in MIRROR_ATTEMPTS + 1..WATCH_MESSAGE_ATTEMPTS {
+            assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1, "attempt {attempt}");
+            assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: attempt, given_up: false });
+            assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "attempt {attempt} was not the hour's only one");
+            wait(1);
+        }
+        // The last is twenty-three hours after the message was queued.
+        assert_eq!(WATCH_MESSAGE_ATTEMPTS - MIRROR_ATTEMPTS, 23);
+        assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1);
+        assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: WATCH_MESSAGE_ATTEMPTS, given_up: true });
+        wait(1000);
+        assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "given up is given up");
+
+        // And counted, by the kind of message it was and nothing of whose.
+        assert!(metrics.render().contains("scout_outbox_given_up_total{kind=\"watch\"} 1\n"), "{}", metrics.render());
+    }
+
+    #[test]
+    fn a_message_given_up_on_is_counted_by_its_kind_and_one_still_tried_is_not() {
+        let (s, _d, metrics) = store_counting();
+        let a = s.account_for_telegram(11).unwrap();
+        s.enqueue_mirror(a, "telegram", "11", "a turn", "0123abcd", false).unwrap();
+        s.enqueue_mirror(a, "telegram", "11", "a booking is waiting", "inbox:7", false).unwrap();
+        let ids: Vec<i64> = s.pending_mirror("telegram", 10).unwrap().iter().map(|m| m.id).collect();
+        for id in &ids {
+            for _ in 1..MIRROR_ATTEMPTS {
+                assert!(!s.mark_mirror_failed(*id).unwrap().given_up);
+            }
+        }
+        assert!(!metrics.render().contains("scout_outbox_given_up_total{"), "nothing is given up yet: {}", metrics.render());
+        for id in &ids {
+            assert!(s.mark_mirror_failed(*id).unwrap().given_up);
+        }
+        let page = metrics.render();
+        assert!(page.contains("scout_outbox_given_up_total{kind=\"turn\"} 1\n"), "{page}");
+        assert!(page.contains("scout_outbox_given_up_total{kind=\"inbox\"} 1\n"), "{page}");
+        // One label, and it is a kind: no account, no chat, no key.
+        for line in page.lines().filter(|l| l.starts_with("scout_outbox_given_up_total{")) {
+            assert_eq!(line.matches('=').count(), 1, "{line}");
+        }
     }
 
     #[test]
@@ -10851,7 +11909,7 @@ CREATE TABLE conversations (
     fn a_database_at_version_six_with_threads_in_it_grows_the_columns_and_keeps_its_rows() {
         let (_dir, db) = version_six_db_with_a_thread();
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27, "the migration did not reach the latest step");
+        assert_eq!(s.schema_version().unwrap(), 28, "the migration did not reach the latest step");
         let conn = s.conn();
         assert!(has_column(&conn, "conversations", "title"));
         assert!(has_column(&conn, "conversations", "pinned"));
@@ -10892,7 +11950,7 @@ CREATE TABLE conversations (
             conn.execute_batch("UPDATE schema_version SET version = 7").unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let conn = s.conn();
         assert!(
             conn.execute_batch(
@@ -10992,7 +12050,7 @@ CREATE TABLE conversations (
         // updated the table: the pod crash-looped on this step.
         let (_dir, path) = version_eighteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let trip = s.list_trips(1).unwrap().remove(0);
         assert_eq!((trip.items[0].lat, trip.items[0].geocode_tried), (None, false));
         s.set_item_coords(trip.items[0].id, None).unwrap();
@@ -11029,7 +12087,7 @@ CREATE TABLE conversations (
     fn step_20_runs_on_a_database_that_has_items_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_nineteen_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let item = &s.list_trips(1).unwrap()[0].items[0];
         assert_eq!((item.warning.as_deref(), item.checking), (None, false));
         let (fresh, _d) = test_store();
@@ -11732,7 +12790,7 @@ CREATE TABLE conversations (
     fn step_21_runs_on_a_database_with_trips_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_db_with_an_item();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let trip = &s.list_trips(1).unwrap()[0];
         assert_eq!(trip.items[0].added, None, "an item from before sharing has no author");
         let (fresh, _d) = test_store();
@@ -11770,7 +12828,7 @@ CREATE TABLE conversations (
     fn step_22_runs_on_a_database_with_mail_in_it_and_matches_a_fresh_one() {
         let (_dir, path) = version_twenty_one_db();
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 27);
+        assert_eq!(s.schema_version().unwrap(), 28);
         let (fresh, _d) = test_store();
         // Not `mail_forwards`: `Store::open` runs `MIGRATIONS` before the
         // steps, so the table is there whatever step 22 says, and comparing
@@ -12364,7 +13422,7 @@ CREATE TABLE messages (
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         assert!(!store.debug_of(1).unwrap(), "backfilled to off");
         let run_id: Option<i64> = store
             .conn()
@@ -12528,7 +13586,7 @@ CREATE TABLE messages (
             conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version BIGINT NOT NULL); DELETE FROM schema_version; INSERT INTO schema_version VALUES (15); INSERT INTO accounts (id) VALUES (1);").unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         assert_eq!(store.handle_of(1).unwrap(), None);
         // Written through the step-16 tables, read through the same code
         // that reads a fresh database: drift between the two DDLs shows here.
@@ -12573,7 +13631,7 @@ CREATE TABLE messages (
         // and a broken step would pass the whole suite.
         let (_dir, path) = version_sixteen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         let m = mail(&store, 1, "re_1");
         let id = store
             .insert_arrival(1, m, &NewArrival {
@@ -12649,7 +13707,7 @@ CREATE TABLE messages (
         // For the DDLs agreeing, see the test above.
         let (_dir, path) = version_seventeen_db();
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), 28);
         let part = mail_part("att_1", Some("inline"), None);
         let m = store
             .insert_mail(1, "re_1", "hotel@example.com", None, None, None, false, std::slice::from_ref(&part))

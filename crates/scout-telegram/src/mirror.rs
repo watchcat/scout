@@ -1,7 +1,7 @@
 //! Sending what the browser queued.
 
 use scout_core::core::Core;
-use scout_core::mirror::PendingMirror;
+use scout_core::mirror::{Failure, PendingMirror};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,9 +46,11 @@ pub type Outgoing = (PendingMirror, Option<InlineKeyboardMarkup>);
 /// rule testable rather than merely written down.
 pub trait Ledger {
     async fn sent(&self, id: i64) -> anyhow::Result<()>;
-    /// Returns how many attempts the row has now spent, so the caller can
-    /// tell a retry from a row it has just given up on.
-    async fn failed(&self, id: i64) -> anyhow::Result<i64>;
+    /// Returns how many attempts the row has now spent and whether that
+    /// was its last, so the caller can tell a retry from a row it has just
+    /// given up on. Which it is is the ledger's to say: a price watch's
+    /// message is tried for a day where a turn is tried five times.
+    async fn failed(&self, id: i64) -> anyhow::Result<Failure>;
 }
 
 pub struct TelegramSink {
@@ -104,7 +106,7 @@ impl Ledger for CoreLedger<'_> {
     async fn sent(&self, id: i64) -> anyhow::Result<()> {
         scout_core::mirror::sent(self.0, id).await
     }
-    async fn failed(&self, id: i64) -> anyhow::Result<i64> {
+    async fn failed(&self, id: i64) -> anyhow::Result<Failure> {
         scout_core::mirror::failed(self.0, id).await
     }
 }
@@ -134,8 +136,8 @@ pub async fn drain<S: Sink, L: Ledger>(
                 // An abandoned row cannot be recovered: its key stays
                 // occupied, so re-enqueueing is a no-op and toggling the
                 // mirror off and on will not bring it back.
-                let attempts = ledger.failed(row.id).await?;
-                if attempts >= scout_core::mirror::ATTEMPTS {
+                let Failure { attempts, given_up } = ledger.failed(row.id).await?;
+                if given_up {
                     tracing::warn!(error = %e, id = row.id, account_id = row.account_id, attempts,
                         "giving up on a mirrored message; it will not be sent and cannot be requeued");
                 } else {
@@ -210,9 +212,10 @@ mod tests {
             self.sent.lock().unwrap().push(id);
             Ok(())
         }
-        async fn failed(&self, id: i64) -> anyhow::Result<i64> {
+        async fn failed(&self, id: i64) -> anyhow::Result<Failure> {
             self.failed.lock().unwrap().push(id);
-            Ok(self.failed.lock().unwrap().len() as i64)
+            let attempts = self.failed.lock().unwrap().len() as i64;
+            Ok(Failure { attempts, given_up: attempts >= scout_core::mirror::ATTEMPTS })
         }
     }
 

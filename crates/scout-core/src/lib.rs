@@ -10,6 +10,7 @@ mod observer;
 mod specialist;
 mod store;
 mod tools;
+mod watch;
 
 pub mod backup;
 pub mod config;

@@ -136,6 +136,11 @@ pub struct Metrics {
     runs: Counter,
     run_duration: Histogram,
     tool_calls: Counter,
+    watch_requests: Counter,
+    watches_live: AtomicU64,
+    watch_checks: Counter,
+    watches_ended: Counter,
+    outbox_given_up: Counter,
     provider_errors: Counter,
     provider_retries: Counter,
     lock_wait: Histogram,
@@ -156,6 +161,11 @@ impl Default for Metrics {
             runs: Counter::new(&["outcome"]),
             run_duration: Histogram::new(RUN_BUCKETS),
             tool_calls: Counter::new(&["tool", "status"]),
+            watch_requests: Counter::new(&["outcome"]),
+            watches_live: AtomicU64::new(0),
+            watch_checks: Counter::new(&["outcome"]),
+            watches_ended: Counter::new(&["why"]),
+            outbox_given_up: Counter::new(&["kind"]),
             provider_errors: Counter::new(&["provider", "kind"]),
             provider_retries: Counter::new(&["provider"]),
             lock_wait: Histogram::new(LOCK_BUCKETS),
@@ -186,6 +196,47 @@ impl Metrics {
 
     pub fn tool_call(&self, tool: &str, status: &str) {
         self.tool_calls.add(&[tool, status]);
+    }
+
+    /// A request for a price watch, by what came of it: `started`, or the
+    /// word for what stopped it (`already_under`, `no_price`, `refused`,
+    /// `failed`, `other_currency`, `watching_already`, `at_cap`,
+    /// `address_too_long`, and from the tool `reads_spent` and `invalid`).
+    /// The words are `watch.rs`'s and the tool's own.
+    pub fn watch_asked(&self, outcome: &str) {
+        self.watch_requests.add(&[outcome]);
+    }
+
+    /// How many price watches are live, everyone's together, as the daily
+    /// pass last counted them: a number that is set, not added to.
+    pub fn watches_live(&self, live: i64) {
+        self.watches_live.store(u64::try_from(live).unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// One daily check of a price watch, by how it went: a price was
+    /// `read`, the page was `unreadable` (gone, or its data priced
+    /// nothing), the shop `refused` its reader, or the request `failed`
+    /// (not answered, or answered with a status that is no page). No host:
+    /// which shop is one person's business, and is in no counter.
+    pub fn watch_checked(&self, outcome: &str) {
+        self.watch_checks.add(&[outcome]);
+    }
+
+    /// A price watch ended, by why: `hit`, `unreadable` after three checks
+    /// that read the page and found no price, `unreached` after a week in
+    /// which nothing could be read, `expired` at sixty days, or `stopped`
+    /// by its owner. What will say whether sixty days and ten watches were
+    /// good guesses.
+    pub fn watch_ended(&self, why: &str) {
+        self.watches_ended.add(&[why]);
+    }
+
+    /// A message in the outbox was given up on, its attempts spent: a
+    /// price `watch`'s one message, an `inbox` nudge about a booking, or a
+    /// mirrored `turn`. The kind and nothing else: a message that never
+    /// arrived is about one person, and no label here says who.
+    pub fn outbox_given_up(&self, kind: &str) {
+        self.outbox_given_up.add(&[kind]);
     }
 
     /// A provider's request that failed for good, retries spent.
@@ -271,6 +322,12 @@ impl Metrics {
         self.runs.render(&mut out, "scout_runs_total", "Runs, by how they ended: answered, cut_short or failed once a run has a row; busy or overloaded when it never got one.");
         self.run_duration.render(&mut out, "scout_run_duration_seconds", "How long a run took, from its row to its last word; the wait for a slot is not in it.");
         self.tool_calls.render(&mut out, "scout_tool_calls_total", "Tool calls the agents made, by tool and whether the tool answered.");
+        self.watch_requests.render(&mut out, "scout_price_watch_requests_total", "Requests for a price watch, by what came of them: started, or what stopped it (already_under, no_price, refused, failed, other_currency, watching_already, at_cap, address_too_long, reads_spent, invalid).");
+        header(&mut out, "scout_price_watches_live", "Price watches running, everyone's together, as the last hourly pass counted them.", "gauge");
+        out.push_str(&format!("scout_price_watches_live {}\n", self.watches_live.load(Ordering::Relaxed)));
+        self.watch_checks.render(&mut out, "scout_price_watch_checks_total", "Daily checks of price watches, by how each went: read (a price was read), unreadable (the page was read and gave none, or is gone), refused (the shop refused its reader), failed (the request came to nothing).");
+        self.outbox_given_up.render(&mut out, "scout_outbox_given_up_total", "Messages the outbox gave up on, their attempts spent, by kind: watch (a price watch's one message), inbox (a nudge about a booking), turn (a mirrored turn).");
+        self.watches_ended.render(&mut out, "scout_price_watches_ended_total", "Price watches ended, by why: hit, unreadable (three checks running read the page and found no price), unreached (a week with no reading at all), expired (sixty days) or stopped by their owner.");
         self.provider_errors.render(&mut out, "scout_provider_errors_total", "Requests that failed after their retries: paid APIs as they answered (client includes a not-found), and the model during runs.");
         self.provider_retries.render(&mut out, "scout_provider_retries_total", "Requests to a provider sent again after a 429, a 5xx or a refused connection.");
         self.lock_wait.render(&mut out, "scout_store_lock_wait_seconds", "Time a store call waited for the database's lock.");
@@ -522,6 +579,11 @@ mod tests {
             "scout_runs_total",
             "scout_run_duration_seconds",
             "scout_tool_calls_total",
+            "scout_price_watch_checks_total",
+            "scout_price_watches_ended_total",
+            "scout_outbox_given_up_total",
+            "scout_price_watch_requests_total",
+            "scout_price_watches_live",
             "scout_provider_errors_total",
             "scout_provider_retries_total",
             "scout_store_lock_wait_seconds",
@@ -584,6 +646,51 @@ mod tests {
         for line in ours {
             assert_eq!(line.matches('=').count(), 1, "{line}");
         }
+    }
+
+    #[test]
+    fn price_watch_checks_are_counted_by_how_they_went_and_endings_by_why() {
+        let m = Metrics::default();
+        for outcome in ["read", "read", "unreadable", "refused", "refused", "refused"] {
+            m.watch_checked(outcome);
+        }
+        for why in ["hit", "expired", "stopped", "stopped", "unreadable", "unreached"] {
+            m.watch_ended(why);
+        }
+        let page = m.render();
+        for series in [
+            "scout_price_watch_checks_total{outcome=\"read\"} 2",
+            "scout_price_watch_checks_total{outcome=\"unreadable\"} 1",
+            // Apart from unreadable: a shop that walls the reader is not a
+            // page that lost its price, and the two call for different work.
+            "scout_price_watch_checks_total{outcome=\"refused\"} 3",
+            "scout_price_watches_ended_total{why=\"hit\"} 1",
+            "scout_price_watches_ended_total{why=\"expired\"} 1",
+            "scout_price_watches_ended_total{why=\"stopped\"} 2",
+            "scout_price_watches_ended_total{why=\"unreadable\"} 1",
+            // Apart again: the page was not read at all for a week.
+            "scout_price_watches_ended_total{why=\"unreached\"} 1",
+        ] {
+            assert!(page.contains(&format!("{series}\n")), "{series} is missing:\n{page}");
+        }
+    }
+
+    #[test]
+    fn the_live_watches_are_a_number_that_is_set_and_requests_a_count_by_how_they_went() {
+        let m = Metrics::default();
+        assert!(m.render().contains("# TYPE scout_price_watches_live gauge\nscout_price_watches_live 0\n"), "{}", m.render());
+        m.watches_live(7);
+        m.watches_live(4);
+        // Not seven and four: how many there are now, as last counted.
+        assert!(m.render().contains("scout_price_watches_live 4\n"), "{}", m.render());
+
+        for outcome in ["started", "started", "already_under", "refused"] {
+            m.watch_asked(outcome);
+        }
+        let page = m.render();
+        assert!(page.contains("scout_price_watch_requests_total{outcome=\"started\"} 2\n"), "{page}");
+        assert!(page.contains("scout_price_watch_requests_total{outcome=\"already_under\"} 1\n"), "{page}");
+        assert!(page.contains("scout_price_watch_requests_total{outcome=\"refused\"} 1\n"), "{page}");
     }
 
     #[test]

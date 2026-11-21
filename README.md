@@ -268,6 +268,18 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 - Your profile: delivery country, sizes, preferred marketplaces, languages.
   Injected into every request so it stops re-asking
 - Reorder reminders for things you buy periodically, delivered in Telegram
+- **Price watches.** *"Tell me when it is under €300."* Scout reads the
+  page's own price there and then and says what it read, so a wrong number
+  shows on day one. After that the page is read again once a day with no
+  model in the loop: a fetch, the same structured-data reading every other
+  price gets, and a comparison in Rust. You get exactly one message: when
+  the price is at or under what you named, with the link and what it was
+  when you asked; or when the page has had no price at three checks
+  running; or when nothing at all could be read for seven days running,
+  with the day a price was last read; or at sixty days, with the lowest
+  price it read. List your watches or stop one by asking. Ten at a time,
+  and only where Scout has a Telegram chat to tell you in — a watch is a
+  promise to come back
 - `/stat` for usage with a text bar chart — your own numbers, or everyone's
   if you're the admin. Flight searches are counted separately, because
   those are the ones a provider bills for, and so are the model's tokens —
@@ -509,7 +521,7 @@ data.
 
 ```
 Telegram ──► bot.rs ─────┐
-Browser  ──► scout-web ──┴► core ──► rig agent ──────► 12 tools + the flight desk
+Browser  ──► scout-web ──┴► core ──► rig agent ──────► 15 tools + the flight desk
                 │                                    │
                 │  streams progress + answer         ├─ search_web        Kagi + Perplexity, merged
                 │  back into one edited message      ├─ search_secondhand eBay / Marktplaats / Vinted
@@ -521,6 +533,7 @@ Browser  ──► scout-web ──┴► core ──► rig agent ────�
                                                      ├─ remember_fact      │
                                                      ├─ forget_fact       ─┘
                                                      ├─ reminders (create/list/cancel)
+                                                     ├─ price watches (watch/list/stop)
                                                      └─ ask_flights *  ──► flight agent ──► 13 tools
                                                                              ├─ search_flights    Duffel + Ignav, merged
                                                                              ├─ flight_booking_links  airline pages, pre-filled
@@ -650,6 +663,22 @@ of JavaScript in the browser client.
 - **A shop that lies convincingly wins.** If a page publishes only a
   bare-integer cents price with nothing to cross-check, Scout reports that
   number instead of inventing a division.
+- **A watch reads the page's own number, once a day.** The price watched
+  is the one the page's structured data states for that exact address. If
+  a shop writes a "from" price there, another seller's, or an amount that
+  needs a discount switched on, that is the number compared — which is why
+  the first answer names the price it read, and beside it the amount the
+  page strikes through where there is one. A sale that comes and goes
+  inside a day can be missed. A day the shop refuses Scout's request, or
+  the request fails, says nothing about the page and is not held against
+  it; a week of such days ends the watch, with a message that says the
+  page could not be read and when a price last was. An address can come to
+  show another product, a discontinued one redirecting to its accessory,
+  and the price there is read as the watched one: when the name differs
+  from the name the watch began with, the message says what the page now
+  calls it and asks you to check. Stock is not watched, only the price: a
+  hit on a page whose data says out of stock is sent, and says so. And a
+  watch tells you; it never buys.
 - **An invite link only works on an empty chat.** Telegram delivers a deep
   link's payload through the START button, and START only appears to someone
   who has never messaged the bot. So a link is right for a public post and

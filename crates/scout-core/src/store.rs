@@ -2517,6 +2517,16 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// The scope of a conversation, `direct` or a group's
+    /// `telegram:<chat>`, or `None` when the thread is gone. For deciding
+    /// whether a run came from a group: see `watch::deliver_to`.
+    pub fn conversation_scope(&self, conversation_id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row("SELECT scope FROM conversations WHERE id = ?", params![conversation_id], |r| r.get(0))
+            .optional()?)
+    }
+
     /// Notes that a watch is being checked now, before its page is asked
     /// for. Returns whether the watch is still live to be checked.
     ///
@@ -8899,6 +8909,17 @@ CREATE TABLE segment_candidates (
         assert!(s.record_watch_check(&read_at(&old, 310.0, now)).unwrap());
         let due: Vec<i64> = s.due_watches(now, ago(20)).unwrap().iter().map(|w| w.id).collect();
         assert_eq!(due, vec![on_the_hour.id, over.id]);
+    }
+
+    #[test]
+    fn a_conversations_scope_says_whether_it_is_a_groups() {
+        let (s, _d) = test_store();
+        let a = s.account_for_telegram(4242).unwrap();
+        let direct = s.start_conversation(a, "direct").unwrap();
+        let group = s.start_conversation(a, "telegram:-100123").unwrap();
+        assert_eq!(s.conversation_scope(direct).unwrap().as_deref(), Some("direct"));
+        assert_eq!(s.conversation_scope(group).unwrap().as_deref(), Some("telegram:-100123"));
+        assert_eq!(s.conversation_scope(group + 100).unwrap(), None, "a thread that is gone has none");
     }
 
     #[test]

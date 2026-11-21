@@ -363,6 +363,57 @@ fn against(price: f64, target: f64, currency: &str) -> String {
     format!("{how} the {}", money(target, currency))
 }
 
+/// Where a watch asked for in this run would send its one message, or
+/// `None` when there is nowhere it may. Worked out once a run, before its
+/// agent is built: a run with nowhere is not offered the watch tools.
+///
+/// A watch message names a product, a target and a price, and the rule is
+/// that a group hears of one only when it was asked for in that group.
+/// The run's own address does not say that. From Telegram it is the chat
+/// the message came in. From the browser it is wherever the account last
+/// spoke on Telegram, which `deliveries` overwrites on every message and
+/// which can be a group the request has nothing to do with.
+///
+/// So an address that is a group's, a negative chat number, is kept only
+/// when the run's thread is that group's own (`telegram:<chat>`, the scope
+/// the bot gives a group's conversation). Otherwise the watch is the
+/// person's: their private chat, whose number is their Telegram id. With
+/// no Telegram account, or two and nothing to say which, there is no
+/// private chat to be had and no watch is offered. What this cannot know
+/// is whether the person has ever started the bot in that private chat;
+/// one who has not is not reached, and the outbox counts the message as
+/// given up.
+///
+/// A reminder follows the address as its run has it, the older rule, and
+/// is not changed here.
+pub(crate) async fn deliver_to(store: &Store, run: &scout_api::RunContext) -> Option<ReplyTo> {
+    let reply_to = run.reply_to.clone()?;
+    if reply_to.channel != crate::mirror::TELEGRAM {
+        return Some(reply_to);
+    }
+    let chat = reply_to.address.parse::<i64>().ok()?;
+    if chat > 0 {
+        return Some(reply_to);
+    }
+    let (theirs, account_id, conversation_id) = (store.clone(), run.account_id, run.conversation_id);
+    let looked = blocking(move || Ok((theirs.conversation_scope(conversation_id)?, theirs.telegram_ids(account_id)?))).await;
+    let (scope, own) = match looked {
+        Ok(found) => found,
+        Err(e) => {
+            // Not fatal: the run is worth doing without the watch tools.
+            tracing::warn!(error = %e, "could not tell where a price watch would be delivered; not offering one");
+            return None;
+        }
+    };
+    if scope.as_deref() == Some(format!("telegram:{chat}").as_str()) {
+        return Some(reply_to);
+    }
+    match own.as_slice() {
+        [own] => Some(ReplyTo::telegram(*own)),
+        _ => None,
+    }
+}
+
 /// A request to be told about a price: whose it is, where to tell them,
 /// the page, and the amount they named. The amount is the person's own,
 /// as the model heard it. No price of the page's is in here to be wrong.
@@ -1156,6 +1207,46 @@ mod tests {
 
     fn ask<'a>(reply_to: &'a ReplyTo, url: &'a str, target: f64) -> Ask<'a> {
         Ask { account_id: 1, reply_to, url, target, currency: "EUR" }
+    }
+
+    /// Where a watch asked for in this run would be delivered: by an
+    /// account with these Telegram ids, in a thread of this scope, its
+    /// channel having handed the run this address.
+    async fn delivered_to(telegram: &[i64], scope: &str, reply_to: Option<ReplyTo>) -> Option<ReplyTo> {
+        let (store, _dir) = a_store();
+        let account_id = store.account_for_identity("email", "a@example.com").unwrap();
+        for id in telegram {
+            store.link_identity(account_id, "telegram", &id.to_string()).unwrap();
+        }
+        let conversation_id = store.start_conversation(account_id, scope).unwrap();
+        deliver_to(&store, &scout_api::RunContext { account_id, conversation_id, reply_to, title_source: None }).await
+    }
+
+    #[tokio::test]
+    async fn a_watch_goes_to_a_group_only_when_it_was_asked_for_in_that_group() {
+        let own = ReplyTo::telegram(4242);
+        let group = ReplyTo::telegram(-100_123);
+
+        // On Telegram the run's address is the chat the message came in.
+        assert_eq!(delivered_to(&[4242], "direct", Some(own.clone())).await, Some(own.clone()));
+        assert_eq!(delivered_to(&[4242], "telegram:-100123", Some(group.clone())).await, Some(group.clone()));
+
+        // From the browser it is wherever the account last spoke, which
+        // can be a group the request has nothing to do with. Then the
+        // watch is the person's own: their private chat, whose number is
+        // their Telegram id.
+        assert_eq!(delivered_to(&[4242], "direct", Some(group.clone())).await, Some(own.clone()));
+        // Another group's thread is not this group either.
+        assert_eq!(delivered_to(&[4242], "telegram:-100999", Some(group.clone())).await, Some(own));
+
+        // And where no private chat is to be had there is nowhere: no
+        // Telegram account at all, or two and nothing to say which.
+        assert_eq!(delivered_to(&[], "direct", Some(group.clone())).await, None);
+        assert_eq!(delivered_to(&[4242, 4343], "direct", Some(group)).await, None);
+        assert_eq!(delivered_to(&[4242], "direct", None).await, None);
+        // An address that is not a chat's number is not guessed at.
+        let odd = ReplyTo { channel: "telegram".into(), address: "somewhere".into() };
+        assert_eq!(delivered_to(&[4242], "direct", Some(odd)).await, None);
     }
 
     #[tokio::test]

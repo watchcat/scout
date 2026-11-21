@@ -101,7 +101,8 @@ async fn run_with(
         let store = core.deps.store.clone();
         tokio::task::spawn_blocking(move || store.list_facts(account_id)).await??
     };
-    let agent = build_agent(&core.deps, run, &facts, observer.clone());
+    let watch_to = crate::watch::deliver_to(&core.deps.store, run).await;
+    let agent = build_agent(&core.deps, run, &facts, watch_to, observer.clone());
     // History comes from the conversation the caller opened, so an
     // in-flight run always reads and writes that thread and never anyone
     // else's — the isolation the (chat, user) map used to provide.

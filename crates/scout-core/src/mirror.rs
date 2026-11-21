@@ -239,11 +239,14 @@ pub async fn sent(core: &Core, id: i64) -> anyhow::Result<()> {
     crate::core::blocking(move || store.mark_mirror_sent(id)).await
 }
 
-/// Records a failed send and returns how many attempts the row has spent.
-pub async fn failed(core: &Core, id: i64) -> anyhow::Result<i64> {
+/// Records a failed send and returns how many attempts the row has spent,
+/// and whether that was its last.
+pub async fn failed(core: &Core, id: i64) -> anyhow::Result<Failure> {
     let store = core.store();
     crate::core::blocking(move || store.mark_mirror_failed(id)).await
 }
+
+pub use crate::store::MirrorFailure as Failure;
 
 /// How many attempts a row gets before it is left alone for good.
 pub use crate::store::MIRROR_ATTEMPTS as ATTEMPTS;

@@ -12,6 +12,24 @@ use std::sync::{Arc, Mutex};
 /// would otherwise be retried against forever.
 pub const MIRROR_ATTEMPTS: i64 = 5;
 
+/// How many times a price watch's message is tried: the five every row
+/// gets, a minute apart as the drain comes round, and then one an hour, so
+/// that the last is twenty-three hours after the message was queued. A
+/// mirrored turn that is lost is a line of a thread the reader has in the
+/// browser. A watch's message is the only word its owner ever gets of how
+/// the watch ended, and the watch is over when it is queued: five minutes
+/// of Telegram being down must not be the end of it.
+pub const WATCH_MESSAGE_ATTEMPTS: i64 = MIRROR_ATTEMPTS + 23;
+
+/// What a send that failed came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirrorFailure {
+    /// How many attempts the row has spent now.
+    pub attempts: i64,
+    /// Whether that was its last: it will not be offered again.
+    pub given_up: bool,
+}
+
 /// How many times the extractor is pointed at one mail before it is left
 /// as failed. Same reasoning as `MIRROR_ATTEMPTS`: nothing bounds a mail
 /// the model keeps choking on except this.
@@ -2591,10 +2609,13 @@ impl Store {
                 |r| r.get(0),
             )?;
             if said == 0 {
+                // Dated by the check and not by the table's default, which
+                // is the server's local clock: how long the message has
+                // waited decides when it is tried again.
                 conn.execute(
-                    "INSERT INTO outbox (id, account_id, channel, address, body, turn_key)
-                     VALUES (nextval('outbox_id_seq'), ?, ?, ?, ?, ?)",
-                    params![account_id, channel, address, body, key],
+                    "INSERT INTO outbox (id, account_id, channel, address, body, turn_key, created_at)
+                     VALUES (nextval('outbox_id_seq'), ?, ?, ?, ?, ?, CAST(? AS TIMESTAMP))",
+                    params![account_id, channel, address, body, key, stamp(check.now)],
                 )?;
             }
             Ok(true)
@@ -3443,14 +3464,26 @@ impl Store {
     /// Oldest first because a thread delivered out of order is worse than
     /// one delivered late. Rows past [`MIRROR_ATTEMPTS`] are left behind
     /// rather than returned.
+    ///
+    /// But for a price watch's message, by its key. Past its first five
+    /// attempts it is offered again once it is an hour old for each
+    /// attempt past the fourth, up to [`WATCH_MESSAGE_ATTEMPTS`]: one try
+    /// an hour for most of a day. Counted from when it was queued, which
+    /// needs no column the table does not have; the cost is that a bot
+    /// which was down for hours spends the hours it missed a minute apart
+    /// when it comes back.
     pub fn pending_mirror(&self, channel: &str, limit: usize) -> Result<Vec<PendingMirror>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, account_id, address, body, turn_key FROM outbox
-             WHERE channel = ? AND sent_at IS NULL AND attempts < ?
+             WHERE channel = ? AND sent_at IS NULL
+               AND (attempts < ?
+                    OR (turn_key LIKE 'watch:%' AND attempts < ?
+                        AND created_at <= CAST(? AS TIMESTAMP) - to_hours(CAST(attempts - ? + 1 AS BIGINT))))
              ORDER BY id LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![channel, MIRROR_ATTEMPTS, limit as i64], |r| {
+        let now = stamp(chrono::Utc::now().naive_utc());
+        let rows = stmt.query_map(params![channel, MIRROR_ATTEMPTS, WATCH_MESSAGE_ATTEMPTS, now, MIRROR_ATTEMPTS, limit as i64], |r| {
             Ok(PendingMirror {
                 id: r.get(0)?,
                 account_id: r.get(1)?,
@@ -3470,8 +3503,9 @@ impl Store {
         Ok(())
     }
 
-    /// It did not arrive. Returns how many attempts the row has now spent,
-    /// so the caller can say out loud when one is given up on.
+    /// It did not arrive. Returns how many attempts the row has now spent
+    /// and whether that was the last, so the caller can say out loud when
+    /// one is given up on.
     ///
     /// At [`MIRROR_ATTEMPTS`] the row stops being returned by
     /// `pending_mirror`, and its `turn_key` stays occupied, so re-enqueueing
@@ -3479,12 +3513,28 @@ impl Store {
     /// — until `prune_outbox` drops the row, months on, and the key is free
     /// for a backfill to try again. That is a thing a human should be able
     /// to find in a log afterwards.
-    pub fn mark_mirror_failed(&self, id: i64) -> Result<i64> {
+    ///
+    /// And on `/metrics`, where a give-up is counted here by the kind of
+    /// message it was: `watch`, `inbox` for a nudge about a booking, or
+    /// `turn`. A price watch's message has more attempts before it is one;
+    /// see [`WATCH_MESSAGE_ATTEMPTS`].
+    pub fn mark_mirror_failed(&self, id: i64) -> Result<MirrorFailure> {
         let conn = self.conn();
         conn.execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?", params![id])?;
-        let attempts: i64 =
-            conn.query_row("SELECT attempts FROM outbox WHERE id = ?", params![id], |r| r.get(0))?;
-        Ok(attempts)
+        let (attempts, key): (i64, String) =
+            conn.query_row("SELECT attempts, turn_key FROM outbox WHERE id = ?", params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let (kind, allowed) = match key.split_once(':') {
+            Some(("watch", _)) => ("watch", WATCH_MESSAGE_ATTEMPTS),
+            Some(("inbox", _)) => ("inbox", MIRROR_ATTEMPTS),
+            _ => ("turn", MIRROR_ATTEMPTS),
+        };
+        // On the attempt that spends the last, and not on one after it:
+        // a row past its allowance is not offered, so there is none.
+        let given_up = attempts >= allowed;
+        if attempts == allowed {
+            self.metrics.outbox_given_up(kind);
+        }
+        Ok(MirrorFailure { attempts, given_up })
     }
 
     pub fn mirror_enabled(&self, account_id: i64) -> Result<bool> {
@@ -11610,11 +11660,92 @@ CREATE TABLE trips (
             // The count comes back so the drain can tell a retry from a row
             // it has just given up on — the log line said "it stays queued"
             // on the fifth failure, which was the one time it did not.
-            assert_eq!(s.mark_mirror_failed(id).unwrap(), attempt);
+            assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: attempt, given_up: false });
             assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1, "gave up too early");
         }
-        assert_eq!(s.mark_mirror_failed(id).unwrap(), MIRROR_ATTEMPTS);
+        assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: MIRROR_ATTEMPTS, given_up: true });
         assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "retried forever");
+        // However long it waits: only a watch's message is tried again later.
+        s.conn().execute("UPDATE outbox SET created_at = created_at - INTERVAL 30 DAY", []).unwrap();
+        assert!(s.pending_mirror("telegram", 10).unwrap().is_empty());
+    }
+
+    /// A store counting on a set of the test's own, since every other
+    /// test in the binary counts on the process's.
+    fn store_counting() -> (Store, TempDir, &'static crate::metrics::Metrics) {
+        let (mut s, dir) = test_store();
+        let metrics: &'static crate::metrics::Metrics = Box::leak(Box::default());
+        s.metrics = metrics;
+        (s, dir, metrics)
+    }
+
+    #[test]
+    fn a_watchs_message_is_tried_for_a_day_before_it_is_given_up() {
+        // A watch ends once and says so once. Given up after five tries a
+        // minute apart, as a mirrored turn is, the row said `hit` and the
+        // person heard nothing because Telegram was down for six minutes.
+        let (s, _d, metrics) = store_counting();
+        let now = chrono::Utc::now().naive_utc();
+        let w = started(&s, &new_watch(1, "https://shop.example/p/widget", now - chrono::Duration::hours(21)));
+        let hit = WatchCheck { ended: Some(("hit", "Widget is €289.00")), ..read_at(&w, 289.0, now) };
+        assert!(s.record_watch_check(&hit).unwrap());
+        let id = s.pending_mirror("telegram", 10).unwrap()[0].id;
+        // Queued on the clock the watch runs on, so its day is a day.
+        let queued_at: String = s.conn().query_row("SELECT CAST(created_at AS VARCHAR) FROM outbox WHERE id = ?", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(unstamp(&queued_at).unwrap(), unstamp(&stamp(now)).unwrap());
+
+        // The first five as any message's: at once, as the drain comes round.
+        for attempt in 1..=MIRROR_ATTEMPTS {
+            assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1, "attempt {attempt}");
+            assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: attempt, given_up: false });
+        }
+        // Then one an hour. Not before its hour,
+        assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "retried within the hour");
+        let wait = |hours: i64| {
+            s.conn().execute(&format!("UPDATE outbox SET created_at = created_at - INTERVAL {hours} HOUR WHERE id = ?"), params![id]).unwrap();
+        };
+        wait(1);
+        // and when it comes, once: a failure puts the next an hour on.
+        for attempt in MIRROR_ATTEMPTS + 1..WATCH_MESSAGE_ATTEMPTS {
+            assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1, "attempt {attempt}");
+            assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: attempt, given_up: false });
+            assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "attempt {attempt} was not the hour's only one");
+            wait(1);
+        }
+        // The last is twenty-three hours after the message was queued.
+        assert_eq!(WATCH_MESSAGE_ATTEMPTS - MIRROR_ATTEMPTS, 23);
+        assert_eq!(s.pending_mirror("telegram", 10).unwrap().len(), 1);
+        assert_eq!(s.mark_mirror_failed(id).unwrap(), MirrorFailure { attempts: WATCH_MESSAGE_ATTEMPTS, given_up: true });
+        wait(1000);
+        assert!(s.pending_mirror("telegram", 10).unwrap().is_empty(), "given up is given up");
+
+        // And counted, by the kind of message it was and nothing of whose.
+        assert!(metrics.render().contains("scout_outbox_given_up_total{kind=\"watch\"} 1\n"), "{}", metrics.render());
+    }
+
+    #[test]
+    fn a_message_given_up_on_is_counted_by_its_kind_and_one_still_tried_is_not() {
+        let (s, _d, metrics) = store_counting();
+        let a = s.account_for_telegram(11).unwrap();
+        s.enqueue_mirror(a, "telegram", "11", "a turn", "0123abcd", false).unwrap();
+        s.enqueue_mirror(a, "telegram", "11", "a booking is waiting", "inbox:7", false).unwrap();
+        let ids: Vec<i64> = s.pending_mirror("telegram", 10).unwrap().iter().map(|m| m.id).collect();
+        for id in &ids {
+            for _ in 1..MIRROR_ATTEMPTS {
+                assert!(!s.mark_mirror_failed(*id).unwrap().given_up);
+            }
+        }
+        assert!(!metrics.render().contains("scout_outbox_given_up_total{"), "nothing is given up yet: {}", metrics.render());
+        for id in &ids {
+            assert!(s.mark_mirror_failed(*id).unwrap().given_up);
+        }
+        let page = metrics.render();
+        assert!(page.contains("scout_outbox_given_up_total{kind=\"turn\"} 1\n"), "{page}");
+        assert!(page.contains("scout_outbox_given_up_total{kind=\"inbox\"} 1\n"), "{page}");
+        // One label, and it is a kind: no account, no chat, no key.
+        for line in page.lines().filter(|l| l.starts_with("scout_outbox_given_up_total{")) {
+            assert_eq!(line.matches('=').count(), 1, "{line}");
+        }
     }
 
     #[test]

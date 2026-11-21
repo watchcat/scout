@@ -138,6 +138,7 @@ pub struct Metrics {
     tool_calls: Counter,
     watch_checks: Counter,
     watches_ended: Counter,
+    outbox_given_up: Counter,
     provider_errors: Counter,
     provider_retries: Counter,
     lock_wait: Histogram,
@@ -160,6 +161,7 @@ impl Default for Metrics {
             tool_calls: Counter::new(&["tool", "status"]),
             watch_checks: Counter::new(&["outcome"]),
             watches_ended: Counter::new(&["why"]),
+            outbox_given_up: Counter::new(&["kind"]),
             provider_errors: Counter::new(&["provider", "kind"]),
             provider_retries: Counter::new(&["provider"]),
             lock_wait: Histogram::new(LOCK_BUCKETS),
@@ -208,6 +210,14 @@ impl Metrics {
     /// good guesses.
     pub fn watch_ended(&self, why: &str) {
         self.watches_ended.add(&[why]);
+    }
+
+    /// A message in the outbox was given up on, its attempts spent: a
+    /// price `watch`'s one message, an `inbox` nudge about a booking, or a
+    /// mirrored `turn`. The kind and nothing else: a message that never
+    /// arrived is about one person, and no label here says who.
+    pub fn outbox_given_up(&self, kind: &str) {
+        self.outbox_given_up.add(&[kind]);
     }
 
     /// A provider's request that failed for good, retries spent.
@@ -294,6 +304,7 @@ impl Metrics {
         self.run_duration.render(&mut out, "scout_run_duration_seconds", "How long a run took, from its row to its last word; the wait for a slot is not in it.");
         self.tool_calls.render(&mut out, "scout_tool_calls_total", "Tool calls the agents made, by tool and whether the tool answered.");
         self.watch_checks.render(&mut out, "scout_price_watch_checks_total", "Daily checks of price watches, by how each went: read (a price was read), unreadable (the page was read and gave none, or is gone), refused (the shop refused its reader), failed (the request came to nothing).");
+        self.outbox_given_up.render(&mut out, "scout_outbox_given_up_total", "Messages the outbox gave up on, their attempts spent, by kind: watch (a price watch's one message), inbox (a nudge about a booking), turn (a mirrored turn).");
         self.watches_ended.render(&mut out, "scout_price_watches_ended_total", "Price watches ended, by why: hit, unreadable (three checks running read the page and found no price), unreached (a week with no reading at all), expired (sixty days) or stopped by their owner.");
         self.provider_errors.render(&mut out, "scout_provider_errors_total", "Requests that failed after their retries: paid APIs as they answered (client includes a not-found), and the model during runs.");
         self.provider_retries.render(&mut out, "scout_provider_retries_total", "Requests to a provider sent again after a 429, a 5xx or a refused connection.");
@@ -548,6 +559,7 @@ mod tests {
             "scout_tool_calls_total",
             "scout_price_watch_checks_total",
             "scout_price_watches_ended_total",
+            "scout_outbox_given_up_total",
             "scout_provider_errors_total",
             "scout_provider_retries_total",
             "scout_store_lock_wait_seconds",

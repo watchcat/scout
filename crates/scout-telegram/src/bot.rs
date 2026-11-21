@@ -1084,11 +1084,24 @@ const PRICE_MARKERS: &[&str] = &[
 /// halfway through a long search — as the freshest line in the prompt it
 /// actually fires. (Observed: a cheapest-price request that opened eight
 /// pages and answered from raw snippets without comparing anything.)
+///
+/// It ends by giving way. The markers are substrings, and "tell me when
+/// it is cheaper than 300" has one in it: a request to be told later,
+/// which is `watch_price`'s, was being ordered to search and compare by
+/// the freshest line it had. The note says so itself, and not a second
+/// list of phrases that would let such a message through, because how
+/// people ask to be told is not something anyone has collected yet. The
+/// tool is named because a run from Telegram always has it: there is
+/// always the chat the message came from to tell the person in. Not yet
+/// tried on a real model.
 const PRICE_REQUEST_NOTE: &str = "\n\n[system note] This is a cheapest-price request. \
 Before answering you MUST call compare_prices once, passing every candidate offer with its \
 price, currency, pack size (units) and shipping cost where stated. Present its best_single \
 and best_per_unit, using its numbers verbatim. Keep enough turns free to do it: search \
-first, open at most 3 pages, then compare.";
+first, open at most 3 pages, then compare. The one exception: if the user is asking to be \
+told later, when a price falls to or under an amount they name ('tell me when it is cheaper \
+than 300'), that is a request for watch_price and none of the above applies - no search and \
+no comparison are needed for it.";
 
 fn looks_like_price_request(text: &str) -> bool {
     let text = text.to_lowercase();
@@ -2102,6 +2115,50 @@ mod tests {
         ] {
             assert!(!looks_like_price_request(other), "false positive: {other}");
         }
+    }
+
+    #[test]
+    fn a_request_to_be_told_when_a_price_falls_is_not_ordered_to_compare() {
+        // "Cheaper than 300" carries the marker of a cheapest-price
+        // request, and the note that follows one was an order to search
+        // and compare. Asked to be told later, that is the wrong errand,
+        // and the note is the freshest line the model reads.
+        let english = "tell me when these are cheaper than €300";
+        let dutch = "laat me weten wanneer deze goedkoper is dan €300";
+        let russian = "скажи, когда они станут дешевле 300 евро";
+        // The prompt as the handler makes it.
+        let sent = |text: &str| match looks_like_price_request(text) {
+            true => format!("{text}{PRICE_REQUEST_NOTE}"),
+            false => text.to_string(),
+        };
+        for asking in [english, dutch, russian] {
+            let prompt = sent(asking);
+            assert!(
+                !prompt.contains("MUST call compare_prices") || prompt.contains("The one exception: "),
+                "ordered to compare, with no way out: {asking}"
+            );
+        }
+        // Two of the three do get the note, which is what this is about.
+        // (The Dutch one does not: "goedkoper" has one o and the marker
+        // two. It is here for the day the list learns the comparative.)
+        assert!(looks_like_price_request(english) && looks_like_price_request(russian));
+
+        // The note gives way itself, in whatever words the request was
+        // made: last, where it is read last, and naming the tool.
+        let exception = PRICE_REQUEST_NOTE
+            .split("The one exception: ")
+            .nth(1)
+            .expect("the note names its exception, after the order");
+        for said in ["to be told later", "watch_price", "none of the above applies", "no search and no comparison"] {
+            assert!(exception.contains(said), "the exception does not say {said:?}: {exception}");
+        }
+        // And for the request it was written for it says what it said,
+        // under the marker that keeps it out of the person's transcript.
+        let order = format!(
+            "\n\n{} This is a cheapest-price request. Before answering you MUST call compare_prices once",
+            scout_core::text::SYSTEM_NOTE
+        );
+        assert!(PRICE_REQUEST_NOTE.starts_with(&order), "got: {PRICE_REQUEST_NOTE}");
     }
 
     #[test]

@@ -16,9 +16,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # The binary has to be copied out within this step: a cache mount is not part
 # of the layer that results from it.
+# Only the package the image ships, and what it depends on. The workspace
+# also holds `scout-browser`, which nothing calls and no image runs yet;
+# built here it would be a second binary with all of scout-core in it,
+# compiled and linked on every deploy and then left behind.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    cargo build --release \
+    cargo build --release -p scout-telegram \
     && cp target/release/scout-telegram /scout-telegram
 
 # Runtime stage: CA certificates (TLS itself is rustls, inside the binary)

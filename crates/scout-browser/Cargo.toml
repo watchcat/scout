@@ -1,0 +1,45 @@
+[package]
+name = "scout-browser"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A shop's page driven over HTTP, one shop a session"
+
+[dependencies]
+# For `net_guard`, so that a session's Chrome leaves by the one fence the
+# render has, and for `measure`, so that a refusal page is known by what
+# `fetch_page` knows it by. That links all of scout-core into this crate;
+# nothing in scout-core knows this crate exists.
+scout-core = { path = "../scout-core" }
+axum = "0.8.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+# For the binary: the guard logs each address it refuses a Chrome, and
+# without a subscriber nobody reads that.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+# A session's profile directory, made under a name nothing else has.
+# `chrome::Profile` is what removes it.
+tempfile = "3"
+# One signal to a Chrome's whole process group, so that what the Chrome
+# started is stopped with it, without unsafe code here. tempfile brings
+# this same crate in already; only its `process` part is added.
+rustix = { version = "1", features = ["process"] }
+# The Public Suffix List, compiled in. "One shop a session" is a comparison
+# of registrable domains, and the list is the only thing that knows where
+# one ends: under `co.za` a shop has three labels, under a shop platform's
+# own suffix every shop has its own, and two labels or a hand-kept list of
+# suffixes get one or the other wrong.
+psl = "2"
+# A session's name, which must not be one a caller could count up to.
+rand = "0.10"
+
+[dev-dependencies]
+# Paused time, so that a session waiting out its three minutes for a free
+# place is a test that finishes at once.
+tokio = { version = "1", features = ["net", "test-util"] }
+# One call into the router without a socket, as scout-web's tests make it.
+tower = { version = "0.5", features = ["util"] }

@@ -570,7 +570,7 @@ rehearsed against a copy of the live database before it ran on the real one,
 and the row counts were compared either side.
 
 That middle arrow is a crate boundary, not a convention. Scout is a cargo
-workspace of four:
+workspace, and four of its crates are that picture:
 
 ```
 scout-core       36,000 lines  the agent, the tools, the database — everything
@@ -584,6 +584,17 @@ scout-web        12,200 lines  the website and the browser chat: sign-in, the
                                thread list, streaming into the page, the
                                inbound webhook and the mail worker
 ```
+
+A fifth, `scout-browser`, is in the workspace and in none of the pictures,
+because nothing uses it yet. It drives a shop's page over HTTP for the shop
+desk that is still a card on the board: a session is opened on one page, in a
+Chrome of its own behind the same guard as `fetch_page`'s render, and each of
+six actions answers with the page as an outline. One shop a session, nothing
+personal typed, no checkout, no sign-in, no downloads; three at once, 25
+actions, 180 seconds, and over when the shop says no. It is built and tested
+to run on one machine (`cargo run -p scout-browser` listens on loopback and
+nowhere else), it is not deployed, and no tool calls it; its own
+documentation says what it keeps to and where each number came from.
 
 `scout-core` does not export its store. The adapter cannot open a database,
 run a query, or name the type that would let it — writing

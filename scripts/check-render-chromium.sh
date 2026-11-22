@@ -24,9 +24,10 @@
 # HEAD`, as a deploy does, to a directory of its own, and needs SCOUT_SSH
 # from the environment or `.env`. The build runs over the connection: if
 # that drops, run it again, and cargo picks up where it stopped. The
-# directory and the image's name are removed however it ends; the node's
-# build cache keeps the layers, the tests' binary among them, until it is
-# pruned.
+# directory and the image's name are removed however it ends, short of a
+# connection lost in the middle of the build, which can finish on the node
+# after the tidying; the node's build cache keeps the layers, the tests'
+# binary among them, until it is pruned.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -52,11 +53,16 @@ if [ "$on_node" -eq 1 ]; then
     there=/opt/scout-render-check
     # The build says nothing for minutes; the connection is kept up through them.
     on_the_node() { ssh -o BatchMode=yes -o ServerAliveInterval=30 "$SCOUT_SSH" "$@"; }
-    tidy() { on_the_node "rm -rf $there; docker image rm scout-render-check >/dev/null 2>&1 || true"; }
+    # Said and not failed on: what the tests found is what this ends with.
+    tidy() {
+        on_the_node "rm -rf $there; docker image rm scout-render-check >/dev/null 2>&1 || true" \
+            || echo "could not tidy up on the node: $there and the image scout-render-check may be left there" >&2
+    }
     trap tidy EXIT
     trap 'exit 130' INT TERM
     git archive HEAD | on_the_node "rm -rf $there && mkdir -p $there && tar -x -C $there"
     pod=$(on_the_node "kubectl -n scout exec deployment/scout -- chromium --version 2>/dev/null" | tr -d "'" || true)
+    [ -n "$pod" ] || echo "(the pod could not be asked which Chromium it runs)"
     on_the_node "cd $there && SCOUT_POD_CHROMIUM='$pod' sh scripts/check-render-chromium.sh ${walled:+--walled '$walled'}"
     exit 0
 fi

@@ -784,8 +784,9 @@ mod tests {
     /// has certainly ended. Sooner says nothing: for as long as the drop
     /// goes on removing, up to `GIVE_UP`, a directory that a live writer
     /// keeps putting back is away at most looks all the same (the first
-    /// version of this looked after half a second, and the tests that use
-    /// it passed two times in three with the group's kill taken out).
+    /// version of this looked after half a second, and with the group's
+    /// kill taken out the two tests that use it passed 22 and 10 times in
+    /// 30, in the review's runs).
     #[cfg(unix)]
     async fn nothing_is_left_in(base: &std::path::Path) -> bool {
         tokio::time::sleep(GIVE_UP + Duration::from_millis(500)).await;
@@ -851,10 +852,17 @@ mod tests {
         first.wait().await.unwrap();
         let then = written(base.path());
         let went_on = comes_true(Duration::from_secs(2), || written(base.path()) > then + 5).await;
-        // And it outlasts a removal, which is what a profile's drop does to
-        // it: the directory is put back, with more written into it.
-        // (A removal can itself lose to a file written in the middle of it.)
-        let removed = (0..50).any(|_| std::fs::remove_dir_all(&profile).is_ok());
+        // And it outlasts removal, which is what a profile's drop does to
+        // it: the directory is put back, with more written into it. Removed
+        // over and over for a second, not once: what ended the writer was a
+        // removal landing between two of its lines, which one removal
+        // seldom does (with the script's `true` put back to `:` this
+        // passed 15 times in 15 on one removal, and fails on these).
+        let removing_until = Instant::now() + Duration::from_secs(1);
+        let mut removed = false;
+        while Instant::now() < removing_until {
+            removed |= std::fs::remove_dir_all(&profile).is_ok();
+        }
         let put_back = comes_true(Duration::from_secs(2), || written(base.path()) > 5).await;
         let still_alive = alive_on(&profile).len();
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
@@ -904,7 +912,13 @@ mod tests {
         assert!(comes_true(Duration::from_secs(5), || written(base.path()) > 0).await, "the stand-in wrote nothing");
         let profile = the_profile_in(base.path());
 
-        let html = render.await.unwrap().unwrap();
+        // Killed, not waited out: the stand-in's first process goes on for
+        // ten seconds if it is left to end by itself, and so does a Chrome.
+        let html = tokio::time::timeout(QUIET_AFTER_OUTPUT + Duration::from_secs(3), render)
+            .await
+            .expect("the render waited for a Chrome it should have killed")
+            .unwrap()
+            .unwrap();
         assert!(html.contains("printed"), "got: {html}");
         assert!(
             comes_true(Duration::from_secs(1), || alive_on(&profile).is_empty()).await,
@@ -1625,15 +1639,18 @@ WAIT
         // pages answered 403 and a challenge).
         let chrome = find_chrome().expect("chrome");
         let url = std::env::var("SCOUT_PROBE_URL").unwrap();
-        let mut plain = reqwest::Client::new().get(&url);
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
+        let mut plain = client.get(&url);
         for (name, value) in crate::measure::request_headers() {
             plain = plain.header(name, value);
         }
         let answer = plain.send().await.expect("the plain request");
-        let status = answer.status();
+        let status = answer.status().as_u16();
         let body = answer.text().await.unwrap_or_default();
-        println!("LIVE plain status={} bytes={} challenge={}", status.as_u16(), body.len(), is_challenge_page(&body));
-        assert!(!status.is_success() || is_challenge_page(&body), "a plain request reads {url}: it is behind no wall");
+        println!("LIVE plain status={status} bytes={} challenge={}", body.len(), is_challenge_page(&body));
+        // The challenge itself, not any refusal: an address mistyped
+        // answers 404, which is no wall either.
+        assert!(is_challenge_page(&body), "a plain request to {url} got HTTP {status} and no challenge: it is behind none");
 
         let html = Renderer::new(chrome).render(&url).await.unwrap();
         let page = crate::tools::fetch::extract_page_for_test(&html, &url);

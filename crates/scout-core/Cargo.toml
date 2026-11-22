@@ -27,6 +27,11 @@ sha2 = "0.11"
 tracing = "0.1"
 rand = "0.10"
 unicode-normalization = "0.1.25"
+# One signal to a render's Chrome and everything that Chrome started, by
+# their process group, without unsafe code here. `scout-browser` stops its
+# Chromes the same way; tempfile brings this crate in already and only its
+# `process` part is added.
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 wiremock = "0.6"

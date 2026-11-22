@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # refuse a plain HTTP client (a shop behind a challenge answers 403 to
 # reqwest and serves the product page to a real browser). Chromium is the
 # bulk of this image; drop it and the bot still runs, minus that fallback.
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime-base
 # No `chmod 4755` on a setuid sandbox here: Debian's chromium ships none —
 # there is no `chrome-sandbox` binary in /usr/lib/chromium at all, so the
 # chmod fails the build outright. It isolates renderers with user
@@ -47,11 +47,46 @@ RUN apt-get update \
     && useradd -m scout \
     && mkdir -p /data \
     && chown scout:scout /data
+ENV SCOUT_CHROME=/usr/bin/chromium
+
+# The renderer's live tests, compiled from the same sources as the binary, to
+# be run against the Chromium installed above: `scripts/check-render-chromium.sh`.
+# What keeps a page's WebRTC in the render's proxy, and the rest of what the
+# renderer tells a Chrome, is settings and switches, and a Chromium that does
+# not know one of them ignores it in silence; they were first measured on a
+# laptop's Chrome, which is not this one. Neither stage is part of the image:
+# a build with no `--target` makes the last stage of this file and what that
+# stage is built from, which these two are not.
+FROM builder AS render-tests
+# One of the crate's tests reads the README, which the build above has no
+# use for.
+COPY README.md ./
+# `--release`, to use what the build above has already compiled: DuckDB is
+# not built a second time, only what the tests' own dependencies change.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    cargo test --release --no-run --lib -p scout-core --message-format=json-render-diagnostics > /tmp/tests.json \
+    && cp "$(sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' /tmp/tests.json | tail -1)" /scout-core-tests
+
+FROM runtime-base AS render-check
+# `ip`, with which the script gives the container a link-local address for a
+# test's page to aim at.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=render-tests /scout-core-tests /usr/local/bin/scout-core-tests
+USER scout
+WORKDIR /tmp
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Every live test of the renderer but the one that wants a shop's address.
+CMD ["scout-core-tests", "--ignored", "--nocapture", "--test-threads=1", "tools::browser::live::", "--skip", "renders_a_walled_page"]
+
+# The image itself. Last, so that it is what a plain `docker build` makes.
+FROM runtime-base
 COPY --from=builder /scout-telegram /usr/local/bin/scout-telegram
 USER scout
 WORKDIR /data
 ENV SCOUT_DB_PATH=/data/scout.duckdb
-ENV SCOUT_CHROME=/usr/bin/chromium
 # Chromium's helper processes (renderer, zygote, crashpad) outlive the process
 # that spawned them and are reparented to PID 1. Without an init there they are
 # never reaped: one render left 35 zombies, which ends in an exhausted PID

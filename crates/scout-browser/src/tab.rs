@@ -1649,6 +1649,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_page_cannot_send_a_datagram_to_a_peer_it_names() {
+        let _one_of_few = testing::gate().await;
+        // No server is named here, so a setting that only kept Chrome from
+        // asking servers would leave this open: the page tells one of its
+        // own connections that its peer is at an address of the page's
+        // choosing, and Chrome sends a check there to see.
+        let listening = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listening.local_addr().unwrap().port();
+        let pages = Pages::serve(&[home(&format!(
+            r#"<p id="peer">pairing</p>
+               <script>
+                 (async () => {{
+                   const said = document.getElementById('peer')
+                   try {{
+                     const a = new RTCPeerConnection(), b = new RTCPeerConnection()
+                     a.createDataChannel('x')
+                     const offer = await a.createOffer()
+                     await a.setLocalDescription(offer)
+                     await b.setRemoteDescription(offer)
+                     const answer = await b.createAnswer()
+                     await b.setLocalDescription(answer)
+                     await a.setRemoteDescription(answer)
+                     await a.addIceCandidate({{ candidate: 'candidate:2 1 udp 2113937151 127.0.0.1 {port} typ host', sdpMid: '0', sdpMLineIndex: 0 }})
+                     said.textContent += ' named'
+                   }} catch (e) {{ said.textContent += ' failed: ' + e }}
+                 }})()
+               </script>"#
+        ))])
+        .await;
+        let Some((mut tab, mut done)) = open(&pages, "/").await else { return };
+        // Until the page has named its peer, and two seconds after that
+        // for a check to arrive in.
+        let mut datagram = [0u8; 1500];
+        let mut arrived = None;
+        let mut since_named = 0;
+        for _ in 0..150 {
+            arrived = tokio::time::timeout(Duration::from_millis(100), listening.recv_from(&mut datagram)).await.ok();
+            if arrived.is_some() || since_named == 20 {
+                break;
+            }
+            if done.seen.text.contains("pairing named") || done.seen.text.contains("failed") {
+                since_named += 1;
+            } else {
+                done = tab.act(&Action::Read { more: false }).await.unwrap();
+            }
+        }
+        assert!(arrived.is_none(), "a check reached 127.0.0.1:{port}, past the proxy: {arrived:?}");
+        // Silence only counts from a page that did name its peer.
+        assert!(done.seen.text.contains("pairing named"), "{}", done.seen.text);
+        tab.close().await;
+    }
+
+    #[tokio::test]
     async fn nothing_is_fetched_ahead_of_a_press() {
         let _one_of_few = testing::gate().await;
         // A page may tell the browser which addresses to fetch, or to make

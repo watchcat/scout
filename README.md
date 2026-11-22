@@ -733,6 +733,7 @@ docker compose logs -f      # what the bot is doing right now
 scripts/deploy.sh           # compose: test, build, drain, hand over
 scripts/deploy-k3s.sh       # production: build on the node, apply, wait
 scripts/deploy-k3s.sh --dry-run # show the plan, change nothing
+scripts/check-render-chromium.sh # the renderer's live tests, against the image's Chromium
 ```
 
 What is being worked on, what is next and what is waiting lives in
@@ -747,6 +748,14 @@ test had happily asserted the opposite:
 ```bash
 cargo test -- --ignored --nocapture   # needs the relevant keys in .env
 ```
+
+The renderer's ignored tests want a real Chrome and no keys. They say what a
+page can do from inside a render — send UDP round the proxy, read the
+machine's addresses, have Chrome load ahead — and what a render cut short
+leaves behind. On a laptop they run against the laptop's Chrome, which is not
+the one production runs: `scripts/check-render-chromium.sh` builds them
+beside the image's Chromium and runs them there, and with `--on-node` on the
+node a deploy builds on.
 
 Docker builds use BuildKit cache mounts: a code change rebuilds in **~20s**, a
 dependency change in ~5s, because Cargo's registry and `target/` survive layer

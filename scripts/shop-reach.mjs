@@ -362,7 +362,12 @@ export function summary(read, extra = {}) {
 // tools/browser.rs, PREFERENCES. Without the first, a shop's page read here can
 // have Chrome send UDP from this machine to any address it names, the tunnel
 // notwithstanding: the proxy carries TCP only (measured there, 2026-11-20).
-const PREFERENCES = { webrtc: { ip_handling_policy: 'disable_non_proxied_udp' }, net: { network_prediction_options: 2 } }
+// The last is one of two things there that have a Chrome ask less of its
+// maker at every start; the other is the `--disable-features` below.
+const PREFERENCES = {
+  webrtc: { ip_handling_policy: 'disable_non_proxied_udp' }, net: { network_prediction_options: 2 },
+  browser: { enable_spellchecking: false },
+}
 
 /// A throwaway profile with its preferences written before any Chrome reads
 /// it, as tools/browser.rs makes one. `mkdtemp` makes it the owner's alone.
@@ -379,7 +384,7 @@ export function chromeArgs(userAgent, socksPort, profile) {
   return [
     '--headless=new', `--user-data-dir=${profile}`, `--user-agent=${userAgent}`,
     `--proxy-server=socks5://127.0.0.1:${socksPort}`, '--proxy-bypass-list=<-loopback>',
-    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
+    '--webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-features=NetworkTimeServiceQuerying',
     '--disable-gpu', '--disable-extensions', '--no-first-run', '--window-size=1280,1024', '--lang=nl-NL', '--mute-audio',
   ]
 }

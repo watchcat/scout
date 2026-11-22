@@ -49,8 +49,8 @@ pub(crate) struct Profile {
 
 /// How often a profile is removed and looked for again, how many times
 /// running it must be found gone, and when to give up on one that
-/// something keeps writing: a hundred milliseconds of quiet, two seconds
-/// at most. Chosen for a process's last moments, not measured.
+/// something keeps writing: a hundred and fifty milliseconds of quiet, two
+/// seconds at most. Chosen for a process's last moments, not measured.
 const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(50);
 const GONE_FOR: u32 = 3;
 const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(2);
@@ -67,9 +67,16 @@ impl Profile {
     }
 
     /// Removes it once more, and says whether that was the last time needed.
+    ///
+    /// A look counts as quiet when it finds the directory already gone, not
+    /// when it has just made it so: removed a moment ago it is away whoever
+    /// is still writing, and counting that ended the wait under a writer
+    /// that paused between files (found 2026-11-22 by the render's version
+    /// of this, whose test writes every 10 ms; this one's wrote without a
+    /// pause, which put the directory back before the look).
     fn gone(&self, quiet: &mut u32, since: std::time::Instant) -> bool {
-        let _ = std::fs::remove_dir_all(&self.path);
         *quiet = if self.path.exists() { 0 } else { *quiet + 1 };
+        let _ = std::fs::remove_dir_all(&self.path);
         *quiet >= GONE_FOR || since.elapsed() >= GIVE_UP
     }
 
@@ -162,6 +169,12 @@ pub(crate) fn chrome_args(profile: &Path, proxy: u16, reaching: Option<SocketAdd
         // resolves, checks and dials it in one place.
         format!("--proxy-server=socks5://127.0.0.1:{proxy}"),
         bypass,
+        // The profile's preferences say this already (`PREFERENCES`), and
+        // the render says it both ways too (`scout-core`'s
+        // `tools/browser.rs`, where each was measured holding without the
+        // other, on Chrome 157 and on Debian's Chromium 156): either is
+        // ignored in silence by a Chrome that does not know it.
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
         // Headless Chrome 157 answered a notification and a location
         // request with a refusal without this (measured 2026-11-20); the
         // flag is here so that the answer does not rest on the mode.
@@ -245,6 +258,40 @@ mod tests {
         drop(profile);
         writing.join().unwrap();
         assert!(!path.exists(), "{} is still there, with {:?} in it", path.display(), std::fs::read_dir(&path).map(|d| d.count()));
+    }
+
+    #[test]
+    fn a_profile_written_into_now_and_then_is_gone_once_the_writing_stops() {
+        // The test above writes without a pause, so the directory is back
+        // before anyone can look. What a dying process writes comes with
+        // pauses, and a look that only ever follows a removal finds the
+        // directory gone each time, whoever is still writing.
+        let profile = Profile::new().unwrap();
+        let path = profile.path().to_path_buf();
+        let writing = std::thread::spawn({
+            let cache = path.join("Default").join("Cache");
+            move || {
+                for file in 0..40 {
+                    let _ = std::fs::create_dir_all(&cache);
+                    let _ = std::fs::write(cache.join(format!("f{file}")), b"x");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        });
+        drop(profile);
+        writing.join().unwrap();
+        assert!(!path.exists(), "{} is still there, with {:?} in it", path.display(), std::fs::read_dir(&path).map(|d| d.count()));
+    }
+
+    #[test]
+    fn chrome_is_told_on_its_command_line_too_to_send_no_datagram() {
+        // The profile says so already (`PREFERENCES`). Said twice, as the
+        // render says it, because a Chrome that does not know one way of
+        // being told ignores it in silence. Not the `--force-…` spelling,
+        // which Chrome ignores.
+        let args = chrome_args(Path::new("/tmp/p"), 4321, None);
+        assert!(args.contains(&"--webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()), "{args:?}");
+        assert!(!args.iter().any(|arg| arg.starts_with("--force-webrtc-ip-handling-policy")));
     }
 
     #[test]

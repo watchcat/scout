@@ -130,8 +130,9 @@ impl Guard {
     /// hosts before it asks for the page: measured 2026-11-20, Chrome 157
     /// with the render's flags sent the proxy nine CONNECTs to six Google
     /// hosts (update, sign-in, static files) ahead of the first one for the
-    /// page. Under [`Guard::exempting`] the proxy would dial every one, so a
-    /// test about loopback would be talking to the internet.
+    /// page. (Fewer since: `STILL_ASKED` in `tools/browser.rs` has what is
+    /// left.) Under [`Guard::exempting`] the proxy would dial every one, so
+    /// a test about loopback would be talking to the internet.
     #[cfg(test)]
     pub fn only(addr: SocketAddr) -> Self {
         Self { exempt: Some(addr), sealed: true }

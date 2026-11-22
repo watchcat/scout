@@ -6,8 +6,9 @@
 #
 # Started as Chrome is, it finds its profile in `--user-data-dir=` and takes
 # the last argument for the address. An address ending in `/prints` gets a
-# page printed, as `--dump-dom` prints one; any other gets nothing, like a
-# page that never loads. Either way the first process then waits, as Chrome
+# page printed, as `--dump-dom` prints one, which also says whether the
+# stand-in was given nothing to read; any other gets nothing, like a page
+# that never loads. Either way the first process then waits, as Chrome
 # lingers after its page.
 profile=
 for arg in "$@"; do
@@ -22,14 +23,28 @@ done
   n=0
   # Ten seconds or so, far past any test here; then it stops by itself.
   while [ "$n" -lt 400 ]; do
-    mkdir -p "$profile/Default"
-    : > "$profile/Default/written-$n"
+    # Not once the directory the profile was made in is gone: that is the
+    # test's own, removed when the test is over, and a writer that had
+    # outlived a failing test would put it back for nobody. Two plain
+    # `mkdir`s for the same reason: `-p` would make that directory too.
+    [ -d "${profile%/*}" ] || exit 0
+    mkdir "$profile" 2> /dev/null
+    mkdir "$profile/Default" 2> /dev/null
+    # `true`, not `:`. The directory can be removed between the line above
+    # and this one, and a redirection that fails on `:`, a special built-in,
+    # ends the shell: the writer died of the very removal it is here to
+    # outlast (found in review, 2026-11-22).
+    true > "$profile/Default/written-$n"
     n=$((n + 1))
     sleep 0.02
   done
 ) > /dev/null 2>&1 &
 
 case "$address" in
-  */prints) echo '<html><body>printed</body></html>' ;;
+  */prints)
+    reads=something
+    [ /dev/stdin -ef /dev/null ] && reads=nothing
+    echo "<html><body>printed, reads $reads</body></html>"
+    ;;
 esac
 wait

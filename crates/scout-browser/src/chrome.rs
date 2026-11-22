@@ -49,8 +49,8 @@ pub(crate) struct Profile {
 
 /// How often a profile is removed and looked for again, how many times
 /// running it must be found gone, and when to give up on one that
-/// something keeps writing: a hundred milliseconds of quiet, two seconds
-/// at most. Chosen for a process's last moments, not measured.
+/// something keeps writing: a hundred and fifty milliseconds of quiet, two
+/// seconds at most. Chosen for a process's last moments, not measured.
 const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(50);
 const GONE_FOR: u32 = 3;
 const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(2);

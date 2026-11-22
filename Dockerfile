@@ -63,9 +63,16 @@ FROM builder AS render-tests
 COPY README.md ./
 # `--release`, to use what the build above has already compiled: DuckDB is
 # not built a second time, only what the tests' own dependencies change.
+#
+# The `touch` is for cargo, which calls a crate built when none of its
+# sources is newer than its last build, whatever is in them. Sent by `git
+# archive`, as the check sends them to the node, every file carries its
+# commit's time: the tests of a commit made before the last build here
+# would not be compiled, and that build's tests would run under its name.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    cargo test --release --no-run --lib -p scout-core --message-format=json-render-diagnostics > /tmp/tests.json \
+    find crates README.md -type f -exec touch {} + \
+    && cargo test --release --no-run --lib -p scout-core --message-format=json-render-diagnostics > /tmp/tests.json \
     && cp "$(sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' /tmp/tests.json | tail -1)" /scout-core-tests
 
 FROM runtime-base AS render-check

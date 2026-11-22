@@ -249,7 +249,7 @@ impl Renderer {
 /// One render's Chrome and everything that Chrome started, stopped together.
 ///
 /// Chrome is several processes: the one started here, and a renderer, a
-/// network service, a crash handler and more that it starts itself. Killing
+/// network service, a GPU process and more that it starts itself. Killing
 /// the first leaves the rest to notice and end themselves, and until they
 /// do they write where they were writing, which is the profile. So the
 /// Chrome is made the leader of a process group of its own, which its
@@ -258,6 +258,25 @@ impl Renderer {
 /// that would not print, a deadline that drops the render mid-read.
 /// `scout-browser` stops its Chromes the same way (`pipe.rs`, which has the
 /// count of helpers found in their Chrome's group).
+///
+/// On the Chrome measured the helpers do notice, and fast: 2026-11-22 on
+/// Chrome 157, with the group's signal taken out, 32 renders cut short had
+/// no process left a tenth of a second later and left no profile. The
+/// signal is here so that nothing rests on what a killed program's children
+/// do next, and the tests that hold it use a stand-in whose second process
+/// does not notice.
+///
+/// Not everything a Chrome starts is in its group. Debian's Chromium 156
+/// puts its two crash handlers in sessions of their own, which no signal to
+/// the group reaches. They end themselves when their Chrome does (the same
+/// day, in the image: gone within 0.3 s of the first process alone being
+/// killed) and they keep their files in the user's home, not the profile.
+///
+/// One cost, by the rule and not by measurement: a terminal's Ctrl-C goes
+/// to its foreground group, which a Chrome in a group of its own is not in.
+/// A bot interrupted at a terminal in the middle of a render leaves that
+/// render's Chrome and profile behind. In the container nothing is typed,
+/// and what stops the bot stops the container.
 struct Chrome(tokio::process::Child);
 
 impl Chrome {
@@ -326,9 +345,9 @@ impl Drop for Chrome {
 /// with it on Debian's Chromium asks its maker for a dictionary on every
 /// start, since every start is a new profile's first: measured 2026-11-22
 /// on Chromium 156, the image's, `redirector.gvt1.com` was asked for
-/// `en-us-10-2.bdic` in each of nine starts without the setting and in none
-/// of six with it. `spellcheck.dictionaries` set to none was measured as
-/// well and changes nothing. (Google's own Chrome on a Mac spells with the
+/// `en-us-10-2.bdic` in 36 of 37 starts without the setting and in none of
+/// 32 with it. `spellcheck.dictionaries` set to none was measured as well
+/// and changes nothing. (Google's own Chrome on a Mac spells with the
 /// system and asks for no dictionary either way.) It is one of the things a
 /// Chrome asks for on its own account; `chrome_args` ends another, and the
 /// `live` tests have what is left.
@@ -350,8 +369,16 @@ const PREFERENCES: &str = r#"{"webrtc":{"ip_handling_policy":"disable_non_proxie
 /// ([`Chrome`]), and the drop goes on removing the directory until it has
 /// stayed away (`LOOK_AGAIN`), since a kill sent is not yet a process
 /// dead. Measured 2026-11-22 by `renders_cut_short_leave_no_chrome_and_no_profile`,
-/// 48 renders cut the same way on Chrome 157 and 48 on Debian's Chromium
-/// 156 in the image: none left a directory, and none a process.
+/// renders cut the same way: 96 on Chrome 157, 48 on Debian's Chromium 156
+/// in the image and 32 on the node, and none left a directory or a process.
+///
+/// That test holds the two together and neither alone: with either taken
+/// out and the other left, a real Chrome's renders still left nothing (80
+/// without the kill and 16 without the repeat, most of them the review's
+/// runs), and only with both out did a profile stay. What holds each by
+/// itself is a test with a stand-in:
+/// `a_render_cut_short_takes_all_of_its_chrome_…` for the kill,
+/// `a_profile_still_being_written_into_…` for the repeat.
 struct Profile(PathBuf);
 
 impl Profile {
@@ -422,7 +449,8 @@ impl Drop for Profile {
         // of whatever let go of the render.
         let _ = std::fs::remove_dir_all(&self.0);
         let path = std::mem::take(&mut self.0);
-        let _ = std::thread::Builder::new().name("scout-chrome-profile".into()).spawn(move || {
+        let left = path.clone();
+        let watching = std::thread::Builder::new().name("scout-chrome-profile".into()).spawn(move || {
             let (mut quiet, since) = (0, Instant::now());
             while quiet < GONE_FOR && since.elapsed() < GIVE_UP {
                 std::thread::sleep(LOOK_AGAIN);
@@ -436,6 +464,9 @@ impl Drop for Profile {
                 tracing::warn!(profile = %path.display(), "a render's profile is still being written into and was left behind");
             }
         });
+        if let Err(e) = watching {
+            tracing::warn!(profile = %left.display(), "a render's profile was removed once and not looked for again: {e}");
+        }
     }
 }
 
@@ -469,8 +500,8 @@ fn chrome_args(url: &str, profile: &Profile, proxy: u16) -> Vec<String> {
         "--webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
         // A Chrome asks its maker what time it is at every start, over the
         // proxy, which opens it: measured 2026-11-22, `clients2.google.com`
-        // in every start of Debian's Chromium 156 and of Chrome 157 without
-        // this and in none with it. Chrome keeps the last
+        // in every start without this, 31 of Debian's Chromium 156 and 13
+        // of Chrome 157, and in none with it, 39 and 17. Chrome keeps the last
         // `--disable-features` it is given, so anything else to be turned
         // off this way goes into this one, after a comma.
         "--disable-features=NetworkTimeServiceQuerying".into(),
@@ -749,15 +780,44 @@ mod tests {
         true
     }
 
-    /// Whether `base` is empty within two and a half seconds and is still
-    /// empty half a second later, in which the stand-in would have written
-    /// twenty times more.
+    /// Whether `base` is empty, looked at once the profile's own removing
+    /// has certainly ended. Sooner says nothing: for as long as the drop
+    /// goes on removing, up to `GIVE_UP`, a directory that a live writer
+    /// keeps putting back is away at most looks all the same (the first
+    /// version of this looked after half a second, and the tests that use
+    /// it passed two times in three with the group's kill taken out).
     #[cfg(unix)]
     async fn nothing_is_left_in(base: &std::path::Path) -> bool {
-        comes_true(Duration::from_millis(2500), || left_in(base).is_empty()).await && {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            left_in(base).is_empty()
-        }
+        tokio::time::sleep(GIVE_UP + Duration::from_millis(500)).await;
+        left_in(base).is_empty()
+    }
+
+    /// The command lines of the processes alive that were started on
+    /// `profile`: a Chrome and its helpers each carry the path, and so
+    /// does every process of the stand-in.
+    pub(super) fn alive_on(profile: &std::path::Path) -> Vec<String> {
+        let on = profile.display().to_string();
+        let lines: Vec<String> = match std::fs::read_dir("/proc") {
+            // Linux, with or without a `ps`.
+            Ok(processes) => processes
+                .flatten()
+                .filter_map(|process| std::fs::read(process.path().join("cmdline")).ok())
+                .map(|line| String::from_utf8_lossy(&line).replace('\0', " "))
+                .collect(),
+            Err(_) => {
+                let ps = std::process::Command::new("ps").args(["-axww", "-o", "command="]).output().expect("ps");
+                String::from_utf8_lossy(&ps.stdout).lines().map(str::to_string).collect()
+            }
+        };
+        lines.into_iter().filter(|line| line.contains(&on)).collect()
+    }
+
+    /// The one profile in `base`.
+    #[cfg(unix)]
+    fn the_profile_in(base: &std::path::Path) -> PathBuf {
+        let profiles: Vec<PathBuf> = std::fs::read_dir(base).unwrap().flatten().map(|entry| entry.path()).collect();
+        assert_eq!(profiles.len(), 1, "one render, one profile: {profiles:?}");
+        profiles[0].clone()
     }
 
     /// A renderer whose Chrome is the stand-in and whose profiles are made
@@ -791,8 +851,17 @@ mod tests {
         first.wait().await.unwrap();
         let then = written(base.path());
         let went_on = comes_true(Duration::from_secs(2), || written(base.path()) > then + 5).await;
+        // And it outlasts a removal, which is what a profile's drop does to
+        // it: the directory is put back, with more written into it.
+        // (A removal can itself lose to a file written in the middle of it.)
+        let removed = (0..50).any(|_| std::fs::remove_dir_all(&profile).is_ok());
+        let put_back = comes_true(Duration::from_secs(2), || written(base.path()) > 5).await;
+        let still_alive = alive_on(&profile).len();
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         assert!(went_on, "nothing more was written once the first process was dead");
+        assert!(removed, "the directory could not be removed from under the stand-in");
+        assert!(put_back, "the directory was not put back once it had been removed");
+        assert!(still_alive > 0, "no process of the stand-in was found by its profile");
     }
 
     #[cfg(unix)]
@@ -806,11 +875,20 @@ mod tests {
         let renderer = renderer_that_lingers(base.path());
         let render = tokio::spawn(async move { renderer.render_inner("http://shop.example/").await });
         assert!(comes_true(Duration::from_secs(5), || written(base.path()) > 0).await, "the stand-in wrote nothing");
+        let profile = the_profile_in(base.path());
+        assert!(!alive_on(&profile).is_empty(), "no process of the stand-in was found by its profile");
 
         // Dropped mid-read, as `render`'s timeout drops it.
         render.abort();
         assert!(render.await.unwrap_err().is_cancelled());
 
+        // The second process too, and at once: it has ten seconds of
+        // writing ahead of it if nothing kills it.
+        assert!(
+            comes_true(Duration::from_secs(1), || alive_on(&profile).is_empty()).await,
+            "still alive: {:?}",
+            alive_on(&profile)
+        );
         assert!(nothing_is_left_in(base.path()).await, "left behind: {:?}", left_in(base.path()));
     }
 
@@ -821,9 +899,31 @@ mod tests {
         // killed. Its other processes have as much to say about the profile
         // here as on the deadline's way out.
         let base = tempfile::tempdir().unwrap();
-        let html = renderer_that_lingers(base.path()).render_inner("http://shop.example/prints").await.unwrap();
+        let renderer = renderer_that_lingers(base.path());
+        let render = tokio::spawn(async move { renderer.render_inner("http://shop.example/prints").await });
+        assert!(comes_true(Duration::from_secs(5), || written(base.path()) > 0).await, "the stand-in wrote nothing");
+        let profile = the_profile_in(base.path());
+
+        let html = render.await.unwrap().unwrap();
         assert!(html.contains("printed"), "got: {html}");
+        assert!(
+            comes_true(Duration::from_secs(1), || alive_on(&profile).is_empty()).await,
+            "still alive: {:?}",
+            alive_on(&profile)
+        );
         assert!(nothing_is_left_in(base.path()).await, "left behind: {:?}", left_in(base.path()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chrome_is_given_nothing_of_ours_to_read() {
+        // In a group of its own a Chrome is no longer in the terminal's
+        // foreground, and one that read the terminal would be stopped for
+        // it. (Where the tests themselves are given nothing to read this
+        // passes whatever the render does.)
+        let base = tempfile::tempdir().unwrap();
+        let html = renderer_that_lingers(base.path()).render_inner("http://shop.example/prints").await.unwrap();
+        assert!(html.contains("reads nothing"), "got: {html}");
     }
 
     #[test]
@@ -912,6 +1012,7 @@ mod live {
     //! Chromium 156, with a private address and a link-local one beside
     //! loopback: told neither way, every listener was reached; told either
     //! way alone, or both, none was and no candidate was gathered.
+    use super::tests::alive_on;
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use tokio::net::UdpSocket;
@@ -1126,22 +1227,32 @@ WAIT
         }
     }
 
-    /// Which of `listeners` something was sent to during the render.
-    async fn those_reached(listeners: &[Listener]) -> Vec<String> {
-        let mut got = Vec::new();
+    /// Which of `listeners` something was sent to during the render, and
+    /// which nothing was.
+    async fn those_reached(listeners: &[Listener]) -> (Vec<String>, Vec<String>) {
+        let (mut got, mut missed) = (Vec::new(), Vec::new());
         for listener in listeners {
             if reached(&listener.socket).await {
                 got.push(listener.what.clone());
+            } else {
+                missed.push(listener.what.clone());
             }
         }
-        got
+        (got, missed)
+    }
+
+    /// What came of a page that aimed UDP at listeners: which it reached,
+    /// which it did not, and what the page wrote.
+    struct Udp {
+        reached: Vec<String>,
+        missed: Vec<String>,
+        said: String,
     }
 
     /// Renders a page that names a STUN and a TURN server on every address
     /// in [`aims`], and a STUN server at `localhost` on each loopback, which
-    /// only a resolver on this machine can turn into an address. Says which
-    /// of them a datagram reached and what the page wrote.
-    async fn udp_to_the_servers_a_page_names(without: Without) -> (Vec<String>, String) {
+    /// only a resolver on this machine can turn into an address.
+    async fn udp_to_the_servers_a_page_names(without: Without) -> Udp {
         let (mut listeners, mut stun, mut turn) = (Vec::new(), Vec::new(), Vec::new());
         for ip in aims() {
             let listener = Listener::on(ip, "as a STUN server").await;
@@ -1162,13 +1273,13 @@ WAIT
 
         let server = MockServer::start().await;
         let html = render_without(&server, &ICE_PAGE.replace("CONFIG", &config.to_string()), without).await;
-        (those_reached(&listeners).await, said(&html).to_string())
+        let (reached, missed) = those_reached(&listeners).await;
+        Udp { reached, missed, said: said(&html).to_string() }
     }
 
     /// Renders a page that tells one of its own connections its peer is at
-    /// each address in [`aims`]. Says which of them a check reached and
-    /// what the page wrote.
-    async fn udp_to_the_peers_a_page_names(without: Without) -> (Vec<String>, String) {
+    /// each address in [`aims`].
+    async fn udp_to_the_peers_a_page_names(without: Without) -> Udp {
         let mut listeners = Vec::new();
         for ip in aims() {
             listeners.push(Listener::on(ip, "as a peer").await);
@@ -1182,7 +1293,8 @@ WAIT
         let server = MockServer::start().await;
         let page = PEER_PAGE.replace("PEERS", &serde_json::Value::from(peers).to_string());
         let html = render_without(&server, &page, without).await;
-        (those_reached(&listeners).await, said(&html).to_string())
+        let (reached, missed) = those_reached(&listeners).await;
+        Udp { reached, missed, said: said(&html).to_string() }
     }
 
     /// What a page with no server named is handed for candidates.
@@ -1198,8 +1310,8 @@ WAIT
         // STUN or a TURN server has Chrome send it a datagram from a socket
         // of its own. Listeners nothing should reach, on loopback and on
         // the machine's other addresses.
-        let (got, said) = udp_to_the_servers_a_page_names(Without::Nothing).await;
-        assert!(got.is_empty(), "a datagram went round the proxy to {got:?}; the page said: {said}");
+        let Udp { reached, said, .. } = udp_to_the_servers_a_page_names(Without::Nothing).await;
+        assert!(reached.is_empty(), "a datagram went round the proxy to {reached:?}; the page said: {said}");
         // Silence only counts from a script that ran to its end.
         assert!(said.starts_with("ice:done "), "the page's script did not finish: {said}");
     }
@@ -1211,8 +1323,8 @@ WAIT
         // Chrome asking servers would leave it open: the page tells one of
         // its own connections that its peer is at addresses of the page's
         // choosing, and Chrome sends a check to each to see.
-        let (got, said) = udp_to_the_peers_a_page_names(Without::Nothing).await;
-        assert!(got.is_empty(), "a check went round the proxy to {got:?}; the page said: {said}");
+        let Udp { reached, said, .. } = udp_to_the_peers_a_page_names(Without::Nothing).await;
+        assert!(reached.is_empty(), "a check went round the proxy to {reached:?}; the page said: {said}");
         // The candidates were taken and the wait ran out, or nothing was tried.
         assert_eq!(said, format!("peer:done candidates={}", aims().len()));
     }
@@ -1233,20 +1345,19 @@ WAIT
         // What the three tests above are worth. Each says "nothing came",
         // which a Chrome with no WebRTC in it would say as well, and a
         // listener the page could never have reached. So the same pages on
-        // the same Chrome with both tellings taken out: every address the
-        // tests aim at has to be reached by both of a page's ways, and a
-        // page has to be handed candidates. If this fails on some Chrome,
-        // those tests say nothing about that Chrome.
-        let (servers, said) = udp_to_the_servers_a_page_names(Without::Both).await;
-        let (peers, _) = udp_to_the_peers_a_page_names(Without::Both).await;
+        // the same Chrome with both tellings taken out: every listener the
+        // tests aim at has to be reached, and a page has to be handed
+        // candidates. If this fails on some Chrome, those tests say nothing
+        // about that Chrome.
+        let servers = udp_to_the_servers_a_page_names(Without::Both).await;
+        let peers = udp_to_the_peers_a_page_names(Without::Both).await;
         let candidates = candidates_a_page_gathers(Without::Both).await;
-        println!("LIVE told nothing: servers reached {servers:?}; peers reached {peers:?}; candidates: {candidates}");
-        for ip in aims() {
-            let stun = format!("{ip} ({}) as a STUN server", kind(ip));
-            assert!(servers.contains(&stun), "nothing reached {stun}, shut or not; the page said: {said}");
-            let peer = format!("{ip} ({}) as a peer", kind(ip));
-            assert!(peers.contains(&peer), "nothing reached {peer}, shut or not");
-        }
+        println!(
+            "LIVE told nothing: servers reached {:?}; peers reached {:?}; candidates: {candidates}",
+            servers.reached, peers.reached
+        );
+        assert!(servers.missed.is_empty(), "nothing reached {:?}, shut or not; the page said: {}", servers.missed, servers.said);
+        assert!(peers.missed.is_empty(), "nothing reached {:?}, shut or not; the page said: {}", peers.missed, peers.said);
         assert!(!candidates.starts_with("ice:done state=complete candidates=0 "), "no candidate, shut or not: {candidates}");
     }
 
@@ -1257,11 +1368,11 @@ WAIT
         // in silence. That is only cover if each way holds without the
         // other on the Chrome that runs, so each is taken out in turn.
         for (left, without) in [("the switch", Without::Preference), ("the preference", Without::Switch)] {
-            let (servers, said) = udp_to_the_servers_a_page_names(without).await;
-            assert!(servers.is_empty(), "with {left} alone a datagram reached {servers:?}; the page said: {said}");
+            let Udp { reached, said, .. } = udp_to_the_servers_a_page_names(without).await;
+            assert!(reached.is_empty(), "with {left} alone a datagram reached {reached:?}; the page said: {said}");
             assert!(said.starts_with("ice:done "), "with {left} alone the page's script did not finish: {said}");
-            let (peers, said) = udp_to_the_peers_a_page_names(without).await;
-            assert!(peers.is_empty(), "with {left} alone a check reached {peers:?}; the page said: {said}");
+            let Udp { reached, said, .. } = udp_to_the_peers_a_page_names(without).await;
+            assert!(reached.is_empty(), "with {left} alone a check reached {reached:?}; the page said: {said}");
             let candidates = candidates_a_page_gathers(without).await;
             assert!(
                 candidates.starts_with("ice:done state=complete candidates=0 "),
@@ -1318,10 +1429,10 @@ WAIT
     ///   them through, each answers with a few kilobytes and nothing is
     ///   downloaded.
     /// - Google's Chrome 157, a laptop's: those two, and `www.google.com`,
-    ///   `www.gstatic.com` and `clientservices.googleapis.com`, of which
-    ///   `--disable-component-update` and `--disable-background-networking`
-    ///   do turn two off. The render does not pass them: on the Chromium
-    ///   that runs they change nothing.
+    ///   `www.gstatic.com` and `clientservices.googleapis.com`. There
+    ///   `--disable-component-update` does end the update check and
+    ///   `--disable-background-networking` the last of the five. The render
+    ///   passes neither: on the Chromium that runs they change nothing.
     ///
     /// Two switches do silence the first pair, by sending Chrome's sign-in
     /// and its updater to an address of the caller's choosing
@@ -1444,25 +1555,6 @@ WAIT
         assert!(new.is_empty(), "Chrome asked on its own account for {new:?}, beside {STILL_ASKED:?}");
     }
 
-    /// The command lines of the processes alive that were started on
-    /// `profile`: a Chrome and its helpers each carry the path.
-    fn alive_on(profile: &std::path::Path) -> Vec<String> {
-        let on = profile.display().to_string();
-        let lines: Vec<String> = match std::fs::read_dir("/proc") {
-            // Linux, with or without a `ps`.
-            Ok(processes) => processes
-                .flatten()
-                .filter_map(|process| std::fs::read(process.path().join("cmdline")).ok())
-                .map(|line| String::from_utf8_lossy(&line).replace('\0', " "))
-                .collect(),
-            Err(_) => {
-                let ps = std::process::Command::new("ps").args(["-axww", "-o", "command="]).output().expect("ps");
-                String::from_utf8_lossy(&ps.stdout).lines().map(str::to_string).collect()
-            }
-        };
-        lines.into_iter().filter(|line| line.contains(&on)).collect()
-    }
-
     #[tokio::test]
     #[ignore]
     async fn renders_cut_short_leave_no_chrome_and_no_profile() {
@@ -1485,7 +1577,7 @@ WAIT
         let chrome = find_chrome().expect("chrome");
 
         let mut left = Vec::new();
-        let mut helpers = 0;
+        let (mut helpers, mut soon) = (0, 0);
         for cut in 0..16u64 {
             let after = Duration::from_millis(200 + cut * 250);
             let renderer = Renderer {
@@ -1501,7 +1593,9 @@ WAIT
             render.abort();
             assert!(render.await.unwrap_err().is_cancelled(), "the render ended before it was cut, {after:?} in");
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            soon += alive_on(&profiles[0]).len();
+            tokio::time::sleep(Duration::from_millis(900)).await;
             let alive = alive_on(&profiles[0]);
             if !alive.is_empty() || profiles[0].exists() {
                 left.push(format!("cut {after:?} in: profile there: {}, alive: {alive:?}", profiles[0].exists()));
@@ -1509,7 +1603,11 @@ WAIT
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
         let back: Vec<PathBuf> = std::fs::read_dir(base.path()).unwrap().flatten().map(|entry| entry.path()).collect();
-        println!("LIVE cut 16 renders, {helpers} processes alive on their profiles when cut; left: {}, back: {}", left.len(), back.len());
+        println!(
+            "LIVE cut 16 renders, {helpers} processes alive on their profiles when cut, {soon} a tenth of a second after; left: {}, back: {}",
+            left.len(),
+            back.len()
+        );
         // A cut that found no process to kill would have shown nothing.
         assert!(helpers >= 16, "the renders had no Chrome alive when they were cut");
         assert!(left.is_empty(), "left behind: {left:#?}");
@@ -1519,11 +1617,28 @@ WAIT
     #[tokio::test]
     #[ignore]
     async fn renders_a_walled_page() {
+        // `SCOUT_PROBE_URL` is to be a page that a plain request is refused.
+        // What the plain request got is printed first, as `fetch_page`
+        // sends it: a render of a page that was never walled says nothing
+        // about walls, and it was first run that way (2026-11-22: a shop's
+        // front page, which a plain request read in full, while its product
+        // pages answered 403 and a challenge).
         let chrome = find_chrome().expect("chrome");
         let url = std::env::var("SCOUT_PROBE_URL").unwrap();
+        let mut plain = reqwest::Client::new().get(&url);
+        for (name, value) in crate::measure::request_headers() {
+            plain = plain.header(name, value);
+        }
+        let answer = plain.send().await.expect("the plain request");
+        let status = answer.status();
+        let body = answer.text().await.unwrap_or_default();
+        println!("LIVE plain status={} bytes={} challenge={}", status.as_u16(), body.len(), is_challenge_page(&body));
+        assert!(!status.is_success() || is_challenge_page(&body), "a plain request reads {url}: it is behind no wall");
+
         let html = Renderer::new(chrome).render(&url).await.unwrap();
         let page = crate::tools::fetch::extract_page_for_test(&html, &url);
-        println!("LIVE bytes={} challenge={} product={:?}", html.len(), is_challenge_page(&html), page);
+        println!("LIVE rendered bytes={} challenge={} product={:?}", html.len(), is_challenge_page(&html), page);
+        assert!(!is_challenge_page(&html), "the render came back as the challenge");
     }
 
     #[tokio::test]

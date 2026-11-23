@@ -761,6 +761,35 @@ mod tests {
 
     pub(crate) const TEST_KEY: &[u8] = b"a test session key of at least 32 bytes";
 
+    /// The Chrome the PDFs are printed with (`trip_pdf::chrome`, which
+    /// falls back to the usual places when `SCOUT_CHROME` names nothing),
+    /// for a test that lays a page out in it; `None`, said on stderr, when
+    /// this machine has none. What it does without one is scout-browser's
+    /// convention, word for word: `SCOUT_REQUIRE_CHROME` set to anything
+    /// makes a missing Chrome a failure instead, where a green run of tests
+    /// that did not run would be worse than a red one.
+    pub(crate) fn chrome_or_skip() -> Option<std::path::PathBuf> {
+        let required = std::env::var_os("SCOUT_REQUIRE_CHROME").is_some_and(|value| !value.is_empty());
+        found_or_skipped(crate::trip_pdf::chrome(), required)
+    }
+
+    fn found_or_skipped(found: Option<std::path::PathBuf>, required: bool) -> Option<std::path::PathBuf> {
+        if found.is_none() {
+            let thread = std::thread::current();
+            let test = thread.name().unwrap_or("a test");
+            assert!(!required, "{test}: SCOUT_REQUIRE_CHROME is set and there is no Chrome on this machine (set SCOUT_CHROME to one)");
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "SKIPPED, NOT RUN: {test}: no Chrome on this machine (set SCOUT_CHROME to one)");
+        }
+        found
+    }
+
+    #[test]
+    #[should_panic(expected = "SCOUT_REQUIRE_CHROME is set and there is no Chrome")]
+    fn a_test_that_requires_chrome_fails_without_one() {
+        found_or_skipped(None, true);
+    }
+
     /// The four themes the landing page and the chat page both carry, by
     /// the value `theme.js` writes to `data-theme`.
     pub(crate) const THEMES: [&str; 4] = ["solarized-dark", "solarized-light", "light", "black"];

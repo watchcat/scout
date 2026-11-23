@@ -2077,4 +2077,180 @@ mod tests {
         let res = post_json(&app, "/chat/trips/address", &cookie, Some(&csrf), r#"{"trip":"October","address":"ab"}"#).await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
+
+    /// Serves `app` on a local port as the account `cookie` signs in, so a
+    /// browser that holds no cookie gets the page, its scripts and its
+    /// trips exactly as the account would. The chat page gets one script
+    /// more, `trips-layout-probe.js`, which measures it. The probe only
+    /// reads. A write would reach the app and be refused there by
+    /// `only_from_our_own_pages`, since the browser's `Origin` is this
+    /// proxy's and not the app's.
+    async fn signed_in_site(app: axum::Router, cookie: String) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let site = listener.local_addr().unwrap();
+        let proxy = axum::Router::new()
+            .route(
+                "/trips-layout-probe.js",
+                axum::routing::get(|| async {
+                    ([(header::CONTENT_TYPE, "text/javascript")], include_str!("../trips-layout-probe.js"))
+                }),
+            )
+            .fallback(move |request: Request<Body>| {
+                let (app, cookie) = (app.clone(), cookie.clone());
+                async move {
+                    let (mut parts, body) = request.into_parts();
+                    let cookie = format!("{}={cookie}", crate::session::COOKIE);
+                    parts.headers.insert(header::COOKIE, cookie.parse().unwrap());
+                    let page = parts.uri.path() == "/chat";
+                    let res = app.oneshot(Request::from_parts(parts, body)).await.unwrap();
+                    if !page {
+                        return res;
+                    }
+                    let (mut parts, body) = res.into_parts();
+                    let html = String::from_utf8(axum::body::to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap();
+                    assert!(html.contains("</body>"), "the chat page has no end to add the probe at");
+                    let html = html.replacen("</body>", r#"<script src="/trips-layout-probe.js"></script></body>"#, 1);
+                    parts.headers.remove(header::CONTENT_LENGTH);
+                    Response::from_parts(parts, Body::from(html))
+                }
+            });
+        tokio::spawn(async move { axum::serve(listener, proxy).await.unwrap() });
+        site
+    }
+
+    /// What `trips-layout-probe.js` found on the Trips tab at `path` on
+    /// `site`, in a Chrome window `width` by `height`.
+    async fn laid_out(chrome: &std::path::Path, site: std::net::SocketAddr, path: &str, width: u32, height: u32) -> serde_json::Value {
+        use tokio::io::AsyncReadExt;
+        let profile = tempfile::tempdir().unwrap();
+        let mut chrome = tokio::process::Command::new(chrome)
+            .args(["--headless=new", "--disable-gpu", "--disable-extensions", "--disable-background-networking"])
+            .args(["--no-first-run", "--no-default-browser-check", "--virtual-time-budget=20000", "--dump-dom"])
+            // Two of the requests Chrome makes to its maker at every start:
+            // the time, and its components' updates. The renderer's own
+            // Chrome turns off the first the same way (`chrome_args`).
+            .args(["--disable-component-update", "--disable-features=NetworkTimeServiceQuerying"])
+            .arg(format!("--window-size={width},{height}"))
+            .arg(format!("--user-data-dir={}", profile.path().display()))
+            .arg(format!("http://{site}{path}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        // Read to the end of the document rather than to the end of Chrome:
+        // a Chrome can stay alive after printing it, which the renderer
+        // measured, and here that would be this test's timeout spent.
+        let mut out = chrome.stdout.take().unwrap();
+        let mut dom = Vec::new();
+        let read = async {
+            let mut chunk = [0u8; 65536];
+            loop {
+                let n = out.read(&mut chunk).await.unwrap();
+                dom.extend_from_slice(&chunk[..n]);
+                if n == 0 || dom.windows(7).any(|w| w == b"</html>") {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(90), read).await.expect("Chrome took over 90 s");
+        let _ = chrome.kill().await;
+        let dom = String::from_utf8_lossy(&dom);
+        let start = dom.find("data-layout=\"").unwrap_or_else(|| {
+            panic!("at {width}px the probe left no findings:\n{}", dom.chars().take(2000).collect::<String>())
+        }) + 13;
+        let end = start + dom[start..].find('"').unwrap();
+        let found = dom[start..end]
+            .replace("&quot;", "\"")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&nbsp;", "\u{a0}")
+            .replace("&amp;", "&");
+        serde_json::from_str(&found).unwrap()
+    }
+
+    /// A trip as a browser draws it: nothing on it is wider than its
+    /// column, nothing on it is cut off at the edge of what holds it, and
+    /// its free days have their card.
+    ///
+    /// Reported on 2026-11-23 from a 1385px window: the × that deletes a
+    /// trip was cut in half at the right edge, and so was the shadow of the
+    /// timeline card. The header's actions were `flex:none`, and a draft
+    /// its reader owns has five of them, 554px; beside them the title was
+    /// squeezed to its longest word and still left the row 23px wider than
+    /// the 729px column, which scrolls, and so cuts what passes its edge.
+    /// The card's shadow reached 32px sideways into a column that has 0px
+    /// of room on its left and 8px on its right. And at 721px each flight
+    /// card's ⋯ was cut by 21px, by a card that hides what passes its edge.
+    ///
+    /// Laid out in a real Chrome because what breaks is the layout: a rule
+    /// that reads right can still lay out wrong once the controls beside it
+    /// are counted. The trips are seeded the way the route test's own are,
+    /// and the page, its scripts and its trips are the app's.
+    #[tokio::test]
+    async fn nothing_on_a_trip_is_wider_than_the_column_it_is_shown_in() {
+        let Some(chrome) = chrome_or_skip() else { return };
+        let (app, core, _dir, account, cookie, csrf) = setup().await;
+        // The report's two: a draft, with all five controls beside a title
+        // whose longest word is wide, and a kept one, with three. And a
+        // title that is one word longer than any column.
+        let long = "Llanfairpwllgwyngyllgogerychwyrndrobwllllantysiliogogogoch";
+        for name in ["Amsterdam to Yerevan", "Mineralnye Vody / Russia", long] {
+            scout_core::trips::seed_trip_for_tests(&core, account, name).await.unwrap();
+        }
+        let keep = post_json(&app, "/chat/trips/keep", &cookie, Some(&csrf), r#"{"trip":"Mineralnye Vody / Russia"}"#).await;
+        assert_eq!(keep.status(), StatusCode::OK);
+        // A way home a week after the seeded leg out, with nothing planned
+        // between: the free days get a card of their own between the two.
+        let home = r#"{"trip":"Amsterdam to Yerevan","origin":"LIS","destination":"AMS","departure_date":"2026-10-19"}"#;
+        let added = post_json(&app, "/chat/trips/segment", &cookie, Some(&csrf), home).await;
+        assert_eq!(added.status(), StatusCode::OK);
+        let site = signed_in_site(app, cookie).await;
+
+        // The report's window, two narrower desktops, the last width before
+        // the phone layout takes over at 720px, and the phone layout at the
+        // narrowest window headless Chrome will open, 500px. Then the same
+        // page as Telegram is served it (`?in=telegram`), which hides the
+        // page's own header.
+        let mut problems = Vec::new();
+        let windows = [
+            ("/chat", 1385, 900), ("/chat", 1100, 800), ("/chat", 900, 800), ("/chat", 721, 800), ("/chat", 500, 844),
+            ("/chat?in=telegram", 900, 800), ("/chat?in=telegram", 500, 844),
+        ];
+        for (path, width, height) in windows {
+            let at = format!("{path} at {width}px");
+            let found = laid_out(&chrome, site, path, width, height).await;
+            assert_eq!(found["width"], width, "the window was not the width asked for: {found}");
+            assert!(found.get("error").is_none(), "{at}: {found}");
+            let trips = found["trips"].as_array().unwrap();
+            let names: Vec<_> = trips.iter().map(|trip| trip["name"].as_str().unwrap()).collect();
+            for name in ["Amsterdam to Yerevan", "Mineralnye Vody / Russia", long, "October"] {
+                assert!(names.contains(&name), "{at}: {name} was not measured: {found}");
+            }
+            for trip in trips {
+                // The days by their `<time>`, which says them the same way
+                // in every language; the sentence around them is the page's.
+                let free = trip["free"].as_array().unwrap();
+                if trip["name"] == "Amsterdam to Yerevan" {
+                    assert_eq!(free.len(), 1, "{at}: {free:?}");
+                    assert_eq!(free[0]["days"], serde_json::json!(["2026-10-13", "2026-10-18"]), "{at}");
+                    let text = free[0]["text"].as_str().unwrap();
+                    assert!(text.starts_with("No plans yet for 6 days from "), "{at}: {text}");
+                } else {
+                    assert!(free.is_empty(), "{at}: {} has a card for a day free of nothing: {free:?}", trip["name"]);
+                }
+                for problem in trip["problems"].as_array().unwrap() {
+                    problems.push(format!("{at}, {}: {}", trip["name"], problem.as_str().unwrap()));
+                }
+                // And the title is not squeezed to its longest word to make
+                // room for the controls: 18rem, or the column if it is less.
+                let (title, column) = (trip["title"].as_f64().unwrap(), trip["column"].as_f64().unwrap());
+                if title + 0.5 < column.min(288.0) {
+                    problems.push(format!("{at}, {}: the title has {title}px of a {column}px column", trip["name"]));
+                }
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
 }

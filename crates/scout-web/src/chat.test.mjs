@@ -12,7 +12,7 @@ import {
   localToday, todayInTrip, todayPositions, composeLabel,
   moveBody, warningBody, tripDays, dayChipDraggable, shouldPollChecks,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
-  pendingRowsFor, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
+  pendingRowsFor, freeRuns, freeDaysLine, freeDaysParts, stackRows, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody, handOverQuestion, handOverRefusal, tripAddressProblem, bookingAddress,
   ITINERARY_NOTE,
   CONFIRM_ARM_MS,
@@ -1235,4 +1235,132 @@ test('a trip address is checked by the server\'s rules as it is typed', () => {
   assert.equal(tripAddressProblem('-lisbon'), 'an address cannot start or end with a dot or a dash')
   assert.equal(tripAddressProblem('lisbon.'), 'an address cannot start or end with a dot or a dash')
   assert.equal(tripAddressProblem('Admin'), 'that one is reserved')
+})
+
+// The trip of the report: in Yerevan from a 04:30 landing on the 29th to a
+// flight home on the 4th, with nothing in between.
+const yerevan = { name: 'Amsterdam to Yerevan', items: [
+  { position: 1, kind: 'flight', origin: 'AMS', destination: 'EVN', date: '2027-04-28', candidates: [
+    { candidate: 1, chosen: true, departing_at_local: '2027-04-28T21:40:00', arriving_at_local: '2027-04-29T04:30:00' },
+  ] },
+  { position: 2, kind: 'flight', origin: 'EVN', destination: 'AMS', date: '2027-05-04', candidates: [] },
+] }
+
+test('the free days are the ones the overview counts, first to last', () => {
+  // Four, as the overview's "4 free days" says: the landing puts the 29th
+  // on the trip, so the run is the 30th to the 3rd.
+  assert.deepEqual(freeRuns(yerevan), [{ from: '2027-04-30', to: '2027-05-03', days: 4 }])
+  const run = tripDayRows(yerevan).find((row) => row.kind === 'free')
+  assert.equal(run.days, freeRuns(yerevan)[0].days, 'the card and the overview count the same days')
+
+  // One empty day is a run too, as it is a row of its own in the overview.
+  const one = { items: [
+    { position: 1, kind: 'flight', origin: 'AMS', destination: 'LIS', date: '2026-10-12', candidates: [] },
+    { position: 2, kind: 'flight', origin: 'LIS', destination: 'AMS', date: '2026-10-14', candidates: [] },
+  ] }
+  assert.deepEqual(freeRuns(one), [{ from: '2026-10-13', to: '2026-10-13', days: 1 }])
+
+  // Days in a hotel with nothing else on them are free days to the
+  // overview, so they are here.
+  const stay = { items: [
+    { position: 1, kind: 'stay', title: 'Hotel Alfama', date: '2026-10-12', ends_at: '2026-10-16T11:00:00' },
+  ] }
+  assert.deepEqual(freeRuns(stay), [{ from: '2026-10-13', to: '2026-10-15', days: 3 }])
+
+  const back_to_back = { items: [
+    { position: 1, kind: 'flight', origin: 'AMS', destination: 'LIS', date: '2026-10-12', candidates: [] },
+    { position: 2, kind: 'flight', origin: 'LIS', destination: 'AMS', date: '2026-10-13', candidates: [] },
+  ] }
+  assert.deepEqual(freeRuns(back_to_back), [])
+  assert.deepEqual(freeRuns({ items: [] }), [])
+})
+
+test('a free run says how long it is and which days', () => {
+  assert.equal(freeDaysLine({ from: '2027-04-30', to: '2027-05-03', days: 4 }, 'en-US'),
+    'No plans yet for 4 days from Fri, Apr 30 to Mon, May 3')
+  assert.equal(freeDaysLine({ from: '2026-10-13', to: '2026-10-13', days: 1 }, 'en-US'),
+    'No plans yet for Tue, Oct 13')
+  // The days as the page draws them: a `<time>` each, its date beside its
+  // label, so what the card names does not hang on the reader's language.
+  assert.deepEqual(freeDaysParts({ from: '2027-04-30', to: '2027-05-03', days: 4 }, 'en-US'), [
+    'No plans yet for 4 days from ', { date: '2027-04-30', label: 'Fri, Apr 30' },
+    ' to ', { date: '2027-05-03', label: 'Mon, May 3' },
+  ])
+})
+
+test('a free run sits in the trip where it falls', () => {
+  // Between the leg that lands before it and the one that leaves after.
+  const rows = stackRows(yerevan, [])
+  assert.deepEqual(rows.map((row) => row.kind === 'item' ? row.item.position : row.kind), [1, 'free', 2])
+  assert.deepEqual(rows[1].run, { from: '2027-04-30', to: '2027-05-03', days: 4 })
+
+  // A booking still waiting in the mail for one of those days is not a
+  // plan yet; it comes after the card that opens the run.
+  const waiting = { id: 3, trip_name: 'Amsterdam to Yerevan', kind: 'stay', title: 'Hotel', date: '2027-05-01', status: 'pending', booking: true }
+  assert.deepEqual(stackRows(yerevan, [waiting]).map((row) => row.kind === 'item' ? row.item.position : row.kind),
+    [1, 'free', 'pending', 2])
+
+  // And a trip with no free day is exactly its items and its mail.
+  const plain = { name: 'Lisbon', items: [{ position: 1, kind: 'flight', date: '2026-10-12', candidates: [] }] }
+  assert.deepEqual(stackRows(plain, []), pendingRowsFor(plain, []))
+})
+
+test('a free run with nothing after it still gets its card, at the end', () => {
+  // A week in a hotel and no way home yet: the stay is dated the day it
+  // starts, so no row is dated after its nights, and the overview counts
+  // them all the same.
+  const stay = { name: 'Lisbon', items: [
+    { position: 1, kind: 'flight', origin: 'AMS', destination: 'LIS', date: '2026-10-12', candidates: [] },
+    { position: 2, kind: 'stay', title: 'Hotel Alfama', date: '2026-10-12', ends_at: '2026-10-19T11:00:00' },
+  ] }
+  const rows = stackRows(stay, [])
+  assert.deepEqual(rows.map((row) => row.kind === 'item' ? row.item.position : row.kind), [1, 2, 'free'])
+  assert.deepEqual(rows[2].run, { from: '2026-10-13', to: '2026-10-18', days: 6 })
+})
+
+test('a free card is for days away and on the ground', () => {
+  // An eSIM bought a week before the flight out: the overview counts the
+  // days between, and they are spent at home, so they get no card.
+  const esim = { name: 'Yerevan', items: [
+    { position: 1, kind: 'activity', title: 'eSIM', date: '2027-04-20' },
+    ...yerevan.items.map((item) => ({ ...item, position: item.position + 1 })),
+  ] }
+  assert.equal(freeRuns(esim).length, 2, 'the overview counts both')
+  assert.deepEqual(stackRows(esim, []).map((row) => row.kind === 'item' ? row.item.position : row.kind), [1, 2, 'free', 3])
+  assert.equal(stackRows(esim, [])[2].run.from, '2027-04-30')
+
+  // And a day spent on a flight that lands two days after it leaves.
+  const sydney = { name: 'Sydney', items: [
+    { position: 1, kind: 'flight', origin: 'LAX', destination: 'SYD', date: '2026-10-12', candidates: [
+      { candidate: 1, chosen: true, departing_at_local: '2026-10-12T22:30:00', arriving_at_local: '2026-10-14T08:15:00' },
+    ] },
+    { position: 2, kind: 'flight', origin: 'SYD', destination: 'LAX', date: '2026-10-20', candidates: [] },
+  ] }
+  assert.deepEqual(freeRuns(sydney).map((run) => run.from), ['2026-10-13', '2026-10-15'])
+  assert.deepEqual(stackRows(sydney, []).filter((row) => row.kind === 'free').map((row) => row.run),
+    [{ from: '2026-10-15', to: '2026-10-19', days: 5 }])
+
+  // A train is travel as much as a flight: the days between the hotel's
+  // last night and the train home are away, with no bed booked.
+  const train = { name: 'Lyon', items: [
+    { position: 1, kind: 'flight', origin: 'AMS', destination: 'LYS', date: '2026-10-12', candidates: [] },
+    { position: 2, kind: 'stay', title: 'Hotel', date: '2026-10-12', ends_at: '2026-10-15T11:00:00' },
+    { position: 3, kind: 'transport', title: 'Train home', date: '2026-10-18' },
+  ] }
+  assert.deepEqual(stackRows(train, []).filter((row) => row.kind === 'free').map((row) => row.run.from), ['2026-10-13', '2026-10-16'])
+  // And the days on a sleeper or a ferry that arrives two days later are
+  // spent on it.
+  const ferry = { name: 'Islands', items: [
+    { position: 1, kind: 'transport', title: 'Ferry', date: '2026-10-10', ends_at: '2026-10-12T07:00:00' },
+    { position: 2, kind: 'stay', title: 'Hotel', date: '2026-10-12', ends_at: '2026-10-16T11:00:00' },
+  ] }
+  assert.deepEqual(stackRows(ferry, []).filter((row) => row.kind === 'free').map((row) => row.run.from), ['2026-10-13'])
+
+  // A trip with no flight, stay or transport has no way to say where away
+  // begins, so every run on it is kept.
+  const walks = { name: 'Walks', items: [
+    { position: 1, kind: 'activity', title: 'Walk', date: '2026-10-12' },
+    { position: 2, kind: 'activity', title: 'Walk', date: '2026-10-15' },
+  ] }
+  assert.equal(stackRows(walks, []).filter((row) => row.kind === 'free').length, 1)
 })

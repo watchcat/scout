@@ -285,7 +285,7 @@ fn validate_plan(plan: &Plan) -> Result<(), Error> {
     Ok(())
 }
 
-fn chrome() -> Option<PathBuf> {
+pub(crate) fn chrome() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SCOUT_CHROME") {
         let path = PathBuf::from(path);
         if path.exists() {

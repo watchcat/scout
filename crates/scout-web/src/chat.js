@@ -788,9 +788,11 @@ export function codeParts(text, known) {
 
 // Whether a finger that went down at `point` was on `rect`, or near
 // enough that the click the browser sends after it, moved onto what it
-// took the finger to mean, is its click: a phone moves a near miss's
-// click onto the nearest thing that answers clicks, and leaves its
-// pointerdown where the finger was. `reach` in the window's pixels.
+// took the finger to mean, is its click: an iPhone moves a near miss's
+// click onto the nearest thing that answers clicks, where nothing under
+// the finger does, and leaves its pointerdown where the finger was.
+// (Chrome moves the pointerdown with the click, which is then on the
+// code.) `reach` in the window's pixels.
 export function fingerReaches(point, rect, reach) {
   return point.x >= rect.left - reach && point.x <= rect.right + reach &&
     point.y >= rect.top - reach && point.y <= rect.bottom + reach
@@ -1988,8 +1990,12 @@ function start() {
     closedFor = tipFor
     hideCodeTip()
   }, true)
-  // A finger that went on to scroll made no tap.
+  // A finger that went on to scroll made no tap, and one whose click went
+  // to something else is done: left to stand, it would make a later click
+  // that no finger made, on a code within reach of where it was, a tap.
+  // On the way back up, so a code's own listener has read it first.
   document.addEventListener('pointercancel', () => { touched = null }, true)
+  document.addEventListener('click', () => { touched = null })
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') hideCodeTip()
   })

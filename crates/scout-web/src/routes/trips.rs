@@ -2268,8 +2268,8 @@ mod tests {
             // it, inside the window, as an iPhone taps and as an Android
             // phone does; a click that is no tap (a mouse's, a pen's, one
             // no finger made) does what it did. Every check run: 30 for
-            // each phone, 5 for the clicks.
-            for (way, checks) in [("iphone", 30), ("android", 30), ("clicks", 5)] {
+            // each phone, 6 for the clicks.
+            for (way, checks) in [("iphone", 30), ("android", 30), ("clicks", 6)] {
                 let taps = &found["taps"][way];
                 for problem in taps["problems"].as_array().unwrap() {
                     problems.push(format!("{at}, {way}: {}", problem.as_str().unwrap()));

@@ -230,7 +230,8 @@ async function taps(phone) {
 // Clicks that are no tap, on a code in a flight option, choose the flight
 // as a click anywhere on the option does: a mouse's, a pen's, and one no
 // finger made, as a screen reader's is, whether a finger tapped that code
-// before it or went down on it and went on to scroll. Last, because each
+// before it, tapped just beside it, or went down on it and went on to
+// scroll. Last, because each
 // sends the choice; the app refuses it (`signed_in_site`; a 400 in every
 // window, measured), and nothing is measured after it.
 async function clicksOnAnOption() {
@@ -260,6 +261,20 @@ async function clicksOnAnOption() {
     tap(el, 'iphone')
     bare(el)
   })
+  // A finger 6px above the code, on the option's time: its click goes to
+  // the option, which chooses the flight, and is waited out first.
+  {
+    const rect = optionCode().getBoundingClientRect()
+    const x = rect.left + rect.width / 2
+    const y = rect.top - 6
+    const under = document.elementFromPoint(x, y) ?? document.body
+    const at = (pointerType) => ({ bubbles: true, cancelable: true, composed: true, isPrimary: true, pointerType, clientX: x, clientY: y })
+    under.dispatchEvent(new PointerEvent('pointerdown', at('touch')))
+    under.dispatchEvent(new PointerEvent('pointerup', at('touch')))
+    under.dispatchEvent(new PointerEvent('click', at('mouse')))
+    await until(() => !document.getElementById('trip-detail').hasAttribute('aria-busy'))
+  }
+  await chooses('a click no finger made, after a finger tapped 6px above it', bare)
   await chooses('a click no finger made, after a finger went down on it and scrolled', (el) => {
     const rect = el.getBoundingClientRect()
     const at = { bubbles: true, pointerType: 'touch', clientX: rect.left + 2, clientY: rect.top + 2 }

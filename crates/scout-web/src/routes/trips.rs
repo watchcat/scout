@@ -2171,8 +2171,9 @@ mod tests {
     }
 
     /// A trip as a browser draws it: nothing on it is wider than its
-    /// column, nothing on it is cut off at the edge of what holds it, and
-    /// its free days have their card.
+    /// column, nothing on it is cut off at the edge of what holds it, its
+    /// free days have their card, and its airport codes say which airports
+    /// they are.
     ///
     /// Reported on 2026-11-23 from a 1385px window: the × that deletes a
     /// trip was cut in half at the right edge, and so was the shadow of the
@@ -2199,6 +2200,9 @@ mod tests {
         for name in ["Amsterdam to Yerevan", "Mineralnye Vody / Russia", long] {
             scout_core::trips::seed_trip_for_tests(&core, account, name).await.unwrap();
         }
+        // Something still to book whose name is three capitals the airport
+        // table also knows: Lanzarote's airport is ACE, and a hotel is not.
+        scout_core::trips::seed_item_for_tests(&core, account, "October", "stay", "ACE Hotel", "2026-10-13").await.unwrap();
         let keep = post_json(&app, "/chat/trips/keep", &cookie, Some(&csrf), r#"{"trip":"Mineralnye Vody / Russia"}"#).await;
         assert_eq!(keep.status(), StatusCode::OK);
         // A way home a week after the seeded leg out, with nothing planned
@@ -2223,6 +2227,7 @@ mod tests {
             let found = laid_out(&chrome, site, path, width, height).await;
             assert_eq!(found["width"], width, "the window was not the width asked for: {found}");
             assert!(found.get("error").is_none(), "{at}: {found}");
+            assert!(found.get("airportsNeverNamed").is_none(), "{at}: no code on the page was ever named");
             let trips = found["trips"].as_array().unwrap();
             let names: Vec<_> = trips.iter().map(|trip| trip["name"].as_str().unwrap()).collect();
             for name in ["Amsterdam to Yerevan", "Mineralnye Vody / Russia", long, "October"] {
@@ -2240,6 +2245,15 @@ mod tests {
                 } else {
                     assert!(free.is_empty(), "{at}: {} has a card for a day free of nothing: {free:?}", trip["name"]);
                 }
+                // Every code drawn names its airport on hover: the seeded
+                // legs are AMS → LIS and back.
+                let airports = &trip["airports"];
+                for (code, name) in [("AMS", "Amsterdam Airport Schiphol"), ("LIS", "Lisbon Humberto Delgado Airport")] {
+                    let title = airports[code].as_str().unwrap_or_default();
+                    assert!(title.starts_with(name), "{at}: {} shows {code} as {title:?}: {airports}", trip["name"]);
+                }
+                assert_eq!(trip["bare"], serde_json::json!([]), "{at}: {} shows codes without their names", trip["name"]);
+                assert!(airports.get("ACE").is_none(), "{at}: {} names the hotel ACE as an airport: {airports}", trip["name"]);
                 for problem in trip["problems"].as_array().unwrap() {
                     problems.push(format!("{at}, {}: {}", trip["name"], problem.as_str().unwrap()));
                 }

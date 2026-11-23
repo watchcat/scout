@@ -472,7 +472,11 @@ export function readinessAlert(trip, address = null) {
   // The address, for the page to make copyable, only where the text
   // names it.
   const alert = readinessAlertText(readiness, booking, trip)
-  return alert && booking && address ? { ...alert, address } : alert
+  if (!alert) return alert
+  // The sentence of what is still to book, apart, for the page to keep its
+  // titles as they are: a hotel called "ACE" is no airport in Lanzarote.
+  const told = booking && alert.text.endsWith(booking) ? { ...alert, booking } : alert
+  return booking && address ? { ...told, address } : told
 }
 
 function readinessAlertText(readiness, booking, trip) {
@@ -741,6 +745,45 @@ export function tripRoute(trip) {
     codes.push(flight.destination)
   }
   return codes.join(' → ')
+}
+
+// What an airport's code says to someone who does not know it, as the
+// pointer resting on the code shows it: "VIE" is "Vienna International
+// Airport · Austria". `entry` is a row of `airports.json`, [name, city,
+// country]; its city is empty where the name already says it, and the
+// country is named in the reader's language.
+const countryNames = new Map()
+export function airportTitle(entry, locale = undefined) {
+  const [name, city, country] = entry
+  let where = country
+  try {
+    if (!countryNames.has(locale)) {
+      countryNames.set(locale, new Intl.DisplayNames(locale === undefined ? undefined : [locale], { type: 'region' }))
+    }
+    where = countryNames.get(locale).of(country) ?? country
+  } catch {
+    // A country code the browser cannot name is still worth printing.
+  }
+  const place = [city, where].filter(Boolean).join(', ')
+  return place ? `${name} · ${place}` : name
+}
+
+// A line of text split around the airport codes in it: three capital
+// letters standing alone that `known` names. Not a flight number's
+// letters ("TO7501"), not a word that happens to be three capitals and is
+// no code the table has.
+export function codeParts(text, known) {
+  const line = String(text ?? '')
+  const parts = []
+  let at = 0
+  for (const match of line.matchAll(/\b[A-Z]{3}\b/g)) {
+    if (!known(match[0])) continue
+    if (match.index > at) parts.push(line.slice(at, match.index))
+    parts.push({ code: match[0] })
+    at = match.index + 3
+  }
+  if (at < line.length) parts.push(line.slice(at))
+  return parts
 }
 
 export function tripLoadIsCurrent(request, current, choicePending) {
@@ -1768,6 +1811,7 @@ function start() {
     tripsTab.setAttribute('aria-pressed', String(showingTrips))
     menuButton.hidden = showingTrips
     if (mirrorButton) mirrorButton.hidden = showingTrips
+    if (showingTrips) loadAirports()
     if (showingTrips && !tripsLoaded) loadTrips().catch(() => {})
     // The trips were painted while this tab was hidden; now it can be seen.
     if (showingTrips) openOnToday(trips.find((trip) => trip.name === currentTrip))
@@ -1775,6 +1819,58 @@ function start() {
     // changes what the line above the composer should say — a load
     // already in flight will say it again once `renderTripDetail` runs.
     updateComposeTarget()
+  }
+
+  // The airport names, from `/airports.json`, the first time Trips is
+  // shown (`switchView`): 226 KB for four thousand airports, which the chat
+  // never needs and the background load of the trips' count does not ask
+  // for. Until it has arrived the codes are drawn bare, and when it does
+  // every element drawn from codes so far gets its names.
+  let airports = null
+  let airportsAsked = false
+  function loadAirports() {
+    if (airportsAsked) return
+    airportsAsked = true
+    fetch('/airports.json')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((table) => {
+        if (!table?.airports) return
+        airports = new Map(Object.entries(table.airports))
+        for (const el of document.querySelectorAll('[data-codes]')) nameCodes(el)
+      })
+      .catch(() => {})
+  }
+
+  // Marks an element whose text is built from airport codes, so each code
+  // the table knows says what it is to a pointer resting on it: an
+  // `<abbr>` with the airport's name as its title, which a browser shows
+  // on hover. Nothing shows on a touch screen, a phone in Telegram
+  // included, where there is no hover. Only marked elements, never the
+  // trip's free text: "THE" in a hotel's name is no airport, though it is
+  // one in Teresina.
+  function withCodes(el) {
+    el.dataset.codes = ''
+    nameCodes(el)
+    return el
+  }
+
+  function nameCodes(el) {
+    if (!airports) return
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+    const texts = []
+    while (walker.nextNode()) {
+      if (!walker.currentNode.parentElement?.closest('abbr')) texts.push(walker.currentNode)
+    }
+    for (const text of texts) {
+      const parts = codeParts(text.data, (code) => airports.has(code))
+      if (!parts.some((part) => typeof part !== 'string')) continue
+      text.replaceWith(...parts.map((part) => {
+        if (typeof part === 'string') return part
+        const abbr = node('abbr', 'airport', part.code)
+        abbr.title = airportTitle(airports.get(part.code))
+        return abbr
+      }))
+    }
   }
 
   async function loadTrips() {
@@ -1853,7 +1949,7 @@ function start() {
       button.setAttribute('aria-current', String(trip.name === currentTrip))
       button.append(
         node('span', 'trip-list-name', trip.name),
-        node('span', 'trip-list-route', tripRoute(trip)),
+        withCodes(node('span', 'trip-list-route', tripRoute(trip))),
       )
       // Drafts were hidden here for a day and it read as the feature not
       // working — see `scout_core::trips::list`. Shown again, but marked:
@@ -1912,7 +2008,7 @@ function start() {
         const item = node('div', point.gap ? 'trip-point gap' : 'trip-point')
         item.append(
           node('span', 'point-dot'),
-          node('span', 'point-code', point.code),
+          withCodes(node('span', 'point-code', point.code)),
           node('span', 'point-date', point.date ? dateLabel(point.date, true) : ''),
         )
         timeline.append(item)
@@ -1985,6 +2081,8 @@ function start() {
         ? ' · check out'
         : ''
     chip.textContent = `${time}${entry.text}${tail}`
+    // Its text is a route or a landing only for these; an item's is its title.
+    if (entry.type === 'flight' || entry.type === 'arrival') withCodes(chip)
     if (entry.warn) {
       chip.classList.add('warn')
       // The "!" is drawn by the stylesheet; this is the same thing said
@@ -2049,17 +2147,17 @@ function start() {
 
     const line = node('span', 'flight-line')
     const depart = node('span', 'flight-time')
-    depart.append(node('strong', '', clockLabel(candidate.departing_at_local)), node('span', '', segment.origin))
+    depart.append(node('strong', '', clockLabel(candidate.departing_at_local)), withCodes(node('span', '', segment.origin)))
     const track = node('span', 'flight-track')
     const stops = stopLabel(candidate)
     const meta = node('span', 'flight-meta')
     meta.append(
       node('span', '', durationLabel(candidate.duration_minutes)),
-      node('span', stops.direct ? 'stop-pill direct' : 'stop-pill', stops.text),
+      withCodes(node('span', stops.direct ? 'stop-pill direct' : 'stop-pill', stops.text)),
     )
     track.append(node('span', 'track-rule'), meta)
     const arrive = node('span', 'flight-time')
-    arrive.append(node('strong', '', clockLabel(candidate.arriving_at_local)), node('span', '', segment.destination))
+    arrive.append(node('strong', '', clockLabel(candidate.arriving_at_local)), withCodes(node('span', '', segment.destination)))
     line.append(depart, track, arrive)
     main.append(top, line)
 
@@ -2413,6 +2511,7 @@ function start() {
       node('span', 'route-arrow', '→'),
       document.createTextNode(segment.destination),
     )
+    withCodes(route.lastChild)
     // The same mark a stay or an activity carries, for the same reason: a
     // leg bought by forwarding a confirmation has a code on it, and the
     // card said nothing about either.
@@ -2467,7 +2566,7 @@ function start() {
     const head = node('div', 'trip-head')
     const title = node('div')
     title.append(
-      node('p', 'eyebrow', tripRoute(trip)),
+      withCodes(node('p', 'eyebrow', tripRoute(trip))),
       node('h2', 'trip-title', trip.name),
       node('p', 'trip-subtitle', `${trip.adults} ${trip.adults === 1 ? 'traveller' : 'travellers'} · ${trip.cabin_class ?? 'Cabin not set'}`),
     )
@@ -2529,25 +2628,30 @@ function start() {
     if (alert) {
       const readiness = node('div', alert.tone === 'ready' ? 'trip-alert ready' : 'trip-alert')
       readiness.append(node('strong', '', alert.headline))
-      if (alert.address) {
+      // What is said of the legs, with their codes named, and then what is
+      // still to book, by its titles, which are left as they were written.
+      const booking = alert.booking ?? ''
+      const legs = alert.text.slice(0, alert.text.length - booking.length)
+      if (legs) readiness.append(withCodes(node('span', '', ` ${legs}`)))
+      if (booking && alert.address) {
         // The sentence with the address set as a thing to copy: the text
         // before it, the address in a code, the text after, then Copy.
-        const [before, after] = alert.text.split(alert.address)
-        readiness.append(document.createTextNode(` ${before}`), node('code', '', alert.address), document.createTextNode(after ?? ''))
+        const [before, after] = booking.split(alert.address)
+        readiness.append(document.createTextNode(legs ? before : ` ${before}`), node('code', '', alert.address), document.createTextNode(after ?? ''))
         const copy = node('button', 'alert-copy', 'Copy')
         copy.type = 'button'
         copy.setAttribute('aria-label', `Copy ${alert.address}`)
         copy.addEventListener('click', () => copyAddress(alert.address))
         readiness.append(copy)
-      } else {
-        readiness.append(document.createTextNode(` ${alert.text}`))
+      } else if (booking) {
+        readiness.append(document.createTextNode(legs ? booking : ` ${booking}`))
       }
       tripDetail.append(readiness)
     }
     for (const note of trip.notes ?? []) {
       const alert = node('div', 'trip-alert')
       alert.append(node('strong', '', ITINERARY_NOTE), document.createTextNode(` ${note}`))
-      tripDetail.append(alert)
+      tripDetail.append(withCodes(alert))
     }
 
     // Items and the mail waiting to become one, in one timeline — see
@@ -2591,7 +2695,7 @@ function start() {
       const nextIndex = rest.findIndex((later) => later.kind === 'flight')
       if (nextIndex >= 0) {
         const check = connectionCheck(item, rest[nextIndex], { itemBetween: nextIndex > 0 })
-        if (check) stack.append(node('div', `join-card ${check.tone}`, check.text))
+        if (check) stack.append(withCodes(node('div', `join-card ${check.tone}`, check.text)))
       }
     }
     tripDetail.append(stack)
@@ -2612,7 +2716,7 @@ function start() {
     const flight = arrival.kind === 'flight' && arrival.origin && arrival.destination
     about.append(
       node('p', 'segment-kicker', `Arrived · ${arrival.kind ? kindLabel(arrival) : 'Booking'}`),
-      node('h3', 'item-title', flight ? `${arrival.origin} → ${arrival.destination}` : arrival.title || arrival.summary || 'Booking'),
+      flight ? withCodes(node('h3', 'item-title', `${arrival.origin} → ${arrival.destination}`)) : node('h3', 'item-title', arrival.title || arrival.summary || 'Booking'),
     )
     if (arrival.place) about.append(node('p', 'item-place', arrival.place))
     const facts = []

@@ -5,7 +5,8 @@
 // see cut, and leaves the findings on the root element as `data-layout`:
 // for each trip, anything wider than the column or cut by the box that
 // clips it, every outer shadow that reaches past that box, the title's
-// width beside the column's, and what its free-day cards say.
+// width beside the column's, what its free-day cards say, and the names
+// its airport codes show.
 //
 // Served as a file of its own because the page's policy runs no inline
 // script, and a plain one, so it is running before the page's module is.
@@ -20,6 +21,11 @@ addEventListener('load', async () => {
   document.getElementById('view-trips').click()
   if (!(await until(() => document.querySelector('#trip-detail .trip-head')))) {
     report.error = 'no trip was shown'
+  }
+  // The airport names arrive on a request of their own, once: waited for
+  // here, so a trip that draws no code is not waited on for one.
+  if (!(await until(() => document.querySelector('abbr.airport')))) {
+    report.airportsNeverNamed = true
   }
   for (const button of document.querySelectorAll('.trip-list button')) {
     const name = button.querySelector('.trip-list-name')?.textContent
@@ -108,6 +114,18 @@ function measure(name) {
     }
   }
 
+  // Each code the trip draws, with the name it shows on hover, and any
+  // element drawn from codes that still shows one bare.
+  found.airports = Object.fromEntries([...document.querySelectorAll('#trip-detail abbr.airport, .trip-list [aria-current="true"] abbr.airport')]
+    .map((abbr) => [abbr.textContent, abbr.title]))
+  found.bare = []
+  for (const el of document.querySelectorAll('#trip-detail [data-codes], .trip-list [aria-current="true"] [data-codes]')) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+    while (walker.nextNode()) {
+      const text = walker.currentNode
+      if (!text.parentElement.closest('abbr') && /\b[A-Z]{3}\b/.test(text.data)) found.bare.push(`${el.getAttribute('class') ?? el.tagName}: ${text.data}`)
+    }
+  }
   found.free = [...detail.querySelectorAll('.free-days-card')].map((card) => ({
     text: card.textContent,
     days: [...card.querySelectorAll('time')].map((time) => time.dateTime),

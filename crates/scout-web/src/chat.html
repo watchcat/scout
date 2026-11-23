@@ -372,10 +372,21 @@
   .trip-empty svg{color:var(--cyan); margin-bottom:14px}
   .trip-empty h2{margin:0 0 6px; color:var(--base2); font-size:21px}
   .trip-empty p{margin:0; max-width:440px}
-  .trip-head{display:flex; align-items:flex-start; justify-content:space-between; gap:20px;
-    margin:0 0 18px; padding:2px 2px 0}
+  /* The title and its controls share a row while both fit, and the
+     controls take a row of their own under the title when they do not.
+     The title is given 18rem before that happens rather than being
+     squeezed to its longest word: a draft its reader owns carries five
+     controls, 554px of them, and with the controls `flex:none` on one row
+     "Amsterdam to Yerevan" came out two lines tall and the row still ran
+     23px past a 729px column — which scrolls, so the × that deletes the
+     trip was cut in half at its edge. A kept trip's three still sit beside
+     the title in a wide window; measured, at 1100px and up, and under it
+     at 900px, where the title's 18rem and the three do not both fit. */
+  .trip-head{display:flex; flex-wrap:wrap; align-items:flex-start; justify-content:space-between;
+    gap:12px 20px; margin:0 0 18px; padding:2px 2px 0}
+  .trip-head > :first-child{flex:1 1 18rem; min-width:0}
   .trip-title{margin:0; color:var(--base2); font-size:clamp(25px,3vw,34px); line-height:1.12;
-    letter-spacing:-.025em}
+    letter-spacing:-.025em; overflow-wrap:break-word}
   .trip-subtitle{margin:7px 0 0; color:var(--base0); font-size:14px}
   /* Who is on the trip, and the way to share it. A link-coloured line
      rather than a pill: it reads as part of the trip's description. */
@@ -405,7 +416,7 @@
   .people-address-form .handle-hint{margin:0}
   .people-ask:not(:empty){margin:12px 0 0; padding-top:12px; border-top:1px solid var(--line)}
   .people-ask p{margin:0 0 10px; color:var(--base1); font-size:13.5px; line-height:1.5}
-  .trip-head-actions{display:flex; align-items:center; gap:8px; flex:none}
+  .trip-head-actions{display:flex; flex-wrap:wrap; align-items:center; gap:8px; flex:0 1 auto; min-width:0}
   .status-chip{display:inline-flex; align-items:center; gap:7px; flex:none; margin-top:5px;
     padding:6px 10px; border:1px solid var(--line); border-radius:999px; color:var(--base1);
     font-size:12px; font-weight:750; text-transform:capitalize}
@@ -459,9 +470,14 @@
      this background fails contrast at this text size. */
   .trip-delete-confirm-row button.danger{border-color:var(--red); color:var(--danger-text)}
   .trip-delete-confirm-row button:disabled{opacity:.6; cursor:default}
+  /* The lift falls straight down: a spread as far in as the blur reaches
+     out leaves nothing to either side. The column this sits in scrolls,
+     and a scroller cuts what passes its edge — the 32px halo this had was
+     cut flat on the left, where the column has no room, and on the right,
+     where it has 8px. */
   .trip-overview{margin-bottom:16px; padding:18px; border:1px solid var(--line); border-radius:16px;
     background:linear-gradient(135deg,var(--overview-from),var(--overview-to));
-    box-shadow:0 10px 32px rgba(0,0,0,.16)}
+    box-shadow:0 16px 22px -22px rgba(0,0,0,.45)}
   .trip-overview-label{display:flex; justify-content:space-between; gap:12px; margin-bottom:16px;
     color:var(--base01); font-size:12px; font-weight:700; text-transform:uppercase;
     letter-spacing:.08em}
@@ -576,14 +592,21 @@
     color:var(--base0); font-size:12px; font-weight:650; white-space:nowrap}
   .item-state svg{flex:none}
   .item-state.held{border-style:solid; border-color:var(--green); color:var(--green)}
-  .segment-head{display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
-    padding:15px 16px 13px; border-bottom:1px solid var(--rule-soft)}
+  /* Wraps for the trip head's reason: the pill, the date and the ⋯ were
+     `flex:none` beside the route, and at 721px, the last width before the
+     phone layout, they did not fit a card that hides what passes its edge:
+     the ⋯ was cut by 21px. The route keeps 12rem; past that the pill, the
+     date and the ⋯ go under it, the ⋯ at the far end. A phone orders them
+     its own way below. */
+  .segment-head{display:flex; flex-wrap:wrap; align-items:flex-start; justify-content:space-between;
+    gap:8px 12px; padding:15px 16px 13px; border-bottom:1px solid var(--rule-soft)}
+  .segment-head > :first-child{flex:1 1 12rem; min-width:0}
   .segment-kicker{margin:0 0 4px; color:var(--base01); font-size:11px; font-weight:800;
     letter-spacing:.1em; text-transform:uppercase}
   .segment-route{margin:0; color:var(--base2); font-size:22px; line-height:1.15}
   .route-arrow{padding:0 7px; color:var(--cyan); font-weight:400}
   .segment-date{flex:none; margin-top:2px; color:var(--base1); font-size:13px}
-  .segment-head-actions{flex:none; display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end}
+  .segment-head-actions{flex:0 1 auto; min-width:0; display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end}
   /* The ⋯ in the corner. No border at rest: it is the quietest thing in
      the head, there for whoever looks for it, and a boxed button there
      would pull the eye off the pill and the date beside it. The negative
@@ -703,6 +726,11 @@
   .join-card.warning::before{background:var(--yellow)}
   .join-card.danger{border-color:var(--red); color:var(--danger-text)}
   .join-card.danger::before{background:var(--red)}
+  /* Days on the trip with nothing on them, where they fall between the
+     cards. Dashed like a day chip or an item still to book: a slot, not a
+     thing on the trip. */
+  .free-days-card{margin:0; padding:12px 16px; border:1px dashed var(--base01); border-radius:12px;
+    color:var(--base0); font-size:13.5px; overflow-wrap:anywhere}
   /* An arrival waiting on the timeline: the item's own box, dashed and in
      the warning colour, because it is not on the trip until the reader
      says so — a solid card would read as already added. */

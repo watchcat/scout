@@ -674,7 +674,11 @@ function nightsBetween(from, to) {
 }
 
 function dayBefore(date) {
-  return new Date(utcDay(date) - DAY_MS).toISOString().slice(0, 10)
+  return addDays(date, -1)
+}
+
+function addDays(date, days) {
+  return new Date(utcDay(date) + days * DAY_MS).toISOString().slice(0, 10)
 }
 
 // Every day from first to last, inclusive. Built in UTC on purpose: these
@@ -1163,6 +1167,90 @@ export function pendingRowsFor(trip, arrivals) {
 
 function rowDate(row) {
   return (row.kind === 'item' ? row.item.date : row.arrival.date) ?? ''
+}
+
+// The runs of days on a trip with nothing on them, first and last day of
+// each: the days the overview counts as "4 free days", or draws as one
+// empty row when there is only one. Read off the overview's own rows, so
+// a run is the same days the overview counts. Without `today`, as the
+// printed plan has them: on a trip day the overview splits a run around
+// today and counts the two halves, and a run here stays whole.
+export function freeRuns(trip) {
+  const runs = []
+  let last = null
+  for (const row of tripDayRows(trip)) {
+    if (row.kind === 'free') {
+      const from = addDays(last, 1)
+      runs.push({ from, to: addDays(from, row.days - 1), days: row.days })
+      continue
+    }
+    if (!row.entries.length) runs.push({ from: row.date, to: row.date, days: 1 })
+    last = row.date
+  }
+  return runs
+}
+
+// Whether a free run is days the traveller is away and on the ground,
+// which are the days "No plans yet" is true of. The overview counts every
+// empty day between the first and the last thing on the trip, and some of
+// those are neither: the week between an eSIM bought on the 20th and the
+// flight out on the 28th is spent at home, and the day between a Tuesday
+// departure and a Thursday landing is spent in the air. Away is from the
+// first flight, stay or transport (a train, a bus, a ferry, a hire car) to
+// the last day of the last one; a trip with none of them has no way to
+// say, so every run on it is kept.
+const TRAVEL = ['flight', 'stay', 'transport']
+function awayOnTheGround(run, trip) {
+  const items = (trip?.items ?? []).filter((item) => TRAVEL.includes(item.kind) && isDay(item.date))
+  if (!items.length) return true
+  // A flight's own day it lands on is its chosen option's, which only a
+  // chosen option names; an undecided leg is taken to land the day it
+  // leaves, which is what the overview assumes of it too. A stay's or a
+  // transport's is its `ends_at`.
+  const ends = (item) => (item.kind === 'flight' ? dayOf(selectedCandidate(item)?.arriving_at_local) : dayOf(item.ends_at)) || item.date
+  const first = items.map((item) => item.date).sort()[0]
+  const last = items.map(ends).sort().at(-1)
+  if (run.to < first || run.from > last) return false
+  return !items.some((item) => item.kind !== 'stay' && item.date < run.from && ends(item) > run.to)
+}
+
+// What a free run's card says, in parts: text, and the days it names as
+// `{ date, label }`, which the page draws as a `<time>`. The days are
+// named, not only counted: "4 free days" sends the reader to a calendar to
+// find which, and which is what they want when they set out to fill them.
+export function freeDaysParts(run, locale = undefined) {
+  const day = (date) => ({
+    date,
+    label: new Intl.DateTimeFormat(locale, { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' })
+      .format(new Date(utcDay(date))),
+  })
+  return run.days === 1
+    ? ['No plans yet for ', day(run.from)]
+    : [`No plans yet for ${run.days} days from `, day(run.from), ' to ', day(run.to)]
+}
+
+// The same, as one line of text.
+export function freeDaysLine(run, locale = undefined) {
+  return freeDaysParts(run, locale).map((part) => (typeof part === 'string' ? part : part.label)).join('')
+}
+
+// The trip's rows as the page stacks its cards: its items and the mail
+// waiting to become one (`pendingRowsFor`), and a `free` row for each run
+// of days the traveller is away with nothing on them. A run goes before
+// the first row dated in it or after it, which is the item that ends it,
+// or a booking still in the mail for one of its days — not a plan yet, so
+// after the card that says there is none. A run nothing comes after, the
+// last nights of a stay with no way home yet, goes at the end.
+export function stackRows(trip, arrivals) {
+  const runs = freeRuns(trip).filter((run) => awayOnTheGround(run, trip))
+  const rows = []
+  for (const row of pendingRowsFor(trip, arrivals)) {
+    const date = rowDate(row)
+    while (runs.length && isDay(date) && runs[0].from <= date) rows.push({ kind: 'free', run: runs.shift() })
+    rows.push(row)
+  }
+  for (const run of runs) rows.push({ kind: 'free', run })
+  return rows
 }
 
 // One line per mail that did not become a pending row: what the reader
@@ -2463,16 +2551,31 @@ function start() {
     }
 
     // Items and the mail waiting to become one, in one timeline — see
-    // `pendingRowsFor`. Drawn even when the trip has no items yet: a draft
-    // an arrival started holds nothing but its pending row, and that row
-    // is the whole reason the trip is on the list.
+    // `pendingRowsFor` — with the days that have nothing on them where
+    // they fall (`stackRows`). Drawn even when the trip has no items yet:
+    // a draft an arrival started holds nothing but its pending row, and
+    // that row is the whole reason the trip is on the list.
     const stack = node('div', 'segment-stack')
     // Counts item rows as they pass: the join below looks past this item
-    // in `trip.items`, and pending rows are not in that list.
+    // in `trip.items`, and pending and free rows are not in that list.
     let itemIndex = 0
-    for (const row of pendingRowsFor(trip, inbox?.pending ?? [])) {
+    for (const row of stackRows(trip, inbox?.pending ?? [])) {
       if (row.kind === 'pending') {
         stack.append(renderPendingRow(trip, row.arrival))
+        continue
+      }
+      if (row.kind === 'free') {
+        const card = node('p', 'free-days-card')
+        for (const part of freeDaysParts(row.run)) {
+          if (typeof part === 'string') {
+            card.append(document.createTextNode(part))
+          } else {
+            const time = node('time', '', part.label)
+            time.dateTime = part.date
+            card.append(time)
+          }
+        }
+        stack.append(card)
         continue
       }
       const item = row.item

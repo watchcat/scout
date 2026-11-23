@@ -786,6 +786,16 @@ export function codeParts(text, known) {
   return parts
 }
 
+// Whether a finger that went down at `point` was on `rect`, or near
+// enough that the click the browser sends after it, moved onto what it
+// took the finger to mean, is its click: a phone moves a near miss's
+// click onto the nearest thing that answers clicks, and leaves its
+// pointerdown where the finger was. `reach` in the window's pixels.
+export function fingerReaches(point, rect, reach) {
+  return point.x >= rect.left - reach && point.x <= rect.right + reach &&
+    point.y >= rect.top - reach && point.y <= rect.bottom + reach
+}
+
 // Where the name of a code tapped on a touch screen shows: under the code,
 // centred on it and kept 8px inside the window; above it where under would
 // run off the bottom and above has the room. `code` is the code's
@@ -1906,24 +1916,32 @@ function start() {
   let codeTip = null
   let tipFor = null
   let closedFor = null
-  // The element a finger last went down on, until the click it makes.
-  let touchedOn = null
+  // Where a finger last went down, and on what, until the click it makes.
+  let touched = null
+  // How far from a code a finger may land and still be tapping it: about
+  // half a fingertip, for the browser's own nudge of a near miss.
+  const FINGER_REACH = 10
 
   // A finger's tap, told by the pointer that went down, not by the click:
   // a tap's click on an iPhone says it came from a mouse (Safari 18.2 on,
-  // WebKit bug 282988), though its pointerdown says a finger. A mouse, or
-  // a pen, has the hover title already, and its click on a flight option
+  // WebKit bug 282988), though its pointerdown says a finger. The finger
+  // went down on the code or within `FINGER_REACH` of it (`fingerReaches`).
+  // A mouse has the hover title already, and its click on a flight option
   // still chooses the flight; so does a click no finger made, a screen
-  // reader's included. Inside a link or a button (a day chip, a trip in
+  // reader's included, and a pen's, taken for a mouse's because most pens
+  // can hover (an Apple Pencil that cannot gets neither the title nor the
+  // card). Inside a link or a button (a day chip, a trip in
   // the list) the tap does what a tap there does, and what it opens draws
   // the same codes, named. Inside a flight option it names the code and
   // does not choose the flight: a reader asking where LYS is has not
   // decided to fly through it.
   function tapCode(event) {
     const abbr = event.currentTarget
-    const touched = touchedOn
-    touchedOn = null
-    if (!tipsShow || !(touched instanceof Node) || !abbr.contains(touched)) return
+    const finger = touched
+    touched = null
+    if (!tipsShow || !finger) return
+    const on = finger.target instanceof Node && abbr.contains(finger.target)
+    if (!on && !fingerReaches(finger, abbr.getBoundingClientRect(), FINGER_REACH)) return
     if (abbr.closest('a, button')) return
     event.preventDefault()
     event.stopPropagation()
@@ -1964,14 +1982,14 @@ function start() {
   // where the code was, so a scroll or a resize closes it too, as they
   // close a ⋯ menu.
   document.addEventListener('pointerdown', (event) => {
-    touchedOn = event.pointerType === 'touch' ? event.target : null
+    touched = event.pointerType === 'touch' ? { target: event.target, x: event.clientX, y: event.clientY } : null
     closedFor = null
     if (!tipFor || codeTip.contains(event.target)) return
     closedFor = tipFor
     hideCodeTip()
   }, true)
   // A finger that went on to scroll made no tap.
-  document.addEventListener('pointercancel', () => { touchedOn = null }, true)
+  document.addEventListener('pointercancel', () => { touched = null }, true)
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') hideCodeTip()
   })

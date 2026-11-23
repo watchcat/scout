@@ -12,7 +12,7 @@ import {
   localToday, todayInTrip, todayPositions, composeLabel,
   moveBody, warningBody, tripDays, dayChipDraggable, shouldPollChecks,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
-  pendingRowsFor, freeRuns, freeDaysLine, freeDaysParts, stackRows, airportTitle, codeParts, codeTipPlace, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
+  pendingRowsFor, freeRuns, freeDaysLine, freeDaysParts, stackRows, airportTitle, codeParts, codeTipPlace, fingerReaches, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody, handOverQuestion, handOverRefusal, tripAddressProblem, bookingAddress,
   ITINERARY_NOTE,
   CONFIRM_ARM_MS,
@@ -1404,6 +1404,20 @@ test("a tapped code's name shows under it, inside the window", () => {
   // A name wider than the window starts at its left margin; the page caps
   // the card's width so it is not.
   assert.equal(codeTipPlace(code(235, 100), { width: 600, height: 34 }, view).left, 8)
+})
+
+test('a finger on a code, or within reach of it, is tapping it', () => {
+  const code = { left: 100, right: 130, top: 50, bottom: 68 }
+  assert.equal(fingerReaches({ x: 115, y: 59 }, code, 10), true)
+  // A near miss the browser moves the click of: 10px off any side.
+  assert.equal(fingerReaches({ x: 140, y: 59 }, code, 10), true)
+  assert.equal(fingerReaches({ x: 90, y: 40 }, code, 10), true)
+  assert.equal(fingerReaches({ x: 115, y: 78 }, code, 10), true)
+  // Past it: another tap, somewhere else.
+  assert.equal(fingerReaches({ x: 141, y: 59 }, code, 10), false)
+  assert.equal(fingerReaches({ x: 115, y: 39 }, code, 10), false)
+  assert.equal(fingerReaches({ x: 89, y: 59 }, code, 10), false)
+  assert.equal(fingerReaches({ x: 115, y: 79 }, code, 10), false)
 })
 
 test('the airport table names every code it has, with its country', () => {

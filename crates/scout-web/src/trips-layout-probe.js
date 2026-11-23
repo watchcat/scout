@@ -10,7 +10,8 @@
 //
 // Then it taps airport codes on the trip named `TAPPED` the way a phone
 // does and reports what showed (`taps`): as an iPhone taps and as an
-// Android phone does, which differ (`tap`), and last as a mouse clicks.
+// Android phone does, which differ (`tap`), and last with the clicks that
+// are no tap, a mouse's, a pen's and one no finger made.
 //
 // Served as a file of its own because the page's policy runs no inline
 // script, and a plain one, so it is running before the page's module is:
@@ -24,8 +25,11 @@ window.fetch = (input, init) => {
   return pageFetch(input, init)
 }
 const pause = (ms) => new Promise((done) => setTimeout(done, ms))
+// Up to 4 s of the page's time, which stands still while a request is
+// on its way: a wait that fails has to leave room in the 20 s Chrome
+// gives the page (`laid_out`) for the findings to be written.
 const until = async (ok) => {
-  for (let i = 0; i < 400 && !ok(); i++) await pause(25)
+  for (let i = 0; i < 160 && !ok(); i++) await pause(25)
   return ok()
 }
 const titled = (name) => () => document.querySelector('#trip-detail .trip-title')?.textContent === name
@@ -61,26 +65,33 @@ addEventListener('load', async () => {
       ? await taps(phone)
       : { checked: 0, problems: [`${TAPPED} could not be shown to tap on`] }
   }
-  report.taps.mouse = await mouseOnAnOption()
+  report.taps.clicks = await clicksOnAnOption()
   document.documentElement.dataset.layout = JSON.stringify(report)
 })
 
 // A tap as a phone's browser sends one: the pointer's down and up from a
 // finger, then the click. An iPhone's click says it came from a mouse
 // (Safari 18.2 on: WebKit bug 282988, fixed and the fix reverted); an
-// Android phone's says a finger. `phone` 'mouse' is a mouse's click.
-// Returns whether the click was let through (`dispatchEvent`'s answer:
-// false when the page prevented its default).
+// Android phone's says a finger. `phone` 'mouse' and 'pen' are a mouse's
+// click and a pen's. Returns whether the click was let through
+// (`dispatchEvent`'s answer: false when the page prevented its default).
 function tap(el, phone) {
   const rect = el.getBoundingClientRect()
+  return tapAt(el, rect.left + rect.width / 2, rect.top + rect.height / 2, phone)
+}
+
+// The same, with the finger down at `x`, `y` and the click on `el`: a
+// near miss whose click the browser moves onto `el`, or a touch somewhere
+// else before a click on `el` that no finger made there.
+function tapAt(el, x, y, phone) {
   const at = (pointerType) => ({
-    bubbles: true, cancelable: true, composed: true, isPrimary: true, pointerType,
-    clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2,
+    bubbles: true, cancelable: true, composed: true, isPrimary: true, pointerType, clientX: x, clientY: y,
   })
-  const press = phone === 'mouse' ? 'mouse' : 'touch'
-  el.dispatchEvent(new PointerEvent('pointerdown', at(press)))
-  el.dispatchEvent(new PointerEvent('pointerup', at(press)))
-  return el.dispatchEvent(new PointerEvent('click', at(phone === 'android' ? 'touch' : 'mouse')))
+  const press = ['mouse', 'pen'].includes(phone) ? phone : 'touch'
+  const under = document.elementFromPoint(x, y) ?? document.body
+  under.dispatchEvent(new PointerEvent('pointerdown', at(press)))
+  under.dispatchEvent(new PointerEvent('pointerup', at(press)))
+  return el.dispatchEvent(new PointerEvent('click', at({ android: 'touch', pen: 'pen' }[phone] ?? 'mouse')))
 }
 
 const tip = () => document.querySelector('.airport-tip:popover-open')
@@ -129,6 +140,7 @@ async function taps(phone) {
   // it showed first, so a name that never opened does not pass for one
   // that closed.
   const closes = async (what, act) => {
+    await ready(routeCode())
     tap(routeCode(), phone)
     check(tip(), `a tap on ${route.textContent} did not show its name before ${what}`)
     await act()
@@ -155,6 +167,19 @@ async function taps(phone) {
     document.getElementById('view-trips').click()
     await until(titled(TAPPED))
   })
+
+  // A near miss, 6px past the code's end, whose click the browser moves
+  // onto the code, is a tap on it; a finger 60px under it is not.
+  {
+    const code = routeCode()
+    await ready(code)
+    const rect = code.getBoundingClientRect()
+    tapAt(code, rect.right + 6, rect.top + rect.height / 2, phone)
+    check(tip(), `a tap 6px past ${code.textContent} did not name it`)
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch' }))
+    tapAt(code, rect.left + rect.width / 2, rect.bottom + 60, phone)
+    check(!tip(), `a finger 60px under ${code.textContent} named it`)
+  }
 
   // In a flight option the code is named and the flight is not chosen.
   const option = document.querySelector('#trip-detail .flight-option:not(.selected) abbr.airport')
@@ -202,27 +227,48 @@ async function taps(phone) {
   return found
 }
 
-// A mouse's click on a code in a flight option still chooses the flight,
-// as a click anywhere on the option does. Last, because it sends the
-// choice; the app refuses it (`signed_in_site`), and nothing is measured
-// after it.
-async function mouseOnAnOption() {
+// Clicks that are no tap, on a code in a flight option, choose the flight
+// as a click anywhere on the option does: a mouse's, a pen's, and one no
+// finger made, as a screen reader's is, whether a finger tapped that code
+// before it or went down on it and went on to scroll. Last, because each
+// sends the choice; the app refuses it (`signed_in_site`; a 400 in every
+// window, measured), and nothing is measured after it.
+async function clicksOnAnOption() {
   const found = { checked: 0, problems: [] }
+  const check = (ok, problem) => {
+    found.checked++
+    if (!ok) found.problems.push(problem)
+  }
   listed(TAPPED)?.click()
   await until(titled(TAPPED))
-  const option = document.querySelector('#trip-detail .flight-option:not(.selected) abbr.airport')
-  found.checked++
-  if (!option) {
-    found.problems.push('no flight option that is not chosen has a named code')
-    return found
+  const optionCode = () => document.querySelector('#trip-detail .flight-option:not(.selected) abbr.airport')
+  check(optionCode(), 'no flight option that is not chosen has a named code')
+  if (!optionCode()) return found
+  await ready(optionCode())
+  const chooses = async (what, click) => {
+    const before = writes.length
+    click(optionCode())
+    check(await until(() => writes.slice(before).some((url) => url.endsWith('/chat/trips/choice'))),
+      `${what} on ${optionCode().textContent} in a flight option did not choose it: ${writes.slice(before)}`)
+    // Settled, refused, before the next: a choice while one is on its way
+    // is dropped (`chooseFlight`).
+    await until(() => !document.getElementById('trip-detail').hasAttribute('aria-busy'))
   }
-  await ready(option)
-  const before = writes.length
-  tap(option, 'mouse')
-  found.checked++
-  if (!(await until(() => writes.slice(before).some((url) => url.endsWith('/chat/trips/choice'))))) {
-    found.problems.push(`a mouse click on ${option.textContent} in a flight option did not choose it: ${writes.slice(before)}`)
-  }
+  const bare = (el) => el.dispatchEvent(new PointerEvent('click', { bubbles: true, cancelable: true, composed: true }))
+  await chooses('a click no finger made, after a finger tapped it twice', (el) => {
+    tap(el, 'iphone')
+    tap(el, 'iphone')
+    bare(el)
+  })
+  await chooses('a click no finger made, after a finger went down on it and scrolled', (el) => {
+    const rect = el.getBoundingClientRect()
+    const at = { bubbles: true, pointerType: 'touch', clientX: rect.left + 2, clientY: rect.top + 2 }
+    el.dispatchEvent(new PointerEvent('pointerdown', at))
+    el.dispatchEvent(new PointerEvent('pointercancel', at))
+    bare(el)
+  })
+  await chooses("a pen's click", (el) => tap(el, 'pen'))
+  await chooses("a mouse's click", (el) => tap(el, 'mouse'))
   return found
 }
 

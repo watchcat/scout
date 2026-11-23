@@ -8,8 +8,20 @@
 // width beside the column's, what its free-day cards say, and the names
 // its airport codes show.
 //
+// Then it taps airport codes on the trip named `TAPPED` the way a phone
+// does and reports what showed (`taps`).
+//
 // Served as a file of its own because the page's policy runs no inline
-// script, and a plain one, so it is running before the page's module is.
+// script, and a plain one, so it is running before the page's module is:
+// early enough to see every request the page sends that is not a read.
+
+const TAPPED = 'Amsterdam to Yerevan'
+const writes = []
+const pageFetch = window.fetch
+window.fetch = (input, init) => {
+  if ((init?.method ?? 'GET').toUpperCase() !== 'GET') writes.push(String(input))
+  return pageFetch(input, init)
+}
 
 addEventListener('load', async () => {
   const pause = (ms) => new Promise((done) => setTimeout(done, ms))
@@ -38,8 +50,108 @@ addEventListener('load', async () => {
     await pause(50)
     report.trips.push(measure(name))
   }
+  const button = [...document.querySelectorAll('.trip-list button')]
+    .find((one) => one.querySelector('.trip-list-name')?.textContent === TAPPED)
+  button?.click()
+  if (button && (await until(() => document.querySelector('#trip-detail .trip-title')?.textContent === TAPPED))) {
+    report.taps = await taps(pause)
+  } else {
+    report.taps = { checked: 0, problems: [`${TAPPED} could not be shown to tap on`] }
+  }
   document.documentElement.dataset.layout = JSON.stringify(report)
 })
+
+// A tap as a phone's browser sends one: the pointer's down and up, then
+// the click, all from a finger. Returns whether the click was let through
+// (`dispatchEvent`'s answer: false when the page prevented its default).
+function tap(el, pointerType = 'touch') {
+  const rect = el.getBoundingClientRect()
+  const at = {
+    bubbles: true, cancelable: true, composed: true, isPrimary: true, pointerType,
+    clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2,
+  }
+  el.dispatchEvent(new PointerEvent('pointerdown', at))
+  el.dispatchEvent(new PointerEvent('pointerup', at))
+  return el.dispatchEvent(new PointerEvent('click', at))
+}
+
+// Taps on the shown trip's codes: one in the segment's route, one inside a
+// flight option not chosen, one in a day chip, one with a mouse. Each
+// check that fails is a problem; `checked` counts the checks run, so a
+// probe that ran none does not pass for one that found nothing wrong.
+async function taps(pause) {
+  const found = { checked: 0, problems: [] }
+  const check = (ok, problem) => {
+    found.checked++
+    if (!ok) found.problems.push(problem)
+  }
+  const tip = () => document.querySelector('.airport-tip:popover-open')
+  // Into view first, and past the scroll that moved it, which closes a
+  // name that is showing.
+  const ready = async (el) => {
+    el.scrollIntoView({ block: 'center' })
+    await pause(100)
+  }
+
+  const route = document.querySelector('#trip-detail .segment-route abbr.airport')
+  if (!route) return { checked: 0, problems: ['no segment route has a named code'] }
+  await ready(route)
+  tap(route)
+  const shown = tip()
+  check(shown, `a tap on ${route.textContent} in the route showed nothing`)
+  if (shown) {
+    found.shown = shown.textContent
+    check(shown.getAttribute('role') === 'tooltip', `the name has role ${shown.getAttribute('role')}`)
+    const box = shown.getBoundingClientRect()
+    const code = route.getBoundingClientRect()
+    const width = document.documentElement.clientWidth
+    check(box.left >= 0 && box.right <= width && box.top >= 0 && box.bottom <= innerHeight,
+      `the name spans ${Math.round(box.left)}–${Math.round(box.right)} × ${Math.round(box.top)}–${Math.round(box.bottom)} in a ${width}×${innerHeight} window`)
+    check(box.top >= code.bottom - 0.5 || box.bottom <= code.top + 0.5, 'the name covers the code it names')
+    check(box.left <= code.right && box.right >= code.left, 'the name is not beside the code it names')
+  }
+  tap(route)
+  check(!tip(), 'a second tap on the same code left its name showing')
+
+  tap(route)
+  document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch' }))
+  check(!tip(), 'a tap elsewhere left the name showing')
+  tap(route)
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  check(!tip(), 'Escape left the name showing')
+  tap(route)
+  document.getElementById('trip-detail').dispatchEvent(new Event('scroll'))
+  check(!tip(), 'a scroll left the name showing')
+
+  // In a flight option the code is named and the flight is not chosen.
+  const option = document.querySelector('#trip-detail .flight-option:not(.selected) abbr.airport')
+  check(option, 'no flight option that is not chosen has a named code')
+  if (option) {
+    await ready(option)
+    const before = writes.length
+    const through = tap(option)
+    check(tip()?.textContent.startsWith(option.textContent), `a tap on ${option.textContent} in a flight option did not name it`)
+    check(!through && writes.length === before, `a tap on ${option.textContent} in a flight option chose the flight: ${writes.slice(before)}`)
+    check(!option.closest('.flight-option').classList.contains('selected'), 'the flight option was marked chosen')
+    tap(option)
+  }
+
+  // A day chip's code is part of the chip: a tap does what a tap on the
+  // chip does, and names nothing.
+  const chip = document.querySelector('#trip-detail a.day-chip abbr.airport')
+  check(chip, 'no day chip has a named code')
+  if (chip) {
+    await ready(chip)
+    tap(chip)
+    check(!tip(), `a tap on ${chip.textContent} in a day chip named it`)
+  }
+
+  // A mouse has the hover title, and its click is left alone.
+  await ready(route)
+  tap(route, 'mouse')
+  check(!tip(), 'a mouse click on a code showed its name as a tap does')
+  return found
+}
 
 // The nearest box above `el` that clips it sideways: one that scrolls,
 // or hides, on the x axis. A box with `overflow-y` set clips x as well.

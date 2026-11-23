@@ -786,6 +786,22 @@ export function codeParts(text, known) {
   return parts
 }
 
+// Where the name of a code tapped on a touch screen shows: under the code,
+// centred on it and kept 8px inside the window; above it where under would
+// run off the bottom and above has the room. `code` is the code's
+// rectangle, `tip` the name's size, `view` the window's, all in the
+// window's pixels.
+export function codeTipPlace(code, tip, view) {
+  const gap = 6
+  const margin = 8
+  const centre = (code.left + code.right) / 2
+  const left = Math.max(margin, Math.min(centre - tip.width / 2, view.width - margin - tip.width))
+  const below = code.bottom + gap
+  const above = code.top - gap - tip.height
+  const fitsBelow = below + tip.height <= view.height - margin
+  return { left, top: fitsBelow || above < margin ? below : above }
+}
+
 export function tripLoadIsCurrent(request, current, choicePending) {
   return request === current && !choicePending
 }
@@ -1811,6 +1827,7 @@ function start() {
     tripsTab.setAttribute('aria-pressed', String(showingTrips))
     menuButton.hidden = showingTrips
     if (mirrorButton) mirrorButton.hidden = showingTrips
+    hideCodeTip()
     if (showingTrips) loadAirports()
     if (showingTrips && !tripsLoaded) loadTrips().catch(() => {})
     // The trips were painted while this tab was hidden; now it can be seen.
@@ -1842,12 +1859,11 @@ function start() {
   }
 
   // Marks an element whose text is built from airport codes, so each code
-  // the table knows says what it is to a pointer resting on it: an
-  // `<abbr>` with the airport's name as its title, which a browser shows
-  // on hover. Nothing shows on a touch screen, a phone in Telegram
-  // included, where there is no hover. Only marked elements, never the
-  // trip's free text: "THE" in a hotel's name is no airport, though it is
-  // one in Teresina.
+  // the table knows says what it is: an `<abbr>` with the airport's name as
+  // its title, which a browser shows to a pointer resting on it, and which
+  // a tap on a touch screen, where nothing rests, shows beside the code
+  // (`tapCode`). Only marked elements, never the trip's free text: "THE"
+  // in a hotel's name is no airport, though it is one in Teresina.
   function withCodes(el) {
     el.dataset.codes = ''
     nameCodes(el)
@@ -1868,10 +1884,86 @@ function start() {
         if (typeof part === 'string') return part
         const abbr = node('abbr', 'airport', part.code)
         abbr.title = airportTitle(airports.get(part.code))
+        // On the code itself, not handed down from the page: Safari on a
+        // phone sends a tap's click only to an element that listens for
+        // it, and this one has to be heard before a flight option's.
+        abbr.addEventListener('click', tapCode)
         return abbr
       }))
     }
   }
+
+  // A tapped code's name, in a card beside it: one card for the page, in
+  // the top layer (`popover`), so no scrolling column cuts it. Manual
+  // rather than `auto` so what closes it is this code's, and a second tap
+  // on the code can close it rather than close and open it again.
+  let codeTip = null
+  let tipFor = null
+  let closedFor = null
+  let lastPointer = ''
+
+  // A tap, not a mouse's click: a mouse has the hover title already, and
+  // its click on a flight option still chooses the flight. Inside a link
+  // or a button (a day chip, a trip in the list) the tap does what a tap
+  // there does, and what it opens draws the same codes, named. Inside a
+  // flight option it names the code and does not choose the flight: a
+  // reader asking where LYS is has not decided to fly through it.
+  function tapCode(event) {
+    const abbr = event.currentTarget
+    if ((event.pointerType || lastPointer) === 'mouse') return
+    if (abbr.closest('a, button')) return
+    event.preventDefault()
+    event.stopPropagation()
+    if (closedFor === abbr) {
+      closedFor = null
+      return
+    }
+    showCodeTip(abbr)
+  }
+
+  function showCodeTip(abbr) {
+    if (!codeTip) {
+      codeTip = node('p', 'airport-tip')
+      codeTip.setAttribute('popover', 'manual')
+      codeTip.setAttribute('role', 'tooltip')
+      document.body.append(codeTip)
+    }
+    if (typeof codeTip.showPopover !== 'function') return
+    codeTip.replaceChildren(node('strong', '', abbr.textContent), ` ${abbr.title}`)
+    // Measured at the window's corner, where nothing squeezes it, then put
+    // where it goes.
+    codeTip.style.left = '0px'
+    codeTip.style.top = '0px'
+    if (!codeTip.matches(':popover-open')) codeTip.showPopover()
+    const view = { width: document.documentElement.clientWidth, height: window.innerHeight }
+    const at = codeTipPlace(abbr.getBoundingClientRect(), codeTip.getBoundingClientRect(), view)
+    codeTip.style.left = `${at.left}px`
+    codeTip.style.top = `${at.top}px`
+    tipFor = abbr
+  }
+
+  function hideCodeTip() {
+    if (codeTip?.matches(':popover-open')) codeTip.hidePopover()
+    tipFor = null
+  }
+
+  // A touch anywhere but on the card closes it, before the tap's click
+  // arrives: that click opens the name of another code, or, on the same
+  // code, finds it `closedFor` and leaves it closed. Pinned to where the
+  // code was, so a scroll or a resize closes it too, as they close a ⋯
+  // menu.
+  document.addEventListener('pointerdown', (event) => {
+    lastPointer = event.pointerType
+    closedFor = null
+    if (!tipFor || codeTip.contains(event.target)) return
+    closedFor = tipFor
+    hideCodeTip()
+  }, true)
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') hideCodeTip()
+  })
+  window.addEventListener('scroll', () => { if (tipFor) hideCodeTip() }, { capture: true, passive: true })
+  window.addEventListener('resize', () => { if (tipFor) hideCodeTip() })
 
   async function loadTrips() {
     // A selection response carries the authoritative post-write trip. Do not
@@ -2544,6 +2636,8 @@ function start() {
     // a load, a click in the list, a saved choice — so this is the one
     // place that has to run whichever of those happened.
     updateComposeTarget()
+    // The code a showing name was for is about to be drawn again, elsewhere.
+    hideCodeTip()
     if (!trip) {
       showTripEmpty(
         trips.length ? 'Choose a trip' : 'No trips yet',

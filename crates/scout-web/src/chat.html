@@ -615,6 +615,21 @@
   /* Inside a day chip or a flight option the code is part of something to
      press, and the pointer says that instead. */
   a abbr.airport, label abbr.airport{cursor:inherit}
+  /* A touch screen has no pointer to rest, so a code is tapped instead
+     (`tapCode`), and a faint dotted line says which ones can be. Not in a
+     day chip or the trip list, where a tap does what the chip or the row
+     does. */
+  @media (hover: none){
+    abbr.airport{text-decoration:underline dotted; text-decoration-color:color-mix(in srgb, currentColor 50%, transparent);
+      text-underline-offset:3px}
+    a abbr.airport, button abbr.airport{text-decoration:none}
+  }
+  /* The tapped code's name. A popover, so the UA's centred box is undone
+     as the ⋯ menu's is, and `showCodeTip` writes `left` and `top`. */
+  .airport-tip{position:fixed; inset:auto; margin:0; max-width:min(320px, calc(100vw - 16px));
+    padding:8px 11px; border:1px solid var(--line); border-radius:10px; background:var(--panel);
+    color:var(--base1); font-size:13px; line-height:1.4; box-shadow:0 10px 24px rgba(0,0,0,.4)}
+  .airport-tip strong{margin-right:3px; color:var(--base2)}
   .segment-date{flex:none; margin-top:2px; color:var(--base1); font-size:13px}
   .segment-head-actions{flex:0 1 auto; min-width:0; display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end}
   /* The ⋯ in the corner. No border at rest: it is the quietest thing in

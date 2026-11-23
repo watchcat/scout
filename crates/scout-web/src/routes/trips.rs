@@ -2264,6 +2264,15 @@ mod tests {
                     problems.push(format!("{at}, {}: the title has {title}px of a {column}px column", trip["name"]));
                 }
             }
+            // A finger has no hover: tapped, a code shows its name beside
+            // it, inside the window. Sixteen checks, all run.
+            let taps = &found["taps"];
+            for problem in taps["problems"].as_array().unwrap() {
+                problems.push(format!("{at}, tapped: {}", problem.as_str().unwrap()));
+            }
+            assert_eq!(taps["checked"], 16, "{at}: the taps were not all made: {taps}");
+            let shown = taps["shown"].as_str().unwrap_or_default();
+            assert!(shown.starts_with("AMS") && shown.contains("Amsterdam Airport Schiphol"), "{at}: a tapped AMS showed {shown:?}");
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
     }

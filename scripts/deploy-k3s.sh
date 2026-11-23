@@ -105,11 +105,17 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$STATE" = absent ]; then
     git archive HEAD | "${SSH[@]}" "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC && tar -x -C $REMOTE_SRC"
 
     say "Starting the build (detached; first one compiles DuckDB, ~10 min)"
-    "${SSH[@]}" "cd $REMOTE_SRC && { setsid nohup docker build -t scout:$SHA . > $BUILD_LOG 2>&1 < /dev/null & echo \$! > $BUILD_PID; } && echo '  pid' \$(cat $BUILD_PID)"
+    # SCOUT_COMMIT goes into the binary, which says it on its metrics page:
+    # the check at the end of this script.
+    "${SSH[@]}" "cd $REMOTE_SRC && { setsid nohup docker build --build-arg SCOUT_COMMIT=$SHA -t scout:$SHA . > $BUILD_LOG 2>&1 < /dev/null & echo \$! > $BUILD_PID; } && echo '  pid' \$(cat $BUILD_PID)"
     STATE=building
 fi
 
+# Whether the image this deploy ships was built by it, or by an earlier run
+# of it that this one found still building, rather than found built.
+BUILT=0
 if [ "$DRY_RUN" -eq 0 ] && [ "$STATE" = building ]; then
+    BUILT=1
     say "Watching the build"
     while :; do
         case "$(remote_state)" in
@@ -182,8 +188,19 @@ if [ "$DRY_RUN" -eq 0 ] && grep -qE '^(AWS_|RESTIC_)' .env; then
 elif [ "$DRY_RUN" -eq 1 ]; then
     echo "  (dry run) apply deploy/k8s/backup-cronjob.yaml, if its keys are set"
 fi
-step "set image scout:$SHA" \
-    && "${SSH[@]}" "kubectl -n scout set image deployment/scout scout=scout:$SHA"
+# `set image` to the name the deployment already has changes nothing, and a
+# Deployment replaces its pod only when its template changes. An image built
+# again under the name it had (after the check at the end found it was not
+# what its name said, and it was removed) is new under an old name, so the
+# pod is restarted onto it.
+if step "set image scout:$SHA (and restart the pod if it already ran that name)"; then
+    running=$("${SSH[@]}" "kubectl -n scout get deployment/scout -o jsonpath='{.spec.template.spec.containers[0].image}'")
+    "${SSH[@]}" "kubectl -n scout set image deployment/scout scout=scout:$SHA"
+    if [ "$running" = "scout:$SHA" ] && [ "$BUILT" -eq 1 ]; then
+        echo "  the deployment already ran scout:$SHA and this deploy built it again: restarting the pod onto it"
+        "${SSH[@]}" "kubectl -n scout rollout restart deployment/scout"
+    fi
+fi
 
 say "Waiting for the rollout"
 # Recreate stops the old pod before starting the new one, so this window
@@ -195,6 +212,48 @@ if step "kubectl rollout status"; then
         "${SSH[@]}" 'kubectl -n scout get pods; kubectl -n scout logs -l app=scout --tail=40' >&2
         exit 1
     fi
+fi
+
+say "Asking the pod which commit it runs"
+# The image's name says which commit it was built for, not what is in it:
+# a build of a commit older than the node's last build used to compile
+# nothing and leave that build's binary under the new name (the `touch` in
+# the Dockerfile). The binary names the commit it was compiled from on its
+# metrics page, which is asked from the node as scripts/metrics.sh asks
+# it: the port is not the internet's. The rollout has waited for the pod
+# to be ready, so only an ask that fails is tried again.
+. scripts/shipped.sh
+pod_metrics() {
+    # Single-quoted: expanded on the node.
+    "${SSH[@]}" 'ip=$(kubectl -n scout get pod -l app=scout --field-selector=status.phase=Running -o jsonpath="{.items[0].status.podIP}") && curl -fsS --max-time 10 "http://$ip:9090/metrics"'
+}
+if step "compare the pod's scout_build_info with $SHA"; then
+    why=$(shipped_check "$SHA" pod_metrics) && shipped=0 || shipped=$?
+    case "$shipped" in
+        0) echo "  it runs $SHA" ;;
+        2)
+            echo >&2
+            echo "  the rollout finished, but $why" >&2
+            echo "  ask again with: scripts/metrics.sh scout_build_info" >&2
+            exit 1 ;;
+        *)
+            echo >&2
+            echo "  the deploy was named $SHA, but $why" >&2
+            # Deploying again would find scout:$SHA built and ship it again.
+            # Only docker's copy goes: the pod's is what it starts from if it
+            # restarts before then, and the next import replaces it.
+            if [ "$BUILT" -eq 0 ]; then
+                # Found built: an earlier run of this deploy may have built it
+                # again and been cut off before restarting the pod onto it.
+                echo "  if an earlier deploy of $SHA was cut off after its build, the pod may only need restarting, on the node:" >&2
+                echo "    kubectl -n scout rollout restart deployment/scout" >&2
+                echo "  otherwise:" >&2
+            fi
+            echo "  scout:$SHA is not what its name says. Remove it from docker on the node, then deploy again:" >&2
+            echo "    docker rmi scout:$SHA" >&2
+            echo "  the deploy builds it afresh and restarts the pod onto it" >&2
+            exit 1 ;;
+    esac
 fi
 
 say "Deployed: $SHA $(git log --oneline -1 --format=%s)"

@@ -133,6 +133,14 @@ pub struct Metrics {
     /// `Store::open` first asks for it, inside `Core::start` — so this is
     /// the restart the summary counts from.
     started: Instant,
+    /// The commit the binary was built from (`scout_api::commit`), which a
+    /// deploy reads back from `scout_build_info`. On this page and not on
+    /// `/healthz`, because the commit that runs tells which published fixes
+    /// are not deployed yet, and this port is in neither the Service nor
+    /// the Ingress. Not a wall (see scout-web's `serve_metrics`:
+    /// `fetch_page` opens loopback too), but not handed to the internet
+    /// either.
+    built_from: Option<&'static str>,
     runs: Counter,
     run_duration: Histogram,
     tool_calls: Counter,
@@ -158,6 +166,7 @@ impl Default for Metrics {
     fn default() -> Self {
         Self {
             started: Instant::now(),
+            built_from: scout_api::commit(),
             runs: Counter::new(&["outcome"]),
             run_duration: Histogram::new(RUN_BUCKETS),
             tool_calls: Counter::new(&["tool", "status"]),
@@ -319,6 +328,8 @@ impl Metrics {
     /// The whole set in the Prometheus text format.
     pub fn render(&self) -> String {
         let mut out = String::new();
+        header(&mut out, "scout_build_info", "Always 1; commit is the one the binary was built from, empty for a build that named none.", "gauge");
+        out.push_str(&format!("scout_build_info{{commit=\"{}\"}} 1\n", escape(self.built_from.unwrap_or(""))));
         self.runs.render(&mut out, "scout_runs_total", "Runs, by how they ended: answered, cut_short or failed once a run has a row; busy or overloaded when it never got one.");
         self.run_duration.render(&mut out, "scout_run_duration_seconds", "How long a run took, from its row to its last word; the wait for a slot is not in it.");
         self.tool_calls.render(&mut out, "scout_tool_calls_total", "Tool calls the agents made, by tool and whether the tool answered.");
@@ -573,9 +584,23 @@ mod tests {
     }
 
     #[test]
+    fn the_page_names_the_commit_its_binary_was_built_from() {
+        // What a deploy reads back after its rollout, to know the pod runs
+        // the commit it was named for. The line is there in either case, so
+        // a binary that names none says so rather than saying nothing.
+        let named = Metrics { built_from: Some("486ec6a"), ..Metrics::default() };
+        assert_eq!(line(&named.render(), "scout_build_info"), Some("scout_build_info{commit=\"486ec6a\"} 1"));
+        let unnamed = Metrics { built_from: None, ..Metrics::default() };
+        assert_eq!(line(&unnamed.render(), "scout_build_info"), Some("scout_build_info{commit=\"\"} 1"));
+        // The process's own set takes it from the build.
+        assert_eq!(Metrics::default().built_from, scout_api::commit());
+    }
+
+    #[test]
     fn an_empty_set_still_names_every_series() {
         let page = Metrics::default().render();
         for name in [
+            "scout_build_info",
             "scout_runs_total",
             "scout_run_duration_seconds",
             "scout_tool_calls_total",

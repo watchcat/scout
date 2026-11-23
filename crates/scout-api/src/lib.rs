@@ -1,3 +1,22 @@
+/// The commit this binary was built from, as the image build names it
+/// (`SCOUT_COMMIT`, which `scripts/deploy-k3s.sh` passes), and `None` for a
+/// build that named none, as `cargo run` does. The metrics page says it as
+/// `scout_build_info`, and a deploy compares it with what it set out to
+/// ship.
+///
+/// It is read here because every other crate of the workspace depends on
+/// this one, scout-browser through scout-core (nothing makes that so but
+/// the manifests as they are). Cargo compiles a crate again when a value
+/// its `option_env!` read has changed, and then every crate that depends on
+/// it, whatever the times on their files say — so in a binary that names a
+/// commit, every workspace crate in it was compiled with that commit named;
+/// the dependencies come from the cache, as `Cargo.lock` decides them.
+/// Read anywhere higher, a crate below that one could still be the last
+/// build's.
+pub fn commit() -> Option<&'static str> {
+    option_env!("SCOUT_COMMIT").filter(|commit| !commit.is_empty())
+}
+
 /// How a piece of streamed text changed.
 ///
 /// `Replace` is not an optimisation escape hatch — it is required. The

@@ -488,6 +488,18 @@ compile locally takes hours rather than minutes. The source crosses as
 `git archive HEAD`, so a deploy refuses to run with uncommitted changes and
 nothing untracked can reach the image.
 
+A deploy ends by asking the pod which commit it runs, and fails when the
+answer is not the one it deployed. The image build names the commit
+(`--build-arg SCOUT_COMMIT`) and the binary says it on its metrics page,
+`scout_build_info{commit="<commit>"} 1`, read from the node like the rest of
+that page (`scripts/metrics.sh scout_build_info`); the site itself does not
+say which commit runs. An image's name alone proves nothing: a build of a
+commit older than the node's last build used to compile nothing and leave
+that build's binary under the new name. A rollback to a commit without
+`scripts/shipped.sh` runs that commit's script and Dockerfile, which
+neither check nor guard against this: safe while its image is still on the
+node, and the old trap again if it has to be built.
+
 **`.env` cannot be `source`d.** Values are unquoted, so a line like
 `SCOUT_MAIL_FROM=Scout <scout@example.com>` is a redirect to bash. The
 script never sources it — it pipes it to `kubectl create secret

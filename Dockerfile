@@ -2,7 +2,8 @@
 
 # Build stage. Cargo's registry and target directory live in BuildKit caches
 # instead of image layers, which is what keeps rebuilds cheap:
-#   * a source change recompiles the touched crate(s) alone (~20s)
+#   * a build compiles the workspace's own crates, all four, and no
+#     dependency unless Cargo.lock changed it (about 3 minutes on the node)
 #   * a Cargo.toml change recompiles the changed dependency alone, instead of
 #     DuckDB's C++ from scratch — that is the ~10 minute build, and touching
 #     dependencies three times in an afternoon paid it three times.
@@ -20,9 +21,28 @@ COPY crates ./crates
 # also holds `scout-browser`, which nothing calls and no image runs yet;
 # built here it would be a second binary with all of scout-core in it,
 # compiled and linked on every deploy and then left behind.
+#
+# The commit the build is of, which the binary says on its metrics page
+# (`scout_build_info`, from `scout_api::commit`). `scripts/deploy-k3s.sh`
+# names it, and a deploy compares it with what it built. Its value is part
+# of this step's cache key, so every deploy compiles, a commit that leaves
+# the crates alone too.
+ARG SCOUT_COMMIT
+# The `touch` is for cargo, which calls a crate built when none of its
+# sources is newer than its last build, whatever is in them, and the target
+# directory above is the last build's. Sent by `git archive`, every file
+# carries its commit's time, so a commit older than the moment the last
+# build here began compiling scout-api compiled nothing, and its image held
+# that build's binary: measured on the node on 2026-11-23, with a commit
+# dated a minute before the build it then followed began. A `COPY` the
+# build cache already holds keeps the times of the build that made it, so
+# the times are set here, not as the files arrive; and in this step, under
+# the target directory's lock, so they cannot be older than a build that
+# held the lock first.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    cargo build --release -p scout-telegram \
+    find crates -type f -exec touch {} + \
+    && cargo build --release -p scout-telegram \
     && cp target/release/scout-telegram /scout-telegram
 
 # Runtime stage: CA certificates (TLS itself is rustls, inside the binary)

@@ -1394,8 +1394,10 @@ test("a tapped code's name shows under it, inside the window", () => {
   // Kept 8px inside either side of the window rather than centred past it.
   assert.deepEqual(codeTipPlace(code(460, 100), tip, view), { left: 252, top: 124 })
   assert.deepEqual(codeTipPlace(code(4, 100), tip, view), { left: 8, top: 124 })
-  // Above the code where under it would run off the bottom.
+  // Above the code where under it would run off the bottom, or into the
+  // last 8px of the window.
   assert.deepEqual(codeTipPlace(code(235, 800), tip, view), { left: 130, top: 760 })
+  assert.deepEqual(codeTipPlace(code(235, 782), tip, view), { left: 130, top: 742 })
   // Under it still where above has no room either: a window shorter than
   // the code and its name together.
   assert.deepEqual(codeTipPlace(code(235, 20), tip, { width: 500, height: 70 }), { left: 130, top: 44 })

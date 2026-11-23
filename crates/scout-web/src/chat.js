@@ -1885,8 +1885,11 @@ function start() {
         const abbr = node('abbr', 'airport', part.code)
         abbr.title = airportTitle(airports.get(part.code))
         // On the code itself, not handed down from the page: Safari on a
-        // phone sends a tap's click only to an element that listens for
-        // it, and this one has to be heard before a flight option's.
+        // phone sends a tap's click to the element tapped only when it, or
+        // an element between it and the page's body, answers clicks, and a
+        // listener on the document does not count. The day chip, the trip's
+        // row and the flight option around some codes answer already; the
+        // route and the overview do not.
         abbr.addEventListener('click', tapCode)
         return abbr
       }))
@@ -1896,21 +1899,31 @@ function start() {
   // A tapped code's name, in a card beside it: one card for the page, in
   // the top layer (`popover`), so no scrolling column cuts it. Manual
   // rather than `auto` so what closes it is this code's, and a second tap
-  // on the code can close it rather than close and open it again.
+  // on the code can close it rather than close and open it again. Where
+  // the browser has no popovers, as where it has no ⋯ menu, there is no
+  // card and a tap does what it did before.
+  const tipsShow = typeof HTMLElement.prototype.showPopover === 'function'
   let codeTip = null
   let tipFor = null
   let closedFor = null
-  let lastPointer = ''
+  // The element a finger last went down on, until the click it makes.
+  let touchedOn = null
 
-  // A tap, not a mouse's click: a mouse has the hover title already, and
-  // its click on a flight option still chooses the flight. Inside a link
-  // or a button (a day chip, a trip in the list) the tap does what a tap
-  // there does, and what it opens draws the same codes, named. Inside a
-  // flight option it names the code and does not choose the flight: a
-  // reader asking where LYS is has not decided to fly through it.
+  // A finger's tap, told by the pointer that went down, not by the click:
+  // a tap's click on an iPhone says it came from a mouse (Safari 18.2 on,
+  // WebKit bug 282988), though its pointerdown says a finger. A mouse, or
+  // a pen, has the hover title already, and its click on a flight option
+  // still chooses the flight; so does a click no finger made, a screen
+  // reader's included. Inside a link or a button (a day chip, a trip in
+  // the list) the tap does what a tap there does, and what it opens draws
+  // the same codes, named. Inside a flight option it names the code and
+  // does not choose the flight: a reader asking where LYS is has not
+  // decided to fly through it.
   function tapCode(event) {
     const abbr = event.currentTarget
-    if ((event.pointerType || lastPointer) === 'mouse') return
+    const touched = touchedOn
+    touchedOn = null
+    if (!tipsShow || !(touched instanceof Node) || !abbr.contains(touched)) return
     if (abbr.closest('a, button')) return
     event.preventDefault()
     event.stopPropagation()
@@ -1925,10 +1938,8 @@ function start() {
     if (!codeTip) {
       codeTip = node('p', 'airport-tip')
       codeTip.setAttribute('popover', 'manual')
-      codeTip.setAttribute('role', 'tooltip')
       document.body.append(codeTip)
     }
-    if (typeof codeTip.showPopover !== 'function') return
     codeTip.replaceChildren(node('strong', '', abbr.textContent), ` ${abbr.title}`)
     // Measured at the window's corner, where nothing squeezes it, then put
     // where it goes.
@@ -1947,18 +1958,20 @@ function start() {
     tipFor = null
   }
 
-  // A touch anywhere but on the card closes it, before the tap's click
-  // arrives: that click opens the name of another code, or, on the same
-  // code, finds it `closedFor` and leaves it closed. Pinned to where the
-  // code was, so a scroll or a resize closes it too, as they close a ⋯
-  // menu.
+  // A pointer going down anywhere but on the card closes it, before the
+  // tap's click arrives: that click opens the name of another code, or, on
+  // the same code, finds it `closedFor` and leaves it closed. Pinned to
+  // where the code was, so a scroll or a resize closes it too, as they
+  // close a ⋯ menu.
   document.addEventListener('pointerdown', (event) => {
-    lastPointer = event.pointerType
+    touchedOn = event.pointerType === 'touch' ? event.target : null
     closedFor = null
     if (!tipFor || codeTip.contains(event.target)) return
     closedFor = tipFor
     hideCodeTip()
   }, true)
+  // A finger that went on to scroll made no tap.
+  document.addEventListener('pointercancel', () => { touchedOn = null }, true)
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') hideCodeTip()
   })
@@ -3176,8 +3189,9 @@ function start() {
   // Asks again while a check is running, so its verdict reaches the card
   // without a reload. One timer, restarted by every paint; it stops
   // itself when nothing on the trip is being checked or the tab is
-  // hidden. A tick is skipped while a menu is open or a note is being
-  // typed: a repaint would close the one and throw away the other.
+  // hidden. A tick is skipped while a menu or a tapped code's name is
+  // open or a note is being typed: a repaint would close the one and
+  // throw away the other.
   let checkTimer = null
   function watchChecks() {
     clearTimeout(checkTimer)
@@ -3186,7 +3200,7 @@ function start() {
     if (!shouldPollChecks(trip, document.hidden)) return
     checkTimer = setTimeout(async () => {
       checkTimer = null
-      const busy = tripChoicePending || tripDetail.querySelector(':popover-open, .item-note-editor, .people-address-form')
+      const busy = tripChoicePending || tipFor || tripDetail.querySelector(':popover-open, .item-note-editor, .people-address-form')
       if (!busy) await loadTrips().catch(() => {})
       watchChecks()
     }, CHECK_POLL_MS)

@@ -609,9 +609,13 @@
      (`withCodes`). No line at rest: codes fill routes, chips and the
      overview, and a browser's dotted `abbr` line under every one would be
      a page of underlines. The pointer's question mark says there is more,
-     and the code it rests on is underlined. */
+     and the code it rests on is underlined. Only where a pointer can rest:
+     a phone keeps `:hover` on whatever was tapped last, and would draw
+     this over the touch screen's own line below. */
   abbr.airport{text-decoration:none; cursor:help}
-  abbr.airport:hover{text-decoration:underline dotted; text-underline-offset:3px}
+  @media (hover: hover){
+    abbr.airport:hover{text-decoration:underline dotted; text-underline-offset:3px}
+  }
   /* Inside a day chip or a flight option the code is part of something to
      press, and the pointer says that instead. */
   a abbr.airport, label abbr.airport{cursor:inherit}
@@ -625,8 +629,11 @@
     a abbr.airport, button abbr.airport{text-decoration:none}
   }
   /* The tapped code's name. A popover, so the UA's centred box is undone
-     as the ⋯ menu's is, and `showCodeTip` writes `left` and `top`. */
-  .airport-tip{position:fixed; inset:auto; margin:0; max-width:min(320px, calc(100vw - 16px));
+     as the ⋯ menu's is, and `showCodeTip` writes `left` and `top`. Its
+     width is capped at the window's less 16px, the scrollbar not counted
+     (`100%` of a fixed box's window, where `100vw` counts it), which is
+     the room `codeTipPlace` keeps it in. */
+  .airport-tip{position:fixed; inset:auto; margin:0; max-width:min(320px, calc(100% - 16px));
     padding:8px 11px; border:1px solid var(--line); border-radius:10px; background:var(--panel);
     color:var(--base1); font-size:13px; line-height:1.4; box-shadow:0 10px 24px rgba(0,0,0,.4)}
   .airport-tip strong{margin-right:3px; color:var(--base2)}

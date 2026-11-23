@@ -189,6 +189,7 @@ fn router(cache: AdmissionCache, auth: Option<AuthState>, inbound: Option<inboun
         .route("/healthz", get(healthz))
         .route("/icon.svg", get(icon))
         .route("/theme.js", get(theme_js))
+        .route("/airports.json", get(airports_json))
         .route("/assets/trips-desktop.webp", get(trips_desktop))
         .route("/assets/trips-mobile.webp", get(trips_mobile))
         .route("/robots.txt", get(robots))
@@ -630,6 +631,15 @@ async fn theme_js() -> impl IntoResponse {
     const SCRIPT: &str = include_str!("theme.js");
     ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
       (header::CACHE_CONTROL, "public, max-age=86400")], SCRIPT)
+}
+
+/// Airport names by IATA code, which the trip page shows when the pointer
+/// rests on a code: built by `scripts/build-airports.py` from OurAirports'
+/// public-domain list, and public like the airports themselves.
+async fn airports_json() -> impl IntoResponse {
+    const TABLE: &str = include_str!("airports.json");
+    ([(header::CONTENT_TYPE, "application/json"),
+      (header::CACHE_CONTROL, "public, max-age=86400")], TABLE)
 }
 
 /// Product screenshots used by the landing page and README. They are renders
@@ -1391,6 +1401,18 @@ mod tests {
         assert_eq!(theme.status(), StatusCode::OK);
         assert_eq!(theme.headers()["content-type"], "text/javascript; charset=utf-8");
         assert_eq!(theme.headers()["cache-control"], "public, max-age=86400");
+
+        // The airport names the trip page shows on a code's hover: public,
+        // like the airports themselves, and kept a day, since the page asks
+        // for its 226 KB the first time Trips is shown on each load.
+        let airports = app.clone()
+            .oneshot(Request::builder().uri("/airports.json").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(airports.status(), StatusCode::OK);
+        assert_eq!(airports.headers()["content-type"], "application/json");
+        assert_eq!(airports.headers()["cache-control"], "public, max-age=86400");
+        let table: serde_json::Value = serde_json::from_str(&body_of(airports).await).unwrap();
+        assert_eq!(table["airports"]["VIE"][0], "Vienna International Airport");
 
         for path in ["/assets/trips-desktop.webp", "/assets/trips-mobile.webp"] {
             let shot = app.clone()

@@ -605,6 +605,16 @@
     letter-spacing:.1em; text-transform:uppercase}
   .segment-route{margin:0; color:var(--base2); font-size:22px; line-height:1.15}
   .route-arrow{padding:0 7px; color:var(--cyan); font-weight:400}
+  /* An airport's code that names the airport to a pointer resting on it
+     (`withCodes`). No line at rest: codes fill routes, chips and the
+     overview, and a browser's dotted `abbr` line under every one would be
+     a page of underlines. The pointer's question mark says there is more,
+     and the code it rests on is underlined. */
+  abbr.airport{text-decoration:none; cursor:help}
+  abbr.airport:hover{text-decoration:underline dotted; text-underline-offset:3px}
+  /* Inside a day chip or a flight option the code is part of something to
+     press, and the pointer says that instead. */
+  a abbr.airport, label abbr.airport{cursor:inherit}
   .segment-date{flex:none; margin-top:2px; color:var(--base1); font-size:13px}
   .segment-head-actions{flex:0 1 auto; min-width:0; display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end}
   /* The ⋯ in the corner. No border at rest: it is the quietest thing in

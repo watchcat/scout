@@ -746,6 +746,7 @@ scripts/deploy.sh           # compose: test, build, drain, hand over
 scripts/deploy-k3s.sh       # production: build on the node, apply, wait
 scripts/deploy-k3s.sh --dry-run # show the plan, change nothing
 scripts/check-render-chromium.sh # the renderer's live tests, against the image's Chromium
+python3 scripts/build-airports.py airports.csv # the airport names the trip page shows, from OurAirports
 ```
 
 What is being worked on, what is next and what is waiting lives in
@@ -778,3 +779,7 @@ invalidation. Only a cold cache pays the full compile.
 ## License
 
 [MIT](LICENSE) — do what you like with it.
+
+The airport names in `crates/scout-web/src/airports.json` come from
+[OurAirports](https://ourairports.com/data/), whose data is in the public
+domain.

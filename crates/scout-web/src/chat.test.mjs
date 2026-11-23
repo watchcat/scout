@@ -12,7 +12,7 @@ import {
   localToday, todayInTrip, todayPositions, composeLabel,
   moveBody, warningBody, tripDays, dayChipDraggable, shouldPollChecks,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
-  pendingRowsFor, freeRuns, freeDaysLine, freeDaysParts, stackRows, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
+  pendingRowsFor, freeRuns, freeDaysLine, freeDaysParts, stackRows, airportTitle, codeParts, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody, handOverQuestion, handOverRefusal, tripAddressProblem, bookingAddress,
   ITINERARY_NOTE,
   CONFIRM_ARM_MS,
@@ -1363,4 +1363,49 @@ test('a free card is for days away and on the ground', () => {
     { position: 2, kind: 'activity', title: 'Walk', date: '2026-10-15' },
   ] }
   assert.equal(stackRows(walks, []).filter((row) => row.kind === 'free').length, 1)
+})
+
+test('an airport code is named in full, where it is', () => {
+  // Where the name says the city, the country alone; where it does not,
+  // the city too.
+  assert.equal(airportTitle(['Vienna International Airport', '', 'AT'], 'en-US'), 'Vienna International Airport · Austria')
+  assert.equal(airportTitle(['Zvartnots International Airport', 'Yerevan', 'AM'], 'en-US'), 'Zvartnots International Airport · Yerevan, Armenia')
+  // The country in the reader's language.
+  assert.equal(airportTitle(['Düsseldorf Airport', '', 'DE'], 'de-DE'), 'Düsseldorf Airport · Deutschland')
+})
+
+test('the codes in a line are the known three-letter words standing alone', () => {
+  const known = (code) => ['AMS', 'EVN', 'LYS', 'VIE', 'DUS'].includes(code)
+  assert.deepEqual(codeParts('21:40 AMS → EVN', known), ['21:40 ', { code: 'AMS' }, ' → ', { code: 'EVN' }])
+  assert.deepEqual(codeParts('1 stop · 1h 30m at LYS', known), ['1 stop · 1h 30m at ', { code: 'LYS' }])
+  assert.deepEqual(codeParts('segment 2 (EVN→AMS) still has', known), ['segment 2 (', { code: 'EVN' }, '→', { code: 'AMS' }, ') still has'])
+  // Not a code: one the table does not name, one inside a longer word or
+  // a flight number, or lower case.
+  assert.deepEqual(codeParts('XYZ VIENNA TO7501 dus', known), ['XYZ VIENNA TO7501 dus'])
+  assert.deepEqual(codeParts('', known), [])
+})
+
+test('the airport table names every code it has, with its country', () => {
+  const { source, airports } = JSON.parse(readFileSync(new URL('./airports.json', import.meta.url), 'utf8'))
+  assert.match(source, /OurAirports/)
+  for (const code of ['AMS', 'VIE', 'DUS', 'EVN', 'LYS', 'IST', 'MRV', 'LIS', 'LON', 'NYC']) {
+    assert.ok(airports[code], `${code} is not in the table`)
+  }
+  for (const [code, entry] of Object.entries(airports)) {
+    assert.match(code, /^[A-Z]{3}$/)
+    assert.equal(entry.length, 3, code)
+    assert.ok(entry[0], `${code} has no name`)
+    assert.match(entry[2], /^[A-Z]{2}$/, `${code}'s country`)
+  }
+})
+
+test('a decision names what is still to book apart, so its titles are not taken for codes', () => {
+  const trip = { readiness: { state: 'not_ready', reason: 'segment 2 (EVN→AMS) still has 2 options and none chosen.' },
+    items: [{ kind: 'flight' }, { kind: 'flight' }], to_book: ['ACE Hotel'] }
+  const alert = readinessAlert(trip)
+  assert.equal(alert.booking, 'ACE Hotel is not booked yet.')
+  assert.ok(alert.text.endsWith(alert.booking), alert.text)
+  assert.ok(alert.text.startsWith('segment 2 (EVN→AMS)'), alert.text)
+  // Nothing to book, nothing apart.
+  assert.equal(readinessAlert({ ...trip, to_book: [] }).booking, undefined)
 })

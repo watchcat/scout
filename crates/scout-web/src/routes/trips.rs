@@ -2264,6 +2264,22 @@ mod tests {
                     problems.push(format!("{at}, {}: the title has {title}px of a {column}px column", trip["name"]));
                 }
             }
+            // A finger has no hover: tapped, a code shows its name beside
+            // it, inside the window, as an iPhone taps and as an Android
+            // phone does; a click that is no tap (a mouse's, a pen's, one
+            // no finger made) does what it did. Every check run: 30 for
+            // each phone, 6 for the clicks.
+            for (way, checks) in [("iphone", 30), ("android", 30), ("clicks", 6)] {
+                let taps = &found["taps"][way];
+                for problem in taps["problems"].as_array().unwrap() {
+                    problems.push(format!("{at}, {way}: {}", problem.as_str().unwrap()));
+                }
+                assert_eq!(taps["checked"], checks, "{at}, {way}: the taps were not all made: {taps}");
+                if way != "clicks" {
+                    let shown = taps["shown"].as_str().unwrap_or_default();
+                    assert!(shown.starts_with("AMS") && shown.contains("Amsterdam Airport Schiphol"), "{at}, {way}: a tapped AMS showed {shown:?}");
+                }
+            }
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
     }

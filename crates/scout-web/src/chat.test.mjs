@@ -12,7 +12,7 @@ import {
   localToday, todayInTrip, todayPositions, composeLabel,
   moveBody, warningBody, tripDays, dayChipDraggable, shouldPollChecks,
   traceLines, applyTraceFrame, traceDuration, isDebugCommand, keepFailedTurn,
-  pendingRowsFor, freeRuns, freeDaysLine, freeDaysParts, stackRows, airportTitle, codeParts, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
+  pendingRowsFor, freeRuns, freeDaysLine, freeDaysParts, stackRows, airportTitle, codeParts, codeTipPlace, fingerReaches, otherMailLines, otherMailDeleteLabel, handleProblem, readinessAlert,
   peopleLine, addedLabel, linkStateLine, tripBody, removePersonBody, handOverQuestion, handOverRefusal, tripAddressProblem, bookingAddress,
   ITINERARY_NOTE,
   CONFIRM_ARM_MS,
@@ -1383,6 +1383,41 @@ test('the codes in a line are the known three-letter words standing alone', () =
   // a flight number, or lower case.
   assert.deepEqual(codeParts('XYZ VIENNA TO7501 dus', known), ['XYZ VIENNA TO7501 dus'])
   assert.deepEqual(codeParts('', known), [])
+})
+
+test("a tapped code's name shows under it, inside the window", () => {
+  const view = { width: 500, height: 844 }
+  const tip = { width: 240, height: 34 }
+  const code = (left, top) => ({ left, right: left + 30, top, bottom: top + 18 })
+  // Centred under the code, 6px below it.
+  assert.deepEqual(codeTipPlace(code(235, 100), tip, view), { left: 130, top: 124 })
+  // Kept 8px inside either side of the window rather than centred past it.
+  assert.deepEqual(codeTipPlace(code(460, 100), tip, view), { left: 252, top: 124 })
+  assert.deepEqual(codeTipPlace(code(4, 100), tip, view), { left: 8, top: 124 })
+  // Above the code where under it would run off the bottom, or into the
+  // last 8px of the window.
+  assert.deepEqual(codeTipPlace(code(235, 800), tip, view), { left: 130, top: 760 })
+  assert.deepEqual(codeTipPlace(code(235, 782), tip, view), { left: 130, top: 742 })
+  // Under it still where above has no room either: a window shorter than
+  // the code and its name together.
+  assert.deepEqual(codeTipPlace(code(235, 20), tip, { width: 500, height: 70 }), { left: 130, top: 44 })
+  // A name wider than the window starts at its left margin; the page caps
+  // the card's width so it is not.
+  assert.equal(codeTipPlace(code(235, 100), { width: 600, height: 34 }, view).left, 8)
+})
+
+test('a finger on a code, or within reach of it, is tapping it', () => {
+  const code = { left: 100, right: 130, top: 50, bottom: 68 }
+  assert.equal(fingerReaches({ x: 115, y: 59 }, code, 10), true)
+  // A near miss the browser moves the click of: 10px off any side.
+  assert.equal(fingerReaches({ x: 140, y: 59 }, code, 10), true)
+  assert.equal(fingerReaches({ x: 90, y: 40 }, code, 10), true)
+  assert.equal(fingerReaches({ x: 115, y: 78 }, code, 10), true)
+  // Past it: another tap, somewhere else.
+  assert.equal(fingerReaches({ x: 141, y: 59 }, code, 10), false)
+  assert.equal(fingerReaches({ x: 115, y: 39 }, code, 10), false)
+  assert.equal(fingerReaches({ x: 89, y: 59 }, code, 10), false)
+  assert.equal(fingerReaches({ x: 115, y: 79 }, code, 10), false)
 })
 
 test('the airport table names every code it has, with its country', () => {

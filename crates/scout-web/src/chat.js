@@ -786,6 +786,34 @@ export function codeParts(text, known) {
   return parts
 }
 
+// Whether a finger that went down at `point` was on `rect`, or near
+// enough that the click the browser sends after it, moved onto what it
+// took the finger to mean, is its click: an iPhone moves a near miss's
+// click onto the nearest thing that answers clicks, where nothing under
+// the finger does, and leaves its pointerdown where the finger was.
+// (Chrome moves the pointerdown with the click, which is then on the
+// code.) `reach` in the window's pixels.
+export function fingerReaches(point, rect, reach) {
+  return point.x >= rect.left - reach && point.x <= rect.right + reach &&
+    point.y >= rect.top - reach && point.y <= rect.bottom + reach
+}
+
+// Where the name of a code tapped on a touch screen shows: under the code,
+// centred on it and kept 8px inside the window; above it where under would
+// run off the bottom and above has the room. `code` is the code's
+// rectangle, `tip` the name's size, `view` the window's, all in the
+// window's pixels.
+export function codeTipPlace(code, tip, view) {
+  const gap = 6
+  const margin = 8
+  const centre = (code.left + code.right) / 2
+  const left = Math.max(margin, Math.min(centre - tip.width / 2, view.width - margin - tip.width))
+  const below = code.bottom + gap
+  const above = code.top - gap - tip.height
+  const fitsBelow = below + tip.height <= view.height - margin
+  return { left, top: fitsBelow || above < margin ? below : above }
+}
+
 export function tripLoadIsCurrent(request, current, choicePending) {
   return request === current && !choicePending
 }
@@ -1811,6 +1839,7 @@ function start() {
     tripsTab.setAttribute('aria-pressed', String(showingTrips))
     menuButton.hidden = showingTrips
     if (mirrorButton) mirrorButton.hidden = showingTrips
+    hideCodeTip()
     if (showingTrips) loadAirports()
     if (showingTrips && !tripsLoaded) loadTrips().catch(() => {})
     // The trips were painted while this tab was hidden; now it can be seen.
@@ -1842,12 +1871,11 @@ function start() {
   }
 
   // Marks an element whose text is built from airport codes, so each code
-  // the table knows says what it is to a pointer resting on it: an
-  // `<abbr>` with the airport's name as its title, which a browser shows
-  // on hover. Nothing shows on a touch screen, a phone in Telegram
-  // included, where there is no hover. Only marked elements, never the
-  // trip's free text: "THE" in a hotel's name is no airport, though it is
-  // one in Teresina.
+  // the table knows says what it is: an `<abbr>` with the airport's name as
+  // its title, which a browser shows to a pointer resting on it, and which
+  // a tap on a touch screen, where nothing rests, shows beside the code
+  // (`tapCode`). Only marked elements, never the trip's free text: "THE"
+  // in a hotel's name is no airport, though it is one in Teresina.
   function withCodes(el) {
     el.dataset.codes = ''
     nameCodes(el)
@@ -1868,10 +1896,111 @@ function start() {
         if (typeof part === 'string') return part
         const abbr = node('abbr', 'airport', part.code)
         abbr.title = airportTitle(airports.get(part.code))
+        // On the code itself, not handed down from the page: Safari on a
+        // phone sends a tap's click to the element tapped only when it, or
+        // an element between it and the page's body, answers clicks, and a
+        // listener on the document does not count. The day chip, the trip's
+        // row and the flight option around some codes answer already; the
+        // route and the overview do not.
+        abbr.addEventListener('click', tapCode)
         return abbr
       }))
     }
   }
+
+  // A tapped code's name, in a card beside it: one card for the page, in
+  // the top layer (`popover`), so no scrolling column cuts it. Manual
+  // rather than `auto` so what closes it is this code's, and a second tap
+  // on the code can close it rather than close and open it again. Where
+  // the browser has no popovers, as where it has no ⋯ menu, there is no
+  // card and a tap does what it did before.
+  const tipsShow = typeof HTMLElement.prototype.showPopover === 'function'
+  let codeTip = null
+  let tipFor = null
+  let closedFor = null
+  // Where a finger last went down, and on what, until the click it makes.
+  let touched = null
+  // How far from a code a finger may land and still be tapping it: about
+  // half a fingertip, for the browser's own nudge of a near miss.
+  const FINGER_REACH = 10
+
+  // A finger's tap, told by the pointer that went down, not by the click:
+  // a tap's click on an iPhone says it came from a mouse (Safari 18.2 on,
+  // WebKit bug 282988), though its pointerdown says a finger. The finger
+  // went down on the code or within `FINGER_REACH` of it (`fingerReaches`).
+  // A mouse has the hover title already, and its click on a flight option
+  // still chooses the flight; so does a click no finger made, a screen
+  // reader's included, and a pen's, taken for a mouse's because most pens
+  // can hover (an Apple Pencil that cannot gets neither the title nor the
+  // card). Inside a link or a button (a day chip, a trip in
+  // the list) the tap does what a tap there does, and what it opens draws
+  // the same codes, named. Inside a flight option it names the code and
+  // does not choose the flight: a reader asking where LYS is has not
+  // decided to fly through it.
+  function tapCode(event) {
+    const abbr = event.currentTarget
+    const finger = touched
+    touched = null
+    if (!tipsShow || !finger) return
+    const on = finger.target instanceof Node && abbr.contains(finger.target)
+    if (!on && !fingerReaches(finger, abbr.getBoundingClientRect(), FINGER_REACH)) return
+    if (abbr.closest('a, button')) return
+    event.preventDefault()
+    event.stopPropagation()
+    if (closedFor === abbr) {
+      closedFor = null
+      return
+    }
+    showCodeTip(abbr)
+  }
+
+  function showCodeTip(abbr) {
+    if (!codeTip) {
+      codeTip = node('p', 'airport-tip')
+      codeTip.setAttribute('popover', 'manual')
+      document.body.append(codeTip)
+    }
+    codeTip.replaceChildren(node('strong', '', abbr.textContent), ` ${abbr.title}`)
+    // Measured at the window's corner, where nothing squeezes it, then put
+    // where it goes.
+    codeTip.style.left = '0px'
+    codeTip.style.top = '0px'
+    if (!codeTip.matches(':popover-open')) codeTip.showPopover()
+    const view = { width: document.documentElement.clientWidth, height: window.innerHeight }
+    const at = codeTipPlace(abbr.getBoundingClientRect(), codeTip.getBoundingClientRect(), view)
+    codeTip.style.left = `${at.left}px`
+    codeTip.style.top = `${at.top}px`
+    tipFor = abbr
+  }
+
+  function hideCodeTip() {
+    if (codeTip?.matches(':popover-open')) codeTip.hidePopover()
+    tipFor = null
+  }
+
+  // A pointer going down anywhere but on the card closes it, before the
+  // tap's click arrives: that click opens the name of another code, or, on
+  // the same code, finds it `closedFor` and leaves it closed. Pinned to
+  // where the code was, so a scroll or a resize closes it too, as they
+  // close a ⋯ menu.
+  document.addEventListener('pointerdown', (event) => {
+    touched = event.pointerType === 'touch' ? { target: event.target, x: event.clientX, y: event.clientY } : null
+    closedFor = null
+    if (!tipFor || codeTip.contains(event.target)) return
+    closedFor = tipFor
+    hideCodeTip()
+  }, true)
+  // A finger that went on to scroll made no tap, and one whose click went
+  // to something else is done: left to stand, it would make a later click
+  // that no finger made, on a code within reach of where it was, a tap.
+  // On the way back up, so a code's own listener has read it first.
+  document.addEventListener('pointercancel', () => { touched = null }, true)
+  document.addEventListener('click', () => { touched = null })
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') hideCodeTip()
+  })
+  window.addEventListener('scroll', () => { if (tipFor) hideCodeTip() }, { capture: true, passive: true })
+  window.addEventListener('resize', () => { if (tipFor) hideCodeTip() })
 
   async function loadTrips() {
     // A selection response carries the authoritative post-write trip. Do not
@@ -2544,6 +2673,8 @@ function start() {
     // a load, a click in the list, a saved choice — so this is the one
     // place that has to run whichever of those happened.
     updateComposeTarget()
+    // The code a showing name was for is about to be drawn again, elsewhere.
+    hideCodeTip()
     if (!trip) {
       showTripEmpty(
         trips.length ? 'Choose a trip' : 'No trips yet',
@@ -3082,8 +3213,9 @@ function start() {
   // Asks again while a check is running, so its verdict reaches the card
   // without a reload. One timer, restarted by every paint; it stops
   // itself when nothing on the trip is being checked or the tab is
-  // hidden. A tick is skipped while a menu is open or a note is being
-  // typed: a repaint would close the one and throw away the other.
+  // hidden. A tick is skipped while a menu or a tapped code's name is
+  // open or a note is being typed: a repaint would close the one and
+  // throw away the other.
   let checkTimer = null
   function watchChecks() {
     clearTimeout(checkTimer)
@@ -3092,7 +3224,7 @@ function start() {
     if (!shouldPollChecks(trip, document.hidden)) return
     checkTimer = setTimeout(async () => {
       checkTimer = null
-      const busy = tripChoicePending || tripDetail.querySelector(':popover-open, .item-note-editor, .people-address-form')
+      const busy = tripChoicePending || tipFor || tripDetail.querySelector(':popover-open, .item-note-editor, .people-address-form')
       if (!busy) await loadTrips().catch(() => {})
       watchChecks()
     }, CHECK_POLL_MS)

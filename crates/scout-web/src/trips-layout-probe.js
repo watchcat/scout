@@ -8,15 +8,35 @@
 // width beside the column's, what its free-day cards say, and the names
 // its airport codes show.
 //
+// Then it taps airport codes on the trip named `TAPPED` the way a phone
+// does and reports what showed (`taps`): as an iPhone taps and as an
+// Android phone does, which differ (`tap`), and last with the clicks that
+// are no tap, a mouse's, a pen's and one no finger made.
+//
 // Served as a file of its own because the page's policy runs no inline
-// script, and a plain one, so it is running before the page's module is.
+// script, and a plain one, so it is running before the page's module is:
+// early enough to see every request the page sends that is not a read.
+
+const TAPPED = 'Amsterdam to Yerevan'
+const writes = []
+const pageFetch = window.fetch
+window.fetch = (input, init) => {
+  if ((init?.method ?? 'GET').toUpperCase() !== 'GET') writes.push(String(input))
+  return pageFetch(input, init)
+}
+const pause = (ms) => new Promise((done) => setTimeout(done, ms))
+// Up to 4 s of the page's time, which stands still while a request is
+// on its way: a wait that fails has to leave room in the 20 s Chrome
+// gives the page (`laid_out`) for the findings to be written.
+const until = async (ok) => {
+  for (let i = 0; i < 160 && !ok(); i++) await pause(25)
+  return ok()
+}
+const titled = (name) => () => document.querySelector('#trip-detail .trip-title')?.textContent === name
+const listed = (name) => [...document.querySelectorAll('.trip-list button')]
+  .find((one) => one.querySelector('.trip-list-name')?.textContent === name)
 
 addEventListener('load', async () => {
-  const pause = (ms) => new Promise((done) => setTimeout(done, ms))
-  const until = async (ok) => {
-    for (let i = 0; i < 400 && !ok(); i++) await pause(25)
-    return ok()
-  }
   const report = { width: innerWidth, trips: [] }
   document.getElementById('view-trips').click()
   if (!(await until(() => document.querySelector('#trip-detail .trip-head')))) {
@@ -38,8 +58,234 @@ addEventListener('load', async () => {
     await pause(50)
     report.trips.push(measure(name))
   }
+  report.taps = {}
+  for (const phone of ['iphone', 'android']) {
+    listed(TAPPED)?.click()
+    report.taps[phone] = (await until(titled(TAPPED)))
+      ? await taps(phone)
+      : { checked: 0, problems: [`${TAPPED} could not be shown to tap on`] }
+  }
+  report.taps.clicks = await clicksOnAnOption()
   document.documentElement.dataset.layout = JSON.stringify(report)
 })
+
+// A tap as a phone's browser sends one: the pointer's down and up from a
+// finger, then the click. An iPhone's click says it came from a mouse
+// (Safari 18.2 on: WebKit bug 282988, fixed and the fix reverted); an
+// Android phone's says a finger. `phone` 'mouse' and 'pen' are a mouse's
+// click and a pen's. Returns whether the click was let through
+// (`dispatchEvent`'s answer: false when the page prevented its default).
+function tap(el, phone) {
+  const rect = el.getBoundingClientRect()
+  return tapAt(el, rect.left + rect.width / 2, rect.top + rect.height / 2, phone)
+}
+
+// The same, with the finger down at `x`, `y` and the click on `el`: a
+// near miss whose click the browser moves onto `el`, or a touch somewhere
+// else before a click on `el` that no finger made there.
+function tapAt(el, x, y, phone) {
+  const at = (pointerType) => ({
+    bubbles: true, cancelable: true, composed: true, isPrimary: true, pointerType, clientX: x, clientY: y,
+  })
+  const press = ['mouse', 'pen'].includes(phone) ? phone : 'touch'
+  const under = document.elementFromPoint(x, y) ?? document.body
+  under.dispatchEvent(new PointerEvent('pointerdown', at(press)))
+  under.dispatchEvent(new PointerEvent('pointerup', at(press)))
+  return el.dispatchEvent(new PointerEvent('click', at({ android: 'touch', pen: 'pen' }[phone] ?? 'mouse')))
+}
+
+const tip = () => document.querySelector('.airport-tip:popover-open')
+// Into view first, and past the scroll that moved it, which closes a name
+// that is showing.
+const ready = async (el) => {
+  el.scrollIntoView({ block: 'center' })
+  await pause(100)
+}
+
+// Taps, as `phone` taps, on the shown trip's codes: one in the segment's
+// route, one inside a flight option not chosen, one in a day chip, one in
+// another trip's row in the list; and a mouse's click on the route's.
+// Each check that fails is a problem; `checked` counts the checks run, so
+// a probe that ran none does not pass for one that found nothing wrong.
+async function taps(phone) {
+  const found = { checked: 0, problems: [] }
+  const check = (ok, problem) => {
+    found.checked++
+    if (!ok) found.problems.push(problem)
+  }
+
+  // Looked up afresh each time: a redraw of the trip draws a new one, and
+  // a tap on the old one, no longer on the page, reaches nothing.
+  const routeCode = () => document.querySelector('#trip-detail .segment-route abbr.airport')
+  const route = routeCode()
+  if (!route) return { checked: 0, problems: ['no segment route has a named code'] }
+  await ready(route)
+  tap(route, phone)
+  const shown = tip()
+  check(shown, `a tap on ${route.textContent} in the route showed nothing`)
+  if (shown) {
+    found.shown = shown.textContent
+    const box = shown.getBoundingClientRect()
+    const code = route.getBoundingClientRect()
+    const width = document.documentElement.clientWidth
+    check(box.left >= 0 && box.right <= width && box.top >= 0 && box.bottom <= innerHeight,
+      `the name spans ${Math.round(box.left)}–${Math.round(box.right)} × ${Math.round(box.top)}–${Math.round(box.bottom)} in a ${width}×${innerHeight} window`)
+    check(box.top >= code.bottom - 0.5 || box.bottom <= code.top + 0.5, 'the name covers the code it names')
+    check(box.left <= code.right && box.right >= code.left, 'the name is not beside the code it names')
+  }
+  tap(route, phone)
+  check(!tip(), 'a second tap on the same code left its name showing')
+
+  // Shown, then closed by each of the things that close it. Asked whether
+  // it showed first, so a name that never opened does not pass for one
+  // that closed.
+  const closes = async (what, act) => {
+    await ready(routeCode())
+    tap(routeCode(), phone)
+    check(tip(), `a tap on ${route.textContent} did not show its name before ${what}`)
+    await act()
+    check(!tip(), `${what} left the name showing`)
+  }
+  await closes('a tap elsewhere', () => {
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch' }))
+  })
+  await closes('Escape', () => {
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  })
+  await closes('a scroll', () => {
+    document.getElementById('trip-detail').dispatchEvent(new Event('scroll'))
+  })
+  await closes('a resize', () => {
+    window.dispatchEvent(new Event('resize'))
+  })
+  // Clicked, not tapped, so nothing but the redraw and the tab can close it.
+  await closes('a redraw of the trip', () => {
+    listed(TAPPED).click()
+  })
+  await closes('a change of tab', async () => {
+    document.getElementById('view-chat').click()
+    document.getElementById('view-trips').click()
+    await until(titled(TAPPED))
+  })
+
+  // A near miss, 6px past the code's end, whose click the browser moves
+  // onto the code, is a tap on it; a finger 60px under it is not.
+  {
+    const code = routeCode()
+    await ready(code)
+    const rect = code.getBoundingClientRect()
+    tapAt(code, rect.right + 6, rect.top + rect.height / 2, phone)
+    check(tip(), `a tap 6px past ${code.textContent} did not name it`)
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch' }))
+    tapAt(code, rect.left + rect.width / 2, rect.bottom + 60, phone)
+    check(!tip(), `a finger 60px under ${code.textContent} named it`)
+  }
+
+  // In a flight option the code is named and the flight is not chosen.
+  const option = document.querySelector('#trip-detail .flight-option:not(.selected) abbr.airport')
+  check(option, 'no flight option that is not chosen has a named code')
+  if (option) {
+    await ready(option)
+    const before = writes.length
+    const through = tap(option, phone)
+    check(tip()?.textContent.startsWith(option.textContent), `a tap on ${option.textContent} in a flight option did not name it`)
+    check(!through && writes.length === before, `a tap on ${option.textContent} in a flight option chose the flight: ${writes.slice(before)}`)
+    check(!option.closest('.flight-option').classList.contains('selected'), 'the flight option was marked chosen')
+    tap(option, phone)
+  }
+
+  // A day chip's code is part of the chip: a tap does what a tap on the
+  // chip does, moving to the chip's card, and names nothing.
+  const chip = document.querySelector('#trip-detail a.day-chip abbr.airport')
+  check(chip, 'no day chip has a named code')
+  if (chip) {
+    await ready(chip)
+    tap(chip, phone)
+    check(!tip(), `a tap on ${chip.textContent} in a day chip named it`)
+    const card = chip.closest('a').hash.slice(1)
+    check(document.activeElement?.id === card, `a tap on ${chip.textContent} in a day chip did not move to ${card}`)
+  }
+
+  // So is a trip's row in the list: a tap on its code opens that trip.
+  const row = [...document.querySelectorAll('.trip-list button')]
+    .find((one) => one.querySelector('.trip-list-name')?.textContent !== TAPPED && one.querySelector('abbr.airport'))
+  check(row, 'no other trip in the list has a named code')
+  if (row) {
+    const name = row.querySelector('.trip-list-name').textContent
+    tap(row.querySelector('abbr.airport'), phone)
+    check(await until(titled(name)), `a tap on a code in ${name}'s row did not open it`)
+    check(!tip(), `a tap on a code in ${name}'s row named it`)
+    listed(TAPPED).click()
+    await until(titled(TAPPED))
+  }
+
+  // A mouse has the hover title: its click shows nothing and goes on as
+  // any click does.
+  await ready(routeCode())
+  const through = tap(routeCode(), 'mouse')
+  check(!tip() && through, 'a mouse click on a code showed its name, or was stopped, as a tap is')
+  return found
+}
+
+// Clicks that are no tap, on a code in a flight option, choose the flight
+// as a click anywhere on the option does: a mouse's, a pen's, and one no
+// finger made, as a screen reader's is, whether a finger tapped that code
+// before it, tapped just beside it, or went down on it and went on to
+// scroll. Last, because each
+// sends the choice; the app refuses it (`signed_in_site`; a 400 in every
+// window, measured), and nothing is measured after it.
+async function clicksOnAnOption() {
+  const found = { checked: 0, problems: [] }
+  const check = (ok, problem) => {
+    found.checked++
+    if (!ok) found.problems.push(problem)
+  }
+  listed(TAPPED)?.click()
+  await until(titled(TAPPED))
+  const optionCode = () => document.querySelector('#trip-detail .flight-option:not(.selected) abbr.airport')
+  check(optionCode(), 'no flight option that is not chosen has a named code')
+  if (!optionCode()) return found
+  await ready(optionCode())
+  const chooses = async (what, click) => {
+    const before = writes.length
+    click(optionCode())
+    check(await until(() => writes.slice(before).some((url) => url.endsWith('/chat/trips/choice'))),
+      `${what} on ${optionCode().textContent} in a flight option did not choose it: ${writes.slice(before)}`)
+    // Settled, refused, before the next: a choice while one is on its way
+    // is dropped (`chooseFlight`).
+    await until(() => !document.getElementById('trip-detail').hasAttribute('aria-busy'))
+  }
+  const bare = (el) => el.dispatchEvent(new PointerEvent('click', { bubbles: true, cancelable: true, composed: true }))
+  await chooses('a click no finger made, after a finger tapped it twice', (el) => {
+    tap(el, 'iphone')
+    tap(el, 'iphone')
+    bare(el)
+  })
+  // A finger 6px above the code, on the option's time: its click goes to
+  // the option, which chooses the flight, and is waited out first.
+  {
+    const rect = optionCode().getBoundingClientRect()
+    const x = rect.left + rect.width / 2
+    const y = rect.top - 6
+    const under = document.elementFromPoint(x, y) ?? document.body
+    const at = (pointerType) => ({ bubbles: true, cancelable: true, composed: true, isPrimary: true, pointerType, clientX: x, clientY: y })
+    under.dispatchEvent(new PointerEvent('pointerdown', at('touch')))
+    under.dispatchEvent(new PointerEvent('pointerup', at('touch')))
+    under.dispatchEvent(new PointerEvent('click', at('mouse')))
+    await until(() => !document.getElementById('trip-detail').hasAttribute('aria-busy'))
+  }
+  await chooses('a click no finger made, after a finger tapped 6px above it', bare)
+  await chooses('a click no finger made, after a finger went down on it and scrolled', (el) => {
+    const rect = el.getBoundingClientRect()
+    const at = { bubbles: true, pointerType: 'touch', clientX: rect.left + 2, clientY: rect.top + 2 }
+    el.dispatchEvent(new PointerEvent('pointerdown', at))
+    el.dispatchEvent(new PointerEvent('pointercancel', at))
+    bare(el)
+  })
+  await chooses("a pen's click", (el) => tap(el, 'pen'))
+  await chooses("a mouse's click", (el) => tap(el, 'mouse'))
+  return found
+}
 
 // The nearest box above `el` that clips it sideways: one that scrolls,
 // or hides, on the x axis. A box with `overflow-y` set clips x as well.

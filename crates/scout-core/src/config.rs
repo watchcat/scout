@@ -81,6 +81,11 @@ pub struct Config {
     /// "from $299"), so its rows arrive labelled. 1,000 free requests,
     /// then $0.002 each.
     pub ignav_api_key: Option<String>,
+    /// The browser pod, which renders the pages a plain request cannot
+    /// read: `SCOUT_BROWSER_URL`, like `http://scout-browser:8091`. Unset,
+    /// a render starts a Chrome of this process's own, as a local run does.
+    /// Set, no Chrome is started here for a render, whatever the pod does.
+    pub browser_url: Option<url::Url>,
 }
 
 impl Config {
@@ -167,6 +172,20 @@ impl Config {
             (None, None) => None,
             _ => bail!("BOL_CLIENT_ID and BOL_CLIENT_SECRET must be set together"),
         };
+        // A wrong one stops the process here rather than quietly rendering
+        // with a Chrome of Scout's own, which would put the browser back in
+        // the pod it was taken out of.
+        let browser_url = match non_empty("SCOUT_BROWSER_URL") {
+            None => None,
+            Some(given) => {
+                let given = given.trim();
+                let url = url::Url::parse(given).with_context(|| format!("SCOUT_BROWSER_URL is not a web address: {given}"))?;
+                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
+                    bail!("SCOUT_BROWSER_URL must be an http address with a host, like http://scout-browser:8091, not {given}");
+                }
+                Some(url)
+            }
+        };
         let ebay_credentials = match (non_empty("EBAY_CLIENT_ID"), non_empty("EBAY_CLIENT_SECRET")) {
             (Some(id), Some(secret)) => Some((id, secret)),
             (None, None) => None,
@@ -247,6 +266,7 @@ impl Config {
             duffel_markup_rate,
             duffel_links_enabled,
             ignav_api_key: non_empty("IGNAV_API_KEY"),
+            browser_url,
             invite_daily_requests,
             pdftoppm: non_empty("SCOUT_PDFTOPPM").unwrap_or_else(|| "pdftoppm".to_string()),
         })
@@ -350,6 +370,24 @@ mod tests {
 
     fn load(env: &HashMap<&str, &str>) -> Result<Config> {
         Config::from_lookup(|k| env.get(k).map(|v| v.to_string()))
+    }
+
+    #[test]
+    fn the_browser_pod_is_a_web_address_or_nothing() {
+        assert_eq!(load(&base_env()).unwrap().browser_url, None);
+        let mut env = base_env();
+        env.insert("SCOUT_BROWSER_URL", "  ");
+        assert_eq!(load(&env).unwrap().browser_url, None);
+        env.insert("SCOUT_BROWSER_URL", " http://scout-browser:8091 ");
+        assert_eq!(load(&env).unwrap().browser_url.map(String::from).as_deref(), Some("http://scout-browser:8091/"));
+        // Each of these is a setting gone wrong, and quietly rendering
+        // with a Chrome of Scout's own instead would put the browser back
+        // in the pod it was taken out of.
+        for wrong in ["scout-browser:8091", "ftp://scout-browser/", "file:///tmp/pod", "not an address", "http://"] {
+            env.insert("SCOUT_BROWSER_URL", wrong);
+            let err = load(&env).unwrap_err().to_string();
+            assert!(err.contains("SCOUT_BROWSER_URL"), "{wrong}: {err}");
+        }
     }
 
     #[test]

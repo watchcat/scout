@@ -2094,7 +2094,11 @@ mod tests {
         Some(crate::tools::browser::Renderer::answering(html))
     }
 
-    /// A browser that never answers: it will not start.
+    /// A browser that comes back with no page. Its Chrome would not start,
+    /// but the mock is on loopback, so the render's own check refuses the
+    /// address first; `fetch_page` takes every failed render alike, and
+    /// that is what these tests are about. (`watch.rs` has one that gets as
+    /// far as not starting.)
     fn silent() -> Option<crate::tools::browser::Renderer> {
         Some(crate::tools::browser::Renderer::new(std::path::PathBuf::from("/definitely/not/chrome")))
     }

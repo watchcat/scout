@@ -179,9 +179,12 @@ impl Config {
             None => None,
             Some(given) => {
                 let given = given.trim();
+                // An http address always has a host, or does not parse. What
+                // is asked is `render` beside its root, so a path, a query
+                // or a sign-in in it would be lost or sent somewhere.
                 let url = url::Url::parse(given).with_context(|| format!("SCOUT_BROWSER_URL is not a web address: {given}"))?;
-                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
-                    bail!("SCOUT_BROWSER_URL must be an http address with a host, like http://scout-browser:8091, not {given}");
+                if !matches!(url.scheme(), "http" | "https") || url.path() != "/" || url.query().is_some() || url.fragment().is_some() || !url.username().is_empty() || url.password().is_some() {
+                    bail!("SCOUT_BROWSER_URL must be an http address and port alone, like http://scout-browser:8091, not {given}");
                 }
                 Some(url)
             }
@@ -383,7 +386,19 @@ mod tests {
         // Each of these is a setting gone wrong, and quietly rendering
         // with a Chrome of Scout's own instead would put the browser back
         // in the pod it was taken out of.
-        for wrong in ["scout-browser:8091", "ftp://scout-browser/", "file:///tmp/pod", "not an address", "http://"] {
+        env.insert("SCOUT_BROWSER_URL", "http://scout-browser:8091/");
+        assert_eq!(load(&env).unwrap().browser_url.map(String::from).as_deref(), Some("http://scout-browser:8091/"));
+        for wrong in [
+            "scout-browser:8091",
+            "ftp://scout-browser/",
+            "file:///tmp/pod",
+            "not an address",
+            "http://",
+            "http://scout-browser:8091/pod",
+            "http://scout-browser:8091/?a=1",
+            "http://scout-browser:8091/#x",
+            "http://user:pass@scout-browser:8091",
+        ] {
             env.insert("SCOUT_BROWSER_URL", wrong);
             let err = load(&env).unwrap_err().to_string();
             assert!(err.contains("SCOUT_BROWSER_URL"), "{wrong}: {err}");

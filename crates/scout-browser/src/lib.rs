@@ -88,6 +88,8 @@
 //! - **A stop lets calls under way finish, and then drops the sessions.** A
 //!   `SIGTERM`, which is what a pod is sent, or a Ctrl-C starts a graceful
 //!   shutdown; what closes a session's Chrome then is its being dropped.
+//!   The pod gives a stop 60 seconds, enough for a render, and a session's
+//!   call that is waiting for a place can wait 180: it is cut short there.
 //!   Nothing sweeps the profiles a killed server leaves in the temporary
 //!   directory, which in the pod is memory that goes with the pod. A
 //!   Chrome whose holder was killed outright is left to end itself on

@@ -1,11 +1,15 @@
 //! The browser pod's manifests say what its fence depends on.
 //!
 //! What the fence does is proved on the cluster after every deploy
-//! (`scripts/check-browser-fence.sh`). These read the files, so that an
-//! edit which would open it fails here first: an egress rule left without
-//! its `to:` allows everything, and a secret mounted into the pod hands a
-//! page that took its Chrome over what the pod was made to keep from it.
+//! (`scripts/check-browser-fence.sh`). These read the files as Kubernetes
+//! will, so that an edit which would open the fence fails here first. The
+//! fence's rules are compared whole: one peer more in any of them, an
+//! empty selector, a rule without its `to:`, is a rule that lets in or out
+//! more than it says, and a mounted secret or a token hands a page that
+//! took the pod's Chrome over what the pod was made to keep from it.
 
+use serde::Deserialize;
+use serde_yaml_ng::Value;
 use std::path::PathBuf;
 
 fn read(path: &str) -> String {
@@ -13,92 +17,135 @@ fn read(path: &str) -> String {
     std::fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
-/// The documents of `browser.yaml`, by kind.
-fn document(kind: &str) -> String {
-    read("deploy/k8s/browser.yaml")
-        .split("\n---\n")
-        .find(|doc| doc.lines().any(|line| line == format!("kind: {kind}")))
-        .unwrap_or_else(|| panic!("browser.yaml has no {kind}"))
-        .to_string()
+/// `browser.yaml` as the deploy hands it to the cluster, with the node's
+/// addresses given as `node`, or why it is no YAML.
+fn parsed(node: &str) -> Result<Vec<Value>, String> {
+    let text = read("deploy/k8s/browser.yaml").replace("${SCOUT_SHA}", "abc1234").replace("${SCOUT_NODE_EXCEPT}", node);
+    serde_yaml_ng::Deserializer::from_str(&text).map(|doc| Value::deserialize(doc).map_err(|e| e.to_string())).collect()
 }
 
-/// The lines that are not comments: a rule written in a comment is no rule.
-fn said(doc: &str) -> Vec<&str> {
-    doc.lines().filter(|line| !line.trim_start().starts_with('#')).collect()
+fn document(kind: &str) -> Value {
+    parsed("203.0.113.4/32")
+        .unwrap()
+        .into_iter()
+        .find(|doc| doc["kind"] == kind)
+        .unwrap_or_else(|| panic!("browser.yaml has no {kind}"))
+}
+
+fn yaml(text: &str) -> Value {
+    serde_yaml_ng::from_str(text).unwrap()
+}
+
+#[test]
+fn the_fence_is_these_rules_and_no_others() {
+    let policy = document("NetworkPolicy");
+    assert_eq!(policy["metadata"]["namespace"], "scout");
+    let expected = yaml(
+        "
+        podSelector: { matchLabels: { app: scout-browser } }
+        policyTypes: [Ingress, Egress]
+        ingress:
+          # Scout's pod, on the one port.
+          - from: [{ podSelector: { matchLabels: { app: scout } } }]
+            ports: [{ protocol: TCP, port: 8091 }]
+        egress:
+          # CoreDNS, one peer: its namespace AND its pods. Two list items
+          # would be either, and the namespace alone every pod in it.
+          - to:
+              - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+                podSelector: { matchLabels: { k8s-app: kube-dns } }
+            ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+          # The public internet, TCP alone.
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except: [203.0.113.4/32, 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16,
+                           172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4]
+            ports: [{ protocol: TCP }]
+        ",
+    );
+    assert_eq!(policy["spec"], expected, "the fence is not the one these tests know");
+}
+
+#[test]
+fn the_node_is_excepted_or_the_manifest_does_not_apply() {
+    // Every address the node has, however many.
+    let policy = parsed("203.0.113.4/32, 198.51.100.7/32, 10.42.0.1/32").unwrap().into_iter().find(|doc| doc["kind"] == "NetworkPolicy").unwrap();
+    let except = &policy["spec"]["egress"][1]["to"][0]["ipBlock"]["except"];
+    for node in ["203.0.113.4/32", "198.51.100.7/32", "10.42.0.1/32"] {
+        assert!(except.as_sequence().unwrap().iter().any(|range| range == node), "{node}: {except:?}");
+    }
+    // None at all: no YAML, so the apply fails rather than leaving them out.
+    assert!(parsed("").is_err(), "an empty list of the node's addresses still made a manifest");
+    let deploy = read("scripts/deploy-k3s.sh");
+    assert!(deploy.contains(r#": "${SCOUT_NODE_EXCEPT:?"#), "the deploy goes ahead without the node's addresses");
 }
 
 #[test]
 fn the_browser_pod_holds_no_secret_no_token_and_cannot_write_its_root() {
-    let pod = document("Deployment");
-    let lines = said(&pod).join("\n");
-    for absent in ["envFrom", "secretRef", "secretKeyRef", "serviceAccountName", "hostNetwork", "hostPath", "privileged"] {
-        assert!(!lines.contains(absent), "the browser pod names {absent}");
-    }
-    for present in [
-        "automountServiceAccountToken: false",
-        "enableServiceLinks: false",
-        "runAsNonRoot: true",
-        "allowPrivilegeEscalation: false",
-        "readOnlyRootFilesystem: true",
-        "capabilities: { drop: [ALL] }",
-        "seccompProfile: { type: RuntimeDefault }",
-        "limits: { memory: 1536Mi }",
+    let deployment = document("Deployment");
+    assert_eq!(deployment["metadata"]["namespace"], "scout");
+    let template = &deployment["spec"]["template"];
+    // Its own label alone: `app: scout` would put it behind Scout's
+    // Service and inside its own fence's way in.
+    assert_eq!(template["metadata"]["labels"], yaml("{ app: scout-browser }"));
+    assert_eq!(deployment["spec"]["selector"], yaml("{ matchLabels: { app: scout-browser } }"));
+
+    let pod = &template["spec"];
+    assert_eq!(pod["automountServiceAccountToken"], false);
+    assert_eq!(pod["enableServiceLinks"], false);
+    assert_eq!(pod["securityContext"], yaml("{ runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }"));
+    for absent in [
+        "serviceAccountName",
+        "serviceAccount",
+        "hostNetwork",
+        "hostPID",
+        "hostIPC",
+        "shareProcessNamespace",
+        "initContainers",
+        "ephemeralContainers",
+        "imagePullSecrets",
     ] {
-        assert!(lines.contains(present), "the browser pod lacks {present}");
+        assert!(pod.get(absent).is_none(), "the browser pod has {absent}");
     }
+    // Scratch only: no secret, no projected token, no host path, no claim.
+    let volumes = pod["volumes"].as_sequence().unwrap();
+    for volume in volumes {
+        let keys: Vec<&str> = volume.as_mapping().unwrap().keys().filter_map(Value::as_str).collect();
+        assert_eq!(keys, ["name", "emptyDir"], "{volume:?}");
+    }
+
+    let containers = pod["containers"].as_sequence().unwrap();
+    assert_eq!(containers.len(), 1, "one container, held to all of this");
+    let browser = &containers[0];
+    assert_eq!(browser["image"], "scout:abc1234");
     // The image's entrypoint is tini, which reaps what Chrome leaves; a
     // `command` would replace it.
-    assert!(lines.contains(r#"args: ["scout-browser"]"#) && !lines.contains("command:"));
-    // Told what fences it, or it would not listen beyond loopback.
-    assert!(lines.contains("SCOUT_BROWSER_FENCE") && lines.contains(r#"value: "0.0.0.0:8091""#));
-}
-
-#[test]
-fn the_fence_lets_in_scout_alone() {
-    let policy = document("NetworkPolicy");
-    let lines = said(&policy);
-    let ingress: Vec<&str> = lines.iter().skip_while(|line| line.trim() != "ingress:").take_while(|line| line.trim() != "egress:").copied().collect();
-    let from: Vec<&&str> = ingress.iter().filter(|line| line.trim().starts_with("- from:")).collect();
-    assert_eq!(from.len(), 1, "one way in: {ingress:#?}");
-    assert!(ingress.iter().any(|line| line.trim() == "matchLabels: { app: scout }"), "{ingress:#?}");
-    assert!(ingress.iter().any(|line| line.trim() == "- { protocol: TCP, port: 8091 }"), "{ingress:#?}");
-    assert!(!ingress.iter().any(|line| line.contains("ipBlock") || line.contains("namespaceSelector")), "{ingress:#?}");
-    assert!(lines.iter().any(|line| line.trim() == "policyTypes: [Ingress, Egress]"));
-}
-
-#[test]
-fn the_fence_lets_out_dns_and_the_public_internet_over_tcp_and_nothing_else() {
-    let policy = document("NetworkPolicy");
-    let lines = said(&policy);
-    let egress: Vec<&str> = lines.iter().skip_while(|line| line.trim() != "egress:").skip(1).copied().collect();
-    // Every rule has its `to:`: written without one, a rule allows
-    // everything (measured on this cluster, 2026-11-20).
-    let indent = egress[0].len() - egress[0].trim_start().len();
-    let rules: Vec<&&str> = egress.iter().filter(|line| line.len() - line.trim_start().len() == indent && line.trim_start().starts_with("- ")).collect();
-    assert_eq!(rules.len(), 2, "two ways out: {egress:#?}");
-    assert!(rules.iter().all(|rule| rule.trim() == "- to:"), "a rule without its to: {rules:?}");
-
-    let text = egress.join("\n");
-    let (dns, public) = text.split_once("ipBlock").expect("a public rule");
-    assert!(dns.contains("k8s-app: kube-dns") && dns.contains("kubernetes.io/metadata.name: kube-system"), "{dns}");
-    assert!(dns.contains("{ protocol: UDP, port: 53 }") && dns.contains("{ protocol: TCP, port: 53 }"), "{dns}");
-    assert!(public.contains("cidr: 0.0.0.0/0"), "{public}");
-    // TCP alone, and on any port: no datagram leaves for the internet.
-    assert!(public.contains("- { protocol: TCP }") && !public.contains("UDP") && !public.contains("SCTP"), "{public}");
-    for excepted in [
-        "0.0.0.0/8",
-        "10.0.0.0/8",
-        "100.64.0.0/10",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "224.0.0.0/4",
-        "240.0.0.0/4",
-        "${SCOUT_NODE_EXCEPT}",
-    ] {
-        assert!(public.contains(excepted), "{excepted} is not excepted: {public}");
+    assert_eq!(browser["args"], yaml("[scout-browser]"));
+    assert!(browser.get("command").is_none() && browser.get("envFrom").is_none());
+    assert_eq!(browser["securityContext"], yaml("{ allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }"));
+    // Each variable a value written here: none from a secret or the API.
+    let env = browser["env"].as_sequence().unwrap();
+    for variable in env {
+        let keys: Vec<&str> = variable.as_mapping().unwrap().keys().filter_map(Value::as_str).collect();
+        assert_eq!(keys, ["name", "value"], "{variable:?}");
     }
+    let named = |name: &str| env.iter().find(|v| v["name"] == name).map(|v| v["value"].clone());
+    assert_eq!(named("SCOUT_BROWSER_BIND"), Some(Value::from("0.0.0.0:8091")));
+    assert!(named("SCOUT_BROWSER_FENCE").and_then(|v| v.as_str().map(str::to_string)).is_some_and(|fence| !fence.trim().is_empty()));
+    // A port of the pod's network, not the node's.
+    assert_eq!(browser["ports"], yaml("[{ name: browser, containerPort: 8091 }]"));
+    assert_eq!(browser["volumeMounts"], yaml("[{ name: tmp, mountPath: /tmp }, { name: home, mountPath: /home/scout }]"));
+    assert_eq!(browser["resources"]["limits"], yaml("{ memory: 1536Mi }"));
+}
+
+#[test]
+fn scout_asks_the_pod_by_its_service_and_nothing_else_reaches_it() {
+    let service = document("Service");
+    // A ClusterIP of the cluster's own: no node port, no load balancer.
+    assert_eq!(service["spec"], yaml("{ selector: { app: scout-browser }, ports: [{ name: browser, port: 8091, targetPort: browser }] }"));
+    let scout = read("deploy/k8s/deployment.yaml");
+    assert!(scout.contains(r#"{ name: SCOUT_BROWSER_URL, value: "http://scout-browser:8091" }"#), "Scout's pod does not name the browser pod");
 }
 
 #[test]
@@ -112,12 +159,4 @@ fn the_names_the_deploy_fills_in_are_the_two_it_is_told_to() {
     assert_eq!(names, ["SCOUT_NODE_EXCEPT", "SCOUT_SHA"]);
     let deploy = read("scripts/deploy-k3s.sh");
     assert!(deploy.contains(r#"envsubst '${SCOUT_SHA} ${SCOUT_NODE_EXCEPT}' < deploy/k8s/browser.yaml"#), "the deploy names other variables");
-}
-
-#[test]
-fn scout_asks_the_pod_by_its_service() {
-    let service = document("Service");
-    assert!(service.contains("name: scout-browser") && service.contains("{ name: browser, port: 8091, targetPort: browser }"), "{service}");
-    let scout = read("deploy/k8s/deployment.yaml");
-    assert!(scout.contains(r#"{ name: SCOUT_BROWSER_URL, value: "http://scout-browser:8091" }"#), "Scout's pod does not name the browser pod");
 }

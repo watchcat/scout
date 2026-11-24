@@ -193,6 +193,9 @@ if step "read the node's own addresses, for the browser pod's fence"; then
 fi
 if step "apply deploy/k8s/browser.yaml (the browser pod, its Service, its fence) and wait for it"; then
     running=$("${SSH[@]}" "kubectl -n scout get deployment/scout-browser -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null" || true)
+    # Never a fence without the node in it. (Filled in empty, the list in
+    # the manifest is no YAML either, so the apply would fail too.)
+    : "${SCOUT_NODE_EXCEPT:?the node's addresses were not read, and the fence would not except them}"
     envsubst '${SCOUT_SHA} ${SCOUT_NODE_EXCEPT}' < deploy/k8s/browser.yaml | "${SSH[@]}" 'kubectl apply -f -'
     # As for Scout's pod below: the same name built again is a new image.
     if [ "$running" = "scout:$SHA" ] && [ "$BUILT" -eq 1 ]; then
@@ -205,17 +208,19 @@ if step "apply deploy/k8s/browser.yaml (the browser pod, its Service, its fence)
         "${SSH[@]}" 'kubectl -n scout get pods -l app=scout-browser; kubectl -n scout logs -l app=scout-browser --tail=40' >&2
         exit 1
     fi
-    # Before Scout is pointed at it: a page rendered in the pod, asked of
-    # itself, names resolved and Chromium started under its fence. Scout's
-    # pod is still the old one here, rendering on its own.
-    if rendered=$("${SSH[@]}" 'kubectl -n scout exec deploy/scout-browser -- env SCOUT_BROWSER_URL=http://127.0.0.1:8091 scout-browser probe render https://example.com/' 2>&1) \
-        && [[ $rendered == *'"Example Domain"'* ]]; then
-        echo "  it renders: $rendered"
-    else
-        echo >&2
-        echo "  the browser pod does not render, and Scout is left as it was: $rendered" >&2
-        exit 1
-    fi
+fi
+# Before Scout is pointed at it, all that can be asked of the pod alone:
+# its fence, from inside it and from a control; what it holds; and a page
+# rendered in it, names resolved and Chromium started under that fence.
+# Scout's pod is still the old one here, rendering on its own, so a pod
+# that fails any of it leaves production as it was.
+say "Proving the browser pod's fence"
+if [ "$DRY_RUN" -eq 1 ]; then
+    scripts/check-browser-fence.sh --dry-run
+elif ! scripts/check-browser-fence.sh "$SHA" pod; then
+    echo >&2
+    echo "  the browser pod is not what deploy/k8s/browser.yaml says it is (above), and Scout is left as it was" >&2
+    exit 1
 fi
 
 for f in pvc service deployment ingress issuer; do
@@ -301,15 +306,15 @@ if step "compare the pod's scout_build_info with $SHA"; then
     esac
 fi
 
-say "Proving the browser pod's fence"
-# After both rollouts: the checks run the new image's probe in the browser
-# pod, in Scout's, and in a control pod started from it.
-if [ "$DRY_RUN" -eq 1 ]; then
-    scripts/check-browser-fence.sh --dry-run
-elif ! scripts/check-browser-fence.sh "$SHA"; then
-    echo >&2
-    echo "  the browser pod's fence is not what deploy/k8s/browser.yaml says it is: see above" >&2
-    exit 1
+say "Asking Scout's pod whether it renders through the browser pod"
+# What needs Scout's new pod: a render asked from it through the Service,
+# and its own start-up line on what it renders with.
+if step "scripts/check-browser-fence.sh $SHA scout"; then
+    if ! scripts/check-browser-fence.sh "$SHA" scout; then
+        echo >&2
+        echo "  Scout's pod does not render through the browser pod: see above" >&2
+        exit 1
+    fi
 fi
 
 say "Deployed: $SHA $(git log --oneline -1 --format=%s)"

@@ -1080,13 +1080,13 @@ mod tests {
         let server = serving(200, SHELL).await;
         let unfilled = Reading::Failed("it came back as a shell that no browser filled".to_string());
         assert_eq!(read(&server).await, unfilled);
-        let stalled = crate::tools::browser::Renderer::new(std::path::PathBuf::from("/definitely/not/chrome"));
+        let stalled = crate::tools::browser::Renderer::not_starting(*server.address());
         let with_one = PageReader::for_a_request(OpenWeb::exempting(*server.address()), Some(stalled), Default::default());
         assert_eq!(with_one.read(&format!("{}/p/widget", server.uri())).await, unfilled);
         // Where a status that is no page sent the request to a browser
         // that would not start, it is the status that is told.
         let server = serving(503, "").await;
-        let stalled = crate::tools::browser::Renderer::new(std::path::PathBuf::from("/definitely/not/chrome"));
+        let stalled = crate::tools::browser::Renderer::not_starting(*server.address());
         let with_one = PageReader::for_a_request(OpenWeb::exempting(*server.address()), Some(stalled), Default::default());
         assert_eq!(with_one.read(&format!("{}/p/widget", server.uri())).await, Reading::Failed("it answered HTTP 503".to_string()));
 

@@ -221,9 +221,9 @@ mod tests {
     #[tokio::test]
     async fn a_render_comes_back_as_the_page_itself() {
         let app = rendering(|url| Ok(format!("<html><title>{url}</title></html>")));
-        let (status, kind, page) = call_raw(&app, "POST", "/render", json!({ "url": "https://shop.example/p/1" })).await;
+        let (status, kind, page) = call_raw(&app, "POST", "/render", json!({ "url": "https://203.0.113.1/p/1" })).await;
         assert_eq!((status, kind.as_str()), (StatusCode::OK, "text/html; charset=utf-8"));
-        assert_eq!(page, "<html><title>https://shop.example/p/1</title></html>");
+        assert_eq!(page, "<html><title>https://203.0.113.1/p/1</title></html>");
     }
 
     #[tokio::test]
@@ -231,17 +231,17 @@ mod tests {
         // The statuses Scout's remote renderer turns back into these errors.
         let app = rendering(|url| {
             Err(match url {
-                "https://shop.example/refused" => BrowserError::Refused("only a web page is rendered, and that address is file:".into()),
-                "https://shop.example/busy" => BrowserError::Busy,
-                "https://shop.example/slow" => BrowserError::Timeout,
+                "https://203.0.113.1/refused" => BrowserError::Refused("only a web page is rendered, and that address is file:".into()),
+                "https://203.0.113.1/busy" => BrowserError::Busy,
+                "https://203.0.113.1/slow" => BrowserError::Timeout,
                 _ => BrowserError::Launch("no Chrome".into()),
             })
         });
         for (url, status, error) in [
-            ("https://shop.example/refused", StatusCode::UNPROCESSABLE_ENTITY, "only a web page is rendered, and that address is file:"),
-            ("https://shop.example/busy", StatusCode::SERVICE_UNAVAILABLE, "too many pages are already rendering"),
-            ("https://shop.example/slow", StatusCode::GATEWAY_TIMEOUT, "rendering timed out"),
-            ("https://shop.example/broken", StatusCode::BAD_GATEWAY, "headless browser failed: no Chrome"),
+            ("https://203.0.113.1/refused", StatusCode::UNPROCESSABLE_ENTITY, "only a web page is rendered, and that address is file:"),
+            ("https://203.0.113.1/busy", StatusCode::SERVICE_UNAVAILABLE, "too many pages are already rendering"),
+            ("https://203.0.113.1/slow", StatusCode::GATEWAY_TIMEOUT, "rendering timed out"),
+            ("https://203.0.113.1/broken", StatusCode::BAD_GATEWAY, "headless browser failed: no Chrome"),
         ] {
             assert_eq!(call(&app, "POST", "/render", Some(json!({ "url": url }))).await, (status, json!({ "error": error })), "{url}");
         }
@@ -281,10 +281,10 @@ mod tests {
         // Two sides of one HTTP call, in two crates: Scout's remote renderer
         // asking, this router answering, over a real socket.
         let app = rendering(|url| match url {
-            "https://shop.example/refused" => Err(BrowserError::Refused("only a web page is rendered, and that address is file:".into())),
-            "https://shop.example/busy" => Err(BrowserError::Busy),
-            "https://shop.example/slow" => Err(BrowserError::Timeout),
-            "https://shop.example/broken" => Err(BrowserError::Launch("no Chrome".into())),
+            "https://203.0.113.1/refused" => Err(BrowserError::Refused("only a web page is rendered, and that address is file:".into())),
+            "https://203.0.113.1/busy" => Err(BrowserError::Busy),
+            "https://203.0.113.1/slow" => Err(BrowserError::Timeout),
+            "https://203.0.113.1/broken" => Err(BrowserError::Launch("no Chrome".into())),
             _ => Ok(format!("<html><title>{url}</title>{}</html>", "é".repeat(5000))),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -292,13 +292,13 @@ mod tests {
         let serving = tokio::spawn(async move { axum::serve(listener, app).await });
         let scout = scout_core::render::Renderer::remote(&pod).unwrap();
 
-        let page = scout.render("https://shop.example/p/1").await.unwrap();
-        assert_eq!(page, format!("<html><title>https://shop.example/p/1</title>{}</html>", "é".repeat(5000)));
+        let page = scout.render("https://203.0.113.1/p/1").await.unwrap();
+        assert_eq!(page, format!("<html><title>https://203.0.113.1/p/1</title>{}</html>", "é".repeat(5000)));
         let answers = [
-            ("https://shop.example/refused", "Refused(\"only a web page is rendered, and that address is file:\")"),
-            ("https://shop.example/busy", "Busy"),
-            ("https://shop.example/slow", "Timeout"),
-            ("https://shop.example/broken", "Launch(\"the browser pod answered 502 Bad Gateway: headless browser failed: no Chrome\")"),
+            ("https://203.0.113.1/refused", "Refused(\"only a web page is rendered, and that address is file:\")"),
+            ("https://203.0.113.1/busy", "Busy"),
+            ("https://203.0.113.1/slow", "Timeout"),
+            ("https://203.0.113.1/broken", "Launch(\"the browser pod answered 502 Bad Gateway: headless browser failed: no Chrome\")"),
         ];
         for (url, expected) in answers {
             assert_eq!(format!("{:?}", scout.render(url).await.unwrap_err()), expected, "{url}");

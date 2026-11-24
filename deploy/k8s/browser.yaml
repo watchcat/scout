@@ -29,12 +29,16 @@ spec:
     metadata:
       labels: { app: scout-browser }
     spec:
-      # A render is bounded by 45 seconds; a stop lets those under way end.
+      # A render is bounded by 45 seconds, and the pause before the stop
+      # is 5: a stop lets the renders under way end. (A session's call can
+      # wait 180 seconds for a place; nothing calls the sessions yet.)
       terminationGracePeriodSeconds: 60
       # No token: a page that took this pod over cannot talk to the
       # Kubernetes API as anyone.
       automountServiceAccountToken: false
-      # No SCOUT_* or other variables naming the cluster's services.
+      # No variables naming the namespace's Services. The kubernetes
+      # Service's own (KUBERNETES_SERVICE_HOST and the rest) every pod is
+      # given regardless; the fence below is what keeps the pod from it.
       enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
@@ -45,8 +49,9 @@ spec:
       containers:
         - name: browser
           image: scout:${SCOUT_SHA}
-          # No registry: the deploy imports the image into the node's own
-          # store, and a missing one should fail rather than be fetched.
+          # The deploy imports the image into the node's own store. With no
+          # registry that has it, a missing one fails to pull rather than
+          # running something else.
           imagePullPolicy: IfNotPresent
           # The image's entrypoint stays tini, which reaps what Chrome's
           # helpers leave behind; this replaces only the command.
@@ -60,6 +65,11 @@ spec:
             - { name: HOME, value: /home/scout }
           ports:
             - { name: browser, containerPort: 8091 }
+          # A moment for the Service to stop sending here before the server
+          # is told to stop: it closes its listener at once on SIGTERM.
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
           readinessProbe:
             httpGet: { path: /healthz, port: browser }
             initialDelaySeconds: 2
@@ -112,8 +122,10 @@ spec:
     matchLabels: { app: scout-browser }
   policyTypes: [Ingress, Egress]
   ingress:
-    # In: Scout's pod, on the one port. (The node itself reaches it too,
-    # for the probes above: kube-router lets a pod's own node in.)
+    # In: Scout's pod, on the one port. The node itself is let in as well,
+    # by kube-router, which admits whatever comes from one of the node's
+    # own addresses (its code, not measured here); the probes above rely on
+    # it, and the deploy's wait for the pod to be ready shows it holds.
     - from:
         - podSelector:
             matchLabels: { app: scout }
@@ -142,6 +154,9 @@ spec:
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
-            except: [0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, ${SCOUT_NODE_EXCEPT}]
+            # The node's addresses first: filled in empty, they leave the
+            # list starting with a comma, which is no YAML, and the apply
+            # fails rather than going ahead without them.
+            except: [${SCOUT_NODE_EXCEPT}, 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4]
       ports:
         - { protocol: TCP }

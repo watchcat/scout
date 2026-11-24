@@ -163,12 +163,11 @@ impl Core {
         );
 
         // The pod's when there is one, and then never a Chrome of this
-        // process's own, even when the pod is down: a render that fails is
-        // a page read without one, as on a machine with no Chrome.
-        let renderer = match &cfg.browser_url {
-            Some(pod) => Some(crate::tools::browser::Renderer::remote(pod)?),
-            None => crate::tools::browser::find_chrome().map(crate::tools::browser::Renderer::new),
-        };
+        // process's own, even when the pod is down. A render that fails is
+        // then told as any failed render is; unlike a machine with no
+        // Chrome, a walled host is not closed for the request, so each of
+        // its pages asks the pod again.
+        let renderer = crate::tools::browser::renderer_for(cfg.browser_url.as_ref())?;
         tracing::info!(
             headless_browser = renderer.is_some(),
             renders_with = renderer.as_ref().map(crate::tools::browser::Renderer::describe).unwrap_or_default(),

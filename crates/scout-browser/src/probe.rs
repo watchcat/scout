@@ -1,9 +1,10 @@
 //! `scout-browser probe …`: what this pod can reach, asked from inside it.
 //!
 //! `scripts/check-browser-fence.sh` runs a probe in the browser pod and,
-//! as its control, in Scout's pod, which no policy holds, so that a probe
-//! that must fail counts only where the same probe could have succeeded. A
-//! fence proved by a probe that can never succeed is proved by nothing.
+//! as its control, in a pod it starts from the same image that no policy
+//! holds, so that a probe that must fail counts only where the same probe
+//! could have succeeded. A fence proved by a probe that can never succeed
+//! is proved by nothing. From Scout's pod it asks for a render.
 //! The image has no curl and no nc, and the question is about the pod's
 //! network, not the node's, so the binary asks it itself.
 //!
@@ -87,11 +88,15 @@ async fn tcp(target: &str) -> Result<String, String> {
         .await
         .map_err(|e| format!("{target} is not a reachable name and port: {e}"))?
         .collect();
+    // A share of the probe's time each, so that a first address that
+    // swallows the connection does not leave none for the next.
+    let each = WITHIN / u32::try_from(addresses.len().max(1)).unwrap_or(u32::MAX);
     let mut failed = format!("{target} resolved to nothing");
     for address in addresses {
-        match tokio::net::TcpStream::connect(address).await {
-            Ok(_) => return Ok(format!("connected to {target}")),
-            Err(e) => failed = format!("{target}: {e}"),
+        match tokio::time::timeout(each, tokio::net::TcpStream::connect(address)).await {
+            Ok(Ok(_)) => return Ok(format!("connected to {target}")),
+            Ok(Err(e)) => failed = format!("{target}: {e}"),
+            Err(_) => failed = format!("{target}: no answer from one of its addresses"),
         }
     }
     Err(failed)
@@ -189,6 +194,28 @@ mod tests {
         let unanswered = run(Probe::Udp(at), Duration::from_millis(300), None).await.unwrap_err();
         assert_eq!(unanswered, "no answer within 0.3 seconds");
         drop(silent);
+    }
+
+    #[tokio::test]
+    async fn udp_is_not_reached_by_another_question_or_by_an_answer_from_elsewhere() {
+        // Where the fence drops the datagram, nothing may stand in for the
+        // answer: not another number from the server asked, and not the
+        // right number from another address.
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let elsewhere = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let at = server.local_addr().unwrap();
+        let answering = tokio::spawn(async move {
+            let mut asked = [0u8; 512];
+            let (length, from) = server.recv_from(&mut asked).await.unwrap();
+            let mut other = asked[..length].to_vec();
+            other[0] ^= 0xff;
+            server.send_to(&other, from).await.unwrap();
+            elsewhere.send_to(&asked[..length], from).await.unwrap();
+            (server, elsewhere)
+        });
+        let unanswered = run(Probe::Udp(at), Duration::from_millis(500), None).await.unwrap_err();
+        assert_eq!(unanswered, "no answer within 0.5 seconds");
+        drop(answering.await.unwrap());
     }
 
     #[tokio::test]

@@ -204,7 +204,8 @@ if step "apply deploy/k8s/browser.yaml (the browser pod, its Service, its fence)
     if [ "$running" = "scout:$SHA" ] && [ "$BUILT" -eq 1 ]; then
         echo "  the browser pod already ran scout:$SHA and this deploy built it again: restarting it onto it"
         "${SSH[@]}" "kubectl -n scout rollout restart deployment/scout-browser"
-        browser_changed=1
+        # Not a change a rollback undoes: the tag now names the new image.
+        browser_rebuilt=1
     fi
     if ! "${SSH[@]}" 'kubectl -n scout rollout status deployment/scout-browser --timeout=180s'; then
         echo >&2
@@ -228,8 +229,10 @@ if [ "$DRY_RUN" -eq 1 ]; then
     scripts/check-browser-fence.sh --dry-run
 elif ! scripts/check-browser-fence.sh "$SHA" pod; then
     echo >&2
-    if [ -n "${running:-}" ] && [ "${browser_changed:-0}" -eq 1 ]; then
-        echo "  the browser pod is not what deploy/k8s/browser.yaml says it is (above): rolling it back to $running, which Scout renders through" >&2
+    if [ "${browser_rebuilt:-0}" -eq 1 ]; then
+        echo "  the browser pod, rebuilt under the tag it ran, does not pass its checks (above), and no rollback brings the old image back: renders fail until it is fixed" >&2
+    elif [ -n "${running:-}" ] && [ "${browser_changed:-0}" -eq 1 ]; then
+        echo "  the browser pod is not what deploy/k8s/browser.yaml says it is (above): rolling it back to $running, which ran before" >&2
         "${SSH[@]}" 'kubectl -n scout rollout undo deployment/scout-browser && kubectl -n scout rollout status deployment/scout-browser --timeout=180s' >&2 \
             || echo "  the rollback did not complete: renders fail until the browser pod is fixed" >&2
     elif [ -n "${running:-}" ]; then

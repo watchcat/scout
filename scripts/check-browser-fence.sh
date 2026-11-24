@@ -72,18 +72,23 @@ fi
 failed=0
 
 # Every address that could be said, written by what it is, and only where
-# it is the whole address: the gateway's is the start of other pods'.
+# it is the whole address: the gateway's is the start of other pods'. Each
+# expression is given twice: a match takes the character after it, which a
+# second copy of the address one character on would need for its start.
 masked() {
     local -a by=()
-    local address
+    local address e
     for address in $INTERNAL; do
         case "$address" in
-            *:*) by+=(-e "s/(^|[^0-9a-fA-F:])${address}([^0-9a-fA-F:]|\$)/\\1<node>\\2/g") ;;
-            *) by+=(-e "s/(^|[^0-9.])${address//./\\.}([^0-9]|\$)/\\1<node>\\2/g") ;;
+            *:*) e="s/(^|[^0-9a-fA-F:])${address}([^0-9a-fA-F:]|\$)/\\1<node>\\2/g" ;;
+            *) e="s/(^|[^0-9.])${address//./\\.}([^0-9]|\$)/\\1<node>\\2/g" ;;
         esac
+        by+=(-e "$e" -e "$e")
     done
-    by+=(-e "s/(^|[^0-9.])${SCOUT_POD//./\\.}([^0-9]|\$)/\\1<scout pod>\\2/g")
-    by+=(-e "s/(^|[^0-9.])${GATEWAY//./\\.}([^0-9]|\$)/\\1<gateway>\\2/g")
+    e="s/(^|[^0-9.])${SCOUT_POD//./\\.}([^0-9]|\$)/\\1<scout pod>\\2/g"
+    by+=(-e "$e" -e "$e")
+    e="s/(^|[^0-9.])${GATEWAY//./\\.}([^0-9]|\$)/\\1<gateway>\\2/g"
+    by+=(-e "$e" -e "$e")
     tr '\n' ' ' | sed -E "${by[@]}" | cut -c1-240
 }
 

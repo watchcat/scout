@@ -116,7 +116,8 @@ not in the figures below.
 - **Two shops refuse the node whatever asks.** bol.com and shop G answered
   403 to the plain request and to the session, and the render came back
   as a block page or a bot check. A session does not get past a shop that
-  has said no, and is not meant to.
+  has said no, and is not meant to. bol.com refused the image's Chromium
+  too: see "bol.com from the browser pod, 2026-11-24".
 - **Three more refuse the plain request and let a browser in.** amazon.nl
   (503, and earlier a 200 that was not the page), shop H (403) and shop J
   (429). For these the render Scout already has is what reads the page.
@@ -298,7 +299,8 @@ numbers cost and where else they are:
   third session, could move a cell.
 - Every browser here was a laptop's Chrome 157 saying what Scout's render
   says of itself. The image's Chromium was not run. The two refusals did
-  not turn on it: Scout's own client was refused first.
+  not turn on it: Scout's own client was refused first. On bol.com it was
+  run six days later, in "bol.com from the browser pod, 2026-11-24".
 - A shop's answer to a datacentre's address on one afternoon. amazon.nl
   gave the plain request two different answers 46 minutes apart, neither
   of them the page.
@@ -309,3 +311,53 @@ numbers cost and where else they are:
   link that leaves the shop but only undoes a redirect that does; it had
   no rule against a checkout address; and its rule on what may be typed
   was tightened after these sessions, which typed nothing personal.
+
+## bol.com from the browser pod, 2026-11-24
+
+Since 2026-11-24 Scout's renders run in a pod of their own, with the
+image's Chromium 156, which the reading above did not run. Two pages were
+asked of that pod through a port-forward, once each, and both came back
+as bol's block page. The laptop's Chrome 158 was run beside it with
+Scout's render flags: twice by `scout-browser` on the laptop, from a
+residential connection's address, within two minutes of the pod's
+renders; and once by hand, three hours later, from that address and
+through a tunnel to the node in turn, four renders in nine seconds.
+
+| page | the pod's Chromium 156, from the node's address | the laptop's Chrome 158, from the node's address | the laptop's Chrome 158, from a residential address |
+|---|---|---|---|
+| a search, `/nl/nl/s/?searchtext=koffiezetapparaat` | the block page, 9.5 KB: "Access blocked" | the same block page, twice | the results page, 1.6 to 1.7 MB, titled "Bol \| Zoekresultaten voor koffiezetapparaat", four times of four |
+| the front page, `/nl/nl/` | the block page, 12.8 KB: "IP address is blocked" | not asked | the same block page, three times |
+
+curl from the node, asking for the front page with a bare `Mozilla/5.0`
+user agent, was answered 403. Every block page saved here is a refusal
+to `page_as_read`, so `fetch_page` says bol.com cannot be read and does
+not hand the notice over as the page; the first of the residential front
+pages came from `scout-browser probe render`, which keeps no copy.
+
+- **From the node's address bol refuses whichever client asks.** Scout's
+  client and the laptop's Chrome 157 on 2026-11-18; curl (the front
+  page), the image's Chromium and the laptop's Chrome 158 today. The same
+  Chrome with the same flags was served the search from the residential
+  address seconds before and seconds after it was refused through the
+  node. The image's Chromium was not run from the residential address, so
+  whether bol serves it there is not measured.
+- **Served is not read.** What `fetch_page` keeps of the served search
+  page is its first 6,000 characters, which are bol's category menu: no
+  product and no price, the only amount the free-delivery threshold, and
+  none of the 30 links kept is a product's, though the HTML links to 30
+  products. On this page a render from another address would hand the
+  model the menu, as the cookie notice was handed over on two shops
+  above. A product page was not tried from there.
+- **The front page is no test of reach.** Asked for the front page from
+  the residential address, the render was shown the 12.8 KB block page,
+  which says that address is blocked; seconds later, from the same
+  address, it was served the search. A check of reach asks for a search.
+- One search and one front page on one evening, and one residential
+  address. bol may answer that address otherwise another day.
+
+What is left for bol.com is its Catalog API, which `search_bol` uses if
+an affiliate account is approved, or renders that leave from an address
+that is not a datacentre's. The second goes around a block bol put up on
+purpose, where a session, as said above, is not meant to get past a shop
+that has said no; and on the page tried here it would hand over the menu.
+It is not decided.

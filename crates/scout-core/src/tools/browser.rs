@@ -40,6 +40,10 @@ pub enum BrowserError {
     Timeout,
     #[error("too many pages are already rendering")]
     Busy,
+    /// Not an address a render is for, said before any Chrome was started:
+    /// the sentence is the reason, for whoever asked.
+    #[error("{0}")]
+    Refused(String),
 }
 
 /// Marks of an interstitial rather than the page asked for.
@@ -84,10 +88,23 @@ pub fn is_challenge_page(html: &str) -> bool {
     is_challenge(html)
 }
 
+/// Chrome's own page for one it could not load: its body is the `neterror`
+/// one and holds the `main-frame-error` block. Both, so that a shop's page
+/// that merely mentions either is still the shop's.
+fn is_chrome_error_page(html: &str) -> bool {
+    html.contains(r#"id="main-frame-error""#) && (html.contains(r#"class="neterror""#) || html.contains("class=\"neterror "))
+}
+
 /// Where Chrome lives, if it does. Resolved once at startup: without it the
 /// fallback stays off and plain fetching behaves exactly as before.
 pub fn find_chrome() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("SCOUT_CHROME") {
+    chrome_from(std::env::var("SCOUT_CHROME").ok())
+}
+
+/// [`find_chrome`], with `SCOUT_CHROME` given rather than read, so that a
+/// test need not set the process's environment under the other tests.
+fn chrome_from(named: Option<String>) -> Option<PathBuf> {
+    if let Some(path) = named {
         let path = PathBuf::from(path);
         return path.exists().then_some(path);
     }
@@ -102,13 +119,52 @@ pub fn find_chrome() -> Option<PathBuf> {
     .find(|p| p.exists())
 }
 
+/// The most of a page the browser pod's answer is read for.
+///
+/// The pod is where a page that took a Chrome over would be, so what the
+/// pod answers is that page's to make, its length included; uncapped, it
+/// could be as long as Scout has memory. The longest render measured was
+/// 598 KB (`docs/BOARD.md`, "The render's Chrome, measured where it runs").
+pub const MAX_REMOTE_PAGE: usize = 16 * 1024 * 1024;
+
+/// How long Scout waits for the browser pod to take a connection. It is on
+/// the same node, a hop away; one that takes longer is not there.
+const REACH_THE_POD: Duration = Duration::from_secs(5);
+
+/// The most of the pod's sentence for a failed render that is kept, and
+/// the characters it may have: it ends up in Scout's own log, and a pod a
+/// page has taken over could otherwise write whatever it liked there.
+const MAX_POD_SENTENCE: usize = 300;
+
+fn pods_sentence(said: &str) -> String {
+    let unwritten = |c: &char| {
+        c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    };
+    said.chars().filter(|c| !unwritten(c)).take(MAX_POD_SENTENCE).collect()
+}
+
+/// The renderer a process with this setting renders with: the browser
+/// pod's when one is named, and then never a Chrome of the process's own,
+/// a Chrome found here included; a Chrome of its own when none is named
+/// and one is found; and otherwise none.
+/// `chrome` is how one is found, [`find_chrome`] outside a test; with a pod
+/// named it is not asked.
+pub(crate) fn renderer_for(pod: Option<&url::Url>, chrome: impl FnOnce() -> Option<PathBuf>) -> Result<Option<Renderer>, BrowserError> {
+    match pod {
+        Some(pod) => Renderer::remote(pod).map(Some),
+        None => Ok(chrome().map(Renderer::new)),
+    }
+}
+
 /// Renders `url` and returns the DOM after scripts have run.
 ///
 /// Cloned into every `fetch_page` tool, so the slots are shared: the limit is
-/// on Chromes alive in this process, not on renders per request.
+/// on renders under way in this process, not on renders per request. For a
+/// local renderer that is Chromes alive here; for one that asks the pod it
+/// is backpressure, and the pod's own slots are the cap.
 #[derive(Clone)]
 pub struct Renderer {
-    chrome: PathBuf,
+    how: How,
     slots: Arc<Semaphore>,
     /// What the proxy Chrome goes through will open: the public internet,
     /// except in a live test, whose page is on loopback.
@@ -130,10 +186,30 @@ pub struct Renderer {
 #[cfg(test)]
 type BeforeChrome = Arc<dyn Fn(&std::path::Path, &mut Vec<String>) + Send + Sync>;
 
+/// Where a render happens.
+#[derive(Clone)]
+enum How {
+    /// In a Chrome of this process's own, started for the render.
+    Local(PathBuf),
+    /// In the browser pod, asked over HTTP: production's, so that a page
+    /// that takes its Chrome over is in a pod with nothing of Scout's.
+    Remote(Remote),
+}
+
+/// The browser pod, as Scout asks it.
+#[derive(Clone)]
+struct Remote {
+    /// `POST` here, `{"url": …}`; the page comes back as the body.
+    render: url::Url,
+    client: reqwest::Client,
+    /// [`MAX_REMOTE_PAGE`], except in a test of the cap.
+    cap: usize,
+}
+
 impl Renderer {
     pub fn new(chrome: PathBuf) -> Self {
         Self {
-            chrome,
+            how: How::Local(chrome),
             slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RENDERS)),
             guard: crate::net_guard::Guard::PUBLIC_ONLY,
             profiles: std::env::temp_dir(),
@@ -144,11 +220,53 @@ impl Renderer {
         }
     }
 
+    /// A renderer that asks the browser pod at `pod`, an address like
+    /// `http://scout-browser:8091`, for every render.
+    ///
+    /// What the pod answers is read as a page fetched from anywhere is:
+    /// untrusted. Its length is capped, and its client follows no redirect
+    /// and goes through no proxy from the environment. Unlike the open
+    /// web's client it has no guard, because the pod is on the cluster's
+    /// private addresses; a redirect it followed would take Scout's own
+    /// requests to wherever a taken-over pod pointed them.
+    ///
+    /// The whole of a render is held to [`RENDER_TIMEOUT`] by `render`, as
+    /// a local one is. Reaching the pod has a limit of its own,
+    /// [`REACH_THE_POD`], so that a pod that is not there does not hold a
+    /// slot for the whole of it.
+    pub fn remote(pod: &url::Url) -> Result<Self, BrowserError> {
+        let render = pod.join("render").map_err(|e| BrowserError::Launch(format!("the browser pod's address: {e}")))?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(REACH_THE_POD)
+            .build()
+            .map_err(|e| BrowserError::Launch(e.to_string()))?;
+        let local = Self::new(PathBuf::new());
+        Ok(Self { how: How::Remote(Remote { render, client, cap: MAX_REMOTE_PAGE }), ..local })
+    }
+
+    /// Which form this is, for the log line at start.
+    pub fn describe(&self) -> String {
+        match &self.how {
+            How::Local(chrome) => format!("a Chrome of this process's own, {}", chrome.display()),
+            How::Remote(remote) => format!("the browser pod, {}", remote.render),
+        }
+    }
+
     /// A renderer whose Chrome reaches `mock` and nothing else, so that a
     /// live test can show a real Chrome a page of its own making.
     #[cfg(test)]
     fn reaching_only(chrome: PathBuf, mock: std::net::SocketAddr) -> Self {
         Self { guard: crate::net_guard::Guard::only(mock), ..Self::new(chrome) }
+    }
+
+    /// A renderer whose Chrome will not start, for a page on `mock` or on
+    /// the public internet: what `fetch_page` does with a render that
+    /// fails, past the check that would refuse the mock's loopback address.
+    #[cfg(test)]
+    pub(crate) fn not_starting(mock: std::net::SocketAddr) -> Self {
+        Self { guard: crate::net_guard::Guard::exempting(mock), ..Self::new(PathBuf::from("/definitely/not/chrome")) }
     }
 
     /// A renderer that hands back `html` whatever it is asked for, so that
@@ -164,9 +282,16 @@ impl Renderer {
             return Ok(html.to_string());
         }
         let started = Instant::now();
+        // Inside the deadline: deciding resolves the name, and a resolver
+        // that does not answer is no reason for a render to outlast it.
+        match tokio::time::timeout(RENDER_TIMEOUT, self.may_render(url)).await {
+            Ok(decided) => decided?,
+            Err(_) => return Err(BrowserError::Timeout),
+        }
         // Queueing is part of the deadline rather than added to it, so a
         // busy renderer cannot turn a 45-second ceiling into ninety.
-        let _slot = match tokio::time::timeout(RENDER_TIMEOUT, self.slots.acquire()).await {
+        let left = RENDER_TIMEOUT.saturating_sub(started.elapsed());
+        let _slot = match tokio::time::timeout(left, self.slots.acquire()).await {
             Ok(Ok(slot)) => slot,
             Ok(Err(e)) => return Err(BrowserError::Launch(e.to_string())),
             Err(_) => return Err(BrowserError::Busy),
@@ -179,6 +304,37 @@ impl Renderer {
             .map_err(|_| BrowserError::Timeout)?
     }
 
+    /// Whether `url` is a page a render may be asked for: a web address,
+    /// on the public internet as this renderer's guard sees it.
+    ///
+    /// `fetch_page` asks only for such pages, having checked them itself.
+    /// This is for whoever else asks, and since the browser pod is asked
+    /// over HTTP, that is anyone who can reach the pod. A Chrome told
+    /// `--dump-dom` with a `file:` address prints the file. With an address
+    /// on loopback it is the proxy that refuses, but only once a Chrome has
+    /// been started for nothing.
+    async fn may_render(&self, url: &str) -> Result<(), BrowserError> {
+        let parsed = url::Url::parse(url).map_err(|_| BrowserError::Refused("that is not a web address".to_string()))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(BrowserError::Refused(format!(
+                "only a web page is rendered, and that address is {}:",
+                parsed.scheme()
+            )));
+        }
+        self.guard
+            .check(&parsed)
+            .await
+            .map_err(|_| BrowserError::Refused(crate::net_guard::NOT_PUBLIC.to_string()))
+    }
+
+    /// The render itself, once it has been decided on and has its slot.
+    async fn render_inner(&self, url: &str) -> Result<String, BrowserError> {
+        match &self.how {
+            How::Local(chrome) => self.render_here(chrome, url).await,
+            How::Remote(remote) => remote.render(url).await,
+        }
+    }
+
     /// One-shot `--dump-dom`, deliberately not a CDP session.
     ///
     /// Driving Chrome over CDP is the obvious approach and it does not work
@@ -186,7 +342,7 @@ impl Renderer {
     /// among others) and action.com's challenge never clears — measured at
     /// 67 seconds of real time, still the interstitial. The same Chrome as a
     /// plain subprocess passes it every time.
-    async fn render_inner(&self, url: &str) -> Result<String, BrowserError> {
+    async fn render_here(&self, chrome: &std::path::Path, url: &str) -> Result<String, BrowserError> {
         // Each render gets a throwaway profile: concurrent runs sharing one
         // would fight over its lock. Its preferences are on disk before
         // Chrome is, and without them there is no render.
@@ -206,7 +362,7 @@ impl Renderer {
         let args = chrome_args(url, &profile, proxy);
         #[cfg(test)]
         let args = self.as_its_test_would_have_it(&profile, args);
-        let mut chrome = Chrome::start(&self.chrome, args).map_err(|e| BrowserError::Launch(e.to_string()))?;
+        let mut chrome = Chrome::start(chrome, args).map_err(|e| BrowserError::Launch(e.to_string()))?;
 
         // Chrome prints the DOM and then lingers — waiting for it to exit
         // means waiting forever (measured: the full page in stdout, the
@@ -215,12 +371,16 @@ impl Renderer {
         let mut stdout = chrome.0.stdout.take().expect("stdout is piped");
         let mut html = Vec::new();
         let mut chunk = vec![0u8; 64 * 1024];
+        let mut ended = false;
         loop {
             // Nothing arrives until the page has loaded, so the first read
             // gets the full deadline; afterwards a short lull means done.
             let patience = if html.is_empty() { RENDER_TIMEOUT } else { QUIET_AFTER_OUTPUT };
             match tokio::time::timeout(patience, stdout.read(&mut chunk)).await {
-                Ok(Ok(0)) => break,
+                Ok(Ok(0)) => {
+                    ended = true;
+                    break;
+                }
                 Ok(Ok(n)) => html.extend_from_slice(&chunk[..n]),
                 Ok(Err(e)) => return Err(BrowserError::Launch(e.to_string())),
                 Err(_) => break,
@@ -231,10 +391,26 @@ impl Renderer {
         drop(chrome);
         drop(profile);
 
+        // A page Chrome could not load is a failed render, in either of the
+        // two ways it comes back. The page asked for: `--dump-dom` prints
+        // nothing and Chrome ends (measured 2026-11-24 on Chrome 157, for a
+        // refused port and for a proxy that would not connect: "Page load
+        // failed: net::ERR_…" on its stderr, an empty stdout). A page it was
+        // sent on to, by script or a meta refresh: Chrome prints its own
+        // error page, 187 KB of it, which would otherwise be handed over as
+        // the shop's (measured the same day on Chrome 158).
         if html.is_empty() {
-            return Err(BrowserError::Timeout);
+            return Err(if ended {
+                BrowserError::Launch("Chrome ended without printing a page: it could not load it".to_string())
+            } else {
+                BrowserError::Timeout
+            });
         }
-        Ok(String::from_utf8_lossy(&html).into_owned())
+        let page = String::from_utf8_lossy(&html).into_owned();
+        if is_chrome_error_page(&page) {
+            return Err(BrowserError::Launch("Chrome could not load the page it was sent on to, and printed its own error page".to_string()));
+        }
+        Ok(page)
     }
 
     #[cfg(test)]
@@ -244,6 +420,64 @@ impl Renderer {
         }
         args
     }
+}
+
+impl Remote {
+    /// One render, asked of the pod. The pod answers as `scout-browser`'s
+    /// `POST /render` does: the page as the body, or a status and
+    /// `{"error": …}` that are turned back into the error it was there.
+    async fn render(&self, url: &str) -> Result<String, BrowserError> {
+        let mut answer = self
+            .client
+            .post(self.render.clone())
+            .json(&serde_json::json!({ "url": url }))
+            .send()
+            .await
+            .map_err(|e| BrowserError::Launch(format!("the browser pod could not be asked: {e}")))?;
+        let status = answer.status();
+        if status == reqwest::StatusCode::OK {
+            return self.page(&mut answer).await;
+        }
+        // An error's sentence is short; a longer one is not read.
+        let said = read_capped(&mut answer, 4096).await.ok().unwrap_or_default();
+        let why = serde_json::from_slice::<serde_json::Value>(&said)
+            .ok()
+            .and_then(|body| body["error"].as_str().map(pods_sentence));
+        Err(match status.as_u16() {
+            503 => BrowserError::Busy,
+            504 => BrowserError::Timeout,
+            422 => BrowserError::Refused(why.unwrap_or_else(|| "the browser pod refused that address".to_string())),
+            _ => BrowserError::Launch(match why {
+                Some(why) => format!("the browser pod answered {status}: {why}"),
+                None => format!("the browser pod answered {status}"),
+            }),
+        })
+    }
+
+    /// The page, read up to the cap and no further.
+    async fn page(&self, answer: &mut reqwest::Response) -> Result<String, BrowserError> {
+        match read_capped(answer, self.cap).await {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(Some(e)) => Err(BrowserError::Launch(format!("the browser pod's page could not be read: {e}"))),
+            Err(None) => Err(BrowserError::Launch(format!("the browser pod's page was longer than {} bytes", self.cap))),
+        }
+    }
+}
+
+/// A body read in pieces until it ends or passes `cap`: `Err(None)` when
+/// it would have, without reading what was beyond.
+async fn read_capped(answer: &mut reqwest::Response, cap: usize) -> Result<Vec<u8>, Option<reqwest::Error>> {
+    if answer.content_length().is_some_and(|said| said > cap as u64) {
+        return Err(None);
+    }
+    let mut body = Vec::new();
+    while let Some(piece) = answer.chunk().await.map_err(Some)? {
+        if body.len() + piece.len() > cap {
+            return Err(None);
+        }
+        body.extend_from_slice(&piece);
+    }
+    Ok(body)
 }
 
 /// One render's Chrome and everything that Chrome started, stopped together.
@@ -589,9 +823,9 @@ mod tests {
     #[test]
     fn chrome_is_found_through_the_env_override_when_set() {
         // A path that does not exist must not enable the fallback.
-        temp_env_var("SCOUT_CHROME", "/definitely/not/here", || {
-            assert!(find_chrome().is_none());
-        });
+        assert!(chrome_from(Some("/definitely/not/here".to_string())).is_none());
+        let here = std::env::current_exe().unwrap();
+        assert_eq!(chrome_from(Some(here.display().to_string())), Some(here));
     }
 
     #[test]
@@ -988,18 +1222,325 @@ mod tests {
         assert_eq!(renderer.slots.available_permits(), MAX_CONCURRENT_RENDERS);
     }
 
-    /// Sets an env var for the duration of `f`. Tests run in threads, so this
-    /// stays in one place rather than being scattered.
-    fn temp_env_var(key: &str, value: &str, f: impl FnOnce()) {
-        let previous = std::env::var(key).ok();
-        // SAFETY: single-threaded assertion inside f; restored right after.
-        unsafe { std::env::set_var(key, value) };
-        f();
-        match previous {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
+    #[tokio::test]
+    async fn what_is_not_a_web_address_is_refused_before_any_chrome() {
+        // `--dump-dom` prints whatever Chrome is pointed at, a file
+        // included, and the browser pod is asked over HTTP: a render does
+        // not take its caller's word that the address is a web page's. The
+        // Chrome here does not exist, so any answer but a refusal would
+        // have been a failure to start it.
+        let renderer = Renderer::new(PathBuf::from("/definitely/not/chrome"));
+        for (url, why) in [
+            ("file:///etc/passwd", "file:"),
+            ("FILE:///etc/passwd", "file:"),
+            ("chrome://version", "chrome:"),
+            ("view-source:https://example.com/", "view-source:"),
+            ("data:text/html,<p>x</p>", "data:"),
+            ("javascript:alert(1)", "javascript:"),
+            ("about:blank", "about:"),
+            ("not an address", "not a web address"),
+            ("", "not a web address"),
+        ] {
+            match renderer.render(url).await {
+                Err(BrowserError::Refused(said)) => assert!(said.contains(why), "{url}: {said}"),
+                other => panic!("{url}: {other:?}"),
+            }
+        }
+        assert_eq!(renderer.slots.available_permits(), MAX_CONCURRENT_RENDERS, "a refusal takes no slot");
+    }
+
+    // ----------------------------------------- a render asked of the pod
+
+    use wiremock::matchers::{any, body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A renderer that asks the pod standing at `pod`.
+    fn asking(pod: &MockServer) -> Renderer {
+        Renderer::remote(&url::Url::parse(&pod.uri()).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_render_asked_of_the_pod_is_the_page_the_pod_rendered() {
+        let pod = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/render"))
+            .and(body_json(serde_json::json!({ "url": "https://203.0.113.1/p/1" })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<html>rendered</html>", "text/html; charset=utf-8"))
+            .expect(1)
+            .mount(&pod)
+            .await;
+        assert_eq!(asking(&pod).render("https://203.0.113.1/p/1").await.unwrap(), "<html>rendered</html>");
+    }
+
+    #[tokio::test]
+    async fn what_the_pod_says_went_wrong_is_what_the_render_says() {
+        let said = |status: u16, error: &str| {
+            ResponseTemplate::new(status).set_body_json(serde_json::json!({ "error": error }))
+        };
+        for (answer, expected) in [
+            (said(503, "too many pages are already rendering"), "busy"),
+            (said(504, "rendering timed out"), "timeout"),
+            (said(422, "only a web page is rendered, and that address is file:"), "refused"),
+            (said(502, "headless browser failed: no Chrome"), "502"),
+            (ResponseTemplate::new(500), "500"),
+            (ResponseTemplate::new(404), "404"),
+        ] {
+            let pod = MockServer::start().await;
+            Mock::given(path("/render")).respond_with(answer).mount(&pod).await;
+            let err = asking(&pod).render("https://203.0.113.1/p/1").await.unwrap_err();
+            match (expected, &err) {
+                ("busy", BrowserError::Busy) | ("timeout", BrowserError::Timeout) => {}
+                // The pod's own sentence, for whoever asked: it says what was wrong with the address.
+                ("refused", BrowserError::Refused(why)) => assert_eq!(why, "only a web page is rendered, and that address is file:"),
+                (status, BrowserError::Launch(why)) if why.contains(status) => {}
+                _ => panic!("{expected}: {err:?}"),
+            }
         }
     }
+
+    #[tokio::test]
+    async fn a_pod_that_answers_with_a_redirect_is_not_followed() {
+        // Were the pod taken over, a redirect would point Scout's own
+        // client, which no guard holds, anywhere in the cluster.
+        let (pod, elsewhere) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(any()).respond_with(ResponseTemplate::new(200).set_body_string("followed")).expect(0).mount(&elsewhere).await;
+        Mock::given(path("/render"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", format!("{}/metrics", elsewhere.uri())))
+            .mount(&pod)
+            .await;
+        let err = asking(&pod).render("https://203.0.113.1/p/1").await.unwrap_err();
+        assert!(matches!(&err, BrowserError::Launch(why) if why.contains("307")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_page_from_the_pod_is_read_up_to_the_cap_and_no_further() {
+        // The pod is where a page that took a Chrome over would be, so its
+        // answer is that page's to make, length and all.
+        let pod = MockServer::start().await;
+        Mock::given(path("/render")).respond_with(ResponseTemplate::new(200).set_body_raw("x".repeat(1000), "text/html")).mount(&pod).await;
+        let capped = |cap| {
+            let mut renderer = asking(&pod);
+            if let How::Remote(remote) = &mut renderer.how {
+                remote.cap = cap;
+            }
+            renderer
+        };
+        assert_eq!(capped(1000).render("https://203.0.113.1/p/1").await.unwrap().len(), 1000);
+        let err = capped(999).render("https://203.0.113.1/p/1").await.unwrap_err();
+        assert!(matches!(&err, BrowserError::Launch(why) if why.contains("999 bytes")), "{err:?}");
+        assert_eq!(MAX_REMOTE_PAGE, 16 * 1024 * 1024);
+    }
+
+    /// A pod that answers every request with `head` and then `pieces`, as
+    /// written, and then holds the connection open: what wiremock, which
+    /// always says how long its answer is, cannot be made to do.
+    async fn pod_saying(head: &'static str, pieces: Vec<Vec<u8>>) -> (url::Url, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let pieces = pieces.clone();
+                // One connection a render: each answer says it closes, so
+                // no render is sent down the one before it.
+                tokio::spawn(async move {
+                    let mut asked = vec![0u8; 16 * 1024];
+                    let _ = socket.read(&mut asked).await;
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    for piece in &pieces {
+                        let _ = socket.write_all(piece).await;
+                    }
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                });
+            }
+        });
+        (url::Url::parse(&format!("http://{at}")).unwrap(), serving)
+    }
+
+    fn capped_at(pod: &url::Url, cap: usize) -> Renderer {
+        let mut renderer = Renderer::remote(pod).unwrap();
+        if let How::Remote(remote) = &mut renderer.how {
+            remote.cap = cap;
+        }
+        renderer
+    }
+
+    #[tokio::test]
+    async fn a_page_from_the_pod_that_says_no_length_is_cut_at_the_cap_all_the_same() {
+        // Sent in pieces with no length said, as a taken-over pod could:
+        // only counting what arrives stops it.
+        let piece = |n: usize| [format!("{n:x}\r\n").into_bytes(), vec![b'x'; n], b"\r\n".to_vec()].concat();
+        let (pod, serving) = pod_saying(
+            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: text/html\r\ntransfer-encoding: chunked\r\n\r\n",
+            vec![piece(1000), piece(1000), b"0\r\n\r\n".to_vec()],
+        )
+        .await;
+        assert_eq!(capped_at(&pod, 2000).render("https://203.0.113.1/p/1").await.unwrap().len(), 2000);
+        let err = capped_at(&pod, 1500).render("https://203.0.113.1/p/1").await.unwrap_err();
+        assert!(matches!(&err, BrowserError::Launch(why) if why.contains("1500 bytes")), "{err:?}");
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_page_from_the_pod_said_to_be_too_long_is_refused_before_it_arrives() {
+        // A length past the cap, and a byte of it: waiting for the rest
+        // would be waiting on the pod's say-so.
+        let (pod, serving) = pod_saying("HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: text/html\r\ncontent-length: 1001\r\n\r\n", vec![b"x".to_vec()]).await;
+        let answered = tokio::time::timeout(Duration::from_secs(5), capped_at(&pod, 1000).render("https://203.0.113.1/p/1")).await;
+        let err = answered.expect("the render waited for a page longer than its cap").unwrap_err();
+        assert!(matches!(&err, BrowserError::Launch(why) if why.contains("1000 bytes")), "{err:?}");
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_pod_that_never_answers_is_a_timeout_at_the_renders_deadline() {
+        // A pod that takes the request and says nothing, as a wedged one
+        // would. The clock is paused only once the pod has the connection:
+        // paused while the connection is still being made, it jumps the
+        // five seconds Scout gives the pod to take one, and the test would
+        // be of that instead (the first version of this test did so in 32
+        // runs of 40).
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = silent.local_addr().unwrap();
+        let (taken, connected) = tokio::sync::oneshot::channel();
+        let held = tokio::spawn(async move {
+            let (socket, _) = silent.accept().await.unwrap();
+            let _ = taken.send(());
+            let mut open = vec![socket];
+            while let Ok((socket, _)) = silent.accept().await {
+                open.push(socket);
+            }
+        });
+        let renderer = Renderer::remote(&url::Url::parse(&format!("http://{at}")).unwrap()).unwrap();
+        let started = tokio::time::Instant::now();
+        let render = tokio::spawn(async move { renderer.render("https://203.0.113.1/p/1").await });
+        connected.await.unwrap();
+        tokio::time::pause();
+        let err = render.await.unwrap().unwrap_err();
+        assert!(matches!(err, BrowserError::Timeout), "{err:?}");
+        let took = started.elapsed();
+        assert!(took >= RENDER_TIMEOUT && took <= RENDER_TIMEOUT + Duration::from_secs(1), "{took:?}");
+        held.abort();
+    }
+
+    #[tokio::test]
+    async fn a_render_asked_of_the_pod_is_refused_what_a_local_one_is_without_asking_the_pod() {
+        // The pod checks too. This is the first of the two checks, not
+        // the only one, and the pod is not asked for what it would refuse.
+        let pod = MockServer::start().await;
+        Mock::given(any()).respond_with(ResponseTemplate::new(200)).expect(0).mount(&pod).await;
+        let renderer = asking(&pod);
+        for url in ["file:///etc/passwd", "http://127.0.0.1:9090/metrics", "http://169.254.169.254/"] {
+            assert!(matches!(renderer.render(url).await, Err(BrowserError::Refused(_))), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_render_asked_of_the_pod_waits_for_one_of_its_own_slots_first() {
+        // Scout's two slots are backpressure, so that a burst of renders
+        // queues here rather than as connections held open to the pod.
+        let pod = MockServer::start().await;
+        Mock::given(any()).respond_with(ResponseTemplate::new(200).set_body_string("<html>x</html>")).expect(0).mount(&pod).await;
+        let renderer = asking(&pod);
+        let held: Vec<_> = (0..MAX_CONCURRENT_RENDERS).map(|_| renderer.slots.try_acquire().expect("a free slot")).collect();
+        let waiting = tokio::time::timeout(Duration::from_millis(300), renderer.render("https://203.0.113.1/p/1")).await;
+        assert!(waiting.is_err(), "a render went to the pod with every slot taken");
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_said_at_once_even_with_every_slot_taken() {
+        // Decided before the wait for a slot, so a refusal neither waits
+        // nor takes one.
+        let renderer = Renderer::new(PathBuf::from("/definitely/not/chrome"));
+        let held: Vec<_> = (0..MAX_CONCURRENT_RENDERS).map(|_| renderer.slots.try_acquire().expect("a free slot")).collect();
+        let started = tokio::time::Instant::now();
+        assert!(matches!(renderer.render("file:///etc/passwd").await, Err(BrowserError::Refused(_))));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        drop(held);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chrome_that_ends_without_printing_a_page_could_not_load_it() {
+        // What a Chrome does with a page it cannot load: print nothing and
+        // end. That is a failed render, not one that took too long.
+        let base = tempfile::tempdir().unwrap();
+        let renderer = Renderer { profiles: base.path().to_path_buf(), ..Renderer::new(PathBuf::from("/usr/bin/true")) };
+        let err = renderer.render_inner("http://shop.example/").await.unwrap_err();
+        assert!(matches!(&err, BrowserError::Launch(why) if why.contains("without printing a page")), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chromes_own_error_page_is_a_failed_render_and_not_the_shops_page() {
+        let base = tempfile::tempdir().unwrap();
+        let errs = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tools/chrome-that-errs.sh");
+        let renderer = Renderer { profiles: base.path().to_path_buf(), ..Renderer::new(PathBuf::from(errs)) };
+        let err = renderer.render_inner("http://shop.example/").await.unwrap_err();
+        assert!(matches!(&err, BrowserError::Launch(why) if why.contains("its own error page")), "{err:?}");
+    }
+
+    #[test]
+    fn a_page_that_only_mentions_chromes_error_page_is_still_a_page() {
+        assert!(is_chrome_error_page(r#"<body class="neterror" id="t"><div id="main-frame-error">x</div></body>"#));
+        assert!(is_chrome_error_page(r#"<body class="neterror offline" id="t"><div id="main-frame-error">x</div></body>"#));
+        for page in [
+            r#"<body><p>Our page about neterror and main-frame-error</p></body>"#,
+            r#"<body class="neterror"><p>no block</p></body>"#,
+            r#"<body><div id="main-frame-error">a shop's own block</div></body>"#,
+        ] {
+            assert!(!is_chrome_error_page(page), "{page}");
+        }
+    }
+
+    #[test]
+    fn a_named_pod_is_what_renders_even_where_a_chrome_is_found() {
+        // The point of the pod: with one named, no Chrome is started in
+        // Scout's own pod for a render, though the image has one there.
+        let found = std::env::current_exe().unwrap();
+        let pod = url::Url::parse("http://scout-browser:8091").unwrap();
+        let named = renderer_for(Some(&pod), || Some(found.clone())).unwrap().expect("a renderer");
+        assert!(matches!(&named.how, How::Remote(remote) if remote.render.as_str() == "http://scout-browser:8091/render"));
+        let unnamed = renderer_for(None, || Some(found.clone())).unwrap().expect("a renderer");
+        assert!(matches!(&unnamed.how, How::Local(chrome) if chrome == &found));
+        assert!(renderer_for(None, || None).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_pods_sentence_is_kept_short_and_on_one_line() {
+        // It goes into Scout's log; a pod a page took over does not get to
+        // write lines of its own there.
+        let pod = MockServer::start().await;
+        let said = format!("first\nERROR a line\u{2028} of the pod's\u{202e} own\u{1b}[31m{}", "x".repeat(1000));
+        Mock::given(path("/render")).respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({ "error": said }))).mount(&pod).await;
+        let Err(BrowserError::Refused(kept)) = asking(&pod).render("https://203.0.113.1/p/1").await else { panic!("not a refusal") };
+        assert_eq!(kept.chars().count(), MAX_POD_SENTENCE);
+        assert!(kept.starts_with("firstERROR a line of the pod's own[31m") && !kept.chars().any(char::is_control), "{kept}");
+    }
+
+    #[tokio::test]
+    async fn an_address_off_the_public_internet_is_refused_before_any_chrome() {
+        // The proxy would refuse each of these too, once Chrome asked; but
+        // Chrome would then be running, and print its own error page as if
+        // it were the page.
+        let renderer = Renderer::new(PathBuf::from("/definitely/not/chrome"));
+        for url in [
+            "http://127.0.0.1:9090/metrics",
+            "http://localhost:8080/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.43.0.1/",
+            "http://[::1]/",
+            "https://[::ffff:127.0.0.1]/",
+        ] {
+            match renderer.render(url).await {
+                Err(BrowserError::Refused(said)) => assert_eq!(said, crate::net_guard::NOT_PUBLIC, "{url}"),
+                other => panic!("{url}: {other:?}"),
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -1551,7 +2092,10 @@ WAIT
                 }
             }
         });
-        let renderer = Renderer { before_chrome: Some(before), ..Renderer::new(find_chrome().expect("chrome")) };
+        // Reaching only the mock, so that the render's own check lets its
+        // page be asked for. The proxy that guard serves is not the one this
+        // Chrome is sent through: the line above puts the noting one there.
+        let renderer = Renderer { before_chrome: Some(before), ..Renderer::reaching_only(find_chrome().expect("chrome"), mock) };
         let html = renderer.render(&format!("{}/", server.uri())).await.unwrap();
         assert_eq!(said(&html), "waited");
 
@@ -1675,7 +2219,11 @@ WAIT
         let chrome = find_chrome().expect("chrome");
         let renderer = Renderer::new(chrome);
         for url in [format!("{}/metrics", server.uri()), format!("http://localhost:{}/", server.address().port())] {
-            let html = renderer.render(&url).await.unwrap_or_default();
+            // A render is refused such an address before its Chrome starts.
+            assert!(matches!(renderer.render(&url).await, Err(BrowserError::Refused(_))), "{url}");
+            // And a Chrome given it all the same, past that check, still
+            // reaches nothing: this is what measures the proxy.
+            let html = renderer.render_inner(&url).await.unwrap_or_default();
             assert!(!html.contains("secret"), "{url} rendered: {html}");
         }
         // And the public web still renders through the proxy.

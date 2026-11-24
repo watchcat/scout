@@ -39,3 +39,13 @@ pub mod text;
 pub mod toolcall;
 pub mod trips;
 pub mod vision;
+
+/// The renderer, and nothing else of `tools`.
+///
+/// `tools` stays private because a channel that can name `Store` can query
+/// it. The browser pod is not a channel: it holds no account and no
+/// secret, and all it does for Scout is turn an address into a rendered
+/// page. This is the whole of what crosses that line.
+pub mod render {
+    pub use crate::tools::browser::{find_chrome, BrowserError, Renderer, RENDER_TIMEOUT};
+}

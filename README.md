@@ -186,7 +186,9 @@ The theme: **the model decides what to look for, Rust decides what's true.**
 **Verifies things**
 - Opens product pages and extracts the real link, price, seller and stock
 - Pages that block plain HTTP get re-opened in **headless Chrome**, which
-  clears the challenge shops like action.com put in front of them
+  clears the challenge shops like action.com put in front of them. In
+  production that Chrome runs in a pod of its own, which holds no key and
+  reaches nothing but the public internet
 - Live APIs where they exist: eBay Browse, Marktplaats, and bol.com Catalog
   if you have an approved affiliate account — current prices, no scraping.
   Each is optional; without one, those shops still arrive through search and
@@ -442,6 +444,7 @@ compiles from source.
 | `IGNAV_API_KEY` | no | — | second flights provider. 1,000 free requests, then $0.002 each. Prices are approximate, not bookable, and labelled as such |
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
 | `SCOUT_CHROME` | no | auto-detected | Chrome/Chromium for the headless fallback |
+| `SCOUT_BROWSER_URL` | no | — | the browser pod, e.g. `http://scout-browser:8091`: renders are asked of it and no Chrome is started here for one. Unset, a render starts a Chrome of this process's own. Must be an http address and port alone; anything else stops the bot at start |
 | `SCOUT_DB_PATH` | no | `scout.duckdb` | DuckDB file |
 | `SCOUT_WEB_BIND` | no | `0.0.0.0:8080` | where the website listens; the bot serves it from the same process |
 | `SCOUT_SESSION_KEY` | web sign-in | — | signs session cookies; 32+ bytes. All four web variables must be set or sign-in does not mount and the site serves the public page only |
@@ -519,8 +522,26 @@ the bot reads them. Everything else becomes the bot's own environment.
 
 The rule for anything added to the file: if the running bot does not read it,
 it should not be in the bot's Secret. That process fetches arbitrary web
-pages, renders them in headless Chromium and feeds the result to a language
-model, so its environment is worth keeping small.
+pages and feeds them to a language model, so its environment is worth
+keeping small.
+
+Rendering those pages in headless Chromium happens in neither of those
+places. The deploy runs a second pod from the same image, `scout-browser`
+(`deploy/k8s/browser.yaml`), and Scout asks it for every render. It gets no
+Secret, no service-account token and no database, and its root cannot be
+written. Its NetworkPolicy lets in Scout's pod alone. It lets out DNS, and
+TCP to the public internet with every private, link-local and multicast range
+excepted. The node's own addresses are excepted too: they are read from the
+node at each deploy and written nowhere. `scripts/check-browser-fence.sh`
+proves it in two phases. The first runs once the browser pod is up and before
+Scout's new pod is: it asks for each thing the pod must not reach from inside
+the pod, and again, as a control, from a pod no policy holds. It checks what
+the pod holds and renders a page in it. The deploy fails when the browser pod
+reaches what it should not, or, where the check must be proved, when the
+control could not reach it either; a browser pod this deploy changed is then
+rolled back. The second runs after Scout's rollout: Scout's pod asks the
+browser pod for a render, and Scout's own start-up line must say it renders
+through it.
 
 `scripts/deploy-k3s.sh` takes **no database backup**. DuckDB is
 single-writer, so the only consistent copy comes from `/backup`, an admin
@@ -610,16 +631,19 @@ scout-web        12,200 lines  the website and the browser chat: sign-in, the
                                inbound webhook and the mail worker
 ```
 
-A fifth, `scout-browser`, is in the workspace and in none of the pictures,
-because nothing uses it yet. It drives a shop's page over HTTP for the shop
-desk that is still a card on the board: a session is opened on one page, in a
-Chrome of its own behind the same guard as `fetch_page`'s render, and each of
-six actions answers with the page as an outline. One shop a session, nothing
+A fifth, `scout-browser`, is the browser pod. Scout's renders run there:
+`POST /render` is scout-core's own renderer, the one-shot `--dump-dom` that
+used to run in Scout's pod, behind the same check on the address and the same
+two slots. It also drives a shop's page over HTTP, for the shop desk that is
+still a card on the board. A session is opened on one page, in a Chrome of
+its own behind the same guard as the render's, and each of six actions
+answers with the page as an outline. The rules: one shop a session, nothing
 personal typed, no checkout, no sign-in, no downloads; three at once, 25
-actions, 180 seconds, and over when the shop says no. It is built and tested
-to run on one machine (`cargo run -p scout-browser` listens on loopback and
-nowhere else), it is not deployed, and no tool calls it; its own
-documentation says what it keeps to and where each number came from.
+actions, 180 seconds, and over when the shop says no. The pod serves those
+sessions too, and nothing calls them. Run anywhere else, `cargo run -p
+scout-browser` listens on loopback and nowhere else unless told what fences
+it. Its own documentation says what it keeps to and where each number came
+from.
 
 `scout-core` does not export its store. The adapter cannot open a database,
 run a query, or name the type that would let it — writing
@@ -746,6 +770,7 @@ scripts/deploy.sh           # compose: test, build, drain, hand over
 scripts/deploy-k3s.sh       # production: build on the node, apply, wait
 scripts/deploy-k3s.sh --dry-run # show the plan, change nothing
 scripts/check-render-chromium.sh # the renderer's live tests, against the image's Chromium
+scripts/check-browser-fence.sh <tag> # the browser pod's fence, proved from inside it (the deploy runs it)
 python3 scripts/build-airports.py airports.csv # the airport names the trip page shows, from OurAirports
 ```
 

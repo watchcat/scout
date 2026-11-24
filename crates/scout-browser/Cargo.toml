@@ -43,3 +43,7 @@ rand = "0.10"
 tokio = { version = "1", features = ["net", "test-util"] }
 # One call into the router without a socket, as scout-web's tests make it.
 tower = { version = "0.5", features = ["util"] }
+# The browser pod's manifests read as what they are, for tests/manifests.rs:
+# a rule's peers compared whole, where text would let a second peer by.
+# Already in the lockfile, through another crate.
+serde_yaml_ng = "0.10"

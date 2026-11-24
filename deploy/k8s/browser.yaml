@@ -1,0 +1,162 @@
+# The browser pod: Chromium for Scout, in a pod with nothing of Scout's.
+#
+# A render opens a page a model chose, from anywhere on the internet, and a
+# page that takes its Chrome over has whatever the Chrome's pod has. In
+# Scout's own pod that was every key in its environment, its database a file
+# away, and a service-account token. Here it is none of those, and the
+# NetworkPolicy below lets the pod reach the public internet and DNS only.
+#
+# Applied by scripts/deploy-k3s.sh through envsubst with two names and no
+# others: SCOUT_SHA, the image the deploy built, and SCOUT_NODE_EXCEPT, the
+# node's own addresses, read from the node at each deploy and written in no
+# file. scripts/check-browser-fence.sh proves the fence after each deploy,
+# and crates/scout-browser/tests/manifests.rs holds this file to it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scout-browser
+  namespace: scout
+spec:
+  replicas: 1
+  # The new pod is ready before the old one goes, so no render finds
+  # nobody there. Two at once is two pods' worth of memory for a moment.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: { app: scout-browser }
+  template:
+    metadata:
+      labels: { app: scout-browser }
+    spec:
+      # A render is bounded by 45 seconds, and the pause before the stop
+      # is 5: a stop lets the renders under way end. (A session's call can
+      # wait 180 seconds for a place; nothing calls the sessions yet.)
+      terminationGracePeriodSeconds: 60
+      # No token: a page that took this pod over cannot talk to the
+      # Kubernetes API as anyone.
+      automountServiceAccountToken: false
+      # No variables naming the namespace's Services. The kubernetes
+      # Service's own (KUBERNETES_SERVICE_HOST and the rest) every pod is
+      # given regardless; the fence below is what keeps the pod from it.
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: browser
+          image: scout:${SCOUT_SHA}
+          # The deploy imports the image into the node's own store. With no
+          # registry that has it, a missing one fails to pull rather than
+          # running something else.
+          imagePullPolicy: IfNotPresent
+          # The image's entrypoint stays tini, which reaps what Chrome's
+          # helpers leave behind; this replaces only the command.
+          args: ["scout-browser"]
+          workingDir: /tmp
+          # No envFrom and no secret: this pod carries no key of any kind.
+          env:
+            - { name: SCOUT_BROWSER_BIND, value: "0.0.0.0:8091" }
+            - { name: SCOUT_BROWSER_FENCE, value: "the scout-browser NetworkPolicy" }
+            - { name: SCOUT_CHROME, value: /usr/bin/chromium }
+            - { name: HOME, value: /home/scout }
+          ports:
+            - { name: browser, containerPort: 8091 }
+          # A moment for the Service to stop sending here before the server
+          # is told to stop: it closes its listener at once on SIGTERM.
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          readinessProbe:
+            httpGet: { path: /healthz, port: browser }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: browser }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            # Two renders at a few hundred MB each, and the memory-backed
+            # /tmp below counts against this too.
+            limits: { memory: 1536Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          # What a render writes, and nothing else: its throwaway profile
+          # in /tmp, and what Chrome keeps in a home of its own.
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: home, mountPath: /home/scout }
+      volumes:
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 512Mi }
+        - name: home
+          emptyDir: { sizeLimit: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scout-browser
+  namespace: scout
+spec:
+  selector: { app: scout-browser }
+  ports:
+    - { name: browser, port: 8091, targetPort: browser }
+---
+# The fence. Measured on this cluster on 2026-11-20 (the plan of 2026-11-24
+# has what): NetworkPolicy is enforced here, by kube-router inside k3s.
+# What it holds is proved after every deploy by check-browser-fence.sh.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: scout-browser
+  namespace: scout
+spec:
+  podSelector:
+    matchLabels: { app: scout-browser }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # In: Scout's pod, on the one port. The node itself is let in as well,
+    # by kube-router, which admits whatever comes from one of the node's
+    # own addresses (its code, not measured here); the probes above rely on
+    # it, and the deploy's wait for the pod to be ready shows it holds.
+    - from:
+        - podSelector:
+            matchLabels: { app: scout }
+      ports:
+        - { protocol: TCP, port: 8091 }
+  egress:
+    # Names, from CoreDNS and nothing else. By selector: an ipBlock on
+    # kube-dns's ClusterIP does not work, since the ClusterIP is rewritten
+    # to CoreDNS's own address before the policy is read, and that address
+    # changes when CoreDNS is moved.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Out: the public internet, over TCP alone. Chrome reaches the network
+    # only through the render's proxy, which carries TCP, and is told twice
+    # to send no UDP of its own; this is the third time, and the one that
+    # holds whatever Chrome does. Excepted: every private, shared, link-
+    # local (the cloud's metadata service), loopback and multicast range,
+    # and the node's own addresses, one of which is public and answers SSH
+    # and the Kubernetes API.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            # The node's addresses first: filled in empty, they leave the
+            # list starting with a comma, which is no YAML, and the apply
+            # fails rather than going ahead without them.
+            except: [${SCOUT_NODE_EXCEPT}, 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4]
+      ports:
+        - { protocol: TCP }

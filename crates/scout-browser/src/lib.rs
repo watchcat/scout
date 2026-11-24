@@ -1,12 +1,20 @@
-//! Browser sessions: a shop's page driven over HTTP, under rules the caller
-//! cannot bend.
+//! The browser pod: Scout's renders, and browser sessions, a shop's page
+//! driven over HTTP under rules the caller cannot bend.
 //!
-//! Nothing uses this crate yet. It is the session half of the `scout-browser`
-//! the shop-browsing spec describes
-//! (`docs/superpowers/specs/2026-11-17-price-watch-and-shop-browsing-design.md`),
-//! built and tested to run on one machine. It is not deployed, it has no
-//! `POST /render`, and nothing in `scout-core` calls it: those are the cards
-//! "Chromium in a pod of its own" and "The shop desk".
+//! In production this runs as a pod of its own (`deploy/k8s/browser.yaml`)
+//! with nothing of Scout's in it, and Scout's renders are asked of it:
+//! `POST /render` is scout-core's own renderer, the one-shot `--dump-dom`
+//! Scout ran in its own pod before, behind the same check and the same two
+//! slots (`server.rs`). The pod's network policy lets in Scout's pod alone
+//! and lets out DNS and TCP to the public internet alone, and
+//! `scripts/check-browser-fence.sh` proves that after every deploy.
+//!
+//! The sessions are the other half of the `scout-browser` the shop-browsing
+//! spec describes
+//! (`docs/superpowers/specs/2026-11-17-price-watch-and-shop-browsing-design.md`).
+//! They are served in the pod as well, where only Scout's pod can reach
+//! them, and nothing calls them yet: that is the card "The shop desk", and
+//! "Before anything calls this" below is what is owed first.
 //!
 //! A session is opened on one page of one shop, in a Chrome of its own
 //! behind `scout_core::net_guard`. Six actions (`read`, `click`, `type`,
@@ -62,25 +70,33 @@
 //! or in front of a model. None of it is a rule above failing; all of it
 //! is outside what this crate was built to be so far.
 //!
-//! - **Nothing stands in front of it.** No sign-in, no check of the `Host`
-//!   a call names, and so `main.rs` refuses to listen anywhere but
-//!   loopback. The pod and its network policy are to be the fence.
-//! - **Only Chrome 157 on macOS has run it.** Not the image's Chromium, and
-//!   not in a container: the flags a container needs (`--no-sandbox`,
-//!   `--disable-dev-shm-usage`) are not passed, and the two preferences in
-//!   `chrome.rs` were measured on that one Chrome.
+//! - **Nothing but the fence stands in front of it.** No sign-in, no check
+//!   of the `Host` a call names, and so `main.rs` refuses to listen beyond
+//!   loopback unless told what fences it. In the pod that is its network
+//!   policy, which lets in Scout's pod alone.
+//! - **Only Chrome 157 on macOS has run a session.** Not the image's
+//!   Chromium, and not in a container: the flags a container needs
+//!   (`--no-sandbox`, `--disable-dev-shm-usage`) are not passed, and the two
+//!   preferences in `chrome.rs` were measured on that one Chrome. The pod's
+//!   seccomp profile may well stop a sandboxed Chrome from starting there.
+//!   The render passes those flags, and `check-browser-fence.sh` renders a
+//!   page in the pod after every deploy.
 //! - **No session has opened a public page.** Every test serves its own on
 //!   loopback, past the proxy by a rule only a test can set. That the proxy
 //!   lets a public page through is known from the render, which starts
 //!   Chrome with the same two flags, and not from here.
-//! - **It stops on Ctrl-C and on nothing else.** A `SIGTERM`, which is what
-//!   a pod is sent, ends the process without closing its sessions, and
-//!   nothing sweeps the profiles a killed server leaves in the temporary
-//!   directory. Its Chromes are then left to end themselves on finding
-//!   their pipe closed: one idle Chrome whose holder was killed outright
-//!   was gone 0.1, 0.4 and 2.7 seconds later in three tries (2026-11-20,
-//!   Chrome 157, with a stand-in for the server holding the pipe). A
-//!   Chrome in the middle of a page was not tried.
+//! - **A stop lets calls under way finish, and then drops the sessions.** A
+//!   `SIGTERM`, which is what a pod is sent, or a Ctrl-C starts a graceful
+//!   shutdown; what closes a session's Chrome then is its being dropped.
+//!   The pod gives a stop 60 seconds, enough for a render, and a session's
+//!   call that is waiting for a place can wait 180: it is cut short there.
+//!   Nothing sweeps the profiles a killed server leaves in the temporary
+//!   directory, which in the pod is memory that goes with the pod. A
+//!   Chrome whose holder was killed outright is left to end itself on
+//!   finding its pipe closed: one idle Chrome was gone 0.1, 0.4 and 2.7
+//!   seconds later in three tries (2026-11-20, Chrome 157, with a stand-in
+//!   for the server holding the pipe). A Chrome in the middle of a page
+//!   was not tried.
 //! - **Calls that wait for a place are not counted.** Three sessions run at
 //!   once; any number of calls may wait, each for up to its 180 seconds.
 //! - **Letting go of a page can hold a worker for up to three seconds.** A
@@ -112,6 +128,7 @@ pub mod chrome;
 pub mod drive;
 pub mod limits;
 pub mod pipe;
+pub mod probe;
 pub mod server;
 pub mod session;
 pub mod site;

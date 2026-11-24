@@ -212,15 +212,22 @@ if [ "$PHASE" != scout ]; then
         echo "  HELD     a volume that is not scratch: $(masked <<<"$volumes")"
         failed=1
     fi
-    # Policies add up, so the fence is the namespace's one policy; and one
-    # Deployment has the pod's label. A policy for another pod would need
-    # this check to say which.
+    # Policies add up, so the fence is the namespace's one policy; and what
+    # stands behind the pod's label is the one Deployment's. The label is
+    # on the Deployment's pods, not on the Deployment (the first deploy
+    # found `-l app=scout-browser` naming no Deployment at all), so it is
+    # looked for in each Deployment's pod template, and each pod with it
+    # must be of a ReplicaSet named as that Deployment's are (a ReplicaSet
+    # made by hand under such a name would pass). A policy for another pod
+    # would need this check to say which.
     policies=$(kubectl -n "$NS" get networkpolicy -o name 2>&1)
-    deployments=$(kubectl -n "$NS" get deployment -l app=scout-browser -o name 2>&1)
-    if [ "$policies" = "networkpolicy.networking.k8s.io/scout-browser" ] && [ "$deployments" = "deployment.apps/scout-browser" ]; then
-        echo "  none     a policy beside the fence, or a second browser Deployment"
+    deployments=$(kubectl -n "$NS" get deployment -o jsonpath='{range .items[?(@.spec.template.metadata.labels.app=="scout-browser")]}deployment.apps/{.metadata.name}{"\n"}{end}' 2>&1)
+    owners=$(kubectl -n "$NS" get pod -l app=scout-browser -o jsonpath='{range .items[*]}{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}{end}' 2>&1)
+    if [ "$policies" = "networkpolicy.networking.k8s.io/scout-browser" ] && [ "$deployments" = "deployment.apps/scout-browser" ] \
+        && [ -n "$owners" ] && ! grep -qvE '^ReplicaSet/scout-browser-[a-z0-9]+$' <<<"$owners"; then
+        echo "  none     a policy beside the fence, or anything but the one Deployment behind the pod's label"
     else
-        echo "  HELD     beside the fence: $(masked <<<"$policies $deployments")"
+        echo "  HELD     beside the fence: $(masked <<<"policies: $policies; deployments: $deployments; pods of: $owners")"
         failed=1
     fi
 fi

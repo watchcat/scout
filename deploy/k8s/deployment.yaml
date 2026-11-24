@@ -49,6 +49,10 @@ spec:
             # deploy, for the commit the pod runs). The cluster and the pod
             # itself can, fetch_page included.
             - { name: SCOUT_METRICS_BIND, value: "0.0.0.0:9090" }
+            # Renders go to the browser pod (browser.yaml), and no Chrome
+            # is started in this pod for one. The trip PDF still prints
+            # here: it is Scout's own page, not the web's.
+            - { name: SCOUT_BROWSER_URL, value: "http://scout-browser:8091" }
           ports:
             - { name: http, containerPort: 8080 }
             - { name: metrics, containerPort: 9090 }

@@ -173,6 +173,40 @@ if [ "$DRY_RUN" -eq 0 ] && grep -qE '^(AWS_|RESTIC_)' .env; then
 elif [ "$DRY_RUN" -eq 1 ]; then
     echo "  (dry run) kubectl create secret scout-offsite (backup keys only, if present)"
 fi
+
+# The browser pod before Scout's, so that Scout's renders have somewhere to
+# go once its new pod starts (deploy/k8s/browser.yaml). Its fence excepts
+# the node's own addresses, one of them public, which are read from the node
+# here and neither written down nor printed. envsubst is given the two names
+# the file holds and fills in no others.
+. scripts/node-except.sh
+export SCOUT_SHA=$SHA
+if step "read the node's own addresses, for the browser pod's fence"; then
+    listing=$("${SSH[@]}" 'ip -4 -o addr show scope global')
+    internal=$("${SSH[@]}" 'kubectl get nodes -o jsonpath="{.items[0].status.addresses[?(@.type==\"InternalIP\")].address}"')
+    if ! SCOUT_NODE_EXCEPT=$(node_except "$listing" "$internal"); then
+        echo "  refusing: $SCOUT_NODE_EXCEPT" >&2
+        exit 1
+    fi
+    export SCOUT_NODE_EXCEPT
+    echo "  $(tr ',' '\n' <<<"$SCOUT_NODE_EXCEPT" | wc -l | tr -d ' ') addresses, each excepted"
+fi
+if step "apply deploy/k8s/browser.yaml (the browser pod, its Service, its fence) and wait for it"; then
+    running=$("${SSH[@]}" "kubectl -n scout get deployment/scout-browser -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null" || true)
+    envsubst '${SCOUT_SHA} ${SCOUT_NODE_EXCEPT}' < deploy/k8s/browser.yaml | "${SSH[@]}" 'kubectl apply -f -'
+    # As for Scout's pod below: the same name built again is a new image.
+    if [ "$running" = "scout:$SHA" ] && [ "$BUILT" -eq 1 ]; then
+        echo "  the browser pod already ran scout:$SHA and this deploy built it again: restarting it onto it"
+        "${SSH[@]}" "kubectl -n scout rollout restart deployment/scout-browser"
+    fi
+    if ! "${SSH[@]}" 'kubectl -n scout rollout status deployment/scout-browser --timeout=180s'; then
+        echo >&2
+        echo "  the browser pod's rollout did not complete" >&2
+        "${SSH[@]}" 'kubectl -n scout get pods -l app=scout-browser; kubectl -n scout logs -l app=scout-browser --tail=40' >&2
+        exit 1
+    fi
+fi
+
 for f in pvc service deployment ingress issuer; do
     step "apply deploy/k8s/$f.yaml" \
         && envsubst < "deploy/k8s/$f.yaml" | "${SSH[@]}" 'kubectl apply -f -'
@@ -254,6 +288,17 @@ if step "compare the pod's scout_build_info with $SHA"; then
             echo "  the deploy builds it afresh and restarts the pod onto it" >&2
             exit 1 ;;
     esac
+fi
+
+say "Proving the browser pod's fence"
+# After both rollouts: the checks run the new image's probe in the browser
+# pod, in Scout's, and in a control pod started from it.
+if [ "$DRY_RUN" -eq 1 ]; then
+    scripts/check-browser-fence.sh --dry-run
+elif ! scripts/check-browser-fence.sh "$SHA"; then
+    echo >&2
+    echo "  the browser pod's fence is not what deploy/k8s/browser.yaml says it is: see above" >&2
+    exit 1
 fi
 
 say "Deployed: $SHA $(git log --oneline -1 --format=%s)"

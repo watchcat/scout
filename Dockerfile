@@ -2,7 +2,7 @@
 
 # Build stage. Cargo's registry and target directory live in BuildKit caches
 # instead of image layers, which is what keeps rebuilds cheap:
-#   * a build compiles the workspace's own crates, all four, and no
+#   * a build compiles the workspace's own crates, all of them, and no
 #     dependency unless Cargo.lock changed it (about 3 minutes on the node)
 #   * a Cargo.toml change recompiles the changed dependency alone, instead of
 #     DuckDB's C++ from scratch — that is the ~10 minute build, and touching
@@ -15,12 +15,13 @@ ENV CARGO_BUILD_JOBS=4
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-# The binary has to be copied out within this step: a cache mount is not part
-# of the layer that results from it.
-# Only the package the image ships, and what it depends on. The workspace
-# also holds `scout-browser`, which nothing calls and no image runs yet;
-# built here it would be a second binary with all of scout-core in it,
-# compiled and linked on every deploy and then left behind.
+# The binaries have to be copied out within this step: a cache mount is not
+# part of the layer that results from it.
+# The two packages the image ships, and what they depend on: the bot, and
+# `scout-browser`, which the browser pod runs from this same image
+# (`deploy/k8s/browser.yaml`). It is a second binary with all of scout-core
+# in it, linked on every deploy, so that the pod renders with the very code
+# Scout's own pod rendered with.
 #
 # The commit the build is of, which the binary says on its metrics page
 # (`scout_build_info`, from `scout_api::commit`). `scripts/deploy-k3s.sh`
@@ -42,14 +43,18 @@ ARG SCOUT_COMMIT
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     find crates -type f -exec touch {} + \
-    && cargo build --release -p scout-telegram \
-    && cp target/release/scout-telegram /scout-telegram
+    && cargo build --release -p scout-telegram -p scout-browser \
+    && cp target/release/scout-telegram /scout-telegram \
+    && cp target/release/scout-browser /scout-browser
 
 # Runtime stage: CA certificates (TLS itself is rustls, inside the binary)
-# plus Chromium, used only to re-open pages that
-# refuse a plain HTTP client (a shop behind a challenge answers 403 to
-# reqwest and serves the product page to a real browser). Chromium is the
-# bulk of this image; drop it and the bot still runs, minus that fallback.
+# plus Chromium, used to re-open pages that refuse a plain HTTP client (a
+# shop behind a challenge answers 403 to reqwest and serves the product
+# page to a real browser). In production those renders run in the browser
+# pod, from this same image; Scout's own pod keeps Chromium for the trip
+# PDF, which prints Scout's own page, and a local run renders with it.
+# Chromium is the bulk of this image; drop it and the bot still runs,
+# minus that fallback.
 FROM debian:bookworm-slim AS runtime-base
 # No `chmod 4755` on a setuid sandbox here: Debian's chromium ships none —
 # there is no `chrome-sandbox` binary in /usr/lib/chromium at all, so the
@@ -111,6 +116,7 @@ CMD ["scout-core-tests", "--ignored", "--nocapture", "--test-threads=1", "tools:
 # The image itself. Last, so that it is what a plain `docker build` makes.
 FROM runtime-base
 COPY --from=builder /scout-telegram /usr/local/bin/scout-telegram
+COPY --from=builder /scout-browser /usr/local/bin/scout-browser
 USER scout
 WORKDIR /data
 ENV SCOUT_DB_PATH=/data/scout.duckdb

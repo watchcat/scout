@@ -1257,6 +1257,68 @@ mod tests {
         assert_eq!(MAX_REMOTE_PAGE, 16 * 1024 * 1024);
     }
 
+    /// A pod that answers every request with `head` and then `pieces`, as
+    /// written, and then holds the connection open: what wiremock, which
+    /// always says how long its answer is, cannot be made to do.
+    async fn pod_saying(head: &'static str, pieces: Vec<Vec<u8>>) -> (url::Url, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let pieces = pieces.clone();
+                // One connection a render: each answer says it closes, so
+                // no render is sent down the one before it.
+                tokio::spawn(async move {
+                    let mut asked = vec![0u8; 16 * 1024];
+                    let _ = socket.read(&mut asked).await;
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    for piece in &pieces {
+                        let _ = socket.write_all(piece).await;
+                    }
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                });
+            }
+        });
+        (url::Url::parse(&format!("http://{at}")).unwrap(), serving)
+    }
+
+    fn capped_at(pod: &url::Url, cap: usize) -> Renderer {
+        let mut renderer = Renderer::remote(pod).unwrap();
+        if let How::Remote(remote) = &mut renderer.how {
+            remote.cap = cap;
+        }
+        renderer
+    }
+
+    #[tokio::test]
+    async fn a_page_from_the_pod_that_says_no_length_is_cut_at_the_cap_all_the_same() {
+        // Sent in pieces with no length said, as a taken-over pod could:
+        // only counting what arrives stops it.
+        let piece = |n: usize| [format!("{n:x}\r\n").into_bytes(), vec![b'x'; n], b"\r\n".to_vec()].concat();
+        let (pod, serving) = pod_saying(
+            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: text/html\r\ntransfer-encoding: chunked\r\n\r\n",
+            vec![piece(1000), piece(1000), b"0\r\n\r\n".to_vec()],
+        )
+        .await;
+        assert_eq!(capped_at(&pod, 2000).render("https://shop.example/p/1").await.unwrap().len(), 2000);
+        let err = capped_at(&pod, 1500).render("https://shop.example/p/1").await.unwrap_err();
+        assert!(matches!(&err, BrowserError::Launch(why) if why.contains("1500 bytes")), "{err:?}");
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_page_from_the_pod_said_to_be_too_long_is_refused_before_it_arrives() {
+        // A length past the cap, and a byte of it: waiting for the rest
+        // would be waiting on the pod's say-so.
+        let (pod, serving) = pod_saying("HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: text/html\r\ncontent-length: 1001\r\n\r\n", vec![b"x".to_vec()]).await;
+        let answered = tokio::time::timeout(Duration::from_secs(5), capped_at(&pod, 1000).render("https://shop.example/p/1")).await;
+        let err = answered.expect("the render waited for a page longer than its cap").unwrap_err();
+        assert!(matches!(&err, BrowserError::Launch(why) if why.contains("1000 bytes")), "{err:?}");
+        serving.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_pod_that_never_answers_is_a_timeout_at_the_renders_deadline() {
         // A pod that takes the request and says nothing, as a wedged one would.

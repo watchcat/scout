@@ -112,6 +112,7 @@ pub mod chrome;
 pub mod drive;
 pub mod limits;
 pub mod pipe;
+pub mod probe;
 pub mod server;
 pub mod session;
 pub mod site;

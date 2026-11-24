@@ -164,8 +164,11 @@ mod tests {
         let reached = run(Probe::Tcp(open.clone()), WITHIN, None).await;
         assert_eq!(reached, Ok(format!("connected to {open}")));
         drop(listener);
-        let refused = run(Probe::Tcp(open.clone()), WITHIN, None).await.unwrap_err();
-        assert!(refused.starts_with(&open), "{refused}");
+        // Not the port just let go of: the other tests, binding as this
+        // one did, can be given it at once (one was, in a gate). Port 0 is
+        // one no connection reaches.
+        let refused = run(Probe::Tcp("127.0.0.1:0".to_string()), WITHIN, None).await.unwrap_err();
+        assert!(refused.starts_with("127.0.0.1:0: "), "{refused}");
     }
 
     #[tokio::test]
@@ -222,9 +225,9 @@ mod tests {
     async fn a_render_is_asked_of_the_pod_and_only_with_one_named() {
         assert!(run(Probe::Render("https://example.com/".into()), WITHIN, None).await.unwrap_err().contains("SCOUT_BROWSER_URL is not set"));
         assert!(run(Probe::Render("https://example.com/".into()), WITHIN, Some("  ")).await.unwrap_err().contains("SCOUT_BROWSER_URL is not set"));
-        // A pod with nothing listening: the render fails, and says so.
-        let gone = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
-        let failed = run(Probe::Render("https://example.com/".into()), WITHIN, Some(&format!("http://{gone}"))).await.unwrap_err();
+        // A pod with nothing listening, on a port no connection reaches:
+        // the render fails, and says so.
+        let failed = run(Probe::Render("https://example.com/".into()), WITHIN, Some("http://127.0.0.1:0")).await.unwrap_err();
         assert!(failed.contains("the browser pod could not be asked"), "{failed}");
     }
 

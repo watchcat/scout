@@ -233,6 +233,35 @@ The trip PDF stays where it is: it prints Scout's own page, not the web.
 The existing board card "`NetworkPolicy` for egress" keeps Scout's own
 egress; this takes the browser out of it.
 
+**As built (2026-11-24, `docs/superpowers/plans/2026-11-24-browser-pod.md`).**
+What changed from the above once it met the cluster and the code:
+
+- **DNS by selector:** CoreDNS's pods (`k8s-app: kube-dns` in
+  `kube-system`) on 53. An ipBlock on the kube-dns ClusterIP does not work,
+  since the address is rewritten to CoreDNS's own before the policy is read
+  (measured 2026-11-20).
+- **TCP alone to the public internet.** Chrome reaches the network only
+  through the render's SOCKS proxy, and WebRTC is told twice to send no UDP;
+  the policy lets no datagram out whatever Chrome does.
+- **The node's own addresses are excepted** as well as the private ranges:
+  the node's InternalIP is public here and answers SSH and the Kubernetes
+  API. They are read from the node at each deploy and written in no file.
+- **The render checks its address first**, in both forms: only http(s),
+  only the public internet, before a slot or a Chrome. Chrome's `--dump-dom`
+  prints a `file:` address, and the pod is asked over HTTP.
+- **Scout reads the pod's answer as untrusted:** capped at 16 MB, no
+  redirect followed, no proxy from the environment. With
+  `SCOUT_BROWSER_URL` set Scout never starts a Chrome of its own for a
+  render, and a malformed one stops it at start.
+- **`scout-browser` listens beyond loopback only when told what fences
+  it** (`SCOUT_BROWSER_FENCE`), stops gracefully on SIGTERM, and serves the
+  sessions as well, which nothing calls.
+- **The fence script asks each closed thing twice:** from the browser pod,
+  and from a control pod of the same image that no policy holds. A check
+  counts only when the control reached what the browser pod could not. It
+  runs after both rollouts. Even an open fence is no worse than what it
+  replaced, since before it every render ran in Scout's own pod.
+
 ## Part 3 — Browsing a shop (gated)
 
 ### Gate 1 — what the traces say

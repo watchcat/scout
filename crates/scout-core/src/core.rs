@@ -167,7 +167,7 @@ impl Core {
         // then told as any failed render is; unlike a machine with no
         // Chrome, a walled host is not closed for the request, so each of
         // its pages asks the pod again.
-        let renderer = crate::tools::browser::renderer_for(cfg.browser_url.as_ref())?;
+        let renderer = crate::tools::browser::renderer_for(cfg.browser_url.as_ref(), crate::tools::browser::find_chrome)?;
         tracing::info!(
             headless_browser = renderer.is_some(),
             renders_with = renderer.as_ref().map(crate::tools::browser::Renderer::describe).unwrap_or_default(),

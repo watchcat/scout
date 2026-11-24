@@ -71,14 +71,20 @@ if [ -z "$NODE" ] || [ -z "$GATEWAY" ] || [ -z "$SCOUT_POD" ]; then
 fi
 failed=0
 
-# Every address that could be said, written by what it is.
+# Every address that could be said, written by what it is, and only where
+# it is the whole address: the gateway's is the start of other pods'.
 masked() {
-    local line
-    line=$(cat)
-    for address in $INTERNAL; do line=${line//"$address"/<node>}; done
-    line=${line//"$SCOUT_POD"/<scout pod>}
-    line=${line//"$GATEWAY"/<gateway>}
-    printf '%s' "$line" | tr '\n' ' ' | cut -c1-240
+    local -a by=()
+    local address
+    for address in $INTERNAL; do
+        case "$address" in
+            *:*) by+=(-e "s/(^|[^0-9a-fA-F:])${address}([^0-9a-fA-F:]|\$)/\\1<node>\\2/g") ;;
+            *) by+=(-e "s/(^|[^0-9.])${address//./\\.}([^0-9]|\$)/\\1<node>\\2/g") ;;
+        esac
+    done
+    by+=(-e "s/(^|[^0-9.])${SCOUT_POD//./\\.}([^0-9]|\$)/\\1<scout pod>\\2/g")
+    by+=(-e "s/(^|[^0-9.])${GATEWAY//./\\.}([^0-9]|\$)/\\1<gateway>\\2/g")
+    tr '\n' ' ' | sed -E "${by[@]}" | cut -c1-240
 }
 
 in_browser() { kubectl -n "$NS" exec deploy/scout-browser -- scout-browser probe "$@" 2>&1; }
@@ -192,11 +198,24 @@ if [ "$PHASE" != scout ]; then
     # cannot be written keeps it out.
     holds_nothing "a root it can write" \
         'if touch /data/written 2>/dev/null; then echo writable; else awk '\''$2 == "/" { if ($4 ~ /^ro(,|$)/) print "none"; else print "not read-only" }'\'' /proc/mounts; fi' none
-    volumes=$(kubectl -n "$NS" get pod -l app=scout-browser -o jsonpath='{.items[*].spec.volumes}' 2>&1)
-    if [ -n "$volumes" ] && ! grep -qE '"(secret|projected|hostPath|configMap|csi|persistentVolumeClaim|downwardAPI|serviceAccountToken)"' <<<"$volumes"; then
+    # Scratch only, as the manifest's test holds it: each volume of each
+    # pod with the label an emptyDir, whatever else Kubernetes might mount.
+    volumes=$(kubectl -n "$NS" get pod -l app=scout-browser -o jsonpath='{range .items[*].spec.volumes[*]}{.name} {.emptyDir}{"\n"}{end}' 2>&1)
+    if [ -n "$volumes" ] && ! grep -qvE '^[a-z0-9-]+ \{' <<<"$volumes"; then
         echo "  none     a volume but scratch"
     else
         echo "  HELD     a volume that is not scratch: $(masked <<<"$volumes")"
+        failed=1
+    fi
+    # Policies add up, so the fence is the namespace's one policy; and one
+    # Deployment has the pod's label. A policy for another pod would need
+    # this check to say which.
+    policies=$(kubectl -n "$NS" get networkpolicy -o name 2>&1)
+    deployments=$(kubectl -n "$NS" get deployment -l app=scout-browser -o name 2>&1)
+    if [ "$policies" = "networkpolicy.networking.k8s.io/scout-browser" ] && [ "$deployments" = "deployment.apps/scout-browser" ]; then
+        echo "  none     a policy beside the fence, or a second browser Deployment"
+    else
+        echo "  HELD     beside the fence: $(masked <<<"$policies $deployments")"
         failed=1
     fi
 fi

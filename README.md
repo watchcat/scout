@@ -444,7 +444,7 @@ compiles from source.
 | `IGNAV_API_KEY` | no | — | second flights provider. 1,000 free requests, then $0.002 each. Prices are approximate, not bookable, and labelled as such |
 | `SECONDHAND_SITES` | no | `ebay.com,marktplaats.nl,vinted.com` | second-hand domains |
 | `SCOUT_CHROME` | no | auto-detected | Chrome/Chromium for the headless fallback |
-| `SCOUT_BROWSER_URL` | no | — | the browser pod, e.g. `http://scout-browser:8091`: renders are asked of it and no Chrome is started here for one. Unset, a render starts a Chrome of this process's own. Must be an http address; anything else stops the bot at start |
+| `SCOUT_BROWSER_URL` | no | — | the browser pod, e.g. `http://scout-browser:8091`: renders are asked of it and no Chrome is started here for one. Unset, a render starts a Chrome of this process's own. Must be an http address and port alone; anything else stops the bot at start |
 | `SCOUT_DB_PATH` | no | `scout.duckdb` | DuckDB file |
 | `SCOUT_WEB_BIND` | no | `0.0.0.0:8080` | where the website listens; the bot serves it from the same process |
 | `SCOUT_SESSION_KEY` | web sign-in | — | signs session cookies; 32+ bytes. All four web variables must be set or sign-in does not mount and the site serves the public page only |
@@ -532,11 +532,16 @@ Secret, no service-account token and no database, and its root cannot be
 written. Its NetworkPolicy lets in Scout's pod alone. It lets out DNS, and
 TCP to the public internet with every private, link-local and multicast range
 excepted. The node's own addresses are excepted too: they are read from the
-node at each deploy and written nowhere. After both rollouts the deploy runs
-`scripts/check-browser-fence.sh`, which asks for each thing the pod must not
-reach from inside the pod. It asks again, as a control, from a pod no policy
-holds, and fails the deploy when the browser pod reaches what it should not,
-or when the control could not reach it either.
+node at each deploy and written nowhere. `scripts/check-browser-fence.sh`
+proves it in two phases. The first runs once the browser pod is up and before
+Scout's new pod is: it asks for each thing the pod must not reach from inside
+the pod, and again, as a control, from a pod no policy holds. It checks what
+the pod holds and renders a page in it. The deploy fails when the browser pod
+reaches what it should not, or, where the check must be proved, when the
+control could not reach it either; a browser pod this deploy changed is then
+rolled back. The second runs after Scout's rollout: Scout's pod asks the
+browser pod for a render, and Scout's own start-up line must say it renders
+through it.
 
 `scripts/deploy-k3s.sh` takes **no database backup**. DuckDB is
 single-writer, so the only consistent copy comes from `/backup`, an admin

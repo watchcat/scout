@@ -37,6 +37,31 @@ fn yaml(text: &str) -> Value {
 }
 
 #[test]
+fn the_browser_pod_is_these_three_things_and_no_others() {
+    // Policies add up: a second one that selects the pod, or one for the
+    // whole namespace, lets through whatever it lets through, beside the
+    // fence. And a second Deployment with the pod's label would stand
+    // behind its Service, holding whatever it was given.
+    let kinds: Vec<(String, String)> = parsed("203.0.113.4/32")
+        .unwrap()
+        .iter()
+        .map(|doc| (doc["kind"].as_str().unwrap_or_default().to_string(), doc["metadata"]["name"].as_str().unwrap_or_default().to_string()))
+        .collect();
+    let expected = [("Deployment", "scout-browser"), ("Service", "scout-browser"), ("NetworkPolicy", "scout-browser")];
+    assert_eq!(kinds, expected.map(|(kind, name)| (kind.to_string(), name.to_string())));
+    let manifests = std::fs::read_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/k8s")).unwrap();
+    for manifest in manifests {
+        let path = manifest.unwrap().path();
+        if path.file_name().is_some_and(|name| name == "browser.yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("NetworkPolicy"), "{} holds a NetworkPolicy, and it adds to the fence", path.display());
+        assert!(!text.contains("app: scout-browser"), "{} names the browser pod's label", path.display());
+    }
+}
+
+#[test]
 fn the_fence_is_these_rules_and_no_others() {
     let policy = document("NetworkPolicy");
     assert_eq!(policy["metadata"]["namespace"], "scout");

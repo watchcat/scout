@@ -1,5 +1,7 @@
-//! The server stops as a pod is stopped: on a SIGTERM, letting calls under
-//! way finish, and ending of its own accord rather than by the signal.
+//! The server stops as a pod is stopped: a SIGTERM starts its graceful
+//! shutdown, and it ends of its own accord rather than by the signal. (That
+//! a call under way is let finish is axum's graceful shutdown, and is not
+//! tried here.)
 
 #![cfg(unix)]
 

@@ -88,10 +88,23 @@ pub fn is_challenge_page(html: &str) -> bool {
     is_challenge(html)
 }
 
+/// Chrome's own page for one it could not load: its body is the `neterror`
+/// one and holds the `main-frame-error` block. Both, so that a shop's page
+/// that merely mentions either is still the shop's.
+fn is_chrome_error_page(html: &str) -> bool {
+    html.contains(r#"id="main-frame-error""#) && (html.contains(r#"class="neterror""#) || html.contains("class=\"neterror "))
+}
+
 /// Where Chrome lives, if it does. Resolved once at startup: without it the
 /// fallback stays off and plain fetching behaves exactly as before.
 pub fn find_chrome() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("SCOUT_CHROME") {
+    chrome_from(std::env::var("SCOUT_CHROME").ok())
+}
+
+/// [`find_chrome`], with `SCOUT_CHROME` given rather than read, so that a
+/// test need not set the process's environment under the other tests.
+fn chrome_from(named: Option<String>) -> Option<PathBuf> {
+    if let Some(path) = named {
         let path = PathBuf::from(path);
         return path.exists().then_some(path);
     }
@@ -124,17 +137,22 @@ const REACH_THE_POD: Duration = Duration::from_secs(5);
 const MAX_POD_SENTENCE: usize = 300;
 
 fn pods_sentence(said: &str) -> String {
-    said.chars().filter(|c| !c.is_control()).take(MAX_POD_SENTENCE).collect()
+    let unwritten = |c: &char| {
+        c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    };
+    said.chars().filter(|c| !unwritten(c)).take(MAX_POD_SENTENCE).collect()
 }
 
 /// The renderer a process with this setting renders with: the browser
 /// pod's when one is named, and then never a Chrome of the process's own,
 /// a Chrome found here included; a Chrome of its own when none is named
 /// and one is found; and otherwise none.
-pub(crate) fn renderer_for(pod: Option<&url::Url>) -> Result<Option<Renderer>, BrowserError> {
+/// `chrome` is how one is found, [`find_chrome`] outside a test; with a pod
+/// named it is not asked.
+pub(crate) fn renderer_for(pod: Option<&url::Url>, chrome: impl FnOnce() -> Option<PathBuf>) -> Result<Option<Renderer>, BrowserError> {
     match pod {
         Some(pod) => Renderer::remote(pod).map(Some),
-        None => Ok(find_chrome().map(Renderer::new)),
+        None => Ok(chrome().map(Renderer::new)),
     }
 }
 
@@ -293,8 +311,8 @@ impl Renderer {
     /// This is for whoever else asks, and since the browser pod is asked
     /// over HTTP, that is anyone who can reach the pod. A Chrome told
     /// `--dump-dom` with a `file:` address prints the file. With an address
-    /// on loopback it is the proxy that refuses, but only once Chrome is
-    /// running, and Chrome then prints its own error page as the page.
+    /// on loopback it is the proxy that refuses, but only once a Chrome has
+    /// been started for nothing.
     async fn may_render(&self, url: &str) -> Result<(), BrowserError> {
         let parsed = url::Url::parse(url).map_err(|_| BrowserError::Refused("that is not a web address".to_string()))?;
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -373,11 +391,14 @@ impl Renderer {
         drop(chrome);
         drop(profile);
 
-        // A page Chrome could not load is no page at all: `--dump-dom`
-        // prints nothing and Chrome ends (measured 2026-11-24 on Chrome
-        // 157, for a refused port and for a proxy that would not connect:
-        // "Page load failed: net::ERR_…" on its stderr, an empty stdout).
-        // It prints no error page that could be taken for the shop's.
+        // A page Chrome could not load is a failed render, in either of the
+        // two ways it comes back. The page asked for: `--dump-dom` prints
+        // nothing and Chrome ends (measured 2026-11-24 on Chrome 157, for a
+        // refused port and for a proxy that would not connect: "Page load
+        // failed: net::ERR_…" on its stderr, an empty stdout). A page it was
+        // sent on to, by script or a meta refresh: Chrome prints its own
+        // error page, 187 KB of it, which would otherwise be handed over as
+        // the shop's (measured the same day on Chrome 158).
         if html.is_empty() {
             return Err(if ended {
                 BrowserError::Launch("Chrome ended without printing a page: it could not load it".to_string())
@@ -385,7 +406,11 @@ impl Renderer {
                 BrowserError::Timeout
             });
         }
-        Ok(String::from_utf8_lossy(&html).into_owned())
+        let page = String::from_utf8_lossy(&html).into_owned();
+        if is_chrome_error_page(&page) {
+            return Err(BrowserError::Launch("Chrome could not load the page it was sent on to, and printed its own error page".to_string()));
+        }
+        Ok(page)
     }
 
     #[cfg(test)]
@@ -798,9 +823,9 @@ mod tests {
     #[test]
     fn chrome_is_found_through_the_env_override_when_set() {
         // A path that does not exist must not enable the fallback.
-        temp_env_var("SCOUT_CHROME", "/definitely/not/here", || {
-            assert!(find_chrome().is_none());
-        });
+        assert!(chrome_from(Some("/definitely/not/here".to_string())).is_none());
+        let here = std::env::current_exe().unwrap();
+        assert_eq!(chrome_from(Some(here.display().to_string())), Some(here));
     }
 
     #[test]
@@ -1368,22 +1393,34 @@ mod tests {
         serving.abort();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_pod_that_never_answers_is_a_timeout_at_the_renders_deadline() {
-        // A pod that takes the request and says nothing, as a wedged one would.
+        // A pod that takes the request and says nothing, as a wedged one
+        // would. The clock is paused only once the pod has the connection:
+        // paused while the connection is still being made, it jumps the
+        // five seconds Scout gives the pod to take one, and the test would
+        // be of that instead (the first version of this test did so in 32
+        // runs of 40).
         let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let at = silent.local_addr().unwrap();
+        let (taken, connected) = tokio::sync::oneshot::channel();
         let held = tokio::spawn(async move {
-            let mut open = Vec::new();
+            let (socket, _) = silent.accept().await.unwrap();
+            let _ = taken.send(());
+            let mut open = vec![socket];
             while let Ok((socket, _)) = silent.accept().await {
                 open.push(socket);
             }
         });
         let renderer = Renderer::remote(&url::Url::parse(&format!("http://{at}")).unwrap()).unwrap();
         let started = tokio::time::Instant::now();
-        let err = renderer.render("https://203.0.113.1/p/1").await.unwrap_err();
+        let render = tokio::spawn(async move { renderer.render("https://203.0.113.1/p/1").await });
+        connected.await.unwrap();
+        tokio::time::pause();
+        let err = render.await.unwrap().unwrap_err();
         assert!(matches!(err, BrowserError::Timeout), "{err:?}");
-        assert!(started.elapsed() <= RENDER_TIMEOUT + Duration::from_secs(1), "{:?}", started.elapsed());
+        let took = started.elapsed();
+        assert!(took >= RENDER_TIMEOUT && took <= RENDER_TIMEOUT + Duration::from_secs(1), "{took:?}");
         held.abort();
     }
 
@@ -1435,19 +1472,40 @@ mod tests {
         assert!(matches!(&err, BrowserError::Launch(why) if why.contains("without printing a page")), "{err:?}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chromes_own_error_page_is_a_failed_render_and_not_the_shops_page() {
+        let base = tempfile::tempdir().unwrap();
+        let errs = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tools/chrome-that-errs.sh");
+        let renderer = Renderer { profiles: base.path().to_path_buf(), ..Renderer::new(PathBuf::from(errs)) };
+        let err = renderer.render_inner("http://shop.example/").await.unwrap_err();
+        assert!(matches!(&err, BrowserError::Launch(why) if why.contains("its own error page")), "{err:?}");
+    }
+
+    #[test]
+    fn a_page_that_only_mentions_chromes_error_page_is_still_a_page() {
+        assert!(is_chrome_error_page(r#"<body class="neterror" id="t"><div id="main-frame-error">x</div></body>"#));
+        assert!(is_chrome_error_page(r#"<body class="neterror offline" id="t"><div id="main-frame-error">x</div></body>"#));
+        for page in [
+            r#"<body><p>Our page about neterror and main-frame-error</p></body>"#,
+            r#"<body class="neterror"><p>no block</p></body>"#,
+            r#"<body><div id="main-frame-error">a shop's own block</div></body>"#,
+        ] {
+            assert!(!is_chrome_error_page(page), "{page}");
+        }
+    }
+
     #[test]
     fn a_named_pod_is_what_renders_even_where_a_chrome_is_found() {
         // The point of the pod: with one named, no Chrome is started in
         // Scout's own pod for a render, though the image has one there.
         let found = std::env::current_exe().unwrap();
-        temp_env_var("SCOUT_CHROME", found.to_str().unwrap(), || {
-            assert_eq!(find_chrome().as_ref(), Some(&found), "the test means a machine with a Chrome");
-            let pod = url::Url::parse("http://scout-browser:8091").unwrap();
-            let named = renderer_for(Some(&pod)).unwrap().expect("a renderer");
-            assert!(matches!(&named.how, How::Remote(remote) if remote.render.as_str() == "http://scout-browser:8091/render"));
-            let unnamed = renderer_for(None).unwrap().expect("a renderer");
-            assert!(matches!(&unnamed.how, How::Local(chrome) if chrome == &found));
-        });
+        let pod = url::Url::parse("http://scout-browser:8091").unwrap();
+        let named = renderer_for(Some(&pod), || Some(found.clone())).unwrap().expect("a renderer");
+        assert!(matches!(&named.how, How::Remote(remote) if remote.render.as_str() == "http://scout-browser:8091/render"));
+        let unnamed = renderer_for(None, || Some(found.clone())).unwrap().expect("a renderer");
+        assert!(matches!(&unnamed.how, How::Local(chrome) if chrome == &found));
+        assert!(renderer_for(None, || None).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1455,11 +1513,11 @@ mod tests {
         // It goes into Scout's log; a pod a page took over does not get to
         // write lines of its own there.
         let pod = MockServer::start().await;
-        let said = format!("first\nERROR a line of the pod's own\u{1b}[31m{}", "x".repeat(1000));
+        let said = format!("first\nERROR a line\u{2028} of the pod's\u{202e} own\u{1b}[31m{}", "x".repeat(1000));
         Mock::given(path("/render")).respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({ "error": said }))).mount(&pod).await;
         let Err(BrowserError::Refused(kept)) = asking(&pod).render("https://203.0.113.1/p/1").await else { panic!("not a refusal") };
         assert_eq!(kept.chars().count(), MAX_POD_SENTENCE);
-        assert!(kept.starts_with("firstERROR a line") && !kept.chars().any(char::is_control), "{kept}");
+        assert!(kept.starts_with("firstERROR a line of the pod's own[31m") && !kept.chars().any(char::is_control), "{kept}");
     }
 
     #[tokio::test]
@@ -1483,18 +1541,6 @@ mod tests {
         }
     }
 
-    /// Sets an env var for the duration of `f`. Tests run in threads, so this
-    /// stays in one place rather than being scattered.
-    fn temp_env_var(key: &str, value: &str, f: impl FnOnce()) {
-        let previous = std::env::var(key).ok();
-        // SAFETY: single-threaded assertion inside f; restored right after.
-        unsafe { std::env::set_var(key, value) };
-        f();
-        match previous {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
 }
 
 #[cfg(test)]

@@ -195,12 +195,16 @@ if step "apply deploy/k8s/browser.yaml (the browser pod, its Service, its fence)
     running=$("${SSH[@]}" "kubectl -n scout get deployment/scout-browser -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null" || true)
     # Never a fence without the node in it. (Filled in empty, the list in
     # the manifest is no YAML either, so the apply would fail too.)
-    : "${SCOUT_NODE_EXCEPT:?the node's addresses were not read, and the fence would not except them}"
+    : "${SCOUT_NODE_EXCEPT:?the addresses of the node were not read, and the fence would not except them}"
     envsubst '${SCOUT_SHA} ${SCOUT_NODE_EXCEPT}' < deploy/k8s/browser.yaml | "${SSH[@]}" 'kubectl apply -f -'
+    # Whether this deploy puts a new pod there, which a failed check below
+    # then takes back.
+    [ "$running" != "scout:$SHA" ] && browser_changed=1
     # As for Scout's pod below: the same name built again is a new image.
     if [ "$running" = "scout:$SHA" ] && [ "$BUILT" -eq 1 ]; then
         echo "  the browser pod already ran scout:$SHA and this deploy built it again: restarting it onto it"
         "${SSH[@]}" "kubectl -n scout rollout restart deployment/scout-browser"
+        browser_changed=1
     fi
     if ! "${SSH[@]}" 'kubectl -n scout rollout status deployment/scout-browser --timeout=180s'; then
         echo >&2
@@ -209,17 +213,30 @@ if step "apply deploy/k8s/browser.yaml (the browser pod, its Service, its fence)
         exit 1
     fi
 fi
-# Before Scout is pointed at it, all that can be asked of the pod alone:
+# Before Scout's new pod, all that can be asked of the browser pod alone:
 # its fence, from inside it and from a control; what it holds; and a page
 # rendered in it, names resolved and Chromium started under that fence.
-# Scout's pod is still the old one here, rendering on its own, so a pod
-# that fails any of it leaves production as it was.
+#
+# What a failure leaves depends on what ran before. On the first deploy of
+# the pod, Scout's running pod renders with a Chrome of its own and is left
+# so. On every later one, Scout's running pod already renders through the
+# browser pod, which has just rolled out: so the browser pod goes back to
+# what it ran before, which passed these checks when it was deployed.
+# (The fence's own policy is applied with it and is not rolled back.)
 say "Proving the browser pod's fence"
 if [ "$DRY_RUN" -eq 1 ]; then
     scripts/check-browser-fence.sh --dry-run
 elif ! scripts/check-browser-fence.sh "$SHA" pod; then
     echo >&2
-    echo "  the browser pod is not what deploy/k8s/browser.yaml says it is (above), and Scout is left as it was" >&2
+    if [ -n "${running:-}" ] && [ "${browser_changed:-0}" -eq 1 ]; then
+        echo "  the browser pod is not what deploy/k8s/browser.yaml says it is (above): rolling it back to $running, which Scout renders through" >&2
+        "${SSH[@]}" 'kubectl -n scout rollout undo deployment/scout-browser && kubectl -n scout rollout status deployment/scout-browser --timeout=180s' >&2 \
+            || echo "  the rollback did not complete: renders fail until the browser pod is fixed" >&2
+    elif [ -n "${running:-}" ]; then
+        echo "  the browser pod, unchanged by this deploy, does not pass its checks (above): renders fail until it is fixed" >&2
+    else
+        echo "  the browser pod is not what deploy/k8s/browser.yaml says it is (above); Scout is left rendering on its own, as it was" >&2
+    fi
     exit 1
 fi
 

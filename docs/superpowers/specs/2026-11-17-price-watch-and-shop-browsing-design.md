@@ -258,9 +258,13 @@ What changed from the above once it met the cluster and the code:
   sessions as well, which nothing calls.
 - **The fence script asks each closed thing twice:** from the browser pod,
   and from a control pod of the same image that no policy holds. A check
-  counts only when the control reached what the browser pod could not. It
-  runs after both rollouts. Even an open fence is no worse than what it
-  replaced, since before it every render ran in Scout's own pod.
+  counts only when the control reached what the browser pod could not.
+  That phase runs before Scout's new pod, with a render in the browser pod;
+  a browser pod the deploy changed is rolled back when it fails. A second
+  phase after Scout's rollout has Scout's pod render through the browser pod
+  and reads Scout's own word that it does. Even an open fence is no worse
+  than what it replaced, since before it every render ran in Scout's own
+  pod.
 
 ## Part 3 — Browsing a shop (gated)
 

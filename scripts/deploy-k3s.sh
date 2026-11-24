@@ -205,6 +205,17 @@ if step "apply deploy/k8s/browser.yaml (the browser pod, its Service, its fence)
         "${SSH[@]}" 'kubectl -n scout get pods -l app=scout-browser; kubectl -n scout logs -l app=scout-browser --tail=40' >&2
         exit 1
     fi
+    # Before Scout is pointed at it: a page rendered in the pod, asked of
+    # itself, names resolved and Chromium started under its fence. Scout's
+    # pod is still the old one here, rendering on its own.
+    if rendered=$("${SSH[@]}" 'kubectl -n scout exec deploy/scout-browser -- env SCOUT_BROWSER_URL=http://127.0.0.1:8091 scout-browser probe render https://example.com/' 2>&1) \
+        && [[ $rendered == *'"Example Domain"'* ]]; then
+        echo "  it renders: $rendered"
+    else
+        echo >&2
+        echo "  the browser pod does not render, and Scout is left as it was: $rendered" >&2
+        exit 1
+    fi
 fi
 
 for f in pvc service deployment ingress issuer; do

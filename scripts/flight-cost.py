@@ -11,19 +11,23 @@ and the pod holds it). The nightly backup is the copy:
 
 Needs the `duckdb` Python package. Runs carry token counts from 2026-10-17
 on, and traces are kept for the last 300 runs (`Core::TRACE_RUNS_KEEP`), so
-this is a rolling window, not history.
+this is a rolling window, not history. Tests: scripts/flight-cost.test.py.
 
 How it counts. A flight-desk run is a run whose trace has an `ask_flights`
 call. Its day-searches are the `flight_search` rows `request_log` holds for
-the same account inside the run's span: `search_flights` writes one for
-every day it buys, so a repeat served from the request's memo is not one.
-Re-pricing searches and Ignav booking lookups are not in `request_log`; they
-are counted from `finalise_trip`'s result and the booking tools' calls.
+the same account between the run's start and its end: `search_flights`
+writes one for every day it buys, so a repeat served from the request's
+memo is not one. A run with no end recorded is skipped, and said. Re-pricing
+searches and Ignav booking lookups are not in `request_log`. They are
+counted from `finalise_trip`'s result (each flight re-priced at both
+providers, plus Duffel's multi-city request when there are two or more) and
+from the booking-link calls that answered.
 
 How it prices. List prices as read on 2026-11-26 (`docs/how-flight-search-works.md`,
-section 7.9): MiniMax M3 per token, uncached input, cached input and output
-apart; a Duffel search at the excess-search fee, since Scout has no orders;
-an Ignav request past its one-time free 1,000.
+sections 7.1 and 7.9): MiniMax M3 per token, uncached input, cached input
+and output apart; a Duffel search at the excess-search fee, since Scout has
+no orders; an Ignav request past its one-time free 1,000. A run's tokens
+are its own and its flight desk's; the small side calls are not in them.
 """
 import collections
 import json
@@ -41,64 +45,106 @@ IGNAV_REQUEST = 0.002
 
 def loads(text):
     try:
-        return json.loads(text) if text else None
+        value = json.loads(text) if text else None
     except ValueError:
         return None
+    return value if isinstance(value, dict) else None
 
 
 def model_cost(tin, cached, tout):
     return (tin - cached) * PRICE_IN + cached * PRICE_CACHED + tout * PRICE_OUT
 
 
-def main(path):
-    c = duckdb.connect(path, read_only=True)
-    span = c.execute("select min(started_at), max(started_at), count(*), count(input_tokens) from runs").fetchone()
-    print(f"runs: {span[2]}, {span[0]:%Y-%m-%d} to {span[1]:%Y-%m-%d}; {span[3]} carry tokens")
-    logged = c.execute(
-        "select count(*), min(created_at), max(created_at) from request_log where kind = 'flight_search'").fetchone()
-    if logged[0]:
-        print(f"day-searches logged: {logged[0]}, {logged[1]:%Y-%m-%d} to {logged[2]:%Y-%m-%d}")
+def provider_cost(bought, repriced, multi, lookups):
+    """Duffel and Ignav, in dollars. A bought day and a re-priced flight are
+    a request at each provider; the multi-city request is Duffel's alone and
+    a booking lookup Ignav's alone."""
+    return (bought + repriced + multi) * DUFFEL_SEARCH + (bought + repriced + lookups) * IGNAV_REQUEST
 
+
+def measure(c):
+    """One dict per flight-desk run that carries tokens, oldest first, and
+    the number of such runs skipped for want of an end."""
     flight_runs = [r[0] for r in c.execute("select distinct run_id from run_traces where tool = 'ask_flights'").fetchall()]
-    print(f"traced flight-desk runs: {len(flight_runs)}\n")
-    print("week | searches | window | return | day-searches | re-price | Ignav lookups | in | cached | out | model $ | providers $ | total $")
-    groups = collections.defaultdict(list)
+    rows, skipped = [], 0
     for start, end, acct, tin, cached, tout, rid in c.execute(
         "select started_at, ended_at, account_id, input_tokens, cached_tokens, output_tokens, id from runs "
         "where input_tokens is not null and id in (select unnest(?)) order by started_at", [flight_runs]).fetchall():
-        calls = c.execute("select tool, args, result from run_traces where run_id = ? and tool is not null", [rid]).fetchall()
-        searches = [loads(a) or {} for t, a, _ in calls if t == "search_flights" and a is not None]
-        flex = max([int(s.get("flex_days") or 0) for s in searches] or [0])
-        ret = any(s.get("return_date") for s in searches)
+        if end is None:
+            skipped += 1
+            continue
+        calls = c.execute(
+            "select tool, args, status, result, truncated from run_traces where run_id = ? and tool is not null",
+            [rid]).fetchall()
+        searches = [(loads(a) or {}, s) for t, a, s, _, _ in calls if t == "search_flights" and a is not None]
+        answered = [args for args, status in searches if status == "ok"]
         bought = c.execute(
             "select count(*) from request_log where kind = 'flight_search' and account_id = ? "
-            "and created_at between ? - interval 5 second and ? + interval 5 second",
-            [acct, start, end or start]).fetchone()[0]
-        reprice, lookups = 0, sum(1 for t, a, _ in calls if t == "flight_booking_links" and a is not None)
-        for t, _, result in calls:
-            if t == "finalise_trip" and result:
-                segments = (loads(result) or {}).get("segments") or []
-                reprice += len(segments) + (1 if len(segments) >= 2 else 0)
-                lookups += sum(1 for s in segments if s.get("booking"))
-        model = model_cost(tin, cached or 0, tout)
-        providers = (bought + reprice) * DUFFEL_SEARCH + (bought + reprice - (1 if reprice else 0) + lookups) * IGNAV_REQUEST
-        print(f"{start:%G-W%V} | {len(searches)} | ±{flex} | {'yes' if ret else 'no'} | {bought} | {reprice} | {lookups} | "
-              f"{tin:,} | {cached:,} ({cached / tin:.0%}) | {tout:,} | {model:.3f} | {providers:.3f} | {model + providers:.3f}")
-        kind = "no search" if not searches else ("window" if flex else "one date")
-        groups[kind].append(model + providers)
+            "and created_at between ? and ?", [acct, start, end]).fetchone()[0]
+        repriced = multi = unread = 0
+        lookups = sum(1 for t, a, s, _, _ in calls if t == "flight_booking_links" and a is not None and s == "ok")
+        for t, a, s, result, truncated in calls:
+            if t != "finalise_trip" or a is None or s != "ok":
+                continue
+            out = None if truncated else loads(result)
+            if out is None:
+                unread += 1
+                continue
+            segments = out.get("segments") or []
+            repriced += len(segments)
+            multi += 1 if len(segments) >= 2 else 0
+            lookups += sum(1 for seg in segments if isinstance(seg, dict) and seg.get("booking"))
+        rows.append(dict(
+            week=f"{start:%G-W%V}",
+            calls=len(searches),
+            flex=max([int(args.get("flex_days") or 0) for args in answered] or [0]),
+            ret=any(args.get("return_date") for args in answered),
+            bought=bought, repriced=repriced, multi=multi, lookups=lookups, unread_finalise=unread,
+            tin=tin, cached=cached or 0, tout=tout,
+            model=model_cost(tin, cached or 0, tout),
+            providers=provider_cost(bought, repriced, multi, lookups),
+        ))
+    return rows, skipped
+
+
+def main(path):
+    c = duckdb.connect(path, read_only=True)
+    first, last, runs, with_tokens = c.execute(
+        "select min(started_at), max(started_at), count(*), count(input_tokens) from runs").fetchone()
+    if not runs:
+        print("no runs in this database")
+        return
+    print(f"runs: {runs}, {first:%Y-%m-%d} to {last:%Y-%m-%d}; {with_tokens} carry tokens")
+    logged, since, until = c.execute(
+        "select count(*), min(created_at), max(created_at) from request_log where kind = 'flight_search'").fetchone()
+    if logged:
+        print(f"day-searches logged: {logged}, {since:%Y-%m-%d} to {until:%Y-%m-%d} "
+              f"(at least ${logged * DUFFEL_SEARCH:.2f} at Duffel's excess-search fee)")
+
+    rows, skipped = measure(c)
+    print(f"flight-desk runs with tokens: {len(rows)}" + (f"; {skipped} skipped, no end recorded" if skipped else ""))
+    print("\nweek | search calls | window | return | day-searches | re-priced | multi-city | lookups | in | cached | out | model $ | providers $ | total $")
+    groups = collections.defaultdict(list)
+    for r in rows:
+        print(f"{r['week']} | {r['calls']} | ±{r['flex']} | {'yes' if r['ret'] else 'no'} | {r['bought']} | {r['repriced']} | "
+              f"{r['multi']} | {r['lookups']} | {r['tin']:,} | {r['cached']:,} ({r['cached'] / r['tin']:.0%}) | {r['tout']:,} | "
+              f"{r['model']:.3f} | {r['providers']:.3f} | {r['model'] + r['providers']:.3f}"
+              + (f" | {r['unread_finalise']} finalise result(s) unreadable" if r["unread_finalise"] else ""))
+        kind = "no search" if not r["calls"] else ("window" if r["flex"] else "one date")
+        groups[kind].append(r["model"] + r["providers"])
     for kind, totals in groups.items():
         print(f"  {kind}: {len(totals)} runs, total $ median {statistics.median(totals):.3f}")
 
     print("\nevery run with tokens, by week: runs, input, cached share, output, model $")
-    all_in = all_cached = all_out = runs = 0
+    all_in = all_cached = all_out = counted = 0
     for week, n, tin, cached, tout in c.execute(
         "select strftime(started_at, '%G-W%V'), count(*), sum(input_tokens), sum(cached_tokens), sum(output_tokens) "
         "from runs where input_tokens is not null group by 1 order by 1").fetchall():
         print(f"  {week}: {n}, {tin:,}, {cached / tin:.0%}, {tout:,}, {model_cost(tin, cached, tout):.2f}")
-        all_in, all_cached, all_out, runs = all_in + tin, all_cached + cached, all_out + tout, runs + n
-    if runs:
+        all_in, all_cached, all_out, counted = all_in + tin, all_cached + cached, all_out + tout, counted + n
+    if counted:
         total = model_cost(all_in, all_cached, all_out)
-        print(f"  all: {runs} runs, cached {all_cached / all_in:.0%}, model ${total:.2f}, ${total / runs:.3f} a run")
+        print(f"  all: {counted} runs, cached {all_cached / all_in:.0%}, model ${total:.2f}, ${total / counted:.3f} a run")
 
 
 if __name__ == "__main__":

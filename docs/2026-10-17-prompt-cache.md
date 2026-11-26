@@ -1,5 +1,11 @@
 # The prompt cache: what MiniMax caches
 
+> **Superseded by production, 2026-11-26.** The probe below saw a cache only
+> on an exact repeat. The runs themselves say otherwise: every week since
+> tokens were first recorded on 2026-10-17, 71% to 85% of all runs' input
+> was reported as cached. `docs/how-flight-search-works.md`, section 7.9,
+> has the figures. Why the probe and the runs differ was not looked into.
+
 The board card said the per-user profile facts sit inside the system
 prompt and break the prefix cache for every user, and asked for them to
 be moved to the end. Two things turned out to be true instead.

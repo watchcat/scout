@@ -684,7 +684,9 @@ of JavaScript in the browser client.
 - **Nobody can price a whole month.** Neither provider has a calendar
   endpoint, so a range costs one search per day. ±3 days is the ceiling; the
   big sites answer month views from caches of indicative fares, which is a
-  different and less honest product.
+  different and less honest product. Ignav's pricing page now lists a
+  cheapest-dates search over up to 31 dates as one request; Scout does not
+  use it yet.
 - **A finalised trip hands out links unevenly.** Ignav segments resolve to
   real sellers; Duffel segments give you the airline and the flight numbers
   and nothing to click, because Duffel gates hosted checkout until they
@@ -752,8 +754,10 @@ of JavaScript in the browser client.
   a ±3 day window is seven searches because neither provider prices a
   calendar, and finalising an N-segment trip is N+1. Parking extra options on
   a segment adds nothing, because they are all priced by the one search that
-  segment was going to cost anyway. Measured: a flight question runs about
-  **1.4 cents** end to end.
+  segment was going to cost anyway. Measured in November 2026: a flight
+  search over a flexible window costs about **8 to 9 cents** at list prices,
+  two-thirds of it the two flight providers
+  (`docs/how-flight-search-works.md`, section 7.9).
 
 ---
 

@@ -4,11 +4,14 @@
 Every run here is written out, so each number the script gives is one a
 reader can count by hand. Needs the `duckdb` package, as the script does.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 
 import duckdb
 
@@ -55,6 +58,18 @@ def finalise(flights, booked=0):
 
 
 class MeasureTest(unittest.TestCase):
+    def setUp(self):
+        real = Db.__init__
+
+        def tracked(db):
+            real(db)
+            self.addCleanup(db.dir.cleanup)
+            self.addCleanup(db.c.close)
+
+        patch = unittest.mock.patch.object(Db, "__init__", tracked)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_a_flexible_return_is_priced_from_its_tokens_and_the_days_it_bought(self):
         db = Db()
         db.run(1, "2026-11-24 10:00:00", "2026-11-24 10:02:00", tokens=(99_622, 66_044, 9_387))
@@ -70,7 +85,8 @@ class MeasureTest(unittest.TestCase):
         db.run(1, "2026-11-24 10:00:00", "2026-11-24 10:01:00")
         db.run(2, "2026-11-24 10:01:03", "2026-11-24 10:02:00")
         db.bought("2026-11-24 10:00:30", 4)
-        db.bought("2026-11-24 10:01:10", 4)
+        # Inside 5 seconds of run 1's end: a padded span would count them as its.
+        db.bought("2026-11-24 10:01:03", 4)
         rows, _ = fc.measure(db.c)
         self.assertEqual([r["bought"] for r in rows], [4, 4])
 
@@ -116,7 +132,10 @@ class MeasureTest(unittest.TestCase):
     def test_an_empty_database_says_so(self):
         db = Db()
         db.c.close()
-        fc.main(str(pathlib.Path(db.dir.name) / "t.duckdb"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fc.main(str(pathlib.Path(db.dir.name) / "t.duckdb"))
+        self.assertEqual(out.getvalue(), "no runs in this database\n")
 
 
 if __name__ == "__main__":

@@ -690,10 +690,10 @@ of JavaScript in the browser client.
 - **A finalised trip hands out links unevenly.** Ignav segments resolve to
   real sellers; Duffel segments give you the airline and the flight numbers
   and nothing to click, because Duffel gates hosted checkout until they
-  enable it for an account. The single-ticket comparison is Duffel-only for
-  the same shape of reason — Scout asks Ignav only for one-ways and round
-  trips. Its pricing page lists multi-city search too, without saying
-  whether that is one ticket, and Scout does not use it. Without a Duffel key that
+  enable it for an account. The single-ticket comparison is Duffel-only
+  because Scout asks Ignav only for one-ways and round trips. Ignav's
+  pricing page lists multi-city search too, without saying whether that is
+  one ticket, and Scout does not use it. Without a Duffel key that
   half of finalising simply says it could not be done, which is deliberately
   not the same as saying separate booking won.
 - **Not every wall falls.** Headless Chrome clears Cloudflare on some shops and
@@ -758,7 +758,7 @@ of JavaScript in the browser client.
   segment was going to cost anyway. Measured in November 2026: a flight
   search over a flexible window costs about **8 to 9 cents** at list prices,
   about two-thirds of it the two flight providers, and the flight desk spent
-  its whole search allowance every time
+  its whole search allowance on every flexible search
   (`docs/how-flight-search-works.md`, section 7.9).
 
 ---

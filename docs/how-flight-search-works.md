@@ -225,7 +225,7 @@ comes back to both.
 
 **One query per day.** The code assumes neither provider prices a calendar,
 so a window of ±3 days is seven separate searches. Ignav's pricing page now
-lists a search over up to 31 departure dates as one request
+lists a cheapest-dates search over up to 31 departure dates as one request
 ([section 8](#8-limits-and-rough-edges)). `FlightQuery::window` lists the days
 nearest the requested date first. If the allowance runs out part-way, the
 far edge of the window is lost and the day the traveller named is not. On a
@@ -1015,7 +1015,7 @@ lookups sit outside the allowance.
 ### 7.9 Measured in production
 
 Read on 2026-11-26 from the nightly backup of 2026-11-25, with
-`scripts/flight-cost.py`. Runs have carried token counts since 2026-10-17.
+`scripts/flight-cost.py` as first committed (`b718624`). Runs have carried token counts since 2026-10-17.
 In that window 9 runs called the flight desk, and 6 of them searched. These
 are small numbers: read them as shape, not precision. The prices are those
 of [section 7.1](#71-the-three-meters). Duffel is counted at its

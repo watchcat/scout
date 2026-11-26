@@ -681,16 +681,19 @@ of JavaScript in the browser client.
   never repeats a price from earlier in the conversation; it searches again.
   Airport codes are the model's job, so a wrong one is a wrong answer rather
   than a silent one.
-- **Nobody can price a whole month.** Neither provider has a calendar
-  endpoint, so a range costs one search per day. ±3 days is the ceiling; the
-  big sites answer month views from caches of indicative fares, which is a
-  different and less honest product.
+- **A range is one search per day.** Scout prices a range one day at a
+  time, so ±3 days is the ceiling; the big sites answer month views from
+  caches of indicative fares, which is a different and less honest product.
+  Duffel prices one day per search. Ignav's pricing page now lists a
+  cheapest-dates search over up to 31 dates as one request, which Scout does
+  not use yet.
 - **A finalised trip hands out links unevenly.** Ignav segments resolve to
   real sellers; Duffel segments give you the airline and the flight numbers
   and nothing to click, because Duffel gates hosted checkout until they
-  enable it for an account. The single-ticket comparison is Duffel-only for
-  the same shape of reason — Ignav has one-way and round-trip endpoints and
-  no way to price a multi-city itinerary at all. Without a Duffel key that
+  enable it for an account. The single-ticket comparison is Duffel-only
+  because Scout asks Ignav only for one-ways and round trips. Ignav's
+  pricing page lists multi-city search too, without saying whether that is
+  one ticket, and Scout does not use it. Without a Duffel key that
   half of finalising simply says it could not be done, which is deliberately
   not the same as saying separate booking won.
 - **Not every wall falls.** Headless Chrome clears Cloudflare on some shops and
@@ -749,11 +752,14 @@ of JavaScript in the browser client.
   flight search is billed by whichever provider answered it. Budgets are
   capped per request: 15 search queries, 5 page opens, 20 model turns, and
   flight searches that start at 4 and grow with what you actually asked for —
-  a ±3 day window is seven searches because neither provider prices a
-  calendar, and finalising an N-segment trip is N+1. Parking extra options on
+  a ±3 day window is seven searches because Scout prices a range one day at
+  a time, and finalising an N-segment trip is N+1. Parking extra options on
   a segment adds nothing, because they are all priced by the one search that
-  segment was going to cost anyway. Measured: a flight question runs about
-  **1.4 cents** end to end.
+  segment was going to cost anyway. Measured in November 2026: a flight
+  search over a flexible window costs about **8 to 9 cents** at list prices,
+  about two-thirds of it the two flight providers, and the flight desk spent
+  its whole search allowance on every flexible search
+  (`docs/how-flight-search-works.md`, section 7.9).
 
 ---
 

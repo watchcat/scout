@@ -2,12 +2,14 @@
 
 Written 2026-11-26 from the code at commit `7ec4765`. Paths are relative to
 the repository root. A number called *measured* was observed in production
-or on a live API and is quoted from a code comment or the README; every other
-number is a constant in the code. Two kinds of number were worked out for
-this document: the prompt sizes in section 7.6, counted from the prompt
-constants as the model receives them, and the sums in section 7.8. What the
-two providers charge and how they behave is taken from the code comments and
-the README, and was not checked with the providers.
+or on a live API. Outside section 7.9 it is quoted from a code comment or
+the README; section 7.9 was measured for this document, with a script that
+is in the repository. Every other number is a constant in the code, apart
+from two kinds worked out for this document: the prompt sizes in section
+7.6, counted from the prompt constants as the model receives them, and the
+sums in section 7.8. The providers' prices were read off their own pricing
+pages on 2026-11-26. Everything else about how the providers behave is taken
+from the code comments and the README.
 
 Scout answers a flight question with two language-model agents, and a body of
 Rust between them and the two fare providers. The design follows one rule,
@@ -221,8 +223,10 @@ Two things are not checked: whether three letters are a real airport, and
 whether the date has already passed. [Section 8](#8-limits-and-rough-edges)
 comes back to both.
 
-**One query per day.** Neither provider prices a calendar, so a window of
-±3 days is seven separate searches. `FlightQuery::window` lists the days
+**One query per day.** The code assumes neither provider prices a calendar,
+so a window of ±3 days is seven separate searches. Ignav's pricing page now
+lists a cheapest-dates search over up to 31 departure dates as one request
+([section 8](#8-limits-and-rough-edges)). `FlightQuery::window` lists the days
 nearest the requested date first. If the allowance runs out part-way, the
 far edge of the window is lost and the day the traveller named is not. On a
 return trip the return date moves with the outbound, so a week away stays a
@@ -337,7 +341,7 @@ comparison.
 | Currency | As the offer states it | Follows the `market` country sent with the request. The default is US, so dollars |
 | Separate tickets (self-transfer) | Never | Flagged with `requires_self_transfer` |
 | Expiry | `expires_at` on each offer | None |
-| Multi-city as one ticket | Yes | No |
+| Multi-city as one ticket | Yes | Not used. The code says there is none. Ignav's pricing page lists multi-city search, without saying whether it is one ticket |
 | Where to buy | Hosted checkout, when Duffel enables it for the account | The airline's page and resellers, flight pre-selected |
 | List price | $0.005 a search with no orders; free against 1,500 searches per order | 1,000 free requests, then $0.002 each |
 
@@ -778,11 +782,17 @@ I have put both on a draft trip called "Hong Kong". Shall I keep it?
 
 ### 7.1 The three meters
 
-| Meter | Who bills | Unit | Price noted in this repository |
+| Meter | Who bills | Unit | List price, 2026-11-26 |
 |---|---|---|---|
-| The model | The LLM provider, MiniMax M3 by default | Tokens in and out | None |
-| Duffel | Duffel | One offer request | Free against 1,500 searches per order; $0.005 each with no orders (`tools/duffel.rs`) |
-| Ignav | Ignav | One request | 1,000 free, then $0.002 each (README) |
+| The model | The LLM provider, MiniMax M3 by default | Tokens in and out | $0.30 per million input tokens, $0.06 per million cached, $1.20 per million output |
+| Duffel | Duffel | One offer request | Free up to 1,500 searches per order in a month, then $0.005 each. By that rule, with no orders every search is billed; the page does not say so in words |
+| Ignav | Ignav | One successful request | 1,000 free once, then $0.002 each. A failed request is not billed |
+
+Sources: [Duffel's pricing page](https://duffel.com/pricing) and
+[Ignav's](https://ignav.com/pricing), read on 2026-11-26. MiniMax's price is
+as third parties listed it in November 2026
+([one of them](https://aicostoptimize.com/models/minimax-m3)); its own page
+was not read.
 
 A flight question needs no web search. The desk has no search tool. The
 main agent keeps its own and is told not to use it for flights.
@@ -791,9 +801,10 @@ One **day-search** is one day of one route. With both keys set it is one
 Duffel request and one Ignav request, $0.007 at those list prices. A return
 trip is still one request at each provider.
 
-The README gives one measured figure: a flight question costs about **1.4
-cents** end to end. It dates from August 2026, a month before the flight
-desk existed, and the repository records no later one.
+Measured in production, a search over a flexible window costs about **8 to 9
+cents**, about two-thirds of it the two providers
+([section 7.9](#79-measured-in-production)). The README's earlier figure of
+1.4 cents dates from August 2026, before the flight desk existed.
 
 ### 7.2 Before a run starts
 
@@ -941,10 +952,14 @@ allowance = 4                       a question and a couple of follow-ups
   transcript is thrown away, and the main conversation keeps only the
   report.
 - **The prompt changes once a day.** It carries a date and not a timestamp,
-  with the fixed rules first and the per-user facts last. That is the right
-  layout for a provider that caches a prompt's prefix. MiniMax does not:
-  measured on 2026-10-17, it serves a cached prompt only on an exact
-  repeat ([the prompt-cache reading](2026-10-17-prompt-cache.md)).
+  with the fixed rules first and the per-user facts last, which is the right
+  layout for a provider that caches a prompt's prefix. Within one run each
+  model turn re-sends the turn before with more appended. MiniMax reports
+  much of that input as cached: every week since 2026-10-17, 71% to 85% of
+  the input of all runs, and cached input costs a fifth of the rest
+  ([section 7.9](#79-measured-in-production)). That is against [the
+  prompt-cache reading](2026-10-17-prompt-cache.md) of the same day, whose
+  probe saw a cache only on an exact repeat.
 - **Models can be chosen per job.** `FLIGHT_MODEL` sets the desk's model.
   `SIDE_LLM_MODEL` sends the small tool-less calls, such as a thread's
   title, to a second model
@@ -976,8 +991,8 @@ allowance = 4                       a question and a couple of follow-ups
 ### 7.8 What the caps add up to
 
 These are list prices with both providers billing every request and no free
-allowance left. They are arithmetic, not measurements. The Ignav lookup
-price is the README's per-request price.
+allowance left. They are arithmetic, not measurements. Ignav's pricing page
+counts a booking-link lookup as one request.
 
 | Operation | Provider requests | At list price |
 |---|---|---|
@@ -988,7 +1003,7 @@ price is the README's per-request price.
 | Finalising 1 flight | 1 Duffel + 1 Ignav | $0.007 |
 | On top, for each finalised flight whose match is an Ignav row | 1 Ignav lookup | $0.002 |
 | Booking links for an Ignav row | 1 Ignav lookup | $0.002 |
-| A Duffel checkout link | 1 Duffel Links session | No price noted in the repository |
+| A Duffel checkout link | 1 Duffel Links session | None listed for the session. An order placed through it costs $3.00, plus 1% of its value under Duffel's own accreditation, $2.00 per paid extra, and 2% on a currency exchange |
 
 A retry can send any of these requests up to three times.
 
@@ -996,6 +1011,55 @@ The most flight searching one request can buy is its allowance: 4
 day-searches, $0.028, for a plain question; 10 day-searches, $0.070, with a
 ±3 window; and one more per flight plus one when a trip is finalised. Ignav
 lookups sit outside the allowance.
+
+### 7.9 Measured in production
+
+Read on 2026-11-26 from the nightly backup of 2026-11-25, with
+`scripts/flight-cost.py` as first committed (`b718624`). Runs have carried token counts since 2026-10-17.
+In that window 9 runs called the flight desk, and 6 of them searched. These
+are small numbers: read them as shape, not precision. The prices are those
+of [section 7.1](#71-the-three-meters). Duffel is counted at its
+excess-search fee, because Scout has no orders, and Ignav past its free
+1,000. A run's tokens are its own and its flight desk's. The small side
+calls, such as a thread's title, are not in them.
+
+| Question | `search_flights` calls | Day-searches bought | Tokens in (cached) | Tokens out | Model | Duffel + Ignav | Total |
+|---|---|---|---|---|---|---|---|
+| Return, ±2 days | 3 | 8 | 99,622 (66%) | 9,387 | $0.025 | $0.056 | **$0.081** |
+| One way, ±2 days | 4 | 8 | 97,379 (71%) | 9,131 | $0.024 | $0.056 | $0.080 |
+| One way, ±3 days | 2 | 10 | 100,489 (76%) | 9,048 | $0.023 | $0.070 | $0.093 |
+| One way, ±1 day | 8 | 6 | 317,160 (86%) | 13,601 | $0.046 | $0.042 | $0.088 |
+| One way, one date | 3 | 3 | 126,800 (42%) | 14,119 | $0.042 | $0.021 | $0.063 |
+| One way, one date | 7 | 4 | 199,495 (87%) | 6,359 | $0.026 | $0.028 | $0.054 |
+| The desk, no search | 0 | 0 | 58,283 to 225,650 | 8,152 to 18,967 | $0.023 to $0.051 | — | $0.023 to $0.051 |
+
+The calls include any the tool refused. The day-searches are the
+`flight_search` rows logged for the account during the run, so a repeat
+served from the memo is not one.
+
+- **A flexible search costs 8 to 9 cents, about two-thirds of it the
+  providers.** Over the four flexible runs the providers are 66% of the
+  total; for the ±1 run alone, half. Every flexible run spent its whole
+  allowance, 4 + 2 × flex_days: 6, 8, 8 and 10 day-searches, against the
+  3, 5, 5 and 7 that one pass over the window needs. One of the two
+  one-date runs spent its 4 as well.
+- **The model costs 2.3 to 4.6 cents a run that searched.** Output, mostly
+  the model's reasoning, is 6,000 to 14,000 tokens in those runs, and 30%
+  to 48% of the model's cost.
+- **The cache halves the model's bill.** Over all 65 runs with token
+  counts, 81% of input was cached, and the model cost $2.16 in all, $0.033
+  a run. Without the cache the return ±2 run would have cost $0.041 in
+  tokens instead of $0.025.
+- **Booking links were not measured.** No run with token counts called a
+  booking tool. A desk run that searched nothing cost 2.3 to 5.1 cents, and
+  an Ignav lookup adds $0.002. So a round trip searched over a flexible
+  window, then its booking links, comes to about 11 to 13 cents. Finalising
+  a trip was not measured either.
+- **Against the bills.** 437 day-searches were logged from 2026-08-06 to
+  2026-11-23. So Ignav's free 1,000 are probably not used up, and Duffel
+  would have charged at least about $2.20 in excess-search fees: re-pricing
+  searches and multi-city requests are not in that log. Neither invoice was
+  checked.
 
 ## 8. Limits and rough edges
 
@@ -1012,8 +1076,11 @@ lookups sit outside the allowance.
   code for the wrong airport. The guard for the date is the prompt, which
   gives the desk today's date. A past date that gets through is refused by
   the provider, and the search is spent either way.
-- **Nobody can price a whole month.** Neither provider has a calendar
-  endpoint. ±3 days is the ceiling.
+- **A window is one search a day.** The code assumes that neither provider
+  prices a calendar, so ±3 days is the ceiling and costs seven searches at
+  each. Ignav's pricing page, read on 2026-11-26, lists "a cheapest-dates
+  search of up to 31 departure dates" as one request, and multi-city
+  search. Scout uses neither. Duffel still prices one day a search.
 - **Bookable copies win only over exact duplicates.** A cheaper approximate
   fare on different flights still ranks first on price. The note then says
   what the cheapest payable price is.
